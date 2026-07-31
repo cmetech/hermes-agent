@@ -302,6 +302,20 @@ _SECRET_DIAGNOSTIC = re.compile(
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TYPED_PUBLICATION_METADATA_MAX_BYTES = 65_536
 _TYPED_PUBLICATION_DESCRIPTOR_VERSION = 2
+_LEGACY_TYPED_PUBLICATION_FIELDS = frozenset(
+    {
+        "publication_id",
+        "content_name",
+        "output_type",
+        "media_type",
+        "size_bytes",
+        "sha256",
+        "metadata_sha256",
+        "node_id",
+        "attempt_id",
+        "relative_path",
+    }
+)
 _TYPED_PUBLICATION_JSON_MEDIA_TYPE = "application/json"
 _TYPED_PUBLICATION_TEXT_MEDIA_TYPE = "text/markdown; charset=utf-8"
 
@@ -799,25 +813,22 @@ def _migrate_legacy_typed_publication_descriptors(
     run_id = projection.get("run_id")
     if not isinstance(artifacts, list) or not isinstance(run_id, str):
         raise JournalRecoveryError("typed publication descriptor authority is invalid")
-    base_fields = {
-        "publication_id",
-        "content_name",
-        "output_type",
-        "media_type",
-        "size_bytes",
-        "sha256",
-        "metadata_sha256",
-        "node_id",
-        "attempt_id",
-        "relative_path",
-    }
     migrated = 0
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
         if "typed_publication_version" in artifact:
             continue
-        if not base_fields <= set(artifact):
+        artifact_fields = frozenset(artifact)
+        if artifact_fields != _LEGACY_TYPED_PUBLICATION_FIELDS:
+            if {
+                "publication_id",
+                "content_name",
+                "metadata_sha256",
+            }.intersection(artifact_fields):
+                raise JournalRecoveryError(
+                    "unversioned typed publication descriptor is invalid"
+                )
             continue
         publication_id = artifact.get("publication_id")
         content_name = artifact.get("content_name")
@@ -5061,10 +5072,27 @@ class RunStore:
                     )
                     raise
                 if journal_current:
-                    migrated = _migrate_legacy_typed_publication_descriptors(
-                        directory,
-                        projection,
-                    )
+                    try:
+                        declared_outputs = _sealed_typed_output_declarations(
+                            directory,
+                            projection,
+                        )
+                        migrated = _migrate_legacy_typed_publication_descriptors(
+                            directory,
+                            projection,
+                        )
+                        if migrated:
+                            _journaled_typed_publications(
+                                projection,
+                                declared_outputs,
+                            )
+                    except JournalRecoveryError:
+                        self._transition_run_repair(
+                            "typed_publication_integrity",
+                            run_id=run_id,
+                            outcome="repair_required",
+                        )
+                        raise
                     if migrated:
                         self._append_locked(
                             directory,
@@ -8966,58 +8994,67 @@ class RunStore:
             raise JournalRecoveryError(
                 "typed mirror journal obligation is not backed by a publication"
             )
-        for mirror_id, obligation in expected.items():
-            existing = required.get(mirror_id)
-            if existing is not None and existing != obligation:
-                raise JournalRecoveryError("typed mirror obligation conflicts with journal")
-            new_requirement = existing is None
-            if new_requirement:
-                self._append_locked(
-                    directory,
-                    projection,
-                    "typed_mirror_required",
-                    {"mirror": self._typed_mirror_payload(obligation)},
-                    node_id=obligation.node_id,
-                    attempt_id=obligation.attempt_id,
-                )
-                required[mirror_id] = obligation
-            descriptor = descriptors.get(obligation.publication_id)
-            content = verified_content.get(obligation.publication_id)
-            if descriptor is None or content is None:
-                raise JournalRecoveryError(
-                    "typed mirror requires a verified run publication"
-                )
-            try:
-                record = mirror_store.stage(
-                    obligation,
-                    content,
-                )
-            except TypedMirrorIntegrityError as exc:
-                raise JournalRecoveryError("typed mirror integrity failure") from exc
-            was_completed = mirror_id in completed
-            try:
-                pointed = mirror_store.point(
-                    record,
-                    replace_current=not was_completed,
-                )
-            except TypedMirrorIntegrityError as exc:
-                raise JournalRecoveryError("typed mirror integrity failure") from exc
-            if not was_completed and not pointed:
-                continue
-            if not was_completed:
-                self._append_locked(
-                    directory,
-                    projection,
-                    "typed_mirror_completed",
-                    {"mirror_id": mirror_id, "entry_id": record.entry_id},
-                    node_id=obligation.node_id,
-                    attempt_id=obligation.attempt_id,
-                )
-                completed[mirror_id] = record.entry_id
-            try:
-                mirror_store.verify(record)
-            except TypedMirrorIntegrityError as exc:
-                raise JournalRecoveryError("typed mirror integrity failure") from exc
+        with mirror_store.capacity_reservation():
+            for mirror_id, obligation in expected.items():
+                existing = required.get(mirror_id)
+                if existing is not None and existing != obligation:
+                    raise JournalRecoveryError(
+                        "typed mirror obligation conflicts with journal"
+                    )
+                new_requirement = existing is None
+                if new_requirement:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "typed_mirror_required",
+                        {"mirror": self._typed_mirror_payload(obligation)},
+                        node_id=obligation.node_id,
+                        attempt_id=obligation.attempt_id,
+                    )
+                    required[mirror_id] = obligation
+                descriptor = descriptors.get(obligation.publication_id)
+                content = verified_content.get(obligation.publication_id)
+                if descriptor is None or content is None:
+                    raise JournalRecoveryError(
+                        "typed mirror requires a verified run publication"
+                    )
+                try:
+                    record = mirror_store.stage(
+                        obligation,
+                        content,
+                    )
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
+                was_completed = mirror_id in completed
+                try:
+                    pointed = mirror_store.point(
+                        record,
+                        replace_current=not was_completed,
+                    )
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
+                if not was_completed and not pointed:
+                    continue
+                if not was_completed:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "typed_mirror_completed",
+                        {"mirror_id": mirror_id, "entry_id": record.entry_id},
+                        node_id=obligation.node_id,
+                        attempt_id=obligation.attempt_id,
+                    )
+                    completed[mirror_id] = record.entry_id
+                try:
+                    mirror_store.verify(record)
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
 
     def complete_node(
         self,

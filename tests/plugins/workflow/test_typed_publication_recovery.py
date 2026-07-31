@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import stat
+import threading
 
 import pytest
 
@@ -143,6 +145,34 @@ def _rewrite_latest_projection(
     _validated, encoded = store_module._encode_journal_frame(latest)
     journal.write_bytes(b"".join(lines[:-1]) + encoded)
     (directory / "run.json").unlink()
+
+
+def _rewrite_current_projection(
+    store: RunStore,
+    run_id: str,
+    mutation,
+) -> None:
+    directory = store.run_directory(run_id)
+    projection_path = directory / "run.json"
+    projection = json.loads(projection_path.read_bytes())
+    mutation(projection)
+    projection_path.write_text(
+        json.dumps(
+            projection,
+            sort_keys=True,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    journal = directory / "events.jsonl"
+    lines = journal.read_bytes().splitlines(keepends=True)
+    latest = json.loads(lines[-1])
+    latest["projection"] = projection
+    latest["projection_sha256"] = store_module._projection_digest(projection)
+    _validated, encoded = store_module._encode_journal_frame(latest)
+    journal.write_bytes(b"".join(lines[:-1]) + encoded)
 
 
 def _forged_metadata_digest(bundle: Path, **updates: object) -> str:
@@ -621,6 +651,63 @@ def test_base_typed_publication_journal_is_checked_and_migrated(
     )
 
 
+def test_fast_path_rejects_a_v2_descriptor_with_only_its_version_removed(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(store, workflow_writer, tmp_path / "v2-downgrade")
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"v2 bytes")
+    _complete(store, claim, artifact, candidate)
+
+    def remove_only_version(projection: dict[str, object]) -> None:
+        _published(projection).pop("typed_publication_version")
+
+    _rewrite_current_projection(store, admitted.run_id, remove_only_version)
+
+    with pytest.raises(JournalRecoveryError, match="typed publication"):
+        store.load_run(admitted.run_id)
+
+    assert "typed_publication_migrated" not in {
+        event["event_type"] for event in store.tail_events(admitted.run_id)
+    }
+
+
+def test_fast_path_validates_legacy_winner_authority_before_migration_event(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(store, workflow_writer, tmp_path / "legacy-authority")
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"legacy bytes")
+    _complete(store, claim, artifact, candidate)
+
+    def forge_legacy_path(projection: dict[str, object]) -> None:
+        published = _published(projection)
+        for field in (
+            "typed_publication_version",
+            "schema_fingerprint",
+            "canonicalization_version",
+            "produced_at",
+            "session_id",
+        ):
+            published.pop(field)
+        published["relative_path"] = "nodes/produce/forged/output.md"
+
+    _rewrite_current_projection(store, admitted.run_id, forge_legacy_path)
+
+    with pytest.raises(JournalRecoveryError, match="typed publication"):
+        store.load_run(admitted.run_id)
+
+    assert "typed_publication_migrated" not in {
+        event["event_type"] for event in store.tail_events(admitted.run_id)
+    }
+
+
 @pytest.mark.parametrize("mirror_state", ["required", "completed"])
 def test_checked_mirror_obligation_cannot_be_demoted_to_an_empty_expected_set(
     tmp_path,
@@ -705,6 +792,99 @@ def test_mirror_profile_quota_fails_before_any_mirror_file_is_visible(
     for name in ("content", "entries", "activations", "indexes"):
         directory = mirror_root / name
         assert not directory.exists() or list(directory.iterdir()) == []
+
+
+def test_concurrent_mirror_recovery_holds_one_profile_capacity_reservation(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    original_stage = store_module.TypedMirrorStore.stage
+
+    def stop_after_requirement(_self, _obligation, _content):
+        raise OSError("leave mirror requirement pending")
+
+    def prepare_pending(label: str, data: bytes) -> str:
+        admitted = _start_archon(
+            store,
+            workflow_writer,
+            tmp_path / label,
+            persist_sessions=True,
+            nodes=[{"id": "produce", "prompt": "Report", "output_type": "Report"}],
+        )
+        claim = store.claim_node(admitted.run_id, "produce", "owner")
+        assert claim is not None
+        _source, artifact, candidate = _candidate(store, claim, data)
+        with pytest.raises(OSError, match="leave mirror requirement pending"):
+            _complete(store, claim, artifact, candidate)
+        return admitted.run_id
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store_module.TypedMirrorStore,
+            "stage",
+            stop_after_requirement,
+        )
+        calibration_run = prepare_pending("quota-calibration", b"0")
+        concurrent_runs = (
+            prepare_pending("quota-concurrent-a", b"1"),
+            prepare_pending("quota-concurrent-b", b"2"),
+        )
+
+    before_calibration = store._profile_storage_bytes()
+    store.load_run(calibration_run)
+    one_recovery_bytes = store._profile_storage_bytes() - before_calibration
+    assert one_recovery_bytes > 512
+    profile_before = store._profile_storage_bytes()
+    store.max_profile_bytes = profile_before + one_recovery_bytes + 512
+    stage_barrier = threading.Barrier(3, timeout=1)
+
+    def pause_after_stage(self, obligation, content):
+        record = original_stage(self, obligation, content)
+        try:
+            stage_barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return record
+
+    def recover(run_id: str) -> str:
+        try:
+            store.load_run(run_id)
+        except StorageQuotaError:
+            return "quota"
+        return "recovered"
+
+    monkeypatch.setattr(
+        store_module.TypedMirrorStore,
+        "stage",
+        pause_after_stage,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(recover, run_id) for run_id in concurrent_runs]
+        try:
+            stage_barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        outcomes = [future.result(timeout=10) for future in futures]
+
+    assert outcomes.count("recovered") == 1
+    assert outcomes.count("quota") == 1
+    assert store._profile_storage_bytes() <= store.max_profile_bytes
+    key = NodeSessionKey(
+        "typed-recovery",
+        "produce",
+        "local",
+        "fake",
+        "fake",
+    )
+    history = NodeSessionRegistry(home).list_mirror_history(key)
+    assert len(history) == 2
+    assert {record.run_id for record in history} == {
+        calibration_run,
+        concurrent_runs[outcomes.index("recovered")],
+    }
 
 
 def test_publication_quota_failure_exposes_neither_content_nor_metadata(

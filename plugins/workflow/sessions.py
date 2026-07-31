@@ -454,6 +454,43 @@ class TypedMirrorStore:
                     finally:
                         os.close(lock_descriptor)
 
+    @contextmanager
+    def capacity_reservation(self) -> Iterator[None]:
+        """Serialize one profile-capacity decision through mirror visibility."""
+        with self._open_layout() as layout:
+            identity = _directory_identity(layout.root)
+            process_lock = _process_lock(identity)
+            with process_lock:
+                flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+                try:
+                    lock_descriptor = os.open(
+                        ".profile-capacity.lock",
+                        flags,
+                        0o600,
+                        dir_fd=layout.root,
+                    )
+                except OSError as exc:
+                    raise TypedMirrorIntegrityError(
+                        "typed mirror capacity lock is unsafe"
+                    ) from exc
+                try:
+                    observed = os.fstat(lock_descriptor)
+                    if (
+                        not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                        or _is_reparse_point(observed)
+                    ):
+                        raise TypedMirrorIntegrityError(
+                            "typed mirror capacity lock is unsafe"
+                        )
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                    yield
+                finally:
+                    try:
+                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_descriptor)
+
     @staticmethod
     def _layout_bytes(layout: _MirrorLayout) -> int:
         total = 0
@@ -816,11 +853,20 @@ class TypedMirrorStore:
             if not replace_current:
                 if current is not None:
                     try:
-                        self._verified_record(layout, current.entry_id)
+                        current_record = self._verified_record(
+                            layout,
+                            current.entry_id,
+                        )
                     except TypedMirrorIntegrityError:
                         pass
                     else:
-                        if self._is_activated(layout, current.entry_id):
+                        if (
+                            current_record.workflow == record.workflow
+                            and current_record.node_id == record.node_id
+                            and current_record.operator_scope
+                            == record.operator_scope
+                            and self._is_activated(layout, current.entry_id)
+                        ):
                             return False
             generation = current.generation if current is not None else 0
             _atomic_bytes_at(

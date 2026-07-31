@@ -332,6 +332,108 @@ Concern: native non-POSIX mirror semantics were not executed on this macOS
 host; the implementation deliberately fails closed when the required
 descriptor-relative and directory-durability primitives are unavailable.
 
+## Quality Fix Round 2 — scope-safe replay, atomic capacity, exact migration
+
+The three remaining Important findings from quality re-review 1 are
+addressed.
+
+- Completed replay now preserves an existing activated pointer only when its
+  verified record belongs to the workflow, node, and operator scope encoded by
+  the target index. A valid activated index copied from scope B over scope A is
+  replaced with A during completed replay, while B's immutable entry and
+  current index remain intact.
+- `TypedMirrorStore.capacity_reservation()` adds a separate profile-capacity
+  lock opened relative to the verified mirror-root descriptor. It shares the
+  root's reentrant process lock and uses `flock` for cross-process exclusion.
+  Run recovery holds this lock across requirement journaling, capacity/free
+  disk checking and staging, scope-index pointing, completion journaling, and
+  activation. The lock order is run lock → profile-capacity lock → scope-index
+  lock; no path acquires a run or admission lock while holding either mirror
+  lock. Exceptions and process crashes release the reservation idempotently.
+- Legacy migration now accepts only the exact genuine Task 8 artifact key set.
+  An otherwise-v2 descriptor with only its version removed is rejected as an
+  invalid unversioned descriptor. On the fast load path, the upgraded
+  projection is checked against the sealed output declaration, succeeded
+  winner, and owned relative path before `typed_publication_migrated` can be
+  appended.
+
+### Strict TDD evidence
+
+Cross-scope replay RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_security_boundaries.py -k 'cross_scope_index'
+```
+
+Observed expected RED: 1 selected, 0 passed and 1 failed because
+`point(..., replace_current=False)` preserved the activated scope-B record.
+
+Concurrent capacity and fast-migration RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'v2_descriptor or legacy_winner_authority or concurrent_mirror_recovery'
+```
+
+Observed expected RED: 3 selected, 0 passed and 3 failed. The version-only
+downgrade loaded successfully, the forged legacy path appended a migration
+event before failing, and both barrier-synchronized recoveries succeeded under
+a budget sized for one.
+
+Final focused GREEN: the selectors passed 1/1 and 3/3 respectively.
+
+### Verification
+
+Round-1 quality regressions:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'swapped_root or base_typed or mirror_obligation or mirror_profile_quota'
+scripts/run_tests.sh tests/plugins/workflow/test_security_boundaries.py -k 'swapped_parent or descriptor_relative_io or pending_current or malformed_scope'
+```
+
+Result: 5/5 and 9/9 passed.
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 140 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/sessions.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Quality-fix self-review
+
+- Confirmed a same-scope activated current entry is still preserved, while a
+  cross-scope entry is replaced and neither immutable history is removed.
+- Confirmed the capacity lock is anchored to the same verified profile mirror
+  root as the scope lock and spans every journal/filesystem visibility boundary
+  in one recovery transaction.
+- Confirmed the barrier regression admits exactly one of two recoveries under a
+  one-recovery budget, rejects the other before exposure, retains only the
+  calibration and successful histories, and leaves aggregate profile bytes at
+  or below the configured limit.
+- Confirmed a genuine base descriptor still migrates, while both fast-path
+  forgery variants raise without appending `typed_publication_migrated`.
+
+Concern: native non-POSIX behavior remains intentionally fail-closed and was
+not executed on this macOS host.
+
 ## Spec Fix Round 2 — mirror-index write fail-closed behavior
 
 `TypedMirrorStore.point()` now distinguishes a genuinely absent scope index

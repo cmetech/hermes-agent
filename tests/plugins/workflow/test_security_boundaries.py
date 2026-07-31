@@ -247,13 +247,18 @@ def test_log_evidence_rejects_non_regular_fifo(
     assert page["warnings"] == ["unsafe_evidence_path"]
 
 
-def _mirror_obligation(data: bytes, *, run_id: str = "run-1"):
+def _mirror_obligation(
+    data: bytes,
+    *,
+    run_id: str = "run-1",
+    operator_scope: str = "scope",
+):
     digest = hashlib.sha256(data).hexdigest()
     return TypedMirrorObligation(
         mirror_id=hashlib.sha256(f"mirror:{run_id}".encode()).hexdigest(),
         workflow="workflow",
         node_id="node",
-        operator_scope="scope",
+        operator_scope=operator_scope,
         run_id=run_id,
         attempt_id="attempt-1",
         publication_id="a" * 32,
@@ -511,6 +516,41 @@ def test_completed_mirror_recovery_replaces_a_pending_current_pointer(tmp_path) 
     mirrors.verify(first)
 
     assert mirrors.get("workflow", "node", "scope") == first
+
+
+def test_completed_mirror_recovery_replaces_an_activated_cross_scope_index(
+    tmp_path,
+) -> None:
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    first_data = b"completed-a"
+    first = mirrors.complete(
+        _mirror_obligation(first_data, operator_scope="scope-a"),
+        first_data,
+    )
+    second_data = b"completed-b"
+    second = mirrors.complete(
+        _mirror_obligation(
+            second_data,
+            run_id="run-2",
+            operator_scope="scope-b",
+        ),
+        second_data,
+    )
+    first_index = mirrors.index_root / (
+        mirrors._scope_id("workflow", "node", "scope-a") + ".json"
+    )
+    second_index = mirrors.index_root / (
+        mirrors._scope_id("workflow", "node", "scope-b") + ".json"
+    )
+    first_index.write_bytes(second_index.read_bytes())
+    assert mirrors.get("workflow", "node", "scope-a") is None
+
+    assert mirrors.point(first, replace_current=False)
+    mirrors.verify(first)
+
+    assert mirrors.get("workflow", "node", "scope-a") == first
+    assert mirrors.get("workflow", "node", "scope-b") == second
+    assert mirrors.list_history("workflow", "node", "scope-b") == (second,)
 
 
 @pytest.mark.parametrize("malformation", ["same_entry_missing_fields", "negative_generation"])
