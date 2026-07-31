@@ -175,6 +175,9 @@ def test_v2_snapshot_rejects_noncanonicalization_versions(version):
     [
         {"$schema": "https://example.invalid/not-draft-2020-12"},
         {"description": "x" * 70_000},
+        {"type": 7},
+        {"type": "object", "required": "x"},
+        {"type": "number", "minimum": "zero"},
     ],
 )
 def test_archon_invalid_output_format_is_a_coded_workflow_validation_error(

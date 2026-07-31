@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib.machinery import ModuleSpec
 import json
 from pathlib import Path
@@ -10,7 +11,7 @@ import yaml
 
 from plugins.workflow.cli import doctor_package
 from plugins.workflow.compat import CompatibilityLevel
-from plugins.workflow.models import WorkflowRuntimeConfig
+from plugins.workflow.models import WorkflowRuntimeConfig, WorkflowStructuredOutput
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import WorkflowTrustStore
 
@@ -358,6 +359,33 @@ def test_doctor_rejects_callable_draft_without_iter_errors(
     assert (
         finding.message == "jsonschema is required; install the Hermes mcp or all extra"
     )
+
+
+def test_doctor_reports_invalid_canonical_schema_with_stable_taxonomy(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = _archon_structured_package(tmp_path, workflow_writer)
+    package = replace(
+        package,
+        language=replace(
+            package.language,
+            structured_outputs={
+                "producer": WorkflowStructuredOutput(
+                    canonical_schema={"type": 7},
+                    schema_fingerprint="f" * 64,
+                )
+            },
+        ),
+    )
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    finding = next(
+        item for item in report.findings if item.code == "structured_output_invalid"
+    )
+    assert report.runnable is False
+    assert finding.blocking is True
+    assert finding.message == "structured-output schema is invalid"
 
 
 def test_doctor_blocks_draft_constructor_import_failure(

@@ -13,6 +13,7 @@ from agent.structured_output import (
     MAX_OUTPUT_BYTES,
     StructuredOutputError,
     StructuredOutputRequest,
+    StructuredOutputSchemaInvalid,
     StructuredOutputStrategy,
     StructuredOutputValidatorUnavailable,
     normalize_schema,
@@ -680,6 +681,16 @@ class AgentNodeExecutor:
             )
         try:
             structured_request = self._structured_request(context)
+        except StructuredOutputSchemaInvalid as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": 0,
+                    "archon_terminal_failure": True,
+                },
+            )
         except ValueError as exc:
             return NodeExecutionResult(
                 "failed",
@@ -692,6 +703,16 @@ class AgentNodeExecutor:
             try:
                 structured_validator = require_structured_output_validator(
                     structured_request.schema.canonical_schema
+                )
+            except StructuredOutputSchemaInvalid as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_invalid",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "archon_terminal_failure": True,
+                    },
                 )
             except StructuredOutputValidatorUnavailable as exc:
                 return NodeExecutionResult(

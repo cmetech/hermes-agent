@@ -345,6 +345,83 @@ def test_validator_is_required_only_when_validation_is_requested(monkeypatch) ->
         structured_output.parse_validate_canonicalize("{}", request)
 
 
+@pytest.mark.parametrize(
+    "schema",
+    (
+        {"type": 7},
+        {"type": "object", "required": "x"},
+        {"type": "number", "minimum": "zero"},
+    ),
+)
+def test_normalize_rejects_malformed_known_keyword_shapes_without_jsonschema(
+    monkeypatch, schema
+) -> None:
+    original_import = builtins.__import__
+
+    def missing_jsonschema(name: str, *args: object, **kwargs: object) -> object:
+        if name == "jsonschema":
+            raise AssertionError("normalization imported optional jsonschema")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "jsonschema", raising=False)
+    monkeypatch.setattr(builtins, "__import__", missing_jsonschema)
+
+    with pytest.raises(
+        StructuredOutputError, match="structured-output schema is invalid"
+    ):
+        normalize_schema(schema)
+
+
+def test_draft_check_schema_error_has_distinct_bounded_taxonomy(monkeypatch) -> None:
+    observed = []
+
+    class FakeSchemaError(Exception):
+        pass
+
+    class FakeDraft:
+        @staticmethod
+        def check_schema(schema):
+            observed.append(schema)
+            raise FakeSchemaError("private schema diagnostic")
+
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = FakeDraft
+    partial.SchemaError = FakeSchemaError
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+    invalid_type = {"type": 7}
+
+    invalid_error = getattr(structured_output, "StructuredOutputSchemaInvalid", None)
+    assert isinstance(invalid_error, type)
+    with pytest.raises(invalid_error) as exc_info:
+        structured_output.require_structured_output_validator(invalid_type)
+
+    assert str(exc_info.value) == "structured-output schema is invalid"
+    assert "private" not in str(exc_info.value)
+    assert observed == [invalid_type]
+
+
+def test_draft_without_callable_check_schema_is_unavailable(monkeypatch) -> None:
+    class FakeDraft:
+        check_schema = object()
+
+        def __init__(self, _schema):
+            pass
+
+        @staticmethod
+        def iter_errors(_value):
+            return ()
+
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = FakeDraft
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
+        structured_output.require_structured_output_validator({"type": "object"})
+
+
 def test_importable_validator_without_callable_draft_is_unavailable(
     monkeypatch,
 ) -> None:
@@ -394,11 +471,20 @@ def test_draft_constructor_import_failure_is_unavailable(monkeypatch) -> None:
 def test_unrelated_draft_constructor_errors_remain_visible(
     monkeypatch, error_type
 ) -> None:
-    def broken_constructor(_schema):
-        raise error_type("constructor defect")
+    class BrokenDraft:
+        @staticmethod
+        def check_schema(_schema):
+            return None
+
+        def __new__(cls, _schema):
+            raise error_type("constructor defect")
+
+    class FakeSchemaError(Exception):
+        pass
 
     partial = types.ModuleType("jsonschema")
-    partial.Draft202012Validator = broken_constructor
+    partial.Draft202012Validator = BrokenDraft
+    partial.SchemaError = FakeSchemaError
     partial.validate = lambda *_args, **_kwargs: None
     monkeypatch.setitem(sys.modules, "jsonschema", partial)
 

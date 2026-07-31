@@ -23,6 +23,7 @@ import yaml
 
 from agent.structured_output import (
     STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE,
+    StructuredOutputSchemaInvalid,
     StructuredOutputValidatorUnavailable,
     require_structured_output_validator,
 )
@@ -1224,21 +1225,32 @@ def doctor_package(
         mcp_available=mcp_available,
     )
     findings = list(compatibility.findings)
-    if (
-        package.language.structured_outputs
-        and not _structured_output_validator_available(
-            package.language.structured_outputs.values()
-        )
-    ):
-        findings.append(
-            _doctor_finding(
-                code="structured_output_unavailable",
-                path="language.structured_outputs",
-                message=STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE,
-                blocking=True,
-                level=CompatibilityLevel.UNSUPPORTED,
+    if package.language.structured_outputs:
+        try:
+            validator_available = _structured_output_validator_available(
+                package.language.structured_outputs.values()
             )
-        )
+        except StructuredOutputSchemaInvalid as exc:
+            findings.append(
+                _doctor_finding(
+                    code="structured_output_invalid",
+                    path="language.structured_outputs",
+                    message=str(exc),
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+        else:
+            if not validator_available:
+                findings.append(
+                    _doctor_finding(
+                        code="structured_output_unavailable",
+                        path="language.structured_outputs",
+                        message=STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE,
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
     findings.extend(_provider_override_findings(package, hermes_home=hermes_home))
     risk = build_risk_summary(package, compatibility)
     package_digest = compute_package_digest(package)

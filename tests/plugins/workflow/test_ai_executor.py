@@ -351,6 +351,38 @@ def test_archon_rejects_callable_unusable_validator_before_runner(
     assert list((tmp_path / "run").iterdir()) == []
 
 
+def test_archon_rejects_invalid_admitted_schema_before_runner(tmp_path):
+    runner = FakeAgentRunner('{"answer":"ready"}')
+    node = _node(
+        "invalid-schema",
+        "Produce data",
+        output_format={"type": "object"},
+    )
+    context = _archon_context(tmp_path, node)
+    invalid_fingerprint = "f" * 64
+    context = replace(
+        context,
+        structured_output=WorkflowStructuredOutput(
+            canonical_schema={"type": 7},
+            schema_fingerprint=invalid_fingerprint,
+        ),
+        structured_output_decision=replace(
+            context.structured_output_decision,
+            schema_fingerprint=invalid_fingerprint,
+        ),
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
+    assert result.error_message == "structured-output schema is invalid"
+    assert result.metadata["provider_attempts"] == 0
+    assert result.metadata["archon_terminal_failure"] is True
+    assert runner.requests == []
+    assert not result.artifacts
+
+
 def test_archon_maps_draft_constructor_import_failure_before_runner(
     tmp_path, monkeypatch
 ):

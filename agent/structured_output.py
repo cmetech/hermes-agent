@@ -33,6 +33,7 @@ MAX_VALIDATION_DIAGNOSTIC_BYTES = 16_384
 STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE = (
     "jsonschema is required; install the Hermes mcp or all extra"
 )
+STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE = "structured-output schema is invalid"
 
 _INTEGER_BOUND_KEYWORDS = frozenset({
     "maxContains",
@@ -71,6 +72,22 @@ _GENERIC_CONTEXT = "generic"
 _SCHEMA_CONTEXT = "schema"
 _SCHEMA_MAP_CONTEXT = "schema_map"
 _SCHEMA_ARRAY_CONTEXT = "schema_array"
+_JSON_SCHEMA_TYPES = frozenset({
+    "array",
+    "boolean",
+    "integer",
+    "null",
+    "number",
+    "object",
+    "string",
+})
+_NUMBER_BOUND_KEYWORDS = frozenset({
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "maximum",
+    "minimum",
+    "multipleOf",
+})
 
 
 class StructuredOutputError(ValueError):
@@ -79,6 +96,10 @@ class StructuredOutputError(ValueError):
 
 class StructuredOutputValidatorUnavailable(StructuredOutputError):
     """The optional jsonschema validator is required for this request."""
+
+
+class StructuredOutputSchemaInvalid(StructuredOutputError):
+    """A schema fails the bounded Draft 2020-12 contract."""
 
 
 class StructuredOutputStrategy(str, Enum):
@@ -245,6 +266,38 @@ def _validate_schema_keyword(
     ref_count: int,
     regex_bytes: int,
 ) -> tuple[str, int, int, int]:
+    if key == "type":
+        valid = (
+            isinstance(value, str)
+            and value in _JSON_SCHEMA_TYPES
+            or isinstance(value, list)
+            and bool(value)
+            and all(
+                isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in value
+            )
+            and len(set(value)) == len(value)
+        )
+        if not valid:
+            raise StructuredOutputSchemaInvalid(
+                STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE
+            )
+    if key == "required" and (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise StructuredOutputSchemaInvalid(STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE)
+    if key in _NUMBER_BOUND_KEYWORDS and (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or (
+            isinstance(value, int | float)
+            and math.isfinite(value)
+            and key == "multipleOf"
+            and value <= 0
+        )
+    ):
+        raise StructuredOutputSchemaInvalid(STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE)
     if key in _SCOPE_CHANGING_KEYWORDS:
         raise StructuredOutputError(f"schema {key} changes resolution scope")
     if key == "$dynamicRef":
@@ -253,6 +306,8 @@ def _validate_schema_keyword(
         isinstance(value, bool) or not isinstance(value, int)
     ):
         raise StructuredOutputError(f"schema {key} must be an integer")
+    if key in _INTEGER_BOUND_KEYWORDS and value < 0:
+        raise StructuredOutputSchemaInvalid(STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE)
     if key == "properties":
         if not isinstance(value, Mapping):
             raise StructuredOutputError("schema properties must be an object")
@@ -412,12 +467,30 @@ def require_structured_output_validator(
         return jsonschema
 
     validator_builder = getattr(jsonschema, "Draft202012Validator", None)
-    if not callable(validator_builder):
+    check_schema = getattr(validator_builder, "check_schema", None)
+    schema_error = getattr(jsonschema, "SchemaError", None)
+    if (
+        not callable(validator_builder)
+        or not callable(check_schema)
+        or not isinstance(schema_error, type)
+        or not issubclass(schema_error, Exception)
+    ):
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         )
+    canonical_schema = _thaw_json(schema) if schema is not None else {}
     try:
-        validator = validator_builder(_thaw_json(schema or {}))
+        check_schema(canonical_schema)
+    except schema_error as exc:
+        raise StructuredOutputSchemaInvalid(
+            STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE
+        ) from exc
+    except (AttributeError, ImportError, TypeError) as exc:
+        raise StructuredOutputValidatorUnavailable(
+            STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
+        ) from exc
+    try:
+        validator = validator_builder(canonical_schema)
     except (AttributeError, ImportError, TypeError) as exc:
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
@@ -561,10 +634,12 @@ __all__ = [
     "MAX_TOTAL_REGEX_BYTES",
     "MAX_VALIDATION_DIAGNOSTIC_BYTES",
     "STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE",
+    "STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE",
     "StructuredOutputError",
     "StructuredOutputRequest",
     "StructuredOutputSchema",
     "StructuredOutputStrategy",
+    "StructuredOutputSchemaInvalid",
     "StructuredOutputValidatorUnavailable",
     "StructuredOutputValue",
     "normalize_schema",
