@@ -1,7 +1,7 @@
 ---
 sidebar_position: 14
 title: "Workflow YAML reference"
-description: "Author profile-aware portable workflow packages for the Phase 1 language contract"
+description: "Author profile-aware portable workflows with structured data and typed artifacts"
 ---
 
 # Workflow YAML reference
@@ -10,8 +10,8 @@ Hermes reads a portable workflow definition and an optional Hermes companion
 file. The portable file describes the DAG. The companion selects the language
 profile and adds Hermes admission and execution policy.
 
-This page describes the Phase 1 contract. It does not claim Phase 2 or later
-execution semantics.
+This page describes the implemented Phase 2 contract. It does not claim the
+deferred Phase 3 timeout, retry, condition, or strict-reference semantics.
 
 ## Authoritative schema
 
@@ -61,12 +61,12 @@ declare its package trusted.
 
 ## Language profiles and backend floor
 
-| Profile | Declaration in `example.hermes.yaml` | Phase 1 behavior |
+| Profile | Declaration in `example.hermes.yaml` | Current behavior |
 | --- | --- | --- |
 | `hermes-legacy` | Omit `language_compatibility`, or declare `language_compatibility: hermes-legacy` on a capable backend. | Preserves existing unversioned Hermes meanings and emits migration warnings. It does not reinterpret old packages. |
 | `archon-2026-07` | `language_compatibility: archon-2026-07` | Opts into the reviewed July 2026 shape. Unknown definition fields and unavailable semantics fail closed. New first-party packages use this profile. |
 
-An Archon companion requires a Phase-1-capable backend. A pre-Phase-1 backend
+An Archon companion requires a profile-aware backend. A pre-Phase-1 backend
 rejects `language_compatibility` as an unknown companion field, so an Archon
 package is intentionally unreadable there. A workflow directory or package
 shared with an older Hermes, OTTO, LOOP24, or other brand runtime must stay
@@ -81,7 +81,7 @@ doctor, and the normal digest-bound trust review again.
 
 | Status | Meaning on this page |
 | --- | --- |
-| **Enforced** | Phase 1 validates and executes the stated structural/runtime meaning. |
+| **Enforced** | Hermes validates and executes the stated structural/runtime meaning. |
 | **Mapped** | Hermes supplies an equivalent through its agent, provider, tool, or policy system. Doctor decides whether the selected environment has that capability. |
 | **Legacy-only** | The current meaning is preserved under `hermes-legacy`, usually with a warning; it is not an Archon-profile guarantee. |
 | **Blocked pending Phase N** | The generated Archon contract carries `x-hermes-status: blocking`. The number is enforcement-phase metadata, not a delivery date or availability promise; schema shape alone does not make the field runnable. |
@@ -97,8 +97,6 @@ support ships.
 | Both | `workflow_language_profile_unsupported` | `sidecar.language_compatibility` | Blocking | 1 |
 | Both | `workflow_normalizer_version_unsupported` | `normalizer_version` | Blocking | 1 |
 | Archon | `archon_unknown_top_level_field` | Any unknown top-level field | Blocking | 1 |
-| Archon | `archon_output_format_unavailable` | `nodes[].output_format` | Blocking | 2 |
-| Archon | `archon_output_type_unavailable` | `nodes[].output_type` | Blocking | 2 |
 | Archon | `archon_idle_timeout_semantics_unavailable` | `nodes[].idle_timeout` | Blocking | 3 |
 | Archon | `archon_retry_semantics_unavailable` | `nodes[].retry` | Blocking | 3 |
 | Archon | `archon_timeout_semantics_unavailable` | `nodes[].timeout` | Blocking | 3 |
@@ -120,7 +118,7 @@ support ships.
 unknown top-level fields; legacy reports them without changing existing
 behavior.
 
-| Field | Shape and present meaning | Phase 1 status |
+| Field | Shape and present meaning | Current status |
 | --- | --- | --- |
 | `name` | Nonempty portable workflow identifier. | Enforced |
 | `description` | Nonempty human description. | Enforced |
@@ -149,33 +147,33 @@ The generated nested helpers are also closed shapes: `worktree` contains only
 Every node has a nonempty `id` and exactly one node-type payload. IDs,
 dependencies, and references are validated as one acyclic graph.
 
-| Field | Shape and present meaning | Phase 1 status |
+| Field | Shape and present meaning | Current status |
 | --- | --- | --- |
 | `id` | Nonempty node identifier, required. | Enforced |
 | `depends_on` | Array of upstream node IDs. | Enforced |
-| `when` | Nonempty condition over upstream `$node.output` values. | Enforced with current Phase 1 condition behavior |
+| `when` | Nonempty condition over upstream `$node.output` values. | Enforced with the existing compatibility behavior; Phase 3 strict semantics are not claimed |
 | `trigger_rule` | `all_success`, `one_success`, `none_failed_min_one_success`, or `all_done`. | Enforced |
 | `context` | `fresh` or `shared`; shared resumes only a cache-fingerprint-compatible predecessor. | Mapped and cache-enforced |
 | `idle_timeout` | Positive number. Hermes legacy executes the authored value as seconds; Archon millisecond normalization is deferred. | Legacy-only; blocked pending Phase 3 (`archon_idle_timeout_semantics_unavailable`) |
-| `retry` | Retry object documented below; unavailable as an Archon semantic block in Phase 1. | Legacy-only; blocked pending Phase 3 (`archon_retry_semantics_unavailable`) |
+| `retry` | Retry object documented below; unavailable as an Archon semantic block in Phase 2. | Legacy-only; blocked pending Phase 3 (`archon_retry_semantics_unavailable`) |
 | `always_run` | Boolean graph scheduling flag. | Enforced |
-| `output_type` | Nonempty type label. Legacy accepts it but does not publish a typed artifact. | Legacy-only; blocked pending Phase 2 (`archon_output_type_unavailable`) |
+| `output_type` | Nonempty, case-sensitive semantic label, at most 16,384 characters. Under Archon, a successful output-producing node publishes one typed artifact for its winning attempt. | Enforced for Archon; legacy accepts the label but does not publish |
 
 ### Node variants
 
-| Node | Required payload | Additional fields | Phase 1 status |
+| Node | Required payload | Additional fields | Current status |
 | --- | --- | --- | --- |
 | `command` | `command: nonempty string`; inline text or a name below `commands/`. | AI fields below. | Mapped to an isolated Hermes agent worker |
 | `prompt` | `prompt: nonempty string`; inline prompt text. | AI fields below. | Mapped to an isolated Hermes agent worker |
 | `bash` | `bash: nonempty string`. | Optional deferred `timeout`. | Enforced through the contained process runner |
 | `script` | `script: nonempty string` and `runtime: uv | bun`. | `deps` string array; optional deferred `timeout`. Named scripts resolve below `scripts/`. | Enforced when the runtime and resource exist |
-| `loop` | `loop` object below. | Common fields except node `retry`. | Enforced with the current Phase 1 loop shape; later Archon loop expansion is not claimed |
+| `loop` | `loop` object below. | Common fields except node `retry`. | Enforced with the existing loop shape; later Archon loop expansion is not claimed |
 | `approval` | `approval` object below. | Common fields, including legacy retry. | Enforced durable compare-and-set user gate |
-| `cancel` | `cancel: nonempty string` reason. | Common fields, including legacy retry. | Enforced durable cancellation |
+| `cancel` | `cancel: nonempty string` reason. | Common fields, including legacy retry. | Enforced durable cancellation; it never publishes because it cannot complete successfully |
 
 For `bash` and `script`, node `timeout` is a positive number interpreted as
 seconds only under `hermes-legacy`. Archon timeout semantics are blocked in
-Phase 1, with enforcement-phase metadata 3
+Phase 2, with enforcement-phase metadata 3
 (`archon_timeout_semantics_unavailable`); no delivery timing is promised. Use
 companion `limits.subprocess_timeout_seconds` today when a package only needs a
 stricter Hermes process-policy ceiling; that is not an Archon `timeout`
@@ -185,16 +183,16 @@ Node `idle_timeout` follows the same profile boundary: its current
 `hermes-legacy` runtime value remains seconds and emits
 `legacy_idle_timeout_seconds`. The `archon-2026-07` field blocks with
 `archon_idle_timeout_semantics_unavailable` until Phase 3 provides the reviewed
-millisecond normalization. Phase 1 does not reinterpret the authored value.
+millisecond normalization. Phase 2 does not reinterpret the authored value.
 
 ### Command and prompt fields
 
-| Field | Shape and present meaning | Phase 1 status |
+| Field | Shape and present meaning | Current status |
 | --- | --- | --- |
 | `persist_session` | Boolean node override for profile-scoped session persistence. | Mapped; fresh context wins |
 | `provider` | Nonempty provider profile override. | Mapped; doctor checks authorization and availability |
 | `model` | Nonempty model override. | Mapped; doctor checks authorization and availability |
-| `output_format` | JSON Schema object. Legacy validates generated output after execution; Phase 1 does not provide the Archon generation/enforcement contract. | Legacy-only; blocked pending Phase 2 (`archon_output_format_unavailable`) |
+| `output_format` | Bounded, self-contained JSON Schema Draft 2020-12 object. Archon seals a provider strategy before execution and retains one canonical JSON value. Legacy keeps post-execution validation. | Enforced for Archon; legacy behavior frozen |
 | `allowed_tools` | Array of nonempty aliases/names; an empty array means no built-in tools. | Mapped and enforced after alias resolution |
 | `denied_tools` | Array of nonempty aliases/names; deny is applied after allow. | Mapped and enforced after alias resolution |
 | `hooks` | Hook event object documented below. | Mapped per event; doctor blocks events without an equivalent |
@@ -203,7 +201,7 @@ millisecond normalization. Phase 1 does not reinterpret the authored value.
 | `agents` | Mapping from portable agent ID to the inline-agent shape below. | Mapped to bounded `workflow_agent` children |
 | `effort` | `low`, `medium`, `high`, or `max`. | Mapped; provider capability applies |
 | `thinking` | `adaptive`, `disabled`, or enabled object with positive `budgetTokens`. | Mapped; provider capability applies |
-| `maxBudgetUsd` | Positive number. Phase 1 cannot guarantee an enforceable portable cost budget. | Legacy-only/provider-conditional; blocked pending Phase 5 (`archon_budget_enforcement_unavailable`) |
+| `maxBudgetUsd` | Positive number. Phase 2 cannot guarantee an enforceable portable cost budget. | Legacy-only/provider-conditional; blocked pending Phase 5 (`archon_budget_enforcement_unavailable`) |
 | `systemPrompt` | Nonempty initial worker system prompt. | Mapped only for a fresh/fingerprint-safe context; changing a shared session blocks |
 | `fallbackModel` | Nonempty fallback identifier. | Mapped; provider capability applies |
 | `betas` | Array of nonempty provider beta names. | Mapped; provider capability applies |
@@ -213,6 +211,124 @@ Published aliases include `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`,
 `WebFetch`, `WebSearch`, `Agent`, and `Task`. Doctor shows the concrete Hermes
 mapping. An unknown capitalized alias or an unavailable mapped tool blocks
 before a model call.
+
+MCP and skills are options on `command` and `prompt`; they are not node kinds.
+The seven node kinds are `command`, `prompt`, `bash`, `script`, `loop`,
+`approval`, and `cancel`. Script execution with `uv` or `bun` is existing
+workflow behavior, not a structured-output node variant.
+
+## Structured output contract
+
+`output_format` is active only under `archon-2026-07`. The schema dialect is
+JSON Schema Draft 2020-12. Schemas must be self-contained: `$defs` is allowed,
+and `$ref` may point only to a JSON Pointer below the same document's `$defs`.
+External, absolute, unresolved, or cyclic references are rejected, as are
+`$dynamicRef`, `$id`, `$anchor`, and `$dynamicAnchor`. Patterns must compile,
+and numeric schema values must be finite.
+
+The loader applies these exact ceilings before a run is admitted:
+
+| Dimension | Maximum |
+| --- | ---: |
+| Canonical schema | 65,536 bytes |
+| Schema nesting depth | 32 |
+| Traversed schema nodes | 4,096 |
+| Object properties across the schema | 1,024 |
+| Local references | 256 |
+| One regex | 1,024 bytes |
+| All regex text | 16,384 bytes |
+| One enum | 1,024 values |
+| Canonical structured output | 500,000 bytes |
+| Invalid response eligible for repair | 256,000 bytes |
+| Repair validation diagnostics | 16,384 bytes |
+| Typed-artifact metadata | 65,536 bytes |
+
+Structured validation uses the optional `jsonschema` dependency. A lean
+installation can run schemaless workflows, but an Archon node with
+`output_format` fails closed before any provider request when the validator is
+missing or unusable. Install it with the Hermes `mcp` or `all` extra, for
+example `python -m pip install 'hermes-agent[mcp]'`, then rerun doctor before
+admission. `workflow validate` remains the static package gate.
+
+### Provider enforcement and repair
+
+Hermes chooses one strategy from the sealed provider/runtime declaration:
+
+- a trusted direct route may use declared native JSON Schema or native JSON
+  mode;
+- an undeclared route inside the complete Hermes agent loop uses bounded prompt
+  adaptation;
+- a custom endpoint, aggregator, or community catalog entry is never promoted
+  to native support by its name or API shape;
+- an explicitly unsupported or delegated runtime fails closed.
+
+The worker resolves its actual route before its first provider request. If it
+cannot honor the admitted strategy, it fails with capability drift rather than
+silently downgrading. Native output is still parsed and validated locally.
+
+Only invalid prompt-adapted output can receive a repair, and at most once. The
+repair is a fresh, one-turn transformation of the bounded response against the
+sealed schema. It receives no original task or history and has no tools, hooks,
+MCP, skills, agents, delegation, fallback, persistent session, or approval,
+secret, or clarification path. Outward-acting nodes, uncertain side effects,
+cancellation, or exhausted provider, model, or wall budgets make repair
+ineligible. Native validation misses fail without repair.
+
+### Canonical JSON and field references
+
+The authoritative response is one complete JSON value. Markdown fences,
+surrounding prose, multiple values, non-finite numbers, and trailing non-space
+content are invalid. Hermes serializes accepted output as UTF-8 with keys
+sorted by Unicode code-point order, compact separators, preserved JSON
+booleans and null, no trailing newline, and a 500,000-byte ceiling. That same
+canonical value and SHA-256 feed downstream references, evidence, publication,
+and preview.
+
+A direct `$node.output.field` reference is rejected during validation only when
+every applicable schema branch proves the field cannot exist. Open objects,
+optional declared fields, unions that permit the field, and schemaless outputs
+remain runtime decisions. Phase 2 does not add Phase 3's strict missing-output,
+missing-reference, or missing-field behavior.
+
+## Typed artifact publication
+
+For a successful Archon `command`, `prompt`, `bash`, `script`, `loop`, or
+`approval` node with `output_type`, Hermes publishes the winning attempt's
+primary output. `output_type` is an open, case-sensitive semantic label; it
+does not select a serializer, filename, or extension. Empty successful text is
+a valid zero-byte publication.
+
+The canonical bundle uses an opaque publication ID and contains:
+
+| Output | Content file | Media type |
+| --- | --- | --- |
+| Structured JSON | `content.json` | `application/json` |
+| Other UTF-8 output | `content.md` | `text/markdown; charset=utf-8` |
+
+`metadata.json` records the content digest, size, semantic output type,
+producer, winning attempt, run, profile, publication ID, production time,
+canonicalization version, optional schema fingerprint, and optional session
+identity. Evidence contains this bounded metadata, never the artifact body.
+
+Completion verifies the active claim and attempt before filesystem mutation,
+stages both files on the run filesystem, flushes them and the staging
+directory, atomically installs the complete directory without replacement,
+flushes its parent, appends and flushes the journal event, and then replaces
+the `run.json` projection. A stale or losing attempt is neither published nor
+journaled.
+
+Recovery follows the journal: incomplete staging and unjournaled final bundles
+are removed; a journaled bundle missing only from `run.json` returns during
+projection rebuild. Missing or corrupt content is reconstructed only from the
+corroborated winning attempt with the recorded digest. Otherwise the run enters
+an explicit typed-artifact integrity or reconciliation state rather than
+guessing from timestamps or directory order.
+
+Authenticated read APIs accept only the run ID and opaque publication ID. They
+verify profile and run ownership, containment, regular files, recorded size,
+and digest. Preview is bounded to 64 KiB: JSON is returned only when its
+complete canonical body fits, while UTF-8 text may be truncated. Downloads
+stream the verified original with a safe attachment name.
 
 ### Loop, approval, and inline-agent objects
 
@@ -239,9 +355,9 @@ before a model call.
 ### Retry object
 
 The generated inventory exposes the nested shape, but the enclosing `retry`
-field is blocked for `archon-2026-07` throughout Phase 1.
+field is blocked for `archon-2026-07` throughout Phase 2.
 
-| Field | Legacy shape and units | Phase 1 status |
+| Field | Legacy shape and units | Current status |
 | --- | --- | --- |
 | `max_attempts` | Integer 1–5 counting total workflow/provider attempts, not retries after the first attempt. | Legacy-only warning `legacy_retry_total_attempts`; Archon retry blocked pending Phase 3 |
 | `delay_ms` | Integer 1,000–60,000 milliseconds. | Legacy-only while the Archon retry object is blocked |
@@ -255,14 +371,14 @@ ceiling and can tighten package policy now. It is not Archon retry semantics.
 All published event keys are structurally recognized so doctor can issue an
 exact finding. Recognition does not imply a runtime mapping.
 
-| Hook event | Phase 1 status |
+| Hook event | Current status |
 | --- | --- |
 | `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | Mapped to isolated worker tool lifecycle |
 | `SubagentStart`, `SubagentStop`, `TaskCompleted` | Mapped to declared `workflow_agent` child lifecycle |
 | `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Setup`, `InstructionsLoaded` | Mapped to isolated worker/session lifecycle |
 | `PermissionRequest` | Mapped to Hermes permission/approval policy; hardline policy remains authoritative |
 | `Elicitation`, `ElicitationResult` | Mapped only when MCP support is available |
-| `Notification`, `Stop`, `PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove` | Blocked by doctor: no equivalent Phase 1 node-worker contract |
+| `Notification`, `Stop`, `PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove` | Blocked by doctor: no equivalent node-worker contract |
 
 Each event value is a nonempty array of hook entries:
 
@@ -387,7 +503,51 @@ outward_action_nodes: []
 ```
 
 This package has no invocation input. It deliberately omits node `timeout` and
-`retry`, which are blocked under the Archon profile in Phase 1.
+`retry`, which are blocked under the Archon profile in Phase 2.
+
+### Structured output and downstream field package
+
+`workflows/report.yaml`:
+
+```yaml
+name: structured-report
+description: Produce one validated report and pass its status downstream
+nodes:
+  - id: summarize
+    prompt: Return the report status and issue count as JSON.
+    output_type: OpsReport/V1
+    output_format:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [status, issue_count]
+      properties:
+        status:
+          type: string
+          enum: [ready, blocked]
+        issue_count:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+  - id: announce
+    depends_on: [summarize]
+    bash: 'printf "status=%s\n" "$summarize.output.status"'
+```
+
+`workflows/report.hermes.yaml`:
+
+```yaml
+language_compatibility: archon-2026-07
+overlap_policy: queue
+execution_environment: trusted_local
+outward_action_nodes: []
+```
+
+The producer's response is validated and canonicalized before `announce`
+resolves the `status` field. `OpsReport/V1` remains exactly case-sensitive; it
+creates one backend-confirmed typed publication for the winning `summarize`
+attempt. It does not create a file named after the output type. Inspect or
+download it from the run's artifact evidence in Desktop.
 
 ### Immutable-input package
 
@@ -448,19 +608,22 @@ Archon node `timeout` field.
    backends) and run `workflow validate`.
 2. Run `workflow doctor --compat-report --json` and review every stable legacy
    warning and environment mapping.
-3. Convert units or semantics only when a later generated contract no longer
+3. Convert units or semantics only when the generated contract no longer
    blocks them. An enforcement-phase number alone is not evidence of
-   availability. In Phase 1, do not convert `output_format`, `output_type`,
-   `idle_timeout`, `timeout`, `retry`, `maxBudgetUsd`, or `sandbox` into Archon
-   claims.
+   availability. Phase 2 enables Archon `output_format` and `output_type`; it
+   does not enable the deferred fields listed below.
 4. Remove any blocker, then declare
    `language_compatibility: archon-2026-07` in the companion.
 5. Rerun validate and doctor. Review and trust the new exact digest before a
    run.
 
-Phase 1 explicitly blocks structured `output_format`, published `output_type`,
-Archon idle-timeout/timeout and retry meanings, enforceable portable budget,
-and sandbox portability. It does not execute Phase 2+ semantics early.
+Phase 2 keeps these later contracts out of scope: new timeout units or
+defaults; retry counts or error classes; strict missing-output, reference, or
+field behavior; condition coercion or precedence; large Bash-value spill and
+quoting; missing persistent-session recovery; `maxBudgetUsd` portability; new
+node kinds; `include`; and `loop_group`. Portable sandbox and budget guarantees
+also remain blocked by their generated compatibility codes. Do not infer any
+of these behaviors from structured output or typed publication.
 
 The legacy global `create-workflow` skill is not an authoring authority for
 Hermes. OTTO V1 `steps`, `produces`, `context_from`, `verify`, and `iterate`

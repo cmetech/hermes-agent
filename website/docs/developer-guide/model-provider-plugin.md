@@ -101,6 +101,7 @@ Full definition in `providers/base.py`. The most useful ones:
 | `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
 | `supports_unauthenticated` | bool | Permits use of a non-secret SDK placeholder when no credential is stored; does not prove the endpoint is reachable or no-auth |
 | `model_capabilities_path` | str | Provider-relative verified-capability endpoint; empty keeps legacy selection behavior |
+| `structured_output_strategy` | `str \| None` | Provider-owned structured-output declaration. Leave unset for bounded prompt adaptation; declare a native mode only with direct transport proof; use `unsupported` to forbid adaptation. |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`) |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
@@ -203,6 +204,61 @@ tools, vision, or reasoning.
 Providers that omit `model_capabilities_path` retain legacy behavior. Their
 existing catalogs, fallbacks, and picker eligibility are not subjected to the
 verified Gateway selection policy.
+
+## Declaring structured output truthfully
+
+Archon workflows can request a bounded Draft 2020-12 `output_format`. Hermes
+selects the enforcement strategy centrally from the resolved runtime; a model
+name, API-mode string, successful past request, or community capability record
+is not sufficient evidence of native support.
+
+Leave `structured_output_strategy=None` unless you own transport-level proof.
+When the request remains inside Hermes' complete agent loop, an undeclared
+runtime uses the bounded `prompt_json_schema` adapter and Hermes validates the
+result. Use an explicit declaration only for one of these contracts:
+
+| Declaration | Contract you must prove |
+| --- | --- |
+| `native_json_schema` | The direct transport grammar-constrains the supplied schema, and its wire shape is covered by transport tests. |
+| `native_json_mode` | The direct transport guarantees JSON syntax; Hermes still validates the portable schema. |
+| `unsupported` | The runtime cannot safely constrain and validate output; do not use prompt adaptation. |
+
+For a route the central runtime already classifies as trusted direct, declare
+the strategy after the transport test proves the contract:
+
+```python
+direct_profile = ProviderProfile(
+    name="direct-provider",
+    base_url="https://api.example.com/v1",
+    structured_output_strategy="native_json_schema",
+)
+```
+
+Do not copy this declaration into an untested provider merely because its API
+is OpenAI-compatible. The declaration does not itself make a new or custom URL
+a trusted-direct route; absent that independent runtime classification, Hermes
+uses prompt adaptation.
+
+Native declarations are honored only on a trusted direct provider route.
+Custom base URLs and aggregator routes fall back to prompt adaptation even if
+they reuse an API mode or hostname pattern associated with a native transport.
+Community model metadata can narrow or describe a route, but cannot promote it
+to native support. Do not advertise native support for ChatGPT subscription or
+OAuth routes from support observed on the direct OpenAI API-key route; those
+are separate runtime authorities.
+
+The prospective decision is sealed when a workflow is admitted. Immediately
+before its first provider request, the isolated worker resolves the actual
+credential, provider, URL, and API mode again. A mismatch that cannot honor the
+sealed strategy fails with `structured_output_capability_drift`; it never
+silently downgrades from native enforcement to prompt adaptation.
+
+For a native declaration, add tests that exercise the real adapter boundary
+and assert the exact schema field sent on the wire. Also cover custom and
+aggregator URLs, an undeclared managed-loop route, explicit unsupported mode,
+and admission/runtime drift before any provider call. Native responses still
+undergo local parse, schema validation, and canonicalization, so transport
+grammar is not a substitute for the optional validator.
 
 ## User overrides — replace a built-in without editing the repo
 
