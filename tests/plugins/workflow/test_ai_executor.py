@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import os
 from dataclasses import replace
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -163,6 +165,18 @@ def _safe_output_component(kind: str, value: str) -> str:
     return f"{kind}-{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
+def _make_jsonschema_unavailable(monkeypatch) -> None:
+    original_import = builtins.__import__
+
+    def missing_jsonschema(name: str, *args: object, **kwargs: object) -> object:
+        if name == "jsonschema":
+            raise ModuleNotFoundError("No module named 'jsonschema'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "jsonschema", raising=False)
+    monkeypatch.setattr(builtins, "__import__", missing_jsonschema)
+
+
 def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path):
     runner = FakeAgentRunner('{"answer":"ok","count":2}')
     node = _node(
@@ -192,6 +206,73 @@ def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path)
     assert result.metadata["cache_fingerprint"]
     output = tmp_path / "run" / result.artifacts[0].relative_path
     assert output.read_text() == '{"answer":"ok","count":2}'
+
+
+def test_archon_structured_output_requires_validator_before_provider_execution(
+    tmp_path, monkeypatch
+):
+    runner = FakeAgentRunner('{"answer":"ready"}')
+    node = _node(
+        "validator-preflight",
+        "Produce data",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+    _make_jsonschema_unavailable(monkeypatch)
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_unavailable"
+    assert (
+        result.error_message
+        == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+    assert runner.requests == []
+    assert result.metadata["provider_attempts"] == 0
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.primary_output is None
+    assert not result.artifacts
+
+
+def test_archon_schemaless_output_does_not_require_validator(tmp_path, monkeypatch):
+    runner = FakeAgentRunner("plain response")
+    node = _node("schemaless", "Produce prose")
+    _make_jsonschema_unavailable(monkeypatch)
+
+    result = AgentNodeExecutor(runner).execute(_archon_text_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert len(runner.requests) == 1
+    assert result.primary_output is not None
+    assert result.primary_output.media_type == "text/plain"
+
+
+def test_legacy_structured_output_keeps_post_provider_validator_check(
+    tmp_path, monkeypatch
+):
+    runner = FakeAgentRunner('{"answer":"ready"}')
+    node = _node(
+        "legacy-post-provider",
+        "Produce data",
+        output_format={"type": "object", "required": ["answer"]},
+    )
+    _make_jsonschema_unavailable(monkeypatch)
+
+    result = AgentNodeExecutor(runner).execute(_context(tmp_path, node))
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_unavailable"
+    assert (
+        result.error_message
+        == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+    assert len(runner.requests) == 1
+    assert result.primary_output is None
+    assert not result.artifacts
 
 
 @pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])

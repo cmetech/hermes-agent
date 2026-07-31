@@ -17,6 +17,7 @@ from agent.structured_output import (
     StructuredOutputValidatorUnavailable,
     normalize_schema,
     parse_validate_canonicalize,
+    require_structured_output_validator,
 )
 from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.entitlement import (
@@ -683,6 +684,19 @@ class AgentNodeExecutor:
                 error_message=str(exc),
                 metadata={"archon_terminal_failure": True},
             )
+        if structured_request is not None:
+            try:
+                require_structured_output_validator()
+            except StructuredOutputValidatorUnavailable as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_unavailable",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "archon_terminal_failure": True,
+                    },
+                )
         fingerprint = self._fingerprint(context)
         explicit_context = node.options.get("context")
         context_mode = "fresh"
@@ -1179,11 +1193,11 @@ class AgentNodeExecutor:
             except json.JSONDecodeError as exc:
                 return self._failure("structured_output_invalid", str(exc))
             try:
-                import jsonschema
-            except ImportError:
+                jsonschema = require_structured_output_validator()
+            except StructuredOutputValidatorUnavailable as exc:
                 return self._failure(
                     "structured_output_unavailable",
-                    "jsonschema is required; install the Hermes mcp or all extra",
+                    str(exc),
                 )
             try:
                 jsonschema.validate(value, _thaw(schema))

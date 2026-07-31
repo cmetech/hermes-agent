@@ -30,20 +30,16 @@ def _schema_with_description(byte_count: int) -> dict[str, object]:
 
 
 def test_normalize_schema_canonicalizes_equivalent_draft_2020_12_schemas() -> None:
-    first = normalize_schema(
-        {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}, "count": {"type": "integer"}},
-            "required": ["answer"],
-        }
-    )
-    second = normalize_schema(
-        {
-            "required": ["answer"],
-            "properties": {"count": {"type": "integer"}, "answer": {"type": "string"}},
-            "type": "object",
-        }
-    )
+    first = normalize_schema({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}, "count": {"type": "integer"}},
+        "required": ["answer"],
+    })
+    second = normalize_schema({
+        "required": ["answer"],
+        "properties": {"count": {"type": "integer"}, "answer": {"type": "string"}},
+        "type": "object",
+    })
 
     assert first.dialect == DRAFT_2020_12
     assert first.canonical_schema["$schema"] == DRAFT_2020_12
@@ -52,12 +48,10 @@ def test_normalize_schema_canonicalizes_equivalent_draft_2020_12_schemas() -> No
 
 
 def test_normalize_schema_returns_a_deeply_immutable_value_object() -> None:
-    schema = normalize_schema(
-        {
-            "type": "object",
-            "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
-        }
-    )
+    schema = normalize_schema({
+        "type": "object",
+        "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
+    })
 
     assert isinstance(schema, StructuredOutputSchema)
     assert isinstance(schema.canonical_schema, Mapping)
@@ -72,9 +66,9 @@ def test_normalize_schema_returns_a_deeply_immutable_value_object() -> None:
 def test_normalize_schema_accepts_exactly_65536_canonical_schema_bytes() -> None:
     empty = _schema_with_description(0)
     fixed_bytes = len(
-        json.dumps(empty, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(
+            empty, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     )
     schema = normalize_schema(_schema_with_description(65_536 - fixed_bytes))
 
@@ -84,9 +78,9 @@ def test_normalize_schema_accepts_exactly_65536_canonical_schema_bytes() -> None
 def test_normalize_schema_rejects_more_than_65536_canonical_schema_bytes() -> None:
     empty = _schema_with_description(0)
     fixed_bytes = len(
-        json.dumps(empty, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(
+            empty, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     )
 
     with pytest.raises(StructuredOutputError, match="schema.*bytes"):
@@ -209,7 +203,10 @@ def test_normalize_schema_rejects_booleans_for_integer_bounds(keyword: str) -> N
     [
         {"$ref": "https://example.test/schema"},
         {"$ref": "#/$defs/missing", "$defs": {}},
-        {"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"},
+        {
+            "$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}},
+            "$ref": "#/$defs/a",
+        },
         {"$dynamicRef": "#/$defs/value", "$defs": {"value": {"type": "string"}}},
         {"$id": "https://example.test/schema", "type": "string"},
         {"$anchor": "value", "type": "string"},
@@ -253,18 +250,18 @@ def test_parse_validate_canonicalize_rejects_outputs_over_500000_bytes() -> None
     request = _request({"type": "string"})
 
     with pytest.raises(StructuredOutputError, match="output.*bytes"):
-        structured_output.parse_validate_canonicalize('"' + "x" * 500_001 + '"', request)
+        structured_output.parse_validate_canonicalize(
+            '"' + "x" * 500_001 + '"', request
+        )
 
 
 def test_parse_validate_canonicalize_validates_then_canonicalizes_response() -> None:
-    request = _request(
-        {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}, "count": {"type": "integer"}},
-            "required": ["answer", "count"],
-            "additionalProperties": False,
-        }
-    )
+    request = _request({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}, "count": {"type": "integer"}},
+        "required": ["answer", "count"],
+        "additionalProperties": False,
+    })
 
     value = structured_output.parse_validate_canonicalize(
         ' \n {"count":1,"answer":"é"}\t', request
@@ -290,12 +287,16 @@ def test_parse_validate_canonicalize_omits_invalid_response_from_diagnostics() -
     request = _request({"type": "integer"})
 
     with pytest.raises(StructuredOutputError) as exc_info:
-        structured_output.parse_validate_canonicalize(json.dumps(response_token), request)
+        structured_output.parse_validate_canonicalize(
+            json.dumps(response_token), request
+        )
 
     assert response_token not in str(exc_info.value)
 
 
-def test_parse_validate_canonicalize_omits_invalid_response_key_from_diagnostics() -> None:
+def test_parse_validate_canonicalize_omits_invalid_response_key_from_diagnostics() -> (
+    None
+):
     response_token = "private-response-token"
     request = _request({"patternProperties": {".*": {"type": "integer"}}})
 
@@ -327,5 +328,17 @@ def test_validator_is_required_only_when_validation_is_requested(monkeypatch) ->
     monkeypatch.setattr(builtins, "__import__", missing_jsonschema)
 
     assert normalize_schema({"type": "object"}).dialect == DRAFT_2020_12
-    with pytest.raises(structured_output.StructuredOutputValidatorUnavailable):
+    validator_requirement = getattr(
+        structured_output, "require_structured_output_validator", None
+    )
+    assert callable(validator_requirement)
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
+        validator_requirement()
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
         structured_output.parse_validate_canonicalize("{}", request)

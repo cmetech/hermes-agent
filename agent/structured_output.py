@@ -31,44 +31,38 @@ MAX_ENUM_VALUES = 1_024
 MAX_OUTPUT_BYTES = 500_000
 MAX_VALIDATION_DIAGNOSTIC_BYTES = 16_384
 
-_INTEGER_BOUND_KEYWORDS = frozenset(
-    {
-        "maxContains",
-        "maxItems",
-        "maxLength",
-        "maxProperties",
-        "minContains",
-        "minItems",
-        "minLength",
-        "minProperties",
-    }
-)
+_INTEGER_BOUND_KEYWORDS = frozenset({
+    "maxContains",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "minContains",
+    "minItems",
+    "minLength",
+    "minProperties",
+})
 _SCOPE_CHANGING_KEYWORDS = frozenset({"$anchor", "$dynamicAnchor", "$id"})
-_SCHEMA_VALUE_KEYWORDS = frozenset(
-    {
-        "additionalItems",
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    }
-)
-_SCHEMA_MAP_KEYWORDS = frozenset(
-    {
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-        "patternProperties",
-        "properties",
-    }
-)
+_SCHEMA_VALUE_KEYWORDS = frozenset({
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+})
+_SCHEMA_MAP_KEYWORDS = frozenset({
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+})
 _SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
 _GENERIC_CONTEXT = "generic"
 _SCHEMA_CONTEXT = "schema"
@@ -99,7 +93,9 @@ class StructuredOutputSchema:
     dialect: str = DRAFT_2020_12_DIALECT
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "canonical_schema", _freeze_json(self.canonical_schema))
+        object.__setattr__(
+            self, "canonical_schema", _freeze_json(self.canonical_schema)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +199,9 @@ def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
             for index, value in enumerate(current):
                 child_path = path + (index,)
                 child_context = (
-                    _SCHEMA_CONTEXT if context == _SCHEMA_ARRAY_CONTEXT else _GENERIC_CONTEXT
+                    _SCHEMA_CONTEXT
+                    if context == _SCHEMA_ARRAY_CONTEXT
+                    else _GENERIC_CONTEXT
                 )
                 copied.append(
                     _copy_schema_value(value, stack, depth, child_path, child_context)
@@ -294,7 +292,10 @@ def _validate_regex(value: object, total_bytes: int) -> int:
     if not isinstance(value, str):
         raise StructuredOutputError("schema regex must be a string")
     value_bytes = len(value.encode("utf-8"))
-    if value_bytes > MAX_REGEX_BYTES or total_bytes + value_bytes > MAX_TOTAL_REGEX_BYTES:
+    if (
+        value_bytes > MAX_REGEX_BYTES
+        or total_bytes + value_bytes > MAX_TOTAL_REGEX_BYTES
+    ):
         raise StructuredOutputError("schema exceeds regex bytes limit")
     try:
         re.compile(value)
@@ -316,16 +317,24 @@ def _validate_local_refs(
     _reject_cyclic_definitions(edges)
 
 
-def _resolve_local_definition(root: Mapping[str, object], reference: str) -> tuple[str, ...]:
+def _resolve_local_definition(
+    root: Mapping[str, object], reference: str
+) -> tuple[str, ...]:
     if not reference.startswith("#/$defs/"):
-        raise StructuredOutputError("schema references must be local JSON Pointers below $defs")
+        raise StructuredOutputError(
+            "schema references must be local JSON Pointers below $defs"
+        )
     encoded_segments = reference[len("#/") :].split("/")
     segments = tuple(_decode_pointer_segment(segment) for segment in encoded_segments)
     current: object = root
     for segment in segments:
         if isinstance(current, Mapping) and segment in current:
             current = current[segment]
-        elif isinstance(current, list) and segment.isdigit() and int(segment) < len(current):
+        elif (
+            isinstance(current, list)
+            and segment.isdigit()
+            and int(segment) < len(current)
+        ):
             current = current[int(segment)]
         else:
             raise StructuredOutputError("schema contains an unresolved local ref")
@@ -367,10 +376,23 @@ def _reject_cyclic_definitions(edges: Mapping[str, set[str]]) -> None:
 
 def _freeze_json(value: object) -> object:
     if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+        return MappingProxyType({
+            key: _freeze_json(item) for key, item in value.items()
+        })
     if isinstance(value, list) or isinstance(value, tuple):
         return tuple(_freeze_json(item) for item in value)
     return value
+
+
+def require_structured_output_validator() -> Any:
+    """Return the optional validator module or fail with install guidance."""
+    try:
+        import jsonschema
+    except ImportError as exc:
+        raise StructuredOutputValidatorUnavailable(
+            "jsonschema is required; install the Hermes mcp or all extra"
+        ) from exc
+    return jsonschema
 
 
 def parse_validate_canonicalize(
@@ -396,23 +418,19 @@ def parse_validate_canonicalize(
     while start < len(response) and response[start] in " \t\r\n":
         start += 1
     try:
-        value, end = json.JSONDecoder(parse_constant=_reject_nonfinite_constant).raw_decode(
-            response, start
-        )
+        value, end = json.JSONDecoder(
+            parse_constant=_reject_nonfinite_constant
+        ).raw_decode(response, start)
     except (json.JSONDecodeError, ValueError) as exc:
         raise StructuredOutputError("response is not one complete JSON value") from exc
     if response[end:].strip(" \t\r\n"):
         raise StructuredOutputError("response contains trailing non-JSON content")
     _reject_nonfinite_value(value)
 
-    try:
-        from jsonschema import Draft202012Validator
-    except ImportError as exc:
-        raise StructuredOutputValidatorUnavailable(
-            "jsonschema is required; install the Hermes mcp or all extra"
-        ) from exc
-
-    validator = Draft202012Validator(_thaw_json(request.schema.canonical_schema))
+    jsonschema = require_structured_output_validator()
+    validator = jsonschema.Draft202012Validator(
+        _thaw_json(request.schema.canonical_schema)
+    )
     errors = list(validator.iter_errors(value))
     if errors:
         raise StructuredOutputError(validation_summary(errors))
@@ -438,7 +456,11 @@ def validation_summary(
     errors: Iterable[object], *, limit_bytes: int = MAX_VALIDATION_DIAGNOSTIC_BYTES
 ) -> str:
     """Return a deterministic, UTF-8-bounded validator diagnostic."""
-    if isinstance(limit_bytes, bool) or not isinstance(limit_bytes, int) or limit_bytes <= 0:
+    if (
+        isinstance(limit_bytes, bool)
+        or not isinstance(limit_bytes, int)
+        or limit_bytes <= 0
+    ):
         raise ValueError("validation diagnostic byte limit must be a positive integer")
     messages = []
     for error in errors:
@@ -511,5 +533,6 @@ __all__ = [
     "StructuredOutputValue",
     "normalize_schema",
     "parse_validate_canonicalize",
+    "require_structured_output_validator",
     "validation_summary",
 ]

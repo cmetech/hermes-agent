@@ -284,36 +284,173 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     installed_env = os.environ.copy()
     installed_env["HERMES_HOME"] = str(installed_home)
     installed_env.pop("PYTHONPATH", None)
+    installed_probe = probe_root / "installed_probe.py"
+    installed_probe.write_text(
+        """
+from __future__ import annotations
+
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
+import plugins.workflow
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.cli import doctor_package
+from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    execution_capability_context,
+)
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.store import RunStore
+
+
+class RecordingRunner:
+    def __init__(self, *, declaration_source: str, api_mode: str) -> None:
+        self.calls = 0
+        self.declaration_source = declaration_source
+        self.api_mode = api_mode
+        self.structured_request_bound = False
+
+    def run(self, request, **_kwargs):
+        self.calls += 1
+        structured = request.structured_output
+        self.structured_request_bound = structured is not None
+        assert structured is not None
+        evidence = {
+            "provider_attempts": 1,
+            "model_calls": 1,
+            "strategy": structured.strategy.value,
+            "adapter_version": structured.adapter_version,
+            "schema_fingerprint": structured.schema.schema_fingerprint,
+            "declaration_source": self.declaration_source,
+        }
+        return PluginAgentRunResult(
+            final_response=' { "answer": "ready" }\\n',
+            session_id=f"installed-{self.calls}",
+            provider=request.provider or "installed-provider",
+            model=request.model or "installed-model",
+            status="completed",
+            pending_interaction=None,
+            usage={"input_tokens": 1, "output_tokens": 1},
+            audit={**evidence, "api_calls": 1, "api_mode": self.api_mode},
+            structured_output=evidence,
+        )
+
+
+def admit_and_advance(package, store, *, idempotency_key: str):
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="installed-provider",
+            model="installed-model",
+        ),
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=idempotency_key,
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    decision = execution_context.structured_output_decisions(package)["producer"]
+    runner = RecordingRunner(
+        declaration_source=decision.declaration_source,
+        api_mode=decision.api_mode,
+    )
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    return result, runner, store.run_directory(admitted.run_id)
+
+
+stage, schemaless_path, structured_path, installed_home = sys.argv[1:]
+store = RunStore(installed_home)
+structured = load_workflow(structured_path)
+report = doctor_package(structured, hermes_home=installed_home)
+payload = {
+    "validator_present": importlib.util.find_spec("jsonschema") is not None,
+    "workflow_module": str(Path(plugins.workflow.__file__).resolve()),
+}
+
+if stage == "pre":
+    plain = load_workflow(schemaless_path)
+    snapshot = store.prepare_run_snapshot(plain)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=plain.definition.name,
+            definition_digest=snapshot.definition_digest,
+            policy_digest=snapshot.policy_digest,
+            input_manifest_digest=snapshot.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="lean",
+            concurrency_key=plain.definition.name,
+        ),
+        immutable_snapshot=snapshot,
+    )
+    payload["schemaless_status"] = RunScheduler(store).advance(
+        admitted.run_id
+    )["status"]
+    result, runner, _run_directory = admit_and_advance(
+        structured, store, idempotency_key="structured-pre"
+    )
+    attempt = result["nodes"]["producer"]["attempts"][-1]
+    payload.update({
+        "structured_status": result["status"],
+        "structured_failure": attempt["error_message"],
+        "provider_calls": runner.calls,
+    })
+else:
+    result, runner, run_directory = admit_and_advance(
+        structured, store, idempotency_key="structured-post"
+    )
+    attempt = result["nodes"]["producer"]["attempts"][-1]
+    candidate = attempt["metadata"]["primary_output_candidate"]
+    canonical = (run_directory / candidate["attempt_relative_path"]).read_bytes()
+    requirements = importlib.metadata.requires("hermes-agent") or ()
+    payload.update({
+        "mcp_extra_declared": any(
+            item.startswith("mcp==") and 'extra == "mcp"' in item
+            for item in requirements
+        ),
+        "runnable": report.runnable,
+        "blocking_codes": [item.code for item in report.findings if item.blocking],
+        "structured_nodes": sorted(structured.language.structured_outputs),
+        "structured_status": result["status"],
+        "provider_calls": runner.calls,
+        "structured_request_bound": runner.structured_request_bound,
+        "canonical_output": canonical.decode("utf-8"),
+        "canonical_sha256": hashlib.sha256(canonical).hexdigest(),
+    })
+
+print(json.dumps(payload))
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
     lean_probe = subprocess.run(
         [
             str(installed_python),
-            "-c",
-            (
-                "import importlib.util,json; "
-                "from plugins.workflow.admission import RunAdmissionRequest; "
-                "from plugins.workflow.cli import doctor_package; "
-                "from plugins.workflow.schema import load_workflow; "
-                "from plugins.workflow.scheduler import RunScheduler; "
-                "from plugins.workflow.store import RunStore; "
-                f"plain=load_workflow({str(schemaless_path)!r}); "
-                f"store=RunStore({str(installed_home)!r}); "
-                "snap=store.prepare_run_snapshot(plain); "
-                "run=store.start_run(RunAdmissionRequest("
-                "workflow_name=plain.definition.name,"
-                "definition_digest=snap.definition_digest,"
-                "policy_digest=snap.policy_digest,"
-                "input_manifest_digest=snap.input_manifest_digest,"
-                "trigger_source='cli',idempotency_key='lean',"
-                "concurrency_key=plain.definition.name),immutable_snapshot=snap); "
-                "status=RunScheduler(store).advance(run.run_id)['status']; "
-                f"structured=load_workflow({str(structured_path)!r}); "
-                f"report=doctor_package(structured,hermes_home={str(installed_home)!r}); "
-                "failure=next(item.message for item in report.findings "
-                "if item.code=='structured_output_unavailable'); provider_calls=0; "
-                "print(json.dumps({'schemaless_status':status,"
-                "'validator_present':importlib.util.find_spec('jsonschema') is not None,"
-                "'structured_failure':failure,'provider_calls':provider_calls}))"
-            ),
+            str(installed_probe),
+            "pre",
+            str(schemaless_path),
+            str(structured_path),
+            str(installed_home),
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -323,9 +460,13 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     )
     assert lean_probe.returncode == 0, lean_probe.stderr
     lean_result = json.loads(lean_probe.stdout)
+    assert Path(lean_result.pop("workflow_module")).is_relative_to(
+        installed_venv.resolve()
+    )
     assert lean_result == {
         "schemaless_status": "succeeded",
         "validator_present": False,
+        "structured_status": "failed",
         "structured_failure": (
             "jsonschema is required; install the Hermes mcp or all extra"
         ),
@@ -350,23 +491,11 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     extra_probe = subprocess.run(
         [
             str(installed_python),
-            "-c",
-            (
-                "import importlib.metadata,importlib.util,json; "
-                "from plugins.workflow.cli import doctor_package; "
-                "from plugins.workflow.schema import load_workflow; "
-                f"package=load_workflow({str(structured_path)!r}); "
-                f"report=doctor_package(package,hermes_home={str(installed_home)!r}); "
-                "declared=any('extra == \"mcp\"' in item and "
-                "item.startswith('mcp==') for item in "
-                "importlib.metadata.requires('hermes-agent')); "
-                "print(json.dumps({'validator_present':"
-                "importlib.util.find_spec('jsonschema') is not None,"
-                "'mcp_extra_declared':declared,'runnable':report.runnable,"
-                "'blocking_codes':[item.code for item in report.findings "
-                "if item.blocking],"
-                "'structured_nodes':sorted(package.language.structured_outputs)}))"
-            ),
+            str(installed_probe),
+            "post",
+            str(schemaless_path),
+            str(structured_path),
+            str(installed_home),
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -375,10 +504,19 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
         timeout=180,
     )
     assert extra_probe.returncode == 0, extra_probe.stderr
-    assert json.loads(extra_probe.stdout) == {
+    extra_result = json.loads(extra_probe.stdout)
+    assert Path(extra_result.pop("workflow_module")).is_relative_to(
+        installed_venv.resolve()
+    )
+    assert extra_result == {
         "validator_present": True,
         "mcp_extra_declared": True,
         "runnable": True,
         "blocking_codes": [],
         "structured_nodes": ["producer"],
+        "structured_status": "succeeded",
+        "provider_calls": 1,
+        "structured_request_bound": True,
+        "canonical_output": '{"answer":"ready"}',
+        "canonical_sha256": hashlib.sha256(b'{"answer":"ready"}').hexdigest(),
     }
