@@ -7,6 +7,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 import sys
+import types
 
 import pytest
 
@@ -177,6 +178,13 @@ def _make_jsonschema_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(builtins, "__import__", missing_jsonschema)
 
 
+def _install_incompatible_jsonschema(monkeypatch) -> None:
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = object()
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+
 def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path):
     runner = FakeAgentRunner('{"answer":"ok","count":2}')
     node = _node(
@@ -236,6 +244,45 @@ def test_archon_structured_output_requires_validator_before_provider_execution(
     assert result.metadata["archon_terminal_failure"] is True
     assert result.primary_output is None
     assert not result.artifacts
+
+
+def test_archon_rejects_importable_incompatible_validator_before_runner(
+    tmp_path, monkeypatch
+):
+    class ProviderTrap:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            raise RuntimeError("provider trap invoked")
+
+    runner = ProviderTrap()
+    node = _node(
+        "incompatible-validator",
+        "Produce data",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+    _install_incompatible_jsonschema(monkeypatch)
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_unavailable"
+    assert (
+        result.error_message
+        == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+    assert runner.requests == []
+    assert result.metadata["provider_attempts"] == 0
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.primary_output is None
+    assert not result.artifacts
+    assert not (tmp_path / "run" / "nodes").exists()
 
 
 def test_archon_schemaless_output_does_not_require_validator(tmp_path, monkeypatch):

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from importlib.machinery import ModuleSpec
 import json
 from pathlib import Path
+import sys
+import types
 
 import yaml
 
@@ -45,9 +48,7 @@ def _package(tmp_path: Path) -> Path:
                         "allowed_tools": ["Read", "UnknownTool"],
                         "skills": ["workflow"],
                         "mcp": "local",
-                        "hooks": {
-                            "PreToolUse": [{"response": {"continue": True}}]
-                        },
+                        "hooks": {"PreToolUse": [{"response": {"continue": True}}]},
                         "agents": {
                             "reviewer": {
                                 "description": "review",
@@ -198,7 +199,10 @@ def test_doctor_json_contract_contains_stable_structured_fields(
         "evidence",
         "notes",
     }
-    assert all({"code", "path", "level", "blocking"} <= item.keys() for item in payload["findings"])
+    assert all(
+        {"code", "path", "level", "blocking"} <= item.keys()
+        for item in payload["findings"]
+    )
 
 
 def test_doctor_matches_runtime_authorization_for_explicit_provider_and_model(
@@ -221,9 +225,7 @@ def test_doctor_matches_runtime_authorization_for_explicit_provider_and_model(
     blocked = doctor_package(package, hermes_home=home)
 
     assert blocked.runnable is False
-    assert {
-        finding.code for finding in blocked.findings if finding.blocking
-    } == {
+    assert {finding.code for finding in blocked.findings if finding.blocking} == {
         "model_override_not_authorized",
         "provider_override_not_authorized",
     }
@@ -281,12 +283,44 @@ def test_doctor_reports_existing_extra_guidance_when_validator_is_missing(
     report = doctor_package(package, hermes_home=tmp_path / "home")
 
     finding = next(
-        item
-        for item in report.findings
-        if item.code == "structured_output_unavailable"
+        (
+            item
+            for item in report.findings
+            if item.code == "structured_output_unavailable"
+        ),
+        None,
     )
+    assert finding is not None
     assert finding.blocking is True
     assert "install the Hermes mcp or all extra" in finding.message
+
+
+def test_doctor_rejects_importable_validator_without_callable_draft(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_structured_package(tmp_path, workflow_writer)
+    partial = types.ModuleType("jsonschema")
+    partial.__spec__ = ModuleSpec("jsonschema", loader=None)
+    partial.Draft202012Validator = object()
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    finding = next(
+        (
+            item
+            for item in report.findings
+            if item.code == "structured_output_unavailable"
+        ),
+        None,
+    )
+    assert finding is not None
+    assert report.runnable is False
+    assert finding.blocking is True
+    assert (
+        finding.message == "jsonschema is required; install the Hermes mcp or all extra"
+    )
 
 
 def test_doctor_schemaless_workflow_does_not_require_validator(

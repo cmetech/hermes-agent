@@ -8,6 +8,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 import sys
+import types
 
 import pytest
 
@@ -342,3 +343,25 @@ def test_validator_is_required_only_when_validation_is_requested(monkeypatch) ->
         match="jsonschema is required; install the Hermes mcp or all extra",
     ):
         structured_output.parse_validate_canonicalize("{}", request)
+
+
+def test_importable_validator_without_callable_draft_is_unavailable(
+    monkeypatch,
+) -> None:
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = object()
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
+        structured_output.require_structured_output_validator()
+
+
+def test_validator_install_guidance_has_one_shared_authority() -> None:
+    assert (
+        getattr(structured_output, "STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE", None)
+        == "jsonschema is required; install the Hermes mcp or all extra"
+    )

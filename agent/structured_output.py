@@ -30,6 +30,9 @@ MAX_TOTAL_REGEX_BYTES = 16_384
 MAX_ENUM_VALUES = 1_024
 MAX_OUTPUT_BYTES = 500_000
 MAX_VALIDATION_DIAGNOSTIC_BYTES = 16_384
+STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE = (
+    "jsonschema is required; install the Hermes mcp or all extra"
+)
 
 _INTEGER_BOUND_KEYWORDS = frozenset({
     "maxContains",
@@ -384,14 +387,28 @@ def _freeze_json(value: object) -> object:
     return value
 
 
-def require_structured_output_validator() -> Any:
-    """Return the optional validator module or fail with install guidance."""
+def require_structured_output_validator(*, legacy: bool = False) -> Any:
+    """Return the required optional validator API or fail with install guidance."""
     try:
         import jsonschema
     except ImportError as exc:
         raise StructuredOutputValidatorUnavailable(
-            "jsonschema is required; install the Hermes mcp or all extra"
+            STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         ) from exc
+    api_name = "validate" if legacy else "Draft202012Validator"
+    validator = getattr(jsonschema, api_name, None)
+    if not callable(validator):
+        raise StructuredOutputValidatorUnavailable(
+            STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
+        )
+    if legacy and any(
+        not isinstance(getattr(jsonschema, name, None), type)
+        or not issubclass(getattr(jsonschema, name), Exception)
+        for name in ("SchemaError", "ValidationError")
+    ):
+        raise StructuredOutputValidatorUnavailable(
+            STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
+        )
     return jsonschema
 
 
@@ -525,6 +542,7 @@ __all__ = [
     "MAX_SCHEMA_PROPERTIES",
     "MAX_TOTAL_REGEX_BYTES",
     "MAX_VALIDATION_DIAGNOSTIC_BYTES",
+    "STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE",
     "StructuredOutputError",
     "StructuredOutputRequest",
     "StructuredOutputSchema",

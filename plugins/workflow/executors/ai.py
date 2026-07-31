@@ -1193,7 +1193,7 @@ class AgentNodeExecutor:
             except json.JSONDecodeError as exc:
                 return self._failure("structured_output_invalid", str(exc))
             try:
-                jsonschema = require_structured_output_validator()
+                jsonschema = require_structured_output_validator(legacy=True)
             except StructuredOutputValidatorUnavailable as exc:
                 return self._failure(
                     "structured_output_unavailable",

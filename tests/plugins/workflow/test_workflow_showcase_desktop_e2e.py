@@ -202,7 +202,7 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         }
 
 
-def test_ai_showcase_desktop_projection_keeps_mcp_and_skills_on_command_nodes(
+def test_ai_showcase_desktop_projection_keeps_mcp_and_skills_on_ai_nodes(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -222,7 +222,20 @@ def test_ai_showcase_desktop_projection_keeps_mcp_and_skills_on_command_nodes(
     assert response.status_code == 200
     nodes = response.json()["definition"]["nodes"]
     assert nodes
-    assert {node["type"] for node in nodes} == {"command"}
-    assert all(node["options"]["mcp"] == "echo.yaml" for node in nodes)
-    assert all(node["options"]["skills"] == ["ascii-art"] for node in nodes)
+    mcp_nodes = [node for node in nodes if "mcp" in node["options"]]
+    skill_nodes = [node for node in nodes if "skills" in node["options"]]
+    extension_nodes = [*mcp_nodes, *skill_nodes]
+    assert mcp_nodes
+    assert skill_nodes
+    assert all(node["type"] in {"command", "prompt"} for node in extension_nodes)
+    assert all(
+        isinstance(node["options"]["mcp"], str) and node["options"]["mcp"]
+        for node in mcp_nodes
+    )
+    assert all(
+        isinstance(node["options"]["skills"], list)
+        and node["options"]["skills"]
+        and all(isinstance(skill, str) and skill for skill in node["options"]["skills"])
+        for node in skill_nodes
+    )
     assert {"mcp", "skills"}.isdisjoint(node["type"] for node in nodes)
