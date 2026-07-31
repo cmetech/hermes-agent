@@ -381,3 +381,78 @@ Result: Ruff and the whitespace check passed.
 - `plugins/workflow/store.py`
 - `tests/plugins/workflow/test_desktop_api.py`
 - `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`
+
+## Quality fix round 3/5
+
+This round closes a regression-coverage gap only; production behavior was
+already correct and no production file changed. The sealed-definition
+`lstat()` preview/download matrix now includes `EINTR`, giving both endpoint
+paths dynamic coverage for all seven portable retryable errno values available
+on this host:
+
+- `EAGAIN`
+- `EINTR`
+- `EIO`
+- `EMFILE`
+- `ENOMEM`
+- `ENFILE`
+- `ESTALE`
+
+The table is also guarded by a completeness test against the authoritative
+`_RETRYABLE_READ_ERRNOS` set. The guard excludes only the set's `-1` sentinel
+used when `ESTALE` is unavailable on a platform. This makes a future production
+taxonomy addition fail the endpoint matrix until matching cases are present.
+Every endpoint case retains the bounded 503 body, no active
+`typed_publication_integrity` marker, and same-endpoint recovery assertions.
+
+### Round 3 TDD evidence
+
+The completeness test was introduced while the endpoint table still contained
+the prior six values:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_desktop_api.py -k retryable_sealed_definition_lstat_matrix_matches_authoritative_set -vv
+```
+
+RED result: 1 file, 0 passed, 1 failed. The assertion reported authoritative
+errno `4` (`EINTR`) as the sole value missing from the matrix. Adding `EINTR`
+to the test table was the only change needed for GREEN; production remained
+unchanged.
+
+Focused taxonomy verification:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_desktop_api.py -k 'artifact_endpoints_preserve_retryable_publication_unavailability or artifact_endpoints_preserve_retryable_sealed_definition_lstat_errors or retryable_sealed_definition_lstat_matrix_matches_authoritative_set' -vv
+```
+
+Fresh result: 1 file, 19 passed, 0 failed. No file retry and no flaky summary
+were emitted. This includes four existing transient read cases, fourteen
+preview/download stat cases across seven errno values, and the completeness
+guard.
+
+### Round 3 verification
+
+Exact Task 10 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 5 files, 262 passed, 0 failed. No file retry and no flaky
+summary were emitted.
+
+Requested ten-file regression matrix:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_coordinator.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py
+```
+
+Fresh result: 10 files, 378 passed, 0 failed, with one platform-specific
+skip. The round 2 baseline contained 375 passing tests; this round adds the two
+`EINTR` endpoint cases and one completeness guard. No file retry and no flaky
+summary were emitted.
+
+### Round 3 files changed
+
+- `tests/plugins/workflow/test_desktop_api.py`
+- `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`

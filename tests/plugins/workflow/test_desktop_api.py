@@ -50,7 +50,10 @@ from plugins.workflow.coordinator_store import (
 )
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.notifications import NotificationOutbox
-from plugins.workflow.output_resolution import ArchonOutputUnavailableError
+from plugins.workflow.output_resolution import (
+    ArchonOutputUnavailableError,
+    _RETRYABLE_READ_ERRNOS,
+)
 from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
@@ -3302,20 +3305,38 @@ def test_artifact_endpoints_preserve_retryable_publication_unavailability(
     assert recovered.status_code == 200
 
 
+_RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS = tuple(
+    (name, getattr(errno, name))
+    for name in (
+        "EAGAIN",
+        "EINTR",
+        "EIO",
+        "EMFILE",
+        "ENOMEM",
+        "ENFILE",
+        "ESTALE",
+    )
+    if hasattr(errno, name)
+)
+
+
+def test_retryable_sealed_definition_lstat_matrix_matches_authoritative_set() -> None:
+    assert {
+        error_number
+        for _name, error_number in _RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS
+    } == {
+        error_number
+        for error_number in _RETRYABLE_READ_ERRNOS
+        if error_number != -1
+    }
+
+
 @pytest.mark.parametrize("endpoint", ["preview", "download"])
 @pytest.mark.parametrize(
     "error_number",
     [
-        pytest.param(getattr(errno, name), id=name)
-        for name in (
-            "EAGAIN",
-            "EIO",
-            "EMFILE",
-            "ENOMEM",
-            "ENFILE",
-            "ESTALE",
-        )
-        if hasattr(errno, name)
+        pytest.param(error_number, id=name)
+        for name, error_number in _RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS
     ],
 )
 def test_artifact_endpoints_preserve_retryable_sealed_definition_lstat_errors(
