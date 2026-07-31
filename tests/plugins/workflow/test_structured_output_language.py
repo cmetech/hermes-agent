@@ -203,6 +203,32 @@ def test_archon_invalid_output_format_is_a_coded_workflow_validation_error(
     ]
 
 
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("minimum", -(10**1_000)),
+        ("maximum", 10**1_000),
+        ("multipleOf", 10**1_000),
+    ],
+)
+def test_archon_output_format_preserves_arbitrary_size_integer_number_keywords(
+    workflow_writer, tmp_path, keyword, value
+):
+    package = load_workflow(
+        _archon_workflow(
+            workflow_writer,
+            tmp_path,
+            nodes=[{
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_format": {"type": "number", keyword: value},
+            }],
+        )
+    )
+
+    assert package.definition.nodes[0].options["output_format"][keyword] == value
+
+
 def _consumer_nodes(schema, path="missing", *, depends_on=True):
     consumer = {
         "id": "consumer",

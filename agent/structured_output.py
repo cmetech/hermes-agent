@@ -287,17 +287,19 @@ def _validate_schema_keyword(
         or len(set(value)) != len(value)
     ):
         raise StructuredOutputSchemaInvalid(STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE)
-    if key in _NUMBER_BOUND_KEYWORDS and (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or (
-            isinstance(value, int | float)
-            and math.isfinite(value)
-            and key == "multipleOf"
+    if key in _NUMBER_BOUND_KEYWORDS:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise StructuredOutputSchemaInvalid(
+                STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE
+            )
+        if (
+            key == "multipleOf"
+            and not (isinstance(value, float) and not math.isfinite(value))
             and value <= 0
-        )
-    ):
-        raise StructuredOutputSchemaInvalid(STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE)
+        ):
+            raise StructuredOutputSchemaInvalid(
+                STRUCTURED_OUTPUT_SCHEMA_INVALID_MESSAGE
+            )
     if key in _SCOPE_CHANGING_KEYWORDS:
         raise StructuredOutputError(f"schema {key} changes resolution scope")
     if key == "$dynamicRef":

@@ -193,6 +193,22 @@ def test_normalize_schema_rejects_nonfinite_numbers(number: float) -> None:
         normalize_schema({"minimum": number})
 
 
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("minimum", -(10**1_000)),
+        ("maximum", 10**1_000),
+        ("multipleOf", 10**1_000),
+    ],
+)
+def test_normalize_schema_preserves_arbitrary_size_integer_number_keywords(
+    keyword: str, value: int
+) -> None:
+    normalized = normalize_schema({"type": "number", keyword: value})
+
+    assert normalized.canonical_schema[keyword] == value
+
+
 @pytest.mark.parametrize("keyword", ["maxItems", "maxLength", "minProperties"])
 def test_normalize_schema_rejects_booleans_for_integer_bounds(keyword: str) -> None:
     with pytest.raises(StructuredOutputError, match="integer"):
