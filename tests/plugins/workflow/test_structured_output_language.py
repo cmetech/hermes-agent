@@ -356,3 +356,227 @@ def test_non_dependency_output_reference_keeps_graph_rejection(
     assert [issue.code for issue in exc.value.issues] == [
         "condition_reference_not_upstream"
     ]
+
+
+def _interpolated_consumer(surface: str) -> dict[str, object]:
+    reference = "$producer.output.missing"
+    consumer: dict[str, object] = {"id": "consumer", "depends_on": ["producer"]}
+    if surface == "when":
+        consumer.update(prompt="Consume", when=f"{reference} != ''")
+    elif surface == "bash":
+        consumer["bash"] = f"printf '%s' '{reference}'"
+    elif surface == "prompt":
+        consumer["prompt"] = f"Consume {reference}"
+    elif surface == "script":
+        consumer.update(script=f"print('{reference}')", runtime="uv")
+    elif surface == "loop.prompt":
+        consumer["loop"] = {
+            "prompt": f"Revise {reference}",
+            "until": "DONE",
+            "max_iterations": 2,
+        }
+    elif surface == "loop.until_bash":
+        consumer["loop"] = {
+            "prompt": "Revise",
+            "until": "DONE",
+            "until_bash": f"test -n '{reference}'",
+            "max_iterations": 2,
+        }
+    elif surface == "approval.message":
+        consumer["approval"] = {"message": f"Approve {reference}"}
+    elif surface == "approval.on_reject.prompt":
+        consumer["approval"] = {
+            "message": "Approve",
+            "on_reject": {"prompt": f"Revise {reference}"},
+        }
+    else:  # pragma: no cover - table exhaustiveness guard
+        raise AssertionError(surface)
+    return consumer
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_path"),
+    (
+        ("when", "nodes[1].when"),
+        ("bash", "nodes[1].bash"),
+        ("prompt", "nodes[1].prompt"),
+        ("script", "nodes[1].script"),
+        ("loop.prompt", "nodes[1].loop.prompt"),
+        ("loop.until_bash", "nodes[1].loop.until_bash"),
+        ("approval.message", "nodes[1].approval.message"),
+        (
+            "approval.on_reject.prompt",
+            "nodes[1].approval.on_reject.prompt",
+        ),
+    ),
+)
+def test_impossible_output_field_is_rejected_on_every_interpolated_surface(
+    workflow_writer, tmp_path, surface, expected_path
+) -> None:
+    producer = {
+        "id": "producer",
+        "prompt": "Produce",
+        "output_format": {
+            "type": "object",
+            "properties": {"present": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    }
+
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        load_workflow(
+            _archon_workflow(
+                workflow_writer,
+                tmp_path,
+                nodes=[producer, _interpolated_consumer(surface)],
+            )
+        )
+
+    assert [(issue.path, issue.code) for issue in exc_info.value.issues] == [
+        (expected_path, "structured_output_field_impossible")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("producer", "reference"),
+    (
+        (
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"optional": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            "$producer.output.optional",
+        ),
+        (
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {"type": "object", "additionalProperties": True},
+            },
+            "$producer.output.missing",
+        ),
+        (
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"missing": {"type": "string"}},
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
+            "$producer.output.missing",
+        ),
+        ({"id": "producer", "prompt": "Produce"}, "$producer.output.missing"),
+        ({"id": "producer", "prompt": "Produce"}, "$unknown.output.missing"),
+        ({"id": "producer", "prompt": "Produce"}, "$producer.output"),
+    ),
+)
+def test_prompt_reference_keeps_conservative_phase_two_admission(
+    workflow_writer, tmp_path, producer, reference
+) -> None:
+    package = load_workflow(
+        _archon_workflow(
+            workflow_writer,
+            tmp_path,
+            nodes=[producer, {"id": "consumer", "prompt": f"Use {reference}"}],
+        )
+    )
+
+    assert package.definition.nodes[-1].id == "consumer"
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        {
+            "id": "consumer",
+            "script": "helper.py",
+            "runtime": "uv",
+            "systemPrompt": "$producer.output.missing",
+        },
+        {"id": "consumer", "command": "$producer.output.missing"},
+        {
+            "id": "consumer",
+            "loop": {
+                "prompt": "Revise",
+                "until": "$producer.output.missing",
+                "max_iterations": 2,
+            },
+        },
+        {
+            "id": "consumer",
+            "loop": {
+                "prompt": "Revise",
+                "until": "DONE",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "$producer.output.missing",
+            },
+        },
+        {"id": "consumer", "cancel": "$producer.output.missing"},
+        {
+            "id": "consumer",
+            "prompt": "Consume",
+            "skills": ["$producer.output.missing"],
+        },
+        {
+            "id": "consumer",
+            "prompt": "Consume",
+            "mcp": "$producer.output.missing",
+        },
+        {
+            "id": "consumer",
+            "prompt": "Consume",
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "$producer.output.missing",
+                        "response": {"continue": True},
+                    }
+                ]
+            },
+        },
+        {
+            "id": "consumer",
+            "prompt": "Consume",
+            "model": "$producer.output.missing",
+        },
+    ),
+)
+def test_non_interpolated_fields_are_not_static_reference_surfaces(
+    workflow_writer, tmp_path, consumer
+) -> None:
+    producer = {
+        "id": "producer",
+        "prompt": "Produce",
+        "output_format": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+
+    package = load_workflow(
+        _archon_workflow(
+            workflow_writer,
+            tmp_path,
+            nodes=[producer, consumer],
+        )
+    )
+
+    assert package.definition.nodes[-1].id == "consumer"

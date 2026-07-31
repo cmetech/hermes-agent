@@ -26,6 +26,7 @@ from plugins.workflow.language import (
     make_language_snapshot,
     read_language_snapshot,
 )
+from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
     ResourceResolver,
@@ -410,6 +411,50 @@ def test_resume_reads_sealed_definition_after_installed_source_changes(
 
     assert loaded.definition.name == "archon-2026-07-snapshot"
     assert loaded.language.effective_profile.value == "archon-2026-07"
+
+
+def test_verified_load_checks_command_references_from_sealed_bytes_only(
+    tmp_path, workflow_writer
+):
+    root = tmp_path / "package"
+    commands = root / "commands"
+    commands.mkdir(parents=True)
+    command = commands / "consume.md"
+    command.write_text("Use $producer.output.missing\n", encoding="utf-8")
+    path = workflow_writer(
+        root / "workflows",
+        name="sealed-command-reference",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    store = RunStore(tmp_path / "home")
+    _prepared, admitted = _start(store, package, key="sealed-command-reference")
+    command.write_text("Use $producer.output.present\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        _load_with_scheduler(store, admitted.run_id)
+
+    assert [(issue.path, issue.code) for issue in exc_info.value.issues] == [
+        ("nodes[1].command", "structured_output_field_impossible")
+    ]
 
 
 def test_verified_load_rejects_normalizer_drift_for_authenticated_bytes(

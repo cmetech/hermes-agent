@@ -12,9 +12,26 @@ import pytest
 
 from plugins.workflow.models import TerminalJournalReserve
 from plugins.workflow import output_resolution
+from plugins.workflow import resources as workflow_resources
 from plugins.workflow import scheduler as workflow_scheduler
 from plugins.workflow.machine_contract import projection_was_truncated
 from plugins.workflow.resources import ResourceResolver, VariableContext
+
+
+def test_output_field_reference_scanner_uses_runtime_variable_grammar():
+    scanner = getattr(workflow_resources, "iter_output_field_references", None)
+    assert callable(scanner)
+
+    assert tuple(
+        scanner(
+            "$producer.output.answer|$producer.output.items.0|"
+            "$producer.output|$1|$ARGUMENTS|$producer.output/ignored|"
+            "$9bad.output.ignored"
+        )
+    ) == (
+        ("producer", ("answer",)),
+        ("producer", ("items", "0")),
+    )
 
 
 def test_local_command_precedes_global_and_preserves_frontmatter(tmp_path: Path):

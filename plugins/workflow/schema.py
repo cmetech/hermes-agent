@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import math
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -52,6 +52,7 @@ from plugins.workflow.models import (
     WorkflowValidationError,
     freeze_value,
 )
+from plugins.workflow.resources import iter_output_field_references
 
 TRIGGER_RULES = (
     "all_success",
@@ -76,7 +77,6 @@ SIDECAR_FIELDS = sidecar_field_names()
 _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
-_WHEN_OUTPUT_REFERENCE = re.compile(r"\$([\w.:-]+)\.output((?:\.[\w.-]+)*)", re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 
@@ -688,35 +688,85 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
 def _validate_structured_output_field_references(
     nodes: tuple[WorkflowNode, ...],
     structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
 ) -> None:
     """Reject only field paths every normalized producer branch excludes."""
     issues: list[ValidationIssue] = []
     for node in nodes:
-        when = node.options.get("when")
-        if not isinstance(when, str):
-            continue
-        for match in _WHEN_OUTPUT_REFERENCE.finditer(when):
-            producer_id = match.group(1)
-            output = structured_outputs.get(producer_id)
-            if output is None:
-                continue
-            schema = getattr(output, "canonical_schema", None)
-            path_parts = tuple(part for part in match.group(2).split(".") if part)
-            if (
-                isinstance(schema, Mapping)
-                and path_parts
-                and prove_output_path_impossible(schema, path_parts)
-            ):
-                issues.append(
-                    _issue(
-                        f"nodes[{node.source_index}].when",
-                        "structured_output_field_impossible",
-                        f"structured output field {'.'.join(path_parts)} is impossible for node {producer_id}",
-                        line=node.source_line,
+        for surface_path, template in _interpolated_node_templates(
+            node, command_bodies=command_bodies
+        ):
+            for producer_id, path_parts in iter_output_field_references(template):
+                output = structured_outputs.get(producer_id)
+                if output is None:
+                    continue
+                schema = getattr(output, "canonical_schema", None)
+                if isinstance(schema, Mapping) and prove_output_path_impossible(
+                    schema, path_parts
+                ):
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "structured_output_field_impossible",
+                            f"structured output field {'.'.join(path_parts)} is impossible for node {producer_id}",
+                            line=node.source_line,
+                        )
                     )
-                )
     if issues:
         raise WorkflowValidationError(tuple(issues))
+
+
+def _interpolated_node_templates(
+    node: WorkflowNode,
+    *,
+    command_bodies: Mapping[str, str] | None,
+) -> Iterable[tuple[str, str]]:
+    """Yield only fields rendered by the Phase 2 runtime variable adapter."""
+    prefix = f"nodes[{node.source_index}]"
+    when = node.options.get("when")
+    if isinstance(when, str):
+        yield f"{prefix}.when", when
+    if node.node_type in {"bash", "prompt"} and isinstance(node.value, str):
+        yield f"{prefix}.{node.node_type}", node.value
+    elif (
+        node.node_type == "script"
+        and isinstance(node.value, str)
+        and is_inline_script(node.value)
+    ):
+        yield f"{prefix}.script", node.value
+    elif node.node_type == "loop" and isinstance(node.value, Mapping):
+        for field in ("prompt", "until_bash"):
+            value = node.value.get(field)
+            if isinstance(value, str):
+                yield f"{prefix}.loop.{field}", value
+    elif node.node_type == "approval" and isinstance(node.value, Mapping):
+        message = node.value.get("message")
+        if isinstance(message, str):
+            yield f"{prefix}.approval.message", message
+        on_reject = node.value.get("on_reject")
+        if isinstance(on_reject, Mapping):
+            prompt = on_reject.get("prompt")
+            if isinstance(prompt, str):
+                yield f"{prefix}.approval.on_reject.prompt", prompt
+    elif node.node_type == "command" and command_bodies is not None:
+        body = command_bodies.get(node.id)
+        if isinstance(body, str):
+            yield f"{prefix}.command", body
+
+
+def validate_authenticated_command_references(
+    package: WorkflowPackage,
+    command_bodies: Mapping[str, str],
+) -> None:
+    """Validate command bodies already read from authenticated snapshot bytes."""
+    if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return
+    _validate_structured_output_field_references(
+        package.definition.nodes,
+        package.language.structured_outputs,
+        command_bodies=command_bodies,
+    )
 
 
 def _parse_sidecar(

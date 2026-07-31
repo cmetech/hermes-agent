@@ -62,7 +62,11 @@ from plugins.workflow.output_resolution import (
     resolve_node_output,
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
-from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
+from plugins.workflow.schema import (
+    is_inline_script,
+    load_workflow_snapshot,
+    validate_authenticated_command_references,
+)
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ArtifactRef,
@@ -1309,6 +1313,21 @@ class RunScheduler:
             raise integrity_error("verified workflow resource identity is missing")
         if verified_sealed_bytes is None:
             raise integrity_error("verified workflow resource bytes are missing")
+        if (
+            package.language.effective_profile
+            is WorkflowLanguageProfile.ARCHON_2026_07
+        ):
+            resolver = ResourceResolver(
+                run_directory,
+                sealed_paths=verified_sealed_paths,
+                sealed_bytes=verified_sealed_bytes,
+            )
+            command_bodies = {
+                node.id: resolver.command(str(node.value)).body
+                for node in package.definition.nodes
+                if node.node_type == "command"
+            }
+            validate_authenticated_command_references(package, command_bodies)
         return (
             package,
             verified_sealed_paths,

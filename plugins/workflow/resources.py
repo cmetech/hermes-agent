@@ -39,6 +39,17 @@ _VARIABLE = re.compile(
 )
 
 
+def iter_output_field_references(
+    template: str,
+) -> Iterable[tuple[str, tuple[str, ...]]]:
+    """Yield field references recognized by runtime variable substitution."""
+    for match in _VARIABLE.finditer(template):
+        node = match.group("node")
+        dot = match.group("dot")
+        if node is not None and dot is not None:
+            yield node, tuple(dot.split("."))
+
+
 def _shell_quote_context(template: str, end: int) -> str | None:
     """Return the POSIX quote containing ``end``, ignoring escaped quotes."""
     quote: str | None = None
@@ -687,4 +698,5 @@ __all__ = [
     "ResourceResolver",
     "ScriptResource",
     "VariableContext",
+    "iter_output_field_references",
 ]
