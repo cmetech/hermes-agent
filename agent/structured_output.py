@@ -387,7 +387,11 @@ def _freeze_json(value: object) -> object:
     return value
 
 
-def require_structured_output_validator(*, legacy: bool = False) -> Any:
+def require_structured_output_validator(
+    schema: Mapping[str, object] | None = None,
+    *,
+    legacy: bool = False,
+) -> Any:
     """Return the required optional validator API or fail with install guidance."""
     try:
         import jsonschema
@@ -395,25 +399,41 @@ def require_structured_output_validator(*, legacy: bool = False) -> Any:
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         ) from exc
-    api_name = "validate" if legacy else "Draft202012Validator"
-    validator = getattr(jsonschema, api_name, None)
-    if not callable(validator):
+    if legacy:
+        validator = getattr(jsonschema, "validate", None)
+        if not callable(validator) or any(
+            not isinstance(getattr(jsonschema, name, None), type)
+            or not issubclass(getattr(jsonschema, name), Exception)
+            for name in ("SchemaError", "ValidationError")
+        ):
+            raise StructuredOutputValidatorUnavailable(
+                STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
+            )
+        return jsonschema
+
+    validator_builder = getattr(jsonschema, "Draft202012Validator", None)
+    if not callable(validator_builder):
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         )
-    if legacy and any(
-        not isinstance(getattr(jsonschema, name, None), type)
-        or not issubclass(getattr(jsonschema, name), Exception)
-        for name in ("SchemaError", "ValidationError")
-    ):
+    try:
+        validator = validator_builder(_thaw_json(schema or {}))
+    except (AttributeError, TypeError) as exc:
+        raise StructuredOutputValidatorUnavailable(
+            STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
+        ) from exc
+    if not callable(getattr(validator, "iter_errors", None)):
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         )
-    return jsonschema
+    return validator
 
 
 def parse_validate_canonicalize(
-    response: str, request: StructuredOutputRequest
+    response: str,
+    request: StructuredOutputRequest,
+    *,
+    validator: Any | None = None,
 ) -> StructuredOutputValue:
     """Parse one JSON value, validate it, and return its canonical JSON bytes."""
     if not isinstance(response, str):
@@ -444,10 +464,8 @@ def parse_validate_canonicalize(
         raise StructuredOutputError("response contains trailing non-JSON content")
     _reject_nonfinite_value(value)
 
-    jsonschema = require_structured_output_validator()
-    validator = jsonschema.Draft202012Validator(
-        _thaw_json(request.schema.canonical_schema)
-    )
+    if validator is None:
+        validator = require_structured_output_validator(request.schema.canonical_schema)
     errors = list(validator.iter_errors(value))
     if errors:
         raise StructuredOutputError(validation_summary(errors))

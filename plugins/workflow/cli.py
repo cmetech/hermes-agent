@@ -49,6 +49,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
+    WorkflowStructuredOutput,
     WorkflowValidationError,
 )
 from plugins.workflow.machine_contract import (
@@ -1187,10 +1188,13 @@ def _provider_override_findings(
     )
 
 
-def _structured_output_validator_available() -> bool:
+def _structured_output_validator_available(
+    structured_outputs: Iterable[WorkflowStructuredOutput],
+) -> bool:
     """Probe the exact optional Draft 2020-12 API execution requires."""
     try:
-        require_structured_output_validator()
+        for structured_output in structured_outputs:
+            require_structured_output_validator(structured_output.canonical_schema)
     except StructuredOutputValidatorUnavailable:
         return False
     return True
@@ -1222,7 +1226,9 @@ def doctor_package(
     findings = list(compatibility.findings)
     if (
         package.language.structured_outputs
-        and not _structured_output_validator_available()
+        and not _structured_output_validator_available(
+            package.language.structured_outputs.values()
+        )
     ):
         findings.append(
             _doctor_finding(

@@ -360,6 +360,19 @@ def test_importable_validator_without_callable_draft_is_unavailable(
         structured_output.require_structured_output_validator()
 
 
+def test_callable_draft_without_iter_errors_is_unavailable(monkeypatch) -> None:
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = lambda _schema: object()
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
+        structured_output.require_structured_output_validator()
+
+
 def test_validator_install_guidance_has_one_shared_authority() -> None:
     assert (
         getattr(structured_output, "STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE", None)

@@ -277,7 +277,7 @@ def test_doctor_reports_existing_extra_guidance_when_validator_is_missing(
     package = _archon_structured_package(tmp_path, workflow_writer)
     monkeypatch.setattr(
         "plugins.workflow.cli._structured_output_validator_available",
-        lambda: False,
+        lambda _structured_outputs: False,
     )
 
     report = doctor_package(package, hermes_home=tmp_path / "home")
@@ -323,6 +323,43 @@ def test_doctor_rejects_importable_validator_without_callable_draft(
     )
 
 
+def test_doctor_rejects_callable_draft_without_iter_errors(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_structured_package(tmp_path, workflow_writer)
+
+    class EmptySchemaValidator:
+        @staticmethod
+        def iter_errors(_value):
+            return ()
+
+    def draft_validator(schema):
+        return EmptySchemaValidator() if schema == {} else object()
+
+    partial = types.ModuleType("jsonschema")
+    partial.__spec__ = ModuleSpec("jsonschema", loader=None)
+    partial.Draft202012Validator = draft_validator
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    finding = next(
+        (
+            item
+            for item in report.findings
+            if item.code == "structured_output_unavailable"
+        ),
+        None,
+    )
+    assert finding is not None
+    assert report.runnable is False
+    assert finding.blocking is True
+    assert (
+        finding.message == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+
+
 def test_doctor_schemaless_workflow_does_not_require_validator(
     tmp_path: Path, workflow_writer, monkeypatch
 ) -> None:
@@ -335,7 +372,7 @@ def test_doctor_schemaless_workflow_does_not_require_validator(
     )
     monkeypatch.setattr(
         "plugins.workflow.cli._structured_output_validator_available",
-        lambda: False,
+        lambda _structured_outputs: False,
     )
 
     report = doctor_package(package, hermes_home=tmp_path / "home")

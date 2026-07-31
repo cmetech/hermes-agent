@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
 from agent.structured_output import (
@@ -393,6 +393,7 @@ class AgentNodeExecutor:
         initial_result,
         metadata: dict[str, object],
         structured_request: StructuredOutputRequest,
+        structured_validator: Any,
         *,
         diagnostics: str,
         first_provider_attempts: int,
@@ -574,7 +575,9 @@ class AgentNodeExecutor:
             )
         try:
             repaired = parse_validate_canonicalize(
-                repair_result.final_response, structured_request
+                repair_result.final_response,
+                structured_request,
+                validator=structured_validator,
             )
         except StructuredOutputValidatorUnavailable as exc:
             return NodeExecutionResult(
@@ -684,9 +687,12 @@ class AgentNodeExecutor:
                 error_message=str(exc),
                 metadata={"archon_terminal_failure": True},
             )
+        structured_validator = None
         if structured_request is not None:
             try:
-                require_structured_output_validator()
+                structured_validator = require_structured_output_validator(
+                    structured_request.schema.canonical_schema
+                )
             except StructuredOutputValidatorUnavailable as exc:
                 return NodeExecutionResult(
                     "failed",
@@ -1135,7 +1141,9 @@ class AgentNodeExecutor:
                 assert structured_counts is not None
                 try:
                     structured_value = parse_validate_canonicalize(
-                        output, structured_request
+                        output,
+                        structured_request,
+                        validator=structured_validator,
                     )
                 except StructuredOutputValidatorUnavailable as exc:
                     return NodeExecutionResult(
@@ -1152,6 +1160,7 @@ class AgentNodeExecutor:
                         result,
                         metadata,
                         structured_request,
+                        structured_validator,
                         diagnostics=str(exc),
                         first_provider_attempts=structured_counts[0],
                         first_model_calls=structured_counts[1],

@@ -185,6 +185,21 @@ def _install_incompatible_jsonschema(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "jsonschema", partial)
 
 
+def _install_callable_unusable_jsonschema(monkeypatch) -> None:
+    class EmptySchemaValidator:
+        @staticmethod
+        def iter_errors(_value):
+            return ()
+
+    def draft_validator(schema):
+        return EmptySchemaValidator() if schema == {} else object()
+
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = draft_validator
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+
 def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path):
     runner = FakeAgentRunner('{"answer":"ok","count":2}')
     node = _node(
@@ -283,6 +298,47 @@ def test_archon_rejects_importable_incompatible_validator_before_runner(
     assert result.primary_output is None
     assert not result.artifacts
     assert not (tmp_path / "run" / "nodes").exists()
+
+
+def test_archon_rejects_callable_unusable_validator_before_runner(
+    tmp_path, monkeypatch
+):
+    runner = FakeAgentRunner('{"answer":"ready"}')
+    node = _node(
+        "callable-unusable-validator",
+        "Produce data",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+    _install_callable_unusable_jsonschema(monkeypatch)
+
+    provider_exception = None
+    result = None
+    try:
+        result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+    except AttributeError as exc:
+        provider_exception = exc
+
+    assert provider_exception is None, (
+        f"validator failed after {len(runner.requests)} provider call(s): "
+        f"{provider_exception}"
+    )
+    assert result is not None
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_unavailable"
+    assert (
+        result.error_message
+        == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+    assert runner.requests == []
+    assert result.metadata["provider_attempts"] == 0
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.primary_output is None
+    assert not result.artifacts
+    assert list((tmp_path / "run").iterdir()) == []
 
 
 def test_archon_schemaless_output_does_not_require_validator(tmp_path, monkeypatch):
