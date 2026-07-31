@@ -1646,6 +1646,10 @@ export interface Translations {
     artifactPreview: string
     artifactDownload: string
     artifactDownloading: string
+    artifactLabel: (identity: string) => string
+    artifactPreviewFor: (identity: string) => string
+    artifactDownloadFor: (identity: string) => string
+    artifactDownloadingFor: (identity: string) => string
     artifactDownloadCancelled: string
     artifactDownloadErrorTitle: string
     artifactDownloadErrorDescription: string

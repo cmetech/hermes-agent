@@ -1,11 +1,15 @@
+import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
+import path from 'node:path'
 
 export const WORKFLOW_ARTIFACT_MAX_BYTES = 500_000
 
 export interface WorkflowArtifactDownloadRequest {
   path: string
   profile?: null | string
+  requestId: string
 }
 
 export type WorkflowArtifactDownloadResult =
@@ -34,7 +38,8 @@ export interface WorkflowArtifactDownloadDeps {
   fetchResource: (
     url: string,
     auth: WorkflowArtifactDownloadAuth,
-    maxBytes: number
+    maxBytes: number,
+    signal?: AbortSignal
   ) => Promise<WorkflowArtifactResource>
   resolveOauthAuth: (baseUrl: string) => Promise<Extract<WorkflowArtifactDownloadAuth, { kind: 'bearer' | 'cookie' }>>
   routePath: (path: string, profile?: null | string) => string
@@ -69,12 +74,20 @@ export interface WorkflowArtifactDownloadIpcDeps {
   }
   download: Omit<WorkflowArtifactDownloadDeps, 'chooseSavePath' | 'writeFile'>
   ipcMain: {
-    handle: (
-      channel: string,
-      handler: (event: WorkflowArtifactIpcEvent, request: WorkflowArtifactDownloadRequest) => Promise<unknown>
-    ) => void
+    handle: (channel: string, handler: (event: WorkflowArtifactIpcEvent, request: any) => Promise<unknown>) => void
   }
-  writeFile: (filePath: string, bytes: Uint8Array) => Promise<void>
+}
+
+interface AtomicArtifactFileHandle {
+  close: () => Promise<void>
+  sync: () => Promise<void>
+  writeFile: (bytes: Uint8Array) => Promise<void>
+}
+
+export interface AtomicArtifactWriteDeps {
+  open: (filePath: string, flags: string, mode: number) => Promise<AtomicArtifactFileHandle>
+  rename: (oldPath: string, newPath: string) => Promise<void>
+  unlink: (filePath: string) => Promise<void>
 }
 
 const DOWNLOAD_PATH_PATTERN = /^\/api\/plugins\/workflow\/runs\/([^/?#]+)\/artifacts\/([^/?#]+)\/download$/
@@ -91,6 +104,76 @@ function responseHeader(headers: unknown, name: string): string {
   return Array.isArray(value) ? String(value[0] ?? '') : String(value ?? '')
 }
 
+function responseStatusError(statusCode: number): Error | null {
+  if (statusCode >= 200 && statusCode < 300) {
+    return null
+  }
+
+  if (statusCode >= 300 && statusCode < 400) {
+    return new Error(`Authenticated workflow artifact download rejected redirect response ${statusCode}.`)
+  }
+
+  return new Error(`Workflow artifact download failed with HTTP ${statusCode}.`)
+}
+
+function abortError(): DOMException {
+  return new DOMException('Workflow artifact download was cancelled.', 'AbortError')
+}
+
+export async function atomicReplaceWorkflowArtifact(
+  destination: string,
+  bytes: Uint8Array,
+  deps: AtomicArtifactWriteDeps = {
+    open: (filePath, flags, mode) => fs.promises.open(filePath, flags, mode),
+    rename: fs.promises.rename,
+    unlink: fs.promises.unlink
+  }
+): Promise<void> {
+  if (bytes.byteLength > WORKFLOW_ARTIFACT_MAX_BYTES) {
+    throw new Error(`Workflow artifact exceeds the download limit of ${WORKFLOW_ARTIFACT_MAX_BYTES} bytes.`)
+  }
+
+  const directory = path.dirname(destination)
+  const basename = path.basename(destination)
+  let handle: AtomicArtifactFileHandle | null = null
+  let temporaryPath = ''
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    temporaryPath = path.join(directory, `.${basename}.${crypto.randomBytes(12).toString('hex')}.tmp`)
+
+    try {
+      handle = await deps.open(temporaryPath, 'wx', 0o600)
+
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt === 7) {
+        throw error
+      }
+    }
+  }
+
+  if (!handle || !temporaryPath) {
+    throw new Error('Could not create a temporary workflow artifact file.')
+  }
+
+  try {
+    await handle.writeFile(bytes)
+    await handle.sync()
+    await handle.close()
+    handle = null
+    await deps.rename(temporaryPath, destination)
+    temporaryPath = ''
+  } finally {
+    if (handle) {
+      await handle.close().catch(() => undefined)
+    }
+
+    if (temporaryPath) {
+      await deps.unlink(temporaryPath).catch(() => undefined)
+    }
+  }
+}
+
 export function collectWorkflowArtifactResponse(
   response: any,
   maxBytes: number,
@@ -99,6 +182,14 @@ export function collectWorkflowArtifactResponse(
   return new Promise((resolve, reject) => {
     const contentLengthHeader = responseHeader(response.headers, 'content-length')
     const contentLength = contentLengthHeader ? Number(contentLengthHeader) : null
+    const statusError = responseStatusError(Number(response.statusCode || 500))
+
+    if (statusError) {
+      abort()
+      reject(statusError)
+
+      return
+    }
 
     if (contentLength !== null && Number.isFinite(contentLength) && contentLength > maxBytes) {
       abort()
@@ -145,13 +236,6 @@ export function collectWorkflowArtifactResponse(
 
       settled = true
       const bytes = Buffer.concat(chunks, byteLength)
-      const statusCode = Number(response.statusCode || 500)
-
-      if (statusCode >= 400) {
-        reject(new Error(`${statusCode}: ${bytes.toString('utf8').slice(0, 500) || response.statusMessage || ''}`))
-
-        return
-      }
 
       if (contentLength !== null && Number.isFinite(contentLength) && contentLength !== byteLength) {
         reject(new Error(`Workflow artifact response ended after ${byteLength} of ${contentLength} bytes.`))
@@ -174,7 +258,8 @@ export function fetchWorkflowArtifactWithToken(
   url: string,
   auth: Exclude<WorkflowArtifactDownloadAuth, { kind: 'cookie' }>,
   maxBytes: number,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<WorkflowArtifactResource> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url)
@@ -186,14 +271,60 @@ export function fetchWorkflowArtifactWithToken(
       return
     }
 
-    const request = client.request(parsed, { headers: workflowArtifactAuthHeaders(auth), method: 'GET' }, response => {
-      void collectWorkflowArtifactResponse(response, maxBytes, () => response.destroy()).then(resolve, reject)
+    let response: http.IncomingMessage | null = null
+    let settled = false
+
+    const cleanup = () => {
+      clearTimeout(deadline)
+      signal?.removeEventListener('abort', onAbort)
+    }
+
+    const fail = (error: unknown) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      response?.destroy()
+      request.destroy()
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+
+    const succeed = (resource: WorkflowArtifactResource) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      resolve(resource)
+    }
+
+    const onAbort = () => fail(abortError())
+
+    const deadline = setTimeout(
+      () => fail(new Error(`Workflow artifact download exceeded its ${timeoutMs}ms deadline.`)),
+      timeoutMs
+    )
+
+    const request = client.request(parsed, { headers: workflowArtifactAuthHeaders(auth), method: 'GET' }, incoming => {
+      response = incoming
+      void collectWorkflowArtifactResponse(incoming, maxBytes, () => {
+        incoming.destroy()
+        request.destroy()
+      }).then(succeed, fail)
     })
 
-    request.on('error', reject)
-    request.setTimeout(timeoutMs, () => {
-      request.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    })
+    request.on('error', fail)
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    if (signal?.aborted) {
+      onAbort()
+
+      return
+    }
+
     request.end()
   })
 }
@@ -202,7 +333,8 @@ export function fetchWorkflowArtifactWithOauthCookie(
   url: string,
   maxBytes: number,
   timeoutMs: number,
-  deps: WorkflowArtifactOauthCookieDeps
+  deps: WorkflowArtifactOauthCookieDeps,
+  signal?: AbortSignal
 ): Promise<WorkflowArtifactResource> {
   return new Promise((resolve, reject) => {
     const oauthSession = deps.getSession()
@@ -238,7 +370,13 @@ export function fetchWorkflowArtifactWithOauthCookie(
 
       settled = true
       clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
       reject(error instanceof Error ? error : new Error(String(error)))
+    }
+
+    const onAbort = () => {
+      fail(abortError())
+      request.abort()
     }
 
     const timer = setTimeout(() => {
@@ -254,38 +392,77 @@ export function fetchWorkflowArtifactWithOauthCookie(
 
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
         resolve(value)
       }, fail)
     })
     request.on('error', fail)
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    if (signal?.aborted) {
+      onAbort()
+
+      return
+    }
+
     request.end()
   })
 }
 
 export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownloadIpcDeps): void {
+  const active = new Map<string, AbortController>()
+
   deps.ipcMain.handle('hermes:workflow-artifact:download', async (event, request) => {
-    return downloadWorkflowArtifactWithDeps(request, {
-      ...deps.download,
-      chooseSavePath: async ({ filename }) => {
-        let owner: null | WorkflowArtifactNativeWindow = null
+    if (typeof request?.requestId !== 'string' || request.requestId.trim().length === 0) {
+      throw new Error('Workflow artifact download request id is required.')
+    }
 
-        try {
-          owner = deps.browserWindow.fromWebContents(event.sender)
-        } catch {
-          // The invoking WebContents may have closed between click and save.
-        }
+    active.get(request.requestId)?.abort()
+    const controller = new AbortController()
+    active.set(request.requestId, controller)
 
-        const options = { defaultPath: filename }
+    try {
+      return await downloadWorkflowArtifactWithDeps(
+        request,
+        {
+          ...deps.download,
+          chooseSavePath: async ({ filename }) => {
+            controller.signal.throwIfAborted()
+            let owner: null | WorkflowArtifactNativeWindow = null
 
-        const result =
-          owner && !owner.isDestroyed()
-            ? await deps.dialog.showSaveDialog(owner, options)
-            : await deps.dialog.showSaveDialog(options)
+            try {
+              owner = deps.browserWindow.fromWebContents(event.sender)
+            } catch {
+              // The invoking WebContents may have closed between click and save.
+            }
 
-        return result.canceled || !result.filePath ? null : result.filePath
-      },
-      writeFile: deps.writeFile
-    })
+            const options = { defaultPath: filename }
+
+            const result =
+              owner && !owner.isDestroyed()
+                ? await deps.dialog.showSaveDialog(owner, options)
+                : await deps.dialog.showSaveDialog(options)
+
+            controller.signal.throwIfAborted()
+
+            return result.canceled || !result.filePath ? null : result.filePath
+          },
+          writeFile: atomicReplaceWorkflowArtifact
+        },
+        controller.signal
+      )
+    } finally {
+      if (active.get(request.requestId) === controller) {
+        active.delete(request.requestId)
+      }
+    }
+  })
+
+  deps.ipcMain.handle('hermes:workflow-artifact:cancel', async (_event, payload) => {
+    const controller = active.get(payload?.requestId)
+    controller?.abort()
+
+    return { cancelled: Boolean(controller) }
   })
 }
 
@@ -356,9 +533,11 @@ function artifactUrl(baseUrl: string, requestPath: string): string {
 
 export async function downloadWorkflowArtifactWithDeps(
   request: WorkflowArtifactDownloadRequest,
-  deps: WorkflowArtifactDownloadDeps
+  deps: WorkflowArtifactDownloadDeps,
+  signal?: AbortSignal
 ): Promise<WorkflowArtifactDownloadResult> {
   assertWorkflowArtifactDownloadPath(request?.path)
+  signal?.throwIfAborted()
 
   const profile = request.profile
   const connection = await deps.ensureBackend(profile)
@@ -369,11 +548,13 @@ export async function downloadWorkflowArtifactWithDeps(
       ? await deps.resolveOauthAuth(connection.baseUrl)
       : { kind: 'token', token: connection.token }
 
-  const resource = await deps.fetchResource(
-    artifactUrl(connection.baseUrl, requestPath),
-    auth,
-    WORKFLOW_ARTIFACT_MAX_BYTES
-  )
+  const resourceUrl = artifactUrl(connection.baseUrl, requestPath)
+
+  const resource = signal
+    ? await deps.fetchResource(resourceUrl, auth, WORKFLOW_ARTIFACT_MAX_BYTES, signal)
+    : await deps.fetchResource(resourceUrl, auth, WORKFLOW_ARTIFACT_MAX_BYTES)
+
+  signal?.throwIfAborted()
 
   if (resource.bytes.byteLength > WORKFLOW_ARTIFACT_MAX_BYTES) {
     throw new Error(`Workflow artifact exceeds the download limit of ${WORKFLOW_ARTIFACT_MAX_BYTES} bytes.`)
@@ -382,6 +563,7 @@ export async function downloadWorkflowArtifactWithDeps(
   const filename = filenameFromContentDisposition(header(resource.headers, 'content-disposition'))
   const mediaType = header(resource.headers, 'content-type') || 'application/octet-stream'
   const filePath = await deps.chooseSavePath({ filename, mediaType })
+  signal?.throwIfAborted()
 
   if (!filePath) {
     return { status: 'cancelled' }

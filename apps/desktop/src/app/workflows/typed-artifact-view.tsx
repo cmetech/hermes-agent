@@ -1,11 +1,16 @@
 import { useQuery } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { LogView } from '@/components/ui/log-view'
-import { downloadWorkflowArtifact, getApiRequestProfile, getWorkflowArtifactPreview } from '@/hermes'
+import {
+  cancelWorkflowArtifactDownload,
+  downloadWorkflowArtifact,
+  getApiRequestProfile,
+  getWorkflowArtifactPreview
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { WorkflowArtifactPreview, WorkflowTypedArtifact } from '@/types/hermes'
 
@@ -20,8 +25,17 @@ interface MetadataRow {
 }
 
 interface DownloadFeedback {
+  contextKey: string
   publicationId: string
+  requestId: string
   status: 'cancelled' | 'error'
+}
+
+interface ActiveDownload {
+  contextKey: string
+  generation: number
+  publicationId: string
+  requestId: string
 }
 
 export function isWorkflowTypedArtifact(item: unknown): item is WorkflowTypedArtifact {
@@ -56,31 +70,80 @@ function previewMatchesArtifact(preview: WorkflowArtifactPreview, artifact: Work
   )
 }
 
+function accessibleIdentityPart(value: null | string | undefined, fallback: string): string {
+  const normalized = value?.trim()
+
+  return (normalized || fallback).slice(0, 80)
+}
+
 export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) {
   const { locale, t } = useI18n()
   const copy = t.operations
   const profile = getApiRequestProfile() ?? 'default'
+  const contextKey = `${profile}\u0000${runId}`
+  const activeDownloadRef = useRef<ActiveDownload | null>(null)
+  const contextRef = useRef(contextKey)
+  const generationRef = useRef(0)
+  const requestSequenceRef = useRef(0)
+  contextRef.current = contextKey
   const [downloadFeedback, setDownloadFeedback] = useState<DownloadFeedback | null>(null)
-  const [downloadingPublicationId, setDownloadingPublicationId] = useState<null | string>(null)
+  const [downloading, setDownloading] = useState<ActiveDownload | null>(null)
   const [selectedPublicationId, setSelectedPublicationId] = useState<null | string>(null)
+
+  useEffect(() => {
+    setDownloadFeedback(null)
+    setDownloading(null)
+    setSelectedPublicationId(null)
+
+    return () => {
+      const active = activeDownloadRef.current
+
+      if (active?.contextKey === contextKey) {
+        activeDownloadRef.current = null
+        generationRef.current += 1
+        void cancelWorkflowArtifactDownload(active.requestId)
+      }
+    }
+  }, [contextKey])
 
   const handleDownload = async (artifact: WorkflowTypedArtifact) => {
     const publicationId = artifact.publication_id
+    const activeProfile = getApiRequestProfile() ?? 'default'
+    const activeContextKey = `${activeProfile}\u0000${runId}`
+    const requestId = `workflow-artifact-${Date.now()}-${++requestSequenceRef.current}`
+    const generation = ++generationRef.current
+    const active: ActiveDownload = { contextKey: activeContextKey, generation, publicationId, requestId }
+
+    const previous = activeDownloadRef.current
+
+    if (previous && previous.contextKey !== activeContextKey) {
+      void cancelWorkflowArtifactDownload(previous.requestId)
+    }
 
     setDownloadFeedback(null)
-    setDownloadingPublicationId(publicationId)
+    setDownloading(active)
+    activeDownloadRef.current = active
+
+    const isCurrent = () =>
+      activeDownloadRef.current?.requestId === requestId &&
+      generationRef.current === generation &&
+      contextRef.current === activeContextKey
 
     try {
-      const activeProfile = getApiRequestProfile() ?? 'default'
-      const result = await downloadWorkflowArtifact(runId, publicationId, activeProfile)
+      const result = await downloadWorkflowArtifact(runId, publicationId, activeProfile, requestId)
 
-      if (result.status === 'cancelled') {
-        setDownloadFeedback({ publicationId, status: 'cancelled' })
+      if (isCurrent() && result.status === 'cancelled') {
+        setDownloadFeedback({ contextKey: activeContextKey, publicationId, requestId, status: 'cancelled' })
       }
-    } catch {
-      setDownloadFeedback({ publicationId, status: 'error' })
+    } catch (error) {
+      if (isCurrent() && !(error instanceof DOMException && error.name === 'AbortError')) {
+        setDownloadFeedback({ contextKey: activeContextKey, publicationId, requestId, status: 'error' })
+      }
     } finally {
-      setDownloadingPublicationId(null)
+      if (isCurrent()) {
+        activeDownloadRef.current = null
+        setDownloading(null)
+      }
     }
   }
 
@@ -142,11 +205,24 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
           ]
 
           const canPreview = previewableMediaType(artifact.media_type)
-          const isDownloading = downloadingPublicationId === artifact.publication_id
-          const feedback = downloadFeedback?.publicationId === artifact.publication_id ? downloadFeedback : null
+
+          const identity = [
+            accessibleIdentityPart(artifact.output_type, copy.artifactUnavailable),
+            accessibleIdentityPart(artifact.node_id, copy.artifactUnavailable),
+            accessibleIdentityPart(artifact.publication_id, copy.artifactUnavailable)
+          ].join(' · ')
+
+          const currentDownload = downloading?.contextKey === contextKey ? downloading : null
+          const isDownloading = currentDownload?.publicationId === artifact.publication_id
+
+          const feedback =
+            downloadFeedback?.contextKey === contextKey && downloadFeedback.publicationId === artifact.publication_id
+              ? downloadFeedback
+              : null
 
           return (
             <section
+              aria-label={copy.artifactLabel(identity)}
               className="grid gap-3 py-4 first:pt-0 last:pb-0"
               key={`${artifact.publication_id}:${index}`}
               role="listitem"
@@ -165,7 +241,7 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
               <div className="flex flex-wrap items-center gap-2">
                 {canPreview ? (
                   <Button
-                    aria-label={copy.artifactPreview}
+                    aria-label={copy.artifactPreviewFor(identity)}
                     aria-pressed={selectedPublicationId === artifact.publication_id}
                     onClick={() => setSelectedPublicationId(artifact.publication_id)}
                     size="sm"
@@ -178,8 +254,10 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
                   <span className="text-xs text-(--ui-text-tertiary)">{copy.artifactDownloadOnly}</span>
                 )}
                 <Button
-                  aria-label={isDownloading ? copy.artifactDownloading : copy.artifactDownload}
-                  disabled={downloadingPublicationId !== null}
+                  aria-label={
+                    isDownloading ? copy.artifactDownloadingFor(identity) : copy.artifactDownloadFor(identity)
+                  }
+                  disabled={currentDownload !== null}
                   onClick={() => void handleDownload(artifact)}
                   size="sm"
                   type="button"
@@ -194,12 +272,14 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
                   {copy.artifactDownloadCancelled}
                 </p>
               ) : feedback?.status === 'error' ? (
-                <ErrorBanner>
-                  <span className="grid gap-1">
-                    <span className="font-medium">{copy.artifactDownloadErrorTitle}</span>
-                    <span>{copy.artifactDownloadErrorDescription}</span>
-                  </span>
-                </ErrorBanner>
+                <div aria-live="assertive" role="alert">
+                  <ErrorBanner>
+                    <span className="grid gap-1">
+                      <span className="font-medium">{copy.artifactDownloadErrorTitle}</span>
+                      <span>{copy.artifactDownloadErrorDescription}</span>
+                    </span>
+                  </ErrorBanner>
+                </div>
               ) : null}
             </section>
           )

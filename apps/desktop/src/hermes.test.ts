@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  cancelWorkflowArtifactDownload,
   downloadWorkflowArtifact,
   executeWorkflowCleanup,
   getApiRequestProfile,
@@ -54,11 +55,13 @@ const emptySessionsResponse = {
 
 describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
+  let nativeCancelDownload: ReturnType<typeof vi.fn>
   let nativeDownload: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
     resetSidebarBatchCapability()
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
+    nativeCancelDownload = vi.fn().mockResolvedValue({ cancelled: true })
     nativeDownload = vi.fn().mockResolvedValue({
       filename: 'diagnostic.json',
       mediaType: 'application/json',
@@ -67,7 +70,11 @@ describe('Hermes REST helpers', () => {
     })
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { api, downloadWorkflowArtifact: nativeDownload }
+      value: {
+        api,
+        cancelWorkflowArtifactDownload: nativeCancelDownload,
+        downloadWorkflowArtifact: nativeDownload
+      }
     })
   })
 
@@ -387,7 +394,9 @@ describe('Hermes REST helpers', () => {
       path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/preview',
       profile: 'remote-profile'
     })
-    await expect(downloadWorkflowArtifact('run / one', artifact.publication_id, 'remote-profile')).resolves.toEqual({
+    await expect(
+      downloadWorkflowArtifact('run / one', artifact.publication_id, 'remote-profile', 'request-1')
+    ).resolves.toEqual({
       filename: 'diagnostic.json',
       mediaType: 'application/json',
       sizeBytes: 13,
@@ -395,8 +404,11 @@ describe('Hermes REST helpers', () => {
     })
     expect(nativeDownload).toHaveBeenCalledWith({
       path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download',
-      profile: 'remote-profile'
+      profile: 'remote-profile',
+      requestId: 'request-1'
     })
+    await expect(cancelWorkflowArtifactDownload('request-1')).resolves.toEqual({ cancelled: true })
+    expect(nativeCancelDownload).toHaveBeenCalledWith('request-1')
   })
 
   it.each(serverWorkflowRunViews)('sends the supported %s run-list view without changing its meaning', async view => {

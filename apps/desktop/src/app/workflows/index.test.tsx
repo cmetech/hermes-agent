@@ -25,6 +25,7 @@ const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null 
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
 vi.mock('@/hermes', () => ({
+  cancelWorkflowArtifactDownload: vi.fn().mockResolvedValue({ cancelled: true }),
   downloadWorkflowArtifact: vi.fn().mockResolvedValue({ status: 'cancelled' }),
   getApiRequestProfile: () => apiRequestState.profile,
   getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
@@ -1029,8 +1030,8 @@ describe('WorkflowsView', () => {
     })
 
     expect(await screen.findByText('Report')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
-    expect(screen.queryByRole('link', { name: 'Download artifact' })).toBeNull()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /Download artifact:/ })).toBeNull()
     expect(screen.queryByText(/legacy\.txt/)).toBeNull()
 
     cleanup()

@@ -482,12 +482,18 @@ export function getWorkflowArtifactPreview(runId: string, publicationId: string)
 export function downloadWorkflowArtifact(
   runId: string,
   publicationId: string,
-  profile: null | string = getApiRequestProfile()
+  profile: null | string,
+  requestId: string
 ): Promise<WorkflowArtifactDownloadResult> {
   return window.hermesDesktop.downloadWorkflowArtifact({
     path: workflowArtifactUrl(runId, publicationId, 'download'),
-    ...(profile === null ? {} : { profile })
+    ...(profile === null ? {} : { profile }),
+    requestId
   })
+}
+
+export function cancelWorkflowArtifactDownload(requestId: string): Promise<{ cancelled: boolean }> {
+  return window.hermesDesktop.cancelWorkflowArtifactDownload(requestId)
 }
 
 export function mutateWorkflowRun(

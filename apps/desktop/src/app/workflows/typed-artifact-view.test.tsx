@@ -10,10 +10,13 @@ import { TypedArtifactView } from './typed-artifact-view'
 
 const getWorkflowArtifactPreview = vi.fn()
 const downloadWorkflowArtifact = vi.fn()
+const cancelWorkflowArtifactDownload = vi.fn()
+const apiRequestState = vi.hoisted(() => ({ profile: 'default' as null | string }))
 
 vi.mock('@/hermes', () => ({
+  cancelWorkflowArtifactDownload: (...args: unknown[]) => cancelWorkflowArtifactDownload(...args),
   downloadWorkflowArtifact: (...args: unknown[]) => downloadWorkflowArtifact(...args),
-  getApiRequestProfile: () => 'default',
+  getApiRequestProfile: () => apiRequestState.profile,
   getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args)
 }))
 
@@ -35,19 +38,24 @@ function artifact(overrides: Partial<WorkflowTypedArtifact> = {}): WorkflowTyped
   }
 }
 
-function renderView(artifacts: WorkflowTypedArtifact[]) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-  return render(
-    <QueryClientProvider client={client}>
-      <I18nProvider configClient={null} initialLocale="en">
-        <TypedArtifactView artifacts={artifacts} runId="run / one" />
-      </I18nProvider>
-    </QueryClientProvider>
+function view(artifacts: WorkflowTypedArtifact[], runId = 'run / one') {
+  return (
+    <I18nProvider configClient={null} initialLocale="en">
+      <TypedArtifactView artifacts={artifacts} runId={runId} />
+    </I18nProvider>
   )
 }
 
+function renderView(artifacts: WorkflowTypedArtifact[], runId = 'run / one') {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+  return render(<QueryClientProvider client={client}>{view(artifacts, runId)}</QueryClientProvider>)
+}
+
 beforeEach(() => {
+  apiRequestState.profile = 'default'
+  cancelWorkflowArtifactDownload.mockReset()
+  cancelWorkflowArtifactDownload.mockResolvedValue({ cancelled: true })
   downloadWorkflowArtifact.mockReset()
   downloadWorkflowArtifact.mockResolvedValue({
     filename: 'diagnostic.json',
@@ -90,14 +98,22 @@ describe('TypedArtifactView', () => {
     expect(screen.getAllByText('verified')).toHaveLength(2)
     expect(getWorkflowArtifactPreview).not.toHaveBeenCalled()
 
-    const download = screen.getByRole('button', { name: 'Download artifact' })
+    const download = screen.getByRole('button', {
+      name: 'Download artifact: DiagnosticReport · produce-report · publication / opaque'
+    })
+
     expect(download.getAttribute('href')).toBeNull()
     fireEvent.click(download)
     await waitFor(() =>
-      expect(downloadWorkflowArtifact).toHaveBeenCalledWith('run / one', 'publication / opaque', 'default')
+      expect(downloadWorkflowArtifact).toHaveBeenCalledWith(
+        'run / one',
+        'publication / opaque',
+        'default',
+        expect.stringMatching(/^workflow-artifact-/)
+      )
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Preview artifact' }))
+    fireEvent.click(screen.getByRole('button', { name: /Preview artifact:/ }))
 
     await waitFor(() => expect(getWorkflowArtifactPreview).toHaveBeenCalledWith('run / one', 'publication / opaque'))
     expect((await screen.findByRole('region', { name: 'Artifact preview' })).textContent).toContain(
@@ -124,8 +140,8 @@ describe('TypedArtifactView', () => {
 
     expect(screen.getByText('application/x-future-artifact')).toBeTruthy()
     expect(screen.getByText('Preview unavailable for this media type. Download remains available.')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Preview artifact' })).toBeNull()
-    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Preview artifact:/ })).toBeNull()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
     expect(getWorkflowArtifactPreview).not.toHaveBeenCalled()
   })
 
@@ -140,7 +156,7 @@ describe('TypedArtifactView', () => {
     } satisfies WorkflowArtifactPreview)
 
     renderView([artifact({ publication_id: 'json-large' })])
-    fireEvent.click(screen.getByRole('button', { name: 'Preview artifact' }))
+    fireEvent.click(screen.getByRole('button', { name: /Preview artifact:/ }))
 
     expect(
       await screen.findByText('The bounded preview is incomplete. Download the artifact to inspect it.')
@@ -150,11 +166,11 @@ describe('TypedArtifactView', () => {
     cleanup()
     getWorkflowArtifactPreview.mockRejectedValueOnce(new Error('preview unavailable'))
     renderView([artifact({ media_type: 'text/markdown; charset=utf-8', publication_id: 'text-failure' })])
-    fireEvent.click(screen.getByRole('button', { name: 'Preview artifact' }))
+    fireEvent.click(screen.getByRole('button', { name: /Preview artifact:/ }))
 
     expect(await screen.findByText('Could not load artifact preview')).toBeTruthy()
     expect(screen.getByText('DiagnosticReport')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
   })
 
   it('keeps pending, cancellation, and retryable download errors inside the artifact row', async () => {
@@ -167,19 +183,84 @@ describe('TypedArtifactView', () => {
     )
 
     renderView([artifact()])
-    fireEvent.click(screen.getByRole('button', { name: 'Download artifact' }))
-    expect(await screen.findByRole('button', { name: 'Downloading artifact' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Download artifact:/ }))
+    expect(await screen.findByRole('button', { name: /Downloading artifact:/ })).toBeTruthy()
 
     resolveDownload({ status: 'cancelled' })
     expect(await screen.findByText('Download canceled.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
 
     downloadWorkflowArtifact.mockRejectedValueOnce(new Error('gateway unavailable'))
-    fireEvent.click(screen.getByRole('button', { name: 'Download artifact' }))
+    fireEvent.click(screen.getByRole('button', { name: /Download artifact:/ }))
 
     expect(await screen.findByText('Could not download artifact')).toBeTruthy()
     expect(screen.getByText('The download failed. Try again.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
+  })
+
+  it('gives repeated artifact rows unique accessible actions and announces async errors', async () => {
+    downloadWorkflowArtifact.mockRejectedValue(new Error('network failed'))
+    renderView([
+      artifact({ node_id: 'producer-a', publication_id: 'publication-a' }),
+      artifact({ node_id: 'producer-b', publication_id: 'publication-b' })
+    ])
+
+    expect(
+      screen.getByRole('button', { name: 'Preview artifact: DiagnosticReport · producer-a · publication-a' })
+    ).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: 'Download artifact: DiagnosticReport · producer-a · publication-a' })
+    ).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: 'Download artifact: DiagnosticReport · producer-b · publication-b' })
+    ).toBeTruthy()
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Download artifact: DiagnosticReport · producer-b · publication-b' })
+    )
+    expect((await screen.findByRole('alert')).textContent).toContain('Could not download artifact')
+  })
+
+  it('cancels and ignores stale download settlement when profile and run context change', async () => {
+    let resolveOld!: (value: { status: 'cancelled' }) => void
+
+    const oldRequest = new Promise<{ status: 'cancelled' }>(resolve => {
+      resolveOld = resolve
+    })
+
+    downloadWorkflowArtifact
+      .mockReturnValueOnce(oldRequest)
+      .mockResolvedValueOnce({ filename: 'new.json', mediaType: 'application/json', sizeBytes: 2, status: 'saved' })
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const rendered = render(
+      <QueryClientProvider client={client}>
+        {view([artifact({ publication_id: 'old-publication' })], 'old-run')}
+      </QueryClientProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Download artifact:.*old-publication/ }))
+    await waitFor(() => expect(downloadWorkflowArtifact).toHaveBeenCalledTimes(1))
+
+    apiRequestState.profile = 'new-profile'
+    rendered.rerender(
+      <QueryClientProvider client={client}>
+        {view([artifact({ node_id: 'new-producer', publication_id: 'new-publication' })], 'new-run')}
+      </QueryClientProvider>
+    )
+
+    const newAction = await screen.findByRole('button', { name: /Download artifact:.*new-publication/ })
+    expect((newAction as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(newAction)
+    await waitFor(() => expect(downloadWorkflowArtifact).toHaveBeenCalledTimes(2))
+    expect(cancelWorkflowArtifactDownload).toHaveBeenCalledTimes(1)
+
+    resolveOld({ status: 'cancelled' })
+    await waitFor(() => expect(screen.queryByText('Download canceled.')).toBeNull())
+    expect(
+      (screen.getByRole('button', { name: /Download artifact:.*new-publication/ }) as HTMLButtonElement).disabled
+    ).toBe(false)
   })
 
   it('isolates preview state by selection so a stale response cannot replace newer intent', async () => {
@@ -207,8 +288,8 @@ describe('TypedArtifactView', () => {
       artifact({ media_type: 'text/markdown; charset=utf-8', publication_id: 'second' })
     ])
     const rows = screen.getAllByRole('listitem')
-    fireEvent.click(within(rows[0]!).getByRole('button', { name: 'Preview artifact' }))
-    fireEvent.click(within(rows[1]!).getByRole('button', { name: 'Preview artifact' }))
+    fireEvent.click(within(rows[0]!).getByRole('button', { name: /Preview artifact:/ }))
+    fireEvent.click(within(rows[1]!).getByRole('button', { name: /Preview artifact:/ }))
 
     expect(await screen.findByText('second')).toBeTruthy()
     resolveFirst({

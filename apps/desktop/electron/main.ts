@@ -6079,14 +6079,15 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
 function fetchWorkflowArtifactResource(
   url: string,
   auth: WorkflowArtifactDownloadAuth,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ) {
   return auth.kind === 'cookie'
     ? fetchWorkflowArtifactWithOauthCookie(url, maxBytes, DEFAULT_FETCH_TIMEOUT_MS, {
         getSession: getOauthSession,
         request: options => electronNet.request(options as any) as any
-      })
-    : fetchWorkflowArtifactWithToken(url, auth, maxBytes, DEFAULT_FETCH_TIMEOUT_MS)
+      }, signal)
+    : fetchWorkflowArtifactWithToken(url, auth, maxBytes, DEFAULT_FETCH_TIMEOUT_MS, signal)
 }
 
 // ---------------------------------------------------------------------------
@@ -9711,8 +9712,7 @@ registerWorkflowArtifactDownloadIpc({
         profileRemoteOverride: profileHasRemoteOverride(profile)
       })
   },
-  ipcMain,
-  writeFile: (filePath, bytes) => fs.promises.writeFile(filePath, Buffer.from(bytes))
+  ipcMain
 })
 
 ipcMain.handle('hermes:api:structured', async (_event, request) => {

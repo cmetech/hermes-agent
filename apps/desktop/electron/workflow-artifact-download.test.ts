@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { pathWithGlobalRemoteProfile } from './connection-config'
 import {
+  atomicReplaceWorkflowArtifact,
   collectWorkflowArtifactResponse,
   downloadWorkflowArtifactWithDeps,
   fetchWorkflowArtifactWithOauthCookie,
@@ -113,10 +114,66 @@ function deps(overrides: Partial<WorkflowArtifactDownloadDeps> = {}): WorkflowAr
 
 const request = {
   path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download',
-  profile: 'remote-profile'
+  profile: 'remote-profile',
+  requestId: 'request-1'
 }
 
 describe('downloadWorkflowArtifactWithDeps', () => {
+  it('atomically overwrites an approved destination and replaces a symlink without following it', async () => {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-workflow-atomic-'))
+    const destination = path.join(tempDir, 'artifact.json')
+    const symlinkTarget = path.join(tempDir, 'target.json')
+
+    try {
+      await fs.promises.writeFile(destination, 'old-content')
+      await atomicReplaceWorkflowArtifact(destination, new TextEncoder().encode('new-content'))
+      await expect(fs.promises.readFile(destination, 'utf8')).resolves.toBe('new-content')
+
+      await fs.promises.writeFile(symlinkTarget, 'target-must-survive')
+      await fs.promises.unlink(destination)
+      await fs.promises.symlink(symlinkTarget, destination)
+      await atomicReplaceWorkflowArtifact(destination, new TextEncoder().encode('replacement'))
+
+      await expect(fs.promises.readFile(symlinkTarget, 'utf8')).resolves.toBe('target-must-survive')
+      await expect(fs.promises.readFile(destination, 'utf8')).resolves.toBe('replacement')
+      expect((await fs.promises.lstat(destination)).isSymbolicLink()).toBe(false)
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an existing destination and removes same-directory temp residue after a partial write failure', async () => {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-workflow-atomic-failure-'))
+    const destination = path.join(tempDir, 'artifact.json')
+    await fs.promises.writeFile(destination, 'verified-original')
+
+    try {
+      await expect(
+        atomicReplaceWorkflowArtifact(destination, new TextEncoder().encode('replacement'), {
+          open: async (...args) => {
+            const handle = await fs.promises.open(...args)
+
+            return {
+              close: () => handle.close(),
+              sync: () => handle.sync(),
+              writeFile: async bytes => {
+                await handle.write(bytes.subarray(0, 3))
+                throw new Error('injected partial write failure')
+              }
+            }
+          },
+          rename: fs.promises.rename,
+          unlink: fs.promises.unlink
+        })
+      ).rejects.toThrow('injected partial write failure')
+
+      await expect(fs.promises.readFile(destination, 'utf8')).resolves.toBe('verified-original')
+      expect((await fs.promises.readdir(tempDir)).filter(name => name.includes('.tmp'))).toEqual([])
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   it('maps static and native OAuth credentials to the established request headers', () => {
     expect(workflowArtifactAuthHeaders({ kind: 'token', token: 'local-session-token' })).toEqual({
       'X-Hermes-Session-Token': 'local-session-token'
@@ -190,6 +247,75 @@ describe('downloadWorkflowArtifactWithDeps', () => {
       ).rejects.toThrow('Workflow artifact exceeds the download limit')
     } finally {
       await server.close()
+    }
+  })
+
+  it('enforces an absolute token deadline through body completion and closes the response', async () => {
+    let responseClosed = false
+
+    const server = await listen((_request, response) => {
+      response.writeHead(200, {
+        'Content-Disposition': 'attachment; filename="slow.bin"',
+        'Content-Type': 'application/octet-stream'
+      })
+      const interval = setInterval(() => response.write('x'), 15)
+      response.on('close', () => {
+        responseClosed = true
+        clearInterval(interval)
+      })
+    })
+
+    try {
+      await expect(
+        fetchWorkflowArtifactWithToken(
+          `${server.baseUrl}/trickle`,
+          { kind: 'token', token: 'static-secret' },
+          WORKFLOW_ARTIFACT_MAX_BYTES,
+          45
+        )
+      ).rejects.toThrow('deadline')
+      await vi.waitFor(() => expect(responseClosed).toBe(true))
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('rejects same-origin, cross-origin, and looping redirects without forwarding credentials', async () => {
+    let sourceRequests = 0
+    let targetRequests = 0
+
+    const target = await listen((_request, response) => {
+      targetRequests += 1
+      response.end('must not reach target')
+    })
+
+    const source = await listen((request, response) => {
+      sourceRequests += 1
+
+      const location =
+        request.url === '/cross' ? `${target.baseUrl}/artifact` : request.url === '/loop' ? '/loop' : '/artifact'
+
+      response.writeHead(302, { Location: location })
+      response.end()
+    })
+
+    try {
+      for (const route of ['same', 'cross', 'loop']) {
+        await expect(
+          fetchWorkflowArtifactWithToken(
+            `${source.baseUrl}/${route}`,
+            { kind: 'bearer', token: 'must-not-forward' },
+            WORKFLOW_ARTIFACT_MAX_BYTES,
+            1_000
+          )
+        ).rejects.toThrow('redirect')
+      }
+
+      expect(sourceRequests).toBe(3)
+      expect(targetRequests).toBe(0)
+    } finally {
+      await source.close()
+      await target.close()
     }
   })
 
@@ -310,8 +436,7 @@ describe('downloadWorkflowArtifactWithDeps', () => {
             profileRemoteOverride: false
           })
       },
-      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
-      writeFile: fs.promises.writeFile
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
     })
 
     try {
@@ -350,8 +475,7 @@ describe('downloadWorkflowArtifactWithDeps', () => {
         resolveOauthAuth: vi.fn(),
         routePath: value => value
       },
-      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
-      writeFile: fs.promises.writeFile
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
     })
 
     try {
@@ -363,6 +487,39 @@ describe('downloadWorkflowArtifactWithDeps', () => {
     } finally {
       await fs.promises.rm(tempDir, { recursive: true, force: true })
     }
+  })
+
+  it('cancels an in-flight request by request id and never opens a late dialog', async () => {
+    const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
+    const showSaveDialog = vi.fn()
+    let transportSignal: AbortSignal | undefined
+
+    registerWorkflowArtifactDownloadIpc({
+      browserWindow: { fromWebContents: () => ({ isDestroyed: () => false }) },
+      dialog: { showSaveDialog },
+      download: {
+        ensureBackend: async () => ({ authMode: 'token', baseUrl: 'http://127.0.0.1:8899', token: 'token' }),
+        fetchResource: (_url, _auth, _maxBytes, signal) => {
+          transportSignal = signal
+
+          return new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+          })
+        },
+        resolveOauthAuth: vi.fn(),
+        routePath: value => value
+      },
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
+    })
+
+    const pending = handlers.get('hermes:workflow-artifact:download')!({ sender: {} }, request)
+    await vi.waitFor(() => expect(transportSignal).toBeDefined())
+    await expect(
+      handlers.get('hermes:workflow-artifact:cancel')!({}, { requestId: request.requestId })
+    ).resolves.toEqual({ cancelled: true })
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(transportSignal?.aborted).toBe(true)
+    expect(showSaveDialog).not.toHaveBeenCalled()
   })
 
   it('aborts before buffering a response whose recorded size exceeds the producer limit', async () => {
@@ -466,7 +623,10 @@ describe('downloadWorkflowArtifactWithDeps', () => {
     const invalidDeps = deps()
 
     await expect(
-      downloadWorkflowArtifactWithDeps({ path: 'https://attacker.example/artifact', profile: 'default' }, invalidDeps)
+      downloadWorkflowArtifactWithDeps(
+        { path: 'https://attacker.example/artifact', profile: 'default', requestId: 'invalid-request' },
+        invalidDeps
+      )
     ).rejects.toThrow('Invalid workflow artifact download path')
     expect(invalidDeps.ensureBackend).not.toHaveBeenCalled()
 
