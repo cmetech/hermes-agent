@@ -204,3 +204,103 @@ Result: Ruff and the whitespace check passed.
 - `tests/plugins/workflow/test_api_runtime.py`
 - `tests/plugins/workflow/test_desktop_api.py`
 - `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`
+
+## Quality fix round 1/5
+
+The quality/security review findings are corrected in a second follow-up
+commit.
+
+Metadata-only loading now separates three concerns. Versioned typed
+descriptors are always validated against the sealed declarations, descriptor
+schema, publication-ID uniqueness, winning attempt, and attempt-local path.
+Legacy migration remains enabled only for explicit recovery loads because it
+may open legacy bundles. Publication bundle and mirror recovery likewise
+remain exclusive to explicit recovery loads. Metadata-only loads reject
+unversioned typed descriptors without opening bodies, and semantic validation
+finishes before any index synchronization or repair-verification transition.
+
+Retryable descriptor-relative read failures now retain a distinct
+`PublicationUnavailableError` at the store boundary. Preview and download
+return HTTP 503 with
+`artifact_temporarily_unavailable` and `retryable: true`, without creating a
+durable `typed_publication_integrity` marker. This applies to both requested
+content and transient sealed-definition access, including store startup
+reconciliation. Removing the injected fault allows the same request to
+succeed. Deterministic descriptor and content contradictions retain their
+409 integrity response and repair transition.
+
+JSON preview now rejects duplicate keys and non-finite values recursively,
+reserializes with sorted keys, compact separators, UTF-8, and `allow_nan=False`,
+and requires exact byte equality with the verified publication. Overflowing
+numbers, excessive nesting, duplicate keys, noncanonical whitespace/order,
+Unicode errors, and canonicalization failures are converted to the bounded
+409 typed-publication-integrity response.
+
+The non-authoritative workflow-catalog body test was removed. It used the
+wrong store root and tested a workflow-definition catalog that does not
+consume run publications. The real run-list and coordinator tests remain and
+use checked `RunStore` publications with exact canonical body-read traps.
+
+### Quality-round TDD evidence
+
+Focused tests were added and observed failing before production edits:
+
+- queued coordinator checked-descriptor matrix: 0 passed, 7 failed; all seven
+  corrupt variants were accepted instead of raising `JournalRecoveryError`;
+- `GET /runs` checked-descriptor matrix: 0 passed, 7 failed; all seven variants
+  were returned as authoritative metadata;
+- transient requested-content and sealed-definition access across preview and
+  download: 0 passed, 4 failed; every response was 409 instead of 503;
+- unsafe/noncanonical JSON: 0 passed, 4 failed; overflowing numbers and deep
+  nesting returned 500, while duplicate keys and noncanonical bytes returned
+  200.
+
+The checked-descriptor variants cover unknown media, boolean size, duplicate
+publication IDs, a non-winning attempt, sealed `output_type` mismatch, sealed
+schema mismatch, and an unversioned legacy descriptor.
+
+Focused GREEN:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py -k 'queued_coordinator_rejects_corrupt_checked_typed_metadata_without_body_reads or runs_list_rejects_corrupt_checked_typed_metadata_without_body_reads or artifact_endpoints_preserve_retryable_publication_unavailability or json_artifact_preview_rejects_noncanonical_or_unsafe_json or json_artifact_preview_is_complete_or_omitted or json_artifact_preview_rejects_noncanonical_nonfinite_content or never_opens_real_artifact_bodies' -vv
+```
+
+Fresh result: 2 files, 27 passed, 0 failed. This includes the 14 descriptor
+cases, four transient cases, four new JSON cases, three existing JSON
+contracts, and two real-publication body-free checks.
+
+### Quality-round verification
+
+Exact Task 10 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 5 files, 247 passed, 0 failed.
+
+Store, coordinator, and Task 9 typed-publication recovery/security:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_store.py tests/plugins/workflow/test_coordinator.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 6 files, 145 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/evidence.py plugins/workflow/dashboard/plugin_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Quality-round files changed
+
+- `plugins/workflow/store.py`
+- `plugins/workflow/dashboard/plugin_api.py`
+- `tests/plugins/workflow/test_api_runtime.py`
+- `tests/plugins/workflow/test_desktop_api.py`
+- `tests/plugins/workflow/test_workflow_detail_api.py`
+- `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ from plugins.workflow.coordinator_store import (
 )
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.output_resolution import ArchonOutputUnavailableError
 from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
@@ -207,6 +209,48 @@ def _published_run(
         if "publication_id" in item
     )
     return store, admitted, artifact
+
+
+def _forge_checked_typed_descriptor(
+    store: RunStore,
+    run_id: str,
+    corruption: str,
+) -> tuple[str, str]:
+    projection = store.load_run(run_id)
+    artifacts = deepcopy(projection["artifacts"])
+    descriptor = next(
+        artifact for artifact in artifacts if "publication_id" in artifact
+    )
+    updates: dict[str, object] = {"artifacts": artifacts}
+    if corruption == "unknown_media":
+        descriptor["media_type"] = "application/octet-stream"
+    elif corruption == "invalid_size_type":
+        descriptor["size_bytes"] = True
+    elif corruption == "duplicate_publication_id":
+        artifacts.append(dict(descriptor))
+    elif corruption == "non_winning_attempt":
+        nodes = deepcopy(projection["nodes"])
+        winner = next(
+            attempt
+            for attempt in nodes[descriptor["node_id"]]["attempts"]
+            if attempt["attempt_id"] == descriptor["attempt_id"]
+        )
+        winner["state"] = "failed"
+        updates["nodes"] = nodes
+    elif corruption == "sealed_output_type_mismatch":
+        descriptor["output_type"] = "ForgedOutputType"
+    elif corruption == "sealed_schema_mismatch":
+        descriptor["schema_fingerprint"] = "f" * 64
+    elif corruption == "legacy_unversioned":
+        descriptor.pop("typed_publication_version")
+    else:
+        raise AssertionError(f"unknown corruption fixture: {corruption}")
+    store.append_event(
+        run_id,
+        "forged_typed_descriptor",
+        projection_updates=updates,
+    )
+    return descriptor["publication_id"], descriptor["content_name"]
 
 
 def _trusted_catalog_workflow(home, workflow_writer, *, name, nodes=None, **options):
@@ -3028,6 +3072,75 @@ def test_runs_list_never_opens_real_artifact_bodies(
     )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "unknown_media",
+        "invalid_size_type",
+        "duplicate_publication_id",
+        "non_winning_attempt",
+        "sealed_output_type_mismatch",
+        "sealed_schema_mismatch",
+        "legacy_unversioned",
+    ],
+)
+def test_runs_list_rejects_corrupt_checked_typed_metadata_without_body_reads(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    corruption,
+) -> None:
+    home = tmp_path / f"home-list-corrupt-{corruption}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"list-corrupt-{corruption}",
+        data=b"CORRUPT_LIST_PUBLICATION_BODY",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_id, content_name = _forge_checked_typed_descriptor(
+        store,
+        admitted.run_id,
+        corruption,
+    )
+    publication_path = f"publications/{publication_id}/{content_name}"
+    real_read = store_module._read_descriptor_relative
+
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail(
+                "run-list metadata validation must not open publication bodies"
+            )
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
+    )
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/runs?view=all"
+    )
+
+    assert response.status_code == 200
+    listed = next(
+        run
+        for run in response.json()["runs"]
+        if run["run_id"] == admitted.run_id
+    )
+    assert listed["status_authoritative"] is False
+    assert listed["health"] == "storage_degraded"
+    assert "typed_publication_integrity" in store._active_run_repair_reasons(
+        admitted.run_id
+    )
+
+
 def test_text_artifact_preview_is_bounded_and_download_streams_verified_bytes(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -3117,6 +3230,77 @@ def test_artifact_preview_and_download_accept_producer_metadata_boundary(
     assert len(evidence.content) < 40_000
 
 
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+@pytest.mark.parametrize("fault_target", ["content", "sealed_definition"])
+def test_artifact_endpoints_preserve_retryable_publication_unavailability(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    endpoint,
+    fault_target,
+) -> None:
+    home = tmp_path / f"home-unavailable-{endpoint}-{fault_target}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"unavailable-{endpoint}-{fault_target}",
+        data=b"retryable publication",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_path = (
+        f"publications/{artifact['publication_id']}/{artifact['content_name']}"
+    )
+    target = (
+        publication_path
+        if fault_target == "content"
+        else "definition.yaml"
+    )
+    fault_active = True
+    real_read = store_module._read_descriptor_relative
+
+    def transient_read_failure(directory, relative_path, *, size_bytes):
+        if fault_active and str(relative_path) == target:
+            raise ArchonOutputUnavailableError(
+                "injected transient publication read failure"
+            )
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        transient_read_failure,
+    )
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        unavailable = client.get(f"{base}/{endpoint}")
+        fault_active = False
+        recovered = client.get(f"{base}/{endpoint}")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        "detail": {
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        }
+    }
+    assert "typed_publication_integrity" not in (
+        store._active_run_repair_reasons(admitted.run_id)
+    )
+    assert recovered.status_code == 200
+
+
 @pytest.mark.parametrize(
     ("data", "expected_content", "expected_bytes", "truncated"),
     [
@@ -3191,6 +3375,53 @@ def test_json_artifact_preview_rejects_noncanonical_nonfinite_content(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "typed_publication_integrity"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b'{"value":1e10000}',
+        b"[" * 1_200 + b"0" + b"]" * 1_200,
+        b'{"a":1,"a":2}',
+        b'{ "b":2, "a":1 }',
+    ],
+    ids=[
+        "overflowing-number",
+        "excessive-nesting",
+        "duplicate-keys",
+        "noncanonical-bytes",
+    ],
+)
+def test_json_artifact_preview_rejects_noncanonical_or_unsafe_json(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    data,
+) -> None:
+    home = tmp_path / f"home-invalid-json-{sha256(data).hexdigest()[:8]}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"invalid-json-{sha256(data).hexdigest()[:8]}",
+        data=data,
+        media_type="application/json",
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "typed_publication_integrity"}
+    }
+    assert len(response.content) < 256
 
 
 @pytest.mark.parametrize(

@@ -39,6 +39,7 @@ from plugins.workflow.compat import (
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.output_resolution import ArchonOutputUnavailableError
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
     WorkflowApiLimits,
@@ -54,6 +55,7 @@ from plugins.workflow.store import (
     JournalRecoveryError,
     PublicationIntegrityError,
     PublicationNotFoundError,
+    PublicationUnavailableError,
     RunStore,
     VerifiedPublication,
 )
@@ -73,6 +75,17 @@ _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
 
 def _reject_nonfinite_json(value: str):
     raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -1663,6 +1676,8 @@ def _verified_publication(
             status_code=404,
             detail={"code": "artifact_not_found"},
         ) from exc
+    except PublicationUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
     except (PublicationIntegrityError, JournalRecoveryError) as exc:
         raise HTTPException(
             status_code=409,
@@ -1673,6 +1688,16 @@ def _verified_publication(
             status_code=404,
             detail={"code": "run_not_found"},
         ) from exc
+
+
+def _artifact_temporarily_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        },
+    )
 
 
 def _artifact_preview_payload(
@@ -1688,8 +1713,26 @@ def _artifact_preview_payload(
                 content = json.loads(
                     publication.content.decode("utf-8"),
                     parse_constant=_reject_nonfinite_json,
+                    object_pairs_hook=_reject_duplicate_json_keys,
                 )
-            except (UnicodeDecodeError, ValueError) as exc:
+                canonical = json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                if canonical != publication.content:
+                    raise ValueError(
+                        "JSON publication bytes are not canonical"
+                    )
+            except (
+                OverflowError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+            ) as exc:
                 raise PublicationIntegrityError(
                     "canonical JSON publication is invalid"
                 ) from exc
@@ -1725,20 +1768,23 @@ def artifact_preview(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
-    with _store_lease() as store:
-        publication = _verified_publication(
-            store,
-            run_id,
-            publication_id,
-            operator,
-        )
-        try:
-            return _artifact_preview_payload(publication)
-        except PublicationIntegrityError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "typed_publication_integrity"},
-            ) from exc
+    try:
+        with _store_lease() as store:
+            publication = _verified_publication(
+                store,
+                run_id,
+                publication_id,
+                operator,
+            )
+    except ArchonOutputUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
+    try:
+        return _artifact_preview_payload(publication)
+    except PublicationIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "typed_publication_integrity"},
+        ) from exc
 
 
 @router.get("/runs/{run_id}/artifacts/{publication_id}/download")
@@ -1750,13 +1796,16 @@ def artifact_download(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
-    with _store_lease() as store:
-        publication = _verified_publication(
-            store,
-            run_id,
-            publication_id,
-            operator,
-        )
+    try:
+        with _store_lease() as store:
+            publication = _verified_publication(
+                store,
+                run_id,
+                publication_id,
+                operator,
+            )
+    except ArchonOutputUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
     filename = f"{publication.publication_id}-{publication.content_name}"
     return StreamingResponse(
         iter((publication.content,)),

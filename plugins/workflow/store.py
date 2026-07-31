@@ -112,6 +112,10 @@ class PublicationIntegrityError(RuntimeError):
     """A requested publication failed descriptor or content verification."""
 
 
+class PublicationUnavailableError(RuntimeError):
+    """A requested publication could not be read due to a retryable host fault."""
+
+
 class ForegroundExecutionConflict(RuntimeError):
     """A foreground owner transition lost its exact state/epoch comparison."""
 
@@ -1020,12 +1024,9 @@ def _sealed_typed_output_declarations(
                 size_bytes=observed.st_size,
             )
         )
-    except (
-        ArchonOutputIntegrityError,
-        ArchonOutputUnavailableError,
-        OSError,
-        yaml.YAMLError,
-    ) as exc:
+    except ArchonOutputUnavailableError:
+        raise
+    except (ArchonOutputIntegrityError, OSError, yaml.YAMLError) as exc:
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc
@@ -1306,6 +1307,32 @@ def _journaled_typed_publications(
                 "typed publication descriptor conflicts with sealed output authority"
             )
     return tuple(descriptors)
+
+
+def _validate_typed_publication_metadata(
+    directory: Path,
+    projection: Mapping[str, object],
+    *,
+    migrate_legacy: bool,
+) -> int:
+    """Validate descriptor authority without opening versioned publication bodies."""
+    declared_outputs = _sealed_typed_output_declarations(
+        directory,
+        projection,
+    )
+    migrated = (
+        _migrate_legacy_typed_publication_descriptors(
+            directory,
+            projection,
+        )
+        if migrate_legacy
+        else 0
+    )
+    _journaled_typed_publications(
+        projection,
+        declared_outputs,
+    )
+    return migrated
 
 
 def _write_or_reuse_typed_approval_output(
@@ -2851,13 +2878,15 @@ class RunStore:
         directory: Path,
         *,
         run_id: str,
-        validate_typed_publications: bool = True,
+        migrate_legacy_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         with workflow_lock(self._run_lock_path(run_id)):
             return self._corroborate_run_evidence_locked(
                 directory,
                 run_id=run_id,
-                validate_typed_publications=validate_typed_publications,
+                migrate_legacy_typed_publications=(
+                    migrate_legacy_typed_publications
+                ),
             )
 
     def _corroborate_run_evidence_locked(
@@ -2867,7 +2896,7 @@ class RunStore:
         run_id: str,
         projection_data: bytes | None = None,
         journal_data: bytes | None = None,
-        validate_typed_publications: bool = True,
+        migrate_legacy_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         if (projection_data is None) != (journal_data is None):
             raise ValueError("projection and journal snapshots must be paired")
@@ -2885,7 +2914,9 @@ class RunStore:
             directory,
             run_id=run_id,
             journal_data=journal_data,
-            validate_typed_publications=validate_typed_publications,
+            migrate_legacy_typed_publications=(
+                migrate_legacy_typed_publications
+            ),
         )
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
@@ -3009,7 +3040,7 @@ class RunStore:
         directory: Path,
         projection: Mapping[str, object],
         *,
-        validate_typed_publications: bool = True,
+        migrate_legacy_typed_publications: bool = True,
     ) -> None:
         journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
         scheduled_at = self._scheduled_at_from_projection(projection)
@@ -3059,7 +3090,9 @@ class RunStore:
             corroborated, _, journal_sha256 = self._corroborate_run_evidence_locked(
                 directory,
                 run_id=str(projection["run_id"]),
-                validate_typed_publications=validate_typed_publications,
+                migrate_legacy_typed_publications=(
+                    migrate_legacy_typed_publications
+                ),
             )
         except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
             self._mark_repair_required(
@@ -5140,33 +5173,13 @@ class RunStore:
                         outcome="repair_required",
                     )
                     raise
-                if journal_current and not recover_typed_publications:
-                    self._sync_loaded_integrity(
-                        directory,
-                        projection,
-                        validate_typed_publications=False,
-                    )
-                    self._transition_run_repair(
-                        "run_evidence_uncorroborated",
-                        run_id=run_id,
-                        outcome="repair_verified",
-                    )
-                    return projection
                 if journal_current:
                     try:
-                        declared_outputs = _sealed_typed_output_declarations(
+                        migrated = _validate_typed_publication_metadata(
                             directory,
                             projection,
+                            migrate_legacy=recover_typed_publications,
                         )
-                        migrated = _migrate_legacy_typed_publication_descriptors(
-                            directory,
-                            projection,
-                        )
-                        if migrated:
-                            _journaled_typed_publications(
-                                projection,
-                                declared_outputs,
-                            )
                     except JournalRecoveryError:
                         self._transition_run_repair(
                             "typed_publication_integrity",
@@ -5174,6 +5187,18 @@ class RunStore:
                             outcome="repair_required",
                         )
                         raise
+                    if not recover_typed_publications:
+                        self._sync_loaded_integrity(
+                            directory,
+                            projection,
+                            migrate_legacy_typed_publications=False,
+                        )
+                        self._transition_run_repair(
+                            "run_evidence_uncorroborated",
+                            run_id=run_id,
+                            outcome="repair_verified",
+                        )
+                        return projection
                     if migrated:
                         self._append_locked(
                             directory,
@@ -5203,7 +5228,9 @@ class RunStore:
                 rebuilt = self._rebuild_projection(
                     directory,
                     run_id=run_id,
-                    validate_typed_publications=recover_typed_publications,
+                    migrate_legacy_typed_publications=(
+                        recover_typed_publications
+                    ),
                 )
             except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
                 # Projection replay is confined to this run. Cross-run/index
@@ -5260,10 +5287,23 @@ class RunStore:
         """Authorize and verify one checked publication without sweeping siblings."""
         # Metadata loading performs run/scope authorization before the caller's
         # opaque ID is examined and never opens typed-publication bodies.
-        projection = self._load_run_metadata(
-            run_id,
-            operator_scope=operator_scope,
-        )
+        try:
+            projection = self._load_run_metadata(
+                run_id,
+                operator_scope=operator_scope,
+            )
+        except ArchonOutputUnavailableError as exc:
+            raise PublicationUnavailableError(
+                "publication metadata is temporarily unavailable"
+            ) from exc
+        except JournalRecoveryError as exc:
+            if "typed_publication_integrity" in (
+                self._active_run_repair_reasons(run_id)
+            ):
+                raise PublicationIntegrityError(
+                    "publication descriptor is not corroborated"
+                ) from exc
+            raise
         if (
             not isinstance(publication_id, str)
             or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
@@ -5320,9 +5360,12 @@ class RunStore:
                     )
             except PublicationNotFoundError:
                 raise
+            except ArchonOutputUnavailableError as exc:
+                raise PublicationUnavailableError(
+                    "publication content is temporarily unavailable"
+                ) from exc
             except (
                 ArchonOutputIntegrityError,
-                ArchonOutputUnavailableError,
                 JournalRecoveryError,
                 OSError,
                 PublicationIntegrityError,
@@ -5478,7 +5521,7 @@ class RunStore:
         *,
         run_id: str,
         journal_data: bytes | None = None,
-        validate_typed_publications: bool = True,
+        migrate_legacy_typed_publications: bool = True,
     ) -> dict[str, object]:
         latest = None
         latest_migration_count = 0
@@ -5502,26 +5545,23 @@ class RunStore:
                     raise JournalRecoveryError("journal projection sequence mismatch")
                 if checksum != _projection_digest(snapshot):
                     raise JournalRecoveryError("journal projection digest mismatch")
-                if validate_typed_publications:
-                    try:
-                        declared_outputs = _sealed_typed_output_declarations(
+                try:
+                    latest_migration_count = (
+                        _validate_typed_publication_metadata(
                             directory,
                             snapshot,
+                            migrate_legacy=(
+                                migrate_legacy_typed_publications
+                            ),
                         )
-                        latest_migration_count = (
-                            _migrate_legacy_typed_publication_descriptors(
-                                directory,
-                                snapshot,
-                            )
-                        )
-                        _journaled_typed_publications(snapshot, declared_outputs)
-                    except JournalRecoveryError:
-                        self._transition_run_repair(
-                            "typed_publication_integrity",
-                            run_id=run_id,
-                            outcome="repair_required",
-                        )
-                        raise
+                    )
+                except JournalRecoveryError:
+                    self._transition_run_repair(
+                        "typed_publication_integrity",
+                        run_id=run_id,
+                        outcome="repair_required",
+                    )
+                    raise
                 latest = snapshot
             elif event.get("event_type") == "node_heartbeat" and latest is not None:
                 node = latest["nodes"].get(event.get("node_id"))
@@ -12440,6 +12480,7 @@ __all__ = [
     "NodeClaim",
     "PublicationIntegrityError",
     "PublicationNotFoundError",
+    "PublicationUnavailableError",
     "RunStore",
     "StorageQuotaError",
     "TypedPublicationCandidate",

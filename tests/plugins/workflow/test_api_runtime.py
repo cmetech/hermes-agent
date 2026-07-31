@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
@@ -16,6 +17,7 @@ from plugins.workflow.schema import load_workflow
 import plugins.workflow.store as store_module
 from plugins.workflow.store import (
     ArtifactRef,
+    JournalRecoveryError,
     RunStore,
     TypedPublicationCandidate,
 )
@@ -240,6 +242,109 @@ def test_queued_coordinator_candidate_scan_never_opens_real_artifact_bodies(
     assert any(
         candidate["run_id"] == run_id and candidate["status"] == "queued"
         for candidate in candidates
+    )
+
+
+def _forge_checked_typed_descriptor(
+    store: RunStore,
+    run_id: str,
+    corruption: str,
+) -> tuple[str, str]:
+    projection = store.load_run(run_id)
+    artifacts = deepcopy(projection["artifacts"])
+    descriptor = next(
+        artifact for artifact in artifacts if "publication_id" in artifact
+    )
+    updates: dict[str, object] = {"artifacts": artifacts}
+    if corruption == "unknown_media":
+        descriptor["media_type"] = "application/octet-stream"
+    elif corruption == "invalid_size_type":
+        descriptor["size_bytes"] = True
+    elif corruption == "duplicate_publication_id":
+        artifacts.append(dict(descriptor))
+    elif corruption == "non_winning_attempt":
+        nodes = deepcopy(projection["nodes"])
+        winner = next(
+            attempt
+            for attempt in nodes[descriptor["node_id"]]["attempts"]
+            if attempt["attempt_id"] == descriptor["attempt_id"]
+        )
+        winner["state"] = "failed"
+        updates["nodes"] = nodes
+    elif corruption == "sealed_output_type_mismatch":
+        descriptor["output_type"] = "ForgedOutputType"
+    elif corruption == "sealed_schema_mismatch":
+        descriptor["schema_fingerprint"] = "f" * 64
+    elif corruption == "legacy_unversioned":
+        descriptor.pop("typed_publication_version")
+    else:
+        raise AssertionError(f"unknown corruption fixture: {corruption}")
+    store.append_event(
+        run_id,
+        "forged_typed_descriptor",
+        projection_updates=updates,
+    )
+    return descriptor["publication_id"], descriptor["content_name"]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "unknown_media",
+        "invalid_size_type",
+        "duplicate_publication_id",
+        "non_winning_attempt",
+        "sealed_output_type_mismatch",
+        "sealed_schema_mismatch",
+        "legacy_unversioned",
+    ],
+)
+def test_queued_coordinator_rejects_corrupt_checked_typed_metadata_without_body_reads(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    corruption,
+) -> None:
+    store, run_id, _publication_id, _content_name = (
+        _queued_run_with_real_typed_publication(
+            tmp_path,
+            workflow_writer,
+            monkeypatch,
+        )
+    )
+    publication_id, content_name = _forge_checked_typed_descriptor(
+        store,
+        run_id,
+        corruption,
+    )
+    publication_path = f"publications/{publication_id}/{content_name}"
+    real_read = store_module._read_descriptor_relative
+
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail(
+                "coordinator metadata validation must not open publication bodies"
+            )
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
+    )
+
+    with pytest.raises(JournalRecoveryError):
+        store.coordinator_candidates(
+            after=None,
+            now=datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc),
+        )
+
+    assert "typed_publication_integrity" in store._active_run_repair_reasons(
+        run_id
     )
 
 
