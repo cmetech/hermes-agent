@@ -924,25 +924,41 @@ def test_concurrent_mirror_recovery_holds_one_profile_capacity_reservation(
             "stage",
             stop_after_requirement,
         )
-        calibration_run = prepare_pending("quota-calibration", b"0")
         concurrent_runs = (
             prepare_pending("quota-concurrent-a", b"1"),
             prepare_pending("quota-concurrent-b", b"2"),
         )
 
-    reservation_checks: list[int] = []
-    original_capacity_check = store._ensure_mirror_capacity
+    class ReservationCaptured(RuntimeError):
+        pass
 
-    def capture_capacity_check(mirror_bytes: int, required_bytes: int) -> None:
-        reservation_checks.append(required_bytes)
-        original_capacity_check(mirror_bytes, required_bytes)
+    def capture_preflight_reservation(run_id: str) -> int:
+        directory = store.run_directory(run_id)
+        journal_before = (directory / "events.jsonl").read_bytes()
+        profile_before = store._profile_storage_bytes()
+        reservation_checks: list[int] = []
 
-    with monkeypatch.context() as patch:
-        patch.setattr(store, "_ensure_mirror_capacity", capture_capacity_check)
-        store.load_run(calibration_run)
+        def capture_and_abort(_mirror_bytes: int, required_bytes: int) -> None:
+            reservation_checks.append(required_bytes)
+            raise ReservationCaptured("capacity preflight captured")
 
-    one_transaction_reserve = reservation_checks[0]
-    assert one_transaction_reserve > max(reservation_checks[1:], default=0)
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_ensure_mirror_capacity", capture_and_abort)
+            with pytest.raises(
+                ReservationCaptured,
+                match="capacity preflight captured",
+            ):
+                store.load_run(run_id)
+
+        assert len(reservation_checks) == 1
+        assert (directory / "events.jsonl").read_bytes() == journal_before
+        assert store._profile_storage_bytes() == profile_before
+        return reservation_checks[0]
+
+    transaction_reserves = tuple(
+        capture_preflight_reservation(run_id) for run_id in concurrent_runs
+    )
+    one_transaction_reserve = max(transaction_reserves)
     profile_before = store._profile_storage_bytes()
     store.max_profile_bytes = profile_before + one_transaction_reserve
     stage_barrier = threading.Barrier(3, timeout=1)
@@ -986,11 +1002,8 @@ def test_concurrent_mirror_recovery_holds_one_profile_capacity_reservation(
         "fake",
     )
     history = NodeSessionRegistry(home).list_mirror_history(key)
-    assert len(history) == 2
-    assert {record.run_id for record in history} == {
-        calibration_run,
-        concurrent_runs[outcomes.index("recovered")],
-    }
+    assert len(history) == 1
+    assert history[0].run_id == concurrent_runs[outcomes.index("recovered")]
 
 
 def test_publication_quota_failure_exposes_neither_content_nor_metadata(

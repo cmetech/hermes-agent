@@ -602,3 +602,99 @@ Result: Ruff and the whitespace check passed.
   would demonstrate continued traversal or mutation after the guard.
 
 Concerns: none within the spec-fix scope.
+
+## Quality Fix Round 4 — transaction-specific concurrency calibration
+
+The production reservation remains unchanged. The exact-budget concurrency
+test no longer derives its budget from a third, differently serialized run.
+It now probes each actual pending transaction through the real preflight
+capacity callback and deliberately aborts on that first callback. Each probe
+asserts that its journal bytes and aggregate profile bytes are unchanged,
+proving calibration stopped before requirement, stage, point, completion, or
+activation mutation. The concurrent launch receives the larger of those two
+observed bounds.
+
+Removing the calibration transaction also makes the final visibility
+assertion exact: mirror history contains only the one concurrent run that
+recovered. The other returns `quota`, no second entry is exposed, and aggregate
+profile usage remains at or below `max_profile_bytes`. No sleeps or runner
+retries were added.
+
+### RED and stability evidence
+
+Quality re-review 3 supplied the relevant RED evidence against the old
+calibration: the canonical runner's first attempt produced outcomes
+`["quota", "quota"]`, then passed only on file retry and emitted a `FLAKY`
+result.
+
+After transaction-specific calibration, the single concurrent selector was
+run once and then through ten additional fresh canonical-script invocations:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'concurrent_mirror_recovery_holds_one_profile_capacity_reservation' -q
+```
+
+Result: initial 1/1 plus 10/10 fresh stress invocations passed; 11 selected
+executions passed in total with no retry and no `FLAKY` output.
+
+The exact ten-case selector used by quality re-review 3 was also run in five
+fresh invocations:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'fresh_mirror_recovery_reserves_complete_transaction_before_requirement or pending_mirror_reserves_completion_before_pointing or concurrent_mirror_recovery_holds_one_profile_capacity_reservation or v2_descriptor or legacy_winner_authority or base_typed or mirror_obligation or mirror_profile_quota or swapped_root' -q
+```
+
+Result: 5/5 invocations and 50/50 selected executions passed with no retry or
+`FLAKY` output.
+
+### Verification
+
+The prior 21 quality executions were rerun as the round-3 reservation selector,
+the prior typed recovery selector, and the prior security selector:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'fresh_mirror_recovery_reserves_complete_transaction_before_requirement or pending_mirror_reserves_completion_before_pointing or concurrent_mirror_recovery_holds_one_profile_capacity_reservation' -q
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'swapped_root or base_typed or mirror_obligation or mirror_profile_quota or v2_descriptor or legacy_winner_authority or concurrent_mirror_recovery' -q
+scripts/run_tests.sh tests/plugins/workflow/test_security_boundaries.py -k 'swapped_parent or descriptor_relative_io or pending_current or malformed_scope or cross_scope_index' -q
+```
+
+Result: 3/3, 8/8, and 10/10 passed with no retry or `FLAKY` output.
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 142 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check tests/plugins/workflow/test_typed_publication_recovery.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Quality-fix self-review
+
+- Confirmed both bounds come from the exact runs later submitted to the thread
+  pool and are measured against the same untouched mirror baseline.
+- Confirmed probe abortion occurs on the one preflight callback, and the
+  journal/profile equality assertions would catch post-mutation calibration.
+- Confirmed the larger actual bound admits whichever transaction acquires the
+  capacity lock first while the first durable byte excludes the second.
+- Confirmed the final history, outcome counts, and profile ceiling still test
+  mutual exclusion and failure before exposure rather than masking timing.
+
+Concern: native non-POSIX behavior remains intentionally fail-closed and was
+not executed on this macOS host.
