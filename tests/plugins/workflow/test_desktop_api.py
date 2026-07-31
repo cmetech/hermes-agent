@@ -63,6 +63,7 @@ from plugins.workflow.store import (
     RunStore,
     TypedPublicationCandidate,
 )
+import plugins.workflow.store as store_module
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
@@ -138,15 +139,24 @@ def _published_run(
     data: bytes,
     media_type: str,
     scope: str | None = None,
+    output_type: str = "DesktopReport",
+    session_id: str | None = "desktop-artifact-session",
 ):
     workflow = workflow_writer(
         root,
         name=f"artifact-{root.name}",
-        nodes=[{
-            "id": "produce",
-            "bash": "true",
-            "output_type": "DesktopReport",
-        }],
+        nodes=[
+            {
+                "id": "produce",
+                "bash": "true",
+                "output_type": output_type,
+            },
+            {
+                "id": "finish",
+                "bash": "true",
+                "depends_on": ["produce"],
+            },
+        ],
     )
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n",
@@ -179,13 +189,13 @@ def _published_run(
         ),
         typed_publication=TypedPublicationCandidate(
             attempt_relative_path=relative_path,
-            output_type="DesktopReport",
+            output_type=output_type,
             media_type=media_type,
             size_bytes=len(data),
             sha256=digest,
             schema_fingerprint=None,
             canonicalization_version=1,
-            session_id="desktop-artifact-session",
+            session_id=session_id,
         ),
     )
     artifact = next(
@@ -2975,6 +2985,49 @@ def test_artifact_endpoints_require_verified_authentication(endpoint) -> None:
     }
 
 
+def test_runs_list_never_opens_real_artifact_bodies(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-list-metadata"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "list-metadata",
+        data=b"REAL_LIST_PUBLICATION_BODY",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_path = (
+        f"publications/{artifact['publication_id']}/{artifact['content_name']}"
+    )
+    real_read = store_module._read_descriptor_relative
+
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail("GET runs must not open publication bodies")
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
+    )
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/runs?view=all"
+    )
+
+    assert response.status_code == 200
+    assert any(
+        run["run_id"] == admitted.run_id
+        for run in response.json()["runs"]
+    )
+
+
 def test_text_artifact_preview_is_bounded_and_download_streams_verified_bytes(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -3015,6 +3068,53 @@ def test_text_artifact_preview_is_bounded_and_download_streams_verified_bytes(
     assert download.headers["content-disposition"] == (
         f'attachment; filename="{publication_id}-content.md"'
     )
+
+
+def test_artifact_preview_and_download_accept_producer_metadata_boundary(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-metadata-boundary"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    output_type = "O" * 16_384
+    session_id = "S" * 16_384
+    body = b"BOUNDARY_BODY_MUST_ONLY_APPEAR_IN_EXPLICIT_CONTENT_RESPONSES"
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "metadata-boundary",
+        data=body,
+        media_type="text/markdown; charset=utf-8",
+        output_type=output_type,
+        session_id=session_id,
+    )
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(_app(_router())) as client:
+        preview = client.get(f"{base}/preview")
+        download = client.get(f"{base}/download")
+        evidence = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence",
+            params={"kind": "artifacts"},
+        )
+
+    assert preview.status_code == 200
+    assert preview.json()["content"] == body.decode()
+    assert len(preview.content) < 1_024
+    assert download.status_code == 200
+    assert download.content == body
+    assert evidence.status_code == 200
+    item = next(
+        value
+        for value in evidence.json()["items"]
+        if value.get("publication_id") == artifact["publication_id"]
+    )
+    assert item["output_type"] == output_type
+    assert item["session_id"] == session_id
+    assert body not in evidence.content
+    assert len(evidence.content) < 40_000
 
 
 @pytest.mark.parametrize(

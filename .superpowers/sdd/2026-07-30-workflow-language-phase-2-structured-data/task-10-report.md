@@ -122,3 +122,85 @@ Result: Ruff and the whitespace check passed.
 ## Concerns
 
 None within Task 10 scope.
+
+## Specification fix round 1/5
+
+The specification-review findings are corrected in a separate follow-up
+commit. `RunStore` now owns authoritative publication lookup: it authorizes
+the run and operator scope first, checks a metadata-only projection against
+the journal head, corroborates only the requested descriptor against sealed
+output authority and winning-attempt metadata, and then opens only that
+publication's canonical body. `EvidenceReader` and the HTTP routes consume
+the store-owned result.
+
+Run listing and queued coordinator candidate selection now use a checked
+metadata-only load path. Explicit `load_run()` retains the existing
+typed-publication recovery and mirror-recovery behavior. The new
+characterizations use real checked typed publications on still-actionable
+runs and fail if the listing or coordinator paths open those bodies.
+
+Publication metadata validation now uses the canonical producer/store bound
+of 16,384 characters through the existing store validator. Preview and
+download accept valid `output_type` and `session_id` values at that boundary;
+typed evidence remains body-free and bounded. Both producer fields are
+rejected at 16,385 characters, and a forged checked descriptor over the same
+bound fails before its body is opened.
+
+### Fix-round TDD evidence
+
+The following focused tests were written and observed failing before the
+production correction:
+
+- queued coordinator scan with a real publication: 1 failed, 0 passed;
+- `GET /runs` with a real publication: 1 failed, 0 passed;
+- preview/download at the canonical metadata boundary: 1 failed, 0 passed;
+- selective store lookup and oversized checked descriptor: 2 failed,
+  0 passed.
+
+After implementation, the combined five-regression focus passed: 5 passed,
+0 failed. The producer-bound characterization passed: 2 passed, 0 failed.
+
+### Fix-round verification
+
+Exact Task 10 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 5 files, 226 passed, 0 failed.
+
+Store/coordinator regression suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_store.py tests/plugins/workflow/test_coordinator.py tests/plugins/workflow/test_coordinator_multiprocess.py
+```
+
+Fresh result: 3 files, 59 passed, 0 failed.
+
+Task 9 typed-publication recovery/security regression suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 3 files, 86 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/evidence.py plugins/workflow/dashboard/plugin_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Fix-round files changed
+
+- `plugins/workflow/store.py`
+- `plugins/workflow/evidence.py`
+- `plugins/workflow/dashboard/plugin_api.py`
+- `tests/plugins/workflow/test_evidence_api.py`
+- `tests/plugins/workflow/test_api_runtime.py`
+- `tests/plugins/workflow/test_desktop_api.py`
+- `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`

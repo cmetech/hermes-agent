@@ -11,7 +11,9 @@ import pytest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow import evidence as evidence_module
 from plugins.workflow.evidence import EvidenceReader
+from plugins.workflow.output_resolution import ArchonOutputIntegrityError
 from plugins.workflow.schema import load_workflow
+import plugins.workflow.store as store_module
 from plugins.workflow.store import (
     ArtifactRef,
     RunStore,
@@ -45,6 +47,8 @@ def _published_store(
     name: str,
     operator_scope: str | None = None,
     body: bytes = b"bounded publication body",
+    output_type: str = "BoundedReport",
+    session_id: str | None = "session-evidence",
 ):
     workflow = workflow_writer(
         tmp_path / "package",
@@ -52,7 +56,7 @@ def _published_store(
         nodes=[{
             "id": "produce",
             "bash": "true",
-            "output_type": "BoundedReport",
+            "output_type": output_type,
         }],
     )
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
@@ -103,13 +107,13 @@ def _published_store(
         ),
         typed_publication=TypedPublicationCandidate(
             attempt_relative_path=relative_path,
-            output_type="BoundedReport",
+            output_type=output_type,
             media_type="text/markdown; charset=utf-8",
             size_bytes=len(body),
             sha256=digest,
             schema_fingerprint=None,
             canonicalization_version=1,
-            session_id="session-evidence",
+            session_id=session_id,
         ),
     )
     return store, admitted, claim, digest, len(body)
@@ -258,6 +262,264 @@ def test_publication_lookup_revalidates_and_returns_verified_content(
     assert publication.content == body
 
 
+def test_run_store_publication_lookup_opens_only_requested_body(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="store-selective-lookup",
+        nodes=[
+            {
+                "id": "produce-a",
+                "bash": "true",
+                "output_type": "ReportA",
+            },
+            {
+                "id": "produce-b",
+                "bash": "true",
+                "output_type": "ReportB",
+            },
+            {
+                "id": "finish",
+                "bash": "true",
+                "depends_on": ["produce-a", "produce-b"],
+            },
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="store-selective-lookup",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    expected_bodies = {
+        "produce-a": b"REQUESTED_PUBLICATION",
+        "produce-b": b"UNRELATED_PUBLICATION_MUST_NOT_BE_OPENED",
+    }
+    for node_id, body in expected_bodies.items():
+        claim = store.claim_node(
+            admitted.run_id,
+            node_id,
+            f"{node_id}-worker",
+        )
+        assert claim is not None
+        source = (
+            store.run_directory(admitted.run_id)
+            / "nodes"
+            / claim.node_id
+            / claim.attempt_id
+            / "output.md"
+        )
+        source.parent.mkdir(parents=True)
+        source.write_bytes(body)
+        relative = source.relative_to(
+            store.run_directory(admitted.run_id)
+        ).as_posix()
+        digest = hashlib.sha256(body).hexdigest()
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(
+                ArtifactRef(
+                    relative,
+                    "text/markdown; charset=utf-8",
+                    len(body),
+                    digest,
+                ),
+            ),
+            typed_publication=TypedPublicationCandidate(
+                attempt_relative_path=relative,
+                output_type="ReportA" if node_id == "produce-a" else "ReportB",
+                media_type="text/markdown; charset=utf-8",
+                size_bytes=len(body),
+                sha256=digest,
+                schema_fingerprint=None,
+                canonicalization_version=1,
+                session_id=f"{node_id}-session",
+            ),
+        )
+    projection = store.load_run(admitted.run_id)
+    publications = {
+        artifact["node_id"]: artifact
+        for artifact in projection["artifacts"]
+        if "publication_id" in artifact
+    }
+    requested = publications["produce-a"]
+    unrelated = publications["produce-b"]
+    unrelated_path = (
+        f"publications/{unrelated['publication_id']}/"
+        f"{unrelated['content_name']}"
+    )
+    real_read = store_module._read_descriptor_relative
+
+    def reject_unrelated_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == unrelated_path:
+            pytest.fail("store lookup opened an unrelated publication body")
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_unrelated_body,
+    )
+
+    publication = store.lookup_publication(
+        admitted.run_id,
+        requested["publication_id"],
+    )
+
+    assert publication.publication_id == requested["publication_id"]
+    assert publication.content == expected_bodies["produce-a"]
+
+
+def test_store_lookup_rejects_checked_descriptor_above_producer_metadata_bound(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store, admitted, _claim, _digest, _size = _published_store(
+        tmp_path,
+        workflow_writer,
+        name="store-lookup-metadata-bound",
+    )
+    projection = store.load_run(admitted.run_id)
+    artifacts = [dict(artifact) for artifact in projection["artifacts"]]
+    descriptor = next(
+        artifact for artifact in artifacts if "publication_id" in artifact
+    )
+    descriptor["output_type"] = "X" * 16_385
+    store.append_event(
+        admitted.run_id,
+        "forged_publication_descriptor",
+        projection_updates={"artifacts": artifacts},
+    )
+    publication_path = (
+        f"publications/{descriptor['publication_id']}/"
+        f"{descriptor['content_name']}"
+    )
+    real_read = store_module._read_descriptor_relative
+
+    def reject_body_open(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail("oversized descriptor must be rejected before body open")
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_body_open,
+    )
+
+    with pytest.raises(store_module.PublicationIntegrityError):
+        store.lookup_publication(
+            admitted.run_id,
+            descriptor["publication_id"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("output_type", "session_id"),
+    [
+        ("X" * 16_385, "session"),
+        ("Report", "S" * 16_385),
+    ],
+)
+def test_typed_publication_producer_rejects_metadata_above_canonical_bound(
+    tmp_path,
+    workflow_writer,
+    output_type,
+    session_id,
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name=f"producer-bound-{output_type[:1]}-{session_id[:1]}",
+        nodes=[{
+            "id": "produce",
+            "bash": "true",
+            "output_type": "Report",
+        }],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key=package.definition.name,
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "producer-worker")
+    assert claim is not None
+    body = b"producer-boundary"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / "output.md"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(body)
+    relative = source.relative_to(store.run_directory(admitted.run_id)).as_posix()
+    digest = hashlib.sha256(body).hexdigest()
+
+    with pytest.raises(
+        ArchonOutputIntegrityError,
+        match="typed publication candidate is invalid",
+    ):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(
+                ArtifactRef(
+                    relative,
+                    "text/markdown; charset=utf-8",
+                    len(body),
+                    digest,
+                ),
+            ),
+            typed_publication=TypedPublicationCandidate(
+                attempt_relative_path=relative,
+                output_type=output_type,
+                media_type="text/markdown; charset=utf-8",
+                size_bytes=len(body),
+                sha256=digest,
+                schema_fingerprint=None,
+                canonicalization_version=1,
+                session_id=session_id,
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "publication_id",
     [
@@ -294,8 +556,8 @@ def test_publication_lookup_authorizes_scope_before_opening_content(
         operator_scope="service:test:owner",
     )
     monkeypatch.setattr(
-        evidence_module,
-        "_read_contained_regular_file",
+        store_module,
+        "_read_descriptor_relative",
         lambda *_args, **_kwargs: pytest.fail(
             "unauthorized publication body must not be opened"
         ),
@@ -330,22 +592,26 @@ def test_publication_lookup_rejects_post_authorization_content_swaps(
         / publication_id
         / "content.md"
     )
-    real_get_run_status = store.get_run_status
+    real_run_directory = store.run_directory
+    swapped = False
 
     def authorize_then_swap(*args, **kwargs):
-        run = real_get_run_status(*args, **kwargs)
-        if mutation == "size":
-            content.write_bytes(original + b"x")
-        elif mutation == "digest":
-            content.write_bytes(b"x" * len(original))
-        else:
-            replacement = tmp_path / "outside-publication"
-            replacement.write_bytes(original)
-            content.unlink()
-            content.symlink_to(replacement)
-        return run
+        nonlocal swapped
+        directory = real_run_directory(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            if mutation == "size":
+                content.write_bytes(original + b"x")
+            elif mutation == "digest":
+                content.write_bytes(b"x" * len(original))
+            else:
+                replacement = tmp_path / "outside-publication"
+                replacement.write_bytes(original)
+                content.unlink()
+                content.symlink_to(replacement)
+        return directory
 
-    monkeypatch.setattr(store, "get_run_status", authorize_then_swap)
+    monkeypatch.setattr(store, "run_directory", authorize_then_swap)
 
     with pytest.raises(evidence_module.PublicationIntegrityError):
         EvidenceReader(store).lookup_publication(
@@ -375,25 +641,34 @@ def test_publication_lookup_rejects_untrusted_descriptor_fields(
     publication_id = EvidenceReader(store).query(
         admitted.run_id, kind="artifacts"
     )["items"][0]["publication_id"]
-    real_get_run_status = store.get_run_status
+    projection = store.load_run(admitted.run_id)
+    artifacts = [dict(artifact) for artifact in projection["artifacts"]]
+    descriptor = next(
+        artifact
+        for artifact in artifacts
+        if artifact.get("publication_id") == publication_id
+    )
+    descriptor[field] = value
+    store.append_event(
+        admitted.run_id,
+        "forged_publication_descriptor",
+        projection_updates={"artifacts": artifacts},
+    )
+    real_read = store_module._read_descriptor_relative
 
-    def authorize_then_mutate(*args, **kwargs):
-        run = real_get_run_status(*args, **kwargs)
-        descriptor = next(
-            artifact
-            for artifact in run["artifacts"]
-            if artifact.get("publication_id") == publication_id
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path).startswith(f"publications/{publication_id}/"):
+            pytest.fail("invalid descriptor must be rejected before body open")
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
         )
-        descriptor[field] = value
-        return run
 
-    monkeypatch.setattr(store, "get_run_status", authorize_then_mutate)
     monkeypatch.setattr(
-        evidence_module,
-        "_read_contained_regular_file",
-        lambda *_args, **_kwargs: pytest.fail(
-            "invalid descriptor must be rejected before body open"
-        ),
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
     )
 
     with pytest.raises(evidence_module.PublicationIntegrityError):

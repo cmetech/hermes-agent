@@ -36,13 +36,7 @@ from plugins.workflow.compat import (
     WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES,
     derive_compatibility_report_state,
 )
-from plugins.workflow.evidence import (
-    EVIDENCE_KINDS,
-    EvidenceReader,
-    PublicationIntegrityError,
-    PublicationNotFoundError,
-    VerifiedPublication,
-)
+from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
@@ -56,7 +50,13 @@ from plugins.workflow.sanitize import (
     sanitize_evidence_bytes,
     sanitize_projection,
 )
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    JournalRecoveryError,
+    PublicationIntegrityError,
+    PublicationNotFoundError,
+    RunStore,
+    VerifiedPublication,
+)
 
 
 _CURSOR_SECRET = secrets.token_bytes(32)
@@ -1653,7 +1653,7 @@ def _verified_publication(
     operator: WorkflowAuthority,
 ) -> VerifiedPublication:
     try:
-        return EvidenceReader(store).lookup_publication(
+        return store.lookup_publication(
             run_id,
             publication_id,
             operator_scope=None if operator.unrestricted else operator.scope,

@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import hashlib
-import hmac
 import os
-import re
 import stat
 from pathlib import Path
 from typing import Mapping
 
 from plugins.workflow.sanitize import sanitize_evidence_bytes, sanitize_projection
+from plugins.workflow.store import (
+    PublicationIntegrityError,
+    PublicationNotFoundError,
+    VerifiedPublication,
+)
 
 
 EVIDENCE_KINDS = frozenset({
@@ -29,42 +30,10 @@ EVIDENCE_KINDS = frozenset({
 
 _LOG_READ_LIMIT = 256 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-_PUBLICATION_ID = re.compile(r"[0-9a-f]{32}")
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_PUBLICATION_CONTENT_NAMES = {
-    "application/json": "content.json",
-    "text/markdown; charset=utf-8": "content.md",
-}
-_PUBLICATION_CONTENT_LIMIT = 500_000
-_PUBLICATION_METADATA_TEXT_LIMIT = 1_024
 
 
 class _UnsafeEvidencePath(Exception):
     """An evidence candidate could not be proven to be a contained regular file."""
-
-
-class PublicationNotFoundError(LookupError):
-    """No authorized publication matches the opaque identifier."""
-
-
-class PublicationIntegrityError(RuntimeError):
-    """A publication descriptor or content file failed verification."""
-
-
-@dataclass(frozen=True, slots=True)
-class VerifiedPublication:
-    publication_id: str
-    content_name: str
-    output_type: str
-    media_type: str
-    size_bytes: int
-    sha256: str
-    node_id: str
-    attempt_id: str
-    schema_fingerprint: str | None
-    produced_at: str
-    session_id: str | None
-    content: bytes
 
 
 def _identity(file_stat: os.stat_result) -> tuple[int, int, int]:
@@ -313,117 +282,10 @@ class EvidenceReader:
         *,
         operator_scope: str | None = None,
     ) -> VerifiedPublication:
-        # Authorization and checked journal/projection recovery precede even
-        # opaque-ID validation so an attacker cannot probe another scope.
-        run = self.store.get_run_status(
+        return self.store.lookup_publication(
             run_id,
+            publication_id,
             operator_scope=operator_scope,
-        )
-        if (
-            not isinstance(publication_id, str)
-            or _PUBLICATION_ID.fullmatch(publication_id) is None
-        ):
-            raise PublicationNotFoundError(publication_id)
-        artifacts = run.get("artifacts")
-        matches = (
-            [
-                artifact
-                for artifact in artifacts
-                if isinstance(artifact, Mapping)
-                and artifact.get("publication_id") == publication_id
-            ]
-            if isinstance(artifacts, list)
-            else []
-        )
-        if not matches:
-            raise PublicationNotFoundError(publication_id)
-        if len(matches) != 1:
-            raise PublicationIntegrityError("publication descriptor is ambiguous")
-        descriptor = matches[0]
-        media_type = descriptor.get("media_type")
-        content_name = descriptor.get("content_name")
-        expected_content_name = (
-            _PUBLICATION_CONTENT_NAMES.get(media_type)
-            if isinstance(media_type, str)
-            else None
-        )
-        size_bytes = descriptor.get("size_bytes")
-        content_sha256 = descriptor.get("sha256")
-        output_type = descriptor.get("output_type")
-        node_id = descriptor.get("node_id")
-        attempt_id = descriptor.get("attempt_id")
-        schema_fingerprint = descriptor.get("schema_fingerprint")
-        produced_at = descriptor.get("produced_at")
-        session_id = descriptor.get("session_id")
-        bounded_text = (output_type, node_id, attempt_id, produced_at)
-        if (
-            expected_content_name is None
-            or content_name != expected_content_name
-            or isinstance(size_bytes, bool)
-            or not isinstance(size_bytes, int)
-            or not 0 <= size_bytes <= _PUBLICATION_CONTENT_LIMIT
-            or not isinstance(content_sha256, str)
-            or _SHA256.fullmatch(content_sha256) is None
-            or any(
-                not isinstance(value, str)
-                or not value
-                or len(value) > _PUBLICATION_METADATA_TEXT_LIMIT
-                for value in bounded_text
-            )
-            or (
-                schema_fingerprint is not None
-                and (
-                    not isinstance(schema_fingerprint, str)
-                    or _SHA256.fullmatch(schema_fingerprint) is None
-                )
-            )
-            or (
-                session_id is not None
-                and (
-                    not isinstance(session_id, str)
-                    or len(session_id) > _PUBLICATION_METADATA_TEXT_LIMIT
-                )
-            )
-        ):
-            raise PublicationIntegrityError("publication descriptor is invalid")
-        directory = self.store.run_directory(
-            run_id,
-            operator_scope=operator_scope,
-        )
-        candidate = (
-            directory
-            / "publications"
-            / publication_id
-            / expected_content_name
-        )
-        try:
-            content, observed_size = _read_contained_regular_file(
-                directory,
-                candidate,
-                size_bytes + 1,
-            )
-        except _UnsafeEvidencePath as exc:
-            raise PublicationIntegrityError(
-                "publication content path is unsafe"
-            ) from exc
-        if observed_size != size_bytes or len(content) != size_bytes:
-            raise PublicationIntegrityError("publication content size changed")
-        observed_digest = hashlib.sha256(content).hexdigest()
-        if not hmac.compare_digest(observed_digest, content_sha256):
-            raise PublicationIntegrityError("publication content digest changed")
-        return VerifiedPublication(
-            publication_id=publication_id,
-            content_name=expected_content_name,
-            output_type=output_type,
-            media_type=media_type,
-            size_bytes=size_bytes,
-            sha256=content_sha256,
-            node_id=node_id,
-            attempt_id=attempt_id,
-            schema_fingerprint=schema_fingerprint,
-            produced_at=produced_at,
-            session_id=session_id,
-            content=content,
         )
 
     def _items(self, run_id, run, *, kind, operator_scope):

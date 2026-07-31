@@ -104,6 +104,14 @@ class JournalRecoveryError(RuntimeError):
     pass
 
 
+class PublicationNotFoundError(LookupError):
+    """No authorized publication matches the opaque identifier."""
+
+
+class PublicationIntegrityError(RuntimeError):
+    """A requested publication failed descriptor or content verification."""
+
+
 class ForegroundExecutionConflict(RuntimeError):
     """A foreground owner transition lost its exact state/epoch comparison."""
 
@@ -186,6 +194,22 @@ class TypedPublicationRef:
     canonicalization_version: int
     produced_at: str
     session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPublication:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    node_id: str
+    attempt_id: str
+    schema_fingerprint: str | None
+    produced_at: str
+    session_id: str | None
+    content: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -1126,10 +1150,14 @@ def _journaled_typed_publications(
         node_id = artifact.get("node_id")
         attempt_id = artifact.get("attempt_id")
         relative_path = artifact.get("relative_path")
-        expected_content = {
-            _TYPED_PUBLICATION_JSON_MEDIA_TYPE: "content.json",
-            _TYPED_PUBLICATION_TEXT_MEDIA_TYPE: "content.md",
-        }.get(media_type)
+        expected_content = (
+            {
+                _TYPED_PUBLICATION_JSON_MEDIA_TYPE: "content.json",
+                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE: "content.md",
+            }.get(media_type)
+            if isinstance(media_type, str)
+            else None
+        )
         if (
             isinstance(descriptor_version, bool)
             or descriptor_version != _TYPED_PUBLICATION_DESCRIPTOR_VERSION
@@ -2819,11 +2847,17 @@ class RunStore:
         )
 
     def _corroborate_run_evidence(
-        self, directory: Path, *, run_id: str
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        validate_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         with workflow_lock(self._run_lock_path(run_id)):
             return self._corroborate_run_evidence_locked(
-                directory, run_id=run_id
+                directory,
+                run_id=run_id,
+                validate_typed_publications=validate_typed_publications,
             )
 
     def _corroborate_run_evidence_locked(
@@ -2833,6 +2867,7 @@ class RunStore:
         run_id: str,
         projection_data: bytes | None = None,
         journal_data: bytes | None = None,
+        validate_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         if (projection_data is None) != (journal_data is None):
             raise ValueError("projection and journal snapshots must be paired")
@@ -2850,6 +2885,7 @@ class RunStore:
             directory,
             run_id=run_id,
             journal_data=journal_data,
+            validate_typed_publications=validate_typed_publications,
         )
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
@@ -2969,7 +3005,11 @@ class RunStore:
         )
 
     def _sync_loaded_integrity(
-        self, directory: Path, projection: Mapping[str, object]
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        validate_typed_publications: bool = True,
     ) -> None:
         journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
         scheduled_at = self._scheduled_at_from_projection(projection)
@@ -3017,7 +3057,9 @@ class RunStore:
             return
         try:
             corroborated, _, journal_sha256 = self._corroborate_run_evidence_locked(
-                directory, run_id=str(projection["run_id"])
+                directory,
+                run_id=str(projection["run_id"]),
+                validate_typed_publications=validate_typed_publications,
             )
         except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
             self._mark_repair_required(
@@ -5046,6 +5088,29 @@ class RunStore:
     def load_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
+        return self._load_run_projection(
+            run_id,
+            operator_scope=operator_scope,
+            recover_typed_publications=True,
+        )
+
+    def _load_run_metadata(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        """Load checked run metadata without opening typed-publication bodies."""
+        return self._load_run_projection(
+            run_id,
+            operator_scope=operator_scope,
+            recover_typed_publications=False,
+        )
+
+    def _load_run_projection(
+        self,
+        run_id: str,
+        *,
+        operator_scope: str | None,
+        recover_typed_publications: bool,
+    ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         path = directory / "run.json"
         with workflow_lock(self._run_lock_path(run_id)):
@@ -5075,6 +5140,18 @@ class RunStore:
                         outcome="repair_required",
                     )
                     raise
+                if journal_current and not recover_typed_publications:
+                    self._sync_loaded_integrity(
+                        directory,
+                        projection,
+                        validate_typed_publications=False,
+                    )
+                    self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_verified",
+                    )
+                    return projection
                 if journal_current:
                     try:
                         declared_outputs = _sealed_typed_output_declarations(
@@ -5123,7 +5200,11 @@ class RunStore:
                 quarantine = directory / f"run.json.corrupt-{uuid.uuid4().hex}"
                 _durable_replace(path, quarantine)
             try:
-                rebuilt = self._rebuild_projection(directory, run_id=run_id)
+                rebuilt = self._rebuild_projection(
+                    directory,
+                    run_id=run_id,
+                    validate_typed_publications=recover_typed_publications,
+                )
             except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
                 # Projection replay is confined to this run. Cross-run/index
                 # reconciliation failures are handled by their global callers.
@@ -5133,14 +5214,15 @@ class RunStore:
                     outcome="repair_required",
                 )
                 raise
-            verified_content = self._recover_typed_publications_locked(
-                directory, rebuilt
-            )
-            self._recover_typed_mirrors_locked(
-                directory,
-                rebuilt,
-                verified_content,
-            )
+            if recover_typed_publications:
+                verified_content = self._recover_typed_publications_locked(
+                    directory, rebuilt
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    rebuilt,
+                    verified_content,
+                )
             scheduled_at = self._scheduled_at_from_projection(rebuilt)
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
@@ -5167,6 +5249,162 @@ class RunStore:
                 outcome="repair_verified",
             )
             return rebuilt
+
+    def lookup_publication(
+        self,
+        run_id: str,
+        publication_id: str,
+        *,
+        operator_scope: str | None = None,
+    ) -> VerifiedPublication:
+        """Authorize and verify one checked publication without sweeping siblings."""
+        # Metadata loading performs run/scope authorization before the caller's
+        # opaque ID is examined and never opens typed-publication bodies.
+        projection = self._load_run_metadata(
+            run_id,
+            operator_scope=operator_scope,
+        )
+        if (
+            not isinstance(publication_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+        ):
+            raise PublicationNotFoundError(publication_id)
+        directory = self.run_directory(
+            run_id,
+            operator_scope=operator_scope,
+        )
+        with workflow_lock(self._run_lock_path(run_id)):
+            try:
+                current = json.loads(
+                    (directory / "run.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise JournalRecoveryError(
+                    "run projection is unavailable during publication lookup"
+                ) from exc
+            if (
+                not self._valid_projection(current, run_id=run_id)
+                or _projection_digest(current) != _projection_digest(projection)
+                or not self._journal_matches_projection(
+                    directory,
+                    projection=current,
+                    run_id=run_id,
+                )
+            ):
+                raise JournalRecoveryError(
+                    "run projection changed during publication lookup"
+                )
+            try:
+                descriptor = self._requested_publication_descriptor(
+                    directory,
+                    current,
+                    publication_id,
+                )
+                content = _read_descriptor_relative(
+                    directory,
+                    (
+                        f"publications/{descriptor.publication_id}/"
+                        f"{descriptor.content_name}"
+                    ),
+                    size_bytes=descriptor.size_bytes,
+                )
+                if (
+                    len(content) != descriptor.size_bytes
+                    or not hmac.compare_digest(
+                        _sha256(content),
+                        descriptor.sha256,
+                    )
+                ):
+                    raise PublicationIntegrityError(
+                        "publication content identity changed"
+                    )
+            except PublicationNotFoundError:
+                raise
+            except (
+                ArchonOutputIntegrityError,
+                ArchonOutputUnavailableError,
+                JournalRecoveryError,
+                OSError,
+                PublicationIntegrityError,
+            ) as exc:
+                self._transition_run_repair(
+                    "typed_publication_integrity",
+                    run_id=run_id,
+                    outcome="repair_required",
+                )
+                if isinstance(exc, PublicationIntegrityError):
+                    raise
+                raise PublicationIntegrityError(
+                    "publication descriptor or content is not corroborated"
+                ) from exc
+        return VerifiedPublication(
+            publication_id=descriptor.publication_id,
+            content_name=descriptor.content_name,
+            output_type=descriptor.output_type,
+            media_type=descriptor.media_type,
+            size_bytes=descriptor.size_bytes,
+            sha256=descriptor.sha256,
+            node_id=descriptor.node_id,
+            attempt_id=descriptor.attempt_id,
+            schema_fingerprint=descriptor.schema_fingerprint,
+            produced_at=descriptor.produced_at,
+            session_id=descriptor.session_id,
+            content=content,
+        )
+
+    def _requested_publication_descriptor(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        publication_id: str,
+    ) -> _JournaledTypedPublication:
+        artifacts = projection.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise JournalRecoveryError(
+                "typed publication descriptor authority is invalid"
+            )
+        matches = [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, Mapping)
+            and artifact.get("publication_id") == publication_id
+        ]
+        if not matches:
+            raise PublicationNotFoundError(publication_id)
+        declarations = _sealed_typed_output_declarations(
+            directory,
+            projection,
+        )
+        requested_node_ids = {
+            artifact.get("node_id")
+            for artifact in matches
+            if isinstance(artifact.get("node_id"), str)
+        }
+        selected_declarations = {
+            node_id: declarations[node_id]
+            for node_id in requested_node_ids
+            if node_id in declarations
+        }
+        selected_projection = dict(projection)
+        selected_projection["artifacts"] = matches
+        descriptors = _journaled_typed_publications(
+            selected_projection,
+            selected_declarations,
+        )
+        if len(descriptors) != 1:
+            raise JournalRecoveryError(
+                "requested typed publication descriptor is ambiguous"
+            )
+        descriptor = descriptors[0]
+        expected_metadata = self._expected_publication_metadata(descriptor)
+        if not hmac.compare_digest(
+            _sha256(expected_metadata),
+            descriptor.metadata_sha256,
+        ):
+            raise JournalRecoveryError(
+                "requested typed publication metadata is not corroborated"
+            )
+        return descriptor
 
     def _journal_matches_projection(
         self,
@@ -5240,6 +5478,7 @@ class RunStore:
         *,
         run_id: str,
         journal_data: bytes | None = None,
+        validate_typed_publications: bool = True,
     ) -> dict[str, object]:
         latest = None
         latest_migration_count = 0
@@ -5263,25 +5502,26 @@ class RunStore:
                     raise JournalRecoveryError("journal projection sequence mismatch")
                 if checksum != _projection_digest(snapshot):
                     raise JournalRecoveryError("journal projection digest mismatch")
-                try:
-                    declared_outputs = _sealed_typed_output_declarations(
-                        directory,
-                        snapshot,
-                    )
-                    latest_migration_count = (
-                        _migrate_legacy_typed_publication_descriptors(
+                if validate_typed_publications:
+                    try:
+                        declared_outputs = _sealed_typed_output_declarations(
                             directory,
                             snapshot,
                         )
-                    )
-                    _journaled_typed_publications(snapshot, declared_outputs)
-                except JournalRecoveryError:
-                    self._transition_run_repair(
-                        "typed_publication_integrity",
-                        run_id=run_id,
-                        outcome="repair_required",
-                    )
-                    raise
+                        latest_migration_count = (
+                            _migrate_legacy_typed_publication_descriptors(
+                                directory,
+                                snapshot,
+                            )
+                        )
+                        _journaled_typed_publications(snapshot, declared_outputs)
+                    except JournalRecoveryError:
+                        self._transition_run_repair(
+                            "typed_publication_integrity",
+                            run_id=run_id,
+                            outcome="repair_required",
+                        )
+                        raise
                 latest = snapshot
             elif event.get("event_type") == "node_heartbeat" and latest is not None:
                 node = latest["nodes"].get(event.get("node_id"))
@@ -5995,7 +6235,7 @@ class RunStore:
             ).fetchall()
         for row in rows:
             if row["status"] == "queued":
-                projection = self.load_run(str(row["run_id"]))
+                projection = self._load_run_metadata(str(row["run_id"]))
                 self._scheduled_at_from_projection(
                     projection,
                     indexed=row["scheduled_at"],
@@ -6350,6 +6590,7 @@ class RunStore:
                     run_id,
                     operator_scope=operator_scope,
                     now=observed_at,
+                    _metadata_only=True,
                 )
             except (
                 JournalRecoveryError,
@@ -7144,8 +7385,13 @@ class RunStore:
         *,
         operator_scope: str | None = None,
         now: datetime | None = None,
+        _metadata_only: bool = False,
     ) -> dict[str, object]:
-        run = self.load_run(run_id, operator_scope=operator_scope)
+        run = (
+            self._load_run_metadata(run_id, operator_scope=operator_scope)
+            if _metadata_only
+            else self.load_run(run_id, operator_scope=operator_scope)
+        )
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
@@ -12192,8 +12438,11 @@ __all__ = [
     "ForegroundExecutionConflict",
     "InputSnapshotError",
     "NodeClaim",
+    "PublicationIntegrityError",
+    "PublicationNotFoundError",
     "RunStore",
     "StorageQuotaError",
     "TypedPublicationCandidate",
     "TypedPublicationRef",
+    "VerifiedPublication",
 ]
