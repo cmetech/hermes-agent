@@ -333,7 +333,7 @@ class TypedMirrorStore:
         hermes_home: str | Path,
         *,
         capacity_check: Callable[[int, int], None] | None = None,
-        free_disk_check: Callable[[], None] | None = None,
+        free_disk_check: Callable[[int], None] | None = None,
     ):
         _require_secure_mirror_io()
         self.hermes_home = Path(hermes_home).resolve()
@@ -455,8 +455,29 @@ class TypedMirrorStore:
                         os.close(lock_descriptor)
 
     @contextmanager
-    def capacity_reservation(self) -> Iterator[None]:
-        """Serialize one profile-capacity decision through mirror visibility."""
+    def capacity_reservation(
+        self,
+        obligation: TypedMirrorObligation,
+        content: bytes,
+        *,
+        transaction_bytes: int,
+    ) -> Iterator[int]:
+        """Reserve a complete mirror transaction before its first mutation."""
+        if not isinstance(transaction_bytes, int) or transaction_bytes < 0:
+            raise TypedMirrorIntegrityError(
+                "typed mirror transaction reservation is invalid"
+            )
+        self._validate_obligation(obligation)
+        if (
+            len(content) != obligation.size_bytes
+            or not hmac.compare_digest(_sha256(content), obligation.sha256)
+        ):
+            raise TypedMirrorIntegrityError("typed mirror content digest does not match")
+        entry = self._entry_document(obligation)
+        entry_bytes = _canonical_json(entry)
+        if len(entry_bytes) > _MIRROR_MAX_DOCUMENT_BYTES:
+            raise TypedMirrorIntegrityError("typed mirror entry exceeds its byte ceiling")
+        record = self._record(entry)
         with self._open_layout() as layout:
             identity = _directory_identity(layout.root)
             process_lock = _process_lock(identity)
@@ -484,7 +505,21 @@ class TypedMirrorStore:
                             "typed mirror capacity lock is unsafe"
                         )
                     fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-                    yield
+                    with self._locked_layout() as reserved_layout:
+                        mirror_bytes = self._layout_bytes(reserved_layout)
+                        mirror_required = self._stage_required_bytes(
+                            reserved_layout,
+                            obligation,
+                            content,
+                            record,
+                            entry_bytes,
+                        )
+                    required = transaction_bytes + mirror_required
+                    if self._free_disk_check is not None:
+                        self._free_disk_check(required)
+                    if self._capacity_check is not None:
+                        self._capacity_check(mirror_bytes, required)
+                    yield required
                 finally:
                     try:
                         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
@@ -529,21 +564,17 @@ class TypedMirrorStore:
             )
         return 0
 
-    def _reserve_stage(
+    def _stage_required_bytes(
         self,
         layout: _MirrorLayout,
         obligation: TypedMirrorObligation,
         content: bytes,
         record: TypedMirrorRecord,
         entry_bytes: bytes,
-    ) -> None:
-        if self._free_disk_check is not None:
-            self._free_disk_check()
-        if self._capacity_check is None:
-            return
+    ) -> int:
         activation = self._activation_bytes(record.entry_id)
         index = self._index_bytes(record.entry_id, generation=1)
-        required = sum((
+        return sum((
             self._missing_file_bytes(
                 layout.content,
                 obligation.sha256,
@@ -561,7 +592,26 @@ class TypedMirrorStore:
             ),
             len(index) * 2,
         ))
-        self._capacity_check(self._layout_bytes(layout), required)
+
+    def _reserve_stage(
+        self,
+        layout: _MirrorLayout,
+        obligation: TypedMirrorObligation,
+        content: bytes,
+        record: TypedMirrorRecord,
+        entry_bytes: bytes,
+    ) -> None:
+        required = self._stage_required_bytes(
+            layout,
+            obligation,
+            content,
+            record,
+            entry_bytes,
+        )
+        if self._free_disk_check is not None:
+            self._free_disk_check(required)
+        if self._capacity_check is not None:
+            self._capacity_check(self._layout_bytes(layout), required)
 
     @staticmethod
     def _scope_id(workflow: str, node_id: str, operator_scope: str) -> str:

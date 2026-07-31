@@ -226,6 +226,105 @@ Result: Ruff and the whitespace check passed.
 
 Concerns: none within the spec-fix scope.
 
+## Quality Fix Round 3 — whole-transaction profile reservation
+
+The remaining Important capacity finding from quality re-review 2 is
+addressed.
+
+- `TypedMirrorStore.capacity_reservation()` now computes the descriptor-safe
+  mirror-file peak while holding the profile-capacity lock and briefly taking
+  the scope lock in the established run lock → capacity lock → scope lock
+  order. The estimate includes missing immutable content and entry files,
+  activation, scope-index replacement, and all corresponding temporary files.
+- `RunStore` dry-runs only the pending requirement/completion transitions
+  against a cloned projection through the same journal-frame builder used by
+  `_append_locked()`. The reservation adds each durable frame, each full
+  `run.json` atomic-replacement temporary file, and conservative encoding
+  headroom before the first journal or mirror mutation.
+- The free-disk watermark check runs at that same pre-journal boundary and
+  deducts the complete reservation from observed free space. The capacity lock
+  remains held through stage, point, completion journaling, and activation.
+  Exception unwinding and process exit release only ephemeral locks; already
+  durable bytes are counted afresh on replay, so there is no phantom
+  reservation state.
+
+### Strict TDD evidence
+
+Focused RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'fresh_mirror_recovery_reserves_complete_transaction_before_requirement or pending_mirror_reserves_completion_before_pointing or concurrent_mirror_recovery_holds_one_profile_capacity_reservation' -q
+```
+
+Observed expected RED: 3 selected, 0 passed and 3 failed. Fresh recovery
+durably exceeded the configured profile quota after appending
+`typed_mirror_required`; required-only recovery completed instead of refusing
+before the point; and the exact one-transaction concurrent budget admitted one
+recovery but left aggregate profile bytes above the configured maximum.
+
+Final focused GREEN: the same selector passed 3/3.
+
+### Verification
+
+Prior quality regressions:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'swapped_root or base_typed or mirror_obligation or mirror_profile_quota or v2_descriptor or legacy_winner_authority or concurrent_mirror_recovery'
+scripts/run_tests.sh tests/plugins/workflow/test_security_boundaries.py -k 'swapped_parent or descriptor_relative_io or pending_current or malformed_scope or cross_scope_index'
+```
+
+Result: 8/8 and 10/10 passed.
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 142 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Journal notification regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_notifications.py
+```
+
+Result: 1 file, 12 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/sessions.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Quality-fix self-review
+
+- Confirmed fresh recovery checks the complete peak before
+  `typed_mirror_required`, and required-only replay checks completion
+  frame/projection capacity before any staging or pointing.
+- Confirmed the exact-budget barrier regression observes the full preflight
+  reservation, admits one recovery, rejects one, and leaves profile usage at or
+  below the configured limit.
+- Confirmed completed replay reserves only mirror repair/visibility bytes,
+  while fresh and pending replay reserve only journal transitions still
+  missing from durable history.
+- Confirmed no reservation record survives exceptions or crashes; replay
+  recomputes from the descriptor-verified mirror layout and current run tree.
+
+Concern: native non-POSIX behavior remains intentionally fail-closed and was
+not executed on this macOS host.
+
 ## Quality Fix Round 1 — anchored recovery, strict replay, and bounded mirrors
 
 All six Important findings from the independent quality review are addressed.

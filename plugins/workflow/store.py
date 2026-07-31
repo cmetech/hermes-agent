@@ -725,11 +725,14 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
         raise
 
 
-def _atomic_json(path: Path, value: object) -> None:
-    encoded = json.dumps(
+def _json_document_bytes(value: object) -> bytes:
+    return json.dumps(
         value, sort_keys=True, ensure_ascii=False, indent=2
     ).encode("utf-8") + b"\n"
-    _atomic_bytes(path, encoded)
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    _atomic_bytes(path, _json_document_bytes(value))
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -4055,12 +4058,13 @@ class RunStore:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
-    def _ensure_free_disk(self) -> None:
+    def _ensure_free_disk(self, required_bytes: int = 0) -> None:
         usage = shutil.disk_usage(self.root)
         watermark = max(1024**3, min(5 * 1024**3, int(usage.total * 0.05)))
-        if usage.free < watermark:
+        if usage.free - required_bytes < watermark:
             raise StorageQuotaError(
-                f"free_disk_watermark not met: {usage.free} < {watermark}"
+                "free_disk_watermark not met after reservation: "
+                f"{usage.free} - {required_bytes} < {watermark}"
             )
 
     @staticmethod
@@ -8994,14 +8998,31 @@ class RunStore:
             raise JournalRecoveryError(
                 "typed mirror journal obligation is not backed by a publication"
             )
-        with mirror_store.capacity_reservation():
-            for mirror_id, obligation in expected.items():
-                existing = required.get(mirror_id)
-                if existing is not None and existing != obligation:
-                    raise JournalRecoveryError(
-                        "typed mirror obligation conflicts with journal"
-                    )
-                new_requirement = existing is None
+        for mirror_id, obligation in expected.items():
+            existing = required.get(mirror_id)
+            if existing is not None and existing != obligation:
+                raise JournalRecoveryError(
+                    "typed mirror obligation conflicts with journal"
+                )
+            descriptor = descriptors.get(obligation.publication_id)
+            content = verified_content.get(obligation.publication_id)
+            if descriptor is None or content is None:
+                raise JournalRecoveryError(
+                    "typed mirror requires a verified run publication"
+                )
+            new_requirement = existing is None
+            was_completed = mirror_id in completed
+            transaction_bytes = self._typed_mirror_transaction_bytes(
+                projection,
+                obligation,
+                requirement_pending=new_requirement,
+                completion_pending=not was_completed,
+            )
+            with mirror_store.capacity_reservation(
+                obligation,
+                content,
+                transaction_bytes=transaction_bytes,
+            ):
                 if new_requirement:
                     self._append_locked(
                         directory,
@@ -9012,12 +9033,6 @@ class RunStore:
                         attempt_id=obligation.attempt_id,
                     )
                     required[mirror_id] = obligation
-                descriptor = descriptors.get(obligation.publication_id)
-                content = verified_content.get(obligation.publication_id)
-                if descriptor is None or content is None:
-                    raise JournalRecoveryError(
-                        "typed mirror requires a verified run publication"
-                    )
                 try:
                     record = mirror_store.stage(
                         obligation,
@@ -9027,7 +9042,6 @@ class RunStore:
                     raise JournalRecoveryError(
                         "typed mirror integrity failure"
                     ) from exc
-                was_completed = mirror_id in completed
                 try:
                     pointed = mirror_store.point(
                         record,
@@ -9496,9 +9510,8 @@ class RunStore:
                     reason_code="uninterruptible_process",
                 )
 
-    def _append_locked(
+    def _prepare_journal_frame(
         self,
-        directory: Path,
         projection: dict[str, object],
         event_type: str,
         payload: Mapping[str, object] | None = None,
@@ -9506,10 +9519,9 @@ class RunStore:
         node_id: str | None = None,
         attempt_id: str | None = None,
         compact_recovery: bool = False,
-        defer_notification: bool = False,
-        terminal_reserve_attempt_id: str | None = None,
-        reserve_connection: sqlite3.Connection | None = None,
-    ) -> dict[str, object]:
+        sample: LeaseClockSample | None = None,
+        timestamp: str | None = None,
+    ) -> tuple[dict[str, object], bytes]:
         projection.setdefault("pause_lane_policy", "hold")
         projection.setdefault("queue_sequence", None)
         projection["lane_state"] = self._lane_state(projection)
@@ -9518,13 +9530,13 @@ class RunStore:
             "run_stalled",
             "evidence_annotation",
         }:
-            sample = self._lease_clock()
-            projection["last_runnable_progress_at"] = sample.utc_now.isoformat()
-            projection["last_runnable_progress_monotonic"] = sample.monotonic_now
-            projection["last_runnable_progress_boot_id"] = sample.boot_id
-            projection["progress_boot_id"] = sample.boot_id
+            observed = sample or self._lease_clock()
+            projection["last_runnable_progress_at"] = observed.utc_now.isoformat()
+            projection["last_runnable_progress_monotonic"] = observed.monotonic_now
+            projection["last_runnable_progress_boot_id"] = observed.boot_id
+            projection["progress_boot_id"] = observed.boot_id
         sequence = int(projection["event_sequence"]) + 1
-        now = _utc_now()
+        now = timestamp or _utc_now()
         projection["event_sequence"] = sequence
         projection["state_version"] = int(projection["state_version"]) + 1
         projection["updated_at"] = now
@@ -9546,7 +9558,80 @@ class RunStore:
         }
         if projection_was_truncated(raw_payload):
             event["payload_truncated"] = True
-        event, encoded = _encode_journal_frame(event)
+        return _encode_journal_frame(event)
+
+    def _typed_mirror_transaction_bytes(
+        self,
+        projection: Mapping[str, object],
+        obligation: TypedMirrorObligation,
+        *,
+        requirement_pending: bool,
+        completion_pending: bool,
+    ) -> int:
+        """Bound journal frames and projection temp files for one mirror."""
+        simulated = json.loads(
+            json.dumps(projection, sort_keys=True, ensure_ascii=False)
+        )
+        pessimistic_sample = LeaseClockSample(
+            datetime.max.replace(tzinfo=timezone.utc),
+            1.7976931348623157e308,
+            "f" * 256,
+        )
+        timestamp = pessimistic_sample.utc_now.isoformat()
+        transitions: list[tuple[str, Mapping[str, object]]] = []
+        if requirement_pending:
+            transitions.append((
+                "typed_mirror_required",
+                {"mirror": self._typed_mirror_payload(obligation)},
+            ))
+        if completion_pending:
+            entry_id = str(
+                TypedMirrorStore._entry_document(obligation)["entry_id"]
+            )
+            transitions.append((
+                "typed_mirror_completed",
+                {"mirror_id": obligation.mirror_id, "entry_id": entry_id},
+            ))
+        required = 0
+        for event_type, payload in transitions:
+            _event, encoded = self._prepare_journal_frame(
+                simulated,
+                event_type,
+                payload,
+                node_id=obligation.node_id,
+                attempt_id=obligation.attempt_id,
+                sample=pessimistic_sample,
+                timestamp=timestamp,
+            )
+            # The frame is a durable addition. Atomic run.json replacement
+            # temporarily retains the current projection beside the full new
+            # document; summing both transition peaks is deliberately
+            # pessimistic and leaves room for platform JSON-number variance.
+            required += len(encoded) + len(_json_document_bytes(simulated)) + 2_048
+        return required
+
+    def _append_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        event_type: str,
+        payload: Mapping[str, object] | None = None,
+        *,
+        node_id: str | None = None,
+        attempt_id: str | None = None,
+        compact_recovery: bool = False,
+        defer_notification: bool = False,
+        terminal_reserve_attempt_id: str | None = None,
+        reserve_connection: sqlite3.Connection | None = None,
+    ) -> dict[str, object]:
+        event, encoded = self._prepare_journal_frame(
+            projection,
+            event_type,
+            payload,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            compact_recovery=compact_recovery,
+        )
         journal_path = directory / "events.jsonl"
         if journal_path.stat().st_size and not _file_ends_with_newline(journal_path):
             self._read_journal_events(directory)
@@ -9609,7 +9694,7 @@ class RunStore:
                         if projection.get("execution_mode") == "background"
                         else "suppressed"
                     ),
-                    now=datetime.fromisoformat(now),
+                    now=datetime.fromisoformat(str(event["timestamp"])),
                 )
         except sqlite3.Error:
             pass

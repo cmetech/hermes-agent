@@ -794,6 +794,103 @@ def test_mirror_profile_quota_fails_before_any_mirror_file_is_visible(
         assert not directory.exists() or list(directory.iterdir()) == []
 
 
+def test_fresh_mirror_recovery_reserves_complete_transaction_before_requirement(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "fresh-mirror-reservation",
+        persist_sessions=True,
+        nodes=[{"id": "produce", "prompt": "Report", "output_type": "Report"}],
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"fresh")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_recover_typed_mirrors_locked", lambda *_args: None)
+        _complete(store, claim, artifact, candidate)
+
+    directory = store.run_directory(admitted.run_id)
+    event_types_before = [
+        event["event_type"] for event in store._read_journal_events(directory)
+    ]
+    assert "typed_mirror_required" not in event_types_before
+    profile_before = store._profile_storage_bytes()
+    store.max_profile_bytes = profile_before + 1
+
+    with pytest.raises(StorageQuotaError, match="profile_storage_quota"):
+        store.load_run(admitted.run_id)
+
+    assert store._profile_storage_bytes() <= store.max_profile_bytes
+    assert [
+        event["event_type"] for event in store._read_journal_events(directory)
+    ] == event_types_before
+    mirror_root = home / "workflows" / "typed-mirrors"
+    for name in ("content", "entries", "activations", "indexes"):
+        mirror_directory = mirror_root / name
+        assert (
+            not mirror_directory.exists()
+            or list(mirror_directory.iterdir()) == []
+        )
+
+
+def test_pending_mirror_reserves_completion_before_pointing(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "pending-completion-reservation",
+        persist_sessions=True,
+        nodes=[{"id": "produce", "prompt": "Report", "output_type": "Report"}],
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"x")
+
+    def stop_after_requirement(_self, _obligation, _content):
+        raise OSError("leave mirror requirement pending")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store_module.TypedMirrorStore,
+            "stage",
+            stop_after_requirement,
+        )
+        with pytest.raises(OSError, match="leave mirror requirement pending"):
+            _complete(store, claim, artifact, candidate)
+
+    directory = store.run_directory(admitted.run_id)
+    event_types_before = [
+        event["event_type"] for event in store._read_journal_events(directory)
+    ]
+    assert event_types_before.count("typed_mirror_required") == 1
+    assert "typed_mirror_completed" not in event_types_before
+    profile_before = store._profile_storage_bytes()
+    store.max_profile_bytes = profile_before + 2_000
+
+    with pytest.raises(StorageQuotaError, match="profile_storage_quota"):
+        store.load_run(admitted.run_id)
+
+    assert store._profile_storage_bytes() <= store.max_profile_bytes
+    assert [
+        event["event_type"] for event in store._read_journal_events(directory)
+    ] == event_types_before
+    mirror_root = home / "workflows" / "typed-mirrors"
+    for name in ("content", "entries", "activations", "indexes"):
+        assert list((mirror_root / name).iterdir()) == []
+
+
 def test_concurrent_mirror_recovery_holds_one_profile_capacity_reservation(
     tmp_path,
     workflow_writer,
@@ -833,12 +930,21 @@ def test_concurrent_mirror_recovery_holds_one_profile_capacity_reservation(
             prepare_pending("quota-concurrent-b", b"2"),
         )
 
-    before_calibration = store._profile_storage_bytes()
-    store.load_run(calibration_run)
-    one_recovery_bytes = store._profile_storage_bytes() - before_calibration
-    assert one_recovery_bytes > 512
+    reservation_checks: list[int] = []
+    original_capacity_check = store._ensure_mirror_capacity
+
+    def capture_capacity_check(mirror_bytes: int, required_bytes: int) -> None:
+        reservation_checks.append(required_bytes)
+        original_capacity_check(mirror_bytes, required_bytes)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_ensure_mirror_capacity", capture_capacity_check)
+        store.load_run(calibration_run)
+
+    one_transaction_reserve = reservation_checks[0]
+    assert one_transaction_reserve > max(reservation_checks[1:], default=0)
     profile_before = store._profile_storage_bytes()
-    store.max_profile_bytes = profile_before + one_recovery_bytes + 512
+    store.max_profile_bytes = profile_before + one_transaction_reserve
     stage_barrier = threading.Barrier(3, timeout=1)
 
     def pause_after_stage(self, obligation, content):
