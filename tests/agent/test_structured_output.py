@@ -373,6 +373,41 @@ def test_callable_draft_without_iter_errors_is_unavailable(monkeypatch) -> None:
         structured_output.require_structured_output_validator()
 
 
+def test_draft_constructor_import_failure_is_unavailable(monkeypatch) -> None:
+    def missing_internal_dependency(_schema):
+        raise ModuleNotFoundError("jsonschema internal dependency missing")
+
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = missing_internal_dependency
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+    schema = normalize_schema({"type": "object", "required": ["answer"]})
+
+    with pytest.raises(
+        structured_output.StructuredOutputValidatorUnavailable,
+        match="jsonschema is required; install the Hermes mcp or all extra",
+    ):
+        structured_output.require_structured_output_validator(schema.canonical_schema)
+
+
+@pytest.mark.parametrize("error_type", (ValueError, RuntimeError))
+def test_unrelated_draft_constructor_errors_remain_visible(
+    monkeypatch, error_type
+) -> None:
+    def broken_constructor(_schema):
+        raise error_type("constructor defect")
+
+    partial = types.ModuleType("jsonschema")
+    partial.Draft202012Validator = broken_constructor
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    with pytest.raises(error_type, match="constructor defect"):
+        structured_output.require_structured_output_validator(
+            normalize_schema({"type": "object"}).canonical_schema
+        )
+
+
 def test_validator_install_guidance_has_one_shared_authority() -> None:
     assert (
         getattr(structured_output, "STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE", None)

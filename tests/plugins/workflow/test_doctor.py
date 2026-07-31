@@ -360,6 +360,47 @@ def test_doctor_rejects_callable_draft_without_iter_errors(
     )
 
 
+def test_doctor_blocks_draft_constructor_import_failure(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_structured_package(tmp_path, workflow_writer)
+
+    def missing_internal_dependency(_schema):
+        raise ModuleNotFoundError("jsonschema internal dependency missing")
+
+    partial = types.ModuleType("jsonschema")
+    partial.__spec__ = ModuleSpec("jsonschema", loader=None)
+    partial.Draft202012Validator = missing_internal_dependency
+    partial.validate = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "jsonschema", partial)
+
+    constructor_exception = None
+    report = None
+    try:
+        report = doctor_package(package, hermes_home=tmp_path / "home")
+    except ModuleNotFoundError as exc:
+        constructor_exception = exc
+
+    assert constructor_exception is None, (
+        f"raw constructor exception escaped Doctor: {constructor_exception}"
+    )
+    assert report is not None
+    finding = next(
+        (
+            item
+            for item in report.findings
+            if item.code == "structured_output_unavailable"
+        ),
+        None,
+    )
+    assert finding is not None
+    assert report.runnable is False
+    assert finding.blocking is True
+    assert (
+        finding.message == "jsonschema is required; install the Hermes mcp or all extra"
+    )
+
+
 def test_doctor_schemaless_workflow_does_not_require_validator(
     tmp_path: Path, workflow_writer, monkeypatch
 ) -> None:

@@ -418,7 +418,7 @@ def require_structured_output_validator(
         )
     try:
         validator = validator_builder(_thaw_json(schema or {}))
-    except (AttributeError, TypeError) as exc:
+    except (AttributeError, ImportError, TypeError) as exc:
         raise StructuredOutputValidatorUnavailable(
             STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE
         ) from exc
