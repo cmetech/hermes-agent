@@ -504,23 +504,24 @@ def test_typed_mirror_index_replace_crash_is_idempotently_recoverable(
         sha256=digest,
     )
     mirrors = mirror_store_type(tmp_path / "home")
-    original = sessions_module._durable_replace
+    original = sessions_module._atomic_bytes_at
+    index_name = mirrors._scope_id("workflow", "node", "scope") + ".json"
     armed = True
 
-    def fail_index(source, target):
+    def fail_index(directory, name, payload):
         nonlocal armed
-        if Path(target).parent == mirrors.index_root and armed:
+        if name == index_name and armed:
             armed = False
             if side == "before":
                 raise OSError("index replace crash")
-            original(source, target)
+            original(directory, name, payload)
             raise OSError("index replace crash")
-        return original(source, target)
+        return original(directory, name, payload)
 
-    monkeypatch.setattr(sessions_module, "_durable_replace", fail_index)
+    monkeypatch.setattr(sessions_module, "_atomic_bytes_at", fail_index)
     with pytest.raises(OSError, match="index replace crash"):
         mirrors.complete(obligation, data)
-    monkeypatch.setattr(sessions_module, "_durable_replace", original)
+    monkeypatch.setattr(sessions_module, "_atomic_bytes_at", original)
 
     recovered = mirrors.complete(obligation, data)
     repeated = mirrors.complete(obligation, data)

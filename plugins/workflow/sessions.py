@@ -8,12 +8,20 @@ import json
 import os
 import sqlite3
 import stat
-import tempfile
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterator
 
 from plugins.workflow.locks import workflow_lock
+
+try:  # pragma: no cover - platform import
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 _SHA256_LENGTH = 64
@@ -26,6 +34,10 @@ _MIRROR_MEDIA = {
 
 
 class TypedMirrorIntegrityError(RuntimeError):
+    pass
+
+
+class _MalformedMirrorIndex(TypedMirrorIntegrityError):
     pass
 
 
@@ -62,6 +74,34 @@ class TypedMirrorRecord:
     sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class _MirrorIndex:
+    entry_id: str
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MirrorLayout:
+    home: int
+    workflow: int
+    root: int
+    content: int
+    entries: int
+    activations: int
+    indexes: int
+
+    def descriptors(self) -> tuple[int, ...]:
+        return (
+            self.home,
+            self.workflow,
+            self.root,
+            self.content,
+            self.entries,
+            self.activations,
+            self.indexes,
+        )
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -75,54 +115,84 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8") + b"\n"
 
 
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _durable_replace(source: str | Path, target: str | Path) -> None:
-    source_path = Path(source)
-    target_path = Path(target)
-    os.replace(source_path, target_path)
-    _fsync_directory(target_path.parent)
-
-
-def _atomic_bytes(path: Path, data: bytes) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _durable_replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-
-
 def _is_reparse_point(observed: os.stat_result) -> bool:
     marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return bool(marker and getattr(observed, "st_file_attributes", 0) & marker)
 
 
-def _read_regular(path: Path, *, max_bytes: int) -> bytes:
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _require_secure_mirror_io() -> None:
+    required_dir_fd_functions = {
+        os.link,
+        os.mkdir,
+        os.open,
+        os.rename,
+        os.stat,
+        os.unlink,
+    }
+    if (
+        os.name != "posix"
+        or fcntl is None
+        or not hasattr(os, "O_CLOEXEC")
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or not required_dir_fd_functions <= os.supports_dir_fd
+        or os.listdir not in os.supports_fd
+    ):
+        raise TypedMirrorIntegrityError(
+            "secure descriptor-relative typed mirror I/O is unavailable"
+        )
+
+
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or _is_reparse_point(observed):
+        raise TypedMirrorIntegrityError("typed mirror directory is unsafe")
+    return observed.st_dev, observed.st_ino
+
+
+def _open_directory_at(
+    parent: int,
+    name: str,
+    *,
+    create: bool,
+) -> int:
+    if create:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise TypedMirrorIntegrityError(
+                "typed mirror directory is unavailable"
+            ) from exc
     try:
-        observed = path.lstat()
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent)
+    except OSError as exc:
+        raise TypedMirrorIntegrityError("typed mirror directory is unsafe") from exc
+    try:
+        _directory_identity(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_regular_at(directory: int, name: str, *, max_bytes: int) -> bytes:
+    try:
+        observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise TypedMirrorIntegrityError("typed mirror file is unavailable") from exc
     if not stat.S_ISREG(observed.st_mode) or _is_reparse_point(observed):
         raise TypedMirrorIntegrityError("typed mirror file is unsafe")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=directory)
     except OSError as exc:
         raise TypedMirrorIntegrityError("typed mirror file is unsafe") from exc
     try:
@@ -151,32 +221,310 @@ def _read_regular(path: Path, *, max_bytes: int) -> bytes:
 
 
 def _validate_directory(path: Path) -> None:
-    observed = path.lstat()
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise TypedMirrorIntegrityError("typed mirror directory is unavailable") from exc
     if not stat.S_ISDIR(observed.st_mode) or _is_reparse_point(observed):
         raise TypedMirrorIntegrityError("typed mirror directory is unsafe")
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("typed mirror write made no progress")
+        remaining = remaining[written:]
+
+
+def _temporary_name(target: str) -> str:
+    return f".{target}.{uuid.uuid4().hex}.tmp"
+
+
+def _write_temporary_at(directory: int, target: str, data: bytes) -> str:
+    temporary = _temporary_name(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+    except OSError as exc:
+        raise TypedMirrorIntegrityError("typed mirror write failed") from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    return temporary
+
+
+def _write_immutable_at(directory: int, name: str, data: bytes) -> None:
+    try:
+        existing = _read_regular_at(directory, name, max_bytes=max(len(data), 1))
+    except FileNotFoundError:
+        pass
+    else:
+        if not hmac.compare_digest(existing, data):
+            raise TypedMirrorIntegrityError("typed mirror immutable identity conflicts")
+        return
+    temporary = _write_temporary_at(directory, name, data)
+    try:
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+        os.fsync(directory)
+    except FileExistsError:
+        existing = _read_regular_at(directory, name, max_bytes=max(len(data), 1))
+        if not hmac.compare_digest(existing, data):
+            raise TypedMirrorIntegrityError("typed mirror immutable identity conflicts")
+    except OSError as exc:
+        raise TypedMirrorIntegrityError("typed mirror immutable write failed") from exc
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except OSError:
+            pass
+    os.fsync(directory)
+
+
+def _atomic_bytes_at(directory: int, name: str, data: bytes) -> None:
+    temporary = _write_temporary_at(directory, name, data)
+    try:
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    except OSError as exc:
+        raise TypedMirrorIntegrityError("typed mirror atomic write failed") from exc
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except OSError:
+            pass
+
+
+_mirror_process_locks: dict[tuple[int, int], threading.RLock] = {}
+_mirror_process_locks_guard = threading.Lock()
+
+
+def _process_lock(identity: tuple[int, int]) -> threading.RLock:
+    with _mirror_process_locks_guard:
+        return _mirror_process_locks.setdefault(identity, threading.RLock())
 
 
 class TypedMirrorStore:
     """Immutable profile-local typed content with one atomic scope pointer."""
 
-    def __init__(self, hermes_home: str | Path):
-        workflow_root = Path(hermes_home).resolve() / "workflows"
-        self.root = workflow_root / "typed-mirrors"
+    def __init__(
+        self,
+        hermes_home: str | Path,
+        *,
+        capacity_check: Callable[[int, int], None] | None = None,
+        free_disk_check: Callable[[], None] | None = None,
+    ):
+        _require_secure_mirror_io()
+        self.hermes_home = Path(hermes_home).resolve()
+        self.hermes_home.mkdir(parents=True, exist_ok=True)
+        self.workflow_root = self.hermes_home / "workflows"
+        self.root = self.workflow_root / "typed-mirrors"
         self.content_root = self.root / "content"
         self.entry_root = self.root / "entries"
         self.activation_root = self.root / "activations"
         self.index_root = self.root / "indexes"
         self.lock_path = self.root / ".scope-index.lock"
+        self._capacity_check = capacity_check
+        self._free_disk_check = free_disk_check
+        with self._open_layout(create=True, verify_expected=False) as layout:
+            self._expected_identities = tuple(
+                _directory_identity(descriptor)
+                for descriptor in layout.descriptors()
+            )
+
+    def _validate_paths(self) -> None:
         for directory in (
-            workflow_root,
+            self.hermes_home,
+            self.workflow_root,
             self.root,
             self.content_root,
             self.entry_root,
             self.activation_root,
             self.index_root,
         ):
-            directory.mkdir(parents=True, exist_ok=True)
             _validate_directory(directory)
+
+    @contextmanager
+    def _open_layout(
+        self,
+        *,
+        create: bool = False,
+        verify_expected: bool = True,
+    ) -> Iterator[_MirrorLayout]:
+        descriptors: list[int] = []
+        try:
+            try:
+                home = os.open(self.hermes_home, _directory_flags())
+                descriptors.append(home)
+                workflow = _open_directory_at(home, "workflows", create=create)
+                descriptors.append(workflow)
+                root = _open_directory_at(workflow, "typed-mirrors", create=create)
+                descriptors.append(root)
+                content = _open_directory_at(root, "content", create=create)
+                descriptors.append(content)
+                entries = _open_directory_at(root, "entries", create=create)
+                descriptors.append(entries)
+                activations = _open_directory_at(root, "activations", create=create)
+                descriptors.append(activations)
+                indexes = _open_directory_at(root, "indexes", create=create)
+                descriptors.append(indexes)
+                layout = _MirrorLayout(
+                    home,
+                    workflow,
+                    root,
+                    content,
+                    entries,
+                    activations,
+                    indexes,
+                )
+                expected_identities = getattr(self, "_expected_identities", None)
+                if expected_identities is not None and tuple(
+                    _directory_identity(descriptor)
+                    for descriptor in layout.descriptors()
+                ) != expected_identities and verify_expected:
+                    raise TypedMirrorIntegrityError(
+                        "typed mirror directory identity changed"
+                    )
+                self._validate_paths()
+            except TypedMirrorIntegrityError:
+                raise
+            except OSError as exc:
+                raise TypedMirrorIntegrityError(
+                    "typed mirror directory is unavailable"
+                ) from exc
+            yield layout
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @contextmanager
+    def _locked_layout(self) -> Iterator[_MirrorLayout]:
+        with self._open_layout() as layout:
+            identity = _directory_identity(layout.root)
+            process_lock = _process_lock(identity)
+            with process_lock:
+                flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+                try:
+                    lock_descriptor = os.open(
+                        ".scope-index.lock",
+                        flags,
+                        0o600,
+                        dir_fd=layout.root,
+                    )
+                except OSError as exc:
+                    raise TypedMirrorIntegrityError(
+                        "typed mirror lock is unsafe"
+                    ) from exc
+                try:
+                    observed = os.fstat(lock_descriptor)
+                    if (
+                        not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                        or _is_reparse_point(observed)
+                    ):
+                        raise TypedMirrorIntegrityError(
+                            "typed mirror lock is unsafe"
+                        )
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                    yield layout
+                finally:
+                    try:
+                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_descriptor)
+
+    @staticmethod
+    def _layout_bytes(layout: _MirrorLayout) -> int:
+        total = 0
+        for descriptor in (
+            layout.content,
+            layout.entries,
+            layout.activations,
+            layout.indexes,
+        ):
+            for name in os.listdir(descriptor):
+                try:
+                    observed = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(observed.st_mode) and not _is_reparse_point(observed):
+                    total += observed.st_size
+        return total
+
+    @staticmethod
+    def _missing_file_bytes(directory: int, name: str, data: bytes) -> int:
+        try:
+            existing = _read_regular_at(
+                directory,
+                name,
+                max_bytes=max(len(data), 1),
+            )
+        except FileNotFoundError:
+            return len(data) * 2
+        if not hmac.compare_digest(existing, data):
+            raise TypedMirrorIntegrityError(
+                "typed mirror immutable identity conflicts"
+            )
+        return 0
+
+    def _reserve_stage(
+        self,
+        layout: _MirrorLayout,
+        obligation: TypedMirrorObligation,
+        content: bytes,
+        record: TypedMirrorRecord,
+        entry_bytes: bytes,
+    ) -> None:
+        if self._free_disk_check is not None:
+            self._free_disk_check()
+        if self._capacity_check is None:
+            return
+        activation = self._activation_bytes(record.entry_id)
+        index = self._index_bytes(record.entry_id, generation=1)
+        required = sum((
+            self._missing_file_bytes(
+                layout.content,
+                obligation.sha256,
+                content,
+            ),
+            self._missing_file_bytes(
+                layout.entries,
+                f"{record.entry_id}.json",
+                entry_bytes,
+            ),
+            self._missing_file_bytes(
+                layout.activations,
+                f"{record.entry_id}.json",
+                activation,
+            ),
+            len(index) * 2,
+        ))
+        self._capacity_check(self._layout_bytes(layout), required)
 
     @staticmethod
     def _scope_id(workflow: str, node_id: str, operator_scope: str) -> str:
@@ -304,15 +652,20 @@ class TypedMirrorStore:
             raise TypedMirrorIntegrityError("typed mirror entry is malformed")
         return document
 
-    def _verified_record(self, entry_id: str) -> TypedMirrorRecord:
+    def _verified_record(
+        self,
+        layout: _MirrorLayout,
+        entry_id: str,
+    ) -> TypedMirrorRecord:
         if (
             not isinstance(entry_id, str)
             or len(entry_id) != _SHA256_LENGTH
             or any(character not in "0123456789abcdef" for character in entry_id)
         ):
             raise TypedMirrorIntegrityError("typed mirror entry identity is invalid")
-        entry_bytes = _read_regular(
-            self.entry_root / f"{entry_id}.json",
+        entry_bytes = _read_regular_at(
+            layout.entries,
+            f"{entry_id}.json",
             max_bytes=_MIRROR_MAX_DOCUMENT_BYTES,
         )
         document = self._verified_entry_document(
@@ -320,8 +673,9 @@ class TypedMirrorStore:
             expected_entry_id=entry_id,
         )
         record = self._record(document)
-        content = _read_regular(
-            self.content_root / record.sha256,
+        content = _read_regular_at(
+            layout.content,
+            record.sha256,
             max_bytes=_MIRROR_MAX_CONTENT_BYTES,
         )
         if (
@@ -335,92 +689,73 @@ class TypedMirrorStore:
     def _activation_bytes(entry_id: str) -> bytes:
         return _canonical_json({"entry_id": entry_id, "schema_version": 1})
 
-    def _is_activated(self, entry_id: str) -> bool:
+    @staticmethod
+    def _index_bytes(entry_id: str, *, generation: int) -> bytes:
+        return _canonical_json({
+            "schema_version": 1,
+            "generation": generation,
+            "entry_id": entry_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def _is_activated(self, layout: _MirrorLayout, entry_id: str) -> bool:
         expected = self._activation_bytes(entry_id)
         try:
-            observed = _read_regular(
-                self.activation_root / f"{entry_id}.json",
+            observed = _read_regular_at(
+                layout.activations,
+                f"{entry_id}.json",
                 max_bytes=_MIRROR_MAX_DOCUMENT_BYTES,
             )
-        except TypedMirrorIntegrityError:
+        except (FileNotFoundError, TypedMirrorIntegrityError):
             return False
         return hmac.compare_digest(observed, expected)
 
-    def _read_index_entry_id(self, index_path: Path) -> str | None:
-        try:
-            index = json.loads(
-                _read_regular(index_path, max_bytes=_MIRROR_MAX_DOCUMENT_BYTES)
-            )
-            if (
-                not isinstance(index, dict)
-                or set(index)
-                != {"schema_version", "generation", "entry_id", "updated_at"}
-                or index.get("schema_version") != 1
-                or isinstance(index.get("generation"), bool)
-                or not isinstance(index.get("generation"), int)
-                or index["generation"] < 1
-                or not isinstance(index.get("updated_at"), str)
-            ):
-                return None
-            updated_at = datetime.fromisoformat(index["updated_at"])
-            if updated_at.tzinfo is None:
-                return None
-            entry_id = index.get("entry_id")
-            if (
-                not isinstance(entry_id, str)
-                or len(entry_id) != _SHA256_LENGTH
-                or any(character not in "0123456789abcdef" for character in entry_id)
-            ):
-                return None
-            return entry_id
-        except (
-            OSError,
-            TypeError,
-            UnicodeDecodeError,
-            ValueError,
-            json.JSONDecodeError,
-            TypedMirrorIntegrityError,
-        ):
-            return None
-
     @staticmethod
-    def _write_immutable(path: Path, data: bytes) -> None:
+    def _parse_index(data: bytes) -> _MirrorIndex:
         try:
-            existing = _read_regular(path, max_bytes=max(len(data), 1))
-        except TypedMirrorIntegrityError:
-            if path.exists() or path.is_symlink():
-                raise
-        else:
-            if not hmac.compare_digest(existing, data):
-                raise TypedMirrorIntegrityError("typed mirror immutable identity conflicts")
-            return
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".immutable-{path.name}.",
-            dir=path.parent,
-        )
+            index = json.loads(data)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _MalformedMirrorIndex("typed mirror index is malformed") from exc
+        if (
+            not isinstance(index, dict)
+            or set(index)
+            != {"schema_version", "generation", "entry_id", "updated_at"}
+            or index.get("schema_version") != 1
+            or isinstance(index.get("generation"), bool)
+            or not isinstance(index.get("generation"), int)
+            or index["generation"] < 1
+            or not isinstance(index.get("updated_at"), str)
+        ):
+            raise _MalformedMirrorIndex("typed mirror index is malformed")
         try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.link(temporary, path, follow_symlinks=False)
-            _fsync_directory(path.parent)
-        except FileExistsError:
-            existing = _read_regular(path, max_bytes=max(len(data), 1))
-            if not hmac.compare_digest(existing, data):
-                raise TypedMirrorIntegrityError(
-                    "typed mirror immutable identity conflicts"
-                )
-        except OSError as exc:
-            raise TypedMirrorIntegrityError(
-                "typed mirror immutable write failed"
-            ) from exc
-        finally:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-        _fsync_directory(path.parent)
+            updated_at = datetime.fromisoformat(index["updated_at"])
+        except ValueError as exc:
+            raise _MalformedMirrorIndex("typed mirror index is malformed") from exc
+        entry_id = index.get("entry_id")
+        if (
+            updated_at.tzinfo is None
+            or updated_at.utcoffset() is None
+            or not isinstance(entry_id, str)
+            or len(entry_id) != _SHA256_LENGTH
+            or any(character not in "0123456789abcdef" for character in entry_id)
+        ):
+            raise _MalformedMirrorIndex("typed mirror index is malformed")
+        return _MirrorIndex(entry_id, int(index["generation"]))
+
+    def _read_index(
+        self,
+        layout: _MirrorLayout,
+        name: str,
+    ) -> _MirrorIndex | None:
+        try:
+            data = _read_regular_at(
+                layout.indexes,
+                name,
+                max_bytes=_MIRROR_MAX_DOCUMENT_BYTES,
+            )
+        except FileNotFoundError:
+            return None
+        return self._parse_index(data)
 
     def stage(
         self,
@@ -439,9 +774,20 @@ class TypedMirrorStore:
         if len(entry_bytes) > _MIRROR_MAX_DOCUMENT_BYTES:
             raise TypedMirrorIntegrityError("typed mirror entry exceeds its byte ceiling")
         record = self._record(entry)
-        with workflow_lock(self.lock_path):
-            self._write_immutable(self.content_root / obligation.sha256, content)
-            self._write_immutable(self.entry_root / f"{record.entry_id}.json", entry_bytes)
+        with self._locked_layout() as layout:
+            self._reserve_stage(
+                layout,
+                obligation,
+                content,
+                record,
+                entry_bytes,
+            )
+            _write_immutable_at(layout.content, obligation.sha256, content)
+            _write_immutable_at(
+                layout.entries,
+                f"{record.entry_id}.json",
+                entry_bytes,
+            )
         return record
 
     def point(
@@ -451,75 +797,48 @@ class TypedMirrorStore:
         replace_current: bool = True,
     ) -> bool:
         """Atomically point the scope index at staged, still-invisible data."""
-        index_path = self.index_root / (
+        index_name = (
             self._scope_id(record.workflow, record.node_id, record.operator_scope)
             + ".json"
         )
-        with workflow_lock(self.lock_path):
-            verified = self._verified_record(record.entry_id)
+        with self._locked_layout() as layout:
+            verified = self._verified_record(layout, record.entry_id)
             if verified != record:
                 raise TypedMirrorIntegrityError("typed mirror staged record conflicts")
-            generation = 0
             try:
-                index_path.lstat()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                raise TypedMirrorIntegrityError(
-                    "typed mirror index is unavailable"
-                ) from exc
-            else:
-                try:
-                    current = json.loads(
-                        _read_regular(
-                            index_path,
-                            max_bytes=_MIRROR_MAX_DOCUMENT_BYTES,
-                        )
-                    )
-                    if isinstance(current, dict):
-                        if current.get("entry_id") == record.entry_id:
-                            current_record = self._verified_record(record.entry_id)
-                            if current_record == record:
-                                return True
-                        if isinstance(
-                            current.get("generation"), int
-                        ) and not isinstance(current.get("generation"), bool):
-                            generation = int(current["generation"])
-                except (
-                    TypeError,
-                    UnicodeDecodeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                ):
-                    pass
+                current = self._read_index(layout, index_name)
+            except _MalformedMirrorIndex:
+                current = None
+            if current is not None and current.entry_id == record.entry_id:
+                current_record = self._verified_record(layout, record.entry_id)
+                if current_record == record:
+                    return True
             if not replace_current:
-                current_id = self._read_index_entry_id(index_path)
-                if current_id is not None:
+                if current is not None:
                     try:
-                        self._verified_record(current_id)
+                        self._verified_record(layout, current.entry_id)
                     except TypedMirrorIntegrityError:
                         pass
                     else:
-                        return False
-            _atomic_bytes(
-                index_path,
-                _canonical_json({
-                    "schema_version": 1,
-                    "generation": generation + 1,
-                    "entry_id": record.entry_id,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }),
+                        if self._is_activated(layout, current.entry_id):
+                            return False
+            generation = current.generation if current is not None else 0
+            _atomic_bytes_at(
+                layout.indexes,
+                index_name,
+                self._index_bytes(record.entry_id, generation=generation + 1),
             )
         return True
 
     def verify(self, record: TypedMirrorRecord) -> TypedMirrorRecord:
         """Expose one immutable entry after its completion journal is durable."""
-        with workflow_lock(self.lock_path):
-            verified = self._verified_record(record.entry_id)
+        with self._locked_layout() as layout:
+            verified = self._verified_record(layout, record.entry_id)
             if verified != record:
                 raise TypedMirrorIntegrityError("typed mirror staged record conflicts")
-            self._write_immutable(
-                self.activation_root / f"{record.entry_id}.json",
+            _write_immutable_at(
+                layout.activations,
+                f"{record.entry_id}.json",
                 self._activation_bytes(record.entry_id),
             )
         return record
@@ -543,27 +862,52 @@ class TypedMirrorStore:
         """Stage and activate a mirror for callers without a journal boundary."""
         return self.activate(self.stage(obligation, content))
 
+    def invalidate(self, obligation: TypedMirrorObligation) -> None:
+        """Remove only this obligation's current pointer; retain immutable history."""
+        index_name = (
+            self._scope_id(
+                obligation.workflow,
+                obligation.node_id,
+                obligation.operator_scope,
+            )
+            + ".json"
+        )
+        with self._locked_layout() as layout:
+            try:
+                current = self._read_index(layout, index_name)
+            except _MalformedMirrorIndex:
+                current = None
+            if current is None:
+                return
+            record = self._verified_record(layout, current.entry_id)
+            if record.mirror_id != obligation.mirror_id:
+                return
+            os.unlink(index_name, dir_fd=layout.indexes)
+            os.fsync(layout.indexes)
+
     def get(
         self,
         workflow: str,
         node_id: str,
         operator_scope: str,
     ) -> TypedMirrorRecord | None:
-        index_path = self.index_root / (
-            self._scope_id(workflow, node_id, operator_scope) + ".json"
-        )
+        index_name = self._scope_id(workflow, node_id, operator_scope) + ".json"
         try:
-            entry_id = self._read_index_entry_id(index_path)
-            if entry_id is None or not self._is_activated(entry_id):
-                return None
-            record = self._verified_record(entry_id)
-            if (
-                record.workflow != workflow
-                or record.node_id != node_id
-                or record.operator_scope != operator_scope
-            ):
-                return None
-            return record
+            with self._open_layout() as layout:
+                current = self._read_index(layout, index_name)
+                if current is None or not self._is_activated(
+                    layout,
+                    current.entry_id,
+                ):
+                    return None
+                record = self._verified_record(layout, current.entry_id)
+                if (
+                    record.workflow != workflow
+                    or record.node_id != node_id
+                    or record.operator_scope != operator_scope
+                ):
+                    return None
+                return record
         except (
             KeyError,
             OSError,
@@ -582,20 +926,26 @@ class TypedMirrorStore:
         operator_scope: str,
     ) -> tuple[TypedMirrorRecord, ...]:
         records: list[TypedMirrorRecord] = []
-        for path in sorted(self.entry_root.glob("*.json"), key=lambda item: item.name):
-            try:
-                entry_id = path.stem
-                if not self._is_activated(entry_id):
-                    continue
-                record = self._verified_record(entry_id)
-            except TypedMirrorIntegrityError:
-                continue
-            if (
-                record.workflow == workflow
-                and record.node_id == node_id
-                and record.operator_scope == operator_scope
-            ):
-                records.append(record)
+        try:
+            with self._open_layout() as layout:
+                for name in sorted(os.listdir(layout.entries)):
+                    if not name.endswith(".json"):
+                        continue
+                    try:
+                        entry_id = name.removesuffix(".json")
+                        if not self._is_activated(layout, entry_id):
+                            continue
+                        record = self._verified_record(layout, entry_id)
+                    except TypedMirrorIntegrityError:
+                        continue
+                    if (
+                        record.workflow == workflow
+                        and record.node_id == node_id
+                        and record.operator_scope == operator_scope
+                    ):
+                        records.append(record)
+        except TypedMirrorIntegrityError:
+            return ()
         return tuple(records)
 
 

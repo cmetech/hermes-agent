@@ -9,6 +9,7 @@ import stat
 
 import pytest
 
+import plugins.workflow.sessions as sessions_module
 from plugins.workflow.showcase import ShowcaseCatalogError, load_showcase_catalog
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.evidence import EvidenceReader
@@ -49,6 +50,33 @@ def _inject_reparse(monkeypatch, target: Path) -> None:
         return observed
 
     monkeypatch.setattr(Path, "lstat", injected)
+
+
+def _inject_descriptor_reparse(monkeypatch, target: Path) -> None:
+    original_stat = sessions_module.os.stat
+
+    def injected(path, *, dir_fd=None, follow_symlinks=True):
+        observed = original_stat(
+            path,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if dir_fd is not None and str(path) == target.name:
+            return _ReparseStat(observed)
+        return observed
+
+    monkeypatch.setattr(sessions_module.os, "stat", injected)
+
+
+def _swap_directory_to_external(
+    directory: Path,
+    external: Path,
+) -> Path:
+    retained = directory.with_name(f"{directory.name}-retained")
+    directory.rename(retained)
+    external.mkdir()
+    directory.symlink_to(external, target_is_directory=True)
+    return retained
 
 
 def _log_path(tmp_path, workflow_writer, *, name: str):
@@ -315,11 +343,11 @@ def test_typed_mirror_content_reparse_point_fails_closed(
     content = mirrors.content_root / obligation.sha256
     sentinel = tmp_path / "outside-content-sentinel"
     sentinel.write_bytes(b"keep")
-    _inject_reparse(monkeypatch, content)
+    _inject_descriptor_reparse(monkeypatch, content)
     original_link = os.link
 
     def trapped_content_link(source, destination, *args, **kwargs):
-        if Path(destination) == content:
+        if str(destination) == content.name:
             sentinel.write_bytes(b"continued through unsafe content")
         return original_link(source, destination, *args, **kwargs)
 
@@ -343,11 +371,11 @@ def test_typed_mirror_index_reparse_point_is_invisible(
     index = index.with_suffix(".json")
     sentinel = tmp_path / "outside-index-sentinel"
     sentinel.write_bytes(b"keep")
-    _inject_reparse(monkeypatch, index)
+    _inject_descriptor_reparse(monkeypatch, index)
     original_open = os.open
 
     def trapped_index_open(path, flags, mode=0o777, *, dir_fd=None):
-        if Path(path) == index:
+        if dir_fd is not None and str(path) == index.name:
             sentinel.write_bytes(b"followed unsafe index")
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -369,13 +397,24 @@ def test_typed_mirror_completion_rejects_reparse_index_before_replace(
     original_index = index.read_bytes()
     sentinel = tmp_path / "outside-index-write-sentinel"
     sentinel.write_bytes(b"keep")
-    _inject_reparse(monkeypatch, index)
+    _inject_descriptor_reparse(monkeypatch, index)
     original_replace = os.replace
 
-    def trapped_index_replace(source, destination):
-        if Path(destination) == index:
+    def trapped_index_replace(
+        source,
+        destination,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+    ):
+        if dst_dir_fd is not None and str(destination) == index.name:
             sentinel.write_bytes(b"replaced unsafe index")
-        return original_replace(source, destination)
+        return original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
 
     monkeypatch.setattr(os, "replace", trapped_index_replace)
     second_data = b"second"
@@ -388,3 +427,123 @@ def test_typed_mirror_completion_rejects_reparse_index_before_replace(
 
     assert index.read_bytes() == original_index
     assert sentinel.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["root", "content", "entries", "activations", "indexes"],
+)
+def test_typed_mirror_operations_reject_swapped_parent_directories(
+    tmp_path,
+    branch: str,
+) -> None:
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    data = b"anchored mirror"
+    obligation = _mirror_obligation(data)
+    record = mirrors.stage(obligation, data)
+    target = {
+        "root": mirrors.root,
+        "content": mirrors.content_root,
+        "entries": mirrors.entry_root,
+        "activations": mirrors.activation_root,
+        "indexes": mirrors.index_root,
+    }[branch]
+    external = tmp_path / f"outside-{branch}"
+    retained = _swap_directory_to_external(target, external)
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"keep")
+
+    if branch == "root":
+        for name in ("content", "entries", "activations", "indexes"):
+            (external / name).mkdir()
+        action = lambda: mirrors.point(record)
+    elif branch == "content":
+        next_data = b"different content"
+        action = lambda: mirrors.stage(
+            _mirror_obligation(next_data, run_id="run-2"),
+            next_data,
+        )
+    elif branch == "entries":
+        next_obligation = _mirror_obligation(data, run_id="run-2")
+        action = lambda: mirrors.stage(next_obligation, data)
+    elif branch == "activations":
+        action = lambda: mirrors.verify(record)
+    else:
+        action = lambda: mirrors.point(record)
+
+    with pytest.raises(TypedMirrorIntegrityError):
+        action()
+
+    assert sentinel.read_bytes() == b"keep"
+    assert {path.name for path in external.iterdir()} <= {
+        "sentinel",
+        "content",
+        "entries",
+        "activations",
+        "indexes",
+    }
+    assert retained.is_dir()
+
+
+def test_typed_mirror_store_fails_closed_without_descriptor_relative_io(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sessions_module.os, "supports_dir_fd", set())
+
+    with pytest.raises(TypedMirrorIntegrityError, match="unavailable"):
+        TypedMirrorStore(tmp_path / "profile")
+
+
+def test_completed_mirror_recovery_replaces_a_pending_current_pointer(tmp_path) -> None:
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    first_data = b"completed-a"
+    first = mirrors.complete(_mirror_obligation(first_data), first_data)
+    pending_data = b"pending-b"
+    pending = mirrors.stage(
+        _mirror_obligation(pending_data, run_id="run-2"),
+        pending_data,
+    )
+    assert mirrors.point(pending)
+    assert mirrors.get("workflow", "node", "scope") is None
+
+    assert mirrors.point(first, replace_current=False)
+    mirrors.verify(first)
+
+    assert mirrors.get("workflow", "node", "scope") == first
+
+
+@pytest.mark.parametrize("malformation", ["same_entry_missing_fields", "negative_generation"])
+def test_typed_mirror_point_repairs_malformed_scope_indexes(
+    tmp_path,
+    malformation: str,
+) -> None:
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    first_data = b"first"
+    first = mirrors.stage(_mirror_obligation(first_data), first_data)
+    target_data = b"target"
+    target = mirrors.stage(
+        _mirror_obligation(target_data, run_id="run-2"),
+        target_data,
+    )
+    index = mirrors.index_root / mirrors._scope_id("workflow", "node", "scope")
+    index = index.with_suffix(".json")
+    if malformation == "same_entry_missing_fields":
+        index.write_text(json.dumps({"entry_id": target.entry_id}), encoding="utf-8")
+    else:
+        index.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "generation": -5,
+                "entry_id": first.entry_id,
+                "updated_at": "2026-07-30T12:00:00+00:00",
+            }),
+            encoding="utf-8",
+        )
+
+    assert mirrors.point(target)
+    mirrors.verify(target)
+
+    repaired = json.loads(index.read_bytes())
+    assert repaired["generation"] == 1
+    assert mirrors.get("workflow", "node", "scope") == target

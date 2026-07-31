@@ -226,6 +226,112 @@ Result: Ruff and the whitespace check passed.
 
 Concerns: none within the spec-fix scope.
 
+## Quality Fix Round 1 — anchored recovery, strict replay, and bounded mirrors
+
+All six Important findings from the independent quality review are addressed.
+
+- Publication cleanup now opens the run and publication roots once with
+  no-follow directory descriptors. Enumeration, quarantine rename, recursive
+  inspection, unlink, and directory removal are descriptor-relative. A
+  post-validation root swap cannot redirect cleanup into an external target,
+  and unsupported hosts fail closed before any traversal.
+- Mirror roots, immutable content and entries, activations, indexes, atomic
+  replacement, enumeration, and the scope lock are anchored to a verified
+  no-follow descriptor chain. The store has an explicit POSIX capability gate,
+  revalidates recorded directory identities, and rejects unsafe or swapped
+  parents.
+- Scope indexes now have one strict parser: exact keys, schema version,
+  timezone-aware update time, generation at least one, and a valid entry ID.
+  Completed replay replaces a pending current pointer, preserves only a
+  verified activated current entry, and resets malformed generations instead
+  of inheriting them.
+- Mirror reconciliation parses journal event types before any descriptor-empty
+  fast path. Required and completed obligations must remain backed by the
+  sealed, verified publication-derived set even when that expected set is
+  empty. A mismatch durably enters `typed_mirror_integrity` and removes a
+  matching current pointer while retaining immutable history.
+- Aggregate profile accounting now includes `workflows/typed-mirrors` for
+  admission, publication, recovery, and mirror writes. Mirror staging checks
+  free disk and reserves content, entry, activation, index, and temporary-write
+  overhead under the mirror lock before its first mutation. Immutable activated
+  history is intentionally retained; capacity is bounded by rejecting new
+  writes rather than collecting entries that may still be journal-referenced.
+- Typed publication descriptors now carry an explicit version. Genuine base
+  Task 8 descriptors are upgraded only after bounded descriptor-relative reads
+  prove the checked metadata digest, content digest, winning-attempt ownership,
+  sealed schema identity, and exact canonical metadata bytes. Recovery appends
+  a checked `typed_publication_migrated` projection; versioned forged demotions
+  remain rejected.
+
+### Strict TDD evidence
+
+Focused RED for publication cleanup, legacy migration, mirror-obligation
+demotion, and aggregate quota:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py -k 'swapped_root or base_typed or mirror_obligation or mirror_profile_quota'
+```
+
+Observed expected RED: 5 selected, 0 passed and 5 failed.
+
+Focused RED for descriptor anchoring, capability gating, pending-index replay,
+and malformed-index recovery:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_security_boundaries.py -k 'swapped_parent or descriptor_relative_io or pending_current or malformed_scope'
+```
+
+Observed expected RED: 9 selected, 0 passed and 9 failed.
+
+Final focused GREEN: the two selectors passed 5/5 and 9/9 respectively.
+
+### Verification
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 136 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/sessions.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Quality-fix self-review
+
+- Confirmed cleanup holds the descriptor it enumerates and recursively removes
+  without following symlinks or reparse points.
+- Confirmed every mirror operation and lock uses the same verified profile-local
+  descriptor chain, while parent swaps leave external sentinels unchanged.
+- Confirmed a completed journal can recover over a pending pointer and that
+  malformed same-entry and negative-generation indexes are replaced safely.
+- Confirmed required-only and completed obligations cannot be silently demoted
+  to an empty expected set, and an old activation is no longer current.
+- Confirmed quota failure occurs before any content, entry, activation, or index
+  file appears in an initially empty mirror store.
+- Confirmed genuine base-format journals migrate and retain exact metadata
+  bytes, while all versioned forged-demotion regressions continue to fail
+  closed.
+
+Concern: native non-POSIX mirror semantics were not executed on this macOS
+host; the implementation deliberately fails closed when the required
+descriptor-relative and directory-durability primitives are unavailable.
+
 ## Spec Fix Round 2 — mirror-index write fail-closed behavior
 
 `TypedMirrorStore.point()` now distinguishes a genuinely absent scope index

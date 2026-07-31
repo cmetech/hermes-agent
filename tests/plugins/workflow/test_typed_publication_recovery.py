@@ -12,6 +12,7 @@ import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.output_resolution import ArchonOutputIntegrityError
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
@@ -531,6 +532,179 @@ def test_recovery_removes_unjournaled_final_bundle_as_one_unit(
     store.load_run(admitted.run_id)
 
     assert not orphan.exists()
+
+
+def test_publication_cleanup_never_traverses_a_swapped_root(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(store, workflow_writer, tmp_path / "cleanup-swap")
+    publications = store.run_directory(admitted.run_id) / "publications"
+    orphan = publications / ("f" * 32)
+    orphan.mkdir(parents=True)
+    (orphan / "content.md").write_bytes(b"orphan")
+    outside = tmp_path / "outside-publications"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    retained = publications.with_name("publications-retained")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def swap_after_validation(path: Path):
+        nonlocal swapped
+        observed = original_lstat(path)
+        if path == publications and not swapped:
+            swapped = True
+            publications.rename(retained)
+            publications.symlink_to(outside, target_is_directory=True)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", swap_after_validation)
+
+    try:
+        store.load_run(admitted.run_id)
+    except JournalRecoveryError:
+        pass
+
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_base_typed_publication_journal_is_checked_and_migrated(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(store, workflow_writer, tmp_path / "base-migration")
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"base bytes")
+    _complete(store, claim, artifact, candidate)
+    directory = store.run_directory(admitted.run_id)
+    publication = _published(store.load_run(admitted.run_id))
+    bundle = directory / "publications" / publication["publication_id"]
+    metadata = (bundle / "metadata.json").read_bytes()
+    journal = directory / "events.jsonl"
+    migrated_lines: list[bytes] = []
+    for line in journal.read_bytes().splitlines():
+        event = json.loads(line)
+        for value in event["projection"]["artifacts"]:
+            if value.get("publication_id") != publication["publication_id"]:
+                continue
+            for field in (
+                "typed_publication_version",
+                "schema_fingerprint",
+                "canonicalization_version",
+                "produced_at",
+                "session_id",
+            ):
+                value.pop(field, None)
+        event["projection_sha256"] = store_module._projection_digest(
+            event["projection"]
+        )
+        _validated, encoded = store_module._encode_journal_frame(event)
+        migrated_lines.append(encoded)
+    journal.write_bytes(b"".join(migrated_lines))
+    (directory / "run.json").unlink()
+
+    recovered = store.load_run(admitted.run_id)
+
+    upgraded = _published(recovered)
+    assert upgraded["typed_publication_version"] == 2
+    assert upgraded["canonicalization_version"] == 1
+    assert upgraded["produced_at"] == json.loads(metadata)["produced_at"]
+    assert (bundle / "metadata.json").read_bytes() == metadata
+    assert store.tail_events(admitted.run_id)[-1]["event_type"] == (
+        "typed_publication_migrated"
+    )
+
+
+@pytest.mark.parametrize("mirror_state", ["required", "completed"])
+def test_checked_mirror_obligation_cannot_be_demoted_to_an_empty_expected_set(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    mirror_state: str,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / f"demoted-{mirror_state}",
+        persist_sessions=True,
+        nodes=[{"id": "produce", "prompt": "Report", "output_type": "Report"}],
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    _source, artifact, candidate = _candidate(store, claim, b"persistent bytes")
+    if mirror_state == "required":
+        def stop_after_requirement(_self, _obligation, _content):
+            raise OSError("stop after mirror requirement")
+
+        monkeypatch.setattr(
+            store_module.TypedMirrorStore,
+            "stage",
+            stop_after_requirement,
+        )
+        with pytest.raises(OSError, match="stop after mirror requirement"):
+            _complete(store, claim, artifact, candidate)
+        monkeypatch.undo()
+    else:
+        _complete(store, claim, artifact, candidate)
+    key = NodeSessionKey(
+        "typed-recovery",
+        "produce",
+        "local",
+        "fake",
+        "fake",
+    )
+    registry = NodeSessionRegistry(home)
+    if mirror_state == "completed":
+        assert registry.get_mirror(key) is not None
+
+    def demote_persistence(projection: dict[str, object]) -> None:
+        projection["nodes"]["produce"].pop("cache_fingerprint", None)
+
+    _rewrite_latest_projection(store, admitted.run_id, demote_persistence)
+
+    with pytest.raises(JournalRecoveryError, match="typed mirror"):
+        store.load_run(admitted.run_id)
+
+    assert "typed_mirror_integrity" in store._active_run_repair_reasons(
+        admitted.run_id
+    )
+    assert registry.get_mirror(key) is None
+
+
+def test_mirror_profile_quota_fails_before_any_mirror_file_is_visible(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "mirror-quota",
+        persist_sessions=True,
+        nodes=[{"id": "produce", "prompt": "Report", "output_type": "Report"}],
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "owner")
+    assert claim is not None
+    data = b"q" * 50_000
+    _source, artifact, candidate = _candidate(store, claim, data)
+    store.max_profile_bytes = store._directory_bytes(store.runs_root) + 60_000
+
+    with pytest.raises(StorageQuotaError, match="profile_storage_quota"):
+        _complete(store, claim, artifact, candidate)
+
+    mirror_root = home / "workflows" / "typed-mirrors"
+    for name in ("content", "entries", "activations", "indexes"):
+        directory = mirror_root / name
+        assert not directory.exists() or list(directory.iterdir()) == []
 
 
 def test_publication_quota_failure_exposes_neither_content_nor_metadata(
