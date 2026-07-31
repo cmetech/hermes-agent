@@ -2,10 +2,10 @@ import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { ErrorState } from '@/components/ui/error-state'
+import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { LogView } from '@/components/ui/log-view'
-import { getApiRequestProfile, getWorkflowArtifactPreview, workflowArtifactDownloadUrl } from '@/hermes'
+import { downloadWorkflowArtifact, getApiRequestProfile, getWorkflowArtifactPreview } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { WorkflowArtifactPreview, WorkflowTypedArtifact } from '@/types/hermes'
 
@@ -17,6 +17,11 @@ interface TypedArtifactViewProps {
 interface MetadataRow {
   label: string
   value: null | string
+}
+
+interface DownloadFeedback {
+  publicationId: string
+  status: 'cancelled' | 'error'
 }
 
 export function isWorkflowTypedArtifact(item: unknown): item is WorkflowTypedArtifact {
@@ -55,7 +60,29 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
   const { locale, t } = useI18n()
   const copy = t.operations
   const profile = getApiRequestProfile() ?? 'default'
+  const [downloadFeedback, setDownloadFeedback] = useState<DownloadFeedback | null>(null)
+  const [downloadingPublicationId, setDownloadingPublicationId] = useState<null | string>(null)
   const [selectedPublicationId, setSelectedPublicationId] = useState<null | string>(null)
+
+  const handleDownload = async (artifact: WorkflowTypedArtifact) => {
+    const publicationId = artifact.publication_id
+
+    setDownloadFeedback(null)
+    setDownloadingPublicationId(publicationId)
+
+    try {
+      const activeProfile = getApiRequestProfile() ?? 'default'
+      const result = await downloadWorkflowArtifact(runId, publicationId, activeProfile)
+
+      if (result.status === 'cancelled') {
+        setDownloadFeedback({ publicationId, status: 'cancelled' })
+      }
+    } catch {
+      setDownloadFeedback({ publicationId, status: 'error' })
+    } finally {
+      setDownloadingPublicationId(null)
+    }
+  }
 
   const selectedArtifact = useMemo(
     () => artifacts.find(artifact => artifact.publication_id === selectedPublicationId) ?? null,
@@ -115,6 +142,8 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
           ]
 
           const canPreview = previewableMediaType(artifact.media_type)
+          const isDownloading = downloadingPublicationId === artifact.publication_id
+          const feedback = downloadFeedback?.publicationId === artifact.publication_id ? downloadFeedback : null
 
           return (
             <section
@@ -148,16 +177,30 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
                 ) : (
                   <span className="text-xs text-(--ui-text-tertiary)">{copy.artifactDownloadOnly}</span>
                 )}
-                <Button asChild size="sm" variant="secondary">
-                  <a
-                    aria-label={copy.artifactDownload}
-                    download
-                    href={workflowArtifactDownloadUrl(runId, artifact.publication_id)}
-                  >
-                    {copy.artifactDownload}
-                  </a>
+                <Button
+                  aria-label={isDownloading ? copy.artifactDownloading : copy.artifactDownload}
+                  disabled={downloadingPublicationId !== null}
+                  onClick={() => void handleDownload(artifact)}
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  {isDownloading ? copy.artifactDownloading : copy.artifactDownload}
                 </Button>
               </div>
+
+              {feedback?.status === 'cancelled' ? (
+                <p aria-live="polite" className="text-xs text-(--ui-text-tertiary)" role="status">
+                  {copy.artifactDownloadCancelled}
+                </p>
+              ) : feedback?.status === 'error' ? (
+                <ErrorBanner>
+                  <span className="grid gap-1">
+                    <span className="font-medium">{copy.artifactDownloadErrorTitle}</span>
+                    <span>{copy.artifactDownloadErrorDescription}</span>
+                  </span>
+                </ErrorBanner>
+              ) : null}
             </section>
           )
         })}

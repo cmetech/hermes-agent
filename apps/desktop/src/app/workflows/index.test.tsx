@@ -25,6 +25,7 @@ const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null 
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
 vi.mock('@/hermes', () => ({
+  downloadWorkflowArtifact: vi.fn().mockResolvedValue({ status: 'cancelled' }),
   getApiRequestProfile: () => apiRequestState.profile,
   getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
   getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
@@ -34,9 +35,7 @@ vi.mock('@/hermes', () => ({
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
   mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),
   previewWorkflowCleanup: (...args: unknown[]) => previewWorkflowCleanup(...args),
-  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args),
-  workflowArtifactDownloadUrl: (runId: string, publicationId: string) =>
-    `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(publicationId)}/download`
+  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args)
 }))
 
 vi.mock('@/lib/hermes-api', () => ({
@@ -1030,7 +1029,8 @@ describe('WorkflowsView', () => {
     })
 
     expect(await screen.findByText('Report')).toBeTruthy()
-    expect(screen.getByRole('link', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Download artifact' })).toBeNull()
     expect(screen.queryByText(/legacy\.txt/)).toBeNull()
 
     cleanup()

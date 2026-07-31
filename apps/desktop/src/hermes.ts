@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import type { WorkflowArtifactDownloadResult } from '@/global'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -478,8 +479,15 @@ export function getWorkflowArtifactPreview(runId: string, publicationId: string)
   })
 }
 
-export function workflowArtifactDownloadUrl(runId: string, publicationId: string): string {
-  return workflowArtifactUrl(runId, publicationId, 'download')
+export function downloadWorkflowArtifact(
+  runId: string,
+  publicationId: string,
+  profile: null | string = getApiRequestProfile()
+): Promise<WorkflowArtifactDownloadResult> {
+  return window.hermesDesktop.downloadWorkflowArtifact({
+    path: workflowArtifactUrl(runId, publicationId, 'download'),
+    ...(profile === null ? {} : { profile })
+  })
 }
 
 export function mutateWorkflowRun(

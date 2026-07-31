@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  downloadWorkflowArtifact,
   executeWorkflowCleanup,
   getApiRequestProfile,
   getCronJobs,
@@ -32,8 +33,7 @@ import {
   saveMoaModels,
   setApiRequestProfile,
   speakText,
-  transcribeAudio,
-  workflowArtifactDownloadUrl
+  transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 import type {
@@ -54,13 +54,20 @@ const emptySessionsResponse = {
 
 describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
+  let nativeDownload: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
     resetSidebarBatchCapability()
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
+    nativeDownload = vi.fn().mockResolvedValue({
+      filename: 'diagnostic.json',
+      mediaType: 'application/json',
+      sizeBytes: 13,
+      status: 'saved'
+    })
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { api }
+      value: { api, downloadWorkflowArtifact: nativeDownload }
     })
   })
 
@@ -340,7 +347,7 @@ describe('Hermes REST helpers', () => {
     )
   })
 
-  it('types typed-artifact evidence and URL-encodes preview and download identities', async () => {
+  it('types typed-artifact evidence and routes encoded preview and download identities through desktop transport', async () => {
     const artifact: WorkflowTypedArtifact = {
       attempt_id: 'attempt-1',
       integrity_status: 'verified',
@@ -380,9 +387,16 @@ describe('Hermes REST helpers', () => {
       path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/preview',
       profile: 'remote-profile'
     })
-    expect(workflowArtifactDownloadUrl('run / one', artifact.publication_id)).toBe(
-      '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download'
-    )
+    await expect(downloadWorkflowArtifact('run / one', artifact.publication_id, 'remote-profile')).resolves.toEqual({
+      filename: 'diagnostic.json',
+      mediaType: 'application/json',
+      sizeBytes: 13,
+      status: 'saved'
+    })
+    expect(nativeDownload).toHaveBeenCalledWith({
+      path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download',
+      profile: 'remote-profile'
+    })
   })
 
   it.each(serverWorkflowRunViews)('sends the supported %s run-list view without changing its meaning', async view => {

@@ -61,6 +61,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   api: request => ipcRenderer.invoke('hermes:api', request),
   apiStructured: request => ipcRenderer.invoke('hermes:api:structured', request),
+  downloadWorkflowArtifact: request => ipcRenderer.invoke('hermes:workflow-artifact:download', request),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),

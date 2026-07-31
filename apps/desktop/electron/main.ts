@@ -211,6 +211,13 @@ import {
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
+import {
+  collectWorkflowArtifactResponse,
+  downloadWorkflowArtifactWithDeps,
+  fetchWorkflowArtifactWithToken,
+  type WorkflowArtifactDownloadAuth,
+  type WorkflowArtifactResource
+} from './workflow-artifact-download'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
@@ -6070,6 +6077,59 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
   })
 }
 
+function fetchWorkflowArtifactWithOauthCookie(url: string, maxBytes: number): Promise<WorkflowArtifactResource> {
+  return new Promise((resolve, reject) => {
+    const sess = getOauthSession()
+
+    if (!sess) {
+      reject(new Error('OAuth session partition is unavailable.'))
+
+      return
+    }
+
+    const request = electronNet.request({
+      method: 'GET',
+      url,
+      session: sess,
+      useSessionCookies: true,
+      redirect: 'follow'
+    } as any)
+
+    const timer = setTimeout(() => {
+      request.abort()
+      reject(new Error(`Timed out connecting to Hermes backend after ${DEFAULT_FETCH_TIMEOUT_MS}ms`))
+    }, DEFAULT_FETCH_TIMEOUT_MS)
+
+    request.on('response', response => {
+      void collectWorkflowArtifactResponse(response, maxBytes, () => request.abort()).then(
+        value => {
+          clearTimeout(timer)
+          resolve(value)
+        },
+        error => {
+          clearTimeout(timer)
+          reject(error)
+        }
+      )
+    })
+    request.on('error', error => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    request.end()
+  })
+}
+
+function fetchWorkflowArtifactResource(
+  url: string,
+  auth: WorkflowArtifactDownloadAuth,
+  maxBytes: number
+): Promise<WorkflowArtifactResource> {
+  return auth.kind === 'cookie'
+    ? fetchWorkflowArtifactWithOauthCookie(url, maxBytes)
+    : fetchWorkflowArtifactWithToken(url, auth, maxBytes, DEFAULT_FETCH_TIMEOUT_MS)
+}
+
 // ---------------------------------------------------------------------------
 // RFC 8252 native-app tokens (system-browser + loopback + PKCE).
 //
@@ -9674,6 +9734,32 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
+
+ipcMain.handle('hermes:workflow-artifact:download', async (_event, request) => {
+  return downloadWorkflowArtifactWithDeps(request, {
+    chooseSavePath: async ({ filename }) => {
+      const result = await dialog.showSaveDialog(mainWindow, {
+        defaultPath: filename,
+        title: 'Save Workflow Artifact'
+      })
+
+      return result.canceled || !result.filePath ? null : result.filePath
+    },
+    ensureBackend,
+    fetchResource: fetchWorkflowArtifactResource,
+    resolveOauthAuth: async baseUrl => {
+      const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+
+      return resolveOauthRestAuth(nativeAt)
+    },
+    routePath: (requestPath, profile) =>
+      pathWithGlobalRemoteProfile(requestPath, profile, {
+        globalRemote: globalRemoteActive(),
+        profileRemoteOverride: profileHasRemoteOverride(profile)
+      }),
+    writeFile: (filePath, bytes) => fs.promises.writeFile(filePath, Buffer.from(bytes))
+  })
+})
 
 ipcMain.handle('hermes:api:structured', async (_event, request) => {
   const profile = request?.profile
