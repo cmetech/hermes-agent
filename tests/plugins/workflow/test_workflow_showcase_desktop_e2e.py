@@ -200,3 +200,29 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         assert admitted["run_id"] in {
             item["run_id"] for item in board_response.json()["runs"]
         }
+
+
+def test_ai_showcase_desktop_projection_keeps_mcp_and_skills_on_command_nodes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+    with TestClient(
+        web_server.app,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    ) as client:
+        response = client.get(
+            "/api/plugins/workflow/workflows/ai-extensions",
+            params={"catalog_source": "showcase"},
+        )
+
+    assert response.status_code == 200
+    nodes = response.json()["definition"]["nodes"]
+    assert nodes
+    assert {node["type"] for node in nodes} == {"command"}
+    assert all(node["options"]["mcp"] == "echo.yaml" for node in nodes)
+    assert all(node["options"]["skills"] == ["ascii-art"] for node in nodes)
+    assert {"mcp", "skills"}.isdisjoint(node["type"] for node in nodes)
