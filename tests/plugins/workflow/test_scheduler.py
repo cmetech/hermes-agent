@@ -948,3 +948,130 @@ def test_legacy_output_scanning_and_parsing_order_remains_unchanged(tmp_path):
 
     assert outputs == {"collect": "legacy-last"}
     assert json.loads(first.read_text()) == {"value": 1}
+
+
+class _PackageValidationRunnerTrap:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def run(self, request, *, is_cancelled=None):
+        self.requests.append(request)
+        raise AssertionError("provider ran before authenticated package validation")
+
+
+def _admit_impossible_authenticated_command(
+    tmp_path, workflow_writer, *, name: str
+):
+    root = tmp_path / name
+    commands = root / "commands"
+    commands.mkdir(parents=True)
+    command = commands / "consume.md"
+    command.write_text("Use $producer.output.missing\n", encoding="utf-8")
+    workflow = workflow_writer(
+        root / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    workflow.with_name(f"{name}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / f"home-{name}")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    command.write_text("Use $producer.output.present\n", encoding="utf-8")
+    return store, admitted.run_id
+
+
+@pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
+def test_public_scheduler_durably_fails_impossible_authenticated_command_before_claim(
+    tmp_path, workflow_writer, monkeypatch, entrypoint
+):
+    store, run_id = _admit_impossible_authenticated_command(
+        tmp_path,
+        workflow_writer,
+        name=f"package-validation-{entrypoint}",
+    )
+    runner = _PackageValidationRunnerTrap()
+    scheduler = RunScheduler(store, agent_runner=runner)
+    executor_calls = []
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("executor ran before authenticated package validation")
+
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    try:
+        if entrypoint == "advance":
+            failed = scheduler.advance(run_id)
+            replay = scheduler.advance(run_id)
+        else:
+            failed = scheduler.advance_all([run_id])[run_id]
+            replay = scheduler.advance_all([run_id])[run_id]
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    expected_error = {
+        "code": "structured_output_field_impossible",
+        "path": "nodes[1].command",
+        "message": "structured output field missing is impossible for node producer",
+    }
+    assert failed["status"] == replay["status"] == "failed"
+    assert failed["last_error"] == replay["last_error"] == expected_error
+    assert len(json.dumps(expected_error).encode("utf-8")) < 4_096
+    assert failed["event_sequence"] == replay["event_sequence"]
+    assert runner.requests == []
+    assert executor_calls == []
+
+    events = store.tail_events(run_id, limit=20)
+    failures = [event for event in events if event["event_type"] == "run_failed"]
+    assert [event["payload"] for event in failures] == [{
+        "reason_code": "package_validation_failed",
+        "validation_code": "structured_output_field_impossible",
+        "validation_path": "nodes[1].command",
+    }]
+    with store._connect() as connection:
+        indexed = connection.execute(
+            "SELECT status, projection_state_version FROM runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert (indexed["status"], indexed["projection_state_version"]) == (
+            "failed",
+            failed["state_version"],
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coordinator_wakes "
+            "WHERE run_id=? AND reason_code='run_failed'",
+            (run_id,),
+        ).fetchone()[0] == 1

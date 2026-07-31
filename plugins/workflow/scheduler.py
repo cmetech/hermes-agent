@@ -49,6 +49,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
+    WorkflowValidationError,
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -1977,7 +1978,13 @@ class RunScheduler:
             sidecar_resources=resources,
         )
 
-    def _prepare_run_package(self, run_id: str, schedule_revalidation):
+    def _prepare_run_package(
+        self,
+        run_id: str,
+        schedule_revalidation,
+        *,
+        expected_state_version: int | None = None,
+    ):
         try:
             read_budget = (
                 self.store._scheduled_promotion_read_budget(
@@ -2004,6 +2011,23 @@ class RunScheduler:
                 sealed_paths,
                 sealed_bytes,
             )
+        except WorkflowValidationError as exc:
+            if not exc.issues:
+                raise
+            issue = exc.issues[0]
+            if expected_state_version is None:
+                expected_state_version = int(
+                    self.store.load_run(run_id).get("state_version", -1)
+                )
+            self.store._fail_package_validation(
+                run_id,
+                expected_state_version=expected_state_version,
+                error_code=issue.code,
+                error_path=issue.path,
+                error_message=issue.message,
+                schedule_revalidation=schedule_revalidation,
+            )
+            return None
         except Exception:
             if schedule_revalidation is None:
                 raise
@@ -2680,7 +2704,11 @@ class RunScheduler:
             )
             if not authorized:
                 return self.store.load_run(run_id)
-        prepared_package = self._prepare_run_package(run_id, authorization)
+        prepared_package = self._prepare_run_package(
+            run_id,
+            authorization,
+            expected_state_version=int(initial.get("state_version", -1)),
+        )
         if prepared_package is None:
             return self.store.load_run(run_id)
         (
@@ -2844,6 +2872,7 @@ class RunScheduler:
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
         authorizations = {}
+        preparation_state_versions = {}
         authorized_run_ids = []
         for run_id in run_ids:
             projection = self.store.load_run(run_id)
@@ -2855,19 +2884,25 @@ class RunScheduler:
                 if not authorized:
                     continue
             authorizations[run_id] = authorization
+            preparation_state_versions[run_id] = int(
+                projection.get("state_version", -1)
+            )
             authorized_run_ids.append(run_id)
         run_ids = authorized_run_ids
         packages = {}
         execution_limits = {}
         sealed_resource_paths = {}
         sealed_resource_bytes = {}
+        package_failures = {}
         prepared_run_ids = []
         for run_id in run_ids:
             prepared_package = self._prepare_run_package(
                 run_id,
                 authorizations[run_id],
+                expected_state_version=preparation_state_versions[run_id],
             )
             if prepared_package is None:
+                package_failures[run_id] = self.store.load_run(run_id)
                 continue
             package, limits, paths, resource_bytes = prepared_package
             packages[run_id] = package
@@ -3054,7 +3089,10 @@ class RunScheduler:
                 done, _pending = wait(futures)
                 for future in done:
                     future.result()
-            return {run_id: self.store.load_run(run_id) for run_id in run_ids}
+            return {
+                **package_failures,
+                **{run_id: self.store.load_run(run_id) for run_id in run_ids},
+            }
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
             with self._activity:

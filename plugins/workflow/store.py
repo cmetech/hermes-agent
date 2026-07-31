@@ -5976,6 +5976,149 @@ class RunStore:
         self._notify_coordinator()
         return True
 
+    def _fail_package_validation(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+        error_code: str,
+        error_path: str,
+        error_message: str,
+        schedule_revalidation: object | None = None,
+    ) -> bool:
+        """Atomically fail a claim-free run on authenticated package validation."""
+        if (
+            isinstance(expected_state_version, bool)
+            or not isinstance(expected_state_version, int)
+            or expected_state_version < 1
+        ):
+            raise ValueError("expected_state_version must be a positive integer")
+        bounded = (
+            ("error_code", error_code, 128),
+            ("error_path", error_path, 1_024),
+            ("error_message", error_message, 2_000),
+        )
+        if any(
+            not isinstance(value, str) or not value or len(value) > maximum
+            for _name, value, maximum in bounded
+        ):
+            raise ValueError("package validation diagnostics must be bounded text")
+        safe_message = _sanitize_diagnostic(error_message)
+        if safe_message is None:
+            raise ValueError("package validation message must be bounded text")
+
+        directory = self.run_directory(run_id)
+        changed = False
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if schedule_revalidation is not None:
+                    self._invalidate_scheduled_promotion_authorization(
+                        schedule_revalidation,
+                        run_id,
+                    )
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                scheduled_at = self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                status = projection.get("status")
+                if (
+                    row["status"] != status
+                    or status not in {"queued", "running"}
+                    or int(projection.get("state_version", -1))
+                    != expected_state_version
+                    or projection.get("desired_status") is not None
+                ):
+                    connection.rollback()
+                    return False
+                metadata = projection.get("run_metadata")
+                if schedule_revalidation is not None:
+                    if (
+                        scheduled_at is None
+                        or status != "queued"
+                        or not isinstance(metadata, Mapping)
+                        or not isinstance(metadata.get("execution_identity"), str)
+                    ):
+                        raise RuntimeError(
+                            "scheduled package failure requires server admission evidence"
+                        )
+                elif scheduled_at is not None:
+                    connection.rollback()
+                    return False
+
+                nodes = projection.get("nodes")
+                if not isinstance(nodes, Mapping):
+                    raise RuntimeError("workflow run nodes are missing")
+                projected_claim = any(
+                    not isinstance(node, Mapping)
+                    or isinstance(node.get("claim"), Mapping)
+                    or node.get("state") in {"claimed", "running"}
+                    for node in nodes.values()
+                )
+                indexed_claim = connection.execute(
+                    "SELECT 1 FROM worker_claims WHERE run_id=? LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if projected_claim or indexed_claim is not None:
+                    connection.rollback()
+                    return False
+
+                projection["status"] = "failed"
+                projection["queue_position"] = None
+                projection["queue_sequence"] = None
+                projection["blocked_by_run_id"] = None
+                projection["last_error"] = {
+                    "code": error_code,
+                    "path": error_path,
+                    "message": safe_message,
+                }
+                for node in nodes.values():
+                    if node["state"] not in {"succeeded", "failed", "skipped"}:
+                        node["state"] = "cancelled"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_failed",
+                    {
+                        "reason_code": "package_validation_failed",
+                        "validation_code": error_code,
+                        "validation_path": error_path,
+                    },
+                    defer_notification=True,
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="run_failed",
+                )
+                connection.commit()
+                changed = True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        if changed:
+            self._notify_coordinator()
+        return changed
+
     def try_promote_run(
         self,
         run_id: str,

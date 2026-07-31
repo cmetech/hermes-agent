@@ -8,6 +8,7 @@ from collections import namedtuple
 
 import pytest
 
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
 from plugins.workflow.trust import WorkflowResourceReadBudget
@@ -269,6 +270,87 @@ def test_projection_and_journal_are_monotonic(tmp_path, workflow_writer):
     assert run["event_sequence"] == 2
     assert [event["sequence"] for event in events] == [1, 2]
     assert os.path.exists(store.run_directory(result.run_id) / "run.json")
+
+
+def _start_package_failure_store_run(tmp_path, workflow_writer, *, name):
+    store = RunStore(tmp_path / f"home-{name}")
+    package = load_workflow(
+        workflow_writer(tmp_path / f"package-{name}", name=name)
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return store, admitted.run_id
+
+
+def test_package_validation_failure_rejects_stale_projection_state(
+    tmp_path, workflow_writer
+):
+    store, run_id = _start_package_failure_store_run(
+        tmp_path, workflow_writer, name="stale-package-failure"
+    )
+    stale_version = store.load_run(run_id)["state_version"]
+    store.append_event(run_id, "semantic_progress", {"phase": "concurrent"})
+    before = store.load_run(run_id)
+
+    changed = store._fail_package_validation(
+        run_id,
+        expected_state_version=stale_version,
+        error_code="structured_output_field_impossible",
+        error_path="nodes[1].command",
+        error_message="bounded validation failure",
+    )
+
+    assert changed is False
+    assert store.load_run(run_id) == before
+    assert not any(
+        event["event_type"] == "run_failed"
+        for event in store.tail_events(run_id, limit=20)
+    )
+
+
+def test_package_validation_failure_never_overwrites_a_live_worker_claim(
+    tmp_path, workflow_writer
+):
+    store, run_id = _start_package_failure_store_run(
+        tmp_path, workflow_writer, name="claimed-package-failure"
+    )
+    claim = store.claim_node(run_id, "start", "live-owner")
+    assert claim is not None
+    before = store.load_run(run_id)
+
+    changed = store._fail_package_validation(
+        run_id,
+        expected_state_version=before["state_version"],
+        error_code="structured_output_field_impossible",
+        error_path="nodes[1].command",
+        error_message="bounded validation failure",
+    )
+
+    after = store.load_run(run_id)
+    assert changed is False
+    assert after == before
+    assert after["nodes"]["start"]["claim"]["attempt_id"] == claim.attempt_id
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+    assert not any(
+        event["event_type"] == "run_failed"
+        for event in store.tail_events(run_id, limit=20)
+    )
 
 
 def test_snapshot_refuses_low_disk_and_per_run_quota(

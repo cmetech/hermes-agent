@@ -1753,6 +1753,157 @@ def test_invalid_scheduled_package_does_not_abort_valid_advance_all_peer(
         )
 
 
+def _admit_scheduled_impossible_authenticated_command(
+    home: Path,
+    workflow_writer,
+    *,
+    name: str,
+    binding: WorkflowRunnerBinding,
+):
+    (home / "commands").mkdir(parents=True, exist_ok=True)
+    (home / "commands/consume.md").write_text(
+        "Use $producer.output.missing\n", encoding="utf-8"
+    )
+    workflow = workflow_writer(
+        home / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    workflow.with_name(f"{name}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits:\n  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    context = background_execution_context(binding, requires_ai=None)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=home.parent,
+        user_home=home.parent,
+        workflow_name=name,
+        values={},
+        idempotency_key=name,
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    return store, str(admitted["run_id"]), due, identity, epoch
+
+
+@pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
+def test_scheduled_package_validation_matches_immediate_durable_failure(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    entrypoint: str,
+) -> None:
+    home = tmp_path / f"home-{entrypoint}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = _RecordingAIRunner()
+    binding = _binding(real_runner=runner)
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_impossible_authenticated_command(
+            home,
+            workflow_writer,
+            name=f"scheduled-package-validation-{entrypoint}",
+            binding=binding,
+        )
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    executor_calls = []
+    authorization = None
+    original_authorize = scheduler._authorize_scheduled_promotion
+
+    def record_authorization(loaded_run_id, projection):
+        nonlocal authorization
+        result = original_authorize(loaded_run_id, projection)
+        authorization = result[1]
+        return result
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("scheduled executor ran before package validation")
+
+    monkeypatch.setattr(
+        scheduler, "_authorize_scheduled_promotion", record_authorization
+    )
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    try:
+        if entrypoint == "advance":
+            failed = scheduler.advance(run_id)
+            replay = scheduler.advance(run_id)
+        else:
+            failed = scheduler.advance_all([run_id])[run_id]
+            replay = scheduler.advance_all([run_id])[run_id]
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert failed["status"] == replay["status"] == "failed"
+    assert failed["last_error"] == replay["last_error"] == {
+        "code": "structured_output_field_impossible",
+        "path": "nodes[1].command",
+        "message": "structured output field missing is impossible for node producer",
+    }
+    assert failed["event_sequence"] == replay["event_sequence"]
+    assert runner.requests == []
+    assert executor_calls == []
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    failures = [
+        event
+        for event in store.tail_events(run_id, limit=20)
+        if event["event_type"] == "run_failed"
+    ]
+    assert [event["payload"] for event in failures] == [{
+        "reason_code": "package_validation_failed",
+        "validation_code": "structured_output_field_impossible",
+        "validation_path": "nodes[1].command",
+    }]
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+
+
 def test_package_preparation_error_without_server_authorization_propagates(
     tmp_path: Path,
     monkeypatch,
