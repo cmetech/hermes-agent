@@ -112,6 +112,31 @@ function deps(overrides: Partial<WorkflowArtifactDownloadDeps> = {}): WorkflowAr
   }
 }
 
+interface TestWebContents extends EventEmitter {
+  destroy: () => void
+  isDestroyed: () => boolean
+  name: string
+}
+
+function webContents(name: string): TestWebContents {
+  const sender = new EventEmitter() as TestWebContents
+  let destroyed = false
+
+  sender.name = name
+  sender.isDestroyed = () => destroyed
+
+  sender.destroy = () => {
+    if (destroyed) {
+      return
+    }
+
+    destroyed = true
+    sender.emit('destroyed')
+  }
+
+  return sender
+}
+
 const request = {
   path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download',
   profile: 'remote-profile',
@@ -439,7 +464,7 @@ describe('downloadWorkflowArtifactWithDeps', () => {
     const filePath = path.join(tempDir, 'peer-report.json')
     const peerWindow = { isDestroyed: () => false, name: 'peer-window' }
     const primaryWindow = { isDestroyed: () => false, name: 'primary-window' }
-    const sender = { name: 'peer-web-contents' }
+    const sender = webContents('peer-web-contents')
     const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
     const showSaveDialog = vi.fn().mockResolvedValue({ canceled: false, filePath })
 
@@ -479,6 +504,12 @@ describe('downloadWorkflowArtifactWithDeps', () => {
       expect(showSaveDialog).toHaveBeenCalledWith(peerWindow, { defaultPath: 'peer-report.json' })
       expect(showSaveDialog).not.toHaveBeenCalledWith(primaryWindow, expect.anything())
       await expect(fs.promises.readFile(filePath, 'utf8')).resolves.toBe('{"ok":true}')
+      expect(sender.listenerCount('destroyed')).toBe(0)
+      await expect(
+        handlers.get('hermes:workflow-artifact:cancel')!({ sender }, { requestId: request.requestId })
+      ).resolves.toEqual({ cancelled: false })
+      sender.destroy()
+      expect(showSaveDialog).toHaveBeenCalledOnce()
     } finally {
       await resourceServer.close()
       await fs.promises.rm(tempDir, { recursive: true, force: true })
@@ -514,8 +545,10 @@ describe('downloadWorkflowArtifactWithDeps', () => {
 
     try {
       const handler = handlers.get('hermes:workflow-artifact:download')!
-      await expect(handler({ sender: {} }, request)).resolves.toEqual({ status: 'cancelled' })
-      await expect(handler({ sender: {} }, request)).rejects.toThrow()
+      await expect(handler({ sender: webContents('gone-sender-one') }, request)).resolves.toEqual({
+        status: 'cancelled'
+      })
+      await expect(handler({ sender: webContents('gone-sender-two') }, request)).rejects.toThrow()
       expect(showSaveDialog).toHaveBeenNthCalledWith(1, { defaultPath: 'artifact.json' })
       expect(showSaveDialog).toHaveBeenNthCalledWith(2, { defaultPath: 'artifact.json' })
     } finally {
@@ -526,7 +559,7 @@ describe('downloadWorkflowArtifactWithDeps', () => {
   it('cancels an in-flight request by request id and never opens a late dialog', async () => {
     const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
     const showSaveDialog = vi.fn()
-    const sender = {}
+    const sender = webContents('cancel-sender')
     let transportSignal: AbortSignal | undefined
 
     registerWorkflowArtifactDownloadIpc({
@@ -560,8 +593,8 @@ describe('downloadWorkflowArtifactWithDeps', () => {
   it('isolates identical request ids by invoking sender and removes both entries after settlement', async () => {
     const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
     const showSaveDialog = vi.fn()
-    const firstSender = { name: 'first-sender' }
-    const secondSender = { name: 'second-sender' }
+    const firstSender = webContents('first-sender')
+    const secondSender = webContents('second-sender')
     const signals: AbortSignal[] = []
 
     registerWorkflowArtifactDownloadIpc({
@@ -621,6 +654,138 @@ describe('downloadWorkflowArtifactWithDeps', () => {
       cancelled: false
     })
     expect(showSaveDialog).not.toHaveBeenCalled()
+  })
+
+  it('aborts and evicts a destroyed sender without affecting its peer or opening a late dialog', async () => {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-workflow-destroyed-sender-'))
+    const abandonedPath = path.join(tempDir, 'abandoned.json')
+    const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
+    const firstSender = webContents('destroyed-sender')
+    const secondSender = webContents('live-sender')
+
+    const transports: Array<{
+      resolve: (resource: { bytes: Uint8Array; headers: Record<string, string> }) => void
+      signal: AbortSignal
+    }> = []
+
+    const resource = {
+      bytes: new TextEncoder().encode('{}'),
+      headers: {
+        'content-disposition': 'attachment; filename="artifact.json"',
+        'content-type': 'application/json'
+      }
+    }
+
+    const showSaveDialog = vi.fn(async (...args: unknown[]) =>
+      args.length === 1 ? { canceled: false, filePath: abandonedPath } : { canceled: true }
+    )
+
+    registerWorkflowArtifactDownloadIpc({
+      browserWindow: {
+        fromWebContents: value => ({ isDestroyed: () => (value as TestWebContents).isDestroyed() })
+      },
+      dialog: { showSaveDialog },
+      download: {
+        ensureBackend: async () => ({ authMode: 'token', baseUrl: 'http://127.0.0.1:8899', token: 'token' }),
+        fetchResource: (_url, _auth, _maxBytes, signal) => {
+          if (!signal) {
+            throw new Error('Expected the IPC download transport to receive an abort signal.')
+          }
+
+          return new Promise((resolve, reject) => {
+            transports.push({ resolve, signal })
+            signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+          })
+        },
+        resolveOauthAuth: vi.fn(),
+        routePath: value => value
+      },
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
+    })
+
+    const download = handlers.get('hermes:workflow-artifact:download')!
+    const cancel = handlers.get('hermes:workflow-artifact:cancel')!
+
+    const firstOutcome = download({ sender: firstSender }, request).then(
+      value => value,
+      error => error
+    )
+
+    const secondOutcome = download({ sender: secondSender }, request).then(
+      value => value,
+      error => error
+    )
+
+    try {
+      await vi.waitFor(() => expect(transports).toHaveLength(2))
+      expect(firstSender.listenerCount('destroyed')).toBe(1)
+      expect(secondSender.listenerCount('destroyed')).toBe(1)
+
+      firstSender.destroy()
+
+      await expect(firstOutcome).resolves.toMatchObject({ name: 'AbortError' })
+      expect(transports.map(transport => transport.signal.aborted)).toEqual([true, false])
+      await expect(cancel({ sender: firstSender }, { requestId: request.requestId })).resolves.toEqual({
+        cancelled: false
+      })
+
+      transports[0]!.resolve(resource)
+      await Promise.resolve()
+      expect(showSaveDialog).not.toHaveBeenCalled()
+      await expect(fs.promises.stat(abandonedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(cancel({ sender: secondSender }, { requestId: request.requestId })).resolves.toEqual({
+        cancelled: true
+      })
+      await expect(secondOutcome).resolves.toMatchObject({ name: 'AbortError' })
+      expect(secondSender.listenerCount('destroyed')).toBe(0)
+      await expect(cancel({ sender: secondSender }, { requestId: request.requestId })).resolves.toEqual({
+        cancelled: false
+      })
+
+      const normalRequest = { ...request, requestId: 'normal-peer-request' }
+      const normalOutcome = download({ sender: secondSender }, normalRequest)
+
+      await vi.waitFor(() => expect(transports).toHaveLength(3))
+      transports[2]!.resolve(resource)
+      await expect(normalOutcome).resolves.toEqual({ status: 'cancelled' })
+      expect(secondSender.listenerCount('destroyed')).toBe(0)
+      await expect(cancel({ sender: secondSender }, { requestId: normalRequest.requestId })).resolves.toEqual({
+        cancelled: false
+      })
+      secondSender.destroy()
+      expect(showSaveDialog).toHaveBeenCalledOnce()
+      await expect(fs.promises.stat(abandonedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await fs.promises.rm(tempDir, { force: true, recursive: true })
+    }
+  })
+
+  it('rejects a download whose sender was already destroyed before handler setup', async () => {
+    const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
+    const sender = webContents('already-destroyed-sender')
+    const fetchResource = vi.fn()
+    const showSaveDialog = vi.fn()
+
+    sender.destroy()
+    registerWorkflowArtifactDownloadIpc({
+      browserWindow: { fromWebContents: () => ({ isDestroyed: () => true }) },
+      dialog: { showSaveDialog },
+      download: {
+        ensureBackend: async () => ({ authMode: 'token', baseUrl: 'http://127.0.0.1:8899', token: 'token' }),
+        fetchResource,
+        resolveOauthAuth: vi.fn(),
+        routePath: value => value
+      },
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
+    })
+
+    await expect(handlers.get('hermes:workflow-artifact:download')!({ sender }, request)).rejects.toMatchObject({
+      name: 'AbortError'
+    })
+    expect(fetchResource).not.toHaveBeenCalled()
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    expect(sender.listenerCount('destroyed')).toBe(0)
   })
 
   it('aborts before buffering a response whose recorded size exceeds the producer limit', async () => {

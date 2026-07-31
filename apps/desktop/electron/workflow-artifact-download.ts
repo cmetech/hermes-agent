@@ -61,8 +61,14 @@ interface WorkflowArtifactNativeWindow {
   isDestroyed: () => boolean
 }
 
+interface WorkflowArtifactWebContents {
+  isDestroyed: () => boolean
+  once: (event: 'destroyed', listener: () => void) => unknown
+  removeListener: (event: 'destroyed', listener: () => void) => unknown
+}
+
 interface WorkflowArtifactIpcEvent {
-  sender: unknown
+  sender: WorkflowArtifactWebContents
 }
 
 export interface WorkflowArtifactDownloadIpcDeps {
@@ -422,7 +428,48 @@ export function fetchWorkflowArtifactWithOauthCookie(
 }
 
 export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownloadIpcDeps): void {
-  const activeBySender = new Map<unknown, Map<string, AbortController>>()
+  interface SenderState {
+    active: Map<string, AbortController>
+    onDestroyed: () => void
+  }
+
+  const activeBySender = new Map<WorkflowArtifactWebContents, SenderState>()
+
+  const createSenderState = (sender: WorkflowArtifactWebContents): SenderState => {
+    const existing = activeBySender.get(sender)
+
+    if (existing) {
+      return existing
+    }
+
+    let state!: SenderState
+
+    const onDestroyed = () => {
+      if (activeBySender.get(sender) !== state) {
+        return
+      }
+
+      activeBySender.delete(sender)
+      sender.removeListener('destroyed', onDestroyed)
+      const controllers = [...state.active.values()]
+
+      state.active.clear()
+
+      for (const controller of controllers) {
+        controller.abort()
+      }
+    }
+
+    state = { active: new Map(), onDestroyed }
+    activeBySender.set(sender, state)
+    sender.once('destroyed', onDestroyed)
+
+    if (sender.isDestroyed()) {
+      onDestroyed()
+    }
+
+    return state
+  }
 
   deps.ipcMain.handle('hermes:workflow-artifact:download', async (event, request) => {
     if (typeof request?.requestId !== 'string' || request.requestId.trim().length === 0) {
@@ -430,12 +477,15 @@ export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownlo
     }
 
     const sender = event.sender
-    const active = activeBySender.get(sender) ?? new Map<string, AbortController>()
-
-    activeBySender.set(sender, active)
-    active.get(request.requestId)?.abort()
+    const state = createSenderState(sender)
     const controller = new AbortController()
-    active.set(request.requestId, controller)
+
+    if (activeBySender.get(sender) === state) {
+      state.active.get(request.requestId)?.abort()
+      state.active.set(request.requestId, controller)
+    } else {
+      controller.abort()
+    }
 
     try {
       return await downloadWorkflowArtifactWithDeps(
@@ -468,18 +518,19 @@ export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownlo
         controller.signal
       )
     } finally {
-      if (active.get(request.requestId) === controller) {
-        active.delete(request.requestId)
+      if (state.active.get(request.requestId) === controller) {
+        state.active.delete(request.requestId)
 
-        if (active.size === 0 && activeBySender.get(sender) === active) {
+        if (state.active.size === 0 && activeBySender.get(sender) === state) {
           activeBySender.delete(sender)
+          sender.removeListener('destroyed', state.onDestroyed)
         }
       }
     }
   })
 
   deps.ipcMain.handle('hermes:workflow-artifact:cancel', async (event, payload) => {
-    const controller = activeBySender.get(event.sender)?.get(payload?.requestId)
+    const controller = activeBySender.get(event.sender)?.active.get(payload?.requestId)
     controller?.abort()
 
     return { cancelled: Boolean(controller) }
