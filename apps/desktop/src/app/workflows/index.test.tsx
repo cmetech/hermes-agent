@@ -12,6 +12,7 @@ import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
 const getWorkflowEvidence = vi.fn()
+const getWorkflowArtifactPreview = vi.fn()
 const listWorkflowAttention = vi.fn()
 const listWorkflowEvents = vi.fn()
 const listWorkflowRuns = vi.fn()
@@ -25,6 +26,7 @@ const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => apiRequestState.profile,
+  getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
   getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
   getWorkflowRun: (...args: unknown[]) => getWorkflowRun(...args),
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
@@ -32,7 +34,9 @@ vi.mock('@/hermes', () => ({
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
   mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),
   previewWorkflowCleanup: (...args: unknown[]) => previewWorkflowCleanup(...args),
-  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args)
+  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args),
+  workflowArtifactDownloadUrl: (runId: string, publicationId: string) =>
+    `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(publicationId)}/download`
 }))
 
 vi.mock('@/lib/hermes-api', () => ({
@@ -147,6 +151,7 @@ beforeEach(() => {
 
   for (const mock of [
     getWorkflowEvidence,
+    getWorkflowArtifactPreview,
     getWorkflowRun,
     listWorkflowAttention,
     listWorkflowEvents,
@@ -168,6 +173,14 @@ beforeEach(() => {
     kind: 'attempts',
     next_cursor: 0,
     schema_version: 1,
+    truncated: false
+  })
+  getWorkflowArtifactPreview.mockResolvedValue({
+    bytes_returned: 0,
+    content: '',
+    media_type: 'text/markdown; charset=utf-8',
+    publication_id: 'publication-1',
+    size_bytes: 0,
     truncated: false
   })
   listWorkflowAttention.mockResolvedValue({ items: [], next_cursor: null, schema_version: 1 })
@@ -986,6 +999,57 @@ describe('WorkflowsView', () => {
         expect.objectContaining({ expected_version: 1, interaction_id: 'interaction-1', value: 'bounded answer' })
       )
     )
+  })
+
+  it('uses typed artifacts only for backend-confirmed publication identities and preserves legacy evidence fallback', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowEvidence.mockResolvedValueOnce({
+      items: [
+        { relative_path: 'legacy.txt' },
+        {
+          attempt_id: 'attempt-1',
+          integrity_status: 'verified',
+          media_type: 'text/markdown; charset=utf-8',
+          node_id: 'producer',
+          output_type: 'Report',
+          publication_id: 'publication-1',
+          recovery_status: 'verified',
+          sha256: 'b'.repeat(64),
+          size_bytes: 42
+        }
+      ],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    })
+    await renderView(client)
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Verified artifacts' }), {
+      button: 0,
+      ctrlKey: false
+    })
+
+    expect(await screen.findByText('Report')).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'Download artifact' })).toBeTruthy()
+    expect(screen.queryByText(/legacy\.txt/)).toBeNull()
+
+    cleanup()
+    getWorkflowEvidence.mockResolvedValueOnce({
+      items: [{ publication_id: '   ', relative_path: 'legacy.txt' }],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    })
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <RunInspector run={run()} />
+      </QueryClientProvider>
+    )
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Verified artifacts' }), { button: 0, ctrlKey: false })
+
+    expect(await screen.findByText(/legacy\.txt/)).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Download artifact' })).toBeNull()
   })
 
   it('separates archive views from explicit preview-token cleanup', async () => {

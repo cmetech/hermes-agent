@@ -305,6 +305,30 @@ export type WorkflowEvidenceKind =
   | 'recovery'
   | 'timeline'
 
+export interface WorkflowTypedArtifact extends Record<string, unknown> {
+  attempt_id?: null | string
+  integrity_status?: null | string
+  media_type?: null | string
+  node_id?: null | string
+  output_type?: null | string
+  produced_at?: null | string
+  publication_id: string
+  recovery_status?: null | string
+  schema_fingerprint?: null | string
+  session_id?: null | string
+  sha256?: null | string
+  size_bytes?: null | number
+}
+
+export interface WorkflowArtifactPreview {
+  bytes_returned: number
+  content?: unknown
+  media_type: string
+  publication_id: string
+  size_bytes: number
+  truncated: boolean
+}
+
 export interface WorkflowEvidencePage {
   items: Array<Record<string, unknown>>
   kind: WorkflowEvidenceKind

@@ -61,6 +61,7 @@ import type {
   ToolsetConfig,
   ToolsetInfo,
   ToolsetModelsResponse,
+  WorkflowArtifactPreview,
   WorkflowAttentionPage,
   WorkflowCleanupPreview,
   WorkflowCleanupResult,
@@ -378,7 +379,9 @@ export async function listSessions(
 export function listWorkflowRuns(cursor?: string, view: WorkflowRunListView = 'board'): Promise<WorkflowRunPage> {
   const query = new URLSearchParams({ view })
 
-  if (cursor) {query.set('cursor', cursor)}
+  if (cursor) {
+    query.set('cursor', cursor)
+  }
 
   return window.hermesDesktop.api<WorkflowRunPage>({
     path: `/api/plugins/workflow/runs?${query.toString()}`,
@@ -459,6 +462,24 @@ export function getWorkflowEvidence(
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/evidence?${query}`,
     ...profileScoped()
   })
+}
+
+function workflowArtifactUrl(runId: string, publicationId: string, action: 'download' | 'preview'): string {
+  return (
+    `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/artifacts/` +
+    `${encodeURIComponent(publicationId)}/${action}`
+  )
+}
+
+export function getWorkflowArtifactPreview(runId: string, publicationId: string): Promise<WorkflowArtifactPreview> {
+  return window.hermesDesktop.api<WorkflowArtifactPreview>({
+    path: workflowArtifactUrl(runId, publicationId, 'preview'),
+    ...profileScoped()
+  })
+}
+
+export function workflowArtifactDownloadUrl(runId: string, publicationId: string): string {
+  return workflowArtifactUrl(runId, publicationId, 'download')
 }
 
 export function mutateWorkflowRun(

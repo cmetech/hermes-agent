@@ -1630,6 +1630,28 @@ export interface Translations {
     outputs: string
     recovery: string
     noEvidence: string
+    artifactOutputType: string
+    artifactMediaType: string
+    artifactProducer: string
+    artifactWinningAttempt: string
+    artifactSize: string
+    artifactSizeBytes: (size: string) => string
+    artifactSha256: string
+    artifactSchemaFingerprint: string
+    artifactProducedAt: string
+    artifactSession: string
+    artifactIntegrity: string
+    artifactRecovery: string
+    artifactUnavailable: string
+    artifactPreview: string
+    artifactDownload: string
+    artifactPreviewRegion: string
+    artifactPreviewLoading: string
+    artifactPreviewErrorTitle: string
+    artifactPreviewErrorDescription: string
+    artifactPreviewIncomplete: string
+    artifactTextPreviewTruncated: string
+    artifactDownloadOnly: string
     provideInput: string
     inputValue: string
     reconcile: string

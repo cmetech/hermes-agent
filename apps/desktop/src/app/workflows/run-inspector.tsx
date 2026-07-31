@@ -10,6 +10,8 @@ import { getApiRequestProfile, getWorkflowEvidence } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { WorkflowEvidenceKind, WorkflowRunSnapshot } from '@/types/hermes'
 
+import { isWorkflowTypedArtifact, TypedArtifactView } from './typed-artifact-view'
+
 interface RunInspectorProps {
   actionsDisabled?: boolean
   events?: Array<Record<string, unknown>>
@@ -84,6 +86,9 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
     staleTime: 5_000
   })
 
+  const evidenceItems = evidence.data?.items ?? []
+  const typedArtifacts = tab === 'artifacts' ? evidenceItems.filter(isWorkflowTypedArtifact) : []
+
   const tabs: Array<{ id: InspectorTab; label: string }> = [
     { id: 'overview', label: copy.overview },
     { id: 'timeline', label: copy.timeline },
@@ -97,8 +102,10 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   const currentNode = run.current_nodes?.[0]
   const provenance = run.provenance
   const coordinator = run.coordinator
+
   const scheduledAt =
     run.presentation_state === 'scheduled_wait' && typeof run.schedule_at === 'string' ? run.schedule_at : null
+
   const scheduled = scheduledAt !== null
 
   return (
@@ -174,8 +181,10 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
           </dl>
         ) : tab === 'timeline' ? (
           <EvidenceItems emptyLabel={copy.noEvidence} items={events} />
+        ) : tab === 'artifacts' && typedArtifacts.length > 0 ? (
+          <TypedArtifactView artifacts={typedArtifacts} runId={run.run_id} />
         ) : (
-          <EvidenceItems emptyLabel={copy.noEvidence} items={evidence.data?.items ?? []} logs={tab === 'logs'} />
+          <EvidenceItems emptyLabel={copy.noEvidence} items={evidenceItems} logs={tab === 'logs'} />
         )}
       </section>
 

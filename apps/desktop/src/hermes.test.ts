@@ -17,6 +17,7 @@ import {
   getProfiles,
   getSessionMessages,
   getStatus,
+  getWorkflowArtifactPreview,
   getWorkflowEvidence,
   getWorkflowRun,
   listAllProfileSessions,
@@ -31,10 +32,16 @@ import {
   saveMoaModels,
   setApiRequestProfile,
   speakText,
-  transcribeAudio
+  transcribeAudio,
+  workflowArtifactDownloadUrl
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
-import type { WorkflowRunListView } from './types/hermes'
+import type {
+  WorkflowArtifactPreview,
+  WorkflowEvidencePage,
+  WorkflowRunListView,
+  WorkflowTypedArtifact
+} from './types/hermes'
 
 const serverWorkflowRunViews = ['board', 'history', 'archive'] satisfies WorkflowRunListView[]
 
@@ -330,6 +337,51 @@ describe('Hermes REST helpers', () => {
         method: 'POST',
         path: '/api/plugins/workflow/runs/run%201/cancel'
       })
+    )
+  })
+
+  it('types typed-artifact evidence and URL-encodes preview and download identities', async () => {
+    const artifact: WorkflowTypedArtifact = {
+      attempt_id: 'attempt-1',
+      integrity_status: 'verified',
+      media_type: 'application/json',
+      node_id: 'produce',
+      output_type: 'Report',
+      publication_id: 'publication / opaque',
+      recovery_status: 'verified',
+      sha256: 'a'.repeat(64),
+      size_bytes: 13
+    }
+
+    const page: WorkflowEvidencePage = {
+      items: [{ relative_path: 'legacy.txt' }, artifact],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    }
+
+    const preview: WorkflowArtifactPreview = {
+      bytes_returned: 13,
+      content: { answer: 42 },
+      media_type: 'application/json',
+      publication_id: artifact.publication_id,
+      size_bytes: 13,
+      truncated: false
+    }
+
+    api.mockResolvedValue(preview)
+    setApiRequestProfile('remote-profile')
+
+    await expect(getWorkflowArtifactPreview('run / one', artifact.publication_id)).resolves.toEqual(preview)
+
+    expect(page.items).toHaveLength(2)
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/preview',
+      profile: 'remote-profile'
+    })
+    expect(workflowArtifactDownloadUrl('run / one', artifact.publication_id)).toBe(
+      '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download'
     )
   })
 
