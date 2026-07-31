@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import asyncio
 from copy import deepcopy
@@ -3295,6 +3296,78 @@ def test_artifact_endpoints_preserve_retryable_publication_unavailability(
             "retryable": True,
         }
     }
+    assert "typed_publication_integrity" not in (
+        store._active_run_repair_reasons(admitted.run_id)
+    )
+    assert recovered.status_code == 200
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+@pytest.mark.parametrize(
+    "error_number",
+    [
+        pytest.param(getattr(errno, name), id=name)
+        for name in (
+            "EAGAIN",
+            "EIO",
+            "EMFILE",
+            "ENOMEM",
+            "ENFILE",
+            "ESTALE",
+        )
+        if hasattr(errno, name)
+    ],
+)
+def test_artifact_endpoints_preserve_retryable_sealed_definition_lstat_errors(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    endpoint,
+    error_number,
+) -> None:
+    home = tmp_path / f"home-lstat-{endpoint}-{error_number}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"lstat-{endpoint}-{error_number}",
+        data=b"retryable sealed definition stat",
+        media_type="text/markdown; charset=utf-8",
+    )
+    definition = store.run_directory(admitted.run_id) / "definition.yaml"
+    fault_active = True
+    real_lstat = Path.lstat
+
+    def transient_definition_lstat(path):
+        if fault_active and path == definition:
+            raise OSError(
+                error_number,
+                "injected transient sealed-definition stat failure",
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", transient_definition_lstat)
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        unavailable = client.get(f"{base}/{endpoint}")
+        fault_active = False
+        recovered = client.get(f"{base}/{endpoint}")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        "detail": {
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        }
+    }
+    assert len(unavailable.content) < 256
     assert "typed_publication_integrity" not in (
         store._active_run_repair_reasons(admitted.run_id)
     )

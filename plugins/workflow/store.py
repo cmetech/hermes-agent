@@ -61,6 +61,7 @@ from plugins.workflow.provenance import (
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     ArchonOutputUnavailableError,
+    _RETRYABLE_READ_ERRNOS,
     _read_descriptor_relative,
     _safe_component,
     write_archon_output_exclusive,
@@ -1026,7 +1027,15 @@ def _sealed_typed_output_declarations(
         )
     except ArchonOutputUnavailableError:
         raise
-    except (ArchonOutputIntegrityError, OSError, yaml.YAMLError) as exc:
+    except OSError as exc:
+        if exc.errno in _RETRYABLE_READ_ERRNOS:
+            raise ArchonOutputUnavailableError(
+                "typed publication sealed definition is temporarily unavailable"
+            ) from exc
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    except (ArchonOutputIntegrityError, yaml.YAMLError) as exc:
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc

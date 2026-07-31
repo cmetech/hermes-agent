@@ -304,3 +304,80 @@ Result: Ruff and the whitespace check passed.
 - `tests/plugins/workflow/test_desktop_api.py`
 - `tests/plugins/workflow/test_workflow_detail_api.py`
 - `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`
+
+## Quality fix round 2/5
+
+The residual retryable sealed-definition stat taxonomy is corrected.
+`_sealed_typed_output_declarations()` now classifies `OSError` from
+`definition.yaml` `lstat()` with the same authoritative retryable errno set
+used by descriptor-relative reads. Retryable stat failures raise
+`ArchonOutputUnavailableError` before deterministic journal-integrity
+handling, so preview and download return the bounded retryable 503 contract
+without creating a durable `typed_publication_integrity` transition.
+
+Non-retryable stat failures retain the deterministic `JournalRecoveryError`
+path. Existing missing, unsafe/nonregular, reparse-point, oversized, and
+malformed sealed-definition behavior is unchanged.
+
+### Round 2 TDD evidence
+
+The endpoint matrix was added before production changes and injects each
+portable retryable errno available on this host:
+
+- `EAGAIN`
+- `EIO`
+- `EMFILE`
+- `ENOMEM`
+- `ENFILE`
+- `ESTALE`
+
+Each errno is exercised through both preview and download. Initial RED:
+0 passed, 12 failed; every case returned 409 instead of 503. The tests also
+require a bounded
+`artifact_temporarily_unavailable`/`retryable: true` response, no active typed
+integrity repair marker, and success from the same endpoint after the fault is
+removed.
+
+Focused GREEN:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_desktop_api.py -k 'artifact_endpoints_preserve_retryable_publication_unavailability or artifact_endpoints_preserve_retryable_sealed_definition_lstat_errors' -vv
+```
+
+Fresh result: 1 file, 16 passed, 0 failed. This includes the four existing
+content/sealed-definition read cases and the twelve new stat cases.
+
+### Round 2 verification
+
+Exact Task 10 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Fresh result: 5 files, 259 passed, 0 failed.
+
+Requested ten-file regression matrix:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_coordinator.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py
+```
+
+Fresh result: 10 files, 375 passed, 0 failed, with one platform-specific
+skip. The prior baseline contained 363 tests; this round adds 12 portable
+stat-error cases.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/evidence.py plugins/workflow/dashboard/plugin_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_detail_api.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Round 2 files changed
+
+- `plugins/workflow/store.py`
+- `tests/plugins/workflow/test_desktop_api.py`
+- `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-10-report.md`
