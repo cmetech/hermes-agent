@@ -72,6 +72,34 @@ afterEach(() => {
 })
 
 describe('TypedArtifactView', () => {
+  it('creates distinct download request ids for independent views started in the same millisecond', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000)
+
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+      render(
+        <QueryClientProvider client={client}>
+          <div>
+            {view([artifact()], 'run-one')}
+            {view([artifact()], 'run-two')}
+          </div>
+        </QueryClientProvider>
+      )
+
+      for (const button of screen.getAllByRole('button', { name: /Download artifact:/ })) {
+        fireEvent.click(button)
+      }
+
+      await waitFor(() => expect(downloadWorkflowArtifact).toHaveBeenCalledTimes(2))
+      const requestIds = downloadWorkflowArtifact.mock.calls.map(call => call[3])
+
+      expect(new Set(requestIds).size).toBe(2)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('renders confirmed metadata and fetches complete canonical JSON only after explicit preview selection', async () => {
     const preview: WorkflowArtifactPreview = {
       bytes_returned: 13,

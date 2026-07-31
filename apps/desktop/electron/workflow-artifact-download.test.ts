@@ -250,15 +250,48 @@ describe('downloadWorkflowArtifactWithDeps', () => {
     }
   })
 
+  it('settles a synchronous token request-construction failure once and clears its deadline', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const rejected = vi.fn()
+
+      const pending = fetchWorkflowArtifactWithToken(
+        'http://127.0.0.1:1/invalid-header',
+        { kind: 'token', token: 'invalid\nheader' },
+        WORKFLOW_ARTIFACT_MAX_BYTES,
+        20
+      ).catch(error => {
+        rejected(error)
+        throw error
+      })
+
+      await expect(pending).rejects.toThrow('Invalid character in header content')
+      expect(rejected).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(25)
+      expect(rejected).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('enforces an absolute token deadline through body completion and closes the response', async () => {
     let responseClosed = false
+    let responseStarted!: () => void
+
+    const responseStart = new Promise<void>(resolve => {
+      responseStarted = resolve
+    })
 
     const server = await listen((_request, response) => {
       response.writeHead(200, {
         'Content-Disposition': 'attachment; filename="slow.bin"',
         'Content-Type': 'application/octet-stream'
       })
-      const interval = setInterval(() => response.write('x'), 15)
+      response.flushHeaders()
+      responseStarted()
+      const interval = setInterval(() => response.write('x'), 250)
       response.on('close', () => {
         responseClosed = true
         clearInterval(interval)
@@ -266,14 +299,15 @@ describe('downloadWorkflowArtifactWithDeps', () => {
     })
 
     try {
-      await expect(
-        fetchWorkflowArtifactWithToken(
-          `${server.baseUrl}/trickle`,
-          { kind: 'token', token: 'static-secret' },
-          WORKFLOW_ARTIFACT_MAX_BYTES,
-          45
-        )
-      ).rejects.toThrow('deadline')
+      const pending = fetchWorkflowArtifactWithToken(
+        `${server.baseUrl}/trickle`,
+        { kind: 'token', token: 'static-secret' },
+        WORKFLOW_ARTIFACT_MAX_BYTES,
+        2_000
+      )
+
+      await responseStart
+      await expect(pending).rejects.toThrow('deadline')
       await vi.waitFor(() => expect(responseClosed).toBe(true))
     } finally {
       await server.close()
@@ -492,6 +526,7 @@ describe('downloadWorkflowArtifactWithDeps', () => {
   it('cancels an in-flight request by request id and never opens a late dialog', async () => {
     const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
     const showSaveDialog = vi.fn()
+    const sender = {}
     let transportSignal: AbortSignal | undefined
 
     registerWorkflowArtifactDownloadIpc({
@@ -512,13 +547,79 @@ describe('downloadWorkflowArtifactWithDeps', () => {
       ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
     })
 
-    const pending = handlers.get('hermes:workflow-artifact:download')!({ sender: {} }, request)
+    const pending = handlers.get('hermes:workflow-artifact:download')!({ sender }, request)
     await vi.waitFor(() => expect(transportSignal).toBeDefined())
     await expect(
-      handlers.get('hermes:workflow-artifact:cancel')!({}, { requestId: request.requestId })
+      handlers.get('hermes:workflow-artifact:cancel')!({ sender }, { requestId: request.requestId })
     ).resolves.toEqual({ cancelled: true })
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(transportSignal?.aborted).toBe(true)
+    expect(showSaveDialog).not.toHaveBeenCalled()
+  })
+
+  it('isolates identical request ids by invoking sender and removes both entries after settlement', async () => {
+    const handlers = new Map<string, (...args: any[]) => Promise<unknown>>()
+    const showSaveDialog = vi.fn()
+    const firstSender = { name: 'first-sender' }
+    const secondSender = { name: 'second-sender' }
+    const signals: AbortSignal[] = []
+
+    registerWorkflowArtifactDownloadIpc({
+      browserWindow: { fromWebContents: () => ({ isDestroyed: () => false }) },
+      dialog: { showSaveDialog },
+      download: {
+        ensureBackend: async () => ({ authMode: 'token', baseUrl: 'http://127.0.0.1:8899', token: 'token' }),
+        fetchResource: (_url, _auth, _maxBytes, signal) => {
+          if (!signal) {
+            throw new Error('Expected the IPC download transport to receive an abort signal.')
+          }
+
+          signals.push(signal)
+
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+          })
+        },
+        resolveOauthAuth: vi.fn(),
+        routePath: value => value
+      },
+      ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
+    })
+
+    const download = handlers.get('hermes:workflow-artifact:download')!
+    const cancel = handlers.get('hermes:workflow-artifact:cancel')!
+
+    const firstOutcome = download({ sender: firstSender }, request).then(
+      value => value,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(signals).toHaveLength(1))
+
+    const secondOutcome = download({ sender: secondSender }, request).then(
+      value => value,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(signals).toHaveLength(2))
+    expect(signals.map(signal => signal.aborted)).toEqual([false, false])
+
+    await expect(cancel({ sender: firstSender }, { requestId: request.requestId })).resolves.toEqual({
+      cancelled: true
+    })
+    await expect(firstOutcome).resolves.toMatchObject({ name: 'AbortError' })
+    expect(signals.map(signal => signal.aborted)).toEqual([true, false])
+    await expect(cancel({ sender: firstSender }, { requestId: request.requestId })).resolves.toEqual({
+      cancelled: false
+    })
+
+    await expect(cancel({ sender: secondSender }, { requestId: request.requestId })).resolves.toEqual({
+      cancelled: true
+    })
+    await expect(secondOutcome).resolves.toMatchObject({ name: 'AbortError' })
+    await expect(cancel({ sender: secondSender }, { requestId: request.requestId })).resolves.toEqual({
+      cancelled: false
+    })
     expect(showSaveDialog).not.toHaveBeenCalled()
   })
 

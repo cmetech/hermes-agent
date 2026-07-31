@@ -84,7 +84,6 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
   const activeDownloadRef = useRef<ActiveDownload | null>(null)
   const contextRef = useRef(contextKey)
   const generationRef = useRef(0)
-  const requestSequenceRef = useRef(0)
   contextRef.current = contextKey
   const [downloadFeedback, setDownloadFeedback] = useState<DownloadFeedback | null>(null)
   const [downloading, setDownloading] = useState<ActiveDownload | null>(null)
@@ -110,7 +109,7 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
     const publicationId = artifact.publication_id
     const activeProfile = getApiRequestProfile() ?? 'default'
     const activeContextKey = `${activeProfile}\u0000${runId}`
-    const requestId = `workflow-artifact-${Date.now()}-${++requestSequenceRef.current}`
+    const requestId = `workflow-artifact-${crypto.randomUUID()}`
     const generation = ++generationRef.current
     const active: ActiveDownload = { contextKey: activeContextKey, generation, publicationId, requestId }
 

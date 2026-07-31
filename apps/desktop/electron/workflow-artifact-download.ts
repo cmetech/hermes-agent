@@ -271,11 +271,17 @@ export function fetchWorkflowArtifactWithToken(
       return
     }
 
+    let deadline: ReturnType<typeof setTimeout> | null = null
+    let request: http.ClientRequest | null = null
     let response: http.IncomingMessage | null = null
     let settled = false
 
     const cleanup = () => {
-      clearTimeout(deadline)
+      if (deadline) {
+        clearTimeout(deadline)
+        deadline = null
+      }
+
       signal?.removeEventListener('abort', onAbort)
     }
 
@@ -287,7 +293,7 @@ export function fetchWorkflowArtifactWithToken(
       settled = true
       cleanup()
       response?.destroy()
-      request.destroy()
+      request?.destroy()
       reject(error instanceof Error ? error : new Error(String(error)))
     }
 
@@ -303,18 +309,24 @@ export function fetchWorkflowArtifactWithToken(
 
     const onAbort = () => fail(abortError())
 
-    const deadline = setTimeout(
+    deadline = setTimeout(
       () => fail(new Error(`Workflow artifact download exceeded its ${timeoutMs}ms deadline.`)),
       timeoutMs
     )
 
-    const request = client.request(parsed, { headers: workflowArtifactAuthHeaders(auth), method: 'GET' }, incoming => {
-      response = incoming
-      void collectWorkflowArtifactResponse(incoming, maxBytes, () => {
-        incoming.destroy()
-        request.destroy()
-      }).then(succeed, fail)
-    })
+    try {
+      request = client.request(parsed, { headers: workflowArtifactAuthHeaders(auth), method: 'GET' }, incoming => {
+        response = incoming
+        void collectWorkflowArtifactResponse(incoming, maxBytes, () => {
+          incoming.destroy()
+          request?.destroy()
+        }).then(succeed, fail)
+      })
+    } catch (error) {
+      fail(error)
+
+      return
+    }
 
     request.on('error', fail)
     signal?.addEventListener('abort', onAbort, { once: true })
@@ -410,13 +422,17 @@ export function fetchWorkflowArtifactWithOauthCookie(
 }
 
 export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownloadIpcDeps): void {
-  const active = new Map<string, AbortController>()
+  const activeBySender = new Map<unknown, Map<string, AbortController>>()
 
   deps.ipcMain.handle('hermes:workflow-artifact:download', async (event, request) => {
     if (typeof request?.requestId !== 'string' || request.requestId.trim().length === 0) {
       throw new Error('Workflow artifact download request id is required.')
     }
 
+    const sender = event.sender
+    const active = activeBySender.get(sender) ?? new Map<string, AbortController>()
+
+    activeBySender.set(sender, active)
     active.get(request.requestId)?.abort()
     const controller = new AbortController()
     active.set(request.requestId, controller)
@@ -454,12 +470,16 @@ export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownlo
     } finally {
       if (active.get(request.requestId) === controller) {
         active.delete(request.requestId)
+
+        if (active.size === 0 && activeBySender.get(sender) === active) {
+          activeBySender.delete(sender)
+        }
       }
     }
   })
 
-  deps.ipcMain.handle('hermes:workflow-artifact:cancel', async (_event, payload) => {
-    const controller = active.get(payload?.requestId)
+  deps.ipcMain.handle('hermes:workflow-artifact:cancel', async (event, payload) => {
+    const controller = activeBySender.get(event.sender)?.get(payload?.requestId)
     controller?.abort()
 
     return { cancelled: Boolean(controller) }
