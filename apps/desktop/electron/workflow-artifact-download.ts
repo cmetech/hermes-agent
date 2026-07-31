@@ -41,6 +41,42 @@ export interface WorkflowArtifactDownloadDeps {
   writeFile: (filePath: string, bytes: Uint8Array) => Promise<void>
 }
 
+interface OauthCookieRequest {
+  abort: () => void
+  end: () => void
+  on: (event: string, listener: (...args: any[]) => void) => OauthCookieRequest
+}
+
+export interface WorkflowArtifactOauthCookieDeps {
+  getSession: () => unknown
+  request: (options: Record<string, unknown>) => OauthCookieRequest
+}
+
+interface WorkflowArtifactNativeWindow {
+  isDestroyed: () => boolean
+}
+
+interface WorkflowArtifactIpcEvent {
+  sender: unknown
+}
+
+export interface WorkflowArtifactDownloadIpcDeps {
+  browserWindow: {
+    fromWebContents: (sender: unknown) => null | WorkflowArtifactNativeWindow
+  }
+  dialog: {
+    showSaveDialog: (...args: any[]) => Promise<{ canceled: boolean; filePath?: string }>
+  }
+  download: Omit<WorkflowArtifactDownloadDeps, 'chooseSavePath' | 'writeFile'>
+  ipcMain: {
+    handle: (
+      channel: string,
+      handler: (event: WorkflowArtifactIpcEvent, request: WorkflowArtifactDownloadRequest) => Promise<unknown>
+    ) => void
+  }
+  writeFile: (filePath: string, bytes: Uint8Array) => Promise<void>
+}
+
 const DOWNLOAD_PATH_PATTERN = /^\/api\/plugins\/workflow\/runs\/([^/?#]+)\/artifacts\/([^/?#]+)\/download$/
 
 export function workflowArtifactAuthHeaders(
@@ -159,6 +195,97 @@ export function fetchWorkflowArtifactWithToken(
       request.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
     })
     request.end()
+  })
+}
+
+export function fetchWorkflowArtifactWithOauthCookie(
+  url: string,
+  maxBytes: number,
+  timeoutMs: number,
+  deps: WorkflowArtifactOauthCookieDeps
+): Promise<WorkflowArtifactResource> {
+  return new Promise((resolve, reject) => {
+    const oauthSession = deps.getSession()
+
+    if (!oauthSession) {
+      reject(new Error('OAuth session partition is unavailable.'))
+
+      return
+    }
+
+    const parsed = new URL(url)
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+      return
+    }
+
+    const request = deps.request({
+      method: 'GET',
+      redirect: 'follow',
+      session: oauthSession,
+      url,
+      useSessionCookies: true
+    })
+
+    let settled = false
+
+    const fail = (error: unknown) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(timer)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+
+    const timer = setTimeout(() => {
+      fail(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+      request.abort()
+    }, timeoutMs)
+
+    request.on('response', response => {
+      void collectWorkflowArtifactResponse(response, maxBytes, () => request.abort()).then(value => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      }, fail)
+    })
+    request.on('error', fail)
+    request.end()
+  })
+}
+
+export function registerWorkflowArtifactDownloadIpc(deps: WorkflowArtifactDownloadIpcDeps): void {
+  deps.ipcMain.handle('hermes:workflow-artifact:download', async (event, request) => {
+    return downloadWorkflowArtifactWithDeps(request, {
+      ...deps.download,
+      chooseSavePath: async ({ filename }) => {
+        let owner: null | WorkflowArtifactNativeWindow = null
+
+        try {
+          owner = deps.browserWindow.fromWebContents(event.sender)
+        } catch {
+          // The invoking WebContents may have closed between click and save.
+        }
+
+        const options = { defaultPath: filename }
+
+        const result =
+          owner && !owner.isDestroyed()
+            ? await deps.dialog.showSaveDialog(owner, options)
+            : await deps.dialog.showSaveDialog(options)
+
+        return result.canceled || !result.filePath ? null : result.filePath
+      },
+      writeFile: deps.writeFile
+    })
   })
 }
 
