@@ -179,8 +179,6 @@ def _archon_package(workflow_writer, tmp_path, *, field, value):
     [
         ("timeout", 1000, "archon_timeout_semantics_unavailable"),
         ("retry", {"max_attempts": 2}, "archon_retry_semantics_unavailable"),
-        ("output_format", {"type": "object"}, "archon_output_format_unavailable"),
-        ("output_type", "report", "archon_output_type_unavailable"),
         ("maxBudgetUsd", 1.0, "archon_budget_enforcement_unavailable"),
         ("sandbox", {"enabled": True}, "archon_sandbox_enforcement_unavailable"),
     ],
@@ -229,6 +227,36 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
     store = RunStore(home)
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("output_format", {"type": "object"}),
+        ("output_type", "report"),
+    ],
+)
+def test_archon_phase_2_output_fields_validate(
+    workflow_writer, tmp_path, capsys, field, value
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    parser = _parser()
+    home = tmp_path / "home"
+    validate = parser.parse_args([
+        "--workdir",
+        str(tmp_path),
+        "--hermes-home",
+        str(home),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert validate.func(validate) == 0
+    result = _json_result(capsys)
+    assert result["valid"] is True
+    assert result["issues"] == []
+    assert result["language"]["effective_profile"] == "archon-2026-07"
 
 
 def test_archon_validate_text_reports_field_specific_compatibility_finding(
@@ -1062,13 +1090,12 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     assert args.func(args) == 0
     validation = _json_result(capsys)
     assert validation["valid"] is True
+    package = load_workflow(path)
     assert validation["language"] == {
         "declared_profile": None,
         "effective_profile": "hermes-legacy",
-        "normalizer_version": 1,
-        "normalized_definition_digest": load_workflow(
-            path
-        ).language.normalized_definition_digest,
+        "normalizer_version": package.language.normalizer_version,
+        "normalized_definition_digest": package.language.normalized_definition_digest,
         "legacy": True,
     }
 

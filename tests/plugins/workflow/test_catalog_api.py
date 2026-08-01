@@ -311,6 +311,9 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
 
     assert module.WorkflowCatalogLanguageStatus.model_validate(list_status)
     assert module.WorkflowDetailLanguageStatus.model_validate(detail_status)
+    assert module.WorkflowDetailLanguageStatus.model_validate(
+        {**detail_status, "normalizer_version": 2}
+    )
 
     invalid_list = [
         {**list_status, "declared_profile": None},
@@ -326,7 +329,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**detail_status, "effective_profile": "hermes-legacy"},
         {**detail_status, "legacy": 0},
         {**detail_status, "normalizer_version": True},
-        {**detail_status, "normalizer_version": 2},
+        {**detail_status, "normalizer_version": 3},
         {**detail_status, "normalized_definition_digest": "A" * 64},
         {**detail_status, "normalized_definition_digest": "a" * 63},
     ]

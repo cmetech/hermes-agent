@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -16,13 +17,16 @@ import yaml
 
 from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
-from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.entitlement import DeterministicAgentRunner
 from plugins.workflow.lease_clock import LeaseClockSample, current_boot_id
 from plugins.workflow.models import ExecutionFence
-from plugins.workflow.runner_binding import RunnerCapabilities, WorkflowRunnerBinding
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    WorkflowRunnerBinding,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.store import RunStore
 import plugins.workflow.showcase as showcase_module
 from tools.managed_process import ProcessIdentity
@@ -118,17 +122,23 @@ def _binding(
     runner: _RecordingAIRunner,
     *,
     runner_capable: bool = True,
-    api_mode: str = "chat_completions",
+    api_mode: str | None = None,
 ) -> WorkflowRunnerBinding:
+    production = production_workflow_runner_binding()
+    runtime_capabilities = production.runtime_capabilities
+    if api_mode is not None:
+        runtime_capabilities = replace(
+            runtime_capabilities,
+            api_mode=api_mode,
+            hermes_managed_tool_loop=api_mode != "codex_app_server",
+        )
     return WorkflowRunnerBinding(
         real_runner=runner,
         deterministic_runner=DeterministicAgentRunner(),
         real_capabilities=RunnerCapabilities(starts_request_mcp=runner_capable),
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
-        runtime_capabilities=ExecutionRuntimeCapabilities(
-            api_mode=api_mode,
-            hermes_managed_tool_loop=api_mode != "codex_app_server",
-        ),
+        runtime_capabilities=runtime_capabilities,
+        configured_provider_routes=production.configured_provider_routes,
     )
 
 
