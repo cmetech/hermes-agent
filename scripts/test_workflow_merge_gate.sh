@@ -6,6 +6,8 @@ ROOT="$(git rev-parse --show-toplevel)"
 PHASE="base"
 BRAND=""
 TESTED_BASE_SHA=""
+PROVISIONED_DESKTOP_VIEW=""
+PROVISIONED_DESKTOP_MARKER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -203,6 +205,9 @@ _require_root_dependencies() {
 _provision_desktop_dependency_view() {
   local source="$1" target="$ROOT/apps/desktop/node_modules" entry name
   mkdir "$target" || return 1
+  PROVISIONED_DESKTOP_VIEW="$target"
+  PROVISIONED_DESKTOP_MARKER="$(mktemp \
+    "$target/.workflow-merge-gate-owner.XXXXXX")" || return 1
   while IFS= read -r -d '' entry; do
     name="${entry##*/}"
     case "$name" in
@@ -215,6 +220,50 @@ _provision_desktop_dependency_view() {
     esac
   done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
 }
+
+_cleanup_desktop_dependency_view() {
+  local target="$PROVISIONED_DESKTOP_VIEW" marker="$PROVISIONED_DESKTOP_MARKER"
+  local expected="$ROOT/apps/desktop/node_modules" resolved_parent
+  [[ -n "$target" ]] || return 0
+  [[ "$target" == "$expected" ]] || return 1
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    PROVISIONED_DESKTOP_VIEW=""
+    PROVISIONED_DESKTOP_MARKER=""
+    return 0
+  fi
+  [[ -d "$target" && ! -L "$target" ]] || return 1
+  resolved_parent="$(cd "$(dirname "$target")" && pwd -P)" || return 1
+  [[ "$resolved_parent" == "$ROOT/apps/desktop" ]] || return 1
+  if [[ -z "$marker" ]]; then
+    rmdir "$target" 2>/dev/null || return 1
+  else
+    [[ "${marker%/*}" == "$target" && -f "$marker" && ! -L "$marker" ]] || return 1
+    rm -rf -- "$target"
+  fi
+  PROVISIONED_DESKTOP_VIEW=""
+  PROVISIONED_DESKTOP_MARKER=""
+}
+
+_finish_gate() {
+  local status="$1"
+  trap - EXIT HUP INT TERM
+  if ! _cleanup_desktop_dependency_view; then
+    echo "desktop dependency cleanup refused an unowned or escaping path" >&2
+    status=1
+  fi
+  exit "$status"
+}
+
+_handle_gate_signal() {
+  local status="$1"
+  _cleanup_desktop_dependency_view || true
+  exit "$status"
+}
+
+trap '_finish_gate $?' EXIT
+trap '_handle_gate_signal 129' HUP
+trap '_handle_gate_signal 130' INT
+trap '_handle_gate_signal 143' TERM
 
 cd "$ROOT"
 if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then

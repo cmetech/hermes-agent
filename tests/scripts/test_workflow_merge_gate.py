@@ -602,7 +602,24 @@ def _install_full_gate_fixtures(repo: Path, tmp_path: Path) -> dict[str, str]:
     fixture_bin = tmp_path / f"{repo.name}-fixture-bin"
     fixture_bin.mkdir()
     npx = fixture_bin / "npx"
-    npx.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    npx.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ -n \"${GATE_DESKTOP_OBSERVATION:-}\" ]]; then\n"
+        "  [[ -d node_modules && ! -L node_modules ]]\n"
+        "  [[ -L node_modules/fixture-package ]]\n"
+        "  [[ -d node_modules/.vite && ! -L node_modules/.vite ]]\n"
+        "  [[ ! -e node_modules/.vite/source-cache ]]\n"
+        "  printf '%s\\n' \"$1\" >>\"$GATE_DESKTOP_OBSERVATION\"\n"
+        "fi\n"
+        "case \"${GATE_NPX_MODE:-pass}:$1\" in\n"
+        "  test-fail:vitest) exit 41 ;;\n"
+        "  typecheck-fail:tsc) exit 42 ;;\n"
+        "  signal:vitest) kill -TERM \"$PPID\"; exit 143 ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     npx.chmod(0o755)
     env = os.environ.copy()
     env.pop("WORKFLOW_MERGE_GATE_FAST", None)
@@ -626,6 +643,77 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     (desktop_modules / ".vite").mkdir()
     (desktop_modules / ".vite/source-cache").write_text("source-only\n")
     env = _install_full_gate_fixtures(detached, tmp_path)
+    observation = tmp_path / "desktop-gate-observation.log"
+    env["GATE_DESKTOP_OBSERVATION"] = str(observation)
+
+    for _attempt in range(2):
+        result = subprocess.run(
+            [GATE, "--repo", detached, "--phase", "base"],
+            cwd=invocation,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not (detached / "apps/desktop/node_modules").exists()
+
+    assert observation.read_text(encoding="utf-8").splitlines() == [
+        "vitest",
+        "tsc",
+        "vitest",
+        "tsc",
+    ]
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+
+
+@pytest.mark.parametrize("failure_mode", ["test-fail", "typecheck-fail", "signal"])
+def test_gate_cleans_provisioned_desktop_view_on_early_exit(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    (desktop_modules / ".vite/source-cache").write_text("source-only\n")
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_NPX_MODE"] = failure_mode
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert not (detached / "apps/desktop/node_modules").exists()
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+
+
+def test_gate_preserves_preexisting_external_desktop_dependency_symlink(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    desktop_modules.mkdir(parents=True)
+    detached_link = detached / "apps/desktop/node_modules"
+    detached_link.symlink_to(desktop_modules, target_is_directory=True)
+    env = _install_full_gate_fixtures(detached, tmp_path)
 
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
@@ -636,13 +724,8 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     )
 
     assert result.returncode == 0, result.stderr
-    detached_modules = detached / "apps/desktop/node_modules"
-    assert not detached_modules.is_symlink()
-    assert (detached_modules / "fixture-package").resolve() == (
-        desktop_modules / "fixture-package"
-    ).resolve()
-    assert not (detached_modules / ".vite").is_symlink()
-    assert not (detached_modules / ".vite/source-cache").exists()
+    assert detached_link.is_symlink()
+    assert detached_link.resolve() == desktop_modules.resolve()
 
 
 def test_gate_rejects_desktop_dependencies_from_different_repository(
