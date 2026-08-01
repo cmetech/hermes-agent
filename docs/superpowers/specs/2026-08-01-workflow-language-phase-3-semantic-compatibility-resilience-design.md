@@ -268,7 +268,11 @@ are JSON null. Valid
 `timeout_source` values are `authored`, `archon_default`, and
 `profile_ceiling`. `timeout_capped` is true whenever an effective wall or idle
 value is lower than its requested value. All non-null numbers are positive
-finite JSON numbers and every attempt count is an integer from 1 through 5.
+finite JSON numbers. Retry ranges are field-specific:
+`requested_retries` is 0 through 5, `requested_total_attempts` is 1 through 6,
+and both `effective_total_attempts` and the limit
+`combined_total_attempts` are 1 through 5. Thus authored `max_attempts: 5`
+round-trips as requested total 6, effective total 5, and `capped: true`.
 
 Admission resolves current profile configuration plus authenticated sidecar
 limits once, before `RunStore.prepare_run_snapshot()` publishes the immutable
@@ -992,6 +996,8 @@ Tests cover exact legacy v2 digests and behavior; v1/v2 resume; deterministic
 v3 snapshot fields; positive finite millisecond conversion; the omitted
 120-second Bash/script default under ceilings below, equal to, and above 120;
 default, explicit, capped, and invalid retry shapes by node kind;
+exact snapshot round-trip and changed-config resume for requested retries 5,
+requested total 6, effective total 5, and `capped: true`;
 requested/effective mismatch; identical effective projections across CLI, API,
 gateway, showcase, schedule, and direct-store admission; immutable sealed
 limits across config changes; profile/version/digest trust identity and retrust
