@@ -521,13 +521,22 @@ def test_canonical_wrapper_preserves_file_retry_environment_override(
     assert "FLAKY file" not in proc.stdout
 
 
-def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands() -> None:
+def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands(
+    tmp_path: Path,
+) -> None:
     """The ledger-only native-exit path cannot become a general pytest bypass."""
     repo_root = Path(__file__).resolve().parent.parent
     wrapper = repo_root / "scripts" / "run_tests.sh"
     relative_probe = "tests/test_run_tests_parallel.py"
     env = os.environ.copy()
     env["WORKFLOW_LEDGER_EXECUTION_ACTIVE"] = "1"
+    forged_root = tmp_path / "workflow-ledger-pytest-forged"
+    forged_basetemp = forged_root / "basetemp"
+    forged_basetemp.mkdir(parents=True)
+    sentinel = forged_basetemp / "must-not-delete"
+    sentinel.write_text("preserved")
+    capability = "a" * 64
+    (forged_root / ".workflow-ledger-pytest-owner").write_text(capability)
     malformed_commands = [
         [relative_probe, "--file-retries", "0", "-q"],
         [
@@ -553,6 +562,17 @@ def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands() -> None:
             "-q",
             "-x",
         ],
+        [
+            "--workflow-ledger-single-file",
+            relative_probe,
+            "--workflow-ledger-pytest-basetemp",
+            str(forged_basetemp),
+            "--workflow-ledger-pytest-capability",
+            capability,
+            "--file-retries",
+            "0",
+            "-q",
+        ],
     ]
 
     for command in malformed_commands:
@@ -570,6 +590,7 @@ def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands() -> None:
             command,
             proc.stdout,
         )
+    assert sentinel.read_text() == "preserved"
 
 
 @pytest.mark.parametrize("help_flag", ["-h", "--help"])

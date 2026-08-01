@@ -145,7 +145,7 @@ if [ "${WORKFLOW_LEDGER_EXECUTION_ACTIVE:-}" = "1" ]; then
     echo "error: invalid ledger wrapper command" >&2
     exit 2
   }
-  [ "$#" -eq 5 ] || [ "$#" -eq 7 ] || invalid_ledger_command
+  [ "$#" -eq 9 ] || [ "$#" -eq 11 ] || invalid_ledger_command
   [ "$1" = "--workflow-ledger-single-file" ] || invalid_ledger_command
   LEDGER_TEST_PATH="$2"
   case "$LEDGER_TEST_PATH" in
@@ -160,13 +160,51 @@ if [ "${WORKFLOW_LEDGER_EXECUTION_ACTIVE:-}" = "1" ]; then
     && git -C "$REPO_ROOT" ls-files --error-unmatch -- "$LEDGER_TEST_PATH" \
       >/dev/null 2>&1 \
     || invalid_ledger_command
-  [ "$3" = "--file-retries" ] && [ "$4" = "0" ] && [ "$5" = "-q" ] \
+  [ "$3" = "--workflow-ledger-pytest-basetemp" ] \
+    && [ "$5" = "--workflow-ledger-pytest-capability" ] \
     || invalid_ledger_command
-  LEDGER_PYTEST_ARGS=("$LEDGER_TEST_PATH" "-q")
-  if [ "$#" -eq 7 ]; then
+  LEDGER_PYTEST_BASETEMP="$4"
+  LEDGER_PYTEST_CAPABILITY="$6"
+  "$PYTHON" - "$REPO_ROOT" "$LEDGER_PYTEST_BASETEMP" \
+      "$LEDGER_PYTEST_CAPABILITY" <<'PY' || invalid_ledger_command
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+repo = Path(sys.argv[1]).resolve(strict=True)
+basetemp = Path(sys.argv[2])
+capability = sys.argv[3]
+if not re.fullmatch(r"[0-9a-f]{64}", capability):
+    raise SystemExit(1)
+if not basetemp.is_absolute() or basetemp.name != "basetemp":
+    raise SystemExit(1)
+root = basetemp.parent.resolve(strict=True)
+if basetemp.resolve(strict=False) != root / "basetemp":
+    raise SystemExit(1)
+if not root.name.startswith("workflow-ledger-pytest-"):
+    raise SystemExit(1)
+if root == repo or root.is_relative_to(repo):
+    raise SystemExit(1)
+if not stat.S_ISDIR(root.lstat().st_mode) or root.is_symlink():
+    raise SystemExit(1)
+marker = root / ".workflow-ledger-pytest-owner"
+if not stat.S_ISREG(marker.lstat().st_mode) or marker.is_symlink():
+    raise SystemExit(1)
+if marker.read_text(encoding="ascii") != capability:
+    raise SystemExit(1)
+if os.path.lexists(basetemp):
+    raise SystemExit(1)
+PY
+  [ "$7" = "--file-retries" ] && [ "$8" = "0" ] && [ "$9" = "-q" ] \
+    || invalid_ledger_command
+  LEDGER_PYTEST_ARGS=("$LEDGER_TEST_PATH" "-q" \
+    "--basetemp=$LEDGER_PYTEST_BASETEMP")
+  if [ "$#" -eq 11 ]; then
     [ "$LEDGER_TEST_PATH" = \
         "tests/plugins/workflow/test_installed_distribution_e2e.py" ] \
-      && [ "$6" = "-m" ] && [ "$7" = "integration" ] \
+      && [ "${10}" = "-m" ] && [ "${11}" = "integration" ] \
       || invalid_ledger_command
     LEDGER_PYTEST_ARGS+=("-m" "integration")
   elif [ "$LEDGER_TEST_PATH" = \
@@ -185,6 +223,8 @@ if [ "${WORKFLOW_LEDGER_EXECUTION_ACTIVE:-}" = "1" ]; then
     PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX" \
     HERMES_TEST_FILE_RETRIES=0 \
     HERMES_OFFLINE="${HERMES_OFFLINE:-1}" \
+    ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
+    ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
     WORKFLOW_LEDGER_EXECUTION_ACTIVE=1 \
     "$PYTHON" -m pytest "${LEDGER_PYTEST_ARGS[@]}"
 fi
