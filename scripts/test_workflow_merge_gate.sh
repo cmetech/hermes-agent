@@ -8,6 +8,7 @@ BRAND=""
 TESTED_BASE_SHA=""
 PROVISIONED_DESKTOP_VIEW=""
 PROVISIONED_DESKTOP_MARKER=""
+PROVISIONED_DESKTOP_SOURCE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -65,6 +66,23 @@ _matches_invocation_dependency_identity() {
       "HEAD:$relative" 2>/dev/null)" || return 1
     [[ "$target_blob" == "$invocation_blob" ]] || return 1
   done
+}
+
+_validated_invocation_desktop_source() {
+  local target_git_dir invocation_git_dir source
+  target_git_dir="$(git -C "$ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [[ "$invocation_git_dir" == "$target_git_dir" &&
+     "$INVOCATION_ROOT" != "$ROOT" &&
+     -d "$INVOCATION_ROOT/apps/desktop/node_modules" &&
+     ! -L "$INVOCATION_ROOT/apps/desktop/node_modules" ]] || return 1
+  _matches_invocation_dependency_identity \
+    package-lock.json apps/desktop/package.json || return 1
+  source="$(cd "$INVOCATION_ROOT/apps/desktop/node_modules" && pwd -P)" || return 1
+  [[ "$source" != "$ROOT" && "$source" != "$ROOT/"* ]] || return 1
+  printf '%s\n' "$source"
 }
 
 _require_root_dependencies() {
@@ -206,6 +224,7 @@ _provision_desktop_dependency_view() {
   local source="$1" target="$ROOT/apps/desktop/node_modules" entry name
   mkdir "$target" || return 1
   PROVISIONED_DESKTOP_VIEW="$target"
+  PROVISIONED_DESKTOP_SOURCE="$source"
   PROVISIONED_DESKTOP_MARKER="$(mktemp \
     "$target/.workflow-merge-gate-owner.XXXXXX")" || return 1
   while IFS= read -r -d '' entry; do
@@ -222,14 +241,20 @@ _provision_desktop_dependency_view() {
 }
 
 _cleanup_desktop_dependency_view() {
+  local restore_external="${1:-0}"
   local target="$PROVISIONED_DESKTOP_VIEW" marker="$PROVISIONED_DESKTOP_MARKER"
-  local expected="$ROOT/apps/desktop/node_modules" resolved_parent
+  local source="$PROVISIONED_DESKTOP_SOURCE"
+  local expected="$ROOT/apps/desktop/node_modules" resolved_parent handoff=""
+  local current_source="" handoff_ready=0
+  [[ "$restore_external" == "0" || "$restore_external" == "1" ]] || return 1
   [[ -n "$target" ]] || return 0
   [[ "$target" == "$expected" ]] || return 1
   if [[ ! -e "$target" && ! -L "$target" ]]; then
     PROVISIONED_DESKTOP_VIEW=""
     PROVISIONED_DESKTOP_MARKER=""
-    return 0
+    PROVISIONED_DESKTOP_SOURCE=""
+    [[ "$restore_external" == "0" ]]
+    return
   fi
   [[ -d "$target" && ! -L "$target" ]] || return 1
   resolved_parent="$(cd "$(dirname "$target")" && pwd -P)" || return 1
@@ -238,16 +263,40 @@ _cleanup_desktop_dependency_view() {
     rmdir "$target" 2>/dev/null || return 1
   else
     [[ "${marker%/*}" == "$target" && -f "$marker" && ! -L "$marker" ]] || return 1
-    rm -rf -- "$target"
+    if [[ "$restore_external" == "1" ]]; then
+      current_source="$(_validated_invocation_desktop_source 2>/dev/null || true)"
+      handoff="$ROOT/apps/desktop/.workflow-merge-gate-handoff.${marker##*.}"
+      if [[ -n "$source" && "$current_source" == "$source" &&
+            ! -e "$handoff" && ! -L "$handoff" ]] &&
+          ln -s "$source" "$handoff"; then
+        handoff_ready=1
+      fi
+    fi
+    if ! rm -rf -- "$target"; then
+      [[ -n "$handoff" && -L "$handoff" ]] && unlink "$handoff"
+      return 1
+    fi
+    if [[ "$restore_external" == "1" ]]; then
+      if [[ "$handoff_ready" != "1" || -e "$target" || -L "$target" ]] ||
+          ! mv "$handoff" "$target"; then
+        [[ -n "$handoff" && -L "$handoff" ]] && unlink "$handoff"
+        PROVISIONED_DESKTOP_VIEW=""
+        PROVISIONED_DESKTOP_MARKER=""
+        PROVISIONED_DESKTOP_SOURCE=""
+        return 1
+      fi
+    fi
   fi
   PROVISIONED_DESKTOP_VIEW=""
   PROVISIONED_DESKTOP_MARKER=""
+  PROVISIONED_DESKTOP_SOURCE=""
 }
 
 _finish_gate() {
-  local status="$1"
+  local status="$1" restore_external=0
   trap - EXIT HUP INT TERM
-  if ! _cleanup_desktop_dependency_view; then
+  [[ "$status" == "0" ]] && restore_external=1
+  if ! _cleanup_desktop_dependency_view "$restore_external"; then
     echo "desktop dependency cleanup refused an unowned or escaping path" >&2
     status=1
   fi
@@ -256,7 +305,7 @@ _finish_gate() {
 
 _handle_gate_signal() {
   local status="$1"
-  _cleanup_desktop_dependency_view || true
+  _cleanup_desktop_dependency_view 0 || true
   exit "$status"
 }
 
@@ -334,18 +383,9 @@ if [[ "$PHASE" == "base" ]]; then
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then
       ln -s "$SHARED_ROOT/node_modules" node_modules
     fi
-    INVOCATION_GIT_DIR="$(git -C "$INVOCATION_ROOT" rev-parse \
-      --path-format=absolute --git-common-dir 2>/dev/null || true)"
-    INVOCATION_DESKTOP_MODULES=""
-    if [[ "$INVOCATION_GIT_DIR" == "$SHARED_GIT_DIR" &&
-          "$INVOCATION_ROOT" != "$ROOT" &&
-          -d "$INVOCATION_ROOT/apps/desktop/node_modules" &&
-          ! -L "$INVOCATION_ROOT/apps/desktop/node_modules" ]] &&
-        _matches_invocation_dependency_identity \
-          package-lock.json apps/desktop/package.json; then
-      INVOCATION_DESKTOP_MODULES="$(cd \
-        "$INVOCATION_ROOT/apps/desktop/node_modules" && pwd -P)"
-    fi
+    INVOCATION_DESKTOP_MODULES="$(
+      _validated_invocation_desktop_source 2>/dev/null || true
+    )"
     if [[ -L apps/desktop/node_modules && ! -e apps/desktop/node_modules ]]; then
       echo "desktop dependencies contain a dangling local dependency link" >&2
       exit 1

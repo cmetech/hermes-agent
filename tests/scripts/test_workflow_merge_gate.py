@@ -616,6 +616,10 @@ def _install_full_gate_fixtures(repo: Path, tmp_path: Path) -> dict[str, str]:
         "  test-fail:vitest) exit 41 ;;\n"
         "  typecheck-fail:tsc) exit 42 ;;\n"
         "  signal:vitest) kill -TERM \"$PPID\"; exit 143 ;;\n"
+        "  handoff-source-missing:tsc) "
+        "mv \"$GATE_DESKTOP_SOURCE\" \"$GATE_DESKTOP_SOURCE.moved\" ;;\n"
+        "  handoff-target-replaced:tsc) rm -rf node_modules; "
+        "ln -s \"$GATE_REPLACEMENT_SOURCE\" node_modules ;;\n"
         "esac\n"
         "exit 0\n",
         encoding="utf-8",
@@ -646,21 +650,32 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     observation = tmp_path / "desktop-gate-observation.log"
     env["GATE_DESKTOP_OBSERVATION"] = str(observation)
 
-    for _attempt in range(2):
-        result = subprocess.run(
-            [GATE, "--repo", detached, "--phase", "base"],
-            cwd=invocation,
-            text=True,
-            capture_output=True,
-            env=env,
-        )
+    env["GATE_NPX_MODE"] = "test-fail"
+    failed = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert failed.returncode != 0
+    assert not (detached / "apps/desktop/node_modules").exists()
 
-        assert result.returncode == 0, result.stderr
-        assert not (detached / "apps/desktop/node_modules").exists()
+    env.pop("GATE_NPX_MODE")
+    retried = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert retried.returncode == 0, retried.stderr
+    detached_modules = detached / "apps/desktop/node_modules"
+    assert detached_modules.is_symlink()
+    assert detached_modules.resolve() == desktop_modules.resolve()
 
     assert observation.read_text(encoding="utf-8").splitlines() == [
         "vitest",
-        "tsc",
         "vitest",
         "tsc",
     ]
@@ -702,6 +717,74 @@ def test_gate_cleans_provisioned_desktop_view_on_early_exit(
     assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
 
 
+def test_gate_fails_closed_when_successful_desktop_handoff_source_disappears(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_DESKTOP_SOURCE"] = str(desktop_modules)
+    env["GATE_NPX_MODE"] = "handoff-source-missing"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "desktop dependency cleanup refused" in result.stderr
+    assert not (detached / "apps/desktop/node_modules").exists()
+    assert Path(f"{desktop_modules}.moved/fixture-package/package.json").is_file()
+
+
+def test_gate_refuses_to_replace_an_unowned_desktop_handoff_target(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    replacement = tmp_path / "unowned-desktop-dependencies"
+    replacement.mkdir()
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_REPLACEMENT_SOURCE"] = str(replacement)
+    env["GATE_NPX_MODE"] = "handoff-target-replaced"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    detached_modules = detached / "apps/desktop/node_modules"
+    assert result.returncode != 0
+    assert "desktop dependency cleanup refused" in result.stderr
+    assert detached_modules.is_symlink()
+    assert detached_modules.resolve() == replacement.resolve()
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+
+
 def test_gate_preserves_preexisting_external_desktop_dependency_symlink(
     tmp_path: Path,
 ) -> None:
@@ -725,6 +808,7 @@ def test_gate_preserves_preexisting_external_desktop_dependency_symlink(
 
     assert result.returncode == 0, result.stderr
     assert detached_link.is_symlink()
+    assert os.readlink(detached_link) == str(desktop_modules)
     assert detached_link.resolve() == desktop_modules.resolve()
 
 
