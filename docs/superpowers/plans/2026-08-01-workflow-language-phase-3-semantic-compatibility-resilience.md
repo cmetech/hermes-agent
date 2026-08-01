@@ -736,7 +736,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   A new renderer against a v3 backend displays backend-authored language/findings and generic persistent-session recovery evidence. A new renderer against an older backend treats missing additive fields as unavailable. An older-compatible shape ignores v3 additions. No renderer parser, retry calculator, session probe, or filesystem access is added.
 
-  Run: `cd apps/desktop && npm test -- --run src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
   Expected: FAIL on v3 and persistent-session evidence fixtures.
 
@@ -746,7 +746,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_catalog_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_workflow_language_desktop_e2e.py tests/plugins/workflow/test_desktop_api.py`
 
-  Run: `cd apps/desktop && npm test -- --run src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
   Run: `cd apps/desktop && npm run typecheck`
 
@@ -832,7 +832,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Run: `cd apps/desktop && npm run typecheck`
 
-  Run: `cd apps/desktop && npm test -- --run src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
   Run scoped ESLint and Prettier commands only over files changed by Phase 3, using the package's existing scripts/binaries. Record the established 20 unrelated full-Desktop Prettier failures as baseline; do not edit those files.
 
