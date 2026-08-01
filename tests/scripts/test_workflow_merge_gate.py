@@ -421,6 +421,23 @@ def _linked_brand_checkout(tmp_path: Path) -> tuple[Path, Path, str]:
     return shared_root, linked, base
 
 
+def _sibling_invocation_checkouts(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    shared_root, base = _brand_repo(tmp_path)
+    invocation = tmp_path / "invocation-worktree"
+    detached = tmp_path / "detached-rehearsal"
+    for worktree in (invocation, detached):
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), base],
+            cwd=shared_root,
+            check=True,
+            capture_output=True,
+        )
+    shutil.rmtree(shared_root / "node_modules")
+    return shared_root, invocation, detached, base
+
+
 def _run_gate_with_marker(
     repo: Path,
     marker: Path,
@@ -479,6 +496,93 @@ def test_brand_gate_provisions_root_parser_dependencies_before_checker(
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "checked\n"
     assert (linked / "node_modules").resolve() == (shared_root / "node_modules").resolve()
+
+
+def test_gate_provisions_parser_dependencies_from_sibling_invocation_worktree(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    marker = tmp_path / "sibling-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "checked\n"
+    assert (detached / "node_modules").resolve() == (
+        invocation / "node_modules"
+    ).resolve()
+
+
+def test_gate_rejects_invocation_dependencies_from_different_repository(
+    tmp_path: Path,
+) -> None:
+    _shared_root, _invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    unrelated = tmp_path / "unrelated-repository"
+    unrelated.mkdir()
+    subprocess.run(["git", "init"], cwd=unrelated, check=True, capture_output=True)
+    _write_parser_dependencies(unrelated)
+    marker = tmp_path / "unrelated-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=unrelated,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_escaping_sibling_invocation_dependency_view(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    outside = tmp_path / "outside-sibling-dependencies"
+    _write_parser_dependencies(outside)
+    (invocation / "node_modules").symlink_to(
+        outside / "node_modules", target_is_directory=True
+    )
+    marker = tmp_path / "escaping-sibling-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
 
 
 def test_gate_fails_before_checker_when_root_parser_dependencies_are_missing(

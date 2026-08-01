@@ -54,14 +54,29 @@ esac
 [[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
 _require_root_dependencies() {
-  local shared_git_dir shared_root resolved_modules node_bin actual_versions
+  local shared_git_dir shared_root invocation_git_dir invocation_modules
+  local resolved_modules node_bin actual_versions
   shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
+  invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  invocation_modules=""
+  if [[ "$invocation_git_dir" == "$shared_git_dir" &&
+        "$INVOCATION_ROOT" != "$ROOT" &&
+        -d "$INVOCATION_ROOT/node_modules" &&
+        ! -L "$INVOCATION_ROOT/node_modules" ]]; then
+    invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+  fi
   if [[ -L "$ROOT/node_modules" && ! -e "$ROOT/node_modules" ]]; then
     echo "root parser dependencies contain a dangling local dependency link" >&2
     return 1
   fi
-  if [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
+  if [[ ! -e "$ROOT/node_modules" && -n "$invocation_modules" ]]; then
+    ln -s "$invocation_modules" "$ROOT/node_modules" 2>/dev/null || {
+      echo "root parser dependencies could not create the bounded dependency view" >&2
+      return 1
+    }
+  elif [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
     ln -s "$shared_root/node_modules" "$ROOT/node_modules" 2>/dev/null || {
       echo "root parser dependencies could not create the bounded dependency view" >&2
       return 1
@@ -73,7 +88,8 @@ _require_root_dependencies() {
   }
   resolved_modules="$(cd "$ROOT/node_modules" && pwd -P)"
   [[ "$resolved_modules" == "$ROOT/node_modules" ||
-     "$resolved_modules" == "$shared_root/node_modules" ]] || {
+     "$resolved_modules" == "$shared_root/node_modules" ||
+     (-n "$invocation_modules" && "$resolved_modules" == "$invocation_modules") ]] || {
     echo "root parser dependencies escape the allowed dependency roots" >&2
     return 1
   }
@@ -160,7 +176,8 @@ _require_root_dependencies() {
       return manifest.version;
     });
     process.stdout.write(versions.join(" "));
-  ' "$resolved_modules" "$ROOT/node_modules" "$shared_root/node_modules" 2>/dev/null)" || {
+  ' "$resolved_modules" "$ROOT/node_modules" "$shared_root/node_modules" \
+    "$invocation_modules" 2>/dev/null)" || {
     echo "root parser dependencies are unreadable or escape the allowed roots" >&2
     return 1
   }
