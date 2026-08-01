@@ -281,7 +281,8 @@ def test_bedrock_classification_is_fresh_pure_managed_and_matches_resolved(
         provider_config={},
     )
     resolved = runtime_provider.classify_resolved_execution_runtime(
-        {"provider": "bedrock", "api_mode": expected_mode}
+        {"provider": "bedrock", "api_mode": expected_mode},
+        target_model=model,
     )
 
     assert prospective == resolved
@@ -334,7 +335,8 @@ def test_bedrock_classification_is_pure_in_a_fresh_process() -> None:
                 provider_config={},
             )
             resolved = runtime_provider.classify_resolved_execution_runtime(
-                {"provider": "bedrock", "api_mode": expected_mode}
+                {"provider": "bedrock", "api_mode": expected_mode},
+                target_model=model,
             )
             assert prospective == resolved
             assert prospective.hermes_managed_tool_loop is True
@@ -477,7 +479,10 @@ def test_prospective_classifier_matches_actual_effective_runtime(
     resolved = runtime_provider.resolve_runtime_provider(**resolve_kwargs)
 
     assert resolved["api_mode"] == expected_mode
-    assert prospective == runtime_provider.classify_resolved_execution_runtime(resolved)
+    assert prospective == runtime_provider.classify_resolved_execution_runtime(
+        resolved,
+        target_model=model_config["default"],
+    )
 
 
 def test_runtime_resolver_wrapper_changes_only_app_server_api_mode(
@@ -529,9 +534,10 @@ def test_runtime_resolver_wrapper_changes_only_app_server_api_mode(
 def test_resolved_runtime_classifier_fails_closed_for_malformed_runtime(
     runtime: object,
 ) -> None:
-    assert runtime_provider.classify_resolved_execution_runtime(runtime) == (
-        runtime_provider.ExecutionRuntimeCapabilities(
-            api_mode="",
-            hermes_managed_tool_loop=False,
-        )
+    classified = runtime_provider.classify_resolved_execution_runtime(runtime)
+
+    assert classified.api_mode == ""
+    assert classified.hermes_managed_tool_loop is False
+    assert classified.effective_provider == (
+        "broken" if isinstance(runtime, dict) else ""
     )

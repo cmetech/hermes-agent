@@ -202,6 +202,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
+      tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
       tests/plugins/workflow/test_scheduled_runs.py \
@@ -210,6 +211,8 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_node_mcp.py \
       tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_runner_binding.py \
+      tests/plugins/workflow/test_typed_publication.py \
+      tests/plugins/workflow/test_typed_publication_recovery.py \
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
