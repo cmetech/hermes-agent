@@ -622,14 +622,17 @@ The implementation may omit a listed modified file when tests prove it needs no 
   subject `feat(process): inherit bounded child descriptors`. Copy rather than
   advance the existing `last_verified_upstream` identity.
 
-- [ ] Commit the generic primitive and its ledger amendment together.
+- [ ] Run the focused generic suite to GREEN before committing.
+
+  Run: `scripts/run_tests.sh tests/tools/test_managed_process.py tests/tools/test_process_registry.py tests/scripts/test_workflow_merge_gate.py`
+
+  Expected: PASS.
+
+- [ ] Commit the verified generic primitive and its ledger amendment together.
 
   Commit: `feat(process): inherit bounded child descriptors`
 
-- [ ] From the resulting clean commit, run the focused generic suite and live
-  customization gates.
-
-  Run: `scripts/run_tests.sh tests/tools/test_managed_process.py tests/tools/test_process_registry.py tests/scripts/test_workflow_merge_gate.py`
+- [ ] From the resulting clean commit, run the live customization gates.
 
   Run: `../../.venv/bin/python scripts/check_upstream_customizations.py --strict --base-ref HEAD`
 
@@ -637,8 +640,8 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Expected: PASS with the new generic seam isolated at this commit boundary.
 
-  If a gate finds a defect, fix it in a new atomic commit, rerun all three
-  commands, and hand off only a clean tree.
+  If a gate finds a defect, fix it in a new atomic commit, rerun the focused
+  suite and both live commands, and hand off only a clean tree.
 
 ## Task 11: Substitute large Bash values through verified descriptors
 
