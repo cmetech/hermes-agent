@@ -2512,10 +2512,11 @@ def _resistant_descendant_source(*, signal_parent: bool) -> str:
         "import sys\n"
         "import time\n\n"
         "def test_resistant_descendant():\n"
-        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
         "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
-        "        \"Path('.resistant-child.ready').write_text(str(os.getpid())); \"\n"
-        "        \"time.sleep(3); Path('.resistant-child.marker').write_text('escaped'); \"\n"
+        "        \"Path('.resistant-child.ready').write_text(\"\n"
+        "        \"f'{os.getpid()}:{psutil.Process().create_time()}'); \"\n"
+        "        \"time.sleep(5); Path('.resistant-child.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child])\n"
         "    ready = Path('.resistant-child.ready')\n"
@@ -2531,22 +2532,36 @@ def _assert_resistant_descendants_were_reaped(repo: Path, *stems: str) -> None:
     ready_paths = [repo / f".{stem}.ready" for stem in stems]
     marker_paths = [repo / f".{stem}.marker" for stem in stems]
     assert all(path.is_file() for path in ready_paths)
-    child_pids = [int(path.read_text()) for path in ready_paths]
-    time.sleep(3.2)
+    child_identities = [
+        (int(pid), float(created_at))
+        for pid, created_at in (path.read_text().split(":", 1) for path in ready_paths)
+    ]
+    time.sleep(2.2)
     escaped = [path.exists() for path in marker_paths]
     alive = []
-    for child_pid in child_pids:
+    for child_pid, child_created_at in child_identities:
         try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            alive.append(False)
-        else:
-            alive.append(True)
+            candidate = ledger_runner.psutil.Process(child_pid)
+            original_identity_alive = (
+                candidate.create_time() == child_created_at
+                and candidate.status() != ledger_runner.psutil.STATUS_ZOMBIE
+            )
+        except (ledger_runner.psutil.NoSuchProcess, ledger_runner.psutil.ZombieProcess):
+            original_identity_alive = False
+        alive.append(original_identity_alive)
+        if original_identity_alive:
             subprocess.run(
                 [
                     sys.executable,
                     "-c",
-                    f"import os, signal; os.kill({child_pid}, signal.SIGKILL)",
+                    (
+                        "import os, psutil, signal, sys; "
+                        "candidate = psutil.Process(int(sys.argv[1])); "
+                        "candidate.create_time() == float(sys.argv[2]) and "
+                        "os.kill(candidate.pid, signal.SIGKILL)"
+                    ),
+                    str(child_pid),
+                    str(child_created_at),
                 ],
                 capture_output=True,
                 check=False,
@@ -2571,10 +2586,11 @@ def _leader_exit_with_resistant_descendant_source(*, passes: bool) -> str:
         "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "    counter.write_text(str(attempt))\n"
         "    stem = f'exit-child-{attempt}'\n"
-        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
         "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
-        "        f\"Path('.{stem}.ready').write_text(str(os.getpid())); \"\n"
-        "        f\"time.sleep(3); Path('.{stem}.marker').write_text('escaped'); \"\n"
+        "        f\"Path('.{stem}.ready').write_text("
+        "f'{{os.getpid()}}:{{psutil.Process().create_time()}}'); \"\n"
+        "        f\"time.sleep(5); Path('.{stem}.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
@@ -2589,10 +2605,11 @@ def _leader_exit_with_resistant_descendant_source(*, passes: bool) -> str:
 
 def _leader_signal_after_fast_intermediate_source() -> str:
     grandchild = (
-        "import os, signal, time; from pathlib import Path; "
+        "import os, psutil, signal, time; from pathlib import Path; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "Path('.fast-grandchild.ready').write_text(str(os.getpid())); "
-        "time.sleep(3); Path('.fast-grandchild.marker').write_text('escaped'); "
+        "Path('.fast-grandchild.ready').write_text("
+        "f'{os.getpid()}:{psutil.Process().create_time()}'); "
+        "time.sleep(5); Path('.fast-grandchild.marker').write_text('escaped'); "
         "time.sleep(30)"
     )
     intermediate = (
