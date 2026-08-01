@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 import hashlib
 import json
@@ -102,6 +103,10 @@ class StructuredOutputSchemaInvalid(StructuredOutputError):
     """A schema fails the bounded Draft 2020-12 contract."""
 
 
+class _CanonicalJSONSizeLimit(ValueError):
+    """Canonical JSON exceeded its caller-owned byte ceiling."""
+
+
 class StructuredOutputStrategy(str, Enum):
     NATIVE_JSON_SCHEMA = "native_json_schema"
     NATIVE_JSON_MODE = "native_json_mode"
@@ -156,23 +161,110 @@ def normalize_schema(schema: Mapping[str, object]) -> StructuredOutputSchema:
 
     canonical = _copy_and_validate_schema(source)
     try:
-        canonical_bytes = json.dumps(
+        canonical_bytes = canonical_json_bytes(
             canonical,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+            max_bytes=MAX_CANONICAL_SCHEMA_BYTES,
+        )
+    except _CanonicalJSONSizeLimit as exc:
+        raise StructuredOutputError(
+            "schema exceeds canonical schema bytes limit"
+        ) from exc
+    except (TypeError, ValueError, UnicodeError) as exc:
         raise StructuredOutputError("schema must contain JSON values") from exc
-    if len(canonical_bytes) > MAX_CANONICAL_SCHEMA_BYTES:
-        raise StructuredOutputError("schema exceeds canonical schema bytes limit")
 
     return StructuredOutputSchema(
         canonical_schema=canonical,
         schema_fingerprint=hashlib.sha256(canonical_bytes).hexdigest(),
         canonical_schema_bytes=canonical_bytes,
     )
+
+
+def parse_exact_decimal_integer(text: str, *, max_digits: int) -> int:
+    """Parse bounded decimal text exactly without CPython's global digit setting."""
+    if (
+        not isinstance(text, str)
+        or not text
+        or isinstance(max_digits, bool)
+        or not isinstance(max_digits, int)
+        or max_digits <= 0
+    ):
+        raise ValueError("decimal integer parser requires bounded text")
+    digits = text[1:] if text[0] in "+-" else text
+    if not digits or len(digits) > max_digits or not digits.isascii() or not digits.isdigit():
+        raise ValueError("decimal integer text is invalid or exceeds its bound")
+    try:
+        return int(Decimal(text))
+    except (InvalidOperation, ValueError, OverflowError) as exc:
+        raise ValueError("decimal integer text is invalid") from exc
+
+
+def _exact_integer_text(value: int, *, max_bytes: int) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("exact integer encoder requires an integer")
+    # A decimal digit needs fewer than 3.322 bits. Reject integers that cannot
+    # possibly fit before asking Decimal to materialize their exact text.
+    possible_bits = (max_bytes * 3_322 + 999) // 1_000 + 1
+    if value.bit_length() > possible_bits:
+        raise _CanonicalJSONSizeLimit("integer exceeds canonical byte ceiling")
+    encoded = format(Decimal(value), "f").encode("ascii")
+    if len(encoded) > max_bytes:
+        raise _CanonicalJSONSizeLimit("integer exceeds canonical byte ceiling")
+    return encoded
+
+
+def canonical_json_bytes(value: object, *, max_bytes: int) -> bytes:
+    """Encode exact bounded canonical JSON without decimal-int string coercion."""
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes <= 0
+    ):
+        raise ValueError("canonical JSON byte limit must be positive")
+    output = bytearray()
+
+    def append(data: bytes) -> None:
+        if len(output) + len(data) > max_bytes:
+            raise _CanonicalJSONSizeLimit("canonical JSON exceeds byte ceiling")
+        output.extend(data)
+
+    def encode(item: object) -> None:
+        if item is None:
+            append(b"null")
+        elif item is True:
+            append(b"true")
+        elif item is False:
+            append(b"false")
+        elif isinstance(item, int):
+            append(_exact_integer_text(item, max_bytes=max_bytes - len(output)))
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("non-finite JSON number")
+            append(float.__repr__(item).encode("ascii"))
+        elif isinstance(item, str):
+            append(json.encoder.encode_basestring(item).encode("utf-8"))
+        elif isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise TypeError("JSON object keys must be strings")
+            append(b"{")
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    append(b",")
+                encode(key)
+                append(b":")
+                encode(item[key])
+            append(b"}")
+        elif isinstance(item, list | tuple):
+            append(b"[")
+            for index, child in enumerate(item):
+                if index:
+                    append(b",")
+                encode(child)
+            append(b"]")
+        else:
+            raise TypeError("value is not JSON-canonicalizable")
+
+    encode(value)
+    return bytes(output)
 
 
 def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
@@ -523,7 +615,11 @@ def parse_validate_canonicalize(
         raise StructuredOutputError("structured output byte limit is invalid")
 
     output_limit = min(request.output_bytes_limit, MAX_OUTPUT_BYTES)
-    if len(response.encode("utf-8")) > output_limit:
+    try:
+        response_bytes = response.encode("utf-8")
+    except UnicodeError as exc:
+        raise StructuredOutputError("response is not one complete JSON value") from exc
+    if len(response_bytes) > output_limit:
         raise StructuredOutputError("output exceeds bytes limit")
 
     start = 0
@@ -531,7 +627,11 @@ def parse_validate_canonicalize(
         start += 1
     try:
         value, end = json.JSONDecoder(
-            parse_constant=_reject_nonfinite_constant
+            parse_constant=_reject_nonfinite_constant,
+            parse_int=lambda text: parse_exact_decimal_integer(
+                text,
+                max_digits=output_limit,
+            ),
         ).raw_decode(response, start)
     except (json.JSONDecodeError, ValueError) as exc:
         raise StructuredOutputError("response is not one complete JSON value") from exc
@@ -545,14 +645,10 @@ def parse_validate_canonicalize(
     if errors:
         raise StructuredOutputError(validation_summary(errors))
     try:
-        canonical_bytes = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+        canonical_bytes = canonical_json_bytes(value, max_bytes=output_limit)
+    except _CanonicalJSONSizeLimit as exc:
+        raise StructuredOutputError("output exceeds bytes limit") from exc
+    except (TypeError, ValueError, UnicodeError) as exc:
         raise StructuredOutputError("response is not JSON-canonicalizable") from exc
 
     return StructuredOutputValue(

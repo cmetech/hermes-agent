@@ -229,6 +229,87 @@ def test_archon_output_format_preserves_arbitrary_size_integer_number_keywords(
     assert package.definition.nodes[0].options["output_format"][keyword] == value
 
 
+def _raw_integer_schema_workflow(tmp_path, *, name, integer_text):
+    root = tmp_path / name / "workflows"
+    root.mkdir(parents=True)
+    path = root / f"{name}.yaml"
+    path.write_text(
+        "name: "
+        + name
+        + "\ndescription: exact integer YAML\nnodes:\n"
+        "  - id: producer\n"
+        "    prompt: Return a number\n"
+        "    output_format:\n"
+        "      type: number\n"
+        "      maximum: "
+        + integer_text
+        + "\n",
+        encoding="utf-8",
+    )
+    path.with_name(f"{name}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return path
+
+
+def test_archon_yaml_preserves_integer_beyond_runtime_decimal_digit_limit(
+    tmp_path,
+):
+    integer_text = "1" + "0" * 4_999
+    path = _raw_integer_schema_workflow(
+        tmp_path,
+        name="yaml-exact-large-integer",
+        integer_text=integer_text,
+    )
+
+    package = load_workflow(path)
+
+    output_format = package.definition.nodes[0].options["output_format"]
+    assert output_format["maximum"] == 10**4_999
+    assert (
+        package.language.structured_outputs["producer"].canonical_schema["maximum"]
+        == 10**4_999
+    )
+
+
+@pytest.mark.parametrize(
+    ("integer_text", "expected"),
+    [
+        ("+10", 10),
+        ("1_000", 1_000),
+        ("0b1010", 10),
+        ("012", 10),
+        ("0xA", 10),
+        ("1:00", 60),
+    ],
+)
+def test_workflow_integer_loader_preserves_safe_loader_yaml_forms(
+    tmp_path, integer_text, expected
+):
+    path = _raw_integer_schema_workflow(
+        tmp_path,
+        name=f"yaml-integer-form-{expected}-{integer_text.encode().hex()}",
+        integer_text=integer_text,
+    )
+
+    package = load_workflow(path)
+
+    assert package.definition.nodes[0].options["output_format"]["maximum"] == expected
+
+
+def test_workflow_rejects_huge_integer_after_document_byte_ceiling(tmp_path):
+    path = _raw_integer_schema_workflow(
+        tmp_path,
+        name="yaml-integer-over-document-limit",
+        integer_text="1" + "0" * (2 * 1024 * 1024),
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert exc.value.issues[0].code == "workflow_too_large"
+
+
 def _consumer_nodes(schema, path="missing", *, depends_on=True):
     consumer = {
         "id": "consumer",

@@ -75,6 +75,45 @@ def test_archon_profile_normalization_is_deterministic(definition):
         == second.metadata.normalized_definition_digest
     )
     assert len(first.metadata.normalized_definition_digest) == 64
+    assert first.metadata.normalized_definition_digest == (
+        "27129b7497b4989c01bc66208ac6051a420f693b27dc646b1ff95c76ce6f6c14"
+    )
+
+
+def test_normalized_digest_preserves_exact_integer_beyond_runtime_digit_limit(
+    definition,
+):
+    maximum = 10**4_999
+    definition = replace(
+        definition,
+        nodes=(
+            replace(
+                definition.nodes[0],
+                node_type="prompt",
+                value="Return an exact integer",
+                options=freeze_value({
+                    "output_format": {
+                        "type": "number",
+                        "maximum": maximum,
+                    }
+                }),
+            ),
+        ),
+    )
+    selection = WorkflowLanguageSelection(
+        declared_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+
+    first = normalize_workflow(definition, selection=selection, normalizer_version=2)
+    second = normalize_workflow(definition, selection=selection, normalizer_version=2)
+
+    assert first.metadata.normalized_definition_digest == (
+        second.metadata.normalized_definition_digest
+    )
+    assert first.metadata.structured_outputs["start"].canonical_schema[
+        "maximum"
+    ] == maximum
 
 
 def test_version_one_keeps_archon_structured_output_identity(definition):

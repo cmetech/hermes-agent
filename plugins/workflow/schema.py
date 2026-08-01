@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
@@ -59,6 +60,49 @@ TRIGGER_RULES = (
     "one_success",
     "none_failed_min_one_success",
     "all_done",
+)
+
+
+class _WorkflowSafeLoader(yaml.SafeLoader):
+    """SafeLoader with local exact decimal integer construction."""
+
+
+def _construct_workflow_yaml_int(loader, node):
+    value = loader.construct_scalar(node).replace("_", "")
+    sign = -1 if value[0] == "-" else 1
+    if value[0] in "+-":
+        value = value[1:]
+    if value == "0":
+        return 0
+    if value.startswith("0b"):
+        return sign * int(value[2:], 2)
+    if value.startswith("0x"):
+        return sign * int(value[2:], 16)
+    if value[0] == "0":
+        return sign * int(value, 8)
+    if ":" in value:
+        digits = [
+            parse_exact_decimal_integer(
+                part,
+                max_digits=MAX_WORKFLOW_DOCUMENT_BYTES,
+            )
+            for part in value.split(":")
+        ]
+        total = 0
+        base = 1
+        for digit in reversed(digits):
+            total += digit * base
+            base *= 60
+        return sign * total
+    return sign * parse_exact_decimal_integer(
+        value,
+        max_digits=MAX_WORKFLOW_DOCUMENT_BYTES,
+    )
+
+
+_WorkflowSafeLoader.add_constructor(
+    "tag:yaml.org,2002:int",
+    _construct_workflow_yaml_int,
 )
 CONTEXT_VALUES = ("fresh", "shared")
 SCRIPT_RUNTIMES = ("bun", "uv")
@@ -774,8 +818,8 @@ def _parse_sidecar(
     data: bytes,
 ) -> tuple[Path, Mapping[str, Any]]:
     try:
-        raw = yaml.safe_load(data.decode("utf-8")) or {}
-    except (UnicodeError, yaml.YAMLError) as exc:
+        raw = yaml.load(data.decode("utf-8"), Loader=_WorkflowSafeLoader) or {}
+    except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
     sidecar = _mapping(raw, "sidecar")
     forbidden = {
@@ -945,8 +989,8 @@ def _load_workflow_bytes(
         )
     try:
         text = data.decode("utf-8")
-        raw = yaml.safe_load(text)
-    except (UnicodeError, yaml.YAMLError) as exc:
+        raw = yaml.load(text, Loader=_WorkflowSafeLoader)
+    except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("document", "invalid_yaml", f"invalid workflow YAML: {exc}")
     document = _mapping(raw, "document")
     top_lines, node_lines = _source_lines(text)

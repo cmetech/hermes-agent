@@ -6,13 +6,16 @@ import base64
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from hashlib import sha256
-import json
 import math
 import re
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from agent.structured_output import StructuredOutputError, normalize_schema
+from agent.structured_output import (
+    StructuredOutputError,
+    canonical_json_bytes,
+    normalize_schema,
+)
 
 from plugins.workflow.models import (
     CompatibilityFinding,
@@ -32,6 +35,10 @@ WORKFLOW_NORMALIZER_VERSION = 2
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
+# The normalized type-tag document expands the already bounded workflow and
+# structured schemas. This conservative ceiling keeps semantic hashing bounded
+# without constraining any admitted 2 MiB workflow or its 32 schema snapshots.
+_MAX_NORMALIZED_DEFINITION_CANONICAL_BYTES = 16 * 1024 * 1024
 LEGACY_LANGUAGE_FINDING_FIELDS = frozenset({
     "idle_timeout",
     "timeout",
@@ -828,14 +835,16 @@ def _json_safe(value: Any) -> Any:
 
 
 def _sha256_json(document: Mapping[str, Any]) -> str:
-    return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
+    return sha256(
+        canonical_json_bytes(
+            document,
+            max_bytes=_MAX_NORMALIZED_DEFINITION_CANONICAL_BYTES,
+        )
+    ).hexdigest()
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
+    return canonical_json_bytes(
         value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+        max_bytes=_MAX_NORMALIZED_DEFINITION_CANONICAL_BYTES,
+    ).decode("utf-8")

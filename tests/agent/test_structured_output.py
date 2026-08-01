@@ -209,6 +209,29 @@ def test_normalize_schema_preserves_arbitrary_size_integer_number_keywords(
     assert normalized.canonical_schema[keyword] == value
 
 
+def test_normalize_schema_preserves_integer_beyond_runtime_decimal_digit_limit() -> (
+    None
+):
+    value = 10**4_999
+    setting = sys.get_int_max_str_digits()
+
+    normalized = normalize_schema({"type": "number", "maximum": value})
+
+    assert normalized.canonical_schema["maximum"] == value
+    assert b'"maximum":' + b"1" + b"0" * 4_999 in (
+        normalized.canonical_schema_bytes
+    )
+    assert normalized.schema_fingerprint == hashlib.sha256(
+        normalized.canonical_schema_bytes
+    ).hexdigest()
+    assert sys.get_int_max_str_digits() == setting
+
+
+def test_normalize_schema_rejects_huge_integer_over_canonical_byte_ceiling() -> None:
+    with pytest.raises(StructuredOutputError, match="schema.*bytes"):
+        normalize_schema({"type": "number", "maximum": 10**70_000})
+
+
 @pytest.mark.parametrize("keyword", ["maxItems", "maxLength", "minProperties"])
 def test_normalize_schema_rejects_booleans_for_integer_bounds(keyword: str) -> None:
     with pytest.raises(StructuredOutputError, match="integer"):
@@ -269,6 +292,38 @@ def test_parse_validate_canonicalize_rejects_outputs_over_500000_bytes() -> None
     with pytest.raises(StructuredOutputError, match="output.*bytes"):
         structured_output.parse_validate_canonicalize(
             '"' + "x" * 500_001 + '"', request
+        )
+
+
+def test_parse_validate_canonicalize_preserves_integer_beyond_digit_limit() -> None:
+    response = "1" + "0" * 4_999
+
+    class AcceptAll:
+        @staticmethod
+        def iter_errors(_value):
+            return ()
+
+    setting = sys.get_int_max_str_digits()
+    result = structured_output.parse_validate_canonicalize(
+        response,
+        _request({"type": "integer"}),
+        validator=AcceptAll(),
+    )
+
+    assert result.value == 10**4_999
+    assert result.canonical_bytes == response.encode("ascii")
+    assert sys.get_int_max_str_digits() == setting
+
+
+def test_parse_validate_canonicalize_rejects_integer_over_output_byte_ceiling() -> (
+    None
+):
+    response = "1" + "0" * 500_000
+
+    with pytest.raises(StructuredOutputError, match="output.*bytes"):
+        structured_output.parse_validate_canonicalize(
+            response,
+            _request({"type": "integer"}),
         )
 
 
