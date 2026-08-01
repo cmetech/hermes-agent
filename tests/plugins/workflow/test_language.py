@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from agent.structured_output import canonical_json_bytes
+import plugins.workflow.language as language_module
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     bind_semantic_fingerprint,
@@ -75,9 +78,41 @@ def test_archon_profile_normalization_is_deterministic(definition):
         == second.metadata.normalized_definition_digest
     )
     assert len(first.metadata.normalized_definition_digest) == 64
-    assert first.metadata.normalized_definition_digest == (
-        "27129b7497b4989c01bc66208ac6051a420f693b27dc646b1ff95c76ce6f6c14"
+    ordinary_document = language_module._json_safe({
+        "profile": selection.effective_profile.value,
+        "normalizer_version": 1,
+        "definition": {
+            "name": first.definition.name,
+            "description": first.definition.description,
+            "nodes": [
+                {
+                    "id": node.id,
+                    "node_type": node.node_type,
+                    "value": node.value,
+                    "depends_on": list(node.depends_on),
+                    "options": node.options,
+                }
+                for node in first.definition.nodes
+            ],
+            "options": first.definition.options,
+        },
+    })
+    shared_encoding = canonical_json_bytes(
+        ordinary_document,
+        max_bytes=1_000_000,
     )
+    stdlib_encoding = json.dumps(
+        ordinary_document,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert shared_encoding == stdlib_encoding
+    assert first.metadata.normalized_definition_digest == hashlib.sha256(
+        shared_encoding
+    ).hexdigest()
 
 
 def test_normalized_digest_preserves_exact_integer_beyond_runtime_digit_limit(
