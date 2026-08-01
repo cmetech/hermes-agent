@@ -6015,11 +6015,6 @@ class RunStore:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if schedule_revalidation is not None:
-                    self._invalidate_scheduled_promotion_authorization(
-                        schedule_revalidation,
-                        run_id,
-                    )
                 row = connection.execute(
                     "SELECT status, scheduled_at FROM runs WHERE run_id=?",
                     (run_id,),
@@ -6073,43 +6068,63 @@ class RunStore:
                     connection.rollback()
                     return False
 
-                projection["status"] = "failed"
-                projection["queue_position"] = None
-                projection["queue_sequence"] = None
-                projection["blocked_by_run_id"] = None
-                projection["last_error"] = {
-                    "code": error_code,
-                    "path": error_path,
-                    "message": safe_message,
-                }
-                for node in nodes.values():
-                    if node["state"] not in {"succeeded", "failed", "skipped"}:
-                        node["state"] = "cancelled"
-                self._append_locked(
-                    directory,
-                    projection,
-                    "run_failed",
-                    {
-                        "reason_code": "package_validation_failed",
-                        "validation_code": error_code,
-                        "validation_path": error_path,
-                    },
-                    defer_notification=True,
-                )
-                self._sync_integrity_index(
-                    connection,
-                    projection=projection,
-                    journal_sha256=_sha256(
-                        (directory / "events.jsonl").read_bytes()
-                    ),
-                )
-                self._record_coordinator_wake(
-                    connection,
-                    run_id=run_id,
-                    reason_code="run_failed",
-                )
-                connection.commit()
-                changed = True
+                if schedule_revalidation is not None:
+                    from plugins.workflow.scheduled_revalidation import (
+                        ScheduledRunRevalidationError,
+                    )
+
+                    try:
+                        self._consume_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                            projection,
+                        )
+                    except ScheduledRunRevalidationError:
+                        self._fail_scheduled_revalidation_locked(
+                            connection,
+                            directory,
+                            projection,
+                        )
+                        connection.commit()
+                        changed = True
+                if not changed:
+                    projection["status"] = "failed"
+                    projection["queue_position"] = None
+                    projection["queue_sequence"] = None
+                    projection["blocked_by_run_id"] = None
+                    projection["last_error"] = {
+                        "code": error_code,
+                        "path": error_path,
+                        "message": safe_message,
+                    }
+                    for node in nodes.values():
+                        if node["state"] not in {"succeeded", "failed", "skipped"}:
+                            node["state"] = "cancelled"
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "run_failed",
+                        {
+                            "reason_code": "package_validation_failed",
+                            "validation_code": error_code,
+                            "validation_path": error_path,
+                        },
+                        defer_notification=True,
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="run_failed",
+                    )
+                    connection.commit()
+                    changed = True
             except BaseException:
                 connection.rollback()
                 raise

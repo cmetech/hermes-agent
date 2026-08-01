@@ -1904,6 +1904,180 @@ def test_scheduled_package_validation_matches_immediate_durable_failure(
         ).fetchone()[0] == 0
 
 
+def test_scheduled_package_validation_revalidates_before_terminal_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = _RecordingAIRunner()
+    binding = _binding(real_runner=runner)
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_impossible_authenticated_command(
+            home,
+            workflow_writer,
+            name="scheduled-package-validation-revalidation",
+            binding=binding,
+        )
+    )
+    initial = store.load_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    observed_projections: list[tuple[object, object, object]] = []
+    executor_calls = []
+    authorization = None
+
+    def reject_revalidation(projection):
+        observed_projections.append(
+            (
+                projection.get("status"),
+                projection.get("state_version"),
+                projection.get("desired_status"),
+            )
+        )
+        raise scheduled_revalidation_module.ScheduledRunRevalidationError(
+            "scheduled authority changed"
+        )
+
+    def authorize(loaded_run_id, _projection):
+        nonlocal authorization
+        authorization = store._scheduled_promotion_authorization(
+            loaded_run_id,
+            reject_revalidation,
+        )
+        return True, authorization
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("scheduled executor ran after rejected revalidation")
+
+    with store._connect() as connection:
+        wakes_before = connection.execute(
+            "SELECT COUNT(*) FROM coordinator_wakes WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    try:
+        failed = scheduler.advance(run_id, max_nodes=1)
+        replay = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert observed_projections == [
+        ("queued", initial["state_version"], None)
+    ]
+    assert failed["status"] == replay["status"] == "failed"
+    assert failed["last_error"] == replay["last_error"] == {
+        "code": "schedule_revalidation_failed",
+        "message": "scheduled run authorization changed before execution",
+    }
+    assert failed["event_sequence"] == replay["event_sequence"]
+    assert runner.requests == []
+    assert executor_calls == []
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    failures = [
+        event
+        for event in store.tail_events(run_id, limit=20)
+        if event["event_type"] == "run_failed"
+    ]
+    assert [event["payload"] for event in failures] == [{
+        "reason_code": "schedule_revalidation_failed",
+    }]
+    with store._connect() as connection:
+        indexed = connection.execute(
+            "SELECT status, projection_state_version FROM runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert (indexed["status"], indexed["projection_state_version"]) == (
+            "failed",
+            failed["state_version"],
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coordinator_wakes WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == wakes_before + 1
+
+
+def test_scheduled_package_validation_propagates_unexpected_verifier_fault(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding(real_runner=_RecordingAIRunner())
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_impossible_authenticated_command(
+            home,
+            workflow_writer,
+            name="scheduled-package-validation-verifier-fault",
+            binding=binding,
+        )
+    )
+    before = store.load_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    verifier_calls = 0
+    authorization = None
+
+    def fail_unexpectedly(_projection):
+        nonlocal verifier_calls
+        verifier_calls += 1
+        raise RuntimeError("unexpected verifier fault")
+
+    def authorize(loaded_run_id, _projection):
+        nonlocal authorization
+        authorization = store._scheduled_promotion_authorization(
+            loaded_run_id,
+            fail_unexpectedly,
+        )
+        return True, authorization
+
+    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
+    try:
+        with pytest.raises(RuntimeError, match="unexpected verifier fault"):
+            scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert verifier_calls == 1
+    assert store.load_run(run_id) == before
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    assert not any(
+        event["event_type"] == "run_failed"
+        for event in store.tail_events(run_id, limit=20)
+    )
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+
+
 def test_package_preparation_error_without_server_authorization_propagates(
     tmp_path: Path,
     monkeypatch,
