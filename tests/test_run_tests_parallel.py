@@ -481,6 +481,97 @@ def test_worker_selection_policy(
     assert int(announced.group("jobs")) == expected_jobs, proc.stdout
 
 
+def test_canonical_wrapper_preserves_file_retry_environment_override(
+    tmp_path: Path,
+) -> None:
+    """The documented env override must reach the per-file controller."""
+    repo_root = Path(__file__).resolve().parent.parent
+    wrapper = repo_root / "scripts" / "run_tests.sh"
+    marker = tmp_path / "failed-once"
+    probe = tmp_path / "test_flaky_probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_fails_only_on_first_file_attempt():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.write_text("failed once")
+                    assert False, "the wrapper must not retry this file"
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_TEST_FILE_RETRIES"] = "0"
+
+    proc = subprocess.run(
+        [str(wrapper), str(probe), "-j", "1", "-q"],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert "the wrapper must not retry this file" in proc.stdout
+    assert "FLAKY file" not in proc.stdout
+
+
+def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands() -> None:
+    """The ledger-only native-exit path cannot become a general pytest bypass."""
+    repo_root = Path(__file__).resolve().parent.parent
+    wrapper = repo_root / "scripts" / "run_tests.sh"
+    relative_probe = "tests/test_run_tests_parallel.py"
+    env = os.environ.copy()
+    env["WORKFLOW_LEDGER_EXECUTION_ACTIVE"] = "1"
+    malformed_commands = [
+        [relative_probe, "--file-retries", "0", "-q"],
+        [
+            "--workflow-ledger-single-file",
+            relative_probe,
+            relative_probe,
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        [
+            "--workflow-ledger-single-file",
+            "tests/../tests/test_run_tests_parallel.py",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        [
+            "--workflow-ledger-single-file",
+            relative_probe,
+            "--file-retries",
+            "0",
+            "-q",
+            "-x",
+        ],
+    ]
+
+    for command in malformed_commands:
+        proc = subprocess.run(
+            [str(wrapper), *command],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 2, (command, proc.stdout)
+        assert "invalid ledger wrapper command" in proc.stdout, (
+            command,
+            proc.stdout,
+        )
+
+
 @pytest.mark.parametrize("help_flag", ["-h", "--help"])
 def test_canonical_wrapper_help_exits_without_running_tests(
     tmp_path: Path,

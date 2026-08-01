@@ -776,9 +776,14 @@ def _command(
     npx_path: str | None = None,
 ) -> tuple[list[str], Path]:
     if kind == "python":
-        # Keep the absolute virtualenv entry point.  Resolving the symlink to
-        # uv's base interpreter would silently discard the venv/site-packages.
-        command = [str(Path(sys.executable).absolute()), "-m", "pytest", "-q", path]
+        command = [
+            str((repo / "scripts/run_tests.sh").absolute()),
+            "--workflow-ledger-single-file",
+            path,
+            "--file-retries",
+            "0",
+            "-q",
+        ]
         if path == "tests/plugins/workflow/test_installed_distribution_e2e.py":
             command.extend(["-m", "integration"])
         return command, repo
@@ -1077,6 +1082,14 @@ def _execute_attempt(
         "WORKFLOW_MERGE_GATE_FAST",
     ):
         env.pop(inherited, None)
+    if kind == "python":
+        # The sealed worktree intentionally has no local virtualenv. Supply
+        # the already-running ledger interpreter as trusted wrapper bootstrap
+        # authority, then let run_tests.sh remove it from pytest's clean env.
+        env["HERMES_PYTHON"] = str(Path(sys.executable).absolute())
+        # Keep the wrapper controller to one attempt; _execute owns the sole
+        # bounded retry and its evidence/diagnostic state machine.
+        env["HERMES_TEST_FILE_RETRIES"] = "0"
     env.update(
         {
             "HERMES_OFFLINE": "1",

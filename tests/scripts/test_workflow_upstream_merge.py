@@ -24,6 +24,37 @@ REHEARSAL = ROOT / "scripts/test_workflow_upstream_merge.sh"
 LEDGER_RUNNER = ROOT / "scripts/run_workflow_ledger_invariants.py"
 
 
+def _install_python_test_wrapper(
+    repo: Path,
+    *,
+    invocation_record: Path | None = None,
+) -> None:
+    """Install the real wrapper in a fixture, optionally behind a recording shim."""
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "scripts/run_tests_parallel.py", scripts)
+    if invocation_record is None:
+        shutil.copy2(ROOT / "scripts/run_tests.sh", scripts)
+        return
+
+    shutil.copy2(ROOT / "scripts/run_tests.sh", scripts / "canonical_run_tests.sh")
+    wrapper = scripts / "run_tests.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "SCRIPT_DIR=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\n"
+        f"printf '%s\\n' \"$@\" > {str(invocation_record)!r}\n"
+        'exec "$SCRIPT_DIR/canonical_run_tests.sh" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+
+def _assert_only_wrapper_pycache(temp_root: Path) -> None:
+    """The wrapper cache is expected; sealed-worktree residue is not."""
+    assert [path.name for path in temp_root.iterdir()] == ["hermes-test-pycache"]
+    shutil.rmtree(temp_root / "hermes-test-pycache")
+
+
 def _write_workspace_lock(repo: Path, name: str, version: str) -> None:
     (repo / "package-lock.json").write_text(json.dumps({
         "name": "fixture",
@@ -92,7 +123,10 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
         "    for name in ('HERMES_PYTHON', 'PYTEST_ADDOPTS', 'PYTHON_BIN', "
         "'WORKFLOW_MERGE_GATE_FAST'):\n"
         "        assert name not in os.environ\n"
-        "    assert os.environ['WORKFLOW_LEDGER_PRESERVED_PROBE'] == 'preserved'\n"
+        "    assert 'WORKFLOW_LEDGER_PRESERVED_PROBE' not in os.environ\n"
+        "    assert os.environ['HERMES_OFFLINE'] == '1'\n"
+        "    assert os.environ['WORKFLOW_LEDGER_EXECUTION_ACTIVE'] == '1'\n"
+        "    assert os.environ['HERMES_TEST_FILE_RETRIES'] == '0'\n"
         "    assert Path(sys.executable).is_absolute()\n"
     )
     (repo / "unmanaged.txt").write_text("common\n")
@@ -115,6 +149,7 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     shutil.copy2(
         ROOT / "scripts/run_workflow_ledger_invariants.py", repo / "scripts"
     )
+    _install_python_test_wrapper(repo)
     shutil.copy2(
         ROOT / "docs/upstream-customizations/merge-evidence.schema.json",
         repo / "docs/upstream-customizations/merge-evidence.schema.json",
@@ -708,6 +743,9 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit wrapper fixture")
     output = repo / "results.json"
 
     result = subprocess.run(
@@ -748,19 +786,95 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
     assert "FIRST_ATTEMPT_STDERR_DIAGNOSTIC" not in serialized
 
 
+def test_ledger_python_invariant_uses_sealed_wrapper_with_single_attempts(
+    tmp_path: Path,
+) -> None:
+    """Python ledger attempts enter through the sealed canonical test wrapper."""
+    repo = tmp_path / "sealed-wrapper-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    invocation_record = tmp_path / "sealed-wrapper-args.txt"
+    test_path = repo / "tests/plugins/workflow/test_installed_distribution_e2e.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "import os\n"
+        "import pytest\n\n"
+        "@pytest.mark.integration\n"
+        "def test_sealed_wrapper_environment():\n"
+        "    assert 'HERMES_PYTHON' not in os.environ\n"
+        "    assert 'WORKFLOW_LEDGER_PRESERVED_PROBE' not in os.environ\n"
+        "    assert os.environ['HERMES_OFFLINE'] == '1'\n"
+        "    assert os.environ['WORKFLOW_LEDGER_EXECUTION_ACTIVE'] == '1'\n"
+        "    assert os.environ['HERMES_TEST_FILE_RETRIES'] == '0'\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": [str(test_path.relative_to(repo))]}]},
+            sort_keys=False,
+        )
+    )
+    _install_python_test_wrapper(repo, invocation_record=invocation_record)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit sealed wrapper fixture")
+    output = tmp_path / "sealed-wrapper-results.json"
+    env = os.environ.copy()
+    env["HERMES_PYTHON"] = "/caller-controlled/python"
+    env["WORKFLOW_LEDGER_PRESERVED_PROBE"] = "must be scrubbed"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+            "--timeout-seconds",
+            "30",
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation_record.read_text().splitlines() == [
+        "--workflow-ledger-single-file",
+        "tests/plugins/workflow/test_installed_distribution_e2e.py",
+        "--file-retries",
+        "0",
+        "-q",
+        "-m",
+        "integration",
+    ]
+    record = json.loads(output.read_text())[0]
+    assert [attempt["result"] for attempt in record["attempts"]] == ["passed"]
+
+
 def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) -> None:
     repo = tmp_path / "runner-cli-repo"
     repo.mkdir()
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    cache_output = tmp_path / "outside-cache.txt"
     test_path = repo / "tests/test_pass.py"
     test_path.parent.mkdir()
     test_path.write_text(
-        "import os\n"
         "from pathlib import Path\n\n"
         "def test_pass():\n"
-        "    Path(os.environ['LEDGER_CACHE_OUTPUT']).write_text('cache output')\n"
+        f"    Path({str(cache_output)!r}).write_text('cache output')\n"
         "    assert True\n"
     )
     manifest = repo / "ledger.yaml"
@@ -770,15 +884,14 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "runner fixture")
     report = tmp_path / "outside-report.json"
-    cache_output = tmp_path / "outside-cache.txt"
     temp_root = tmp_path / "sealed-temp"
     temp_root.mkdir()
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
     env = os.environ.copy()
-    env["LEDGER_CACHE_OUTPUT"] = str(cache_output)
     env["TMPDIR"] = str(temp_root)
 
     result = subprocess.run(
@@ -806,7 +919,7 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
     assert json.loads(report.read_text())[0]["result"] == "passed"
     assert cache_output.read_text() == "cache output"
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
@@ -1049,6 +1162,7 @@ def test_sealed_ledger_runner_ignores_untracked_pytest_discovery_inputs(
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit failing invariant")
     (repo / "conftest.py").write_text(
@@ -1094,7 +1208,7 @@ def test_sealed_ledger_runner_ignores_untracked_pytest_discovery_inputs(
     ]
     assert (repo / "conftest.py").is_file()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="FIFO mutation handshake requires POSIX")
@@ -1107,13 +1221,13 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    handshake = tmp_path / "mutation-handshake"
     test_path = repo / "tests/test_delayed_authority.py"
     test_path.parent.mkdir()
     test_path.write_text(
-        "import os\n"
         "from pathlib import Path\n\n"
         "def test_delayed_authority():\n"
-        "    handshake = Path(os.environ['LEDGER_MUTATION_HANDSHAKE'])\n"
+        f"    handshake = Path({str(handshake)!r})\n"
         "    first_attempt = handshake.with_suffix('.first')\n"
         "    if not first_attempt.exists():\n"
         "        first_attempt.write_text('started\\n')\n"
@@ -1133,11 +1247,11 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit failing delayed authority")
     outside = tmp_path / "outside-authority.py"
     outside.write_text("ALLOW = True\n")
-    handshake = tmp_path / "mutation-handshake"
     ready = handshake.with_suffix(".ready")
     go = handshake.with_suffix(".go")
     os.mkfifo(ready)
@@ -1146,7 +1260,6 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     temp_root = tmp_path / "runner-temp"
     temp_root.mkdir()
     env = os.environ.copy()
-    env["LEDGER_MUTATION_HANDSHAKE"] = str(handshake)
     env["TMPDIR"] = str(temp_root)
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
 
@@ -1190,7 +1303,7 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     ]
     assert authority.is_symlink()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
@@ -1846,15 +1959,19 @@ def _run_ledger_fixture(
     tmp_path: Path,
     sources: dict[str, str],
     *,
-    timeout_seconds: float = 0.4,
+    timeout_seconds: float = 2,
     output_limit_bytes: int = 2048,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
     repo = tmp_path / "ledger-fixture"
     repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
     for path, source in sources.items():
         target = repo / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(source)
+    _install_python_test_wrapper(repo)
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
@@ -1862,6 +1979,8 @@ def _run_ledger_fixture(
             sort_keys=False,
         )
     )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit ledger fixture")
     output = repo / "results.json"
     started = time.monotonic()
     result = subprocess.run(
@@ -1884,7 +2003,7 @@ def _run_ledger_fixture(
         cwd=repo,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=15,
     )
     result.elapsed_seconds = time.monotonic() - started  # type: ignore[attr-defined]
     records = json.loads(output.read_text()) if output.exists() else []
@@ -1912,7 +2031,7 @@ def test_ledger_runner_timeout_terminates_spawned_process_group(tmp_path: Path) 
                 "import subprocess\nimport sys\nimport time\n\n"
                 "def test_process_group():\n"
                 "    subprocess.Popen([sys.executable, '-c', "
-                "\"import time; from pathlib import Path; time.sleep(1); \""
+                "\"import time; from pathlib import Path; time.sleep(3); \""
                 "\"Path('escaped-child.marker').write_text('escaped')\"])\n"
                 "    time.sleep(30)\n"
             )
@@ -2560,7 +2679,7 @@ def test_ledger_runner_escalates_group_after_timeout_leader_exits(
     result, records = _run_ledger_fixture(
         tmp_path,
         {"tests/test_resistant_timeout.py": _resistant_descendant_source(signal_parent=False)},
-        timeout_seconds=0.5,
+        timeout_seconds=2,
     )
 
     assert result.returncode == 1
@@ -2603,7 +2722,7 @@ def _setsid_descendant_source(stem: str, outcome: str) -> str:
         "        \"os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
         "        f\"Path('.{child_stem}.ready').write_text("
         "f'{{os.getpid()}}:{{psutil.Process().create_time()}}'); \"\n"
-        "        f\"time.sleep(2); Path('.{child_stem}.marker').write_text('escaped'); \"\n"
+        "        f\"time.sleep(5); Path('.{child_stem}.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, \n"
         "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
@@ -2701,7 +2820,7 @@ def test_ledger_runner_reaps_setsid_descendant_after_timeout(tmp_path: Path) -> 
     result, records = _run_ledger_fixture(
         tmp_path,
         {"tests/test_setsid_timeout.py": _setsid_descendant_source("setsid-timeout", "timeout")},
-        timeout_seconds=0.5,
+        timeout_seconds=3,
     )
 
     assert result.returncode == 1
@@ -2717,9 +2836,16 @@ def test_ledger_runner_reaps_setsid_descendant_after_cancellation(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "cancelled-ledger-fixture"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
     test_path = repo / "tests/test_setsid_cancellation.py"
     test_path.parent.mkdir(parents=True)
     test_path.write_text(_setsid_descendant_source("setsid-cancellation", "cancellation"))
+    _install_python_test_wrapper(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit cancellation fixture")
     cancel_event = threading.Event()
     ready = repo / ".setsid-cancellation-1.ready"
 
