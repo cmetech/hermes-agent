@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Proposed task-level plan — awaiting independent review and user approval
+**Status:** Revised after independent review — awaiting user approval
 
 **Goal:** Make Archon timeout, retry, typed-condition, strict-reference, large Bash substitution, and missing persistent-session semantics explicit, durable, and safe while preserving exact unversioned and `hermes-legacy` behavior.
 
@@ -63,6 +63,7 @@ No task may waive RED because a neighboring task happened to add part of the beh
 - `tests/plugins/workflow/test_phase3_resolution_waits.py`
 - `tests/plugins/workflow/test_phase3_bash_substitution.py`
 - `tests/plugins/workflow/test_persistent_session_recovery.py`
+- `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 ### Principal modified modules
 
@@ -96,6 +97,7 @@ No task may waive RED because a neighboring task happened to add part of the beh
 - `apps/desktop/src/app/workflows/run-inspector.tsx`
 - `website/docs/user-guide/features/workflow-yaml-reference.md`
 - `skills/software-development/workflow-builder/references/portable-schema.md`
+- `docs/upstream-customizations/workflow-orchestration.yaml`
 
 The implementation may omit a listed modified file when tests prove it needs no change. Adding a new production module not listed here requires a concrete ownership or dependency reason recorded in the task report; it must not become speculative infrastructure.
 
@@ -106,6 +108,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 **Files:**
 
 - Create: `tests/plugins/workflow/test_phase3_language.py`
+- Create: `tests/plugins/workflow/test_phase3_code_catalog.py`
 - Modify: `plugins/workflow/language.py`
 - Modify: `plugins/workflow/models.py`
 - Modify: `plugins/workflow/language_schema.py`
@@ -151,9 +154,27 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Implement trust identity and central compatibility inventory updates without duplicating policy outside `language_schema.py`/`compat.py`.
 
+- [ ] Establish the versioned Phase 3 durable-code catalog authority.
+
+  Add bounded code metadata to the existing dependency-neutral
+  `plugins/workflow/language_schema.py` authority: stable code, public meaning,
+  area, effective profile, normalizer applicability, and whether it may appear
+  in compatibility, runtime failure, or evidence projections. Extend
+  `compatibility_code_catalog()`, doctor, and editor/API contract generation
+  from that authority. Add relationship tests proving uniqueness, bounded
+  metadata, and profile/version applicability without asserting a brittle
+  enumeration count. Later tasks must register each code in the same commit as
+  its real emitter and add a behavior path to the completeness suite; source
+  text searches do not count as emitter coverage.
+
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_doctor.py`
+
+  Expected: FAIL because v3 durable runtime/evidence code metadata and
+  behavior-linked completeness hooks do not exist.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_trust_policy.py tests/plugins/workflow/test_compat_matrix.py tests/plugins/workflow/test_doctor.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_trust_policy.py tests/plugins/workflow/test_compat_matrix.py tests/plugins/workflow/test_doctor.py`
 
   Commit: `feat(workflow): add phase 3 language normalization`
 
@@ -164,6 +185,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Create: `plugins/workflow/execution_semantics.py`
 - Create: `tests/plugins/workflow/test_phase3_execution_semantics.py`
 - Modify: `plugins/workflow/models.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/store.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/cli.py`
@@ -174,6 +196,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Test: `tests/plugins/workflow/test_api_runtime.py`
 - Test: `tests/plugins/workflow/test_scheduled_runs.py`
 - Test: `tests/plugins/workflow/test_showcase_schedule_e2e.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing round-trip tests for exact `phase3_execution_semantics` schema version 1.
 
@@ -207,9 +230,13 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Make v3 scheduler load authenticated effective semantics directly. Keep legacy `_run_execution_limits()` behavior unchanged.
 
+- [ ] Register normalization and execution-snapshot mismatch codes in the
+  Phase 3 durable-code catalog and exercise each through real load/admission or
+  resume behavior in `test_phase3_code_catalog.py`.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_execution_semantics.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_scheduled_runs.py tests/plugins/workflow/test_showcase_schedule_e2e.py tests/plugins/workflow/test_crash_recovery.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_execution_semantics.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_scheduled_runs.py tests/plugins/workflow/test_showcase_schedule_e2e.py tests/plugins/workflow/test_crash_recovery.py`
 
   Commit: `feat(workflow): seal phase 3 execution semantics`
 
@@ -225,6 +252,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Modify: `plugins/workflow/compat.py`
 - Test: `tests/plugins/workflow/test_structured_output_language.py`
 - Test: `tests/plugins/workflow/test_security_boundaries.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing table-driven lexer and identifier tests.
 
@@ -258,9 +286,13 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Scan authenticated named-script bytes and fail explicitly without generating a mutable script copy.
 
+- [ ] Register every static-reference and identifier blocker in the Phase 3
+  durable-code catalog in this commit, and extend the behavior-linked
+  completeness matrix with the real admission path for each code.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_structured_output_language.py tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_script_executor.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_structured_output_language.py tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_script_executor.py`
 
   Commit: `feat(workflow): enforce strict phase 3 references`
 
@@ -269,12 +301,14 @@ The implementation may omit a listed modified file when tests prove it needs no 
 **Files:**
 
 - Modify: `plugins/workflow/output_resolution.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/resources.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/executors/base.py`
 - Modify: `tests/plugins/workflow/test_strict_output_references.py`
 - Test: `tests/plugins/workflow/test_typed_publication.py`
 - Test: `tests/plugins/workflow/test_typed_publication_recovery.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing resolver tests for `ResolvedOutputReference(typed_value, rendered_text)`.
 
@@ -298,9 +332,12 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Thread the resolver object through `NodeExecutionContext` and scheduler caches with existing weight/count bounds.
 
+- [ ] Register the strict runtime resolver codes in the Phase 3 durable-code
+  catalog and prove each through actual resolution/integrity behavior.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_performance_bounds.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_performance_bounds.py`
 
   Commit: `feat(workflow): resolve phase 3 outputs strictly`
 
@@ -310,10 +347,12 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - Create: `plugins/workflow/conditions.py`
 - Create: `tests/plugins/workflow/test_phase3_conditions.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/schema.py`
 - Test: `tests/plugins/workflow/test_scheduler.py`
 - Test: `tests/plugins/workflow/test_parallel_scheduler.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing lexer/parser tests for exact grammar and precedence.
 
@@ -349,9 +388,12 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Dispatch v3 to the new evaluator and legacy to the unchanged current adapter.
 
+- [ ] Register every condition code in the Phase 3 durable-code catalog and
+  cover it through a real parser/evaluator/store-transition behavior path.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_conditions.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_compat_matrix.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_conditions.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_compat_matrix.py`
 
   Commit: `feat(workflow): evaluate typed phase 3 conditions`
 
@@ -360,12 +402,14 @@ The implementation may omit a listed modified file when tests prove it needs no 
 **Files:**
 
 - Create: `tests/plugins/workflow/test_phase3_resolution_waits.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/store.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/output_resolution.py`
 - Test: `tests/plugins/workflow/test_coordinator_multiprocess.py`
 - Test: `tests/plugins/workflow/test_crash_recovery.py`
 - Test: `tests/plugins/workflow/test_performance_bounds.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing store tests for the exact resolution-wait state machine.
 
@@ -389,9 +433,12 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Route only `output_reference_temporarily_unavailable` through the wait protocol. Convert every other strict resolver error to a terminal zero-attempt node failure.
 
+- [ ] Register transient and exhausted-resolution codes in the Phase 3
+  durable-code catalog and prove both through the real wait state machine.
+
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_resolution_waits.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_performance_bounds.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_resolution_waits.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_performance_bounds.py`
 
   Commit: `feat(workflow): bound phase 3 reference waits`
 
@@ -531,20 +578,83 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Commit: `feat(workflow): unify phase 3 retry accounting`
 
-## Task 10: Substitute large Bash values through verified descriptors
+## Task 10: Add generic bounded child-descriptor inheritance
+
+**Files:**
+
+- Modify: `tools/managed_process.py`
+- Modify: `tests/tools/test_managed_process.py`
+- Test: `tests/tools/test_process_registry.py`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+- Test: `tests/scripts/test_workflow_merge_gate.py`
+
+- [ ] Add failing POSIX descriptor-inheritance tests before touching the
+  workflow plugin.
+
+  Add an explicit bounded `inherited_descriptors` argument to the intended
+  `ManagedProcessTree.spawn()` contract in tests. Prove a child reads the exact
+  nominated read-only descriptor, unrelated descriptors are closed, standard
+  descriptors/duplicates/closed descriptors/over-bound lists are rejected,
+  `start_new_session` and process-tree termination remain intact, spawn failure
+  closes no caller-owned handle unexpectedly, and a non-empty request fails
+  closed on native Windows.
+
+  Run: `scripts/run_tests.sh tests/tools/test_managed_process.py tests/tools/test_process_registry.py`
+
+  Expected: FAIL because `ManagedProcessTree.spawn()` has no explicit bounded
+  descriptor contract.
+
+- [ ] Implement the smallest generic primitive.
+
+  Validate at most 64 unique descriptors above standard input/output/error,
+  pass exactly those through the POSIX process API with all other descriptors
+  closed, and preserve the existing Windows Job Object, process identity,
+  termination, escalation, resource, and reap semantics. The generic primitive
+  does not know workflow values, spills, shell syntax, or evidence.
+
+- [ ] Add a dedicated Phase 3 extension entry adjacent to the existing
+  historical `managed-process-tree` entry in
+  `docs/upstream-customizations/workflow-orchestration.yaml`.
+
+  Leave the historical entry and its expected subject intact. The new entry
+  records only the inherited-descriptor owned symbol/contract, exact tests,
+  merge guidance, `upstream_candidate: true`, removal condition, and expected
+  subject `feat(process): inherit bounded child descriptors`. Copy rather than
+  advance the existing `last_verified_upstream` identity.
+
+- [ ] Commit the generic primitive and its ledger amendment together.
+
+  Commit: `feat(process): inherit bounded child descriptors`
+
+- [ ] From the resulting clean commit, run the focused generic suite and live
+  customization gates.
+
+  Run: `scripts/run_tests.sh tests/tools/test_managed_process.py tests/tools/test_process_registry.py tests/scripts/test_workflow_merge_gate.py`
+
+  Run: `../../.venv/bin/python scripts/check_upstream_customizations.py --strict --base-ref HEAD`
+
+  Run: `scripts/test_workflow_merge_gate.sh --phase base`
+
+  Expected: PASS with the new generic seam isolated at this commit boundary.
+
+  If a gate finds a defect, fix it in a new atomic commit, rerun all three
+  commands, and hand off only a clean tree.
+
+## Task 11: Substitute large Bash values through verified descriptors
 
 **Files:**
 
 - Create: `plugins/workflow/bash_rendering.py`
 - Create: `tests/plugins/workflow/test_phase3_bash_substitution.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/resources.py`
 - Modify: `plugins/workflow/executors/bash.py`
 - Modify: `plugins/workflow/executors/base.py`
-- Modify: `tools/managed_process.py`
 - Test: `tests/plugins/workflow/test_bash_e2e.py`
 - Test: `tests/tools/test_managed_process.py`
 - Test: `tests/plugins/workflow/test_security_boundaries.py`
 - Test: `tests/plugins/workflow/test_performance_bounds.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing byte-bound and content-preservation tests using real `/bin/sh`.
 
@@ -577,34 +687,52 @@ The implementation may omit a listed modified file when tests prove it needs no 
   __HERMES_WF_SPILL_abcd=${__HERMES_WF_SPILL_abcd%x}
   ```
 
-  The sentinel preserves trailing newlines and the captured read status prevents `printf` from masking failure. In admitted unquoted and double-quoted tokens substitute `"${__HERMES_WF_SPILL_abcd}"`; inside a single-quoted token close the quote, insert the quoted expansion, and reopen it. Deduplicate identical resolved values before assigning bounded descriptors.
+  The sentinel preserves trailing newlines and the captured read status prevents
+  `printf` from masking failure. Use the exact context table:
 
-- [ ] Extend `ManagedProcessTree.spawn()` with an explicit POSIX inherited-descriptor argument.
+  | Placeholder context | Replacement |
+  |---|---|
+  | unquoted token | `"${__HERMES_WF_SPILL_abcd}"` |
+  | already double-quoted token | `${__HERMES_WF_SPILL_abcd}` |
+  | already single-quoted token | `'"${__HERMES_WF_SPILL_abcd}"'` |
+
+  Deduplicate identical resolved values before assigning bounded descriptors.
+  Real `/bin/sh` tests must compare exact argument/content identity separately
+  in all three surrounding contexts—including spaces, globs, empty strings,
+  quotes, and trailing newlines—and prove the double-quoted expansion remains
+  inside the original double-quoted word.
+
+- [ ] Consume Task 10's explicit bounded inherited-descriptor argument.
 
   Pass only spill descriptors; retain start-new-session containment; close parent descriptors after spawn; never make unrelated handles inheritable. On native Windows fail closed for large v3 values before launch and keep existing inline command construction/platform gate.
+
+- [ ] Register every Bash admission/runtime code in the Phase 3 durable-code
+  catalog and prove each through a real lexer, bound, integrity, or launch path.
 
 - [ ] Add descriptor race, failure, and evidence RED tests.
 
   Replace/unlink the pathname between materialization and spawn; attempt symlink/escape swaps; close/corrupt a descriptor; test 64/65 files and total bounds. Assert the shell reads the verified handle or fails, never the replacement. Assert exact `argv[-1]`, template/rendered SHA-256 and byte size, spill count/total/content digests, fixed descriptor manifest, no values/paths, cleanup, and legacy pathname behavior.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_bash_e2e.py tests/tools/test_managed_process.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_bash_e2e.py tests/tools/test_managed_process.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py`
 
   Expected: FAIL until consumption and process launch share descriptor authority.
 
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_bash_e2e.py tests/tools/test_managed_process.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_bash_e2e.py tests/tools/test_managed_process.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py`
 
   Commit: `feat(workflow): secure large bash substitutions`
 
-## Task 11: Classify missing isolated sessions without widening core behavior
+## Task 12: Classify missing isolated sessions without widening core behavior
 
 **Files:**
 
 - Modify: `agent/plugin_agent.py`
 - Modify: `agent/plugin_agent_worker.py`
 - Modify: `tests/agent/test_plugin_agent.py`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
 - Test: `tests/plugins/workflow/test_ai_executor.py`
+- Test: `tests/scripts/test_workflow_merge_gate.py`
 
 - [ ] Add failing parent-preflight tests for `PluginAgentSessionMissingError`.
 
@@ -630,13 +758,35 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Preserve all existing non-workflow callers and session behavior. Do not change prompts, toolsets, or history.
 
-- [ ] Run focused verification and commit.
+- [ ] Add a dedicated Phase 3 extension entry adjacent to the existing
+  historical `plugin-agent-runner` entry in the real workflow customization
+  ledger.
 
-  Run: `scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_ai_executor.py`
+  Leave the historical expected subject intact. The new entry owns only
+  `PluginAgentSessionMissingError`, parent preflight, worker
+  `persistent_session_missing` framing/correlation, and their tests. Record
+  merge guidance, `upstream_candidate: true`, removal condition, and expected
+  subject `feat(agent): classify missing plugin sessions`; copy rather than
+  advance the existing `last_verified_upstream` identity.
+
+- [ ] Run focused verification, then commit the generic classification and its
+  ledger amendment together.
+
+  Run: `scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_ai_executor.py tests/scripts/test_workflow_merge_gate.py`
 
   Commit: `feat(agent): classify missing plugin sessions`
 
-## Task 12: Recover missing cross-run sessions with a durable CAS obligation
+- [ ] From the resulting clean commit, run both live customization gates.
+
+  Run: `../../.venv/bin/python scripts/check_upstream_customizations.py --strict --base-ref HEAD`
+
+  Run: `scripts/test_workflow_merge_gate.sh --phase base`
+
+  Expected: PASS with the new generic seam isolated at this commit boundary.
+  If a gate finds a defect, fix it in a new atomic commit, rerun the focused
+  and live commands, and hand off only a clean tree.
+
+## Task 13: Recover missing cross-run sessions with a durable CAS obligation
 
 **Files:**
 
@@ -647,9 +797,11 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Modify: `plugins/workflow/store.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/evidence.py`
+- Modify: `plugins/workflow/language_schema.py`
 - Test: `tests/plugins/workflow/test_persisted_sessions.py`
 - Test: `tests/plugins/workflow/test_crash_recovery.py`
 - Test: `tests/plugins/workflow/test_coordinator_multiprocess.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing source-sensitive recovery tests.
 
@@ -658,6 +810,31 @@ The implementation may omit a listed modified file when tests prove it needs no 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py`
 
   Expected: FAIL because the AI executor cannot distinguish source or recover only confirmed absence.
+
+- [ ] Add failing pre-provider reserve, selection, and crash-order tests.
+
+  Before allocating the fresh worker, require journal reserve for the bounded
+  selection frame, possible winning registry obligation, and bounded outcome
+  frames. Append `persistent_session_missing_fresh_start` plus
+  `fresh_start_selected` through an active-claim-fenced store callback before
+  provider launch, including `provider_attempts_before_recovery: 0` and only
+  digests/bounded identifiers.
+
+  Inject crashes immediately before selection, after selection but before
+  provider launch, and just after provider launch. Prove respectively: no
+  selection evidence or provider/CAS; durable selection followed by ordinary
+  zero-effect interrupted-claim recovery with no provider/CAS; and the existing
+  unknown-outcome rules with no silent provider replay. A reserve refusal must
+  happen before allocation. No private key, session ID, fingerprint, history,
+  path, or provider content may enter journal-derived public projection.
+
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py`
+
+  Expected: FAIL because selection evidence and its complete reserve are not a
+  durable pre-provider boundary.
+
+- [ ] Implement the pre-provider reserve and active-claim selection callback
+  before fresh worker allocation.
 
 - [ ] Return a private `SessionRegistryUpdateCandidate` from successful fresh execution instead of mutating `NodeSessionRegistry` inside the executor.
 
@@ -695,17 +872,27 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Expected: FAIL until store and registry ordering is recoverably idempotent.
 
-- [ ] Add sanitized recovery evidence.
+- [ ] Complete sanitized recovery outcome evidence.
 
-  Emit selection and outcomes `fresh_start_selected`, `stale_entry_replaced`, `stale_entry_replaced_already_applied`, `newer_entry_retained`, `registry_update_deferred`, or `fresh_execution_failed`. Include attempt/generation, hashes, source, bounded provider/runtime profile, and zero-provider pre-recovery count. Exclude raw session IDs, keys, fingerprints, histories, storage paths, and provider responses.
+  Project the already-durable selection plus outcomes
+  `stale_entry_replaced`, `stale_entry_replaced_already_applied`,
+  `newer_entry_retained`, `registry_update_deferred`, or
+  `fresh_execution_failed`. Include attempt/generation, hashes, source,
+  bounded provider/runtime profile, and zero-provider pre-recovery count.
+  Exclude raw session IDs, keys, fingerprints, histories, storage paths, and
+  provider responses.
+
+- [ ] Register all missing-session selection/failure/pending codes and events
+  in the Phase 3 durable-code catalog and exercise each through a real
+  preflight, recovery, store, registry, or evidence path.
 
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py`
 
   Commit: `feat(workflow): recover missing persistent sessions`
 
-## Task 13: Project bounded Phase 3 truth through API and Desktop
+## Task 14: Project bounded Phase 3 truth through API and Desktop
 
 **Files:**
 
@@ -713,12 +900,14 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Modify: `plugins/workflow/dashboard/plugin_api.py`
 - Modify: `apps/desktop/src/types/hermes.ts`
 - Modify: `apps/desktop/src/app/workflows/run-inspector.tsx`
+- Modify: `apps/desktop/src/app/workflows/index.test.tsx`
 - Modify: `apps/desktop/src/app/workflows/review-run-dialog.test.tsx`
 - Modify: `apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx`
 - Test: `tests/plugins/workflow/test_catalog_api.py`
 - Test: `tests/plugins/workflow/test_workflow_detail_api.py`
 - Test: `tests/plugins/workflow/test_evidence_api.py`
 - Test: `tests/plugins/workflow/test_workflow_language_desktop_e2e.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 
 - [ ] Add failing backend projection tests.
 
@@ -732,11 +921,14 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Keep artifact lookup publication-ID based. Add no endpoint and no filesystem parameter. Preserve operator-scope/profile authorization and all sanitizers.
 
+  Prove API, doctor, and editor code projections derive from the versioned
+  Phase 3 durable-code authority, with no hand-maintained duplicate list.
+
 - [ ] Add failing Desktop compatibility/rendering tests.
 
-  A new renderer against a v3 backend displays backend-authored language/findings and generic persistent-session recovery evidence. A new renderer against an older backend treats missing additive fields as unavailable. An older-compatible shape ignores v3 additions. No renderer parser, retry calculator, session probe, or filesystem access is added.
+  A new renderer against a v3 backend displays backend-authored language/findings and generic persistent-session recovery evidence. In `index.test.tsx`, render `RunInspector`, select the recovery tab, assert `kind=recovery` is requested, and render `recovery_kind: persistent_session` through the generic bounded evidence view. A new renderer against an older backend treats missing additive fields as unavailable and preserves usable empty/error states. An older-compatible shape ignores v3 additions. No renderer parser, retry calculator, session probe, or filesystem access is added.
 
-  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
   Expected: FAIL on v3 and persistent-session evidence fixtures.
 
@@ -744,15 +936,15 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Run backend/Desktop verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_catalog_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_workflow_language_desktop_e2e.py tests/plugins/workflow/test_desktop_api.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_catalog_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_workflow_language_desktop_e2e.py tests/plugins/workflow/test_desktop_api.py`
 
-  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
   Run: `cd apps/desktop && npm run typecheck`
 
   Commit: `feat(workflow): expose bounded phase 3 evidence`
 
-## Task 14: Update generated contracts, operator docs, and installed flows
+## Task 15: Update generated contracts, operator docs, and installed flows
 
 **Files:**
 
@@ -762,6 +954,7 @@ The implementation may omit a listed modified file when tests prove it needs no 
 - Modify: `skills/software-development/workflow-builder/references/authoring-checklist.md` only if generated guidance requires it
 - Create: `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/progress.md`
 - Test: `tests/plugins/workflow/test_language_schema.py`
+- Test: `tests/plugins/workflow/test_phase3_code_catalog.py`
 - Test: `tests/plugins/workflow/test_portable_compatibility_e2e.py`
 - Test: `tests/plugins/workflow/test_installed_distribution_e2e.py`
 - Test: `tests/agent/test_workflow_builder_skill.py`
@@ -769,9 +962,9 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Add failing generated-contract and documentation assertions.
 
-  Generated field metadata must describe millisecond units, 120,000 ms omission, AI/deterministic retry defaults, retries-after-initial, direct dependencies, strict types/errors, safe Bash contexts/bounds, and missing-session recovery. It must keep MCP/skills as options and loops/includes as Phase 4.
+  Generated field metadata must describe millisecond units, 120,000 ms omission, AI/deterministic retry defaults, retries-after-initial, direct dependencies, strict types/errors, safe Bash contexts/bounds, and missing-session recovery. Public stable-code documentation must derive from the registered catalog and the completeness test must pair every registered code with a real behavior path; do not maintain a second prose-only list. It must keep MCP/skills as options and loops/includes as Phase 4.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/agent/test_workflow_builder_skill.py tests/skills/test_workflow_operator_behavior.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_language_schema.py tests/agent/test_workflow_builder_skill.py tests/skills/test_workflow_operator_behavior.py`
 
   Expected: FAIL because generated/editor/author guidance still reflects Phase 2 blockers.
 
@@ -791,34 +984,27 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
 - [ ] Run focused verification and commit.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_portable_compatibility_e2e.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py tests/agent/test_workflow_builder_skill.py tests/skills/test_workflow_operator_behavior.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_portable_compatibility_e2e.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py tests/agent/test_workflow_builder_skill.py tests/skills/test_workflow_operator_behavior.py`
 
   Commit: `docs(workflow): publish phase 3 language contract`
 
-## Task 15: Complete final regression, review, and customization gates
+## Task 16: Complete final regression, review, and customization gates
 
 **Files:**
 
-- Modify only when a verified gate requires it: `docs/upstream-customizations.json`
-- Modify only when a verified gate requires it: `.github/workflows/upstream-merge.yml`
-- Create: `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-15-report.md`
+- Modify only when a verified gate proves an intentional ledger correction is required: `docs/upstream-customizations/workflow-orchestration.yaml`
+- Modify only when a verified gate proves selection/harness changes are required: `scripts/test_workflow_merge_gate.sh`
+- Modify only when a verified rehearsal defect requires it: `scripts/test_workflow_upstream_merge.sh`
+- Create: `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-16-report.md`
 - Create: independent final specification and quality review reports in the same SDD directory
 - Test: `tests/scripts/test_check_upstream_customizations.py`
 - Test: `tests/scripts/test_workflow_merge_gate.py`
 - Test: `tests/scripts/test_workflow_upstream_merge.py`
 - Test: `tests/test_desktop_workflow_test_gate.py`
 
-- [ ] Run one final independent specification review over the complete Phase 3 diff.
+- [ ] First bring every focused Phase 3 test green with retries disabled for evidence.
 
-  Review goal-backward against the umbrella design, approved Phase 3 design, and every plan task. Require exact legacy behavior, no Phase 4/5, all stable failure/evidence contracts, all admission boundaries, and every requested workstream. Route findings through the bounded fix protocol.
-
-- [ ] Run one separate independent quality review over the complete Phase 3 diff.
-
-  Inspect correctness, concurrency, crash consistency, descriptor safety, shell injection, bounds, privacy, API authorization, prompt caching, alternation, maintainability, and test quality. Route findings through the bounded fix protocol and obtain a clean rereview.
-
-- [ ] Run every Phase 3 focused Python test together with retries disabled for evidence.
-
-  Run: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_phase3_execution_semantics.py tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_phase3_conditions.py tests/plugins/workflow/test_phase3_resolution_waits.py tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_persistent_session_recovery.py tests/agent/test_plugin_agent.py`
+  Run: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_phase3_execution_semantics.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_phase3_conditions.py tests/plugins/workflow/test_phase3_resolution_waits.py tests/plugins/workflow/test_phase3_bash_substitution.py tests/plugins/workflow/test_persistent_session_recovery.py tests/agent/test_plugin_agent.py`
 
   Expected: PASS with zero failed files and no flaky retry.
 
@@ -826,33 +1012,97 @@ The implementation may omit a listed modified file when tests prove it needs no 
 
   Run: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`
 
-  Expected: PASS with zero failures and no flaky retry. Record exact file/test/pass/skip counts and raw-log SHA-256 in the Task 15 report.
+  Expected: PASS with zero failures and no flaky retry. Record exact
+  file/test/pass/skip counts and raw-log SHA-256 in the Task 16 report.
 
 - [ ] Run scoped Desktop gates without rewriting unrelated files.
 
   Run: `cd apps/desktop && npm run typecheck`
 
-  Run: `cd apps/desktop && npm test -- src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  Run: `cd apps/desktop && npm test -- src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
 
-  Run scoped ESLint and Prettier commands only over files changed by Phase 3, using the package's existing scripts/binaries. Record the established 20 unrelated full-Desktop Prettier failures as baseline; do not edit those files.
+  Run: `cd apps/desktop && npx eslint src/types/hermes.ts src/app/workflows/run-inspector.tsx src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+
+  Run: `cd apps/desktop && npx prettier --check src/types/hermes.ts src/app/workflows/run-inspector.tsx src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+
+  These commands do not write files. Record the established 20 unrelated
+  full-Desktop Prettier failures as baseline; do not edit those files.
 
 - [ ] Run schema, installed-distribution, merge-gate, and customization checks.
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/scripts/test_check_upstream_customizations.py tests/scripts/test_workflow_merge_gate.py tests/scripts/test_workflow_upstream_merge.py tests/test_desktop_workflow_test_gate.py`
 
-  Expected: PASS. Update `docs/upstream-customizations.json` only if generic seam changes are required by its established ledger contract.
+  Run: `../../.venv/bin/python scripts/check_upstream_customizations.py --strict --base-ref HEAD`
 
-- [ ] Rehearse upstream/OTTO/LOOP24 integration against the pinned refs required by the existing workflow merge-gate scripts.
+  Run: `scripts/test_workflow_merge_gate.sh --phase base`
 
-  Use temporary branches/worktrees or the repository rehearsal harness. Do not touch literal `main`, push, publish, or propagate brands. Record executable invariant counts, reference counts, failures, flakes, and exact refs.
+  Expected: PASS. The live strict checker and base merge gate validate the
+  candidate HEAD; harness unit tests are additional evidence, not substitutes.
+  Do not edit the ledger merely to silence a failure.
+
+- [ ] Resolve exact refs and rehearse upstream/OTTO/LOOP24 integration.
+
+  Run:
+
+  ```bash
+  git fetch origin --prune
+  scripts/test_workflow_upstream_merge.sh \
+    --upstream-ref origin/main \
+    --base-ref HEAD \
+    --brand-ref otto \
+    --brand-ref loop24
+  ```
+
+  Record the resolved 40-hex identities before invocation, plus executable
+  invariant/reference counts, failures, flakes, and temporary-worktree cleanup.
+  Reading `origin/main` as the synchronization input does not authorize
+  switching to or mutating literal `main`; do not push, publish, or propagate
+  brand refs.
+
+- [ ] If any gate above requires a production, test, harness, or ledger fix,
+  apply the bounded review/fix protocol, commit it atomically, and rerun every
+  final gate whose evidence that change invalidated. Do not start final reviews
+  until the complete candidate is green and the worktree is clean.
+
+- [ ] Record the exact green candidate HEAD and tree, then run one independent
+  final specification review against those identities.
+
+  Review goal-backward against the umbrella design, approved Phase 3 design,
+  and every plan task. Require exact legacy behavior, no Phase 4/5, all stable
+  failure/evidence contracts, all admission boundaries, and every requested
+  workstream.
+
+- [ ] Run one separate independent quality review against the same exact HEAD
+  and tree.
+
+  Inspect correctness, concurrency, crash consistency, descriptor safety,
+  shell injection, bounds, privacy, API authorization, prompt caching,
+  alternation, maintainability, and test quality.
+
+- [ ] Converge reviews and gates on one production tree.
+
+  If either review causes any production/test/harness/ledger fix, commit it
+  atomically, rerun the affected focused checks plus every final gate whose
+  evidence changed, record the new exact HEAD/tree, and obtain clean
+  specification and quality rereviews of that new identity. Up to three
+  bounded rounds are already authorized. Stop rather than waive a remaining
+  finding or failing invariant.
 
 - [ ] Perform final controller verification.
 
-  Verify the feature branch, HEAD, tree, clean worktree, atomic commit series, review closure, test evidence hashes, absence of production edits after final verification, and preservation of the shared base checkout's user-owned changes.
+  Verify the feature branch, final reviewed production HEAD/tree, report-only
+  HEAD/tree if different, clean worktree, atomic commit series, 0-finding review
+  closure, test evidence hashes, no production path differing from the last
+  clean-rereview tree, and preservation of the shared base checkout's
+  user-owned changes.
 
-- [ ] Commit only retained reports/ledger changes from this task.
+- [ ] Commit only retained report artifacts after convergence.
 
-  Commit: `test(workflow): verify phase 3 compatibility`
+  Do not defer ledger changes to this report commit; Tasks 10 and 12 own their
+  generic-seam ledger entries at the same implementation boundaries. Record
+  both the final reviewed production identity and this report-only identity.
+
+  Commit: `docs(workflow): record phase 3 verification`
 
 ## Completion handoff
 
