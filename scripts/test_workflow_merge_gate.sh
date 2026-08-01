@@ -53,6 +53,18 @@ case "$PYTHON_BIN" in
 esac
 [[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
+_matches_invocation_dependency_identity() {
+  local relative target_blob invocation_blob
+  for relative in "$@"; do
+    git -C "$ROOT" diff --quiet HEAD -- "$relative" || return 1
+    git -C "$INVOCATION_ROOT" diff --quiet HEAD -- "$relative" || return 1
+    target_blob="$(git -C "$ROOT" rev-parse "HEAD:$relative" 2>/dev/null)" || return 1
+    invocation_blob="$(git -C "$INVOCATION_ROOT" rev-parse \
+      "HEAD:$relative" 2>/dev/null)" || return 1
+    [[ "$target_blob" == "$invocation_blob" ]] || return 1
+  done
+}
+
 _require_root_dependencies() {
   local shared_git_dir shared_root invocation_git_dir invocation_modules
   local resolved_modules node_bin actual_versions
@@ -64,7 +76,8 @@ _require_root_dependencies() {
   if [[ "$invocation_git_dir" == "$shared_git_dir" &&
         "$INVOCATION_ROOT" != "$ROOT" &&
         -d "$INVOCATION_ROOT/node_modules" &&
-        ! -L "$INVOCATION_ROOT/node_modules" ]]; then
+        ! -L "$INVOCATION_ROOT/node_modules" ]] &&
+      _matches_invocation_dependency_identity package.json package-lock.json; then
     invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
   fi
   if [[ -L "$ROOT/node_modules" && ! -e "$ROOT/node_modules" ]]; then
@@ -187,6 +200,22 @@ _require_root_dependencies() {
   }
 }
 
+_provision_desktop_dependency_view() {
+  local source="$1" target="$ROOT/apps/desktop/node_modules" entry name
+  mkdir "$target" || return 1
+  while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    case "$name" in
+      .vite|.vite-temp|.cache)
+        mkdir "$target/$name" || return 1
+        ;;
+      *)
+        ln -s "$entry" "$target/$name" || return 1
+        ;;
+    esac
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+}
+
 cd "$ROOT"
 if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "tracked working tree is dirty; refusing to seal TESTED_BASE_SHA" >&2
@@ -256,7 +285,28 @@ if [[ "$PHASE" == "base" ]]; then
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then
       ln -s "$SHARED_ROOT/node_modules" node_modules
     fi
-    if [[ ! -d apps/desktop/node_modules && -d "$SHARED_ROOT/apps/desktop/node_modules" ]]; then
+    INVOCATION_GIT_DIR="$(git -C "$INVOCATION_ROOT" rev-parse \
+      --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    INVOCATION_DESKTOP_MODULES=""
+    if [[ "$INVOCATION_GIT_DIR" == "$SHARED_GIT_DIR" &&
+          "$INVOCATION_ROOT" != "$ROOT" &&
+          -d "$INVOCATION_ROOT/apps/desktop/node_modules" &&
+          ! -L "$INVOCATION_ROOT/apps/desktop/node_modules" ]] &&
+        _matches_invocation_dependency_identity \
+          package-lock.json apps/desktop/package.json; then
+      INVOCATION_DESKTOP_MODULES="$(cd \
+        "$INVOCATION_ROOT/apps/desktop/node_modules" && pwd -P)"
+    fi
+    if [[ -L apps/desktop/node_modules && ! -e apps/desktop/node_modules ]]; then
+      echo "desktop dependencies contain a dangling local dependency link" >&2
+      exit 1
+    fi
+    if [[ ! -e apps/desktop/node_modules && -n "$INVOCATION_DESKTOP_MODULES" ]]; then
+      _provision_desktop_dependency_view "$INVOCATION_DESKTOP_MODULES" || {
+        echo "desktop dependencies could not create the bounded dependency view" >&2
+        exit 1
+      }
+    elif [[ ! -e apps/desktop/node_modules && -d "$SHARED_ROOT/apps/desktop/node_modules" ]]; then
       ln -s "$SHARED_ROOT/apps/desktop/node_modules" apps/desktop/node_modules
     fi
     [[ -d node_modules ]] || {
