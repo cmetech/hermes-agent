@@ -85,6 +85,21 @@ PARSER_VERSIONS = {
 }
 
 
+def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
+    packages: dict[str, object] = {"": {"name": name}}
+    packages.update(
+        {
+            f"node_modules/{package}": {"version": version}
+            for package, version in PARSER_VERSIONS.items()
+        }
+    )
+    return {
+        "name": name,
+        "lockfileVersion": 3,
+        "packages": packages,
+    }
+
+
 def _write_parser_dependencies(root: Path) -> None:
     for package, version in PARSER_VERSIONS.items():
         package_dir = root / "node_modules" / package
@@ -402,7 +417,7 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'base'\n")
     (repo / "package.json").write_text('{"name":"gate-fixture"}\n')
     (repo / "package-lock.json").write_text(
-        '{"name":"gate-fixture","lockfileVersion":3,"packages":{}}\n'
+        f"{json.dumps(_parser_package_lock())}\n"
     )
     (repo / "apps/desktop/package.json").write_text(
         '{"name":"gate-desktop-fixture"}\n'
@@ -445,6 +460,29 @@ def _sibling_invocation_checkouts(
         )
     shutil.rmtree(shared_root / "node_modules")
     return shared_root, invocation, detached, base
+
+
+def _brand_parser_checkouts(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    shared_root, invocation, brand, base = _sibling_invocation_checkouts(tmp_path)
+    _write_parser_dependencies(invocation)
+    (brand / "package.json").write_text('{"name":"otto-gate-fixture"}\n')
+    (brand / "package-lock.json").write_text(
+        f"{json.dumps(_parser_package_lock('otto-gate-fixture'))}\n"
+    )
+    subprocess.run(
+        ["git", "add", "package.json", "package-lock.json"],
+        cwd=brand,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "generate brand metadata"],
+        cwd=brand,
+        check=True,
+        capture_output=True,
+    )
+    return shared_root, invocation, brand, base
 
 
 def _run_gate_with_marker(
@@ -533,6 +571,130 @@ def test_gate_provisions_parser_dependencies_from_sibling_invocation_worktree(
     assert (detached / "node_modules").resolve() == (
         invocation / "node_modules"
     ).resolve()
+
+
+def _run_brand_parser_gate(
+    brand: Path,
+    invocation: Path,
+    base: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            GATE,
+            "--repo",
+            brand,
+            "--phase",
+            "brand",
+            "--brand",
+            "otto",
+            "--tested-base-sha",
+            base,
+        ],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "WORKFLOW_MERGE_GATE_FAST": "1"},
+    )
+
+
+def test_brand_gate_reuses_parser_dependencies_across_brand_metadata(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 0, result.stderr
+    assert (brand / "node_modules").is_symlink()
+    assert (brand / "node_modules").resolve() == (invocation / "node_modules").resolve()
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "version-mismatch",
+        "missing-entry",
+        "duplicate-entry",
+        "malformed-entry",
+        "dirty-brand-lock",
+        "dirty-source-lock",
+    ],
+)
+def test_brand_gate_rejects_unsealed_or_mismatched_parser_lock_entries(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+    target = brand / "package-lock.json"
+    payload = _parser_package_lock("otto-gate-fixture")
+    packages = payload["packages"]
+    assert isinstance(packages, dict)
+    if malformation == "version-mismatch":
+        packages["node_modules/typescript"] = {"version": "0.0.0"}
+    elif malformation == "missing-entry":
+        packages.pop("node_modules/typescript")
+    elif malformation == "malformed-entry":
+        packages["node_modules/typescript"] = {"version": 603}
+    elif malformation == "duplicate-entry":
+        entry = '"node_modules/typescript":{"version":"6.0.3"}'
+        serialized = json.dumps(payload, separators=(",", ":"))
+        serialized = serialized.replace(entry, f"{entry},{entry}", 1)
+        target.write_text(f"{serialized}\n")
+    elif malformation == "dirty-brand-lock":
+        payload["name"] = "dirty-brand-lock"
+    elif malformation == "dirty-source-lock":
+        target = invocation / "package-lock.json"
+        target.write_text(f"{json.dumps(_parser_package_lock('dirty-source'))}\n")
+    if malformation not in {"duplicate-entry", "dirty-source-lock"}:
+        target.write_text(f"{json.dumps(payload)}\n")
+    if not malformation.startswith("dirty-"):
+        subprocess.run(
+            ["git", "add", "package-lock.json"],
+            cwd=brand,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"malform lock: {malformation}"],
+            cwd=brand,
+            check=True,
+            capture_output=True,
+        )
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+
+
+def test_brand_gate_rejects_parser_dependencies_from_different_repository(
+    tmp_path: Path,
+) -> None:
+    _shared_root, _invocation, brand, base = _brand_parser_checkouts(
+        tmp_path / "target"
+    )
+    unrelated, _unrelated_base = _brand_repo(tmp_path / "unrelated")
+
+    result = _run_brand_parser_gate(brand, unrelated, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+
+
+def test_brand_gate_rejects_escaping_parser_dependency_symlink(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+    outside = tmp_path / "outside-brand-parser-dependencies"
+    _write_parser_dependencies(outside)
+    shutil.rmtree(invocation / "node_modules")
+    (invocation / "node_modules").symlink_to(
+        outside / "node_modules", target_is_directory=True
+    )
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
 
 
 def test_gate_rejects_invocation_dependencies_from_different_repository(

@@ -68,6 +68,63 @@ _matches_invocation_dependency_identity() {
   done
 }
 
+_matches_brand_parser_lock_identity() {
+  "$PYTHON_BIN" - "$ROOT" "$INVOCATION_ROOT" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+expected = {
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0",
+    "micromark": "4.0.2",
+}
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate lock key: {key}")
+        result[key] = value
+    return result
+
+
+def parser_versions(repo):
+    subprocess.run(
+        ["git", "-C", repo, "diff", "--quiet", "HEAD", "--", "package-lock.json"],
+        check=True,
+    )
+    raw = subprocess.check_output(
+        ["git", "-C", repo, "show", "HEAD:package-lock.json"]
+    )
+    lock = json.loads(raw, object_pairs_hook=unique_object)
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        raise ValueError("lock packages must be an object")
+    versions = {}
+    for name in expected:
+        entry = packages.get(f"node_modules/{name}")
+        if not isinstance(entry, dict):
+            raise ValueError(f"missing or malformed parser lock entry: {name}")
+        version = entry.get("version")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"missing or malformed parser lock version: {name}")
+        versions[name] = version
+    return versions
+
+
+try:
+    target = parser_versions(Path(sys.argv[1]))
+    invocation = parser_versions(Path(sys.argv[2]))
+except (json.JSONDecodeError, OSError, subprocess.SubprocessError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if target == invocation == expected else 1)
+PY
+}
+
 _validated_invocation_desktop_source() {
   local target_git_dir invocation_git_dir source
   target_git_dir="$(git -C "$ROOT" rev-parse \
@@ -96,9 +153,13 @@ _require_root_dependencies() {
   if [[ "$invocation_git_dir" == "$shared_git_dir" &&
         "$INVOCATION_ROOT" != "$ROOT" &&
         -d "$INVOCATION_ROOT/node_modules" &&
-        ! -L "$INVOCATION_ROOT/node_modules" ]] &&
-      _matches_invocation_dependency_identity package.json package-lock.json; then
-    invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+        ! -L "$INVOCATION_ROOT/node_modules" ]]; then
+    if [[ "$PHASE" == "base" ]] &&
+        _matches_invocation_dependency_identity package.json package-lock.json; then
+      invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+    elif [[ "$PHASE" == "brand" ]] && _matches_brand_parser_lock_identity; then
+      invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+    fi
   fi
   if [[ -L "$ROOT/node_modules" && ! -e "$ROOT/node_modules" ]]; then
     echo "root parser dependencies contain a dangling local dependency link" >&2
