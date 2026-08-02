@@ -13,8 +13,11 @@ from types import MappingProxyType
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow import output_resolution
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.models import (
     RunExecutionLimits,
@@ -22,6 +25,10 @@ from plugins.workflow.models import (
     WorkflowValidationError,
 )
 from plugins.workflow.output_resolution import PrimaryOutputCandidate, ResolvedNodeOutput
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    execution_capability_context,
+)
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import ArtifactRef, NodeClaim, RunStore
@@ -952,6 +959,226 @@ def test_legacy_output_scanning_and_parsing_order_remains_unchanged(tmp_path):
 
     assert outputs == {"collect": "legacy-last"}
     assert json.loads(first.read_text()) == {"value": 1}
+
+
+class _RecordingSchedulerRunner:
+    def __init__(
+        self,
+        response: str = "done",
+        *,
+        declaration_source: str = "default_prompt_adapter",
+    ) -> None:
+        self.response = response
+        self.declaration_source = declaration_source
+        self.requests = []
+
+    def run(self, request, **_kwargs):
+        self.requests.append(request)
+        structured = None
+        audit = {}
+        if request.structured_output is not None:
+            structured = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": self.declaration_source,
+            }
+            audit = {
+                **structured,
+                "api_calls": 1,
+                "api_mode": "chat_completions",
+            }
+        return PluginAgentRunResult(
+            final_response=self.response,
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit=audit,
+            structured_output=structured,
+        )
+
+
+def _start_archon_scheduler_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    name: str,
+    nodes: list[dict[str, object]],
+    commands: dict[str, str] | None = None,
+):
+    root = tmp_path / name
+    workflow = workflow_writer(
+        root / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=nodes,
+    )
+    if commands:
+        directory = root / "commands"
+        directory.mkdir()
+        for command_name, body in commands.items():
+            (directory / f"{command_name}.md").write_text(body, encoding="utf-8")
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="fake-provider",
+            model="fake-model",
+        ),
+    )
+    store = RunStore(tmp_path / f"home-{name}")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    decisions = execution_context.structured_output_decisions(package)
+    return (
+        store,
+        admitted.run_id,
+        {node_id: decision.declaration_source for node_id, decision in decisions.items()},
+    )
+
+
+@pytest.mark.parametrize("producer_kind", ("bash", "script"))
+@pytest.mark.parametrize(
+    "text",
+    ('{"answer":42}', '["answer"]', "42", "true", "null"),
+)
+def test_v3_real_deterministic_producer_preserves_schemaless_json_text(
+    tmp_path,
+    workflow_writer,
+    producer_kind: str,
+    text: str,
+) -> None:
+    producer = {
+        "id": "producer",
+        producer_kind: (
+            f"printf '%s' '{text}'"
+            if producer_kind == "bash"
+            else f"print({text!r})"
+        ),
+    }
+    if producer_kind == "script":
+        producer["runtime"] = "uv"
+    name = f"strict-{producer_kind}-{hashlib.sha256(text.encode()).hexdigest()[:8]}"
+    store, run_id, _declaration_sources = _start_archon_scheduler_run(
+        tmp_path,
+        workflow_writer,
+        name=name,
+        nodes=[
+            producer,
+            {
+                "id": "consumer",
+                "prompt": "consume [$producer.output]",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    runner = _RecordingSchedulerRunner()
+    scheduler = RunScheduler(store, agent_runner=runner)
+
+    try:
+        result = scheduler.advance(run_id, max_nodes=10)
+        outputs = scheduler._output_values(result, store.run_directory(run_id))
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    assert [request.prompt for request in runner.requests] == [f"consume [{text}]"]
+    resolved = outputs["producer"]
+    assert isinstance(resolved, output_resolution.ResolvedNodeOutput)
+    assert resolved.value == text
+    assert resolved.text == text
+    assert resolved.schema_fingerprint is None
+
+
+@pytest.mark.parametrize("surface", ("prompt", "command"))
+def test_v3_scheduler_keeps_ai_reference_failure_terminal_before_provider(
+    tmp_path,
+    workflow_writer,
+    surface: str,
+) -> None:
+    consumer = {
+        "id": "consumer",
+        surface: (
+            "consume" if surface == "command" else "Use $producer.output.missing"
+        ),
+        "depends_on": ["producer"],
+        "retry": {"max_attempts": 2, "on_error": "all", "delay_ms": 1000},
+    }
+    commands = (
+        {"consume": "Use $producer.output.missing\n"}
+        if surface == "command"
+        else None
+    )
+    store, run_id, declaration_sources = _start_archon_scheduler_run(
+        tmp_path,
+        workflow_writer,
+        name=f"terminal-reference-{surface}",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {
+                        "present": {"type": "string"},
+                        "missing": {"type": "string"},
+                    },
+                },
+            },
+            consumer,
+        ],
+        commands=commands,
+    )
+    runner = _RecordingSchedulerRunner(
+        '{"present":"ready"}',
+        declaration_source=declaration_sources["producer"],
+    )
+    scheduler = RunScheduler(store, agent_runner=runner)
+
+    try:
+        result = scheduler.advance(run_id, max_nodes=10)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    producer_state = result["nodes"]["producer"]
+    assert producer_state["state"] == "succeeded", producer_state
+    state = result["nodes"]["consumer"]
+    attempt = state["attempts"][0]
+    assert result["status"] == "failed"
+    assert state["state"] == "failed"
+    assert state["retry_consumed"] == 1
+    assert len(state["attempts"]) == 1
+    assert attempt["error_code"] == "output_reference_field_missing"
+    assert attempt["metadata"]["archon_terminal_failure"] is True
+    assert attempt["metadata"]["additional_provider_attempts"] == 0
+    assert [request.prompt for request in runner.requests] == ["Produce"]
+    assert result["last_error"]["code"] == "output_reference_field_missing"
 
 
 class _PackageValidationRunnerTrap:

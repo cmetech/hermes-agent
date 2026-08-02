@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import hashlib
 import json
@@ -1099,6 +1100,79 @@ def test_v3_node_resolution_keeps_json_looking_schemaless_bytes_as_text(
     assert reference.rendered_text == canonical.decode("utf-8")
 
 
+@pytest.mark.parametrize(
+    "text",
+    ('{"answer":42}', '["answer"]', "42", "true", "null"),
+)
+def test_v3_candidate_less_node_resolution_keeps_schemaless_bytes_as_text(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    canonical = text.encode("utf-8")
+    path = tmp_path / "stdout.txt"
+    path.write_bytes(canonical)
+    descriptor = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "relative_path": "stdout.txt",
+        "media_type": "application/json",
+        "size_bytes": len(canonical),
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+    resolved = output_resolution.resolve_node_output(
+        run_directory=tmp_path,
+        node_id="producer",
+        attempt_id="attempt-winner",
+        descriptor=descriptor,
+        strict=True,
+    )
+    reference = output_resolution.resolve_output_reference(
+        resolved, node_id="producer"
+    )
+
+    assert reference.typed_value == text
+    assert reference.rendered_text == text
+    assert resolved.schema_fingerprint is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        ('{"answer":42}', {"answer": 42}),
+        ('["answer"]', ("answer",)),
+        ("42", 42),
+        ("true", True),
+        ("null", None),
+    ),
+)
+def test_v2_candidate_less_node_resolution_retains_json_reparse_adapter(
+    tmp_path: Path,
+    text: str,
+    expected: object,
+) -> None:
+    canonical = text.encode("utf-8")
+    path = tmp_path / "stdout.txt"
+    path.write_bytes(canonical)
+
+    resolved = output_resolution.resolve_node_output(
+        run_directory=tmp_path,
+        node_id="producer",
+        attempt_id="attempt-winner",
+        descriptor={
+            "node_id": "producer",
+            "attempt_id": "attempt-winner",
+            "relative_path": "stdout.txt",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        },
+        strict=False,
+    )
+
+    assert resolved.value == expected
+
+
 def test_v3_resolver_traverses_exact_mapping_keys_and_canonical_indexes() -> None:
     output = _resolved_output(
         {"items": [{"count": 3}], "01": "mapping-key", "zero": ["first"]}
@@ -1216,6 +1290,195 @@ def test_v3_resolver_requires_publication_path_and_full_schema_identity(
         )
 
     assert exc.value.code == "output_reference_integrity"
+
+
+def _strict_publication_projection(tmp_path: Path) -> dict[str, object]:
+    canonical = b'{"answer":"ready"}'
+    publication_id = "a" * 32
+    content = tmp_path / "publications" / publication_id / "content.json"
+    content.parent.mkdir(parents=True)
+    content.write_bytes(canonical)
+    digest = hashlib.sha256(canonical).hexdigest()
+    normalized_schema = normalize_schema({"type": "object"})
+    schema_fingerprint = normalized_schema.schema_fingerprint
+    candidate = {
+        "attempt_relative_path": "nodes/producer/attempt-winner/output.json",
+        "media_type": "application/json",
+        "size_bytes": len(canonical),
+        "sha256": digest,
+        "schema_fingerprint": schema_fingerprint,
+        "canonicalization_version": 1,
+        "output_type": "Answer",
+    }
+    return {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 3,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {
+                "producer": {
+                    "canonical_schema": dict(normalized_schema.canonical_schema),
+                    "schema_fingerprint": schema_fingerprint,
+                    "canonicalization_version": 1,
+                }
+            },
+            "node_semantics": {},
+        },
+        "nodes": {
+            "producer": {
+                "type": "prompt",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                    "metadata": {"primary_output_candidate": candidate},
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "producer",
+            "attempt_id": "attempt-winner",
+            "relative_path": candidate["attempt_relative_path"],
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": digest,
+            "publication_id": publication_id,
+            "content_name": "content.json",
+            "schema_fingerprint": schema_fingerprint,
+            "canonicalization_version": 1,
+            "output_type": "Answer",
+        }],
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "publication_id",
+        "content_name",
+        "schema_fingerprint",
+        "canonicalization_version",
+        "output_type",
+    ),
+)
+def test_v3_strict_publication_requires_complete_descriptor_identity(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    projection = _strict_publication_projection(tmp_path)
+    descriptor = projection["artifacts"][0]
+    publication_id = descriptor["publication_id"]
+    descriptor.pop(missing_field)
+    candidate = output_resolution.primary_output_candidate_from_identity(
+        projection["nodes"]["producer"]["attempts"][0]["metadata"][
+            "primary_output_candidate"
+        ]
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        output_resolution.resolve_node_output(
+            run_directory=tmp_path,
+            node_id="producer",
+            attempt_id="attempt-winner",
+            descriptor=descriptor,
+            candidate=candidate,
+            publication_id=publication_id,
+            strict=True,
+        )
+
+    assert exc.value.code == "output_reference_integrity"
+
+
+def test_v3_schemaless_publication_accepts_complete_identity_without_candidate(
+    tmp_path: Path,
+) -> None:
+    canonical = b"approved"
+    publication_id = "a" * 32
+    content = tmp_path / "publications" / publication_id / "content.md"
+    content.parent.mkdir(parents=True)
+    content.write_bytes(canonical)
+
+    resolved = output_resolution.resolve_node_output(
+        run_directory=tmp_path,
+        node_id="review",
+        attempt_id="attempt-winner",
+        descriptor={
+            "node_id": "review",
+            "attempt_id": "attempt-winner",
+            "relative_path": "nodes/review/attempt-winner/output.md",
+            "media_type": "text/markdown; charset=utf-8",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "publication_id": publication_id,
+            "content_name": "content.md",
+            "schema_fingerprint": None,
+            "canonicalization_version": 1,
+            "output_type": "ApprovalDecision",
+        },
+        publication_id=publication_id,
+        strict=True,
+    )
+
+    assert resolved.value == "approved"
+    assert resolved.text == "approved"
+    assert resolved.schema_fingerprint is None
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("content_name", "content.md"),
+        ("schema_fingerprint", "4" * 64),
+        ("canonicalization_version", 2),
+        ("output_type", "ChangedAnswer"),
+    ),
+)
+def test_v3_warm_cache_revalidates_every_publication_descriptor_identity_field(
+    tmp_path: Path,
+    field: str,
+    changed: object,
+) -> None:
+    projection = _strict_publication_projection(tmp_path)
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    first = scheduler._output_values(projection, tmp_path)["producer"]
+    drifted = copy.deepcopy(projection)
+    drifted["artifacts"][0][field] = changed
+    second = scheduler._output_values(drifted, tmp_path)["producer"]
+
+    assert isinstance(first, output_resolution.ResolvedNodeOutput)
+    assert isinstance(second, output_resolution.WorkflowOutputReferenceError)
+    assert second.code == "output_reference_integrity"
+
+
+def test_v3_missing_winning_candidate_descriptor_is_integrity_not_missing(
+    tmp_path: Path,
+) -> None:
+    projection = _strict_publication_projection(tmp_path)
+    projection["artifacts"] = []
+
+    output = RunScheduler.__new__(RunScheduler)._output_values(projection, tmp_path)
+
+    assert isinstance(output["producer"], output_resolution.WorkflowOutputReferenceError)
+    assert output["producer"].code == "output_reference_integrity"
+
+
+def test_v3_integrity_failure_does_not_poison_good_publication_cache(
+    tmp_path: Path,
+) -> None:
+    good = _strict_publication_projection(tmp_path)
+    bad = copy.deepcopy(good)
+    bad["artifacts"][0]["content_name"] = "content.md"
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    rejected = scheduler._output_values(bad, tmp_path)["producer"]
+    resolved = scheduler._output_values(good, tmp_path)["producer"]
+
+    assert isinstance(rejected, output_resolution.WorkflowOutputReferenceError)
+    assert rejected.code == "output_reference_integrity"
+    assert isinstance(resolved, output_resolution.ResolvedNodeOutput)
+    assert resolved.value == {"answer": "ready"}
 
 
 def test_v3_scheduler_rejects_ambiguous_successful_winning_attempts(

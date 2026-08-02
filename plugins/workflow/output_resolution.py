@@ -602,6 +602,36 @@ def _resolve_node_output(
         raise ArchonOutputIntegrityError("Archon output publication identity changed")
     read_relative_path = relative_path
     if strict and publication_id is not None:
+        descriptor_schema = descriptor.get("schema_fingerprint")
+        descriptor_version = descriptor.get("canonicalization_version")
+        descriptor_output_type = descriptor.get("output_type")
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+            or not {
+                "publication_id",
+                "content_name",
+                "schema_fingerprint",
+                "canonicalization_version",
+                "output_type",
+            }.issubset(descriptor)
+            or descriptor_publication_id != publication_id
+            or (
+                descriptor_schema is not None
+                and (
+                    not isinstance(descriptor_schema, str)
+                    or _SHA256.fullmatch(descriptor_schema) is None
+                )
+            )
+            or (candidate is None and descriptor_schema is not None)
+            or isinstance(descriptor_version, bool)
+            or descriptor_version != 1
+            or not isinstance(descriptor_output_type, str)
+            or not descriptor_output_type.strip()
+            or len(descriptor_output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+        ):
+            raise ArchonOutputIntegrityError(
+                "Archon output publication descriptor is incomplete"
+            )
         content_name = descriptor.get("content_name")
         expected_content_name = (
             "content.json"
@@ -618,28 +648,31 @@ def _resolve_node_output(
                 "Archon output publication descriptor is invalid"
             )
         read_relative_path = f"publications/{publication_id}/{expected_content_name}"
-    if candidate is not None and (
-        candidate.attempt_relative_path != relative_path
-        or candidate.media_type != media_type
-        or candidate.size_bytes != size_bytes
-        or candidate.sha256 != digest
-        or (
-            "schema_fingerprint" in descriptor
-            and descriptor.get("schema_fingerprint") != candidate.schema_fingerprint
-        )
-        or (
-            "canonicalization_version" in descriptor
-            and descriptor.get("canonicalization_version")
-            != candidate.canonicalization_version
-        )
-        or (
-            "output_type" in descriptor
-            and descriptor.get("output_type") != candidate.output_type
-        )
-    ):
-        raise ArchonOutputIntegrityError(
-            "Archon output candidate and descriptor disagree"
-        )
+    if candidate is not None:
+        publication_descriptor = strict and publication_id is not None
+        if (
+            candidate.attempt_relative_path != relative_path
+            or candidate.media_type != media_type
+            or candidate.size_bytes != size_bytes
+            or candidate.sha256 != digest
+            or (
+                (publication_descriptor or "schema_fingerprint" in descriptor)
+                and descriptor.get("schema_fingerprint")
+                != candidate.schema_fingerprint
+            )
+            or (
+                (publication_descriptor or "canonicalization_version" in descriptor)
+                and descriptor.get("canonicalization_version")
+                != candidate.canonicalization_version
+            )
+            or (
+                (publication_descriptor or "output_type" in descriptor)
+                and descriptor.get("output_type") != candidate.output_type
+            )
+        ):
+            raise ArchonOutputIntegrityError(
+                "Archon output candidate and descriptor disagree"
+            )
     canonical_bytes = _read_descriptor_relative(
         run_directory,
         read_relative_path,
@@ -672,7 +705,7 @@ def _resolve_node_output(
                 raise ArchonOutputIntegrityError(
                     "Archon structured output candidate content disagrees"
                 )
-    elif strict and candidate is not None:
+    elif strict:
         value = text
     elif candidate is not None and candidate.structured_value is not None:
         value = candidate.structured_value

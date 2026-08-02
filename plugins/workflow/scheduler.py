@@ -785,6 +785,10 @@ class RunScheduler:
             else:
                 descriptor = canonical[-1] if canonical else None
             if descriptor is None:
+                if strict_v3 and candidate is not None:
+                    outputs[node_id] = WorkflowOutputReferenceError(
+                        "output_reference_integrity", node_id
+                    )
                 continue
             expected_structured = snapshot.structured_outputs.get(node_id)
             if strict_v3 and (
@@ -814,6 +818,10 @@ class RunScheduler:
                 descriptor.get("size_bytes"),
                 descriptor.get("sha256"),
                 publication_id if isinstance(publication_id, str) else None,
+                descriptor.get("content_name"),
+                descriptor.get("schema_fingerprint"),
+                descriptor.get("canonicalization_version"),
+                descriptor.get("output_type"),
                 *(
                     (
                         candidate.attempt_relative_path,

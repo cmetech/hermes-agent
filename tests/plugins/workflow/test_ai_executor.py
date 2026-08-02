@@ -1760,3 +1760,34 @@ def test_retryable_runner_exception_charges_unknown_provider_attempts(
 
     assert result.error_code == expected_code
     assert result.metadata["provider_attempts"] == 2
+
+
+def test_v3_prompt_reference_failure_escapes_ai_executor_before_provider(
+    tmp_path,
+) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    node = _node(
+        "consumer",
+        "Use $producer.output.missing",
+        retry={"max_attempts": 2, "on_error": "all"},
+    )
+    context = replace(
+        _archon_text_context(tmp_path, node),
+        variable_context=VariableContext(
+            workflow_id="run-1",
+            normalizer_version=3,
+            node_outputs={
+                "producer": output_resolution.WorkflowOutputReferenceError(
+                    "output_reference_field_missing",
+                    "producer",
+                    ("missing",),
+                )
+            },
+        ),
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        AgentNodeExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_field_missing"
+    assert runner.requests == []

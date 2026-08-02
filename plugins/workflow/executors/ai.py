@@ -35,6 +35,7 @@ from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     PrimaryOutputCandidate,
+    WorkflowOutputReferenceError,
     write_archon_output_exclusive,
 )
 from plugins.workflow.resources import (
@@ -984,6 +985,8 @@ class AgentNodeExecutor:
             )
         except ValueError as exc:
             return self._failure("validation", str(exc))
+        except WorkflowOutputReferenceError:
+            raise
         except RuntimeError as exc:
             return NodeExecutionResult(
                 "failed",
