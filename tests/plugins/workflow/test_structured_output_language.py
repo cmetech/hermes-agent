@@ -46,7 +46,7 @@ def test_archon_normalizes_output_format_and_accepts_output_type(
         )
     )
 
-    assert package.language.normalizer_version == 2
+    assert package.language.normalizer_version == 3
     assert package.definition.nodes[0].options["output_format"] == {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -418,7 +418,6 @@ def test_closed_structured_output_rejects_impossible_field_reference(
                 },
             ]
         },
-        None,
     ],
 )
 def test_possible_structured_output_field_reference_is_not_rejected(
@@ -441,7 +440,7 @@ def test_possible_structured_output_field_reference_is_not_rejected(
     assert package.definition.nodes[-1].id == "consumer"
 
 
-def test_non_dependency_output_reference_keeps_graph_rejection(
+def test_non_dependency_output_reference_uses_v3_direct_dependency_rejection(
     workflow_writer, tmp_path
 ):
     with pytest.raises(WorkflowValidationError) as exc:
@@ -461,7 +460,7 @@ def test_non_dependency_output_reference_keeps_graph_rejection(
         )
 
     assert [issue.code for issue in exc.value.issues] == [
-        "condition_reference_not_upstream"
+        "output_reference_not_declared_dependency"
     ]
 
 
@@ -596,12 +595,16 @@ def test_impossible_output_field_is_rejected_on_every_interpolated_surface(
 def test_prompt_reference_keeps_conservative_phase_two_admission(
     workflow_writer, tmp_path, producer, reference
 ) -> None:
-    package = load_workflow(
-        _archon_workflow(
-            workflow_writer,
-            tmp_path,
-            nodes=[producer, {"id": "consumer", "prompt": f"Use {reference}"}],
-        )
+    path = _archon_workflow(
+        workflow_writer,
+        tmp_path,
+        nodes=[producer, {"id": "consumer", "prompt": f"Use {reference}"}],
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=2,
     )
 
     assert package.definition.nodes[-1].id == "consumer"

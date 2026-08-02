@@ -27,6 +27,7 @@ from plugins.workflow.language import (
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
+    ARCHON_V3_WHEN_EXPRESSION_PATTERN,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
     agent_field_names,
@@ -39,10 +40,13 @@ from plugins.workflow.language_schema import (
     hook_event_names,
     hook_response_field_names,
     hook_specific_field_names,
+    is_reference_safe_node_id,
+    iter_output_references,
     loop_field_names,
     retry_field_names,
     sidecar_field_names,
     structural_node_field_names,
+    WorkflowReferenceSyntaxError,
 )
 from plugins.workflow.models import (
     ValidationIssue,
@@ -123,6 +127,9 @@ _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
+_ARCHON_V3_WHEN_EXPRESSION = re.compile(
+    ARCHON_V3_WHEN_EXPRESSION_PATTERN, re.ASCII
+)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 
 
@@ -589,6 +596,13 @@ def _normalize_node(
         profile is WorkflowLanguageProfile.ARCHON_2026_07
         and normalizer_version == 3
     )
+    if archon_v3 and not is_reference_safe_node_id(node_id):
+        _fail(
+            f"{path}.id",
+            "archon_node_id_not_reference_safe",
+            f"{path}.id cannot be addressed by the Archon v3 reference grammar",
+            line=lines.get("id"),
+        )
     if archon_v3:
         structural_fields.update({"timeout", "idle_timeout", "retry"})
     structurally_invalid = sorted(set(node) - structural_fields)
@@ -636,7 +650,13 @@ def _normalize_node(
         _validate_hook_fields(node["hooks"], f"{path}.hooks")
     if "when" in node:
         when = _string(node["when"], f"{path}.when")
-        if not _WHEN_EXPRESSION.fullmatch(when):
+        if archon_v3:
+            try:
+                tuple(iter_output_references(when, normalizer_version=3))
+            except WorkflowReferenceSyntaxError as exc:
+                _fail(f"{path}.when", exc.code, str(exc))
+        expression_pattern = _ARCHON_V3_WHEN_EXPRESSION if archon_v3 else _WHEN_EXPRESSION
+        if not expression_pattern.fullmatch(when):
             _fail(
                 f"{path}.when",
                 "malformed_condition",
@@ -658,7 +678,9 @@ def _normalize_node(
     )
 
 
-def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
+def _validate_graph(
+    nodes: tuple[WorkflowNode, ...], *, strict_output_references: bool = False
+) -> None:
     issues: list[ValidationIssue] = []
     by_id: dict[str, WorkflowNode] = {}
     for node in nodes:
@@ -684,7 +706,7 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
                     )
                 )
         when = node.options.get("when")
-        if isinstance(when, str):
+        if isinstance(when, str) and not strict_output_references:
             for reference in _WHEN_REFERENCE.findall(when):
                 if reference not in by_id:
                     issues.append(
@@ -728,7 +750,7 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
     upstream_issues: list[ValidationIssue] = []
     for node in nodes:
         when = node.options.get("when")
-        if not isinstance(when, str):
+        if strict_output_references or not isinstance(when, str):
             continue
         upstream = collect_ancestors(node.id)
         for reference in _WHEN_REFERENCE.findall(when):
@@ -770,6 +792,120 @@ def _validate_structured_output_field_references(
                             surface_path,
                             "structured_output_field_impossible",
                             f"structured output field {'.'.join(path_parts)} is impossible for node {producer_id}",
+                            line=node.source_line,
+                        )
+                    )
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+
+
+def _schema_has_unaddressable_dotted_key(
+    schema: Mapping[str, object], path_parts: tuple[str, ...]
+) -> bool:
+    """Detect an impossible traversal that instead names one dotted key."""
+    seen: set[tuple[int, int]] = set()
+
+    def resolve_local_ref(reference: object) -> object:
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            return None
+        current: object = schema
+        for raw_part in reference[2:].split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(current, Mapping) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    def visit(current: object, index: int) -> bool:
+        if not isinstance(current, Mapping) or index >= len(path_parts):
+            return False
+        marker = (id(current), index)
+        if marker in seen:
+            return False
+        seen.add(marker)
+        referenced = resolve_local_ref(current.get("$ref"))
+        if referenced is not None and visit(referenced, index):
+            return True
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            branches = current.get(keyword)
+            if isinstance(branches, tuple | list) and any(
+                visit(branch, index) for branch in branches
+            ):
+                return True
+        properties = current.get("properties")
+        if not isinstance(properties, Mapping):
+            return False
+        remaining = ".".join(path_parts[index:])
+        if "." in remaining and remaining in properties:
+            return True
+        return visit(properties.get(path_parts[index]), index + 1)
+
+    return visit(schema, 0)
+
+
+def _validate_v3_static_output_references(
+    nodes: tuple[WorkflowNode, ...],
+    structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
+) -> None:
+    """Enforce the closed v3 grammar and direct-dependency reference rule."""
+    issues: list[ValidationIssue] = []
+    for node in nodes:
+        for surface_path, template in _interpolated_node_templates(
+            node, command_bodies=command_bodies
+        ):
+            try:
+                references = tuple(
+                    iter_output_references(template, normalizer_version=3)
+                )
+            except WorkflowReferenceSyntaxError as exc:
+                issues.append(
+                    _issue(surface_path, exc.code, str(exc), line=node.source_line)
+                )
+                continue
+            for reference in references:
+                if reference.node_id not in node.depends_on:
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "output_reference_not_declared_dependency",
+                            f"output reference {reference.node_id} must be listed directly in depends_on for node {node.id}",
+                            line=node.source_line,
+                        )
+                    )
+                    continue
+                if not reference.path:
+                    continue
+                output = structured_outputs.get(reference.node_id)
+                schema = getattr(output, "canonical_schema", None)
+                if not isinstance(schema, Mapping):
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "output_reference_path_unsupported",
+                            f"output field reference requires a structured output contract on node {reference.node_id}",
+                            line=node.source_line,
+                        )
+                    )
+                    continue
+                if prove_output_path_impossible(schema, reference.path):
+                    if _schema_has_unaddressable_dotted_key(schema, reference.path):
+                        code = "output_reference_path_unsupported"
+                        message = (
+                            "output reference cannot address a mapping key containing a dot"
+                        )
+                    else:
+                        code = "structured_output_field_impossible"
+                        message = (
+                            f"structured output field {'.'.join(reference.path)} "
+                            f"is impossible for node {reference.node_id}"
+                        )
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            code,
+                            message,
                             line=node.source_line,
                         )
                     )
@@ -820,7 +956,50 @@ def validate_authenticated_command_references(
     command_bodies: Mapping[str, str],
 ) -> None:
     """Validate command bodies already read from authenticated snapshot bytes."""
+    validate_authenticated_resource_references(
+        package,
+        command_bodies=command_bodies,
+        named_script_bodies={},
+    )
+
+
+def validate_authenticated_resource_references(
+    package: WorkflowPackage,
+    *,
+    command_bodies: Mapping[str, str],
+    named_script_bodies: Mapping[str, str],
+) -> None:
+    """Scan authenticated command and named-script bytes before promotion."""
     if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return
+    if package.language.normalizer_version == 3:
+        _validate_v3_static_output_references(
+            package.definition.nodes,
+            package.language.structured_outputs,
+            command_bodies=command_bodies,
+        )
+        issues: list[ValidationIssue] = []
+        for node in package.definition.nodes:
+            body = named_script_bodies.get(node.id)
+            if body is None:
+                continue
+            try:
+                references = tuple(
+                    iter_output_references(body, normalizer_version=3)
+                )
+            except WorkflowReferenceSyntaxError:
+                references = ()
+            if references:
+                issues.append(
+                    _issue(
+                        f"nodes[{node.source_index}].script",
+                        "named_script_output_reference_unsupported",
+                        "named scripts receive workflow values through their environment and cannot interpolate output references",
+                        line=node.source_line,
+                    )
+                )
+        if issues:
+            raise WorkflowValidationError(tuple(issues))
         return
     _validate_structured_output_field_references(
         package.definition.nodes,
@@ -1090,7 +1269,11 @@ def _load_workflow_bytes(
         )
         for index, node in enumerate(raw_nodes)
     )
-    _validate_graph(nodes)
+    archon_v3 = (
+        selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and selected_normalizer_version == 3
+    )
+    _validate_graph(nodes, strict_output_references=archon_v3)
     options = {
         key: value
         for key, value in document.items()
@@ -1123,9 +1306,14 @@ def _load_workflow_bytes(
             exc.code,
             str(exc),
         )
-    _validate_structured_output_field_references(
-        normalized.definition.nodes, normalized.metadata.structured_outputs
-    )
+    if archon_v3:
+        _validate_v3_static_output_references(
+            normalized.definition.nodes, normalized.metadata.structured_outputs
+        )
+    else:
+        _validate_structured_output_field_references(
+            normalized.definition.nodes, normalized.metadata.structured_outputs
+        )
     return WorkflowPackage(
         source_definition=definition,
         definition=normalized.definition,

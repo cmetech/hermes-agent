@@ -18,6 +18,7 @@ from typing import Iterable, Mapping
 
 import yaml
 
+from plugins.workflow.language_schema import iter_output_references
 from plugins.workflow.output_resolution import ResolvedNodeOutput
 
 
@@ -41,8 +42,15 @@ _VARIABLE = re.compile(
 
 def iter_output_field_references(
     template: str,
+    *,
+    normalizer_version: int = 2,
 ) -> Iterable[tuple[str, tuple[str, ...]]]:
     """Yield field references recognized by runtime variable substitution."""
+    if normalizer_version == 3:
+        for reference in iter_output_references(template, normalizer_version=3):
+            if reference.path:
+                yield reference.node_id, reference.path
+        return
     for match in _VARIABLE.finditer(template):
         node = match.group("node")
         dot = match.group("dot")
@@ -106,6 +114,29 @@ class ScriptResource:
     path: Path
     runtime: str
     authenticated_bytes: bytes | None = None
+
+
+def parse_command_resource(path: Path, text: str) -> CommandResource:
+    """Parse one already-authenticated UTF-8 command resource."""
+    metadata: dict[str, object] = {}
+    body = text
+    if text.startswith("---\n"):
+        header, separator, remainder = text[4:].partition("\n---\n")
+        if not separator:
+            raise ValueError(f"command frontmatter is not terminated: {path}")
+        parsed = yaml.safe_load(header) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError(f"command frontmatter must be a mapping: {path}")
+        metadata = parsed
+        body = remainder
+    description = metadata.get("description")
+    argument_hint = metadata.get("argument-hint")
+    return CommandResource(
+        path=path,
+        body=body,
+        description=str(description) if description is not None else None,
+        argument_hint=str(argument_hint) if argument_hint is not None else None,
+    )
 
 
 class AuthenticatedExecutionMaterializer:
@@ -550,25 +581,7 @@ class ResourceResolver:
     def _parse_command(path: Path, *, text: str | None = None) -> CommandResource:
         if text is None:
             text = path.read_text(encoding="utf-8")
-        metadata: dict[str, object] = {}
-        body = text
-        if text.startswith("---\n"):
-            header, separator, remainder = text[4:].partition("\n---\n")
-            if not separator:
-                raise ValueError(f"command frontmatter is not terminated: {path}")
-            parsed = yaml.safe_load(header) or {}
-            if not isinstance(parsed, dict):
-                raise ValueError(f"command frontmatter must be a mapping: {path}")
-            metadata = parsed
-            body = remainder
-        description = metadata.get("description")
-        argument_hint = metadata.get("argument-hint")
-        return CommandResource(
-            path=path,
-            body=body,
-            description=str(description) if description is not None else None,
-            argument_hint=str(argument_hint) if argument_hint is not None else None,
-        )
+        return parse_command_resource(path, text)
 
 
 @dataclass(frozen=True)

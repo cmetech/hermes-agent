@@ -22,7 +22,11 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowValidationError,
 )
-from plugins.workflow.schema import is_inline_script
+from plugins.workflow.resources import parse_command_resource
+from plugins.workflow.schema import (
+    is_inline_script,
+    validate_authenticated_resource_references,
+)
 
 _LOCK_TIMEOUT_SECONDS = 5.0
 _ISOLATION_CAPABILITIES = (
@@ -365,6 +369,8 @@ def compute_package_digest(
     """Hash the portable document and all executable package resources."""
     root = package.root.resolve(strict=True)
     resources: dict[str, bytes] = {}
+    command_bodies: dict[str, str] = {}
+    named_script_bodies: dict[str, str] = {}
 
     def add(path: Path) -> tuple[str, bytes]:
         relative, data = _contained_resource(root, path, read_budget=read_budget)
@@ -379,16 +385,25 @@ def compute_package_digest(
         add(package.sidecar_path or expected_sidecar)
     for node in package.definition.nodes:
         if node.node_type == "command":
-            add(_command_path(package, str(node.value), read_budget))
+            relative, data = add(
+                _command_path(package, str(node.value), read_budget)
+            )
+            command_bodies[node.id] = parse_command_resource(
+                root / relative,
+                data.decode("utf-8"),
+            ).body
         elif node.node_type == "script" and isinstance(node.value, str):
             if not is_inline_script(node.value):
-                add(
+                _relative, data = add(
                     _named_script_path(
                         package,
                         node.value,
                         str(node.options["runtime"]),
                         read_budget,
                     )
+                )
+                named_script_bodies[node.id] = data.decode(
+                    "utf-8", errors="surrogateescape"
                 )
         mcp_value = node.options.get("mcp")
         references = (
@@ -423,6 +438,12 @@ def compute_package_digest(
                         and read_budget.has_cached(resource)
                     ) or resource.exists() or resource.is_symlink():
                         add(resource)
+
+    validate_authenticated_resource_references(
+        package,
+        command_bodies=command_bodies,
+        named_script_bodies=named_script_bodies,
+    )
 
     digest = hashlib.sha256()
     for relative in sorted(resources):

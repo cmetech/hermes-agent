@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 import json
 import math
+import re
 from types import MappingProxyType
 from typing import Any
 
@@ -24,6 +25,27 @@ DURABLE_METADATA_STRING_MAX_CHARS = 16_384
 CONTRACT_READER_VERSION = 1
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
+ARCHON_V3_NODE_ID_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
+ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN = (
+    r"(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)"
+)
+ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
+    rf"\$(?P<node>{ARCHON_V3_NODE_ID_PATTERN})\.output"
+    rf"(?P<path>(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*)"
+)
+ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
+    rf"\$({ARCHON_V3_NODE_ID_PATTERN})\.output"
+    rf"(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*"
+)
+ARCHON_V3_WHEN_CLAUSE_PATTERN = (
+    rf"{ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN}\s*"
+    r"(?:==|!=|<=|>=|<|>)\s*"
+    r"(?:'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))"
+)
+ARCHON_V3_WHEN_EXPRESSION_PATTERN = (
+    rf"^\s*{ARCHON_V3_WHEN_CLAUSE_PATTERN}"
+    rf"(?:\s*(?:&&|\|\|)\s*{ARCHON_V3_WHEN_CLAUSE_PATTERN})*\s*$"
+)
 WHEN_CLAUSE_PATTERN = (
     r"\$[\w.:-]+\.output(?:\.[\w.-]+)*\s*"
     r"(?:==|!=|<=|>=|<|>)\s*"
@@ -45,6 +67,87 @@ ECMASCRIPT_WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN}"
     rf"(?:\s*(?:&&|\|\|)\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN})*\s*$"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputReferenceToken:
+    """One exact versioned workflow output reference in an authored surface."""
+
+    node_id: str
+    path: tuple[str, ...]
+    start: int
+    end: int
+
+
+class WorkflowReferenceSyntaxError(ValueError):
+    """A reference-like token cannot be represented by the v3 grammar."""
+
+    code = "output_reference_path_unsupported"
+
+
+_ARCHON_V3_NODE_ID = re.compile(rf"^(?:{ARCHON_V3_NODE_ID_PATTERN})$", re.ASCII)
+_ARCHON_V3_OUTPUT_REFERENCE = re.compile(
+    ARCHON_V3_OUTPUT_REFERENCE_PATTERN, re.ASCII
+)
+_REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
+
+
+def is_reference_safe_node_id(value: str) -> bool:
+    """Return whether a node ID is addressable by the Archon v3 grammar."""
+    return bool(_ARCHON_V3_NODE_ID.fullmatch(value))
+
+
+def _reference_candidate_end(template: str, start: int) -> int:
+    end = start + 1
+    while end < len(template) and template[end] not in _REFERENCE_CANDIDATE_END:
+        end += 1
+    return end
+
+
+def iter_output_references(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Iterate references with the single ASCII grammar used by Archon v3."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return
+        match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
+        if match is not None:
+            end = match.end()
+            following = template[end : end + 1]
+            if following and (
+                following in ".[/\\"
+                or following == "_"
+                or following.isalnum()
+                or not following.isascii()
+            ):
+                raise WorkflowReferenceSyntaxError(
+                    "output reference uses an unsupported path"
+                )
+            raw_path = match.group("path")
+            yield OutputReferenceToken(
+                node_id=match.group("node"),
+                path=tuple(raw_path[1:].split(".")) if raw_path else (),
+                start=start,
+                end=end,
+            )
+            position = end
+            continue
+        candidate_end = _reference_candidate_end(template, start)
+        candidate = template[start:candidate_end]
+        if ".output" in candidate or re.search(
+            r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII
+        ):
+            raise WorkflowReferenceSyntaxError(
+                "output reference uses an unsupported path"
+            )
+        position = max(start + 1, candidate_end)
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +324,85 @@ PHASE3_DURABLE_CODES = (
         True,
         False,
         ("resources.phase3_execution_semantics",),
+    ),
+    DurableWorkflowCode(
+        "archon_node_id_not_reference_safe",
+        "node id cannot be represented by the Archon v3 reference grammar",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].id",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_not_declared_dependency",
+        "referenced producer is not a direct declared dependency",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "output_reference_path_unsupported",
+        "output reference path cannot be represented or addressed",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "structured_output_field_impossible",
+        "declared structured output schema excludes the referenced path",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "named_script_output_reference_unsupported",
+        "named scripts cannot interpolate workflow output references",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].script",),
     ),
 )
 
@@ -1307,6 +1489,12 @@ def _field_schema(
         )
     if spec.pattern is not None:
         result["pattern"] = spec.pattern
+    if (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and spec.scope == "node"
+        and spec.yaml_name == "id"
+    ):
+        result["pattern"] = rf"^{ARCHON_V3_NODE_ID_PATTERN}$"
     if spec.max_length is not None:
         result["maxLength"] = spec.max_length
     unit = _field_unit(spec, profile)
@@ -1689,6 +1877,7 @@ def semantic_rule_descriptors(
 ) -> list[dict[str, object]]:
     """Publish only semantic rules enforced by the current workflow loader."""
     selected = _profile(profile)
+    archon_v3 = selected is WorkflowLanguageProfile.ARCHON_2026_07
     definition_applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
@@ -1722,12 +1911,16 @@ def semantic_rule_descriptors(
             "applicability": definition_applicability,
             "status": "supported",
             "parameters": {
-                "expression_pattern": ECMASCRIPT_WHEN_EXPRESSION_PATTERN,
+                "expression_pattern": (
+                    ARCHON_V3_WHEN_EXPRESSION_PATTERN
+                    if archon_v3
+                    else ECMASCRIPT_WHEN_EXPRESSION_PATTERN
+                ),
                 "expression_flags": "u",
             },
             "examples": [
                 "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
-                "$café.output.status == 'ready'",
+                *([] if archon_v3 else ["$café.output.status == 'ready'"]),
             ],
         },
         {
@@ -1741,16 +1934,57 @@ def semantic_rule_descriptors(
             "status": "supported",
             "parameters": {
                 "syntax": "$ID.output(.path)*",
-                "pattern": ECMASCRIPT_WHEN_REFERENCE_PATTERN,
+                "pattern": (
+                    ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN
+                    if archon_v3
+                    else ECMASCRIPT_WHEN_REFERENCE_PATTERN
+                ),
                 "pattern_flags": "u",
                 "node_id_capture_group": 1,
                 "require_upstream": True,
+                **({"require_direct_dependency": True} if archon_v3 else {}),
             },
             "examples": [
                 "$prepare.output.status == 'ready'",
-                "$café.output.status == 'ready'",
+                *([] if archon_v3 else ["$café.output.status == 'ready'"]),
             ],
         },
+        *(
+            [
+                {
+                    "id": "strict-output-reference",
+                    "label": "Strict output reference",
+                    "description": (
+                        "Every output reference names a direct dependency and uses "
+                        "the closed ASCII node and path grammar."
+                    ),
+                    "field_paths": [
+                        "nodes[].when",
+                        "nodes[].prompt",
+                        "nodes[].bash",
+                        "nodes[].script",
+                        "nodes[].command",
+                        "nodes[].loop.prompt",
+                        "nodes[].loop.until_bash",
+                        "nodes[].approval.message",
+                        "nodes[].approval.on_reject.prompt",
+                    ],
+                    "applicability": definition_applicability,
+                    "status": "supported",
+                    "parameters": {
+                        "syntax": "$ID.output(.path)*",
+                        "pattern": ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN,
+                        "pattern_flags": "u",
+                        "node_id_capture_group": 1,
+                        "require_upstream": True,
+                        "require_direct_dependency": True,
+                    },
+                    "examples": ["$prepare.output.status"],
+                }
+            ]
+            if archon_v3
+            else []
+        ),
         {
             "id": "companion-node-reference-list",
             "label": "Companion node references",

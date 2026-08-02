@@ -17,6 +17,7 @@ from plugins.workflow.models import (
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import compute_package_digest
 
 
 def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
@@ -110,6 +111,128 @@ def test_task2_snapshot_mismatch_codes_have_additive_catalog_metadata() -> None:
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False
+
+
+def test_task3_static_reference_codes_have_additive_catalog_metadata() -> None:
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+
+    for code in (
+        "archon_node_id_not_reference_safe",
+        "output_reference_not_declared_dependency",
+        "output_reference_path_unsupported",
+        "structured_output_field_impossible",
+        "named_script_output_reference_unsupported",
+    ):
+        assert catalog[code]["normalizer_versions"] == [3]
+        assert catalog[code]["runtime_failure"] is True
+        assert catalog[code]["evidence"] is False
+
+
+def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
+    tmp_path, workflow_writer
+) -> None:
+    emitted: set[str] = set()
+
+    unsafe = workflow_writer(
+        tmp_path / "unsafe",
+        nodes=[{"id": "unsafe.id", "bash": "true"}],
+    )
+    unsafe.with_name(f"{unsafe.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as unsafe_exc:
+        load_workflow(unsafe)
+    emitted.add(unsafe_exc.value.issues[0].code)
+
+    undeclared = workflow_writer(
+        tmp_path / "undeclared",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {"id": "consumer", "prompt": "$producer.output"},
+        ],
+    )
+    undeclared.with_name(f"{undeclared.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as undeclared_exc:
+        load_workflow(undeclared)
+    emitted.add(undeclared_exc.value.issues[0].code)
+
+    unsupported = workflow_writer(
+        tmp_path / "unsupported",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "consumer",
+                "prompt": "$producer.output.field",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    unsupported.with_name(f"{unsupported.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as unsupported_exc:
+        load_workflow(unsupported)
+    emitted.add(unsupported_exc.value.issues[0].code)
+
+    impossible = workflow_writer(
+        tmp_path / "impossible",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "prompt": "$producer.output.missing",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    impossible.with_name(f"{impossible.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as impossible_exc:
+        load_workflow(impossible)
+    emitted.add(impossible_exc.value.issues[0].code)
+
+    named_root = tmp_path / "named"
+    (named_root / "scripts").mkdir(parents=True)
+    (named_root / "scripts" / "consume.py").write_text(
+        "print('$producer.output')\n", encoding="utf-8"
+    )
+    named = workflow_writer(
+        named_root,
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "consumer",
+                "script": "consume.py",
+                "runtime": "uv",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    named.with_name(f"{named.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as named_exc:
+        compute_package_digest(load_workflow(named))
+    emitted.add(named_exc.value.issues[0].code)
+
+    assert emitted == {
+        "archon_node_id_not_reference_safe",
+        "output_reference_not_declared_dependency",
+        "output_reference_path_unsupported",
+        "structured_output_field_impossible",
+        "named_script_output_reference_unsupported",
+    }
 
 
 def _admit_catalog_snapshot(store: RunStore, package, *, key: str) -> str:
