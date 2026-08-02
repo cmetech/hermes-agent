@@ -16,6 +16,7 @@ import math
 import operator
 import os
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -41,44 +42,149 @@ _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 _MAX_INHERITED_DESCRIPTORS = 64
 _DESCRIPTOR_BOOTSTRAP_ERROR_MAX_BYTES = 4096
+_DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES = 16 * 1024 * 1024
 _POSIX_DESCRIPTOR_BOOTSTRAP = r"""
+import ctypes
 import errno
 import os
 import signal
+import struct
 import sys
 
 status_fd = int(sys.argv[1])
+environment_fd = int(sys.argv[2])
 signal_states = tuple(
     (int(number), ignored == "1")
     for number, ignored in (
-        item.split(":", 1) for item in sys.argv[2].split(",") if item
+        item.split(":", 1) for item in sys.argv[3].split(",") if item
     )
 )
-use_argv_zero = sys.argv[3] == "1"
-executable = sys.argv[6] if use_argv_zero else sys.argv[4]
+use_argv_zero = sys.argv[4] == "1"
+executable = sys.argv[7] if use_argv_zero else sys.argv[5]
 pairs = tuple(
     (int(pin), int(target))
-    for pin, target in (item.split(":", 1) for item in sys.argv[5].split(","))
+    for pin, target in (item.split(":", 1) for item in sys.argv[6].split(","))
 )
-argv = sys.argv[6:]
+argv = sys.argv[7:]
 try:
     os.set_inheritable(status_fd, False)
+    data = bytearray()
+    while len(data) <= 16777216:
+        chunk = os.read(environment_fd, min(65536, 16777217 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    os.close(environment_fd)
+    if len(data) > 16777216:
+        raise ValueError("environment transport exceeds its bound")
+    if len(data) < 4:
+        raise ValueError("environment transport is incomplete")
+    count = struct.unpack_from("!I", data)[0]
+    offset = 4
+    environment = {}
+    environment_entries = []
+    for _index in range(count):
+        if offset + 8 > len(data):
+            raise ValueError("environment transport is incomplete")
+        key_size, value_size = struct.unpack_from("!II", data, offset)
+        offset += 8
+        end = offset + key_size + value_size
+        if end > len(data):
+            raise ValueError("environment transport is incomplete")
+        key_end = offset + key_size
+        key = bytes(data[offset:key_end])
+        value = bytes(data[key_end:end])
+        environment[key] = value
+        environment_entries.append(key + b"=" + value)
+        offset = end
+    if offset != len(data):
+        raise ValueError("environment transport has trailing data")
     for pin, target in pairs:
         os.dup2(pin, target, inheritable=True)
     for pin, _target in pairs:
         os.close(pin)
     for number, ignored in signal_states:
         signal.signal(number, signal.SIG_IGN if ignored else signal.SIG_DFL)
-    os.execvpe(executable, argv, os.environ)
+    executable_bytes = os.fsencode(executable)
+    if os.path.dirname(executable_bytes):
+        executable_candidates = (executable_bytes,)
+    else:
+        executable_candidates = tuple(
+            os.path.join(os.fsencode(directory), executable_bytes)
+            for directory in os.get_exec_path(environment)
+        )
+    argv_bytes = tuple(os.fsencode(item) for item in argv)
+    argv_vector = (ctypes.c_char_p * (len(argv_bytes) + 1))(*argv_bytes, None)
+    environment_vector = (ctypes.c_char_p * (len(environment_entries) + 1))(
+        *environment_entries, None
+    )
+    execve = ctypes.CDLL(None, use_errno=True).execve
+    execve.argtypes = (
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_char_p),
+    )
+    execve.restype = ctypes.c_int
+    saved_error = None
+    last_error = None
+    for candidate in executable_candidates:
+        ctypes.set_errno(0)
+        execve(candidate, argv_vector, environment_vector)
+        error_number = ctypes.get_errno() or errno.EIO
+        last_error = OSError(error_number, os.strerror(error_number), candidate)
+        if error_number not in (errno.ENOENT, errno.ENOTDIR):
+            saved_error = last_error
+    if saved_error is not None:
+        raise saved_error
+    if last_error is not None:
+        raise last_error
+    raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), executable_bytes)
 except BaseException as exc:
     error_number = getattr(exc, "errno", None) or errno.EIO
-    message = str(exc).encode("utf-8", "replace")[:4096]
+    message = os.strerror(error_number).encode("utf-8", "replace")[:4096]
     try:
         os.write(status_fd, str(error_number).encode("ascii") + b":" + message)
     except BaseException:
         pass
     os._exit(127)
 """
+
+
+def _serialize_descriptor_bootstrap_environment(
+    environment: object,
+) -> tuple[bytes, dict[bytes, bytes] | None]:
+    """Snapshot final-exec bytes without exposing values in bootstrap argv."""
+    if environment is None:
+        entries = tuple(os.environb.items())
+        bootstrap_environment = None
+    else:
+        entries = tuple(
+            (os.fsencode(key), os.fsencode(value))
+            for key, value in environment.items()
+        )
+        bootstrap_environment = dict(entries)
+
+    payload = bytearray(struct.pack("!I", len(entries)))
+    for key, value in entries:
+        if b"=" in key:
+            raise ValueError("illegal environment variable name")
+        if b"\0" in key or b"\0" in value:
+            raise ValueError("embedded null byte")
+        payload.extend(struct.pack("!II", len(key), len(value)))
+        payload.extend(key)
+        payload.extend(value)
+        if len(payload) > _DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES:
+            raise ValueError("environment is too large for descriptor launch")
+    return bytes(payload), bootstrap_environment
+
+
+def _write_descriptor_payload(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "environment transport write failed")
+        view = view[written:]
 
 
 def _close_descriptors(descriptors: Sequence[int]) -> None:
@@ -688,6 +794,9 @@ class ManagedProcessTree:
         pinned: tuple[tuple[int, int], ...] = ()
         status_read: int | None = None
         status_write: int | None = None
+        environment_read: int | None = None
+        environment_write: int | None = None
+        environment_payload = b""
         resolved_executable: object = argv[0]
         use_argv_zero = True
         executable = ""
@@ -706,6 +815,14 @@ class ManagedProcessTree:
             bootstrap_signal_states = _descriptor_bootstrap_signal_states(
                 restore_signals
             )
+            environment_payload, bootstrap_environment = (
+                _serialize_descriptor_bootstrap_environment(kwargs.get("env"))
+            )
+            target_executable = argv[0] if use_argv_zero else executable
+            if not os.path.dirname(os.fsencode(target_executable)):
+                os.get_exec_path(kwargs.get("env"))
+            if "env" in kwargs:
+                kwargs["env"] = bootstrap_environment
 
         windows_job = None
         process = None
@@ -726,6 +843,9 @@ class ManagedProcessTree:
                     )
                     + 1
                 )
+                environment_read, environment_write = _open_internal_pipe_above(
+                    max(status_read, status_write) + 1
+                )
                 mapping = ",".join(
                     f"{pin}:{target}" for pin, target in pinned
                 )
@@ -736,6 +856,7 @@ class ManagedProcessTree:
                     "-c",
                     _POSIX_DESCRIPTOR_BOOTSTRAP,
                     str(status_write),
+                    str(environment_read),
                     bootstrap_signal_states,
                     "1" if use_argv_zero else "0",
                     executable,
@@ -746,6 +867,7 @@ class ManagedProcessTree:
                 kwargs["pass_fds"] = (
                     *(pin for pin, _target in pinned),
                     status_write,
+                    environment_read,
                 )
 
             windows_job = _WindowsJob.create() if _IS_WINDOWS else None
@@ -754,6 +876,18 @@ class ManagedProcessTree:
             # cannot see kwargs populated earlier in the function.
             process = subprocess.Popen(launch_argv, **kwargs)
             if pinned:
+                assert environment_read is not None
+                assert environment_write is not None
+                os.close(environment_read)
+                environment_read = None
+                try:
+                    _write_descriptor_payload(
+                        environment_write,
+                        environment_payload,
+                    )
+                finally:
+                    os.close(environment_write)
+                    environment_write = None
                 _close_descriptors(tuple(pin for pin, _target in pinned))
                 pinned = ()
                 assert status_read is not None
@@ -823,6 +957,16 @@ class ManagedProcessTree:
             if status_write is not None:
                 try:
                     os.close(status_write)
+                except OSError:
+                    pass
+            if environment_read is not None:
+                try:
+                    os.close(environment_read)
+                except OSError:
+                    pass
+            if environment_write is not None:
+                try:
+                    os.close(environment_write)
                 except OSError:
                     pass
 

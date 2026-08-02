@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 import psutil
@@ -61,6 +62,37 @@ class _RaisingExecutablePath:
 class _RaisingSignalTruth:
     def __bool__(self) -> bool:
         raise RuntimeError("restore_signals truth conversion failed")
+
+
+def _environment_entries(output: bytes) -> frozenset[bytes]:
+    return frozenset(line for line in output.splitlines() if line)
+
+
+def _direct_environment(argv: list[str], env) -> tuple[int, frozenset[bytes]]:
+    process = subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    stdout, _ = process.communicate(timeout=5)
+    return process.returncode, _environment_entries(stdout)
+
+
+def _managed_environment(
+    argv: list[str], env, inherited_descriptor: int
+) -> tuple[int, frozenset[bytes]]:
+    tree = ManagedProcessTree.spawn(
+        argv,
+        env=env,
+        inherited_descriptors=[inherited_descriptor],
+    )
+    try:
+        stdout, _ = tree.process.communicate(timeout=5)
+        return tree.process.returncode, _environment_entries(stdout)
+    finally:
+        tree.close()
 
 
 def test_termination_policy_resolves_to_bounded_deadlines() -> None:
@@ -596,6 +628,153 @@ def test_inherited_descriptor_successful_custom_executable_preserves_argv() -> N
     finally:
         if tree is not None:
             tree.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, frozenset()),
+        (
+            {"PATH": "/usr/bin:/bin", "HERMES_DIAG": "plain"},
+            frozenset({b"PATH=/usr/bin:/bin", b"HERMES_DIAG=plain"}),
+        ),
+    ],
+    ids=["empty", "minimal"],
+)
+def test_inherited_descriptor_preserves_exact_explicit_environment(
+    environment,
+    expected,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    argv = ["/usr/bin/env"]
+    try:
+        direct = _direct_environment(argv, environment)
+        managed = _managed_environment(argv, environment, read_fd)
+
+        assert direct == (0, expected)
+        assert managed == direct
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_preserves_mixed_non_utf8_environment(
+    tmp_path,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    environment = {
+        b"PATH": b"/usr/bin:/bin",
+        "HERMES_PATHLIKE": Path(tmp_path / "pathlike-value"),
+        b"HERMES_NON_UTF8": b"value-\xff",
+    }
+    expected = frozenset(
+        {
+            b"PATH=/usr/bin:/bin",
+            b"HERMES_PATHLIKE=" + os.fsencode(tmp_path / "pathlike-value"),
+            b"HERMES_NON_UTF8=value-\xff",
+        }
+    )
+    try:
+        direct = _direct_environment(["env"], environment)
+        managed = _managed_environment(["env"], environment, read_fd)
+
+        assert direct == (0, expected)
+        assert managed == direct
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_preserves_distinct_mixed_keys_with_same_bytes() -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    environment = {
+        b"PATH": b"/usr/bin:/bin",
+        b"HERMES_DUPLICATE": b"bytes-entry",
+        "HERMES_DUPLICATE": "text-entry",
+    }
+    expected = frozenset(
+        {
+            b"PATH=/usr/bin:/bin",
+            b"HERMES_DUPLICATE=bytes-entry",
+            b"HERMES_DUPLICATE=text-entry",
+        }
+    )
+    try:
+        direct = _direct_environment(["env"], environment)
+        managed = _managed_environment(["env"], environment, read_fd)
+
+        assert direct == (0, expected)
+        assert managed == direct
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_path_resolution_rejects_ambiguous_mixed_path() -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    environment = {"PATH": "/usr/bin:/bin", b"PATH": b"/usr/bin:/bin"}
+    direct_error = _capture_exception(
+        lambda: subprocess.Popen(["env"], env=environment),
+    )
+    try:
+        managed_error = _capture_exception(
+            lambda: ManagedProcessTree.spawn(
+                ["env"],
+                env=environment,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+
+        assert managed_error == direct_error
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_omitted_environment_matches_direct_inheritance(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("LC_CTYPE", raising=False)
+    monkeypatch.delenv("__CF_USER_TEXT_ENCODING", raising=False)
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        direct = _direct_environment(["/usr/bin/env"], None)
+        managed = _managed_environment(["/usr/bin/env"], None, read_fd)
+
+        assert managed == direct
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
         os.close(read_fd)
         os.close(write_fd)
 
