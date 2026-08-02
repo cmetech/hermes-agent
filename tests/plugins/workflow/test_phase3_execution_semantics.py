@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import hashlib
 import json
 import shlex
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from plugins.workflow.models import RunExecutionLimits
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
+from plugins.workflow.cli import _runtime_config, register_cli
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.gateway_command import workflow_gateway_command
 from plugins.workflow.execution_semantics import WorkflowExecutionSemanticsError
+from plugins.workflow.runner_binding import (
+    assess_package_execution,
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
+import plugins.workflow.showcase as showcase_module
+from plugins.workflow.showcase import run_showcase
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
     WorkflowTrustStore,
@@ -23,6 +34,7 @@ from plugins.workflow.trust import (
     compute_package_digest,
 )
 from hermes_cli.plugin_invocation import PluginInvocationContext
+from tools.managed_process import ProcessResourceLimits
 import yaml
 
 
@@ -33,10 +45,17 @@ def _execution_semantics_module():
         pytest.fail("Phase 3 effective execution semantics codec is not implemented")
 
 
-def _archon_package(tmp_path, workflow_writer, *, nodes):
+def _archon_package(tmp_path, workflow_writer, *, nodes, sidecar=None):
     path = workflow_writer(tmp_path, name="phase3-execution", nodes=nodes)
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
-        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+        yaml.safe_dump(
+            {
+                "language_compatibility": "archon-2026-07",
+                **dict(sidecar or {}),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
     )
     return load_workflow(path)
 
@@ -161,6 +180,9 @@ def test_effective_execution_semantics_round_trip_exact_schema_and_caps(
         lambda value: value.__setitem__("schema_version", True),
         lambda value: value.__setitem__("normalizer_version", 3.0),
         lambda value: value["limits"].__setitem__("extra", 1),
+        lambda value: value["limits"].__setitem__(
+            "ai_idle_timeout_seconds", 300
+        ),
         lambda value: value["limits"].__setitem__(
             "provider_request_timeout_seconds", float("inf")
         ),
@@ -351,6 +373,286 @@ def test_gateway_admission_seals_resolved_profile_execution_authority(
     }
 
 
+def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "profile"
+    path = workflow_writer(
+        home / "workflows",
+        name="archon-execution-parity",
+        filename="archon-execution-parity.yaml",
+        nodes=[
+            {"id": "shell", "bash": "true", "timeout": 90_000},
+            {
+                "id": "scripted",
+                "script": "print('ok')",
+                "runtime": "uv",
+                "timeout": 180_000,
+                "retry": {"max_attempts": 1, "on_error": "all"},
+            },
+            {
+                "id": "agent",
+                "prompt": "work",
+                "idle_timeout": 150_000,
+                "retry": {"max_attempts": 5},
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "language_compatibility": "archon-2026-07",
+                "delivery_defaults": {
+                    "inputs": {
+                        "arguments": {
+                            "kind": "text",
+                            "required": True,
+                            "max_bytes": 1024,
+                        }
+                    }
+                },
+                "limits": {
+                    "ai_idle_timeout_seconds": 160,
+                    "ai_wall_timeout_seconds": 300,
+                    "provider_request_timeout_seconds": 100,
+                    "subprocess_timeout_seconds": 60,
+                    "combined_retries": 4,
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "entries": {
+                        "workflow": {
+                            "runtime": {
+                                "ai_idle_timeout_seconds": 200,
+                                "ai_wall_timeout_seconds": 400,
+                                "provider_request_timeout_seconds": 120,
+                                "subprocess_timeout_seconds": 80,
+                                "combined_retries": 5,
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    binding = production_workflow_runner_binding()
+    context = background_execution_context(binding, requires_ai=True)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    now = datetime.now(timezone.utc)
+    coordinator = CoordinatorStore(store.database)
+    coordinator_identity = CoordinatorIdentity(
+        owner_id="execution-parity",
+        host_kind="web",
+        host_instance_id="execution-parity",
+        pid=1,
+        process_start_time=None,
+    )
+    coordinator_lease = coordinator.try_acquire(
+        coordinator_identity,
+        now=now,
+        lease_seconds=300,
+    )
+    assert coordinator_lease.is_leader
+    values = {"arguments": "same-input"}
+    run_ids: dict[str, str] = {}
+
+    cli_parser = argparse.ArgumentParser()
+    register_cli(cli_parser)
+    cli_args = cli_parser.parse_args(
+        [
+            "--workdir",
+            str(tmp_path),
+            "--hermes-home",
+            str(home),
+            "run",
+            str(path),
+            "--arguments",
+            values["arguments"],
+            "--no-wait",
+            "--idempotency-key",
+            "execution-parity-cli",
+            "--json",
+        ]
+    )
+    assert cli_args.func(cli_args) == 0
+    cli_envelope = json.loads(capsys.readouterr().out)
+    assert cli_envelope["result"]["run_id"] is not None
+    run_ids["cli"] = str(cli_envelope["result"]["run_id"])
+
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+    gateway = json.loads(
+        workflow_gateway_command(
+            "run "
+            f"{shlex.quote(str(path))} "
+            f"--arguments {shlex.quote(values['arguments'])} "
+            "--idempotency-key execution-parity-gateway",
+            invocation,
+            hermes_home=home,
+            workdir=tmp_path,
+        )
+    )
+    assert gateway["result"]["run_id"] is not None
+    run_ids["gateway"] = str(gateway["result"]["run_id"])
+
+    authority = ApiAdmissionAuthority(
+        principal="execution-parity",
+        namespace="execution-parity",
+        operator_scope=None,
+        source_instance="desktop:execution-parity",
+        assurance="local_admin_claim",
+        trigger_source="desktop",
+    )
+    api = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values=values,
+        idempotency_key="execution-parity-api",
+        concurrency_policy="queue",
+        authority=authority,
+        catalog_source="profile",
+        runner_binding=binding,
+    )
+    assert api["run_id"] is not None
+    run_ids["api"] = str(api["run_id"])
+
+    due = now.replace(microsecond=0) + timedelta(minutes=5)
+    scheduled = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values=values,
+        idempotency_key="execution-parity-scheduled",
+        concurrency_policy="queue",
+        authority=authority,
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=now,
+    )
+    assert scheduled["run_id"] is not None
+    run_ids["scheduled"] = str(scheduled["run_id"])
+
+    base_scenario = showcase_module.load_showcase_catalog()["resilience"]
+    scenario = replace(
+        base_scenario,
+        id="archon-execution-parity",
+        display_name="Archon execution parity",
+        package_digest=risk.package_digest,
+        capability_claims=(),
+        requires_ai=True,
+    )
+    monkeypatch.setattr(
+        showcase_module,
+        "load_showcase_catalog",
+        lambda: {scenario.id: scenario},
+    )
+    monkeypatch.setattr(showcase_module, "_scenario_package", lambda _scenario: package)
+    monkeypatch.setattr(
+        showcase_module,
+        "preflight_showcase",
+        lambda *_args, **_kwargs: {"bundle_digest": "b" * 64},
+    )
+    monkeypatch.setattr(
+        showcase_module,
+        "_verified_distribution_risk",
+        lambda *_args, **_kwargs: risk,
+    )
+    assert coordinator.release(
+        coordinator_identity,
+        epoch=coordinator_lease.lease.epoch,
+        now=now,
+    )
+    showcase = run_showcase(
+        scenario.id,
+        hermes_home=home,
+        symptom=values["arguments"],
+        no_wait=True,
+        idempotency_key="execution-parity-showcase",
+    )
+    assert showcase["run_id"] is not None, showcase
+    run_ids["showcase"] = str(showcase["run_id"])
+
+    resolved = RunExecutionLimits.resolve(
+        _runtime_config(home, sidecar=package.sidecar)
+    )
+    direct = store.prepare_run_snapshot(
+        package,
+        values=values,
+        execution_limits=resolved,
+    )
+    direct_resources = (direct.staging_directory / "resources.json").read_bytes()
+    expected_digest = hashlib.sha256(direct_resources).hexdigest()
+    expected_semantics = json.dumps(
+        json.loads(direct_resources)["phase3_execution_semantics"],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    for surface, run_id in run_ids.items():
+        run_directory = store.run_directory(run_id)
+        resource_bytes = (run_directory / "resources.json").read_bytes()
+        semantics_bytes = json.dumps(
+            json.loads(resource_bytes)["phase3_execution_semantics"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        assert semantics_bytes == expected_semantics, surface
+        assert hashlib.sha256(resource_bytes).hexdigest() == expected_digest, surface
+        assert store.load_run(run_id)["input_manifest_digest"] == expected_digest
+
+    restarted_store = RunStore(home)
+    changed_scheduler = RunScheduler(
+        restarted_store,
+        ai_idle_timeout_seconds=300.0,
+        ai_wall_timeout_seconds=1800.0,
+        provider_request_timeout_seconds=300.0,
+        subprocess_timeout_seconds=120.0,
+        default_max_attempts=1,
+    )
+    authorization = restarted_store._scheduled_promotion_authorization(
+        run_ids["scheduled"], lambda _projection: None
+    )
+    try:
+        resumed = changed_scheduler._prepare_run_package(
+            run_ids["scheduled"],
+            authorization,
+        )
+    finally:
+        changed_scheduler.shutdown(deadline_seconds=2)
+    assert resumed is not None
+    assert "resources.json" in resumed[2]
+    assert resumed[3]["resources.json"] == direct_resources
+
+
 def _admit_snapshot(store: RunStore, package, prepared, *, key: str) -> str:
     admitted = store.start_run(
         RunAdmissionRequest(
@@ -370,13 +672,45 @@ def _admit_snapshot(store: RunStore, package, prepared, *, key: str) -> str:
     return admitted.run_id
 
 
+def _reseal_resources(
+    store: RunStore,
+    run_id: str,
+    encoded: bytes,
+) -> None:
+    run_directory = store.run_directory(run_id)
+    (run_directory / "resources.json").write_bytes(encoded)
+    from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
+
+    store.append_event(
+        run_id,
+        "test_reseal_resources",
+        projection_updates={
+            "input_manifest_digest": hashlib.sha256(encoded).hexdigest(),
+            "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
+        },
+    )
+
+
 def test_scheduler_resume_uses_sealed_limits_after_current_configuration_changes(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, monkeypatch
 ) -> None:
     package = _archon_package(
         tmp_path / "package",
         workflow_writer,
         nodes=[{"id": "shell", "bash": "true"}],
+        sidecar={
+            "limits": {
+                "max_parallel_nodes": 2,
+                # Invalid against the restarted current idle limit if the
+                # legacy five-field resolver runs before sealed v3 authority.
+                "ai_wall_timeout_seconds": 1,
+            },
+            "resource_limits": {
+                "process_tree_rss_bytes": 64 * 1024 * 1024,
+                "process_tree_cpu_seconds": 45.0,
+                "max_descendants": 3,
+            },
+        },
     )
     store = RunStore(tmp_path / "home")
     admitted_limits = RunExecutionLimits(
@@ -399,7 +733,24 @@ def test_scheduler_resume_uses_sealed_limits_after_current_configuration_changes
         provider_request_timeout_seconds=300.0,
         subprocess_timeout_seconds=120.0,
         default_max_attempts=5,
+        max_parallel_nodes=3,
+        cooperative_shutdown_seconds=1.0,
+        term_grace_seconds=2.0,
+        kill_reap_grace_seconds=3.0,
+        resource_limits=ProcessResourceLimits(
+            max_rss_bytes=128 * 1024 * 1024,
+            max_cpu_seconds=90.0,
+            max_descendants=6,
+        ),
     )
+    current_config_reads = 0
+
+    def reject_current_config_read(_package):
+        nonlocal current_config_reads
+        current_config_reads += 1
+        raise AssertionError("v3 resume consulted current execution limits")
+
+    monkeypatch.setattr(scheduler, "_run_execution_limits", reject_current_config_read)
     try:
         loaded = scheduler._prepare_run_package(run_id, None)
     finally:
@@ -414,6 +765,168 @@ def test_scheduler_resume_uses_sealed_limits_after_current_configuration_changes
         resumed_limits.subprocess_timeout_seconds,
         resumed_limits.combined_retries,
     ) == (120.0, 240.0, 90.0, 30.0, 2)
+    assert current_config_reads == 0
+    assert (
+        resumed_limits.max_parallel_nodes,
+        resumed_limits.process_tree_rss_bytes,
+        resumed_limits.process_tree_cpu_seconds,
+        resumed_limits.max_descendants,
+        resumed_limits.cooperative_shutdown_seconds,
+        resumed_limits.term_grace_seconds,
+        resumed_limits.kill_reap_grace_seconds,
+    ) == (2, 64 * 1024 * 1024, 45.0, 3, 1.0, 2.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda encoded: encoded.replace(
+            b'"ai_idle_timeout_seconds":300.0',
+            b'"ai_idle_timeout_seconds":300',
+            1,
+        ),
+        lambda encoded: encoded.replace(
+            b'"ai_idle_timeout_seconds":300.0',
+            b'"ai_idle_timeout_seconds":3e2',
+            1,
+        ),
+        lambda encoded: encoded.replace(
+            b'"ai_idle_timeout_seconds":300.0',
+            b'"ai_idle_timeout_seconds":300.00',
+            1,
+        ),
+        lambda encoded: encoded.replace(b"{", b"{ ", 1),
+        lambda encoded: json.dumps(
+            dict(reversed(tuple(json.loads(encoded).items()))),
+            separators=(",", ":"),
+        ).encode(),
+    ],
+    ids=("integer", "exponent", "decimal", "whitespace", "field-order"),
+)
+def test_scheduler_rejects_noncanonical_execution_semantics_bytes(
+    tmp_path,
+    workflow_writer,
+    rewrite,
+) -> None:
+    package = _archon_package(
+        tmp_path / "package",
+        workflow_writer,
+        nodes=[{"id": "shell", "bash": "true"}],
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    run_id = _admit_snapshot(store, package, prepared, key="noncanonical-semantics")
+    resources_path = store.run_directory(run_id) / "resources.json"
+    encoded = resources_path.read_bytes()
+    changed = rewrite(encoded)
+    assert changed != encoded
+    _reseal_resources(store, run_id, changed)
+
+    scheduler = RunScheduler(store)
+    try:
+        with pytest.raises(WorkflowExecutionSemanticsError) as exc:
+            scheduler._prepare_run_package(run_id, None)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert exc.value.code == "workflow_execution_semantics_mismatch"
+    assert store.load_run(run_id)["nodes"]["shell"]["attempts"] == []
+
+
+def test_scheduled_promotion_preserves_execution_semantics_mismatch(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    package = _archon_package(
+        tmp_path / "package",
+        workflow_writer,
+        nodes=[{"id": "shell", "bash": "true"}],
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    due = datetime.now(timezone.utc)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="scheduled-semantics-tamper",
+            host_kind="web",
+            host_instance_id="scheduled-semantics-tamper",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=due,
+        lease_seconds=60,
+    ).is_leader
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="scheduled-semantics-tamper",
+            concurrency_key="scheduled-semantics-tamper",
+            execution_mode="background",
+            run_metadata={
+                "schedule_at": due.isoformat().replace("+00:00", "Z"),
+                "execution_identity": "a" * 64,
+            },
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    run_id = admitted.run_id
+    resources_path = store.run_directory(run_id) / "resources.json"
+    resources = json.loads(resources_path.read_bytes())
+    resources["phase3_execution_semantics"]["nodes"]["shell"]["retry"][
+        "effective_total_attempts"
+    ] = 5
+    _reseal_resources(
+        store,
+        run_id,
+        json.dumps(resources, sort_keys=True, separators=(",", ":")).encode(),
+    )
+
+    scheduler = RunScheduler(store, utcnow=lambda: due)
+    authorization = None
+
+    def authorize(loaded_run_id, _projection):
+        nonlocal authorization
+        authorization = store._scheduled_promotion_authorization(
+            loaded_run_id,
+            lambda _current: None,
+        )
+        return True, authorization
+
+    executor_calls: list[object] = []
+    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_claim",
+        lambda *args, **kwargs: executor_calls.append((args, kwargs)),
+    )
+    try:
+        terminal = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert terminal["status"] == "failed"
+    assert terminal["last_error"]["code"] == "workflow_execution_semantics_mismatch"
+    assert terminal["nodes"]["shell"]["attempts"] == []
+    assert executor_calls == []
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            terminal,
+        )
+    assert any(
+        event["event_type"] == "run_failed"
+        and event["payload"].get("validation_code")
+        == "workflow_execution_semantics_mismatch"
+        for event in store.tail_events(run_id, limit=20)
+    )
 
 
 def test_scheduler_rejects_execution_semantics_tamper_before_claim(
@@ -434,17 +947,7 @@ def test_scheduler_rejects_execution_semantics_tamper_before_claim(
         "effective_total_attempts"
     ] = 5
     encoded = json.dumps(resources, sort_keys=True, separators=(",", ":")).encode()
-    resources_path.write_bytes(encoded)
-    from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
-
-    store.append_event(
-        run_id,
-        "test_reseal_tamper",
-        projection_updates={
-            "input_manifest_digest": hashlib.sha256(encoded).hexdigest(),
-            "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
-        },
-    )
+    _reseal_resources(store, run_id, encoded)
     scheduler = RunScheduler(store)
     try:
         with pytest.raises(WorkflowExecutionSemanticsError) as exc:

@@ -26,6 +26,11 @@ from typing import Callable, Iterable, Mapping
 from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
+from plugins.workflow.execution_semantics import (
+    Phase3ExecutionSemantics,
+    WorkflowExecutionSemanticsError,
+    read_phase3_execution_semantics,
+)
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
@@ -1978,6 +1983,55 @@ class RunScheduler:
             sidecar_resources=resources,
         )
 
+    def _run_execution_limits_with_sealed_phase3(
+        self,
+        package: WorkflowPackage,
+        semantics: Phase3ExecutionSemantics,
+    ) -> RunExecutionLimits:
+        """Resolve legacy resource controls without rereading v3 semantic fields."""
+        sidecar_limits = package.sidecar.get("limits", {})
+        sidecar_resources = package.sidecar.get("resource_limits", {})
+        if not isinstance(sidecar_limits, Mapping) or not isinstance(
+            sidecar_resources, Mapping
+        ):
+            raise ValueError("workflow sidecar limits must contain mappings")
+        sealed_names = {
+            "ai_idle_timeout_seconds",
+            "ai_wall_timeout_seconds",
+            "provider_request_timeout_seconds",
+            "subprocess_timeout_seconds",
+            "combined_retries",
+        }
+        profile_values = {
+            name: getattr(self.profile_execution_limits, name)
+            for name in self.profile_execution_limits.__dataclass_fields__
+        }
+        profile_values.update({
+            "ai_idle_timeout_seconds": semantics.limits[
+                "ai_idle_timeout_seconds"
+            ],
+            "ai_wall_timeout_seconds": semantics.limits[
+                "ai_wall_timeout_seconds"
+            ],
+            "provider_request_timeout_seconds": semantics.limits[
+                "provider_request_timeout_seconds"
+            ],
+            "subprocess_timeout_seconds": semantics.limits[
+                "subprocess_timeout_seconds"
+            ],
+            "combined_retries": semantics.limits["combined_total_attempts"],
+        })
+        base = RunExecutionLimits.resolve(
+            WorkflowRuntimeConfig(**profile_values),
+            sidecar_limits={
+                name: value
+                for name, value in sidecar_limits.items()
+                if name not in sealed_names
+            },
+            sidecar_resources=sidecar_resources,
+        )
+        return semantics.to_run_execution_limits(base=base)
+
     def _prepare_run_package(
         self,
         run_id: str,
@@ -2005,17 +2059,11 @@ class RunScheduler:
                         read_budget=read_budget,
                     )
                 )
-            execution_limits = self._run_execution_limits(package)
             if (
                 package.language.effective_profile
                 is WorkflowLanguageProfile.ARCHON_2026_07
                 and package.language.normalizer_version == 3
             ):
-                from plugins.workflow.execution_semantics import (
-                    WorkflowExecutionSemanticsError,
-                    read_phase3_execution_semantics,
-                )
-
                 try:
                     resources_bytes = sealed_bytes.get("resources.json")
                     if not isinstance(resources_bytes, bytes):
@@ -2027,6 +2075,21 @@ class RunScheduler:
                         raise WorkflowExecutionSemanticsError(
                             "sealed execution semantics resources are malformed"
                         )
+                    try:
+                        canonical_resources = json.dumps(
+                            resources,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise WorkflowExecutionSemanticsError(
+                            "sealed execution semantics resources are malformed"
+                        ) from exc
+                    if not hmac.compare_digest(resources_bytes, canonical_resources):
+                        raise WorkflowExecutionSemanticsError(
+                            "sealed execution semantics resources are not canonical"
+                        )
                     semantics = read_phase3_execution_semantics(
                         resources.get("phase3_execution_semantics"),
                         package=package,
@@ -2035,9 +2098,12 @@ class RunScheduler:
                     raise WorkflowExecutionSemanticsError(
                         "sealed execution semantics resources are malformed"
                     ) from exc
-                execution_limits = semantics.to_run_execution_limits(
-                    base=execution_limits
+                execution_limits = self._run_execution_limits_with_sealed_phase3(
+                    package,
+                    semantics,
                 )
+            else:
+                execution_limits = self._run_execution_limits(package)
             return package, execution_limits, sealed_paths, sealed_bytes
         except WorkflowValidationError as exc:
             if not exc.issues:
@@ -2053,6 +2119,22 @@ class RunScheduler:
                 error_code=issue.code,
                 error_path=issue.path,
                 error_message=issue.message,
+                schedule_revalidation=schedule_revalidation,
+            )
+            return None
+        except WorkflowExecutionSemanticsError as exc:
+            if schedule_revalidation is None:
+                raise
+            if expected_state_version is None:
+                expected_state_version = int(
+                    self.store.load_run(run_id).get("state_version", -1)
+                )
+            self.store._fail_package_validation(
+                run_id,
+                expected_state_version=expected_state_version,
+                error_code=exc.code,
+                error_path="resources.phase3_execution_semantics",
+                error_message=str(exc),
                 schedule_revalidation=schedule_revalidation,
             )
             return None

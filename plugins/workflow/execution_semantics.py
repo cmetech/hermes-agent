@@ -122,9 +122,17 @@ def _positive_finite(value: object, field: str) -> float:
     return float(value)
 
 
+def _canonical_seconds(value: object, field: str) -> float:
+    if not isinstance(value, float):
+        raise WorkflowExecutionSemanticsError(
+            f"{field} must use the canonical finite-number representation"
+        )
+    return _positive_finite(value, field)
+
+
 def _optional_positive_finite(value: object, field: str) -> None:
     if value is not None:
-        _positive_finite(value, field)
+        _canonical_seconds(value, field)
 
 
 def _bounded_integer(value: object, field: str, minimum: int, maximum: int) -> None:
@@ -378,19 +386,17 @@ def read_phase3_execution_semantics(
                 "combined_total_attempts must be an integer from 1 through 5"
             )
         parsed_limits = RunExecutionLimits(
-            ai_idle_timeout_seconds=_positive_finite(
-                raw_limits["ai_idle_timeout_seconds"],
-                "ai_idle_timeout_seconds",
+            ai_idle_timeout_seconds=_canonical_seconds(
+                raw_limits["ai_idle_timeout_seconds"], "ai_idle_timeout_seconds"
             ),
-            ai_wall_timeout_seconds=_positive_finite(
-                raw_limits["ai_wall_timeout_seconds"],
-                "ai_wall_timeout_seconds",
+            ai_wall_timeout_seconds=_canonical_seconds(
+                raw_limits["ai_wall_timeout_seconds"], "ai_wall_timeout_seconds"
             ),
-            provider_request_timeout_seconds=_positive_finite(
+            provider_request_timeout_seconds=_canonical_seconds(
                 raw_limits["provider_request_timeout_seconds"],
                 "provider_request_timeout_seconds",
             ),
-            subprocess_timeout_seconds=_positive_finite(
+            subprocess_timeout_seconds=_canonical_seconds(
                 raw_limits["subprocess_timeout_seconds"],
                 "subprocess_timeout_seconds",
             ),

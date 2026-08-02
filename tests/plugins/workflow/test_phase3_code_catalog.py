@@ -1,28 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import replace
 
 import pytest
 
 import plugins.workflow.language_schema as language_schema
-from plugins.workflow.execution_semantics import (
-    WorkflowExecutionSemanticsError,
-    build_phase3_execution_semantics,
-    read_phase3_execution_semantics,
-)
-from plugins.workflow.language import (
-    WorkflowLanguageCompatibilityError,
-    make_language_snapshot,
-    verify_language_snapshot,
-)
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.execution_semantics import WorkflowExecutionSemanticsError
+from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.language_schema import compatibility_code_catalog
 from plugins.workflow.models import (
-    RunExecutionLimits,
     WorkflowLanguageProfile,
     WorkflowValidationError,
 )
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.store import RunStore
 
 
 def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
@@ -118,7 +112,50 @@ def test_task2_snapshot_mismatch_codes_have_additive_catalog_metadata() -> None:
         assert catalog[code]["evidence"] is False
 
 
-def test_task2_catalog_codes_are_emitted_by_real_snapshot_verifiers(
+def _admit_catalog_snapshot(store: RunStore, package, *, key: str) -> str:
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=key,
+            execution_mode="foreground",
+            foreground_owner_id=f"owner-{key}",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return admitted.run_id
+
+
+def _reseal_catalog_resources(
+    store: RunStore,
+    run_id: str,
+    resources: dict[str, object],
+    *,
+    projection_updates: dict[str, object] | None = None,
+) -> None:
+    run_directory = store.run_directory(run_id)
+    encoded = json.dumps(resources, sort_keys=True, separators=(",", ":")).encode()
+    (run_directory / "resources.json").write_bytes(encoded)
+    from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
+
+    store.append_event(
+        run_id,
+        "test_reseal_catalog_resources",
+        projection_updates={
+            **dict(projection_updates or {}),
+            "input_manifest_digest": hashlib.sha256(encoded).hexdigest(),
+            "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
+        },
+    )
+
+
+def test_task2_catalog_codes_are_emitted_by_real_resume_failures(
     tmp_path, workflow_writer
 ) -> None:
     path = workflow_writer(
@@ -129,21 +166,38 @@ def test_task2_catalog_codes_are_emitted_by_real_snapshot_verifiers(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     package = load_workflow(path)
-    language_snapshot = make_language_snapshot(package, "a" * 64)
-    changed_language = replace(
-        language_snapshot,
-        normalized_definition_digest="b" * 64,
+    store = RunStore(tmp_path / "home")
+    language_run = _admit_catalog_snapshot(store, package, key="language-mismatch")
+    language_resources_path = store.run_directory(language_run) / "resources.json"
+    language_resources = json.loads(language_resources_path.read_bytes())
+    language_resources["language"]["normalized_definition_digest"] = "b" * 64
+    _reseal_catalog_resources(
+        store,
+        language_run,
+        language_resources,
+        projection_updates={"language": language_resources["language"]},
     )
 
-    with pytest.raises(WorkflowLanguageCompatibilityError) as language_exc:
-        verify_language_snapshot(package, "a" * 64, changed_language)
+    scheduler = RunScheduler(store)
+    try:
+        with pytest.raises(WorkflowLanguageCompatibilityError) as language_exc:
+            scheduler._prepare_run_package(language_run, None)
 
-    semantics = build_phase3_execution_semantics(
-        package, RunExecutionLimits()
-    ).to_dict()
-    semantics["nodes"]["agent"]["retry"]["effective_total_attempts"] = 1
-    with pytest.raises(WorkflowExecutionSemanticsError) as execution_exc:
-        read_phase3_execution_semantics(semantics, package=package)
+        execution_run = _admit_catalog_snapshot(
+            store, package, key="execution-mismatch"
+        )
+        execution_resources_path = (
+            store.run_directory(execution_run) / "resources.json"
+        )
+        execution_resources = json.loads(execution_resources_path.read_bytes())
+        execution_resources["phase3_execution_semantics"]["nodes"]["agent"][
+            "retry"
+        ]["effective_total_attempts"] = 1
+        _reseal_catalog_resources(store, execution_run, execution_resources)
+        with pytest.raises(WorkflowExecutionSemanticsError) as execution_exc:
+            scheduler._prepare_run_package(execution_run, None)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
 
     assert {
         language_exc.value.code,
