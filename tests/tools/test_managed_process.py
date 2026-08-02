@@ -26,6 +26,21 @@ def _sleep_argv(seconds: float = 30.0) -> list[str]:
     return [sys.executable, "-c", f"import time; time.sleep({seconds})"]
 
 
+def _capture_spawn_error(
+    expected_exception,
+    spawn,
+) -> tuple[type[OSError], int, object]:
+    try:
+        result = spawn()
+    except expected_exception as exc:
+        error = (type(exc), exc.errno, exc.filename)
+        exc.__traceback__ = None
+        return error
+    if isinstance(result, ManagedProcessTree):
+        result.close()
+    pytest.fail(f"DID NOT RAISE {expected_exception!r}")
+
+
 def test_termination_policy_resolves_to_bounded_deadlines() -> None:
     policy = TerminationPolicy()
 
@@ -423,19 +438,142 @@ def test_spawn_failure_does_not_close_caller_owned_inherited_descriptor(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
 @pytest.mark.live_system_guard_bypass
-def test_exec_failure_closes_internal_pins_but_not_caller_descriptor() -> None:
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_inherited_descriptor_default_executable_matches_direct_popen_failure(
+    explicit_none,
+) -> None:
     read_fd, write_fd = os.pipe()
     before = psutil.Process().num_fds()
+    argv = ["/definitely/missing/hermes-managed-process-test"]
+    direct_kwargs = {"executable": None} if explicit_none else {}
     try:
-        with pytest.raises(FileNotFoundError):
-            ManagedProcessTree.spawn(
-                ["/definitely/missing/hermes-managed-process-test"],
+        direct_error = _capture_spawn_error(
+            FileNotFoundError,
+            lambda: subprocess.Popen(argv, **direct_kwargs),
+        )
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                argv,
                 inherited_descriptors=[read_fd],
-            )
+                **direct_kwargs,
+            ),
+        )
+        assert managed_error == direct_error
         assert psutil.Process().num_fds() == before
         os.write(write_fd, b"x")
         assert os.read(read_fd, 1) == b"x"
     finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_empty_executable_matches_direct_fail_closed(
+    tmp_path,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    effect = tmp_path / "must-not-run"
+    argv = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(effect)!r}).write_text('ran')",
+    ]
+    try:
+        direct_error = _capture_spawn_error(
+            PermissionError,
+            lambda: subprocess.Popen(argv, executable=""),
+        )
+        assert not effect.exists()
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                argv,
+                executable="",
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_missing_custom_executable_matches_direct_failure(
+    tmp_path,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    effect = tmp_path / "must-not-run"
+    missing = str(tmp_path / "missing-custom-executable")
+    argv = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(effect)!r}).write_text('ran')",
+    ]
+    try:
+        direct_error = _capture_spawn_error(
+            FileNotFoundError,
+            lambda: subprocess.Popen(argv, executable=missing),
+        )
+        assert not effect.exists()
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                argv,
+                executable=missing,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_successful_custom_executable_preserves_argv() -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    argv = ["custom-python-argv-zero", "-c", "import sys;print(sys.argv)", "tail"]
+    direct = subprocess.Popen(
+        argv,
+        executable=sys.executable,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    direct_stdout, _ = direct.communicate(timeout=5)
+    tree = None
+    try:
+        tree = ManagedProcessTree.spawn(
+            argv,
+            executable=sys.executable,
+            inherited_descriptors=[read_fd],
+        )
+        managed_stdout, _ = tree.process.communicate(timeout=5)
+        assert tree.process.args == argv
+        assert managed_stdout == direct_stdout
+        assert tree.process.returncode == direct.returncode == 0
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        if tree is not None:
+            tree.close()
         os.close(read_fd)
         os.close(write_fd)
 

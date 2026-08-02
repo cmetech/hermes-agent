@@ -48,12 +48,13 @@ import sys
 
 status_fd = int(sys.argv[1])
 restore_signals = sys.argv[2] == "1"
-executable = sys.argv[3] or sys.argv[5]
+use_argv_zero = sys.argv[3] == "1"
+executable = sys.argv[6] if use_argv_zero else sys.argv[4]
 pairs = tuple(
     (int(pin), int(target))
-    for pin, target in (item.split(":", 1) for item in sys.argv[4].split(","))
+    for pin, target in (item.split(":", 1) for item in sys.argv[5].split(","))
 )
-argv = sys.argv[5:]
+argv = sys.argv[6:]
 try:
     os.set_inheritable(status_fd, False)
     for pin, target in pairs:
@@ -690,11 +691,13 @@ class ManagedProcessTree:
                     _close_descriptors(tuple(pin for pin, _target in pinned))
                     raise
                 raw_executable = kwargs.pop("executable", None)
+                use_argv_zero = raw_executable is None
                 executable = (
                     ""
-                    if raw_executable is None
+                    if use_argv_zero
                     else os.fsdecode(os.fspath(raw_executable))
                 )
+                resolved_executable = argv[0] if use_argv_zero else executable
                 restore_signals = bool(kwargs.get("restore_signals", True))
                 mapping = ",".join(
                     f"{pin}:{target}" for pin, target in pinned
@@ -707,6 +710,7 @@ class ManagedProcessTree:
                     _POSIX_DESCRIPTOR_BOOTSTRAP,
                     str(status_write),
                     "1" if restore_signals else "0",
+                    "1" if use_argv_zero else "0",
                     executable,
                     mapping,
                     *argv,
@@ -743,13 +747,10 @@ class ManagedProcessTree:
                         if separator and number.isdigit()
                         else errno.EIO
                     )
-                    target = os.fsdecode(
-                        os.fspath(popen_kwargs.get("executable", argv[0]))
-                    )
                     raise OSError(
                         error_number,
                         message.decode("utf-8", "replace"),
-                        target,
+                        resolved_executable,
                     )
                 # The bootstrap execs in place; keep Popen's public identity
                 # compatible with a direct launch rather than exposing internals.
