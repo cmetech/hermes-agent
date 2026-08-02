@@ -19,7 +19,11 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
-from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.models import (
+    RunExecutionLimits,
+    WorkflowPackage,
+    WorkflowValidationError,
+)
 from plugins.workflow.compat import (
     WorkflowCompatibilityBlockedError,
     require_runnable,
@@ -433,12 +437,18 @@ def start_api_run(
             ) from exc
 
     try:
+        from plugins.workflow.cli import _runtime_config
+
+        execution_limits = RunExecutionLimits.resolve(
+            _runtime_config(home, sidecar=package.sidecar)
+        )
         prepared = store.prepare_run_snapshot(
             package,
             values=values or None,
             verified_inputs=verified_inputs or None,
             resource_read_budget=resource_budget,
             trusted_package_digest=package_digest,
+            execution_limits=execution_limits,
         )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(

@@ -46,6 +46,7 @@ from plugins.workflow.compat import (
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
+    RunExecutionLimits,
     ValidationIssue,
     WorkflowLanguageProfile,
     WorkflowPackage,
@@ -1823,7 +1824,9 @@ def _cmd_run(
         else None
     )
     prepared = store.prepare_run_snapshot(
-        package, values={"arguments": args.arguments} if args.arguments else None
+        package,
+        values={"arguments": args.arguments} if args.arguments else None,
+        execution_limits=RunExecutionLimits.resolve(runtime),
     )
     intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(

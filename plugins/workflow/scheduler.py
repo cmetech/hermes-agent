@@ -2005,12 +2005,40 @@ class RunScheduler:
                         read_budget=read_budget,
                     )
                 )
-            return (
-                package,
-                self._run_execution_limits(package),
-                sealed_paths,
-                sealed_bytes,
-            )
+            execution_limits = self._run_execution_limits(package)
+            if (
+                package.language.effective_profile
+                is WorkflowLanguageProfile.ARCHON_2026_07
+                and package.language.normalizer_version == 3
+            ):
+                from plugins.workflow.execution_semantics import (
+                    WorkflowExecutionSemanticsError,
+                    read_phase3_execution_semantics,
+                )
+
+                try:
+                    resources_bytes = sealed_bytes.get("resources.json")
+                    if not isinstance(resources_bytes, bytes):
+                        raise WorkflowExecutionSemanticsError(
+                            "sealed execution semantics resources are missing"
+                        )
+                    resources = json.loads(resources_bytes)
+                    if not isinstance(resources, Mapping):
+                        raise WorkflowExecutionSemanticsError(
+                            "sealed execution semantics resources are malformed"
+                        )
+                    semantics = read_phase3_execution_semantics(
+                        resources.get("phase3_execution_semantics"),
+                        package=package,
+                    )
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise WorkflowExecutionSemanticsError(
+                        "sealed execution semantics resources are malformed"
+                    ) from exc
+                execution_limits = semantics.to_run_execution_limits(
+                    base=execution_limits
+                )
+            return package, execution_limits, sealed_paths, sealed_bytes
         except WorkflowValidationError as exc:
             if not exc.issues:
                 raise

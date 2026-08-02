@@ -3,11 +3,19 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.runner_binding import (
+    assess_package_execution,
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
     WorkflowApiLimits,
@@ -21,11 +29,106 @@ from plugins.workflow.store import (
     RunStore,
     TypedPublicationCandidate,
 )
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    compute_package_digest,
+)
+import yaml
 
 
 class _Store:
     def __init__(self, home: Path) -> None:
         self.home = home
+
+
+def test_api_admission_seals_resolved_profile_execution_authority(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "profile"
+    path = workflow_writer(
+        home / "workflows",
+        name="archon-sealed-api-limits",
+        filename="archon-sealed-api-limits.yaml",
+        nodes=[{"id": "start", "bash": "true"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "plugins": {
+                "entries": {
+                    "workflow": {
+                        "runtime": {
+                            "ai_idle_timeout_seconds": 120,
+                            "ai_wall_timeout_seconds": 240,
+                            "provider_request_timeout_seconds": 90,
+                            "subprocess_timeout_seconds": 30,
+                            "combined_retries": 2,
+                        }
+                    }
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    binding = production_workflow_runner_binding()
+    context = background_execution_context(binding, requires_ai=False)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    coordinator = CoordinatorStore(store.database)
+    acquired = coordinator.try_acquire(
+        CoordinatorIdentity(
+            owner_id="api-sealed-limits",
+            host_kind="web",
+            host_instance_id="api-sealed-limits",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values={},
+        idempotency_key="archon-sealed-api-limits",
+        concurrency_policy="queue",
+        authority=ApiAdmissionAuthority(
+            principal="api-sealed-limits",
+            namespace="api-sealed-limits",
+            operator_scope=None,
+            source_instance="desktop:api-sealed-limits",
+            assurance="local_admin_claim",
+            trigger_source="desktop",
+        ),
+        catalog_source="profile",
+        runner_binding=binding,
+    )
+    resources = json.loads(
+        (
+            store.run_directory(str(admitted["run_id"])) / "resources.json"
+        ).read_bytes()
+    )
+
+    assert resources["phase3_execution_semantics"]["limits"] == {
+        "ai_idle_timeout_seconds": 120.0,
+        "ai_wall_timeout_seconds": 240.0,
+        "provider_request_timeout_seconds": 90.0,
+        "subprocess_timeout_seconds": 30.0,
+        "combined_total_attempts": 2,
+    }
 
 
 def test_registry_reuses_profile_store_and_evicts_only_idle_lru(tmp_path) -> None:

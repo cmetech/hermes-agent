@@ -253,6 +253,72 @@ def test_archon_phase3_timeout_and_retry_fields_validate(
     assert result["language"]["normalizer_version"] == 3
 
 
+def test_archon_cli_admission_seals_resolved_profile_execution_authority(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="archon-sealed-cli-limits",
+        filename="archon-sealed-cli-limits.yaml",
+        nodes=[{"id": "start", "bash": "true"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "plugins": {
+                "entries": {
+                    "workflow": {
+                        "runtime": {
+                            "ai_idle_timeout_seconds": 120,
+                            "ai_wall_timeout_seconds": 240,
+                            "provider_request_timeout_seconds": 90,
+                            "subprocess_timeout_seconds": 30,
+                            "combined_retries": 2,
+                        }
+                    }
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(home),
+        "run",
+        path.stem,
+        "--foreground",
+        "--idempotency-key",
+        "archon-sealed-cli-limits",
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    result = _json_result(capsys)
+    resources = json.loads(
+        (RunStore(home).run_directory(result["run_id"]) / "resources.json").read_bytes()
+    )
+    assert resources["phase3_execution_semantics"]["limits"] == {
+        "ai_idle_timeout_seconds": 120.0,
+        "ai_wall_timeout_seconds": 240.0,
+        "provider_request_timeout_seconds": 90.0,
+        "subprocess_timeout_seconds": 30.0,
+        "combined_total_attempts": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

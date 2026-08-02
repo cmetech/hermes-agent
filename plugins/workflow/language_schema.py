@@ -200,6 +200,28 @@ PHASE3_DURABLE_CODES = (
         False,
         ("nodes[].retry",),
     ),
+    DurableWorkflowCode(
+        "workflow_language_snapshot_mismatch",
+        "sealed language semantics differ from the normalized package",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("resources.language",),
+    ),
+    DurableWorkflowCode(
+        "workflow_execution_semantics_mismatch",
+        "sealed execution semantics are malformed or differ from the normalized request",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("resources.phase3_execution_semantics",),
+    ),
 )
 
 

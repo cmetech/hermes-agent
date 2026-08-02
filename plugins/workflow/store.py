@@ -50,6 +50,7 @@ from plugins.workflow.lease_clock import (
 from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
+    RunExecutionLimits,
     TerminalJournalReserve,
     WorkflowLanguageProfile,
     WorkflowPackage,
@@ -3857,6 +3858,7 @@ class RunStore:
         verified_inputs: Mapping[str, tuple[bytes, str]] | None = None,
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
+        execution_limits: RunExecutionLimits | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -3883,6 +3885,20 @@ class RunStore:
                 package, read_budget=resource_read_budget
             )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
+            phase3_execution_semantics = None
+            if (
+                package.language.effective_profile
+                is WorkflowLanguageProfile.ARCHON_2026_07
+                and package.language.normalizer_version == 3
+            ):
+                from plugins.workflow.execution_semantics import (
+                    build_phase3_execution_semantics,
+                )
+
+                phase3_execution_semantics = build_phase3_execution_semantics(
+                    package,
+                    execution_limits or RunExecutionLimits(),
+                ).to_dict()
 
             def read_package_file(path: Path) -> bytes:
                 if resource_read_budget is None:
@@ -4086,14 +4102,19 @@ class RunStore:
                 }
                 | {"resources.json"}
             )
+            snapshot_resources: dict[str, object] = {
+                "inputs_sha256": _sha256(manifest_data),
+                "node_skills": node_skill_digests,
+                "node_agent_skills": node_agent_skill_digests,
+                "language": language,
+                "sealed_paths": sealed_paths,
+            }
+            if phase3_execution_semantics is not None:
+                snapshot_resources["phase3_execution_semantics"] = (
+                    phase3_execution_semantics
+                )
             snapshot_manifest = json.dumps(
-                {
-                    "inputs_sha256": _sha256(manifest_data),
-                    "node_skills": node_skill_digests,
-                    "node_agent_skills": node_agent_skill_digests,
-                    "language": language,
-                    "sealed_paths": sealed_paths,
-                },
+                snapshot_resources,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
