@@ -341,18 +341,28 @@ class RetryLedgerGrant:
             on_error=self.on_error,
         )
 
-    def charge(self, provider_evidence: object) -> "RetryAttemptCharge":
+    def charge(
+        self,
+        provider_evidence: object,
+        *,
+        provider_attempts_exact: bool | None = None,
+    ) -> "RetryAttemptCharge":
         """Charge one workflow attempt and validated provider retries once."""
         granted = self.remaining_attempts
         if granted <= 0:
             raise ValueError("retry grant is exhausted")
         if (
-            isinstance(provider_evidence, int)
+            provider_attempts_exact is not False
+            and isinstance(provider_evidence, int)
             and not isinstance(provider_evidence, bool)
             and 0 <= provider_evidence < granted
         ):
             additional = provider_evidence
-            exact = True
+            exact = (
+                provider_attempts_exact
+                if isinstance(provider_attempts_exact, bool)
+                else True
+            )
         else:
             additional = granted - 1
             exact = False

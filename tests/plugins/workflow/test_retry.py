@@ -4,9 +4,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.models import RetryPolicy, RunExecutionLimits
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    execution_capability_context,
+)
 from plugins.workflow.scheduler import (
     FailureClass,
     RunScheduler,
@@ -17,7 +24,14 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def _start(store, package, *, key="retry", execution_limits=None):
+def _start(
+    store,
+    package,
+    *,
+    key="retry",
+    execution_limits=None,
+    run_metadata=None,
+):
     prepared = store.prepare_run_snapshot(
         package,
         execution_limits=execution_limits,
@@ -31,6 +45,7 @@ def _start(store, package, *, key="retry", execution_limits=None):
             trigger_source="cli",
             idempotency_key=key,
             concurrency_key=package.definition.name,
+            run_metadata=run_metadata,
         ),
         immutable_snapshot=prepared,
     )
@@ -277,6 +292,42 @@ def test_archon_missing_or_invalid_exact_provider_evidence_consumes_full_grant(
     assert evidence["remaining_attempts"] == 0
 
 
+def test_archon_explicit_inexact_provider_count_cannot_reduce_conservative_charge(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "explicit-inexact",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=3,
+    )
+    store = RunStore(tmp_path / "explicit-inexact-home")
+    admitted = _start(store, package, key="explicit-inexact")
+
+    class Inexact:
+        def execute(self, _context):
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                metadata={
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": False,
+                },
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = Inexact()
+    result = scheduler.advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    evidence = node["attempts"][0]["metadata"]
+    assert result["status"] == "failed"
+    assert node["retry_consumed"] == 3
+    assert evidence["additional_provider_attempts"] == 2
+    assert evidence["provider_attempts_exact"] is False
+
+
 def test_archon_unknown_provider_outcome_reconciles_after_full_conservative_charge(
     tmp_path, workflow_writer
 ) -> None:
@@ -329,6 +380,417 @@ def test_phase3_failure_classes_distinguish_unknown_effects_and_terminal_errors(
         known_no_effect=known_no_effect,
         outward_action=outward_action,
     ).value == expected
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "authentication",
+        "authorization",
+        "credit_exhausted",
+        "validation",
+        "invalid_request",
+        "output_limit",
+        "resource_limit",
+        "cleanup_failed",
+        "execution_integrity",
+        "structured_output_capability_drift",
+        "workflow_execution_semantics_mismatch",
+        "workflow_language_snapshot_invalid",
+    ],
+)
+def test_phase3_outward_nodes_preserve_closed_fatal_classification(error_code):
+    assert classify_failure(
+        error_code,
+        known_no_effect=True,
+        outward_action=True,
+    ) is FailureClass.FATAL
+
+
+@pytest.mark.parametrize("on_error", ["transient", "all"])
+def test_archon_outward_execution_integrity_is_terminal_before_provider_launch(
+    tmp_path, workflow_writer, on_error
+) -> None:
+    retry = {"max_attempts": 2, "on_error": on_error}
+    package = _archon_retry_package(
+        tmp_path / on_error,
+        workflow_writer,
+        node_type="prompt",
+        retry=retry,
+        combined_total_attempts=3,
+        outward=True,
+    )
+    store = RunStore(tmp_path / f"home-{on_error}")
+    admitted = _start(
+        store,
+        package,
+        key=f"integrity-{on_error}",
+        run_metadata={"ai_entitlement": "real"},
+    )
+
+    class ProviderTrap:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, _request, **_kwargs):
+            self.calls += 1
+            raise AssertionError("provider launched past entitlement integrity failure")
+
+    runner = ProviderTrap()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    assert result["status"] == "failed"
+    assert runner.calls == 0
+    assert len(node["attempts"]) == 1
+    assert node["retry_consumed"] == 1
+    assert node.get("pending_interaction") is None
+    assert node["attempts"][0]["metadata"]["provider_attempts_exact"] is True
+    assert node["attempts"][0]["metadata"]["additional_provider_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    ("total_provider_calls", "fallback_model"),
+    [(1, None), (2, "fallback-model")],
+    ids=("initial-only", "fallback-call"),
+)
+def test_archon_text_worker_totals_convert_once_before_durable_charge(
+    tmp_path,
+    workflow_writer,
+    total_provider_calls,
+    fallback_model,
+) -> None:
+    node = {"id": "work", "prompt": "work"}
+    if fallback_model is not None:
+        node["fallbackModel"] = fallback_model
+    workflow = workflow_writer(
+        tmp_path / f"text-{total_provider_calls}",
+        name=f"text-total-{total_provider_calls}",
+        nodes=[node],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits: {combined_retries: 3}\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / f"text-home-{total_provider_calls}")
+    admitted = _start(store, package, key=f"text-{total_provider_calls}")
+
+    class TextRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="done",
+                session_id="text-session",
+                provider="fake",
+                model="fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={"provider_attempts": total_provider_calls},
+            )
+
+    runner = TextRunner()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    node_state = result["nodes"]["work"]
+    attempt = node_state["attempts"][0]["metadata"]
+    assert result["status"] == "succeeded"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].fallback_model == fallback_model
+    assert node_state["retry_consumed"] == total_provider_calls
+    assert attempt["additional_provider_attempts"] == total_provider_calls - 1
+    assert attempt["provider_attempts_exact"] is True
+
+
+@pytest.mark.parametrize(
+    ("raised", "error_code", "expected_status"),
+    [
+        (OSError("network down"), "network_error", "failed"),
+        (RuntimeError("runner broke"), "agent_execution_failed", "paused"),
+    ],
+    ids=("os-error", "runner-error"),
+)
+def test_archon_real_runner_exceptions_keep_conservative_charge_provenance(
+    tmp_path, workflow_writer, raised, error_code, expected_status
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / error_code,
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=3,
+    )
+    store = RunStore(tmp_path / f"home-{error_code}")
+    admitted = _start(store, package, key=error_code)
+
+    class RaisingRunner:
+        def run(self, _request, **_kwargs):
+            raise raised
+
+    result = RunScheduler(store, agent_runner=RaisingRunner()).advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    attempt = node["attempts"][0]["metadata"]
+    assert result["status"] == expected_status
+    assert node["retry_consumed"] == 3
+    assert attempt["additional_provider_attempts"] == 2
+    assert attempt["provider_attempts_exact"] is False
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [None, -1],
+    ids=("missing", "invalid"),
+)
+def test_archon_real_failed_result_keeps_conservative_charge_provenance(
+    tmp_path, workflow_writer, reported
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / f"reported-{reported}",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=3,
+    )
+    store = RunStore(tmp_path / f"home-reported-{reported}")
+    admitted = _start(store, package, key=f"reported-{reported}")
+
+    class FailedRunner:
+        def run(self, _request, **_kwargs):
+            audit = {"failure_kind": "agent_failed"}
+            if reported is not None:
+                audit["provider_attempts"] = reported
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit=audit,
+            )
+
+    result = RunScheduler(store, agent_runner=FailedRunner()).advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    attempt = node["attempts"][0]["metadata"]
+    assert result["status"] == "paused"
+    assert node["retry_consumed"] == 3
+    assert attempt["additional_provider_attempts"] == 2
+    assert attempt["provider_attempts_exact"] is False
+
+
+def test_archon_fallback_without_exact_worker_count_uses_conservative_provenance(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "fallback-conservative",
+        name="fallback-conservative",
+        nodes=[{
+            "id": "work",
+            "prompt": "work",
+            "fallbackModel": "fallback-model",
+        }],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits: {combined_retries: 3}\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "fallback-conservative-home")
+    admitted = _start(store, package, key="fallback-conservative")
+
+    class FallbackCountMissing:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider="fake",
+                model="fallback-model",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "provider_timeout"},
+            )
+
+    runner = FallbackCountMissing()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    evidence = node["attempts"][0]["metadata"]
+    assert runner.requests[0].fallback_model == "fallback-model"
+    assert result["status"] == "failed"
+    assert node["retry_consumed"] == 3
+    assert evidence["additional_provider_attempts"] == 2
+    assert evidence["provider_attempts_exact"] is False
+
+
+def test_archon_structured_repair_failure_keeps_conservative_charge_provenance(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "repair",
+        name="repair-accounting",
+        nodes=[{
+            "id": "work",
+            "prompt": "produce structured data",
+            "output_format": {
+                "type": "object",
+                "required": ["answer"],
+                "properties": {"answer": {"type": "string"}},
+            },
+        }],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits: {combined_retries: 3}\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="fake-provider",
+            model="fake-model",
+        ),
+    )
+    decision = execution_context.structured_output_decisions(package)["work"]
+    store = RunStore(tmp_path / "repair-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="repair-accounting",
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class RepairFails:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            if len(self.requests) == 2:
+                raise RuntimeError("repair worker unavailable")
+            structured = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": decision.declaration_source,
+            }
+            return PluginAgentRunResult(
+                final_response="not json",
+                session_id="repair-session",
+                provider=decision.effective_provider,
+                model=decision.model,
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    **structured,
+                    "api_calls": 1,
+                    "api_mode": decision.api_mode,
+                },
+                structured_output=structured,
+            )
+
+    runner = RepairFails()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    attempt = node["attempts"][0]["metadata"]
+    assert len(runner.requests) == 2
+    assert result["status"] == "failed"
+    assert node["retry_consumed"] == 3
+    assert attempt["additional_provider_attempts"] == 2
+    assert attempt["provider_attempts_exact"] is False
+    assert attempt["audit"]["provider_attempts_exact"] is False
+
+
+@pytest.mark.parametrize(
+    ("node_type", "additional_provider_attempts", "expected_charge"),
+    [("bash", 0, 1), ("prompt", 1, 2)],
+    ids=("deterministic", "ai"),
+)
+def test_archon_cleanup_failure_atomically_charges_and_blocks_restart_replay(
+    tmp_path,
+    workflow_writer,
+    node_type,
+    additional_provider_attempts,
+    expected_charge,
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / node_type,
+        workflow_writer,
+        node_type=node_type,
+        retry={"max_attempts": 2, "on_error": "all"},
+        combined_total_attempts=3,
+    )
+    store = RunStore(tmp_path / f"cleanup-home-{node_type}")
+    admitted = _start(store, package, key=f"cleanup-{node_type}")
+    calls = 0
+
+    class CleanupFails:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            return NodeExecutionResult(
+                "failed",
+                error_code="cleanup_failed",
+                error_message="owned process remained",
+                metadata={
+                    "additional_provider_attempts": additional_provider_attempts,
+                    "provider_attempts_exact": True,
+                },
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors[node_type] = CleanupFails()
+    first = scheduler.advance(admitted.run_id)
+
+    node = first["nodes"]["work"]
+    assert first["desired_status"] == "cleanup_failed"
+    assert node["retry_consumed"] == expected_charge
+    assert node["attempts"][0]["metadata"]["retry_consumed"] == expected_charge
+    assert node["attempts"][0]["metadata"]["provider_attempts_exact"] is True
+
+    class ReplayTrap:
+        def execute(self, _context):
+            raise AssertionError("cleanup-blocked attempt replayed after restart")
+
+    restarted = RunScheduler(store)
+    restarted.executors[node_type] = ReplayTrap()
+    after_restart = restarted.advance(admitted.run_id)
+
+    assert calls == 1
+    assert after_restart["desired_status"] == "cleanup_failed"
+    assert after_restart["nodes"]["work"]["retry_consumed"] == expected_charge
 
 
 def test_archon_unknown_no_effect_retries_only_under_explicit_all_policy(

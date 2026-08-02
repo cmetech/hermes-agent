@@ -143,6 +143,27 @@ def validated_provider_retry_count(
     return None
 
 
+def validated_provider_total_call_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int | None:
+    """Convert an exact total provider-call count to additional calls once."""
+    if (
+        isinstance(granted_attempts, bool)
+        or not isinstance(granted_attempts, int)
+        or granted_attempts <= 0
+    ):
+        raise ValueError("granted provider attempts must be a positive integer")
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= granted_attempts
+    ):
+        return value - 1
+    return None
+
+
 def conservative_provider_retry_count(
     value: object,
     *,

@@ -31,6 +31,7 @@ from plugins.workflow.executors.base import (
     conservative_provider_retry_count,
     sealed_provider_request_for_launch,
     validated_provider_retry_count,
+    validated_provider_total_call_count,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import (
@@ -406,6 +407,11 @@ class AgentNodeExecutor:
         wall_deadline: float,
     ) -> NodeExecutionResult:
         response = initial_result.final_response
+        strict_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and isinstance(context.variable_context, VariableContext)
+            and context.variable_context.normalizer_version == 3
+        )
         response_bytes = response.encode("utf-8")
         diagnostics = self._bounded_diagnostics(diagnostics)
         metadata.update({
@@ -446,6 +452,8 @@ class AgentNodeExecutor:
             })
             metadata["audit"] = aggregate_audit
             metadata["provider_attempts"] = max(0, granted_provider_attempts - 1)
+            if strict_v3:
+                metadata["provider_attempts_exact"] = False
 
         if (
             structured_request.strategy
@@ -574,6 +582,8 @@ class AgentNodeExecutor:
         })
         metadata["audit"] = aggregate_audit
         metadata["provider_attempts"] = max(0, total_provider_attempts - 1)
+        if strict_v3:
+            metadata["provider_attempts_exact"] = True
         if repair_result.status != "completed":
             return failed(
                 "repair_cancelled"
@@ -691,6 +701,16 @@ class AgentNodeExecutor:
                 self.deterministic_runner,
             )
         except AIExecutionIntegrityError as exc:
+            if strict_v3:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="execution_integrity",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "provider_attempts_exact": True,
+                    },
+                )
             return self._failure("execution_integrity", str(exc))
         if agent_runner is None:
             return self._failure(
@@ -830,7 +850,10 @@ class AgentNodeExecutor:
                     "failed",
                     error_code="provider_timeout",
                     error_message="workflow attempt deadline expired",
-                    metadata={"provider_attempts": 0},
+                    metadata={
+                        "provider_attempts": 0,
+                        **({"provider_attempts_exact": True} if strict_v3 else {}),
+                    },
                 )
             wall_deadline = (
                 context.deadline_budget.wall_deadline
@@ -1017,7 +1040,8 @@ class AgentNodeExecutor:
                     "provider_attempts": conservative_provider_retry_count(
                         None,
                         granted_attempts=granted_provider_attempts,
-                    )
+                    ),
+                    **({"provider_attempts_exact": False} if strict_v3 else {}),
                 },
             )
         except ValueError as exc:
@@ -1033,7 +1057,8 @@ class AgentNodeExecutor:
                     "provider_attempts": conservative_provider_retry_count(
                         None,
                         granted_attempts=granted_provider_attempts,
-                    )
+                    ),
+                    **({"provider_attempts_exact": False} if strict_v3 else {}),
                 },
             )
         finally:
@@ -1081,10 +1106,14 @@ class AgentNodeExecutor:
                     None,
                     granted_attempts=granted_provider_attempts,
                 )
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = False
             else:
                 metadata["negotiation_evidence"] = "corroborated"
                 error_message = "structured output negotiation failed"
                 metadata["provider_attempts"] = 0
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = True
             metadata["archon_terminal_failure"] = True
             return NodeExecutionResult(
                 "failed",
@@ -1114,6 +1143,8 @@ class AgentNodeExecutor:
                     metadata=metadata,
                 )
             metadata["provider_attempts"] = max(0, structured_counts[0] - 1)
+            if strict_v3:
+                metadata["provider_attempts_exact"] = True
         elif structured_request is not None and result.status == "completed":
             metadata["archon_terminal_failure"] = True
             return NodeExecutionResult(
@@ -1123,12 +1154,23 @@ class AgentNodeExecutor:
                 metadata=metadata,
             )
         else:
-            provider_attempts = validated_provider_retry_count(
-                result.audit.get("provider_attempts"),
-                granted_attempts=granted_provider_attempts,
+            provider_attempts = (
+                validated_provider_total_call_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
+                )
+                if strict_v3
+                else validated_provider_retry_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
+                )
             )
             if provider_attempts is not None:
                 metadata["provider_attempts"] = provider_attempts
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = True
+            elif strict_v3:
+                metadata["provider_attempts_exact"] = False
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
             return NodeExecutionResult("paused", metadata=metadata)
@@ -1178,6 +1220,8 @@ class AgentNodeExecutor:
                     result.audit.get("provider_attempts"),
                     granted_attempts=granted_provider_attempts,
                 )
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = False
             return NodeExecutionResult(
                 "failed",
                 (),

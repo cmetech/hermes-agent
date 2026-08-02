@@ -9940,9 +9940,17 @@ class RunStore:
         *,
         artifacts: Iterable[ArtifactRef] = (),
         error_message: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        consumed_attempts: int | None = None,
         now: LeaseClockSample | None = None,
     ) -> None:
         """Keep ownership blocked when an executor cannot prove tree cleanup."""
+        if consumed_attempts is not None and (
+            isinstance(consumed_attempts, bool)
+            or not isinstance(consumed_attempts, int)
+            or consumed_attempts < 0
+        ):
+            raise ValueError("consumed attempts must be a non-negative integer")
         directory = self.run_directory(claim.run_id)
         with workflow_lock(
             self._run_lock_path(claim.run_id)
@@ -9954,6 +9962,13 @@ class RunStore:
             active = node.get("claim", {})
             if active.get("attempt_id") != claim.attempt_id:
                 raise RuntimeError("stale cleanup failure")
+            safe_metadata = None
+            if metadata is not None:
+                safe_metadata = dict(_sanitize(dict(metadata)))
+                safe_metadata.pop("output", None)
+                node["attempts"][-1]["metadata"] = safe_metadata
+            if consumed_attempts is not None:
+                node["retry_consumed"] = consumed_attempts
             projection["desired_status"] = "cleanup_failed"
             projection["last_error"] = {
                 "code": "cleanup_failed",
@@ -9983,7 +9998,16 @@ class RunStore:
                 directory,
                 projection,
                 "cleanup_failed",
-                {"artifacts": refs, "cleanup_complete": False},
+                {
+                    "artifacts": refs,
+                    "cleanup_complete": False,
+                    **(
+                        {"retry_consumed": consumed_attempts}
+                        if consumed_attempts is not None
+                        else {}
+                    ),
+                    **({"metadata": safe_metadata} if safe_metadata is not None else {}),
+                },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,

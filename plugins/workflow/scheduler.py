@@ -284,6 +284,8 @@ _FATAL_FAILURES = {
     "output_limit",
     "resource_limit",
     "cleanup_failed",
+    "execution_integrity",
+    "structured_output_integrity",
     "structured_output_capability_drift",
     "workflow_execution_semantics_mismatch",
     "workflow_language_snapshot_invalid",
@@ -303,6 +305,8 @@ def classify_failure(
     code = (error_code or "").lower()
     if code in {"cancelled", "shutdown", "interrupted"}:
         return FailureClass.CANCELLED
+    if code in _FATAL_FAILURES:
+        return FailureClass.FATAL
     if outward_action:
         return FailureClass.UNKNOWN_OUTCOME
     if code in {"unknown_side_effect", "outcome_unknown"}:
@@ -311,8 +315,6 @@ def classify_failure(
             if known_no_effect is None
             else FailureClass.UNKNOWN_OUTCOME
         )
-    if code in _FATAL_FAILURES:
-        return FailureClass.FATAL
     if (
         known_no_effect is False
         and code not in _TRANSIENT_FAILURES
@@ -3343,7 +3345,13 @@ class RunScheduler:
                         result.metadata.get("provider_attempts"),
                     )
                 )
-                retry_charge = retry_grant.charge(provider_evidence)
+                exactness = result.metadata.get("provider_attempts_exact")
+                retry_charge = retry_grant.charge(
+                    provider_evidence,
+                    provider_attempts_exact=(
+                        exactness if isinstance(exactness, bool) else None
+                    ),
+                )
                 result = replace(
                     result,
                     metadata={
@@ -3361,6 +3369,14 @@ class RunScheduler:
                 claim,
                 artifacts=result.artifacts,
                 error_message=result.error_message,
+                metadata=(
+                    result.metadata if execution_semantics is not None else None
+                ),
+                consumed_attempts=(
+                    retry_charge.retry_consumed
+                    if retry_charge is not None
+                    else None
+                ),
             )
             return
         if result.status != "failed":
