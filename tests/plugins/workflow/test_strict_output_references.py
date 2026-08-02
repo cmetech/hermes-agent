@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 import plugins.workflow.language_schema as language_schema
+import plugins.workflow.resources as workflow_resources
 from agent.structured_output import normalize_schema
 from plugins.workflow import output_resolution
 from plugins.workflow.resources import VariableContext, substitution_renderer
@@ -1341,6 +1342,80 @@ def test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash(
         "field value",
         "neighbor value",
     ]
+
+
+def test_v3_output_and_scalar_span_composition_scales_with_token_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_iterator = workflow_resources.iter_output_references
+    span_reads = 0
+
+    class CountingReference:
+        def __init__(self, reference: language_schema.OutputReferenceToken) -> None:
+            self.node_id = reference.node_id
+            self.path = reference.path
+            self._start = reference.start
+            self._end = reference.end
+
+        @property
+        def start(self) -> int:
+            nonlocal span_reads
+            span_reads += 1
+            return self._start
+
+        @property
+        def end(self) -> int:
+            nonlocal span_reads
+            span_reads += 1
+            return self._end
+
+    def counting_iterator(
+        template: str,
+        *,
+        normalizer_version: int,
+    ):
+        for reference in real_iterator(
+            template,
+            normalizer_version=normalizer_version,
+        ):
+            yield CountingReference(reference)
+
+    monkeypatch.setattr(
+        workflow_resources,
+        "iter_output_references",
+        counting_iterator,
+    )
+    renderer = substitution_renderer(
+        VariableContext(
+            arguments="scalar value",
+            node_outputs={
+                "ARGUMENTS": _resolved_output(
+                    "output value",
+                    structured=False,
+                    node_id="ARGUMENTS",
+                )
+            },
+            normalizer_version=3,
+        ),
+        direct_dependencies=("ARGUMENTS",),
+    )
+
+    def render(token_count: int) -> tuple[int, str]:
+        nonlocal span_reads
+        span_reads = 0
+        template = " ".join(
+            "$ARGUMENTS.output $ARGUMENTS" for _ in range(token_count)
+        )
+        rendered = renderer.render_prompt(template)
+        return span_reads, rendered
+
+    small_reads, _ = render(128)
+    large_reads, rendered = render(512)
+
+    assert rendered == " ".join(
+        "output value scalar value" for _ in range(512)
+    )
+    assert large_reads <= small_reads * 5
 
 
 def test_v3_malformed_later_reference_reports_its_exact_producer() -> None:

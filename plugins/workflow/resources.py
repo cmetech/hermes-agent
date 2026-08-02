@@ -842,11 +842,16 @@ class StrictSubstitutionRenderer:
             for reference in references
         ]
         if include_scalar_variables:
+            reference_cursor = 0
             for match in _SCALAR_VARIABLE.finditer(template):
-                if any(
-                    match.start() < reference.end
-                    and match.end() > reference.start
-                    for reference in references
+                while (
+                    reference_cursor < len(references)
+                    and references[reference_cursor].end <= match.start()
+                ):
+                    reference_cursor += 1
+                if reference_cursor < len(references) and (
+                    match.start() < references[reference_cursor].end
+                    and match.end() > references[reference_cursor].start
                 ):
                     continue
                 value = self._scalar(match)
