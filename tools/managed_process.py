@@ -10,11 +10,13 @@ primitive without acquiring terminal-specific state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import logging
 import math
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -37,6 +39,142 @@ _CREATE_SUSPENDED = 0x00000004
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 _MAX_INHERITED_DESCRIPTORS = 64
+_DESCRIPTOR_BOOTSTRAP_ERROR_MAX_BYTES = 4096
+_POSIX_DESCRIPTOR_BOOTSTRAP = r"""
+import errno
+import os
+import signal
+import sys
+
+status_fd = int(sys.argv[1])
+restore_signals = sys.argv[2] == "1"
+executable = sys.argv[3] or sys.argv[5]
+pairs = tuple(
+    (int(pin), int(target))
+    for pin, target in (item.split(":", 1) for item in sys.argv[4].split(","))
+)
+argv = sys.argv[5:]
+try:
+    os.set_inheritable(status_fd, False)
+    for pin, target in pairs:
+        os.dup2(pin, target, inheritable=True)
+    for pin, _target in pairs:
+        os.close(pin)
+    if restore_signals:
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            value = getattr(signal, name, None)
+            if value is not None:
+                signal.signal(value, signal.SIG_DFL)
+    os.execvpe(executable, argv, os.environ)
+except BaseException as exc:
+    error_number = getattr(exc, "errno", None) or errno.EIO
+    message = str(exc).encode("utf-8", "replace")[:4096]
+    try:
+        os.write(status_fd, str(error_number).encode("ascii") + b":" + message)
+    except BaseException:
+        pass
+    os._exit(127)
+"""
+
+
+def _close_descriptors(descriptors: Sequence[int]) -> None:
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _pin_read_only_descriptors(
+    descriptors: tuple[int, ...],
+) -> tuple[tuple[int, int], ...]:
+    """Own stable POSIX duplicates without changing ownership of caller fds."""
+    import fcntl
+
+    pins: list[tuple[int, int]] = []
+    next_descriptor = max(descriptors, default=2) + 1
+    try:
+        for descriptor in descriptors:
+            try:
+                pin = int(
+                    fcntl.fcntl(
+                        descriptor,
+                        fcntl.F_DUPFD_CLOEXEC,
+                        next_descriptor,
+                    )
+                )
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    raise ValueError(
+                        f"inherited descriptor {descriptor} is closed"
+                    ) from exc
+                raise ValueError(
+                    f"inherited descriptor {descriptor} could not be pinned"
+                ) from exc
+            pins.append((pin, descriptor))
+            next_descriptor = pin + 1
+            try:
+                flags = int(fcntl.fcntl(pin, fcntl.F_GETFL))
+            except OSError as exc:
+                raise ValueError(
+                    f"inherited descriptor {descriptor} access mode could not be inspected"
+                ) from exc
+            if flags & os.O_ACCMODE != os.O_RDONLY:
+                raise ValueError(
+                    f"inherited descriptor {descriptor} must be read-only"
+                )
+        return tuple(pins)
+    except BaseException:
+        _close_descriptors(tuple(pin for pin, _target in pins))
+        raise
+
+
+def _read_descriptor_bootstrap_error(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = _DESCRIPTOR_BOOTSTRAP_ERROR_MAX_BYTES + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _open_internal_pipe_above(minimum: int) -> tuple[int, int]:
+    """Create a CLOEXEC status pipe that cannot alias a nominated target fd."""
+    import fcntl
+
+    read_descriptor, write_descriptor = os.pipe()
+    safe_read: int | None = None
+    safe_write: int | None = None
+    try:
+        safe_read = int(
+            fcntl.fcntl(
+                read_descriptor,
+                fcntl.F_DUPFD_CLOEXEC,
+                minimum,
+            )
+        )
+        safe_write = int(
+            fcntl.fcntl(
+                write_descriptor,
+                fcntl.F_DUPFD_CLOEXEC,
+                safe_read + 1,
+            )
+        )
+        return safe_read, safe_write
+    except BaseException:
+        _close_descriptors(
+            tuple(
+                descriptor
+                for descriptor in (safe_read, safe_write)
+                if descriptor is not None
+            )
+        )
+        raise
+    finally:
+        _close_descriptors((read_descriptor, write_descriptor))
 
 
 class _WindowsJob:
@@ -516,18 +654,21 @@ class ManagedProcessTree:
             )
         if _IS_WINDOWS and inherited:
             raise ValueError("inherited descriptors are not supported on native Windows")
-        for descriptor in inherited:
-            try:
-                os.fstat(descriptor)
-            except OSError as exc:
-                raise ValueError(
-                    f"inherited descriptor {descriptor} is closed"
-                ) from exc
 
         kwargs = dict(popen_kwargs)
+        if inherited and kwargs.get("shell"):
+            raise ValueError("shell=True is not supported with inherited descriptors")
+        if inherited and kwargs.get("preexec_fn") is not None:
+            raise ValueError(
+                "preexec_fn is not supported with inherited descriptors"
+            )
         kwargs.setdefault("stdin", subprocess.DEVNULL)
         kwargs.setdefault("stdout", subprocess.PIPE)
         kwargs.setdefault("stderr", subprocess.STDOUT)
+        launch_argv = list(argv)
+        pinned: tuple[tuple[int, int], ...] = ()
+        status_read: int | None = None
+        status_write: int | None = None
         if _IS_WINDOWS:
             kwargs["creationflags"] = (
                 int(kwargs.get("creationflags", windows_hide_flags()))
@@ -536,8 +677,45 @@ class ManagedProcessTree:
         else:
             kwargs.setdefault("start_new_session", True)
             if inherited:
+                pinned = _pin_read_only_descriptors(inherited)
+                try:
+                    status_read, status_write = _open_internal_pipe_above(
+                        max(
+                            *inherited,
+                            *(pin for pin, _target in pinned),
+                        )
+                        + 1
+                    )
+                except BaseException:
+                    _close_descriptors(tuple(pin for pin, _target in pinned))
+                    raise
+                raw_executable = kwargs.pop("executable", None)
+                executable = (
+                    ""
+                    if raw_executable is None
+                    else os.fsdecode(os.fspath(raw_executable))
+                )
+                restore_signals = bool(kwargs.get("restore_signals", True))
+                mapping = ",".join(
+                    f"{pin}:{target}" for pin, target in pinned
+                )
+                launch_argv = [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    _POSIX_DESCRIPTOR_BOOTSTRAP,
+                    str(status_write),
+                    "1" if restore_signals else "0",
+                    executable,
+                    mapping,
+                    *argv,
+                ]
                 kwargs["close_fds"] = True
-                kwargs["pass_fds"] = inherited
+                kwargs["pass_fds"] = (
+                    *(pin for pin, _target in pinned),
+                    status_write,
+                )
 
         windows_job = _WindowsJob.create() if _IS_WINDOWS else None
         process = None
@@ -545,7 +723,37 @@ class ManagedProcessTree:
             # noqa: subprocess-stdin — stdin IS set: kwargs.setdefault("stdin",
             # subprocess.DEVNULL) above. The scanner reads the call text only and
             # cannot see kwargs populated earlier in the function.
-            process = subprocess.Popen(list(argv), **kwargs)
+            process = subprocess.Popen(launch_argv, **kwargs)
+            if pinned:
+                _close_descriptors(tuple(pin for pin, _target in pinned))
+                pinned = ()
+                assert status_read is not None
+                assert status_write is not None
+                os.close(status_write)
+                status_write = None
+                try:
+                    bootstrap_error = _read_descriptor_bootstrap_error(status_read)
+                finally:
+                    os.close(status_read)
+                    status_read = None
+                if bootstrap_error:
+                    number, separator, message = bootstrap_error.partition(b":")
+                    error_number = (
+                        int(number)
+                        if separator and number.isdigit()
+                        else errno.EIO
+                    )
+                    target = os.fsdecode(
+                        os.fspath(popen_kwargs.get("executable", argv[0]))
+                    )
+                    raise OSError(
+                        error_number,
+                        message.decode("utf-8", "replace"),
+                        target,
+                    )
+                # The bootstrap execs in place; keep Popen's public identity
+                # compatible with a direct launch rather than exposing internals.
+                process.args = list(argv)
             if windows_job is not None:
                 windows_job.assign(int(process._handle))
                 windows_job.resume_process(process.pid)
@@ -579,6 +787,18 @@ class ManagedProcessTree:
                 except BaseException:
                     pass
             raise
+        finally:
+            _close_descriptors(tuple(pin for pin, _target in pinned))
+            if status_read is not None:
+                try:
+                    os.close(status_read)
+                except OSError:
+                    pass
+            if status_write is not None:
+                try:
+                    os.close(status_write)
+                except OSError:
+                    pass
 
     def tree_active(self) -> bool:
         """Return true while any owned process is live or quiescence is uncertain."""

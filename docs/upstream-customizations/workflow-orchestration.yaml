@@ -388,7 +388,10 @@ upstream_changes:
   - ManagedProcessTree.spawn
   owned_invariants:
   - explicit bounded inherited_descriptors spawn contract
-  - exact POSIX descriptor inheritance with unrelated descriptors closed
+  - nominated POSIX descriptors are proven read-only before child creation
+  - pinned open-file identity is remapped to the exact nominated child number
+    with unrelated descriptors closed
+  - internal pins and bootstrap status descriptors close on every launch outcome
   - caller ownership of inherited descriptors across spawn success and failure
   - native Windows nonempty inheritance requests fail closed before child creation
   tests:
@@ -400,12 +403,14 @@ upstream_changes:
   merge_guidance: >-
     Reconcile this narrow generic spawn seam with upstream process ownership.
     Preserve validation of at most 64 unique open integer descriptors above
-    stdin/stdout/stderr, exact POSIX pass_fds inheritance with every unrelated
-    descriptor closed, caller ownership of nominated handles, and native Windows
-    fail-closed behavior for every nonempty request. Keep workflow values, spill
-    files, shell rendering, and evidence out of the managed-process primitive,
-    while retaining the historical Job Object, process identity, termination,
-    escalation, resource, and wait/reap contracts in the adjacent entry.
+    stdin/stdout/stderr, read-only access-mode enforcement, and pinned open-file
+    identity remapped to the exact nominated POSIX child descriptor number while
+    every unrelated descriptor is closed. Preserve caller ownership of nominated
+    handles, internal-pin cleanup on every outcome, and native Windows fail-closed
+    behavior for every nonempty request. Keep workflow values, spill files, shell
+    rendering, and evidence out of the managed-process primitive, while retaining
+    the historical Job Object, process identity, termination, escalation,
+    resource, and wait/reap contracts in the adjacent entry.
   removal_condition: >-
     Remove when upstream's generic managed-process primitive exposes equivalent
     bounded exact child-descriptor inheritance on POSIX and fail-closed native

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import psutil
@@ -89,6 +92,228 @@ def test_spawn_rejects_closed_inherited_descriptor() -> None:
             )
     finally:
         os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.parametrize("open_flags", [os.O_WRONLY, os.O_RDWR])
+def test_spawn_rejects_writable_regular_descriptor_without_child_or_ownership_change(
+    monkeypatch,
+    tmp_path,
+    open_flags,
+) -> None:
+    path = tmp_path / "writable-descriptor"
+    path.write_bytes(b"caller-owned")
+    descriptor = os.open(path, open_flags)
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawned.append(True),
+    )
+    try:
+        with pytest.raises(ValueError, match="read-only"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(0.01),
+                inherited_descriptors=[descriptor],
+            )
+        os.fstat(descriptor)
+        assert spawned == []
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+def test_spawn_rejects_pipe_write_end_without_child_or_ownership_change(
+    monkeypatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawned.append(True),
+    )
+    try:
+        with pytest.raises(ValueError, match="read-only"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(0.01),
+                inherited_descriptors=[write_fd],
+            )
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+        assert spawned == []
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+def test_spawn_fails_closed_when_access_mode_inspection_fails(
+    monkeypatch,
+) -> None:
+    import fcntl
+
+    real_fcntl = fcntl.fcntl
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    spawned: list[bool] = []
+
+    def fail_getfl(descriptor, operation, argument=0):
+        if operation == fcntl.F_GETFL:
+            raise OSError(errno.EIO, "inspection failed")
+        return real_fcntl(descriptor, operation, argument)
+
+    monkeypatch.setattr(fcntl, "fcntl", fail_getfl)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawned.append(True),
+    )
+    try:
+        with pytest.raises(ValueError, match="could not be inspected"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(0.01),
+                inherited_descriptors=[read_fd],
+            )
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+        assert spawned == []
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_spawn_accepts_read_only_regular_descriptor_at_exact_number(tmp_path) -> None:
+    path = tmp_path / "read-only-descriptor"
+    path.write_bytes(b"regular exact bytes")
+    descriptor = os.open(path, os.O_RDONLY)
+    code = f"import os,sys;sys.stdout.buffer.write(os.read({descriptor}, 4096))"
+    tree = None
+    try:
+        tree = ManagedProcessTree.spawn(
+            [sys.executable, "-c", code],
+            inherited_descriptors=[descriptor],
+        )
+        stdout, _ = tree.process.communicate(timeout=5)
+        assert stdout == b"regular exact bytes"
+        os.fstat(descriptor)
+    finally:
+        if tree is not None:
+            tree.close()
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_identity_is_pinned_across_close_and_number_reuse(
+    monkeypatch,
+) -> None:
+    original_read, original_write = os.pipe()
+    replacement_read, replacement_write = os.pipe()
+    os.write(original_write, b"original")
+    os.close(original_write)
+    os.write(replacement_write, b"replacement")
+    os.close(replacement_write)
+    real_popen = subprocess.Popen
+    handoff_replaced = threading.Event()
+    handoff_barrier = threading.Barrier(2)
+
+    def replace_in_competing_thread() -> None:
+        handoff_barrier.wait(timeout=5)
+        os.close(original_read)
+        os.dup2(replacement_read, original_read)
+        handoff_replaced.set()
+        handoff_barrier.wait(timeout=5)
+
+    def replace_after_validation(*args, **kwargs):
+        handoff_barrier.wait(timeout=5)
+        handoff_barrier.wait(timeout=5)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", replace_after_validation)
+    code = f"import os,sys;sys.stdout.buffer.write(os.read({original_read}, 4096))"
+    tree = None
+    replacer = threading.Thread(target=replace_in_competing_thread)
+    replacer.start()
+    try:
+        tree = ManagedProcessTree.spawn(
+            [sys.executable, "-c", code],
+            inherited_descriptors=[original_read],
+        )
+        stdout, _ = tree.process.communicate(timeout=5)
+        assert handoff_replaced.is_set()
+        assert stdout == b"original"
+        assert os.read(original_read, 4096) == b"replacement"
+    finally:
+        replacer.join(timeout=5)
+        assert not replacer.is_alive()
+        if tree is not None:
+            tree.close()
+        os.close(original_read)
+        os.close(replacement_read)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_multiple_inherited_descriptors_keep_their_exact_child_numbers() -> None:
+    first_read, first_write = os.pipe()
+    second_read, second_write = os.pipe()
+    os.write(first_write, b"first")
+    os.write(second_write, b"second")
+    os.close(first_write)
+    os.close(second_write)
+    code = (
+        "import os,sys;"
+        f"sys.stdout.buffer.write(os.read({first_read},4096)+b'|'+"
+        f"os.read({second_read},4096))"
+    )
+    tree = None
+    try:
+        tree = ManagedProcessTree.spawn(
+            [sys.executable, "-c", code],
+            inherited_descriptors=[first_read, second_read],
+        )
+        stdout, _ = tree.process.communicate(timeout=5)
+        assert stdout == b"first|second"
+    finally:
+        if tree is not None:
+            tree.close()
+        os.close(first_read)
+        os.close(second_read)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_concurrent_inherited_descriptor_launches_preserve_exact_identity() -> None:
+    barrier = threading.Barrier(8)
+
+    def launch(index: int) -> bytes:
+        read_fd, write_fd = os.pipe()
+        payload = f"payload-{index}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        tree = None
+        try:
+            barrier.wait(timeout=5)
+            code = f"import os,sys;sys.stdout.buffer.write(os.read({read_fd}, 4096))"
+            tree = ManagedProcessTree.spawn(
+                [sys.executable, "-c", code],
+                inherited_descriptors=[read_fd],
+            )
+            stdout, _ = tree.process.communicate(timeout=5)
+            return stdout
+        finally:
+            if tree is not None:
+                tree.close()
+            os.close(read_fd)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(launch, range(8)))
+
+    assert results == [f"payload-{index}".encode() for index in range(8)]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
@@ -176,6 +401,7 @@ def test_spawn_failure_does_not_close_caller_owned_inherited_descriptor(
     monkeypatch,
 ) -> None:
     read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
     monkeypatch.setattr(
         subprocess,
         "Popen",
@@ -187,6 +413,26 @@ def test_spawn_failure_does_not_close_caller_owned_inherited_descriptor(
                 _sleep_argv(),
                 inherited_descriptors=[read_fd],
             )
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_exec_failure_closes_internal_pins_but_not_caller_descriptor() -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        with pytest.raises(FileNotFoundError):
+            ManagedProcessTree.spawn(
+                ["/definitely/missing/hermes-managed-process-test"],
+                inherited_descriptors=[read_fd],
+            )
+        assert psutil.Process().num_fds() == before
         os.write(write_fd, b"x")
         assert os.read(read_fd, 1) == b"x"
     finally:
