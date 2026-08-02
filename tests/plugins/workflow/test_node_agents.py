@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult
+from agent.plugin_agent import PluginAgentRunRequest, PluginAgentRunResult
 from agent.plugin_agent_worker import _build_inline_agent_handler
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.schema import load_workflow
@@ -186,6 +186,102 @@ def test_inline_agent_handler_is_synchronous_bounded_and_returns_sanitized_resul
         "inline_agent_started",
         "inline_agent_completed",
     ]
+
+
+def test_strict_inline_agent_inherits_one_private_provider_authority(tmp_path):
+    runner = ChildRunner(
+        PluginAgentRunResult(
+            final_response="child result",
+            session_id="child-session",
+            provider="fake",
+            model="fake",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+    )
+    descriptor = {
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": 43210,
+        "authkey": "YXV0aG9yaXR5",
+    }
+    parent = PluginAgentRunRequest(
+        prompt="parent",
+        sealed_provider_attempt_grant=True,
+        max_api_attempts=5,
+        _provider_attempt_authority=descriptor,
+    )
+    handler = _build_inline_agent_handler(
+        plugin_id="workflow",
+        definitions={
+            "reviewer": {
+                "description": "review",
+                "prompt": "Base",
+                "model": None,
+                "allowed_tools": [],
+                "denied_tools": ["delegate_task", "workflow_agent"],
+                "instructions": "",
+                "max_iterations": 2,
+            }
+        },
+        workdir=tmp_path,
+        parent_request=parent,
+        runner_factory=lambda _plugin_id: runner,
+        emit_progress=lambda **_payload: None,
+        pause=lambda _descriptor: None,
+    )
+
+    assert handler({"agent_id": "reviewer", "task": "Inspect"})["status"] == (
+        "completed"
+    )
+    child = runner.requests[0]
+    assert child.sealed_provider_attempt_grant is True
+    assert child.max_api_attempts == 5
+    assert child._provider_attempt_authority == descriptor
+
+
+def test_legacy_inline_agent_does_not_gain_provider_authority(tmp_path):
+    runner = ChildRunner(
+        PluginAgentRunResult(
+            final_response="child result",
+            session_id="child-session",
+            provider="fake",
+            model="fake",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+    )
+    parent = PluginAgentRunRequest(prompt="parent", max_api_attempts=2)
+    handler = _build_inline_agent_handler(
+        plugin_id="workflow",
+        definitions={
+            "reviewer": {
+                "description": "review",
+                "prompt": "Base",
+                "model": None,
+                "allowed_tools": [],
+                "denied_tools": ["delegate_task", "workflow_agent"],
+                "instructions": "",
+                "max_iterations": 2,
+            }
+        },
+        workdir=tmp_path,
+        parent_request=parent,
+        runner_factory=lambda _plugin_id: runner,
+        emit_progress=lambda **_payload: None,
+        pause=lambda _descriptor: None,
+    )
+
+    assert handler({"agent_id": "reviewer", "task": "Inspect"})["status"] == (
+        "completed"
+    )
+    child = runner.requests[0]
+    assert child.sealed_provider_attempt_grant is False
+    assert child._provider_attempt_authority is None
 
 
 def test_inline_agent_pending_approval_bubbles_to_parent_pause(tmp_path):

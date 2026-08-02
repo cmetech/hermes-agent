@@ -15,6 +15,12 @@ import unicodedata
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from agent.plugin_agent import (
+    _ProviderAttemptGrantExhausted,
+    _reserve_shared_provider_attempt,
+    _snapshot_shared_provider_attempts,
+)
+
 
 _PROTOCOL_VERSION = 1
 _MAX_REQUEST_BYTES = 1_000_000
@@ -29,13 +35,6 @@ class PackageMCPUnavailable(RuntimeError):
     """A request-carried MCP cannot be supplied to Hermes' tool loop."""
 
     failure_kind = "package_mcp_unavailable"
-
-
-class _ProviderAttemptGrantExhausted(RuntimeError):
-    """The isolated request has spent its sealed provider-call authority."""
-
-    failure_kind = "provider_attempt_grant_exhausted"
-    status_code = 400
 
 
 _AUTHORITY_DESCRIPTOR_KEY = "__hermes_authenticated_local_mcp"
@@ -1044,6 +1043,12 @@ def _build_inline_agent_handler(
             workdir=workdir,
             max_iterations=int(definition.get("max_iterations", 90)),
             max_api_attempts=getattr(parent, "max_api_attempts", 1),
+            sealed_provider_attempt_grant=getattr(
+                parent, "sealed_provider_attempt_grant", False
+            ),
+            _provider_attempt_authority=getattr(
+                parent, "_provider_attempt_authority", None
+            ),
             idle_timeout_seconds=getattr(parent, "idle_timeout_seconds", 300.0),
             wall_timeout_seconds=getattr(parent, "wall_timeout_seconds", 1800.0),
             provider_request_timeout_seconds=getattr(
@@ -1539,6 +1544,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             provider_attempt_grant_exhausted = [False]
             provider_attempt_lock = threading.Lock()
             sealed_provider_grant = request.sealed_provider_attempt_grant
+            shared_provider_authority = request._provider_attempt_authority
             counted_provider_methods = 0
             if sealed_provider_grant:
 
@@ -1549,6 +1555,17 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                         raise InterruptedError(
                             "Agent interrupted before isolated provider call"
                         )
+                    if shared_provider_authority is not None:
+                        try:
+                            provider_attempt_counter[0] = (
+                                _reserve_shared_provider_attempt(
+                                    shared_provider_authority
+                                )
+                            )
+                        except _ProviderAttemptGrantExhausted:
+                            provider_attempt_grant_exhausted[0] = True
+                            raise
+                        return
                     with provider_attempt_lock:
                         if (
                             provider_attempt_counter[0]
@@ -1584,6 +1601,20 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                         return _original_method(*args, **kwargs)
 
                     setattr(agent, method_name, counted_provider_call)
+
+            def provider_attempt_state() -> tuple[int, bool]:
+                if sealed_provider_grant and shared_provider_authority is not None:
+                    snapshot = _snapshot_shared_provider_attempts(
+                        shared_provider_authority
+                    )
+                    return (
+                        int(snapshot["provider_attempts"]),
+                        bool(snapshot["exhausted"]),
+                    )
+                return (
+                    provider_attempt_counter[0],
+                    provider_attempt_grant_exhausted[0],
+                )
             _active_agent = agent
             from hermes_cli.plugins import get_plugin_manager
 
@@ -1623,8 +1654,10 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 model_calls = max(
                     0, int(getattr(agent, "_api_call_count", 0) or 0)
                 )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
                 provider_attempts = (
-                    provider_attempt_counter[0]
+                    shared_attempts
                     if sealed_provider_grant or counted_provider_methods
                     else model_calls
                 )
@@ -1677,13 +1710,12 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     getattr(agent, "session_cache_write_tokens", 0) or 0
                 ),
             }
-            failed = (
-                bool(response.get("failed"))
-                or provider_attempt_grant_exhausted[0]
-            )
+            shared_attempts, shared_exhausted = provider_attempt_state()
+            provider_attempt_grant_exhausted[0] = shared_exhausted
+            failed = bool(response.get("failed")) or shared_exhausted
             model_calls = max(0, int(response.get("api_calls", 0) or 0))
             provider_attempts = (
-                provider_attempt_counter[0]
+                shared_attempts
                 if sealed_provider_grant or counted_provider_methods
                 else model_calls
             )

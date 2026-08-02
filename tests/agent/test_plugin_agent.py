@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -22,10 +23,12 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    _ProviderAttemptAuthority,
     _PluginAgentCancelled,
     _PluginAgentResourceExceeded,
     _MAX_FRAME_BYTES,
     _exchange_worker,
+    _reserve_shared_provider_attempt,
     _read_stream,
 )
 from agent.structured_output import (
@@ -1423,6 +1426,270 @@ def test_worker_sealed_provider_grant_caps_recovery_and_fallback_cycles(
     assert charge.retry_consumed == grant
     assert charge.remaining_attempts == 0
     assert charge.provider_attempts_exact is True
+
+
+@pytest.mark.parametrize("grant", range(1, 6))
+def test_sealed_provider_authority_is_one_atomic_process_tree_grant(grant) -> None:
+    authority = _ProviderAttemptAuthority(grant)
+    descriptor = json.dumps(authority.descriptor, separators=(",", ":"))
+    code = (
+        "import json,sys;"
+        "from agent.plugin_agent import _reserve_shared_provider_attempt;"
+        "descriptor=json.loads(sys.argv[1]);"
+        "\ntry:_reserve_shared_provider_attempt(descriptor)"
+        "\nexcept Exception as exc:print(getattr(exc,'failure_kind',type(exc).__name__))"
+        "\nelse:print('reserved')"
+    )
+    try:
+        # Independent children race for one broker-owned grant.
+        children = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, descriptor],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(grant + 3)
+        ]
+        outputs = []
+        for child in children:
+            stdout, stderr = child.communicate(timeout=10)
+            assert child.returncode == 0, stderr
+            outputs.append(stdout.strip())
+
+        snapshot = authority.snapshot()
+        assert outputs.count("reserved") == grant
+        assert outputs.count("provider_attempt_grant_exhausted") == 3
+        assert snapshot == {"provider_attempts": grant, "exhausted": True}
+    finally:
+        authority.close()
+
+
+def test_sealed_provider_authority_sequential_and_nested_clients_share_count() -> None:
+    authority = _ProviderAttemptAuthority(4)
+    descriptor = json.dumps(authority.descriptor, separators=(",", ":"))
+    grandchild = (
+        "import json,subprocess,sys;"
+        "descriptor=sys.argv[1];"
+        "code=('import json,sys;from agent.plugin_agent import '"
+        "'_reserve_shared_provider_attempt as reserve;'"
+        "'reserve(json.loads(sys.argv[1]));print(\\\"grandchild\\\")');"
+        "result=subprocess.run([sys.executable,'-c',code,descriptor],"
+        "capture_output=True,text=True,check=True);print(result.stdout.strip())"
+    )
+    try:
+        _reserve_shared_provider_attempt(authority.descriptor)
+        _reserve_shared_provider_attempt(authority.descriptor)
+        result = subprocess.run(
+            [sys.executable, "-c", grandchild, descriptor],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        assert result.stdout.strip() == "grandchild"
+        _reserve_shared_provider_attempt(authority.descriptor)
+        assert authority.snapshot() == {
+            "provider_attempts": 4,
+            "exhausted": False,
+        }
+    finally:
+        authority.close()
+
+
+def test_sealed_provider_authority_close_fails_closed_without_reopening() -> None:
+    authority = _ProviderAttemptAuthority(2)
+    descriptor = authority.descriptor
+    _reserve_shared_provider_attempt(descriptor)
+    authority.close()
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        _reserve_shared_provider_attempt(descriptor)
+
+    replacement = _ProviderAttemptAuthority(2)
+    try:
+        assert replacement.snapshot() == {
+            "provider_attempts": 0,
+            "exhausted": False,
+        }
+    finally:
+        replacement.close()
+
+
+def test_cancelled_sealed_exchange_closes_its_private_authority() -> None:
+    authority_threads_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name == "provider-attempt-authority"
+    }
+    cancelled = threading.Event()
+    cancelled.set()
+    code = "import sys,time;sys.stdin.readline();time.sleep(60)"
+
+    with pytest.raises(_PluginAgentCancelled):
+        _exchange_worker(
+            {
+                "protocol_version": 1,
+                "type": "run",
+                "request": {
+                    "sealed_provider_attempt_grant": True,
+                    "max_api_attempts": 2,
+                    "inline_agents": {"child": {"prompt": "child"}},
+                },
+            },
+            workdir=None,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            worker_argv=[sys.executable, "-c", code],
+            is_cancelled=cancelled.is_set,
+            termination_policy=TerminationPolicy(
+                cooperative_grace_seconds=0.05,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.2,
+                wait_timeout_seconds=0.2,
+            ),
+        )
+
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name == "provider-attempt-authority"
+    } == authority_threads_before
+
+
+@pytest.mark.parametrize("concurrent_children", [False, True])
+def test_worker_audit_includes_real_inline_child_process_reservations(
+    monkeypatch, tmp_path, concurrent_children
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+    from tools.registry import registry
+
+    authority = _ProviderAttemptAuthority(4)
+    child_requests = []
+
+    class FakeDB:
+        pass
+
+    class ProcessChildRunner:
+        def __init__(self, _plugin_id):
+            pass
+
+        def run(self, request, **_kwargs):
+            child_requests.append(request)
+            descriptor = json.dumps(
+                dict(request._provider_attempt_authority), separators=(",", ":")
+            )
+            code = (
+                "import json,sys;from agent.plugin_agent import "
+                "_reserve_shared_provider_attempt as reserve;"
+                "reserve(json.loads(sys.argv[1]))"
+            )
+            subprocess.run(
+                [sys.executable, "-c", code, descriptor],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return PluginAgentRunResult(
+                final_response="child result",
+                session_id="child-session",
+                provider="fake-provider",
+                model="fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "parent-session"
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "workflow_agent"},
+                }
+            ]
+            self.valid_tool_names = {"workflow_agent"}
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._interrupt_requested = False
+
+        def run_conversation(self, _prompt, conversation_history=None):
+            self._provider_attempt_reservation_callback()
+            handler = registry._tools["workflow_agent"].handler
+            arguments = {"agent_id": "reviewer", "task": "Inspect"}
+            if concurrent_children:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    child_results = list(
+                        pool.map(lambda _index: handler(arguments), range(2))
+                    )
+            else:
+                child_results = [handler(arguments), handler(arguments)]
+            assert all('"status": "completed"' in item for item in child_results)
+            self._provider_attempt_reservation_callback()
+            return {
+                "failed": False,
+                "api_calls": 2,
+                "final_response": "parent completed",
+            }
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(plugin_agent, "PluginAgentRunner", ProcessChildRunner)
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake-provider",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    request = PluginAgentRunRequest(
+        prompt="parent",
+        inline_agents={
+            "reviewer": {
+                "prompt": "review",
+                "allowed_tools": [],
+                "denied_tools": ["delegate_task", "workflow_agent"],
+            }
+        },
+        workdir=tmp_path,
+        max_api_attempts=4,
+        sealed_provider_attempt_grant=True,
+        _provider_attempt_authority=authority.descriptor,
+    )
+    try:
+        result = worker._run(
+            {"plugin_id": "workflow", "request": request.to_wire()}
+        )
+        assert result["status"] == "completed"
+        assert result["audit"]["provider_attempts"] == 4
+        assert authority.snapshot() == {
+            "provider_attempts": 4,
+            "exhausted": False,
+        }
+        assert len(child_requests) == 2
+        assert all(item.sealed_provider_attempt_grant for item in child_requests)
+        assert all(
+            item._provider_attempt_authority == request._provider_attempt_authority
+            for item in child_requests
+        )
+    finally:
+        authority.close()
 
 
 def test_worker_codex_delegation_reserves_once_per_transport(monkeypatch) -> None:

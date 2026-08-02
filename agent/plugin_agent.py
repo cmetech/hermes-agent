@@ -12,9 +12,11 @@ import binascii
 from dataclasses import dataclass, field
 import json
 import math
+from multiprocessing.connection import AuthenticationError, Client, Listener
 from pathlib import Path
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -70,6 +72,211 @@ class _PluginAgentResourceExceeded(RuntimeError):
     """Internal control flow for bounded worker-tree enforcement."""
 
 
+class _ProviderAttemptGrantExhausted(RuntimeError):
+    """One shared sealed request tree has spent its provider-call authority."""
+
+    failure_kind = "provider_attempt_grant_exhausted"
+    status_code = 400
+
+
+_PROVIDER_AUTHORITY_VERSION = 1
+_PROVIDER_AUTHORITY_AUTHKEY_BYTES = 32
+_PROVIDER_AUTHORITY_FRAME_BYTES = 1024
+
+
+def _validated_provider_attempt_authority(
+    value: object,
+) -> tuple[tuple[str, int], bytes]:
+    if not isinstance(value, Mapping):
+        raise ValueError("provider attempt authority must be an object")
+    if set(value) != {"version", "host", "port", "authkey"}:
+        raise ValueError("provider attempt authority fields are invalid")
+    if value.get("version") != _PROVIDER_AUTHORITY_VERSION:
+        raise ValueError("provider attempt authority version is invalid")
+    host = value.get("host")
+    port = value.get("port")
+    token = value.get("authkey")
+    if host != "127.0.0.1":
+        raise ValueError("provider attempt authority host is invalid")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("provider attempt authority port is invalid")
+    if not isinstance(token, str):
+        raise ValueError("provider attempt authority authkey is invalid")
+    try:
+        authkey = base64.b64decode(token, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("provider attempt authority authkey is invalid") from exc
+    if len(authkey) != _PROVIDER_AUTHORITY_AUTHKEY_BYTES:
+        raise ValueError("provider attempt authority authkey is invalid")
+    return (host, port), authkey
+
+
+def _shared_provider_attempt_request(
+    descriptor: Mapping[str, Any], operation: str
+) -> Mapping[str, Any]:
+    address, authkey = _validated_provider_attempt_authority(descriptor)
+    try:
+        connection = Client(address, family="AF_INET", authkey=authkey)
+        try:
+            connection.send_bytes(
+                json.dumps(
+                    {"operation": operation}, separators=(",", ":")
+                ).encode("ascii")
+            )
+            response = json.loads(
+                connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
+            )
+        finally:
+            connection.close()
+    except (
+        AuthenticationError,
+        EOFError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+    ) as exc:
+        raise RuntimeError("sealed provider attempt authority unavailable") from exc
+    if not isinstance(response, Mapping):
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    return response
+
+
+def _reserve_shared_provider_attempt(descriptor: Mapping[str, Any]) -> int:
+    response = _shared_provider_attempt_request(descriptor, "reserve")
+    count = response.get("provider_attempts")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    if response.get("reserved") is False:
+        raise _ProviderAttemptGrantExhausted(
+            "sealed provider attempt grant exhausted"
+        )
+    if response.get("reserved") is not True:
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    return count
+
+
+def _snapshot_shared_provider_attempts(
+    descriptor: Mapping[str, Any],
+) -> dict[str, int | bool]:
+    response = _shared_provider_attempt_request(descriptor, "snapshot")
+    count = response.get("provider_attempts")
+    exhausted = response.get("exhausted")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or not isinstance(exhausted, bool)
+    ):
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    return {"provider_attempts": count, "exhausted": exhausted}
+
+
+class _ProviderAttemptAuthority:
+    """Authenticated request-local broker for one process-tree attempt grant."""
+
+    def __init__(self, grant: int) -> None:
+        if isinstance(grant, bool) or not isinstance(grant, int) or not 1 <= grant <= 5:
+            raise ValueError("provider attempt authority grant must be between 1 and 5")
+        self._grant = grant
+        self._provider_attempts = 0
+        self._exhausted = False
+        self._state_lock = threading.Lock()
+        self._authkey = secrets.token_bytes(_PROVIDER_AUTHORITY_AUTHKEY_BYTES)
+        self._shutdown_nonce = secrets.token_hex(32)
+        self._listener = Listener(
+            ("127.0.0.1", 0), family="AF_INET", authkey=self._authkey
+        )
+        host, port = self._listener.address
+        self.descriptor: Mapping[str, Any] = {
+            "version": _PROVIDER_AUTHORITY_VERSION,
+            "host": host,
+            "port": port,
+            "authkey": base64.b64encode(self._authkey).decode("ascii"),
+        }
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="provider-attempt-authority",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                connection = self._listener.accept()
+            except (AuthenticationError, OSError):
+                if self._closed:
+                    return
+                continue
+            try:
+                request = json.loads(
+                    connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
+                )
+                operation = request.get("operation") if isinstance(request, Mapping) else None
+                if operation == "reserve":
+                    with self._state_lock:
+                        if self._provider_attempts >= self._grant:
+                            self._exhausted = True
+                            response = {
+                                "reserved": False,
+                                "provider_attempts": self._provider_attempts,
+                            }
+                        else:
+                            self._provider_attempts += 1
+                            response = {
+                                "reserved": True,
+                                "provider_attempts": self._provider_attempts,
+                            }
+                elif operation == "snapshot":
+                    response = self.snapshot()
+                elif (
+                    operation == "shutdown"
+                    and request.get("nonce") == self._shutdown_nonce
+                ):
+                    connection.send_bytes(b'{"closed":true}')
+                    return
+                else:
+                    response = {"error": "invalid operation"}
+                connection.send_bytes(
+                    json.dumps(response, separators=(",", ":")).encode("ascii")
+                )
+            except (EOFError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+                pass
+            finally:
+                connection.close()
+
+    def snapshot(self) -> dict[str, int | bool]:
+        with self._state_lock:
+            return {
+                "provider_attempts": self._provider_attempts,
+                "exhausted": self._exhausted,
+            }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            connection = Client(
+                self._listener.address, family="AF_INET", authkey=self._authkey
+            )
+            try:
+                connection.send_bytes(
+                    json.dumps(
+                        {"operation": "shutdown", "nonce": self._shutdown_nonce},
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                )
+                connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
+            finally:
+                connection.close()
+        except (AuthenticationError, EOFError, OSError):
+            pass
+        self._listener.close()
+        self._thread.join(timeout=2.0)
+
+
 @dataclass(frozen=True)
 class PluginAgentRunRequest:
     prompt: str
@@ -96,6 +303,9 @@ class PluginAgentRunRequest:
     max_iterations: int = 90
     max_api_attempts: int = 3
     sealed_provider_attempt_grant: bool = False
+    _provider_attempt_authority: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
@@ -107,7 +317,7 @@ class PluginAgentRunRequest:
     kill_reap_grace_seconds: float = 2.0
 
     def to_wire(self) -> dict[str, Any]:
-        return {
+        payload = {
             "prompt": self.prompt,
             "provider": self.provider,
             "model": self.model,
@@ -146,6 +356,11 @@ class PluginAgentRunRequest:
             "term_grace_seconds": self.term_grace_seconds,
             "kill_reap_grace_seconds": self.kill_reap_grace_seconds,
         }
+        if self._provider_attempt_authority is not None:
+            payload["_provider_attempt_authority"] = _wire_json(
+                self._provider_attempt_authority
+            )
+        return payload
 
     @classmethod
     def from_wire(cls, value: Mapping[str, Any]) -> "PluginAgentRunRequest":
@@ -176,6 +391,7 @@ class PluginAgentRunRequest:
             "max_iterations",
             "max_api_attempts",
             "sealed_provider_attempt_grant",
+            "_provider_attempt_authority",
             "idle_timeout_seconds",
             "wall_timeout_seconds",
             "provider_request_timeout_seconds",
@@ -535,6 +751,12 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("max API attempts must be between 1 and 5")
     if not isinstance(request.sealed_provider_attempt_grant, bool):
         raise ValueError("sealed provider attempt grant must be boolean")
+    if request._provider_attempt_authority is not None:
+        if not request.sealed_provider_attempt_grant:
+            raise ValueError(
+                "provider attempt authority requires a sealed provider grant"
+            )
+        _validated_provider_attempt_authority(request._provider_attempt_authority)
     for label, value in (("provider", request.provider), ("model", request.model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"{label} must be a non-empty string or None")
@@ -746,7 +968,7 @@ def _read_stream(
                 pass
 
 
-def _exchange_worker(
+def _exchange_worker_once(
     payload: dict[str, Any],
     *,
     workdir: Path | None,
@@ -867,6 +1089,52 @@ def _exchange_worker(
         tree.close()
         stdout_reader.join(timeout=1.0)
         stderr_reader.join(timeout=1.0)
+
+
+def _exchange_worker(
+    payload: dict[str, Any],
+    *,
+    workdir: Path | None,
+    idle_timeout_seconds: float,
+    wall_timeout_seconds: float,
+    worker_argv: list[str] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+    resource_limits: ProcessResourceLimits | None = None,
+    termination_policy: TerminationPolicy | None = None,
+) -> dict[str, Any]:
+    """Exchange one frame while owning any top-level sealed grant broker."""
+
+    owned_authority: _ProviderAttemptAuthority | None = None
+    request = payload.get("request")
+    if (
+        isinstance(request, dict)
+        and request.get("sealed_provider_attempt_grant") is True
+        and bool(request.get("inline_agents"))
+        and request.get("_provider_attempt_authority") is None
+    ):
+        grant = request.get("max_api_attempts")
+        owned_authority = _ProviderAttemptAuthority(grant)
+        payload = {
+            **payload,
+            "request": {
+                **request,
+                "_provider_attempt_authority": dict(owned_authority.descriptor),
+            },
+        }
+    try:
+        return _exchange_worker_once(
+            payload,
+            workdir=workdir,
+            idle_timeout_seconds=idle_timeout_seconds,
+            wall_timeout_seconds=wall_timeout_seconds,
+            worker_argv=worker_argv,
+            is_cancelled=is_cancelled,
+            resource_limits=resource_limits,
+            termination_policy=termination_policy,
+        )
+    finally:
+        if owned_authority is not None:
+            owned_authority.close()
 
 
 class PluginAgentRunner:
