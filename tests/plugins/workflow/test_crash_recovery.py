@@ -82,6 +82,62 @@ def test_expired_lease_interrupts_and_stale_completion_cannot_win(
     assert store.load_run(admitted.run_id)["status"] == "succeeded"
 
 
+def test_resolution_wait_restart_rebuilds_without_claim_or_immediate_poll(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch restart recovery treating a durable read wait as runnable work."""
+    path = workflow_writer(
+        tmp_path / "resolution-restart-package",
+        name="resolution-restart",
+        nodes=[
+            {"id": "producer", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["producer"]},
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    home = tmp_path / "resolution-restart-home"
+    store = RunStore(home)
+    admitted = _run(store, load_workflow(path), idempotency_key="resolution-restart")
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    identity = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "publication_id": "a" * 32,
+        "sha256": "b" * 64,
+        "size_bytes": 5,
+        "media_type": "text/markdown; charset=utf-8",
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "text",
+    }
+    assert store.defer_output_resolution(
+        admitted.run_id,
+        "consumer",
+        producer_identity=identity,
+        now=observed,
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+
+    restarted = RunStore(home)
+    projection = restarted.load_run(admitted.run_id)
+    assert projection["nodes"]["consumer"]["state"] == "waiting_resolution"
+    assert projection["nodes"]["consumer"]["resolution_read_count"] == 1
+    assert restarted.claim_node(
+        admitted.run_id, "consumer", "restart-must-not-claim"
+    ) is None
+    assert restarted.wake_due_output_resolutions(
+        admitted.run_id,
+        now=observed + timedelta(milliseconds=249),
+    ) == ()
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
+
+
 def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:

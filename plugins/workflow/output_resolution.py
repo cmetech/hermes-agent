@@ -43,6 +43,17 @@ _PRIMARY_OUTPUT_CANDIDATE_FIELDS = frozenset({
     "canonicalization_version",
     "output_type",
 })
+_OUTPUT_PUBLICATION_IDENTITY_FIELDS = frozenset({
+    "node_id",
+    "attempt_id",
+    "publication_id",
+    "sha256",
+    "size_bytes",
+    "media_type",
+    "schema_fingerprint",
+    "canonicalization_version",
+    "output_type",
+})
 
 
 class ArchonOutputIntegrityError(RuntimeError):
@@ -61,10 +72,17 @@ class WorkflowOutputReferenceError(ArchonOutputIntegrityError):
         code: str,
         node_id: str,
         path: tuple[str, ...] = (),
+        *,
+        producer_identity: Mapping[str, object] | None = None,
     ) -> None:
         self.code = code
         self.node_id = node_id
         self.path = tuple(path)
+        self.producer_identity = (
+            MappingProxyType(canonical_output_publication_identity(producer_identity))
+            if producer_identity is not None
+            else None
+        )
         super().__init__(f"{code}: output reference for {node_id}")
 
 
@@ -77,6 +95,86 @@ class ResolvedOutputReference:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "typed_value", _freeze_json(self.typed_value))
+
+
+def canonical_output_publication_identity(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the bounded producer identity fenced by a resolution wait."""
+    if set(value) != _OUTPUT_PUBLICATION_IDENTITY_FIELDS:
+        raise ValueError("output publication identity fields are invalid")
+    node_id = value.get("node_id")
+    attempt_id = value.get("attempt_id")
+    publication_id = value.get("publication_id")
+    digest = value.get("sha256")
+    size_bytes = value.get("size_bytes")
+    media_type = value.get("media_type")
+    schema_fingerprint = value.get("schema_fingerprint")
+    canonicalization_version = value.get("canonicalization_version")
+    output_type = value.get("output_type")
+    if (
+        not isinstance(node_id, str)
+        or not node_id
+        or len(node_id.encode("utf-8")) > 256
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or len(attempt_id.encode("utf-8")) > 256
+        or (
+            publication_id is not None
+            and (
+                not isinstance(publication_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+            )
+        )
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or not 0 <= size_bytes <= 500_000
+        or not isinstance(media_type, str)
+        or not media_type
+        or len(media_type.encode("utf-8")) > 256
+        or (
+            schema_fingerprint is not None
+            and (
+                not isinstance(schema_fingerprint, str)
+                or _SHA256.fullmatch(schema_fingerprint) is None
+            )
+        )
+        or isinstance(canonicalization_version, bool)
+        or canonicalization_version != 1
+        or not isinstance(output_type, str)
+        or not output_type.strip()
+        or len(output_type.encode("utf-8")) > DURABLE_METADATA_STRING_MAX_CHARS
+    ):
+        raise ValueError("output publication identity is invalid")
+    identity = {
+        field: value[field]
+        for field in sorted(_OUTPUT_PUBLICATION_IDENTITY_FIELDS)
+    }
+    if len(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ) > 2_048:
+        raise ValueError("output publication identity is too large")
+    return identity
+
+
+def output_publication_identity_sha256(value: Mapping[str, object]) -> str:
+    """Return the stable private identity digest used in bounded events."""
+    identity = canonical_output_publication_identity(value)
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _canonical_relative_path(value: object) -> PurePosixPath | None:
@@ -477,9 +575,74 @@ class ResolvedNodeOutput:
     publication_id: str | None
     schema_fingerprint: str | None = None
     canonicalization_version: int = 1
+    output_type: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "value", _freeze_json(self.value))
+
+
+def output_publication_identity(
+    *,
+    node_id: str,
+    attempt_id: str,
+    descriptor: Mapping[str, object],
+    candidate: PrimaryOutputCandidate | None,
+) -> dict[str, object]:
+    """Build the private wait fence from the winning descriptor authority."""
+    schema_fingerprint = (
+        candidate.schema_fingerprint
+        if candidate is not None
+        else descriptor.get("schema_fingerprint")
+    )
+    output_type = (
+        candidate.output_type
+        if candidate is not None and candidate.output_type is not None
+        else descriptor.get("output_type")
+    )
+    return canonical_output_publication_identity({
+        "node_id": node_id,
+        "attempt_id": attempt_id,
+        "publication_id": descriptor.get("publication_id"),
+        "sha256": descriptor.get("sha256"),
+        "size_bytes": descriptor.get("size_bytes"),
+        "media_type": descriptor.get("media_type"),
+        "schema_fingerprint": schema_fingerprint,
+        "canonicalization_version": (
+            candidate.canonicalization_version
+            if candidate is not None
+            else descriptor.get("canonicalization_version", 1)
+        ),
+        "output_type": (
+            output_type
+            if isinstance(output_type, str) and output_type
+            else "structured"
+            if schema_fingerprint is not None
+            else "text"
+        ),
+    })
+
+
+def resolved_output_publication_identity(
+    output: ResolvedNodeOutput,
+) -> dict[str, object]:
+    """Recover the same wait fence after a successful immutable read."""
+    return canonical_output_publication_identity({
+        "node_id": output.node_id,
+        "attempt_id": output.attempt_id,
+        "publication_id": output.publication_id,
+        "sha256": output.sha256,
+        "size_bytes": len(output.canonical_bytes),
+        "media_type": output.media_type,
+        "schema_fingerprint": output.schema_fingerprint,
+        "canonicalization_version": output.canonicalization_version,
+        "output_type": (
+            output.output_type
+            if isinstance(output.output_type, str) and output.output_type
+            else "structured"
+            if output.schema_fingerprint is not None
+            else "text"
+        ),
+    })
 
 
 def _render_reference_value(value: object) -> str:
@@ -731,6 +894,13 @@ def _resolve_node_output(
         publication_id=publication_id,
         schema_fingerprint=schema_fingerprint,
         canonicalization_version=canonicalization_version,
+        output_type=(
+            candidate.output_type
+            if candidate is not None
+            else descriptor.get("output_type")
+            if isinstance(descriptor.get("output_type"), str)
+            else None
+        ),
     )
 
 
@@ -797,6 +967,10 @@ __all__ = [
     "ResolvedOutputReference",
     "ResolvedNodeOutput",
     "WorkflowOutputReferenceError",
+    "canonical_output_publication_identity",
+    "output_publication_identity_sha256",
+    "output_publication_identity",
+    "resolved_output_publication_identity",
     "primary_output_candidate_from_identity",
     "primary_output_candidate_identity",
     "resolve_legacy_output_values",

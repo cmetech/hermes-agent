@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import os
 from pathlib import Path
@@ -59,6 +59,14 @@ def _acquire_after_lock(database: str, results) -> None:
         lease_seconds=2,
     )
     results.put(acquired.is_leader)
+
+
+def _race_resolution_wake(home: str, run_id: str, due: str, barrier, results) -> None:
+    barrier.wait()
+    awakened = RunStore(Path(home)).wake_due_output_resolutions(
+        run_id, now=datetime.fromisoformat(due)
+    )
+    results.put(awakened)
 
 
 def _run_blocked_old_epoch(
@@ -371,6 +379,89 @@ def test_foreground_owner_death_is_adopted_and_replay_safe_run_continues(
         CoordinatorStore(store.database).notify_local()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_due_resolution_wake_has_one_multiprocess_cas_winner(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch two coordinators recording the same failed-read wake."""
+    home = tmp_path / "resolution-race-home"
+    path = workflow_writer(
+        tmp_path / "resolution-race-package",
+        name="resolution-race",
+        nodes=[
+            {"id": "producer", "bash": "true"},
+            {
+                "id": "consumer",
+                "bash": "true",
+                "depends_on": ["producer"],
+                "when": "$producer.output == 'ready'",
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(home)
+    package = load_workflow(path)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="resolution-race",
+            concurrency_key="resolution-race",
+        ),
+        immutable_snapshot=prepared,
+    )
+    identity = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "publication_id": "a" * 32,
+        "sha256": "b" * 64,
+        "size_bytes": 5,
+        "media_type": "text/markdown; charset=utf-8",
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "text",
+    }
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert store.defer_output_resolution(
+        admitted.run_id,
+        "consumer",
+        producer_identity=identity,
+        now=observed,
+    )
+    due = observed + timedelta(milliseconds=250)
+
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_race_resolution_wake,
+            args=(str(home), admitted.run_id, due.isoformat(), barrier, results),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    outcomes = [results.get(timeout=5) for _ in processes]
+    assert sorted(outcomes, key=len) == [(), ("consumer",)]
+    projection = store.load_run(admitted.run_id)
+    assert projection["nodes"]["consumer"]["state"] == "pending"
+    assert projection["nodes"]["consumer"]["resolution_read_count"] == 1
+    assert sum(
+        event["event_type"] == "output_resolution_ready"
+        for event in store.tail_events(admitted.run_id)
+    ) == 1
 
 
 def test_foreground_owner_death_with_unresolved_outward_spawn_reconciles(

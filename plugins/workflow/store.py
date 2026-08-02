@@ -68,6 +68,8 @@ from plugins.workflow.output_resolution import (
     _RETRYABLE_READ_ERRNOS,
     _read_descriptor_relative,
     _safe_component,
+    canonical_output_publication_identity,
+    output_publication_identity_sha256,
     write_archon_output_exclusive,
 )
 from plugins.workflow.schedule_time import (
@@ -321,6 +323,7 @@ _NODE_STATES = {
     "claimed",
     "running",
     "waiting_retry",
+    "waiting_resolution",
     "paused",
     "interrupted",
     "succeeded",
@@ -10287,6 +10290,266 @@ class RunStore:
                 projection,
                 f"node_{state}",
                 payload,
+                node_id=node_id,
+            )
+            return True
+
+    def transition_v3_reference_node(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """CAS one non-transient v3 reference failure before executor claim."""
+        if (
+            not isinstance(code, str)
+            or not code.startswith("output_reference_")
+            or code == "output_reference_temporarily_unavailable"
+            or len(code.encode("utf-8")) > 128
+        ):
+            raise ValueError("v3 reference failure code is invalid")
+        if not isinstance(message, str) or not message:
+            raise ValueError("v3 reference failure message is invalid")
+        safe_message = _sanitize_v3_condition_diagnostic(message)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("v3 reference transition requires an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") not in {
+                "pending",
+                "ready",
+            }:
+                return False
+            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
+                raise RuntimeError("reference failure already consumed an attempt")
+            self._clear_output_resolution_fields(node)
+            node["state"] = "failed"
+            node["retry_consumed"] = 0
+            projection["last_error"] = {
+                "code": code,
+                "message": safe_message,
+                "node_id": node_id,
+            }
+            self._append_locked(
+                directory,
+                projection,
+                "node_failed",
+                {"error_code": code, "error_message": safe_message},
+                node_id=node_id,
+            )
+            return True
+
+    @staticmethod
+    def _clear_output_resolution_fields(node: dict[str, object]) -> None:
+        for field in (
+            "next_resolution_at",
+            "resolution_producer_identity",
+            "resolution_read_count",
+            "resolution_resume_state",
+        ):
+            node.pop(field, None)
+
+    def _fail_output_resolution_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        node_id: str,
+        node: dict[str, object],
+        *,
+        code: str,
+        message: str,
+        read_count: int,
+    ) -> None:
+        node["state"] = "failed"
+        node["resolution_read_count"] = read_count
+        node.pop("next_resolution_at", None)
+        node.pop("resolution_resume_state", None)
+        node["retry_consumed"] = 0
+        projection["last_error"] = {
+            "code": code,
+            "message": message,
+            "node_id": node_id,
+        }
+        self._append_locked(
+            directory,
+            projection,
+            "node_failed",
+            {"error_code": code, "error_message": message},
+            node_id=node_id,
+        )
+
+    def defer_output_resolution(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        producer_identity: Mapping[str, object],
+        now: datetime | None = None,
+    ) -> bool:
+        """CAS one transient v3 read into the bounded durable wait protocol."""
+        identity = canonical_output_publication_identity(producer_identity)
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("resolution observation time must be timezone-aware")
+        instant = instant.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("output resolution waits require an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") not in {
+                "pending",
+                "ready",
+            }:
+                return False
+            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
+                raise RuntimeError("output resolution wait consumed an executor attempt")
+
+            retained_identity = node.get("resolution_producer_identity")
+            read_count = int(node.get("resolution_read_count", 0)) + 1
+            if retained_identity is not None and retained_identity != identity:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_integrity",
+                    message="output reference producer identity changed during resolution",
+                    read_count=read_count,
+                )
+                return True
+
+            node["resolution_producer_identity"] = identity
+            if read_count >= 6:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_unavailable",
+                    message="output reference remained unavailable after 6 reads",
+                    read_count=read_count,
+                )
+                return True
+
+            delay_seconds = (0.25, 0.5, 1.0, 2.0, 4.0)[read_count - 1]
+            next_resolution_at = instant + timedelta(seconds=delay_seconds)
+            node["resolution_read_count"] = read_count
+            node["resolution_resume_state"] = str(node["state"])
+            node["state"] = "waiting_resolution"
+            node["next_resolution_at"] = next_resolution_at.isoformat()
+            node["retry_consumed"] = 0
+            self._append_locked(
+                directory,
+                projection,
+                "output_resolution_deferred",
+                {
+                    "error_code": "output_reference_temporarily_unavailable",
+                    "next_resolution_at": next_resolution_at.isoformat(),
+                    "producer_identity_sha256": output_publication_identity_sha256(
+                        identity
+                    ),
+                    "resolution_read_count": read_count,
+                },
+                node_id=node_id,
+            )
+            return True
+
+    def wake_due_output_resolutions(
+        self, run_id: str, *, now: datetime | None = None
+    ) -> tuple[str, ...]:
+        """Wake each due resolution waiter exactly once under the run CAS lock."""
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("resolution wake time must be timezone-aware")
+        instant = instant.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        ready: list[str] = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("status") != "running":
+                return ()
+            for candidate_id, node in projection.get("nodes", {}).items():
+                if (
+                    not isinstance(node, dict)
+                    or node.get("state") != "waiting_resolution"
+                    or not isinstance(node.get("next_resolution_at"), str)
+                    or datetime.fromisoformat(node["next_resolution_at"]) > instant
+                ):
+                    continue
+                resume_state = node.pop("resolution_resume_state", None)
+                if resume_state not in {"pending", "ready"}:
+                    raise RuntimeError("resolution wait resume state is invalid")
+                node["state"] = resume_state
+                node.pop("next_resolution_at", None)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "output_resolution_ready",
+                    {"resolution_read_count": node["resolution_read_count"]},
+                    node_id=str(candidate_id),
+                )
+                ready.append(str(candidate_id))
+        return tuple(ready)
+
+    def clear_output_resolution(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        producer_identity: Mapping[str, object],
+    ) -> bool:
+        """Clear one matching durable wait after a successful strict read."""
+        identity = canonical_output_publication_identity(producer_identity)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if (
+                not isinstance(node, dict)
+                or node.get("state") not in {"pending", "ready"}
+                or "resolution_read_count" not in node
+            ):
+                return False
+            if node.get("resolution_producer_identity") != identity:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_integrity",
+                    message="output reference producer identity changed during resolution",
+                    read_count=int(node.get("resolution_read_count", 0)) + 1,
+                )
+                return True
+            read_count = int(node["resolution_read_count"])
+            self._clear_output_resolution_fields(node)
+            self._append_locked(
+                directory,
+                projection,
+                "output_resolution_cleared",
+                {"resolution_read_count": read_count},
                 node_id=node_id,
             )
             return True

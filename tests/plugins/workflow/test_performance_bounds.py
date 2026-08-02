@@ -68,6 +68,70 @@ def test_many_clause_condition_reference_discovery_copies_only_linear_bytes() ->
     assert large_slices <= 4 * large_bytes
 
 
+def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch coordinator sweeps mutating or polling a not-yet-due resolution read."""
+    path = workflow_writer(
+        tmp_path / "resolution-bound-package",
+        name="resolution-bound",
+        nodes=[
+            {"id": "producer", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["producer"]},
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    store = RunStore(tmp_path / "resolution-bound-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="resolution-bound",
+            concurrency_key="resolution-bound",
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    identity = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "publication_id": "a" * 32,
+        "sha256": "b" * 64,
+        "size_bytes": 5,
+        "media_type": "text/markdown; charset=utf-8",
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "text",
+    }
+    assert store.defer_output_resolution(
+        admitted.run_id,
+        "consumer",
+        producer_identity=identity,
+        now=observed,
+    )
+    before = store.load_run(admitted.run_id)
+    started = time.perf_counter()
+
+    for offset in range(1_000):
+        assert store.wake_due_output_resolutions(
+            admitted.run_id,
+            now=observed + timedelta(microseconds=offset),
+        ) == ()
+
+    after = store.load_run(admitted.run_id)
+    assert time.perf_counter() - started < 2.0
+    assert after["event_sequence"] == before["event_sequence"]
+    assert after["state_version"] == before["state_version"]
+    assert after["nodes"]["consumer"] == before["nodes"]["consumer"]
+
+
 def test_thousand_node_projection_is_bounded_and_disables_mermaid(
     tmp_path, workflow_writer
 ) -> None:

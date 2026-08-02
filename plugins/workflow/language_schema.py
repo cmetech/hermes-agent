@@ -342,6 +342,13 @@ class DurableWorkflowCode:
 
 _ARCHON_V3 = frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
 _NORMALIZER_V3 = frozenset({3})
+# The projected Phase 3 code catalog is an authenticated/API-facing bounded
+# summary. 16 KiB covers the approved normalization/reference/condition codes
+# plus the remaining planned Bash and session-recovery entries without making
+# each additive task revise an unrelated test ceiling.
+PHASE3_DURABLE_CODE_CATALOG_MAX_BYTES = 16 * 1024
+
+
 PHASE3_DURABLE_CODES = (
     DurableWorkflowCode(
         "archon_timeout_node_unsupported",
@@ -579,6 +586,28 @@ PHASE3_DURABLE_CODES = (
     DurableWorkflowCode(
         "output_reference_integrity",
         "winning output publication identity or content changed",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_temporarily_unavailable",
+        "winning output is temporarily unavailable to the host reader",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_unavailable",
+        "bounded output-resolution reads were exhausted",
         "references",
         _ARCHON_V3,
         _NORMALIZER_V3,

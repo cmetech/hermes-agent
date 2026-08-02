@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 
@@ -39,9 +40,18 @@ def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
         and item.normalizer_versions == frozenset({3})
         for item in language_schema.PHASE3_DURABLE_CODES
     )
-    assert len(
-        json.dumps([item.to_dict() for item in language_schema.PHASE3_DURABLE_CODES])
-    ) < 8_192
+    projected = compatibility_code_catalog(
+        WorkflowLanguageProfile.ARCHON_2026_07
+    )
+    canonical_bytes = json.dumps(
+        projected,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert len(canonical_bytes) <= (
+        language_schema.PHASE3_DURABLE_CODE_CATALOG_MAX_BYTES
+    )
 
 
 def test_runtime_only_codes_omit_editor_only_compatibility_projection_fields() -> None:
@@ -395,6 +405,85 @@ def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
     catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
     for code in emitted:
         assert catalog[code]["area"] == "conditions"
+        assert catalog[code]["normalizer_versions"] == [3]
+        assert catalog[code]["runtime_failure"] is True
+        assert catalog[code]["evidence"] is False
+
+
+def test_task6_resolution_wait_codes_have_real_state_machine_emitters(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch catalog-only transient/exhausted codes with no durable emitter."""
+    path = workflow_writer(
+        tmp_path / "resolution-catalog",
+        name="resolution-catalog",
+        nodes=[
+            {"id": "producer", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["producer"]},
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    store = RunStore(tmp_path / "resolution-catalog-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="resolution-catalog",
+            concurrency_key="resolution-catalog",
+        ),
+        immutable_snapshot=prepared,
+    )
+    identity = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "publication_id": "a" * 32,
+        "sha256": "b" * 64,
+        "size_bytes": 5,
+        "media_type": "text/markdown; charset=utf-8",
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "text",
+    }
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    for read_count in range(1, 7):
+        assert store.defer_output_resolution(
+            admitted.run_id,
+            "consumer",
+            producer_identity=identity,
+            now=observed,
+        )
+        if read_count < 6:
+            due = datetime.fromisoformat(
+                store.load_run(admitted.run_id)["nodes"]["consumer"][
+                    "next_resolution_at"
+                ]
+            )
+            assert store.wake_due_output_resolutions(
+                admitted.run_id, now=due
+            ) == ("consumer",)
+            observed = due
+
+    transient = next(
+        event["payload"]["error_code"]
+        for event in store.tail_events(admitted.run_id)
+        if event["event_type"] == "output_resolution_deferred"
+    )
+    exhausted = store.load_run(admitted.run_id)["last_error"]["code"]
+    assert {transient, exhausted} == {
+        "output_reference_temporarily_unavailable",
+        "output_reference_unavailable",
+    }
+
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+    for code in (transient, exhausted):
+        assert catalog[code]["area"] == "references"
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False

@@ -49,6 +49,7 @@ from plugins.workflow.language import (
     read_language_snapshot,
     verify_language_snapshot,
 )
+from plugins.workflow.language_schema import iter_output_references
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
@@ -69,8 +70,11 @@ from plugins.workflow.output_resolution import (
     WorkflowOutputReferenceError,
     primary_output_candidate_from_identity,
     primary_output_candidate_identity,
+    output_publication_identity,
     resolve_legacy_output_values,
     resolve_node_output,
+    resolve_output_reference,
+    resolved_output_publication_identity,
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import (
@@ -832,6 +836,20 @@ class RunScheduler:
                 )
                 continue
             publication_id = descriptor.get("publication_id")
+            producer_identity = None
+            if strict_v3:
+                try:
+                    producer_identity = output_publication_identity(
+                        node_id=node_id,
+                        attempt_id=winning_attempt,
+                        descriptor=descriptor,
+                        candidate=candidate,
+                    )
+                except ValueError:
+                    outputs[node_id] = WorkflowOutputReferenceError(
+                        "output_reference_integrity", node_id
+                    )
+                    continue
             resolution_key = (
                 root_identity,
                 run_id,
@@ -877,10 +895,16 @@ class RunScheduler:
                             ),
                             strict=strict_v3,
                         )
+                    except WorkflowOutputReferenceError as exc:
+                        if strict_v3:
+                            outputs[node_id] = exc
+                            continue
+                        resolved = None
                     except ArchonOutputIntegrityError:
                         # Preserve Phase 2 missing-output outcomes. Phase 3
                         # makes integrity and missing references strict.
                         if strict_v3:
+                            assert producer_identity is not None
                             outputs[node_id] = WorkflowOutputReferenceError(
                                 "output_reference_integrity", node_id
                             )
@@ -889,6 +913,12 @@ class RunScheduler:
                     except ArchonOutputUnavailableError:
                         # Host-level read availability is retryable. Do not
                         # turn one transient failure into a stable cache miss.
+                        if strict_v3:
+                            outputs[node_id] = WorkflowOutputReferenceError(
+                                "output_reference_temporarily_unavailable",
+                                node_id,
+                                producer_identity=producer_identity,
+                            )
                         continue
                     if resolved is not None or not strict_v3:
                         self._cache_resolved_output(resolution_key, resolved)
@@ -1151,11 +1181,16 @@ class RunScheduler:
             )
 
             def resolve_condition_output(node_id: str) -> object:
-                return self._output_values(
+                output = self._output_values(
                     projection,
                     run_directory,
                     node_ids=(node_id,),
                 ).get(node_id)
+                if isinstance(output, ResolvedNodeOutput):
+                    resolved_identities[node_id] = (
+                        resolved_output_publication_identity(output)
+                    )
+                return output
 
             transitions: dict[str, tuple[str, str | None]] = {}
             condition_transitions: dict[str, tuple[str, str, str]] = {}
@@ -1179,17 +1214,56 @@ class RunScheduler:
                 condition = node.options.get("when")
                 if isinstance(condition, str):
                     if strict_v3:
+                        resolved_identities: dict[str, dict[str, object]] = {}
                         try:
                             matches = evaluate_v3_condition(
                                 condition, resolve_condition_output
                             )
                         except (WorkflowConditionError, WorkflowOutputReferenceError) as exc:
+                            if (
+                                isinstance(exc, WorkflowOutputReferenceError)
+                                and exc.code
+                                == "output_reference_temporarily_unavailable"
+                                and exc.producer_identity is not None
+                            ):
+                                current = self.store.load_run(run_id)["nodes"][node.id]
+                                retained = current.get(
+                                    "resolution_producer_identity"
+                                )
+                                if (
+                                    isinstance(retained, Mapping)
+                                    and retained != exc.producer_identity
+                                    and any(
+                                        retained == identity
+                                        for identity in resolved_identities.values()
+                                    )
+                                ):
+                                    self.store.clear_output_resolution(
+                                        run_id,
+                                        node.id,
+                                        producer_identity=retained,
+                                    )
+                                self.store.defer_output_resolution(
+                                    run_id,
+                                    node.id,
+                                    producer_identity=exc.producer_identity,
+                                    now=self._utcnow(),
+                                )
+                                continue
                             condition_transitions[node.id] = (
                                 "failed",
                                 exc.code,
                                 str(exc),
                             )
                             continue
+                        current = self.store.load_run(run_id)["nodes"][node.id]
+                        retained = current.get("resolution_producer_identity")
+                        if isinstance(retained, Mapping):
+                            self.store.clear_output_resolution(
+                                run_id,
+                                node.id,
+                                producer_identity=retained,
+                            )
                         if not matches:
                             condition_transitions[node.id] = (
                                 "skipped",
@@ -1222,6 +1296,156 @@ class RunScheduler:
                     message=message,
                 )
             self.store.transition_pending_nodes(run_id, transitions)
+
+    @staticmethod
+    def _strict_reference_templates(
+        node: WorkflowNode,
+        *,
+        run_directory: Path,
+        sealed_resource_paths: frozenset[str] | None,
+        sealed_resource_bytes: Mapping[str, bytes] | None,
+    ) -> tuple[str, ...]:
+        """Return authenticated non-condition templates without rendering them."""
+        templates: list[str] = []
+        if node.node_type in {"bash", "prompt"} and isinstance(node.value, str):
+            templates.append(node.value)
+        elif (
+            node.node_type == "script"
+            and isinstance(node.value, str)
+            and is_inline_script(node.value)
+        ):
+            templates.append(node.value)
+        elif node.node_type == "loop" and isinstance(node.value, Mapping):
+            templates.extend(
+                value
+                for field in ("prompt", "until_bash")
+                if isinstance((value := node.value.get(field)), str)
+            )
+        elif node.node_type == "approval" and isinstance(node.value, Mapping):
+            message = node.value.get("message")
+            if isinstance(message, str):
+                templates.append(message)
+            on_reject = node.value.get("on_reject")
+            if isinstance(on_reject, Mapping):
+                prompt = on_reject.get("prompt")
+                if isinstance(prompt, str):
+                    templates.append(prompt)
+        elif (
+            node.node_type == "command"
+            and sealed_resource_paths is not None
+            and sealed_resource_bytes is not None
+        ):
+            resolver = ResourceResolver(
+                run_directory,
+                sealed_paths=sealed_resource_paths,
+                sealed_bytes=sealed_resource_bytes,
+            )
+            templates.append(resolver.command(str(node.value)).body)
+        return tuple(templates)
+
+    def _preflight_strict_node_references(
+        self,
+        run_id: str,
+        node: WorkflowNode,
+        package: WorkflowPackage,
+        projection: Mapping[str, object],
+        *,
+        sealed_resource_paths: frozenset[str] | None,
+        sealed_resource_bytes: Mapping[str, bytes] | None,
+    ) -> bool:
+        """Resolve v3 references before claim without rendering Task 7 consumers."""
+        if (
+            package.language.effective_profile
+            is not WorkflowLanguageProfile.ARCHON_2026_07
+            or package.language.normalizer_version != 3
+        ):
+            return True
+        run_directory = self.store.run_directory(run_id)
+        references = tuple(dict.fromkeys(
+            (reference.node_id, reference.path)
+            for template in self._strict_reference_templates(
+                node,
+                run_directory=run_directory,
+                sealed_resource_paths=sealed_resource_paths,
+                sealed_resource_bytes=sealed_resource_bytes,
+            )
+            for reference in iter_output_references(
+                template, normalizer_version=3
+            )
+        ))
+        if not references:
+            return True
+        outputs = self._output_values(
+            projection,
+            run_directory,
+            node_ids=(producer_id for producer_id, _path in references),
+        )
+        resolved_identities: list[dict[str, object]] = []
+        try:
+            for producer_id, path in references:
+                output = outputs.get(producer_id)
+                if isinstance(output, WorkflowOutputReferenceError):
+                    raise output
+                resolved = resolve_output_reference(
+                    output if isinstance(output, ResolvedNodeOutput) else None,
+                    node_id=producer_id,
+                    path=path,
+                )
+                del resolved
+                assert isinstance(output, ResolvedNodeOutput)
+                resolved_identities.append(
+                    resolved_output_publication_identity(output)
+                )
+        except WorkflowOutputReferenceError as exc:
+            if (
+                exc.code == "output_reference_temporarily_unavailable"
+                and exc.producer_identity is not None
+            ):
+                current = self.store.load_run(run_id)["nodes"][node.id]
+                retained = current.get("resolution_producer_identity")
+                if (
+                    isinstance(retained, Mapping)
+                    and retained != exc.producer_identity
+                    and any(retained == identity for identity in resolved_identities)
+                ):
+                    self.store.clear_output_resolution(
+                        run_id,
+                        node.id,
+                        producer_identity=retained,
+                    )
+                self.store.defer_output_resolution(
+                    run_id,
+                    node.id,
+                    producer_identity=exc.producer_identity,
+                    now=self._utcnow(),
+                )
+            else:
+                self.store.transition_v3_reference_node(
+                    run_id,
+                    node.id,
+                    code=exc.code,
+                    message=str(exc),
+                )
+            return False
+
+        current = self.store.load_run(run_id)["nodes"][node.id]
+        retained = current.get("resolution_producer_identity")
+        if isinstance(retained, Mapping):
+            if any(retained == identity for identity in resolved_identities):
+                self.store.clear_output_resolution(
+                    run_id,
+                    node.id,
+                    producer_identity=retained,
+                )
+            else:
+                self.store.transition_v3_reference_node(
+                    run_id,
+                    node.id,
+                    code="output_reference_integrity",
+                    message="output reference producer identity changed during resolution",
+                )
+                return False
+        return True
 
     def _load_verified_run_package(
         self,
@@ -3028,6 +3252,9 @@ class RunScheduler:
                     ):
                         break
                 self.store.wake_due_retries(run_id, now=self._utcnow())
+                self.store.wake_due_output_resolutions(
+                    run_id, now=self._utcnow()
+                )
                 self._resolve_graph(run_id, package.definition.nodes)
                 projection = self.store.load_run(run_id)
                 if projection["status"] in {
@@ -3040,11 +3267,19 @@ class RunScheduler:
                     "waiting_retry",
                 }:
                     break
-                ready = sorted(
+                ready = [
                     node_id
-                    for node_id, state in projection["nodes"].items()
-                    if state["state"] == "ready"
-                )
+                    for node_id in sorted(projection["nodes"])
+                    if projection["nodes"][node_id]["state"] == "ready"
+                    and self._preflight_strict_node_references(
+                        run_id,
+                        by_id[node_id],
+                        package,
+                        projection,
+                        sealed_resource_paths=sealed_resource_paths,
+                        sealed_resource_bytes=sealed_resource_bytes,
+                    )
+                ]
                 remaining = None if max_nodes is None else max_nodes - executed
                 capacity = min(
                     self.max_parallel_nodes,
@@ -3235,17 +3470,32 @@ class RunScheduler:
                             schedule_revalidation=authorizations[run_id],
                         )
                     self.store.wake_due_retries(run_id, now=self._utcnow())
+                    self.store.wake_due_output_resolutions(
+                        run_id, now=self._utcnow()
+                    )
                     self._resolve_graph(run_id, packages[run_id].definition.nodes)
                     projection = self.store.load_run(run_id)
                     if projection["status"] != "running":
                         continue
                     active.append(run_id)
                     snapshots[run_id] = projection
-                    candidates[run_id] = sorted(
+                    candidates[run_id] = [
                         node_id
-                        for node_id, node in projection["nodes"].items()
-                        if node["state"] == "ready"
-                    )
+                        for node_id in sorted(projection["nodes"])
+                        if projection["nodes"][node_id]["state"] == "ready"
+                        and self._preflight_strict_node_references(
+                            run_id,
+                            next(
+                                node
+                                for node in packages[run_id].definition.nodes
+                                if node.id == node_id
+                            ),
+                            packages[run_id],
+                            projection,
+                            sealed_resource_paths=sealed_resource_paths[run_id],
+                            sealed_resource_bytes=sealed_resource_bytes[run_id],
+                        )
+                    ]
                 if not active and not futures:
                     break
                 claims = []

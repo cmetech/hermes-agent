@@ -1169,14 +1169,10 @@ def test_v3_scheduler_keeps_ai_reference_failure_terminal_before_provider(
     producer_state = result["nodes"]["producer"]
     assert producer_state["state"] == "succeeded", producer_state
     state = result["nodes"]["consumer"]
-    attempt = state["attempts"][0]
     assert result["status"] == "failed"
     assert state["state"] == "failed"
-    assert state["retry_consumed"] == 1
-    assert len(state["attempts"]) == 1
-    assert attempt["error_code"] == "output_reference_field_missing"
-    assert attempt["metadata"]["archon_terminal_failure"] is True
-    assert attempt["metadata"]["additional_provider_attempts"] == 0
+    assert state["retry_consumed"] == 0
+    assert state["attempts"] == []
     assert [request.prompt for request in runner.requests] == ["Produce"]
     assert result["last_error"]["code"] == "output_reference_field_missing"
 
