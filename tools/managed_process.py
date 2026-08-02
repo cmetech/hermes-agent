@@ -132,7 +132,10 @@ try:
         execve(candidate, argv_vector, environment_vector)
         error_number = ctypes.get_errno() or errno.EIO
         last_error = OSError(error_number, os.strerror(error_number), candidate)
-        if error_number not in (errno.ENOENT, errno.ENOTDIR):
+        if (
+            saved_error is None
+            and error_number not in (errno.ENOENT, errno.ENOTDIR)
+        ):
             saved_error = last_error
     if saved_error is not None:
         raise saved_error

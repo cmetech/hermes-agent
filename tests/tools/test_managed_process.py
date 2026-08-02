@@ -759,6 +759,150 @@ def test_inherited_descriptor_path_resolution_rejects_ambiguous_mixed_path() -> 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
 @pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_path_search_preserves_first_meaningful_error(
+    tmp_path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    effect = tmp_path / "failed-path-candidate-must-not-run"
+    blocked = first / "hermes-probe"
+    blocked.write_text(f"#!/bin/sh\nprintf ran > {effect}\n")
+    blocked.chmod(0o600)
+    (second / "hermes-probe").symlink_to("hermes-probe")
+    environment = {"PATH": os.pathsep.join((str(first), str(second)))}
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        direct_error = _capture_spawn_error(
+            OSError,
+            lambda: subprocess.Popen(["hermes-probe"], env=environment),
+        )
+        assert direct_error == (PermissionError, errno.EACCES, "hermes-probe")
+        assert psutil.Process().num_fds() == before
+
+        managed_error = _capture_spawn_error(
+            OSError,
+            lambda: ManagedProcessTree.spawn(
+                ["hermes-probe"],
+                env=environment,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_path_search_continues_to_later_success(
+    tmp_path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    blocked = first / "hermes-probe"
+    blocked.write_text("#!/bin/sh\nexit 99\n")
+    blocked.chmod(0o600)
+    executable = second / "hermes-probe"
+    executable.write_text("#!/bin/sh\nprintf later-success\nprintf ran > \"$1\"\n")
+    executable.chmod(0o700)
+    environment = {"PATH": os.pathsep.join((str(first), str(second)))}
+    direct_effect = tmp_path / "direct-ran"
+    managed_effect = tmp_path / "managed-ran"
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    tree = None
+    try:
+        direct = subprocess.Popen(
+            ["hermes-probe", str(direct_effect)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        direct_stdout, _ = direct.communicate(timeout=5)
+        assert (direct.returncode, direct_stdout) == (0, b"later-success")
+        assert direct_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+
+        tree = ManagedProcessTree.spawn(
+            ["hermes-probe", str(managed_effect)],
+            env=environment,
+            inherited_descriptors=[read_fd],
+        )
+        managed_stdout, _ = tree.process.communicate(timeout=5)
+        assert (tree.process.returncode, managed_stdout) == (0, b"later-success")
+        assert managed_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        if tree is not None:
+            tree.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    ("path_order", "expected_error"),
+    [
+        (("not-a-directory", "missing"), errno.ENOENT),
+        (("missing", "not-a-directory"), errno.ENOTDIR),
+    ],
+)
+def test_inherited_descriptor_path_search_preserves_last_not_found_error(
+    tmp_path,
+    path_order,
+    expected_error,
+) -> None:
+    not_a_directory = tmp_path / "not-a-directory"
+    not_a_directory.write_text("not a directory")
+    path_entries = {
+        "not-a-directory": not_a_directory,
+        "missing": tmp_path / "missing",
+    }
+    environment = {
+        "PATH": os.pathsep.join(str(path_entries[name]) for name in path_order)
+    }
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        direct_error = _capture_spawn_error(
+            OSError,
+            lambda: subprocess.Popen(["hermes-probe"], env=environment),
+        )
+        assert direct_error[1:] == (expected_error, "hermes-probe")
+        assert psutil.Process().num_fds() == before
+
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                ["hermes-probe"],
+                env=environment,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
 def test_inherited_descriptor_omitted_environment_matches_direct_inheritance(
     monkeypatch,
 ) -> None:
