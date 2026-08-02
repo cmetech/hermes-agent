@@ -62,6 +62,7 @@ from plugins.workflow.output_resolution import (
     PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
     PrimaryOutputCandidate,
     ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
     primary_output_candidate_from_identity,
     primary_output_candidate_identity,
     resolve_legacy_output_values,
@@ -164,6 +165,20 @@ def _resolved_output_weight(
         + sys.getsizeof(value.canonical_bytes)
         + _cache_text_weight(value.text)
         + _cache_value_weight(value.value)
+        + _cache_text_weight(value.media_type)
+        + _cache_text_weight(value.sha256)
+        + _cache_text_weight(value.node_id)
+        + _cache_text_weight(value.attempt_id)
+        + (
+            _cache_text_weight(value.publication_id)
+            if value.publication_id is not None
+            else 0
+        )
+        + (
+            _cache_text_weight(value.schema_fingerprint)
+            if value.schema_fingerprint is not None
+            else 0
+        )
     )
 
 
@@ -651,6 +666,8 @@ class RunScheduler:
                 read_text=self._read_text,
             )
 
+        strict_v3 = snapshot.normalizer_version == 3
+
         artifacts = projection.get("artifacts", [])
         nodes = projection.get("nodes", {})
         if not isinstance(artifacts, list) or not isinstance(nodes, Mapping):
@@ -663,15 +680,20 @@ class RunScheduler:
             if not isinstance(node_id, str) or not isinstance(node_state, Mapping):
                 continue
             attempts = node_state.get("attempts", [])
-            winning_attempt_state = next(
-                (
-                    attempt
-                    for attempt in reversed(attempts)
-                    if isinstance(attempt, Mapping)
-                    and attempt.get("state") == "succeeded"
-                    and isinstance(attempt.get("attempt_id"), str)
-                ),
-                None,
+            successful_attempts = tuple(
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("state") == "succeeded"
+                and isinstance(attempt.get("attempt_id"), str)
+            )
+            if strict_v3 and len(successful_attempts) > 1:
+                outputs[node_id] = WorkflowOutputReferenceError(
+                    "output_reference_integrity", node_id
+                )
+                continue
+            winning_attempt_state = (
+                successful_attempts[-1] if successful_attempts else None
             )
             if winning_attempt_state is None:
                 continue
@@ -692,6 +714,10 @@ class RunScheduler:
                         raw_candidate
                     )
                 except ArchonOutputIntegrityError:
+                    if strict_v3:
+                        outputs[node_id] = WorkflowOutputReferenceError(
+                            "output_reference_integrity", node_id
+                        )
                     continue
                 with self._output_resolution_lock:
                     live_candidate = self._cached_primary_output_candidate(
@@ -701,11 +727,19 @@ class RunScheduler:
                     if primary_output_candidate_identity(live_candidate) != dict(
                         raw_candidate
                     ):
+                        if strict_v3:
+                            outputs[node_id] = WorkflowOutputReferenceError(
+                                "output_reference_integrity", node_id
+                            )
                         continue
                     candidate = live_candidate
                 else:
                     candidate = retained_candidate
             elif requires_candidate:
+                if strict_v3:
+                    outputs[node_id] = WorkflowOutputReferenceError(
+                        "output_reference_integrity", node_id
+                    )
                 continue
             candidates = [
                 artifact
@@ -725,19 +759,49 @@ class RunScheduler:
                 )
             ]
             if requires_candidate:
-                canonical = [
+                attempt_local = [
                     artifact
                     for artifact in canonical
                     if candidate is not None
                     and artifact.get("relative_path")
                     == candidate.attempt_relative_path
                 ]
-                descriptor = canonical[-1] if canonical else None
+                publications = [
+                    artifact
+                    for artifact in candidates
+                    if isinstance(artifact.get("publication_id"), str)
+                ]
+                if strict_v3 and candidate is not None and candidate.output_type is not None:
+                    if len(publications) != 1:
+                        outputs[node_id] = WorkflowOutputReferenceError(
+                            "output_reference_integrity", node_id
+                        )
+                        continue
+                    descriptor = publications[0]
+                else:
+                    descriptor = attempt_local[-1] if attempt_local else None
             elif node_type in {"bash", "script"}:
                 descriptor = (canonical or candidates)[-1] if candidates else None
             else:
                 descriptor = canonical[-1] if canonical else None
             if descriptor is None:
+                continue
+            expected_structured = snapshot.structured_outputs.get(node_id)
+            if strict_v3 and (
+                (expected_structured is None and candidate is not None
+                 and candidate.schema_fingerprint is not None)
+                or (
+                    expected_structured is not None
+                    and (
+                        candidate is None
+                        or candidate.schema_fingerprint
+                        != expected_structured.schema_fingerprint
+                    )
+                )
+            ):
+                outputs[node_id] = WorkflowOutputReferenceError(
+                    "output_reference_integrity", node_id
+                )
                 continue
             publication_id = descriptor.get("publication_id")
             resolution_key = (
@@ -779,16 +843,23 @@ class RunScheduler:
                                 if isinstance(publication_id, str)
                                 else None
                             ),
+                            strict=strict_v3,
                         )
                     except ArchonOutputIntegrityError:
                         # Preserve Phase 2 missing-output outcomes. Phase 3
                         # makes integrity and missing references strict.
+                        if strict_v3:
+                            outputs[node_id] = WorkflowOutputReferenceError(
+                                "output_reference_integrity", node_id
+                            )
+                            continue
                         resolved = None
                     except ArchonOutputUnavailableError:
                         # Host-level read availability is retryable. Do not
                         # turn one transient failure into a stable cache miss.
                         continue
-                    self._cache_resolved_output(resolution_key, resolved)
+                    if resolved is not None or not strict_v3:
+                        self._cache_resolved_output(resolution_key, resolved)
             if resolved is not None:
                 outputs[node_id] = resolved
         return outputs
@@ -951,10 +1022,11 @@ class RunScheduler:
                     )
         outputs = {
             node: value
-            if isinstance(value, str | ResolvedNodeOutput)
+            if isinstance(value, str | ResolvedNodeOutput | WorkflowOutputReferenceError)
             else json.dumps(value, sort_keys=True)
             for node, value in self._output_values(projection, run_directory).items()
         }
+        language_snapshot = read_language_snapshot(projection.get("language"))
         return VariableContext(
             arguments=arguments,
             user_message=arguments,
@@ -963,6 +1035,11 @@ class RunScheduler:
             base_branch="base",
             docs_dir=run_directory / "docs",
             node_outputs=outputs,
+            normalizer_version=(
+                language_snapshot.normalizer_version
+                if language_snapshot is not None
+                else WORKFLOW_NORMALIZER_VERSION
+            ),
         )
 
     @staticmethod
@@ -2419,6 +2496,11 @@ class RunScheduler:
                             workflow_name=package.definition.name,
                             workflow_options=package.definition.options,
                             variable_context=variables,
+                            output_resolver=(
+                                variables.output_reference
+                                if package.language.normalizer_version == 3
+                                else None
+                            ),
                             predecessor_results=self._predecessor_results(
                                 projection,
                                 node.depends_on,
@@ -2518,6 +2600,16 @@ class RunScheduler:
                         error_code="structured_output_capability_drift",
                         error_message=str(exc),
                         metadata={"archon_terminal_failure": True},
+                    )
+                except WorkflowOutputReferenceError as exc:
+                    result = NodeExecutionResult(
+                        "failed",
+                        error_code=exc.code,
+                        error_message=str(exc),
+                        metadata={
+                            "archon_terminal_failure": True,
+                            "additional_provider_attempts": 0,
+                        },
                     )
                 except Exception as exc:
                     result = NodeExecutionResult(

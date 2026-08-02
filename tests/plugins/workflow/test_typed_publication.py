@@ -17,6 +17,7 @@ from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     PrimaryOutputCandidate,
+    ResolvedNodeOutput,
 )
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -220,6 +221,16 @@ def test_production_ai_output_node_publishes_one_atomic_typed_bundle(
         identity not in publication_id
         for identity in (admitted.run_id, "produce", artifact["attempt_id"])
     )
+    resolved = scheduler._output_values(
+        result, store.run_directory(admitted.run_id)
+    )["produce"]
+    assert isinstance(resolved, ResolvedNodeOutput)
+    reference = scheduler._variables(
+        result, store.run_directory(admitted.run_id)
+    ).output_reference("produce")
+    assert resolved.publication_id == publication_id
+    assert reference.typed_value == data.decode("utf-8")
+    assert reference.rendered_text == data.decode("utf-8")
 
 
 def test_production_cancel_never_publishes(

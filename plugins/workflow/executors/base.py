@@ -16,7 +16,10 @@ from plugins.workflow.models import (
     WorkflowNode,
     WorkflowStructuredOutput,
 )
-from plugins.workflow.output_resolution import PrimaryOutputCandidate
+from plugins.workflow.output_resolution import (
+    PrimaryOutputCandidate,
+    ResolvedOutputReference,
+)
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
     ProcessIdentity,
@@ -75,6 +78,9 @@ class NodeExecutionContext:
     structured_output: WorkflowStructuredOutput | None = None
     structured_output_decision: StructuredOutputCapabilityDecision | None = None
     outward_action: bool = False
+    output_resolver: (
+        Callable[[str, tuple[str, ...]], ResolvedOutputReference] | None
+    ) = None
 
 
 @dataclass(frozen=True)

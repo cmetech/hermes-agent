@@ -53,6 +53,32 @@ class ArchonOutputUnavailableError(RuntimeError):
     """An attempt-local output could not be read due to transient host I/O."""
 
 
+class WorkflowOutputReferenceError(ArchonOutputIntegrityError):
+    """Bounded typed failure while resolving one v3 output reference."""
+
+    def __init__(
+        self,
+        code: str,
+        node_id: str,
+        path: tuple[str, ...] = (),
+    ) -> None:
+        self.code = code
+        self.node_id = node_id
+        self.path = tuple(path)
+        super().__init__(f"{code}: output reference for {node_id}")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedOutputReference:
+    """The typed and deterministic text facets of one output reference."""
+
+    typed_value: object
+    rendered_text: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "typed_value", _freeze_json(self.typed_value))
+
+
 def _canonical_relative_path(value: object) -> PurePosixPath | None:
     if (
         not isinstance(value, str)
@@ -449,12 +475,97 @@ class ResolvedNodeOutput:
     node_id: str
     attempt_id: str
     publication_id: str | None
+    schema_fingerprint: str | None = None
+    canonicalization_version: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "value", _freeze_json(self.value))
 
 
-def resolve_node_output(
+def _render_reference_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+
+    def thaw(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): thaw(child) for key, child in item.items()}
+        if isinstance(item, tuple | list):
+            return [thaw(child) for child in item]
+        return item
+
+    try:
+        return json.dumps(
+            thaw(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ArchonOutputIntegrityError(
+            "Archon structured output is not canonical JSON"
+        ) from exc
+
+
+def resolve_output_reference(
+    output: ResolvedNodeOutput | None,
+    *,
+    node_id: str,
+    path: tuple[str, ...] = (),
+) -> ResolvedOutputReference:
+    """Resolve one v3 reference without reparsing schemaless provider text."""
+    if output is None:
+        raise WorkflowOutputReferenceError(
+            "output_reference_missing", node_id, tuple(path)
+        )
+    if output.node_id != node_id:
+        raise WorkflowOutputReferenceError(
+            "output_reference_integrity", node_id, tuple(path)
+        )
+    if path and output.schema_fingerprint is None:
+        raise WorkflowOutputReferenceError(
+            "output_reference_not_structured", node_id, tuple(path)
+        )
+
+    value = output.value
+    for segment in path:
+        if isinstance(value, Mapping):
+            if segment not in value:
+                raise WorkflowOutputReferenceError(
+                    "output_reference_field_missing", node_id, tuple(path)
+                )
+            value = value[segment]
+            continue
+        if isinstance(value, tuple | list):
+            if not re.fullmatch(r"0|[1-9][0-9]*", segment):
+                raise WorkflowOutputReferenceError(
+                    "output_reference_path_type", node_id, tuple(path)
+                )
+            index = int(segment)
+            if index >= len(value):
+                raise WorkflowOutputReferenceError(
+                    "output_reference_field_missing", node_id, tuple(path)
+                )
+            value = value[index]
+            continue
+        raise WorkflowOutputReferenceError(
+            "output_reference_path_type", node_id, tuple(path)
+        )
+
+    try:
+        rendered = (
+            output.text
+            if output.schema_fingerprint is None and not path
+            else _render_reference_value(value)
+        )
+    except ArchonOutputIntegrityError as exc:
+        raise WorkflowOutputReferenceError(
+            "output_reference_integrity", node_id, tuple(path)
+        ) from exc
+    return ResolvedOutputReference(value, rendered)
+
+
+def _resolve_node_output(
     *,
     run_directory: Path,
     node_id: str,
@@ -462,6 +573,7 @@ def resolve_node_output(
     descriptor: Mapping[str, object],
     candidate: PrimaryOutputCandidate | None = None,
     publication_id: str | None = None,
+    strict: bool = False,
 ) -> ResolvedNodeOutput:
     """Resolve one descriptor without consulting raw provider response text."""
     relative_path = descriptor.get("relative_path")
@@ -482,18 +594,55 @@ def resolve_node_output(
         or len(digest) != 64
     ):
         raise ArchonOutputIntegrityError("Archon output descriptor is invalid")
+    descriptor_publication_id = descriptor.get("publication_id")
+    if (
+        descriptor_publication_id is not None
+        and descriptor_publication_id != publication_id
+    ):
+        raise ArchonOutputIntegrityError("Archon output publication identity changed")
+    read_relative_path = relative_path
+    if strict and publication_id is not None:
+        content_name = descriptor.get("content_name")
+        expected_content_name = (
+            "content.json"
+            if media_type == "application/json"
+            else "content.md"
+            if media_type == "text/markdown; charset=utf-8"
+            else None
+        )
+        if (
+            expected_content_name is None
+            or content_name != expected_content_name
+        ):
+            raise ArchonOutputIntegrityError(
+                "Archon output publication descriptor is invalid"
+            )
+        read_relative_path = f"publications/{publication_id}/{expected_content_name}"
     if candidate is not None and (
         candidate.attempt_relative_path != relative_path
         or candidate.media_type != media_type
         or candidate.size_bytes != size_bytes
         or candidate.sha256 != digest
+        or (
+            "schema_fingerprint" in descriptor
+            and descriptor.get("schema_fingerprint") != candidate.schema_fingerprint
+        )
+        or (
+            "canonicalization_version" in descriptor
+            and descriptor.get("canonicalization_version")
+            != candidate.canonicalization_version
+        )
+        or (
+            "output_type" in descriptor
+            and descriptor.get("output_type") != candidate.output_type
+        )
     ):
         raise ArchonOutputIntegrityError(
             "Archon output candidate and descriptor disagree"
         )
     canonical_bytes = _read_descriptor_relative(
         run_directory,
-        relative_path,
+        read_relative_path,
         size_bytes=size_bytes,
     )
     if (
@@ -505,13 +654,32 @@ def resolve_node_output(
         text = canonical_bytes.decode("utf-8")
     except UnicodeError as exc:
         raise ArchonOutputIntegrityError("Archon output is not UTF-8") from exc
-    if candidate is not None and candidate.structured_value is not None:
+    schema_fingerprint = candidate.schema_fingerprint if candidate is not None else None
+    canonicalization_version = (
+        candidate.canonicalization_version if candidate is not None else 1
+    )
+    if schema_fingerprint is not None and strict:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ArchonOutputIntegrityError("Archon JSON output is invalid") from exc
+        if media_type != "application/json":
+            raise ArchonOutputIntegrityError(
+                "Archon structured output media type is invalid"
+            )
+        if candidate is not None and candidate.structured_value is not None:
+            if _render_reference_value(candidate.structured_value) != _render_reference_value(value):
+                raise ArchonOutputIntegrityError(
+                    "Archon structured output candidate content disagrees"
+                )
+    elif strict and candidate is not None:
+        value = text
+    elif candidate is not None and candidate.structured_value is not None:
         value = candidate.structured_value
     else:
         try:
-            # Phase 2 retains the legacy JSON-looking text adapter for shell,
-            # script, and schemaless outputs. Phase 3 may make media/type
-            # interpretation strict without changing the canonical bytes.
+            # Phase 2 retains the JSON-looking text adapter when no publication
+            # identity says whether this output was structured.
             value = json.loads(text)
         except json.JSONDecodeError as exc:
             if media_type == "application/json":
@@ -528,7 +696,38 @@ def resolve_node_output(
         node_id=node_id,
         attempt_id=attempt_id,
         publication_id=publication_id,
+        schema_fingerprint=schema_fingerprint,
+        canonicalization_version=canonicalization_version,
     )
+
+
+def resolve_node_output(
+    *,
+    run_directory: Path,
+    node_id: str,
+    attempt_id: str,
+    descriptor: Mapping[str, object],
+    candidate: PrimaryOutputCandidate | None = None,
+    publication_id: str | None = None,
+    strict: bool = False,
+) -> ResolvedNodeOutput:
+    """Resolve one winning output, optionally mapping integrity to the v3 code."""
+    try:
+        return _resolve_node_output(
+            run_directory=run_directory,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            descriptor=descriptor,
+            candidate=candidate,
+            publication_id=publication_id,
+            strict=strict,
+        )
+    except ArchonOutputIntegrityError as exc:
+        if strict:
+            raise WorkflowOutputReferenceError(
+                "output_reference_integrity", node_id
+            ) from exc
+        raise
 
 
 def resolve_legacy_output_values(
@@ -562,10 +761,13 @@ __all__ = [
     "ArchonOutputUnavailableError",
     "PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY",
     "PrimaryOutputCandidate",
+    "ResolvedOutputReference",
     "ResolvedNodeOutput",
+    "WorkflowOutputReferenceError",
     "primary_output_candidate_from_identity",
     "primary_output_candidate_identity",
     "resolve_legacy_output_values",
     "resolve_node_output",
+    "resolve_output_reference",
     "write_archon_output_exclusive",
 ]

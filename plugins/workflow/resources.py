@@ -19,7 +19,12 @@ from typing import Iterable, Mapping
 import yaml
 
 from plugins.workflow.language_schema import iter_output_references
-from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    ResolvedOutputReference,
+    WorkflowOutputReferenceError,
+    resolve_output_reference,
+)
 
 
 _COMMAND_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -598,7 +603,23 @@ class VariableContext:
     loop_user_input: str = ""
     loop_prev_output: str = ""
     rejection_reason: str = ""
-    node_outputs: Mapping[str, str | ResolvedNodeOutput] = field(default_factory=dict)
+    node_outputs: Mapping[
+        str, str | ResolvedNodeOutput | WorkflowOutputReferenceError
+    ] = field(default_factory=dict)
+    normalizer_version: int = 2
+
+    def output_reference(
+        self, node_id: str, path: tuple[str, ...] = ()
+    ) -> ResolvedOutputReference:
+        """Resolve one Archon v3 output through the canonical strict resolver."""
+        raw = self.node_outputs.get(node_id)
+        if isinstance(raw, WorkflowOutputReferenceError):
+            raise WorkflowOutputReferenceError(raw.code, node_id, tuple(path))
+        return resolve_output_reference(
+            raw if isinstance(raw, ResolvedNodeOutput) else None,
+            node_id=node_id,
+            path=path,
+        )
 
     def _value(self, match: re.Match[str]) -> str | None:
         position = match.group("position")
@@ -611,10 +632,15 @@ class VariableContext:
             return values[index] if index < len(values) else ""
         node = match.group("node")
         if node is not None:
+            dot = match.group("dot")
+            if self.normalizer_version == 3:
+                return self.output_reference(
+                    node,
+                    tuple(dot.split(".")) if dot else (),
+                ).rendered_text
             raw = self.node_outputs.get(node)
             if raw is None:
                 return ""
-            dot = match.group("dot")
             if not dot:
                 return raw.text if isinstance(raw, ResolvedNodeOutput) else raw
             try:

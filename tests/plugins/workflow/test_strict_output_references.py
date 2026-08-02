@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
 
 import pytest
 
 import plugins.workflow.language_schema as language_schema
+from agent.structured_output import normalize_schema
+from plugins.workflow import output_resolution
+from plugins.workflow.resources import VariableContext
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.language_schema import (
     definition_json_schema,
     workflow_authoring_contract,
@@ -970,3 +975,314 @@ def test_v3_invalid_authenticated_command_has_a_bounded_stable_error(
     assert _codes(exc) == ["invalid_command_resource"]
     assert exc.value.issues[0].path == "nodes[0].command"
     assert len(exc.value.issues[0].message.encode("utf-8")) <= 128
+
+
+def _resolved_output(
+    value: object,
+    *,
+    structured: bool = True,
+    node_id: str = "producer",
+) -> object:
+    if structured:
+        canonical = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        schema_fingerprint = "3" * 64
+        media_type = "application/json"
+    else:
+        assert isinstance(value, str)
+        canonical = value.encode("utf-8")
+        schema_fingerprint = None
+        media_type = "text/markdown; charset=utf-8"
+    return output_resolution.ResolvedNodeOutput(
+        canonical_bytes=canonical,
+        value=value,
+        text=canonical.decode("utf-8"),
+        media_type=media_type,
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        node_id=node_id,
+        attempt_id="attempt-winner",
+        publication_id="a" * 32,
+        schema_fingerprint=schema_fingerprint,
+        canonicalization_version=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "rendered"),
+    (
+        ("plain", "plain"),
+        (None, "null"),
+        (True, "true"),
+        (3, "3"),
+        ([{"z": 1}], '[{"z":1}]'),
+        ({"z": 1, "a": False}, '{"a":false,"z":1}'),
+    ),
+)
+def test_v3_resolver_returns_immutable_typed_and_rendered_facets(
+    value: object, rendered: str
+) -> None:
+    result = output_resolution.resolve_output_reference(
+        _resolved_output(value), node_id="producer", path=()
+    )
+
+    if isinstance(value, list):
+        assert json.loads(result.rendered_text) == value
+    else:
+        assert result.typed_value == value
+    assert result.rendered_text == rendered
+    with pytest.raises((AttributeError, TypeError)):
+        result.rendered_text = "changed"
+
+
+def test_v3_schemaless_json_looking_text_never_becomes_structured() -> None:
+    output = _resolved_output('{"answer":42}', structured=False)
+
+    whole = output_resolution.resolve_output_reference(
+        output, node_id="producer", path=()
+    )
+
+    assert whole.typed_value == '{"answer":42}'
+    assert whole.rendered_text == '{"answer":42}'
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        output_resolution.resolve_output_reference(
+            output, node_id="producer", path=("answer",)
+        )
+    assert (exc.value.code, exc.value.node_id, exc.value.path) == (
+        "output_reference_not_structured",
+        "producer",
+        ("answer",),
+    )
+
+
+def test_v3_node_resolution_keeps_json_looking_schemaless_bytes_as_text(
+    tmp_path: Path,
+) -> None:
+    canonical = b'{"answer":42}'
+    path = tmp_path / "output.md"
+    path.write_bytes(canonical)
+    digest = hashlib.sha256(canonical).hexdigest()
+    candidate = output_resolution.PrimaryOutputCandidate(
+        attempt_relative_path="output.md",
+        media_type="text/plain",
+        size_bytes=len(canonical),
+        sha256=digest,
+        structured_value=None,
+        schema_fingerprint=None,
+        canonicalization_version=1,
+        output_type=None,
+    )
+
+    resolved = output_resolution.resolve_node_output(
+        run_directory=tmp_path,
+        node_id="producer",
+        attempt_id="attempt-winner",
+        descriptor={
+            "node_id": "producer",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.md",
+            "media_type": "text/plain",
+            "size_bytes": len(canonical),
+            "sha256": digest,
+        },
+        candidate=candidate,
+        strict=True,
+    )
+    reference = output_resolution.resolve_output_reference(
+        resolved, node_id="producer"
+    )
+
+    assert reference.typed_value == canonical.decode("utf-8")
+    assert reference.rendered_text == canonical.decode("utf-8")
+
+
+def test_v3_resolver_traverses_exact_mapping_keys_and_canonical_indexes() -> None:
+    output = _resolved_output(
+        {"items": [{"count": 3}], "01": "mapping-key", "zero": ["first"]}
+    )
+
+    count = output_resolution.resolve_output_reference(
+        output, node_id="producer", path=("items", "0", "count")
+    )
+    exact = output_resolution.resolve_output_reference(
+        output, node_id="producer", path=("01",)
+    )
+
+    assert (count.typed_value, count.rendered_text) == (3, "3")
+    assert (exact.typed_value, exact.rendered_text) == ("mapping-key", "mapping-key")
+
+    for path, expected in (
+        (("missing",), "output_reference_field_missing"),
+        (("items", "1"), "output_reference_field_missing"),
+        (("items", "01"), "output_reference_path_type"),
+        (("items", "zero"), "output_reference_path_type"),
+        (("items", "0", "count", "child"), "output_reference_path_type"),
+    ):
+        with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+            output_resolution.resolve_output_reference(
+                output, node_id="producer", path=path
+            )
+        assert exc.value.code == expected
+        assert exc.value.path == path
+
+
+def test_v3_missing_output_has_a_bounded_typed_failure() -> None:
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        output_resolution.resolve_output_reference(
+            None, node_id="producer", path=("answer",)
+        )
+
+    assert exc.value.code == "output_reference_missing"
+    assert exc.value.node_id == "producer"
+    assert exc.value.path == ("answer",)
+    assert len(str(exc.value).encode("utf-8")) <= 256
+
+
+def test_v3_nonfinite_structured_value_fails_as_reference_integrity() -> None:
+    output = output_resolution.ResolvedNodeOutput(
+        canonical_bytes=b"1e999",
+        value=float("inf"),
+        text="1e999",
+        media_type="application/json",
+        sha256=hashlib.sha256(b"1e999").hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="a" * 32,
+        schema_fingerprint="3" * 64,
+        canonicalization_version=1,
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        output_resolution.resolve_output_reference(output, node_id="producer")
+
+    assert exc.value.code == "output_reference_integrity"
+
+
+def test_v3_variable_context_uses_strict_resolver_without_empty_fallback() -> None:
+    variables = VariableContext(
+        node_outputs={"producer": _resolved_output({"answer": "ready"})},
+        normalizer_version=3,
+    )
+
+    assert variables.render_prompt("$producer.output.answer") == "ready"
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        variables.render_prompt("$producer.output.missing")
+    assert exc.value.code == "output_reference_field_missing"
+
+
+def test_v3_resolver_requires_publication_path_and_full_schema_identity(
+    tmp_path: Path,
+) -> None:
+    canonical = b'{"answer":"ready"}'
+    forged = tmp_path / "nodes" / "producer" / "attempt-winner" / "output.json"
+    forged.parent.mkdir(parents=True)
+    forged.write_bytes(canonical)
+    candidate = output_resolution.PrimaryOutputCandidate(
+        attempt_relative_path=forged.relative_to(tmp_path).as_posix(),
+        media_type="application/json",
+        size_bytes=len(canonical),
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        structured_value={"answer": "ready"},
+        schema_fingerprint="3" * 64,
+        canonicalization_version=1,
+        output_type="Answer",
+    )
+    descriptor = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "relative_path": candidate.attempt_relative_path,
+        "media_type": "application/json",
+        "size_bytes": len(canonical),
+        "sha256": candidate.sha256,
+        "publication_id": "a" * 32,
+        "content_name": "content.json",
+        "schema_fingerprint": candidate.schema_fingerprint,
+        "canonicalization_version": 1,
+        "output_type": "Answer",
+    }
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        output_resolution.resolve_node_output(
+            run_directory=tmp_path,
+            node_id="producer",
+            attempt_id="attempt-winner",
+            descriptor=descriptor,
+            candidate=candidate,
+            publication_id="a" * 32,
+            strict=True,
+        )
+
+    assert exc.value.code == "output_reference_integrity"
+
+
+def test_v3_scheduler_rejects_ambiguous_successful_winning_attempts(
+    tmp_path: Path,
+) -> None:
+    normalized_schema = normalize_schema({"type": "object"})
+    artifacts: list[dict[str, object]] = []
+    attempts: list[dict[str, object]] = []
+    for suffix, answer in (("old", "stale"), ("new", "winner")):
+        attempt_id = f"attempt-{suffix}"
+        data = json.dumps(
+            {"answer": answer}, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        path = tmp_path / "nodes" / "producer" / attempt_id / "output.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        identity = {
+            "attempt_relative_path": path.relative_to(tmp_path).as_posix(),
+            "media_type": "application/json",
+            "size_bytes": len(data),
+            "sha256": digest,
+            "schema_fingerprint": normalized_schema.schema_fingerprint,
+            "canonicalization_version": 1,
+            "output_type": "Answer",
+        }
+        attempts.append({
+            "attempt_id": attempt_id,
+            "state": "succeeded",
+            "metadata": {"primary_output_candidate": identity},
+        })
+        artifacts.append({
+            "node_id": "producer",
+            "attempt_id": attempt_id,
+            "relative_path": identity["attempt_relative_path"],
+            "media_type": identity["media_type"],
+            "size_bytes": identity["size_bytes"],
+            "sha256": identity["sha256"],
+        })
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 3,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {
+                "producer": {
+                    "canonical_schema": dict(normalized_schema.canonical_schema),
+                    "schema_fingerprint": normalized_schema.schema_fingerprint,
+                    "canonicalization_version": 1,
+                }
+            },
+            "node_semantics": {},
+        },
+        "nodes": {
+            "producer": {
+                "type": "prompt",
+                "attempts": attempts,
+            }
+        },
+        "artifacts": artifacts,
+    }
+
+    outputs = RunScheduler.__new__(RunScheduler)._output_values(projection, tmp_path)
+
+    assert isinstance(
+        outputs["producer"], output_resolution.WorkflowOutputReferenceError
+    )
+    assert outputs["producer"].code == "output_reference_integrity"

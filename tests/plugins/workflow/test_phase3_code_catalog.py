@@ -10,6 +10,11 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.execution_semantics import WorkflowExecutionSemanticsError
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.language_schema import compatibility_code_catalog
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+    resolve_output_reference,
+)
 from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowValidationError,
@@ -251,6 +256,53 @@ def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
         "named_script_output_reference_unsupported",
         "invalid_command_resource",
     }
+
+
+def test_task4_runtime_reference_codes_have_behavior_linked_catalog_entries() -> None:
+    canonical = b'{"items":[1],"scalar":3}'
+    structured = ResolvedNodeOutput(
+        canonical_bytes=canonical,
+        value={"items": [1], "scalar": 3},
+        text=canonical.decode("utf-8"),
+        media_type="application/json",
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="a" * 32,
+        schema_fingerprint="3" * 64,
+        canonicalization_version=1,
+    )
+    text = b'{"looks":"structured"}'
+    schemaless = ResolvedNodeOutput(
+        canonical_bytes=text,
+        value=text.decode("utf-8"),
+        text=text.decode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        sha256=hashlib.sha256(text).hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="b" * 32,
+    )
+    cases = (
+        (None, (), "producer", "output_reference_missing"),
+        (schemaless, ("looks",), "producer", "output_reference_not_structured"),
+        (structured, ("missing",), "producer", "output_reference_field_missing"),
+        (structured, ("scalar", "child"), "producer", "output_reference_path_type"),
+        (structured, (), "different", "output_reference_integrity"),
+    )
+    emitted: set[str] = set()
+    for output, path, node_id, expected in cases:
+        with pytest.raises(WorkflowOutputReferenceError) as exc:
+            resolve_output_reference(output, node_id=node_id, path=path)
+        assert exc.value.code == expected
+        emitted.add(exc.value.code)
+
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+    for code in emitted:
+        assert catalog[code]["area"] == "references"
+        assert catalog[code]["normalizer_versions"] == [3]
+        assert catalog[code]["runtime_failure"] is True
+        assert catalog[code]["evidence"] is False
 
 
 def _admit_catalog_snapshot(store: RunStore, package, *, key: str) -> str:
