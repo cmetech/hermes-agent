@@ -356,6 +356,54 @@ def test_archon_unknown_provider_outcome_reconciles_after_full_conservative_char
     assert node["attempts"][0]["metadata"]["provider_attempts_exact"] is False
 
 
+def test_archon_provider_grant_exhaustion_is_terminal_without_reconciliation(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "grant-exhausted",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=3,
+    )
+    store = RunStore(tmp_path / "grant-exhausted-home")
+    admitted = _start(store, package, key="grant-exhausted")
+    calls = 0
+
+    class Exhausted:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_attempt_grant_exhausted",
+                metadata={
+                    "provider_attempts": 2,
+                    "provider_attempts_exact": True,
+                    "known_no_effect": True,
+                },
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = Exhausted()
+
+    result = scheduler.advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    assert result["status"] == "failed"
+    assert node["state"] == "failed"
+    assert node["retry_consumed"] == 3
+    assert node.get("pending_interaction") is None
+    assert result["last_error"]["code"] == "provider_attempt_grant_exhausted"
+    assert calls == 1
+
+    restarted = RunScheduler(RunStore(tmp_path / "grant-exhausted-home"))
+    restarted.executors["prompt"] = Exhausted()
+    resumed = restarted.advance(admitted.run_id)
+    assert resumed["status"] == "failed"
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("code", "known_no_effect", "outward_action", "expected"),
     [

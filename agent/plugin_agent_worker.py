@@ -1538,19 +1538,11 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             provider_attempt_counter = [0]
             provider_attempt_grant_exhausted = [False]
             provider_attempt_lock = threading.Lock()
+            sealed_provider_grant = request.sealed_provider_attempt_grant
             counted_provider_methods = 0
-            for method_name in (
-                "_interruptible_streaming_api_call",
-                "_interruptible_api_call",
-            ):
-                original_method = getattr(agent, method_name, None)
-                if not callable(original_method):
-                    continue
-                counted_provider_methods += 1
+            if sealed_provider_grant:
 
-                def counted_provider_call(
-                    *args, _original_method=original_method, **kwargs
-                ):
+                def reserve_provider_attempt() -> None:
                     if _cancel_event.is_set() or getattr(
                         agent, "_interrupt_requested", False
                     ):
@@ -1567,9 +1559,31 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                                 "sealed provider attempt grant exhausted"
                             )
                         provider_attempt_counter[0] += 1
-                    return _original_method(*args, **kwargs)
 
-                setattr(agent, method_name, counted_provider_call)
+                agent._provider_attempt_reservation_callback = (
+                    reserve_provider_attempt
+                )
+            else:
+                # Preserve the pre-v3 observation contract exactly. Legacy
+                # audit counts orchestration-method entries (including nested
+                # delegation) but never treats max_api_attempts as one sealed
+                # request-wide grant across recovery or fallback cycles.
+                for method_name in (
+                    "_interruptible_streaming_api_call",
+                    "_interruptible_api_call",
+                ):
+                    original_method = getattr(agent, method_name, None)
+                    if not callable(original_method):
+                        continue
+                    counted_provider_methods += 1
+
+                    def counted_provider_call(
+                        *args, _original_method=original_method, **kwargs
+                    ):
+                        provider_attempt_counter[0] += 1
+                        return _original_method(*args, **kwargs)
+
+                    setattr(agent, method_name, counted_provider_call)
             _active_agent = agent
             from hermes_cli.plugins import get_plugin_manager
 
@@ -1606,9 +1620,13 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 if request.structured_output is None:
                     raise
                 assert structured_decision is not None
-                provider_attempts = provider_attempt_counter[0]
                 model_calls = max(
                     0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                provider_attempts = (
+                    provider_attempt_counter[0]
+                    if sealed_provider_grant or counted_provider_methods
+                    else model_calls
                 )
                 structured_evidence = _structured_output_evidence(
                     structured_decision,
@@ -1659,11 +1677,14 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     getattr(agent, "session_cache_write_tokens", 0) or 0
                 ),
             }
-            failed = bool(response.get("failed"))
+            failed = (
+                bool(response.get("failed"))
+                or provider_attempt_grant_exhausted[0]
+            )
             model_calls = max(0, int(response.get("api_calls", 0) or 0))
             provider_attempts = (
                 provider_attempt_counter[0]
-                if counted_provider_methods
+                if sealed_provider_grant or counted_provider_methods
                 else model_calls
             )
             structured_evidence = None

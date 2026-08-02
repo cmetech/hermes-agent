@@ -1911,6 +1911,44 @@ def test_retryable_runner_exception_charges_unknown_provider_attempts(
     assert result.metadata["provider_attempts"] == 2
 
 
+def test_v3_provider_grant_exhaustion_is_exact_and_known_no_effect(tmp_path) -> None:
+    class ExhaustedRunner:
+        def run(self, request, **_kwargs):
+            assert request.sealed_provider_attempt_grant is True
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "failure_kind": "provider_attempt_grant_exhausted",
+                    "provider_attempts": 2,
+                },
+            )
+
+    context = _archon_text_context(
+        tmp_path,
+        _node("grant-exhausted", "work"),
+        max_provider_attempts=2,
+    )
+    context = replace(
+        context,
+        variable_context=VariableContext(
+            workflow_id="run-1", normalizer_version=3
+        ),
+    )
+    result = AgentNodeExecutor(ExhaustedRunner()).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_attempt_grant_exhausted"
+    assert result.metadata["provider_attempts"] == 1
+    assert result.metadata["provider_attempts_exact"] is True
+    assert result.metadata["known_no_effect"] is True
+
+
 def test_v3_prompt_reference_failure_escapes_ai_executor_before_provider(
     tmp_path,
 ) -> None:

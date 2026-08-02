@@ -97,3 +97,72 @@ def test_bedrock_stream_returns_normally_when_not_interrupted():
         api_kwargs = {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
         out = cch.interruptible_streaming_api_call(agent, api_kwargs)
         assert out is resp
+
+
+@pytest.mark.parametrize(
+    ("grant", "expected_converse_calls", "expect_success"),
+    [(1, 0, False), (2, 1, True)],
+)
+def test_bedrock_stream_denial_reserves_each_actual_transport_call(
+    grant, expected_converse_calls, expect_success
+):
+    """The denied stream and the converse fallback are two provider calls."""
+
+    class GrantExhausted(RuntimeError):
+        pass
+
+    agent = _FakeAgent()
+    agent._interrupt_requested = False
+    reservations = 0
+    calls = {"stream": 0, "converse": 0}
+
+    def reserve():
+        nonlocal reservations
+        if reservations >= grant:
+            raise GrantExhausted("provider grant exhausted")
+        reservations += 1
+
+    agent._provider_attempt_reservation_callback = reserve
+
+    def denied_stream(**_kwargs):
+        calls["stream"] += 1
+        raise PermissionError("streaming denied")
+
+    def converse(**_kwargs):
+        calls["converse"] += 1
+        return {"output": "ok"}
+
+    response = SimpleNamespace(choices=[], usage=None, stop_reason="end_turn")
+    fake_client = SimpleNamespace(
+        converse_stream=denied_stream,
+        converse=converse,
+    )
+
+    with patch(
+        "agent.bedrock_adapter._get_bedrock_runtime_client",
+        return_value=fake_client,
+    ), patch(
+        "agent.bedrock_adapter.normalize_converse_response",
+        return_value=response,
+    ), patch(
+        "agent.bedrock_adapter.is_stale_connection_error",
+        return_value=False,
+    ), patch(
+        "agent.bedrock_adapter.is_streaming_access_denied_error",
+        return_value=True,
+    ), patch(
+        "agent.bedrock_adapter.invalidate_runtime_client",
+        lambda *a, **k: None,
+    ):
+        api_kwargs = {
+            "__bedrock_region__": "us-east-1",
+            "__bedrock_converse__": True,
+        }
+        if expect_success:
+            assert cch.interruptible_streaming_api_call(agent, api_kwargs) is response
+        else:
+            with pytest.raises(GrantExhausted):
+                cch.interruptible_streaming_api_call(agent, api_kwargs)
+
+    assert reservations == grant
+    assert calls == {"stream": 1, "converse": expected_converse_calls}

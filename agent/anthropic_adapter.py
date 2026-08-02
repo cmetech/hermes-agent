@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -2885,6 +2885,7 @@ def create_anthropic_message(
     *,
     log_prefix: str = "",
     prefer_stream: bool = True,
+    before_transport: Callable[[], None] | None = None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -2903,6 +2904,8 @@ def create_anthropic_message(
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
+            if before_transport is not None:
+                before_transport()
             with stream_fn(**stream_kwargs) as stream:
                 return stream.get_final_message()
         except Exception as exc:
@@ -2917,4 +2920,6 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    if before_transport is not None:
+        before_transport()
     return messages_api.create(**create_kwargs)

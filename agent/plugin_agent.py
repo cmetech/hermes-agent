@@ -95,6 +95,7 @@ class PluginAgentRunRequest:
     workdir: Path | None = None
     max_iterations: int = 90
     max_api_attempts: int = 3
+    sealed_provider_attempt_grant: bool = False
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
@@ -134,6 +135,7 @@ class PluginAgentRunRequest:
             "workdir": str(self.workdir) if self.workdir is not None else None,
             "max_iterations": self.max_iterations,
             "max_api_attempts": self.max_api_attempts,
+            "sealed_provider_attempt_grant": self.sealed_provider_attempt_grant,
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "wall_timeout_seconds": self.wall_timeout_seconds,
             "provider_request_timeout_seconds": self.provider_request_timeout_seconds,
@@ -173,6 +175,7 @@ class PluginAgentRunRequest:
             "workdir",
             "max_iterations",
             "max_api_attempts",
+            "sealed_provider_attempt_grant",
             "idle_timeout_seconds",
             "wall_timeout_seconds",
             "provider_request_timeout_seconds",
@@ -530,6 +533,8 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or not 1 <= request.max_api_attempts <= 5
     ):
         raise ValueError("max API attempts must be between 1 and 5")
+    if not isinstance(request.sealed_provider_attempt_grant, bool):
+        raise ValueError("sealed provider attempt grant must be boolean")
     for label, value in (("provider", request.provider), ("model", request.model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"{label} must be a non-empty string or None")

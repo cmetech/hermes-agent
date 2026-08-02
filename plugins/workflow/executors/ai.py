@@ -505,6 +505,9 @@ class AgentNodeExecutor:
             workdir=context.run_directory,
             max_iterations=1,
             max_api_attempts=remaining_provider_attempts,
+            sealed_provider_attempt_grant=(
+                initial_request.sealed_provider_attempt_grant
+            ),
             idle_timeout_seconds=min(
                 initial_request.idle_timeout_seconds, remaining_wall
             ),
@@ -977,6 +980,7 @@ class AgentNodeExecutor:
                 workdir=context.run_directory,
                 max_iterations=90,
                 max_api_attempts=granted_provider_attempts,
+                sealed_provider_attempt_grant=strict_v3,
                 idle_timeout_seconds=idle_timeout,
                 wall_timeout_seconds=wall_timeout,
                 provider_request_timeout_seconds=provider_timeout,
@@ -1189,6 +1193,9 @@ class AgentNodeExecutor:
             failure_kind = str(result.audit.get("failure_kind", "")).lower()
             if failure_kind == "package_mcp_unavailable":
                 error_code = "package_mcp_unavailable"
+            elif failure_kind == "provider_attempt_grant_exhausted":
+                error_code = "provider_attempt_grant_exhausted"
+                metadata["known_no_effect"] = True
             elif (
                 "unknown_side_effect" in failure_kind
                 or "outcome_unknown" in failure_kind

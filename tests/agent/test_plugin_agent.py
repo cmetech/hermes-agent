@@ -64,6 +64,7 @@ def _run_real_worker_retry_cycles(
     recover_primary: bool,
     fallback_model: str | None,
     structured_output: StructuredOutputRequest | None = None,
+    sealed_provider_attempt_grant: bool = True,
 ) -> tuple[dict, list[tuple[str, str]]]:
     """Drive the real worker wrapper and real AIAgent conversation retry loop.
 
@@ -88,6 +89,9 @@ def _run_real_worker_retry_cycles(
             return None
 
     def fake_provider_call(agent, api_kwargs):
+        reserve = getattr(agent, "_provider_attempt_reservation_callback", None)
+        if reserve is not None:
+            reserve()
         calls.append((agent.provider, agent.model))
         messages = api_kwargs["messages"]
         system_prefix = tuple(
@@ -184,6 +188,7 @@ def _run_real_worker_retry_cycles(
         fallback_model=fallback_model,
         max_api_attempts=grant,
         structured_output=structured_output,
+        sealed_provider_attempt_grant=sealed_provider_attempt_grant,
     )
     result = worker._run({"plugin_id": "test-plugin", "request": request.to_wire()})
     return result, calls
@@ -339,11 +344,14 @@ def test_request_and_result_are_immutable() -> None:
 
 def test_structured_request_and_result_round_trip_explicit_wire_values() -> None:
     request = PluginAgentRunRequest(
-        prompt="return data", structured_output=_structured_request()
+        prompt="return data",
+        structured_output=_structured_request(),
+        sealed_provider_attempt_grant=True,
     )
     request_wire = request.to_wire()
 
     assert request_wire["structured_output"]["strategy"] == "prompt_json_schema"
+    assert request_wire["sealed_provider_attempt_grant"] is True
     assert isinstance(
         request_wire["structured_output"]["schema"]["canonical_schema_bytes"], str
     )
@@ -400,6 +408,7 @@ def test_protocol_v1_accepts_old_frames_without_structured_output() -> None:
     )
 
     assert request.structured_output is None
+    assert request.sealed_provider_attempt_grant is False
     assert result.structured_output is None
 
 
@@ -1416,6 +1425,86 @@ def test_worker_sealed_provider_grant_caps_recovery_and_fallback_cycles(
     assert charge.provider_attempts_exact is True
 
 
+def test_worker_codex_delegation_reserves_once_per_transport(monkeypatch) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    calls = 0
+
+    class FakeDB:
+        pass
+
+    class FakeCodexAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "codex-session"
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._api_call_count = 0
+            self._interrupt_requested = False
+
+        def _interruptible_api_call(self, _kwargs):
+            nonlocal calls
+            reserve = getattr(
+                self, "_provider_attempt_reservation_callback", None
+            )
+            if reserve is not None:
+                reserve()
+            calls += 1
+            return _worker_response("codex completed")
+
+        def _interruptible_streaming_api_call(self, kwargs):
+            return self._interruptible_api_call(kwargs)
+
+        def run_conversation(self, _prompt, conversation_history=None):
+            self._interruptible_streaming_api_call({"input": "hello"})
+            self._api_call_count = 1
+            return {
+                "failed": False,
+                "api_calls": 1,
+                "final_response": "codex completed",
+            }
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeCodexAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://fake.invalid/codex",
+            "api_key": "secret",
+        },
+    )
+
+    result = worker._run(
+        {
+            "plugin_id": "test-plugin",
+            "request": PluginAgentRunRequest(
+                prompt="hello",
+                allowed_tools=(),
+                max_api_attempts=1,
+                sealed_provider_attempt_grant=True,
+            ).to_wire(),
+        }
+    )
+
+    assert calls == 1
+    assert result["status"] == "completed"
+    assert result["audit"]["provider_attempts"] == 1
+    assert "failure_kind" not in result["audit"]
+
+
 def test_worker_fallback_calls_draw_from_same_sealed_provider_grant(
     monkeypatch,
 ) -> None:
@@ -1435,6 +1524,28 @@ def test_worker_fallback_calls_draw_from_same_sealed_provider_grant(
     assert result["status"] == "failed"
     assert result["audit"]["provider_attempts"] == 3
     assert result["audit"]["failure_kind"] == "provider_attempt_grant_exhausted"
+
+
+def test_legacy_plugin_agent_retains_recovery_and_fallback_cycles(monkeypatch) -> None:
+    result, calls = _run_real_worker_retry_cycles(
+        monkeypatch,
+        grant=2,
+        outcomes=("timeout", "timeout", "rate_limit", "legacy fallback completed"),
+        recover_primary=True,
+        fallback_model="fallback-model",
+        sealed_provider_attempt_grant=False,
+    )
+
+    assert calls == [
+        ("fake-provider", "primary-model"),
+        ("fake-provider", "primary-model"),
+        ("fake-provider", "fallback-model"),
+        ("fake-provider", "fallback-model"),
+    ]
+    assert result["status"] == "completed"
+    assert result["final_response"] == "legacy fallback completed"
+    assert result["audit"]["provider_attempts"] == 4
+    assert "failure_kind" not in result["audit"]
 
 
 def test_structured_repair_worker_cannot_exceed_its_residual_provider_grant(
