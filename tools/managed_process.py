@@ -81,7 +81,6 @@ try:
         raise ValueError("environment transport is incomplete")
     count = struct.unpack_from("!I", data)[0]
     offset = 4
-    environment = {}
     environment_entries = []
     for _index in range(count):
         if offset + 8 > len(data):
@@ -94,8 +93,22 @@ try:
         key_end = offset + key_size
         key = bytes(data[offset:key_end])
         value = bytes(data[key_end:end])
-        environment[key] = value
         environment_entries.append(key + b"=" + value)
+        offset = end
+    if offset + 4 > len(data):
+        raise ValueError("environment transport is incomplete")
+    search_path_count = struct.unpack_from("!I", data, offset)[0]
+    offset += 4
+    executable_search_path = []
+    for _index in range(search_path_count):
+        if offset + 4 > len(data):
+            raise ValueError("environment transport is incomplete")
+        directory_size = struct.unpack_from("!I", data, offset)[0]
+        offset += 4
+        end = offset + directory_size
+        if end > len(data):
+            raise ValueError("environment transport is incomplete")
+        executable_search_path.append(bytes(data[offset:end]))
         offset = end
     if offset != len(data):
         raise ValueError("environment transport has trailing data")
@@ -110,8 +123,8 @@ try:
         executable_candidates = (executable_bytes,)
     else:
         executable_candidates = tuple(
-            os.path.join(os.fsencode(directory), executable_bytes)
-            for directory in os.get_exec_path(environment)
+            os.path.join(directory, executable_bytes)
+            for directory in executable_search_path
         )
     argv_bytes = tuple(os.fsencode(item) for item in argv)
     argv_vector = (ctypes.c_char_p * (len(argv_bytes) + 1))(*argv_bytes, None)
@@ -155,8 +168,9 @@ except BaseException as exc:
 
 def _serialize_descriptor_bootstrap_environment(
     environment: object,
+    target_executable: str,
 ) -> tuple[bytes, dict[bytes, bytes] | None]:
-    """Snapshot final-exec bytes without exposing values in bootstrap argv."""
+    """Snapshot final-exec bytes and original-mapping search authority."""
     if environment is None:
         entries = tuple(os.environb.items())
         bootstrap_environment = None
@@ -176,6 +190,21 @@ def _serialize_descriptor_bootstrap_environment(
         payload.extend(struct.pack("!II", len(key), len(value)))
         payload.extend(key)
         payload.extend(value)
+        if len(payload) > _DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES:
+            raise ValueError("environment is too large for descriptor launch")
+    executable_search_path: tuple[bytes, ...] = ()
+    if not os.path.dirname(os.fsencode(target_executable)):
+        executable_search_path = tuple(
+            os.fsencode(directory) for directory in os.get_exec_path(environment)
+        )
+    payload.extend(struct.pack("!I", len(executable_search_path)))
+    if len(payload) > _DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES:
+        raise ValueError("environment is too large for descriptor launch")
+    for directory in executable_search_path:
+        if b"\0" in directory:
+            raise ValueError("embedded null byte")
+        payload.extend(struct.pack("!I", len(directory)))
+        payload.extend(directory)
         if len(payload) > _DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES:
             raise ValueError("environment is too large for descriptor launch")
     return bytes(payload), bootstrap_environment
@@ -818,12 +847,13 @@ class ManagedProcessTree:
             bootstrap_signal_states = _descriptor_bootstrap_signal_states(
                 restore_signals
             )
-            environment_payload, bootstrap_environment = (
-                _serialize_descriptor_bootstrap_environment(kwargs.get("env"))
-            )
             target_executable = argv[0] if use_argv_zero else executable
-            if not os.path.dirname(os.fsencode(target_executable)):
-                os.get_exec_path(kwargs.get("env"))
+            environment_payload, bootstrap_environment = (
+                _serialize_descriptor_bootstrap_environment(
+                    kwargs.get("env"),
+                    target_executable,
+                )
+            )
             if "env" in kwargs:
                 kwargs["env"] = bootstrap_environment
 

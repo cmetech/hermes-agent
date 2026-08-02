@@ -64,6 +64,24 @@ class _RaisingSignalTruth:
         raise RuntimeError("restore_signals truth conversion failed")
 
 
+class _ItemsThenPathMapping(dict):
+    """Expose PATH only after Popen has snapshotted final environment items."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__({"HERMES_MARKER": "exact"})
+        self._path = path
+        self._items_read = False
+
+    def items(self):
+        self._items_read = True
+        return super().items()
+
+    def get(self, key, default=None):
+        if key == "PATH":
+            return self._path if self._items_read else "/definitely/missing"
+        return super().get(key, default)
+
+
 def _environment_entries(output: bytes) -> frozenset[bytes]:
     return frozenset(line for line in output.splitlines() if line)
 
@@ -667,6 +685,38 @@ def test_inherited_descriptor_preserves_exact_explicit_environment(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+def test_inherited_descriptor_search_metadata_stays_inside_transport_bound(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    spawned: list[bool] = []
+    monkeypatch.setattr(managed, "_DESCRIPTOR_BOOTSTRAP_ENV_MAX_BYTES", 64)
+
+    def reject_spawn(*_args, **_kwargs):
+        spawned.append(True)
+        raise AssertionError("transport overflow reached child creation")
+
+    monkeypatch.setattr(subprocess, "Popen", reject_spawn)
+    try:
+        with pytest.raises(ValueError, match="environment is too large"):
+            ManagedProcessTree.spawn(
+                ["/usr/bin/true"],
+                env={"K": "v" * 51},
+                inherited_descriptors=[read_fd],
+            )
+        assert spawned == []
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
 @pytest.mark.live_system_guard_bypass
 def test_inherited_descriptor_preserves_mixed_non_utf8_environment(
     tmp_path,
@@ -753,6 +803,205 @@ def test_inherited_descriptor_path_resolution_rejects_ambiguous_mixed_path() -> 
         os.write(write_fd, b"x")
         assert os.read(read_fd, 1) == b"x"
     finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("path_key", [Path("PATH"), Path("Path"), Path("path")])
+def test_inherited_descriptor_pathlike_key_does_not_grant_search_authority(
+    tmp_path,
+    path_key,
+) -> None:
+    executable_directory = tmp_path / "pathlike-authority"
+    executable_directory.mkdir()
+    effect = tmp_path / "pathlike-path-key-must-not-run"
+    executable = executable_directory / "hermes-probe"
+    executable.write_text("#!/bin/sh\nprintf ran > \"$1\"\n")
+    executable.chmod(0o700)
+    environment = {path_key: str(executable_directory)}
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        direct_error = _capture_spawn_error(
+            OSError,
+            lambda: subprocess.Popen(
+                ["hermes-probe", str(effect)],
+                env=environment,
+            ),
+        )
+        assert direct_error == (FileNotFoundError, errno.ENOENT, "hermes-probe")
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                ["hermes-probe", str(effect)],
+                env=environment,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("path_key", ["PATH", b"PATH"], ids=["text", "bytes"])
+def test_inherited_descriptor_recognized_path_key_preserves_search_authority(
+    tmp_path,
+    path_key,
+) -> None:
+    executable_directory = tmp_path / "recognized-path-authority"
+    executable_directory.mkdir()
+    executable = executable_directory / "hermes-probe"
+    executable.write_text("#!/bin/sh\nprintf authority-ok\nprintf ran > \"$1\"\n")
+    executable.chmod(0o700)
+    path_value = (
+        os.fsencode(executable_directory)
+        if isinstance(path_key, bytes)
+        else str(executable_directory)
+    )
+    environment = {path_key: path_value}
+    direct_effect = tmp_path / "direct-recognized-path"
+    managed_effect = tmp_path / "managed-recognized-path"
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    tree = None
+    try:
+        direct = subprocess.Popen(
+            ["hermes-probe", str(direct_effect)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        direct_stdout, _ = direct.communicate(timeout=5)
+        assert (direct.returncode, direct_stdout) == (0, b"authority-ok")
+        assert direct_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+
+        tree = ManagedProcessTree.spawn(
+            ["hermes-probe", str(managed_effect)],
+            env=environment,
+            inherited_descriptors=[read_fd],
+        )
+        managed_stdout, _ = tree.process.communicate(timeout=5)
+        assert (tree.process.returncode, managed_stdout) == (0, b"authority-ok")
+        assert managed_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        if tree is not None:
+            tree.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("recognized_key", ["PATH", b"PATH"], ids=["text", "bytes"])
+def test_inherited_descriptor_duplicate_normalized_path_keys_preserve_original_authority(
+    tmp_path,
+    recognized_key,
+) -> None:
+    executable_directory = tmp_path / "normalized-duplicate-authority"
+    executable_directory.mkdir()
+    effect = tmp_path / "normalized-duplicate-must-not-run"
+    executable = executable_directory / "hermes-probe"
+    executable.write_text("#!/bin/sh\nprintf ran > \"$1\"\n")
+    executable.chmod(0o700)
+    missing_directory = tmp_path / "recognized-path-is-missing"
+    recognized_value = (
+        os.fsencode(missing_directory)
+        if isinstance(recognized_key, bytes)
+        else str(missing_directory)
+    )
+    environment = {
+        recognized_key: recognized_value,
+        Path("PATH"): str(executable_directory),
+    }
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    try:
+        direct_error = _capture_spawn_error(
+            OSError,
+            lambda: subprocess.Popen(
+                ["hermes-probe", str(effect)],
+                env=environment,
+            ),
+        )
+        assert direct_error == (FileNotFoundError, errno.ENOENT, "hermes-probe")
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                ["hermes-probe", str(effect)],
+                env=environment,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert not effect.exists()
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_custom_mapping_preserves_popen_lookup_order(
+    tmp_path,
+) -> None:
+    executable_directory = tmp_path / "mapping-lookup-order"
+    executable_directory.mkdir()
+    executable = executable_directory / "hermes-probe"
+    executable.write_text("#!/bin/sh\nprintf mapping-order-ok\nprintf ran > \"$1\"\n")
+    executable.chmod(0o700)
+    direct_effect = tmp_path / "direct-mapping-order"
+    managed_effect = tmp_path / "managed-mapping-order"
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    tree = None
+    try:
+        direct = subprocess.Popen(
+            ["hermes-probe", str(direct_effect)],
+            env=_ItemsThenPathMapping(str(executable_directory)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        direct_stdout, _ = direct.communicate(timeout=5)
+        assert (direct.returncode, direct_stdout) == (0, b"mapping-order-ok")
+        assert direct_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+
+        tree = ManagedProcessTree.spawn(
+            ["hermes-probe", str(managed_effect)],
+            env=_ItemsThenPathMapping(str(executable_directory)),
+            inherited_descriptors=[read_fd],
+        )
+        managed_stdout, _ = tree.process.communicate(timeout=5)
+        assert (tree.process.returncode, managed_stdout) == (0, b"mapping-order-ok")
+        assert managed_effect.read_text() == "ran"
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        if tree is not None:
+            tree.close()
         os.close(read_fd)
         os.close(write_fd)
 
