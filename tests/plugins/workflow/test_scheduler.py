@@ -16,10 +16,14 @@ import pytest
 from plugins.workflow import output_resolution
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.models import RunExecutionLimits, WorkflowNode
+from plugins.workflow.models import (
+    RunExecutionLimits,
+    WorkflowNode,
+    WorkflowValidationError,
+)
 from plugins.workflow.output_resolution import PrimaryOutputCandidate, ResolvedNodeOutput
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import ArtifactRef, NodeClaim, RunStore
 from plugins.workflow import locks
 
@@ -959,9 +963,7 @@ class _PackageValidationRunnerTrap:
         raise AssertionError("provider ran before authenticated package validation")
 
 
-def _admit_impossible_authenticated_command(
-    tmp_path, workflow_writer, *, name: str
-):
+def _write_impossible_authenticated_command(tmp_path, workflow_writer, *, name: str):
     root = tmp_path / name
     commands = root / "commands"
     commands.mkdir(parents=True)
@@ -988,10 +990,28 @@ def _admit_impossible_authenticated_command(
             },
         ],
     )
-    workflow.with_name(f"{name}.hermes.yaml").write_text(
+    sidecar = workflow.with_name(f"{name}.hermes.yaml")
+    sidecar.write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    return workflow, sidecar, command
+
+
+def _admit_v2_impossible_authenticated_command(
+    tmp_path, workflow_writer, *, name: str
+):
+    workflow, sidecar, command = _write_impossible_authenticated_command(
+        tmp_path,
+        workflow_writer,
+        name=name,
+    )
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=2,
+    )
+    assert package.language.normalizer_version == 2
     store = RunStore(tmp_path / f"home-{name}")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -1011,11 +1031,31 @@ def _admit_impossible_authenticated_command(
     return store, admitted.run_id
 
 
+def test_v3_admission_rejects_impossible_authenticated_command_before_snapshot(
+    tmp_path, workflow_writer
+):
+    workflow, _sidecar, _command = _write_impossible_authenticated_command(
+        tmp_path,
+        workflow_writer,
+        name="package-validation-v3",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home-package-validation-v3")
+
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        store.prepare_run_snapshot(package)
+
+    assert [(issue.path, issue.code) for issue in exc_info.value.issues] == [
+        ("nodes[1].command", "structured_output_field_impossible")
+    ]
+    assert store.list_runs() == ()
+
+
 @pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
-def test_public_scheduler_durably_fails_impossible_authenticated_command_before_claim(
+def test_public_scheduler_durably_fails_admitted_v2_impossible_command_before_claim(
     tmp_path, workflow_writer, monkeypatch, entrypoint
 ):
-    store, run_id = _admit_impossible_authenticated_command(
+    store, run_id = _admit_v2_impossible_authenticated_command(
         tmp_path,
         workflow_writer,
         name=f"package-validation-{entrypoint}",
