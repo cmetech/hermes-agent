@@ -233,6 +233,56 @@ def test_condition_contract_publishes_ecmascript_unicode_grammar():
     assert unicode_condition in references["examples"]
 
 
+def test_archon_condition_contract_projects_runtime_bounds_and_typed_rules():
+    """Catch backend authoring metadata drifting from the bounded v3 evaluator."""
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    condition = next(
+        item
+        for item in contract["semantic_rules"]
+        if item["id"] == "condition-expression"
+    )
+    parameters = condition["parameters"]
+
+    assert parameters["limits"] == {
+        "max_utf8_bytes": language_schema.ARCHON_V3_CONDITION_MAX_BYTES,
+        "max_tokens": language_schema.ARCHON_V3_CONDITION_MAX_TOKENS,
+        "max_parser_call_depth": language_schema.ARCHON_V3_CONDITION_MAX_NESTING,
+    }
+    assert parameters["comparison_operators"] == list(
+        language_schema.ARCHON_V3_CONDITION_COMPARISON_OPERATORS
+    )
+    assert parameters["logical_operators"] == list(
+        language_schema.ARCHON_V3_CONDITION_LOGICAL_OPERATORS
+    )
+    assert parameters["precedence"] == [
+        {
+            "operators": ["&&"],
+            "associativity": "left",
+            "higher_than": ["||"],
+        },
+        {
+            "operators": ["||"],
+            "associativity": "left",
+            "higher_than": [],
+        },
+    ]
+    assert parameters["evaluation"] == {
+        "order": "left_to_right",
+        "short_circuit": True,
+    }
+    assert parameters["typed_operand_modes"] == {
+        "quoted_equality": "exact_string_only",
+        "unquoted_decimal_equality": "canonical_finite_number_only",
+        "ordered_lhs": [
+            "canonical_finite_number",
+            "schemaless_whole_decimal_text",
+        ],
+        "ordered_rhs": ["unquoted_decimal", "quoted_decimal"],
+        "structured_strings_coerce_to_number": False,
+    }
+    assert len(json.dumps(contract).encode("utf-8")) < 256_000
+
+
 @pytest.mark.parametrize(
     ("condition", "expected"),
     [

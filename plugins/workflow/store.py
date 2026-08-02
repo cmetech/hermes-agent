@@ -41,7 +41,10 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
-from plugins.workflow.language_schema import DURABLE_METADATA_STRING_MAX_CHARS
+from plugins.workflow.language_schema import (
+    ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES,
+    DURABLE_METADATA_STRING_MAX_CHARS,
+)
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
     lease_is_fresh,
@@ -420,6 +423,21 @@ def _sanitize_diagnostic(value: str | None) -> str | None:
     if value is None:
         return None
     return _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)[:2000]
+
+
+def _sanitize_v3_condition_diagnostic(value: str) -> str:
+    """Redact and truncate one condition diagnostic by valid UTF-8 bytes."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("v3 condition message must be valid UTF-8") from exc
+    sanitized = _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)
+    encoded = sanitized.encode("utf-8")
+    if len(encoded) <= ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES:
+        return sanitized
+    return encoded[:ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -10221,17 +10239,15 @@ class RunStore:
             raise ValueError("v3 condition state must be skipped or failed")
         if state == "skipped" and code != "condition_false":
             raise ValueError("v3 skipped condition must use condition_false")
-        if (
-            not isinstance(code, str)
-            or not code
-            or len(code.encode("utf-8")) > 128
-            or not isinstance(message, str)
-            or not message
-        ):
+        try:
+            code_size = len(code.encode("utf-8")) if isinstance(code, str) else 0
+        except UnicodeEncodeError as exc:
+            raise ValueError("v3 condition code must be valid UTF-8") from exc
+        if not isinstance(code, str) or not code or code_size > 128:
             raise ValueError("v3 condition diagnostics must be bounded text")
-        safe_message = _sanitize_diagnostic(message)
-        if safe_message is None:
+        if not isinstance(message, str) or not message:
             raise ValueError("v3 condition message must be bounded text")
+        safe_message = _sanitize_v3_condition_diagnostic(message)
 
         directory = self.run_directory(run_id)
         with workflow_lock(self._run_lock_path(run_id)):

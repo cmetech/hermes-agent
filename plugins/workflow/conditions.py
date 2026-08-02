@@ -4,13 +4,17 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import math
 import re
-from typing import Mapping
+from typing import Callable, Mapping
 
 from plugins.workflow.language_schema import (
+    ARCHON_V3_CONDITION_COMPARISON_OPERATORS,
     ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES,
+    ARCHON_V3_CONDITION_EQUALITY_OPERATORS,
+    ARCHON_V3_CONDITION_LOGICAL_OPERATORS,
     ARCHON_V3_CONDITION_MAX_BYTES,
     ARCHON_V3_CONDITION_MAX_NESTING,
     ARCHON_V3_CONDITION_MAX_TOKENS,
+    ARCHON_V3_CONDITION_ORDERED_OPERATORS,
     ARCHON_V3_DECIMAL_NUMBER_PATTERN,
     OutputReferenceToken,
     WorkflowReferenceSyntaxError,
@@ -28,7 +32,6 @@ _DECIMAL_TOKEN = re.compile(ARCHON_V3_DECIMAL_NUMBER_PATTERN, re.ASCII)
 _DECIMAL_NUMBER = re.compile(
     rf"^(?:{ARCHON_V3_DECIMAL_NUMBER_PATTERN})$", re.ASCII
 )
-_OPERATORS = ("==", "!=", "<=", ">=", "<", ">")
 _ERROR_MEANINGS = {
     "condition_operand_type": "condition operands have incompatible canonical types",
     "condition_operand_nonfinite": "condition numeric operand is not finite",
@@ -96,7 +99,7 @@ class _Parser:
         try:
             self._skip_whitespace()
             groups = [self._parse_and_group()]
-            while self._consume("||"):
+            while self._consume(ARCHON_V3_CONDITION_LOGICAL_OPERATORS[1]):
                 self._count_token()
                 groups.append(self._parse_and_group())
             self._skip_whitespace()
@@ -110,7 +113,7 @@ class _Parser:
         self._enter()
         try:
             clauses = [self._parse_clause()]
-            while self._consume("&&"):
+            while self._consume(ARCHON_V3_CONDITION_LOGICAL_OPERATORS[0]):
                 self._count_token()
                 clauses.append(self._parse_clause())
             return tuple(clauses)
@@ -126,7 +129,7 @@ class _Parser:
             operator = next(
                 (
                     candidate
-                    for candidate in _OPERATORS
+                    for candidate in ARCHON_V3_CONDITION_COMPARISON_OPERATORS
                     if self.expression.startswith(candidate, self.position)
                 ),
                 None,
@@ -257,10 +260,10 @@ def _numeric_left(value: object, *, schemaless_text: bool) -> Decimal:
 
 def _evaluate_clause(
     clause: _Clause,
-    outputs: Mapping[str, object],
+    output_for: Callable[[str], object],
 ) -> bool:
     reference = clause.reference
-    raw_output = outputs.get(reference.node_id)
+    raw_output = output_for(reference.node_id)
     if isinstance(raw_output, WorkflowOutputReferenceError):
         raise raw_output
     if raw_output is not None and not isinstance(raw_output, ResolvedNodeOutput):
@@ -287,13 +290,22 @@ def _evaluate_clause(
         and not reference.path
     )
 
-    if clause.operator in {"==", "!="} and clause.literal.quoted:
+    if (
+        clause.operator in ARCHON_V3_CONDITION_EQUALITY_OPERATORS
+        and clause.literal.quoted
+    ):
         if not isinstance(left, str):
             raise WorkflowConditionError("condition_operand_type")
         equal = left == clause.literal.text
         return equal if clause.operator == "==" else not equal
 
-    left_decimal = _numeric_left(left, schemaless_text=schemaless_text)
+    left_decimal = _numeric_left(
+        left,
+        schemaless_text=(
+            schemaless_text
+            and clause.operator in ARCHON_V3_CONDITION_ORDERED_OPERATORS
+        ),
+    )
     right_decimal = _decimal_text(clause.literal.text)
     operations = {
         "==": left_decimal == right_decimal,
@@ -307,14 +319,16 @@ def _evaluate_clause(
 
 
 def evaluate_v3_condition(
-    expression: str, outputs: Mapping[str, object]
+    expression: str,
+    outputs: Mapping[str, object] | Callable[[str], object],
 ) -> bool:
     """Evaluate one v3 condition against canonical node outputs."""
     parsed = _parse(expression)
+    output_for = outputs.get if isinstance(outputs, Mapping) else outputs
     for group in parsed.or_groups:
         group_matches = True
         for clause in group:
-            if not _evaluate_clause(clause, outputs):
+            if not _evaluate_clause(clause, output_for):
                 group_matches = False
                 break
         if group_matches:

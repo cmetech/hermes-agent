@@ -657,18 +657,30 @@ class RunScheduler:
         return data.decode("utf-8")
 
     def _output_values(
-        self, projection: Mapping[str, object], run_directory: Path
+        self,
+        projection: Mapping[str, object],
+        run_directory: Path,
+        *,
+        node_ids: Iterable[str] | None = None,
     ) -> dict[str, object]:
         snapshot = read_language_snapshot(projection.get("language"))
         if (
             snapshot is None
             or snapshot.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY
         ):
-            return resolve_legacy_output_values(
+            legacy_outputs = resolve_legacy_output_values(
                 projection,
                 run_directory,
                 read_text=self._read_text,
             )
+            if node_ids is None:
+                return legacy_outputs
+            requested = frozenset(node_ids)
+            return {
+                node_id: value
+                for node_id, value in legacy_outputs.items()
+                if node_id in requested
+            }
 
         strict_v3 = snapshot.normalizer_version == 3
 
@@ -680,7 +692,15 @@ class RunScheduler:
         run_id = str(projection.get("run_id", ""))
         root_identity = str(run_directory.resolve())
         outputs: dict[str, object] = {}
-        for node_id, node_state in nodes.items():
+        node_items = (
+            nodes.items()
+            if node_ids is None
+            else (
+                (node_id, nodes.get(node_id))
+                for node_id in dict.fromkeys(node_ids)
+            )
+        )
+        for node_id, node_state in node_items:
             if not isinstance(node_id, str) or not isinstance(node_state, Mapping):
                 continue
             attempts = node_state.get("attempts", [])
@@ -1116,7 +1136,7 @@ class RunScheduler:
     def _resolve_graph(self, run_id: str, nodes: Iterable[WorkflowNode]) -> None:
         while True:
             projection = self.store.load_run(run_id)
-            outputs = self._output_values(projection, self.store.run_directory(run_id))
+            run_directory = self.store.run_directory(run_id)
             language_snapshot = read_language_snapshot(projection.get("language"))
             strict_v3 = (
                 language_snapshot is not None
@@ -1124,6 +1144,19 @@ class RunScheduler:
                 is WorkflowLanguageProfile.ARCHON_2026_07
                 and language_snapshot.normalizer_version == 3
             )
+            outputs = (
+                None
+                if strict_v3
+                else self._output_values(projection, run_directory)
+            )
+
+            def resolve_condition_output(node_id: str) -> object:
+                return self._output_values(
+                    projection,
+                    run_directory,
+                    node_ids=(node_id,),
+                ).get(node_id)
+
             transitions: dict[str, tuple[str, str | None]] = {}
             condition_transitions: dict[str, tuple[str, str, str]] = {}
             for node in nodes:
@@ -1147,7 +1180,9 @@ class RunScheduler:
                 if isinstance(condition, str):
                     if strict_v3:
                         try:
-                            matches = evaluate_v3_condition(condition, outputs)
+                            matches = evaluate_v3_condition(
+                                condition, resolve_condition_output
+                            )
                         except (WorkflowConditionError, WorkflowOutputReferenceError) as exc:
                             condition_transitions[node.id] = (
                                 "failed",
@@ -1164,6 +1199,7 @@ class RunScheduler:
                             continue
                     else:
                         try:
+                            assert outputs is not None
                             if not evaluate_condition(condition, outputs):
                                 transitions[node.id] = ("skipped", "condition_false")
                                 continue

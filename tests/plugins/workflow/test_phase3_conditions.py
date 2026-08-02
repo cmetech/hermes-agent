@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
 
 import pytest
 
+from plugins.workflow import scheduler as scheduler_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.conditions import (
     WorkflowConditionError,
@@ -19,7 +21,7 @@ from plugins.workflow.output_resolution import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import ArtifactRef, RunStore
 from plugins.workflow.models import WorkflowValidationError
 
 
@@ -170,7 +172,6 @@ def test_v3_condition_admission_uses_the_bounded_parser(
         (2, True, "$source.output > '1.5'", True),
         (0.1, True, "$source.output == .1", True),
         (9_007_199_254_740_993, True, "$source.output == 9007199254740993", True),
-        (" 2.50\t", False, "$source.output == 2.5", True),
         (" 2.50\t", False, "$source.output > '2.49'", True),
         ("2", False, "$source.output == '2'", True),
         (-0.5, True, "$source.output >= -.5", True),
@@ -196,6 +197,8 @@ def test_v3_condition_typed_comparison_matrix(
     ("value", "structured", "expression", "code"),
     (
         ("2", True, "$source.output == 2", "condition_operand_type"),
+        (" 2.50\t", False, "$source.output == 2.5", "condition_operand_type"),
+        ("2.50", False, "$source.output != 2.500", "condition_operand_type"),
         ("2", True, "$source.output > '1'", "condition_operand_type"),
         (2, True, "$source.output == '2'", "condition_operand_type"),
         (True, True, "$source.output == 1", "condition_operand_type"),
@@ -324,6 +327,182 @@ def test_store_atomically_fails_v3_condition_without_an_attempt(
     assert rebuilt["nodes"]["consumer"]["attempts"] == []
     assert rebuilt["nodes"]["consumer"]["retry_consumed"] == 0
     assert rebuilt["last_error"]["code"] == "condition_operand_type"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("a" * 2_000, "a" * 2_000),
+        ("a" * 2_001, "a" * 2_000),
+        ("é" * 1_000, "é" * 1_000),
+        ("é" * 1_001, "é" * 1_000),
+        (("a" * 1_999) + "é", "a" * 1_999),
+    ),
+    ids=(
+        "ascii-exact",
+        "ascii-overflow",
+        "multibyte-exact",
+        "multibyte-overflow",
+        "split-codepoint",
+    ),
+)
+def test_store_bounds_v3_condition_diagnostics_by_utf8_bytes_and_rebuilds(
+    tmp_path, workflow_writer, message: str, expected: str
+) -> None:
+    """Catch character-based persistence bounds or split UTF-8 code points."""
+    store, run_id = _start_archon_run(
+        tmp_path,
+        workflow_writer,
+        name=f"condition-diagnostic-{len(message)}-{len(message.encode('utf-8'))}",
+        nodes=[
+            {"id": "source", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["source"]},
+        ],
+    )
+
+    assert store.transition_v3_condition_node(
+        run_id,
+        "consumer",
+        state="failed",
+        code="condition_operand_type",
+        message=message,
+    )
+    projection = store.load_run(run_id)
+    failed_event = next(
+        event
+        for event in store.tail_events(run_id)
+        if event["event_type"] == "node_failed"
+    )
+
+    assert projection["last_error"]["message"] == expected
+    assert failed_event["payload"]["error_message"] == expected
+    assert len(expected.encode("utf-8")) <= 2_000
+    (store.run_directory(run_id) / "run.json").unlink()
+    rebuilt = store.load_run(run_id)
+    assert rebuilt["last_error"]["message"] == expected
+    assert len(rebuilt["last_error"]["message"].encode("utf-8")) <= 2_000
+
+
+def test_store_rejects_invalid_unicode_v3_condition_diagnostic(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch lone surrogates reaching JSON journal serialization."""
+    store, run_id = _start_archon_run(
+        tmp_path,
+        workflow_writer,
+        name="condition-diagnostic-invalid-unicode",
+        nodes=[
+            {"id": "source", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["source"]},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        store.transition_v3_condition_node(
+            run_id,
+            "consumer",
+            state="failed",
+            code="condition_operand_type",
+            message="invalid-\ud800-diagnostic",
+        )
+
+    projection = store.load_run(run_id)
+    assert projection["nodes"]["consumer"]["state"] == "pending"
+    assert not any(
+        event["event_type"] == "node_failed"
+        for event in store.tail_events(run_id)
+    )
+
+
+def _complete_condition_source(
+    store: RunStore,
+    run_id: str,
+    node_id: str,
+    content: bytes,
+) -> None:
+    claim = store.claim_node(run_id, node_id, "condition-test-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    relative_path = Path("nodes") / node_id / claim.attempt_id / "stdout.log"
+    output_path = store.run_directory(run_id) / relative_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(content)
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(
+            ArtifactRef(
+                relative_path=relative_path.as_posix(),
+                media_type="text/plain; charset=utf-8",
+                size_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected_state"),
+    (
+        ("$left.output == '1' || $right.output == '1'", "ready"),
+        ("$left.output == '2' && $right.output == '1'", "skipped"),
+    ),
+)
+def test_v3_scheduler_does_not_resolve_short_circuited_condition_reference(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    expression: str,
+    expected_state: str,
+) -> None:
+    """Catch scheduler I/O and cache effects for an unreachable condition clause."""
+    store, run_id = _start_archon_run(
+        tmp_path,
+        workflow_writer,
+        name=f"condition-lazy-{expected_state}",
+        nodes=[
+            {"id": "left", "bash": "printf 1"},
+            {"id": "right", "bash": "printf 1"},
+            {
+                "id": "consumer",
+                "bash": "true",
+                "depends_on": ["left", "right"],
+                "when": expression,
+            },
+        ],
+    )
+    _complete_condition_source(store, run_id, "left", b"1")
+    _complete_condition_source(store, run_id, "right", b"1")
+    scheduler = RunScheduler(store)
+    resolved_nodes: list[str] = []
+
+    real_resolve = scheduler_module.resolve_node_output
+
+    def recording_resolve_node_output(**kwargs):
+        node_id = kwargs["node_id"]
+        resolved_nodes.append(node_id)
+        if node_id == "right":
+            raise AssertionError("short-circuited RHS was resolved")
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(
+        scheduler_module, "resolve_node_output", recording_resolve_node_output
+    )
+
+    scheduler._resolve_graph(
+        run_id,
+        load_workflow(
+            store.run_directory(run_id) / "definition.yaml"
+        ).definition.nodes,
+    )
+
+    projection = store.load_run(run_id)
+    assert projection["nodes"]["consumer"]["state"] == expected_state, (
+        projection.get("last_error"),
+        resolved_nodes,
+    )
+    assert resolved_nodes == ["left"]
+    assert not any(key[2] == "right" for key in scheduler._resolved_output_cache)
 
 
 def test_v3_false_condition_skips_without_claim_or_retry(

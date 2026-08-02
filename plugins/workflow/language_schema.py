@@ -26,6 +26,29 @@ ARCHON_V3_CONDITION_MAX_BYTES = 16_384
 ARCHON_V3_CONDITION_MAX_TOKENS = 256
 ARCHON_V3_CONDITION_MAX_NESTING = 3
 ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES = 2_000
+ARCHON_V3_CONDITION_EQUALITY_OPERATORS = ("==", "!=")
+ARCHON_V3_CONDITION_ORDERED_OPERATORS = ("<=", ">=", "<", ">")
+ARCHON_V3_CONDITION_COMPARISON_OPERATORS = (
+    *ARCHON_V3_CONDITION_EQUALITY_OPERATORS,
+    *ARCHON_V3_CONDITION_ORDERED_OPERATORS,
+)
+ARCHON_V3_CONDITION_LOGICAL_OPERATORS = ("&&", "||")
+ARCHON_V3_CONDITION_PRECEDENCE = (
+    (("&&",), "left", ("||",)),
+    (("||",), "left", ()),
+)
+ARCHON_V3_CONDITION_EVALUATION_ORDER = "left_to_right"
+ARCHON_V3_CONDITION_SHORT_CIRCUIT = True
+ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
+    "quoted_equality": "exact_string_only",
+    "unquoted_decimal_equality": "canonical_finite_number_only",
+    "ordered_lhs": (
+        "canonical_finite_number",
+        "schemaless_whole_decimal_text",
+    ),
+    "ordered_rhs": ("unquoted_decimal", "quoted_decimal"),
+    "structured_strings_coerce_to_number": False,
+})
 CONTRACT_READER_VERSION = 1
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -2125,6 +2148,43 @@ def semantic_rule_descriptors(
                     else ECMASCRIPT_WHEN_EXPRESSION_PATTERN
                 ),
                 "expression_flags": "u",
+                **(
+                    {
+                        "limits": {
+                            "max_utf8_bytes": ARCHON_V3_CONDITION_MAX_BYTES,
+                            "max_tokens": ARCHON_V3_CONDITION_MAX_TOKENS,
+                            "max_parser_call_depth": ARCHON_V3_CONDITION_MAX_NESTING,
+                        },
+                        "comparison_operators": list(
+                            ARCHON_V3_CONDITION_COMPARISON_OPERATORS
+                        ),
+                        "logical_operators": list(
+                            ARCHON_V3_CONDITION_LOGICAL_OPERATORS
+                        ),
+                        "precedence": [
+                            {
+                                "operators": list(operators),
+                                "associativity": associativity,
+                                "higher_than": list(higher_than),
+                            }
+                            for operators, associativity, higher_than in (
+                                ARCHON_V3_CONDITION_PRECEDENCE
+                            )
+                        ],
+                        "evaluation": {
+                            "order": ARCHON_V3_CONDITION_EVALUATION_ORDER,
+                            "short_circuit": ARCHON_V3_CONDITION_SHORT_CIRCUIT,
+                        },
+                        "typed_operand_modes": {
+                            key: list(value) if isinstance(value, tuple) else value
+                            for key, value in (
+                                ARCHON_V3_CONDITION_TYPED_OPERAND_MODES.items()
+                            )
+                        },
+                    }
+                    if archon_v3
+                    else {}
+                ),
             },
             "examples": [
                 "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
