@@ -996,6 +996,12 @@ class AgentNodeExecutor:
                     error_message="workflow attempt deadline expired",
                     metadata={"provider_attempts": 0},
                 )
+            if context.is_cancelled is not None and context.is_cancelled():
+                return NodeExecutionResult(
+                    "cancelled",
+                    error_code="cancelled",
+                    metadata={"provider_attempts": 0},
+                )
             result = agent_runner.run(
                 request,
                 is_cancelled=context.is_cancelled,

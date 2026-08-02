@@ -13,6 +13,7 @@ from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -64,6 +65,14 @@ def _acquire_after_lock(database: str, results) -> None:
 def _race_resolution_wake(home: str, run_id: str, due: str, barrier, results) -> None:
     barrier.wait()
     awakened = RunStore(Path(home)).wake_due_output_resolutions(
+        run_id, now=datetime.fromisoformat(due)
+    )
+    results.put(awakened)
+
+
+def _race_retry_wake(home: str, run_id: str, due: str, barrier, results) -> None:
+    barrier.wait()
+    awakened = RunStore(Path(home)).wake_due_retries(
         run_id, now=datetime.fromisoformat(due)
     )
     results.put(awakened)
@@ -462,6 +471,93 @@ def test_due_resolution_wake_has_one_multiprocess_cas_winner(
         event["event_type"] == "output_resolution_ready"
         for event in store.tail_events(admitted.run_id)
     ) == 1
+
+
+def test_due_retry_wake_has_one_multiprocess_winner_and_one_remaining_grant(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "retry-race-home"
+    path = workflow_writer(
+        tmp_path / "retry-race-package",
+        name="retry-race",
+        nodes=[{
+            "id": "work",
+            "bash": "true",
+            "retry": {"max_attempts": 1, "delay_ms": 1000},
+        }],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="retry-race",
+            concurrency_key="retry-race",
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+
+    class FailsOnce:
+        def execute(self, _context):
+            return NodeExecutionResult("failed", error_code="provider_timeout")
+
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: observed,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors["bash"] = FailsOnce()
+    waiting = scheduler.advance(admitted.run_id)
+    assert waiting["status"] == "waiting_retry"
+    assert waiting["nodes"]["work"]["retry_consumed"] == 1
+
+    due = observed + timedelta(seconds=1)
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_race_retry_wake,
+            args=(str(home), admitted.run_id, due.isoformat(), barrier, results),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    outcomes = [results.get(timeout=5) for _ in processes]
+    assert sorted(outcomes, key=len) == [(), ("work",)]
+    awakened = store.load_run(admitted.run_id)
+    assert awakened["nodes"]["work"]["state"] == "ready"
+    assert awakened["nodes"]["work"]["retry_consumed"] == 1
+    assert len(awakened["nodes"]["work"]["attempts"]) == 1
+
+    grants: list[int] = []
+
+    class Succeeds:
+        def execute(self, execution_context):
+            grants.append(execution_context.max_provider_attempts)
+            return NodeExecutionResult("succeeded")
+
+    scheduler.executors["bash"] = Succeeds()
+    completed = scheduler.advance(admitted.run_id)
+    assert completed["status"] == "succeeded"
+    assert grants == [1]
+    assert completed["nodes"]["work"]["retry_consumed"] == 2
+    assert len(completed["nodes"]["work"]["attempts"]) == 2
 
 
 def test_foreground_owner_death_with_unresolved_outward_spawn_reconciles(

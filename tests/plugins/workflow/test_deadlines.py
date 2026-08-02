@@ -426,7 +426,12 @@ def test_archon_workflow_retry_gets_a_fresh_sealed_attempt_budget_after_backoff(
 ):
     workflow = workflow_writer(
         tmp_path / "package",
-        nodes=[{"id": "shell", "bash": "true", "timeout": 1_500.5}],
+        nodes=[{
+            "id": "shell",
+            "bash": "true",
+            "timeout": 1_500.5,
+            "retry": {"max_attempts": 1},
+        }],
     )
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         yaml.safe_dump({"language_compatibility": "archon-2026-07"}),

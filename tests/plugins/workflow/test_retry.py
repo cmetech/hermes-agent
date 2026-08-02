@@ -2,16 +2,26 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.models import RetryPolicy
-from plugins.workflow.scheduler import RunScheduler, compute_retry_delay
+from plugins.workflow.models import RetryPolicy, RunExecutionLimits
+from plugins.workflow.scheduler import (
+    FailureClass,
+    RunScheduler,
+    classify_failure,
+    compute_retry_delay,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def _start(store, package, *, key="retry"):
-    prepared = store.prepare_run_snapshot(package)
+def _start(store, package, *, key="retry", execution_limits=None):
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=execution_limits,
+    )
     return store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
@@ -24,6 +34,432 @@ def _start(store, package, *, key="retry"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def _archon_retry_package(
+    tmp_path,
+    workflow_writer,
+    *,
+    node_type: str,
+    retry: dict[str, object] | None,
+    combined_total_attempts: int,
+    outward: bool = False,
+):
+    node = {
+        "id": "work",
+        node_type: "print('work')" if node_type == "script" else "work",
+    }
+    if node_type == "script":
+        node["runtime"] = "uv"
+    if retry is not None:
+        node["retry"] = retry
+    path = workflow_writer(
+        tmp_path,
+        name=f"archon-{node_type}-{combined_total_attempts}",
+        nodes=[node],
+    )
+    sidecar = [
+        "language_compatibility: archon-2026-07",
+        f"limits: {{combined_retries: {combined_total_attempts}}}",
+    ]
+    if outward:
+        sidecar.append("outward_action_nodes: [work]")
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "\n".join(sidecar) + "\n",
+        encoding="utf-8",
+    )
+    return load_workflow(path)
+
+
+@pytest.mark.parametrize(
+    (
+        "node_type",
+        "retry",
+        "combined_total_attempts",
+        "requested_retries",
+        "requested_total_attempts",
+        "effective_total_attempts",
+        "capped",
+    ),
+    [
+        ("prompt", None, 5, 2, 3, 3, False),
+        ("bash", None, 5, 0, 1, 1, False),
+        ("bash", {"max_attempts": 1}, 5, 1, 2, 2, False),
+        ("script", {"max_attempts": 1}, 5, 1, 2, 2, False),
+        ("prompt", {"max_attempts": 5}, 5, 5, 6, 5, True),
+    ],
+)
+def test_archon_retry_grant_and_success_charge_use_sealed_total_attempts(
+    tmp_path,
+    workflow_writer,
+    node_type,
+    retry,
+    combined_total_attempts,
+    requested_retries,
+    requested_total_attempts,
+    effective_total_attempts,
+    capped,
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / node_type,
+        workflow_writer,
+        node_type=node_type,
+        retry=retry,
+        combined_total_attempts=combined_total_attempts,
+    )
+    store = RunStore(tmp_path / f"home-{node_type}")
+    admitted = _start(store, package, key=f"sealed-{node_type}")
+    grants: list[int] = []
+
+    class Succeeds:
+        def execute(self, context):
+            grants.append(context.max_provider_attempts)
+            return NodeExecutionResult(
+                "succeeded",
+                metadata={"provider_attempts": 0},
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors[node_type] = Succeeds()
+
+    result = scheduler.advance(admitted.run_id)
+
+    node = result["nodes"]["work"]
+    evidence = node["attempts"][0]["metadata"]
+    assert result["status"] == "succeeded"
+    assert grants == [effective_total_attempts]
+    assert node["retry_consumed"] == 1
+    assert evidence["requested_retries"] == requested_retries
+    assert evidence["requested_total_attempts"] == requested_total_attempts
+    assert evidence["effective_total_attempts"] == effective_total_attempts
+    assert evidence["additional_provider_attempts"] == 0
+    assert evidence["remaining_attempts"] == effective_total_attempts - 1
+    assert evidence["capped"] is capped
+
+
+@pytest.mark.parametrize(
+    ("combined_total_attempts", "effective_total_attempts"),
+    [(1, 1), (2, 2), (3, 3), (4, 3), (5, 3)],
+)
+def test_archon_ai_default_intersects_every_combined_cap_without_multiplication(
+    tmp_path,
+    workflow_writer,
+    combined_total_attempts,
+    effective_total_attempts,
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / str(combined_total_attempts),
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=combined_total_attempts,
+    )
+    store = RunStore(tmp_path / f"home-{combined_total_attempts}")
+    admitted = _start(
+        store,
+        package,
+        key=f"cap-{combined_total_attempts}",
+        execution_limits=RunExecutionLimits(
+            combined_retries=combined_total_attempts
+        ),
+    )
+    grants: list[int] = []
+
+    class Succeeds:
+        def execute(self, context):
+            grants.append(context.max_provider_attempts)
+            return NodeExecutionResult(
+                "succeeded", metadata={"provider_attempts": 0}
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = Succeeds()
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert grants == [effective_total_attempts]
+    assert result["nodes"]["work"]["retry_consumed"] == 1
+
+
+def test_archon_mixed_provider_and_workflow_attempts_share_one_charge_ledger(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "mixed",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / "mixed-home")
+    admitted = _start(store, package, key="mixed-ledger")
+    now = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    grants: list[int] = []
+
+    class Mixed:
+        def execute(self, context):
+            grants.append(context.max_provider_attempts)
+            if len(grants) == 1:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_timeout",
+                    metadata={"provider_attempts": 1},
+                )
+            return NodeExecutionResult(
+                "succeeded", metadata={"provider_attempts": 0}
+            )
+
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors["prompt"] = Mixed()
+
+    waiting = scheduler.advance(admitted.run_id)
+    assert waiting["status"] == "waiting_retry"
+    assert waiting["nodes"]["work"]["retry_consumed"] == 2
+    now += timedelta(seconds=3)
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert grants == [3, 1]
+    assert result["nodes"]["work"]["retry_consumed"] == 3
+    attempts = result["nodes"]["work"]["attempts"]
+    assert [entry["metadata"]["additional_provider_attempts"] for entry in attempts] == [
+        1,
+        0,
+    ]
+    assert [entry["metadata"]["remaining_attempts"] for entry in attempts] == [
+        1,
+        0,
+    ]
+
+
+@pytest.mark.parametrize("reported", [None, -1, True, 3], ids=repr)
+def test_archon_missing_or_invalid_exact_provider_evidence_consumes_full_grant(
+    tmp_path, workflow_writer, reported
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / f"unknown-{reported!r}",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / f"unknown-home-{reported!r}")
+    admitted = _start(store, package, key=f"unknown-{reported!r}")
+    calls = 0
+
+    class UnknownCount:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            metadata = {} if reported is None else {"provider_attempts": reported}
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                metadata=metadata,
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = UnknownCount()
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert calls == 1
+    assert result["nodes"]["work"]["retry_consumed"] == 3
+    evidence = result["nodes"]["work"]["attempts"][0]["metadata"]
+    assert evidence["additional_provider_attempts"] == 2
+    assert evidence["remaining_attempts"] == 0
+
+
+def test_archon_unknown_provider_outcome_reconciles_after_full_conservative_charge(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "unknown-outcome",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / "unknown-outcome-home")
+    admitted = _start(store, package, key="unknown-outcome")
+
+    class UnknownOutcome:
+        def execute(self, _context):
+            return NodeExecutionResult("failed", error_code="agent_failed")
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = UnknownOutcome()
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "paused"
+    node = result["nodes"]["work"]
+    assert node["retry_consumed"] == 3
+    assert node["pending_interaction"] == "reconcile"
+    assert node["attempts"][0]["metadata"]["provider_attempts_exact"] is False
+
+
+@pytest.mark.parametrize(
+    ("code", "known_no_effect", "outward_action", "expected"),
+    [
+        ("provider_timeout", False, False, "transient"),
+        ("process_exit", True, False, "transient"),
+        ("agent_failed", True, False, "unknown_error"),
+        ("agent_failed", False, False, "unknown_outcome"),
+        ("provider_timeout", False, True, "unknown_outcome"),
+        ("cleanup_failed", True, False, "fatal"),
+        ("resource_limit", True, False, "fatal"),
+        ("structured_output_capability_drift", True, False, "fatal"),
+        ("authentication", True, False, "fatal"),
+        ("authorization", True, False, "fatal"),
+        ("credit_exhausted", True, False, "fatal"),
+    ],
+)
+def test_phase3_failure_classes_distinguish_unknown_effects_and_terminal_errors(
+    code, known_no_effect, outward_action, expected
+) -> None:
+    assert classify_failure(
+        code,
+        known_no_effect=known_no_effect,
+        outward_action=outward_action,
+    ).value == expected
+
+
+def test_archon_unknown_no_effect_retries_only_under_explicit_all_policy(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "unknown-no-effect",
+        workflow_writer,
+        node_type="prompt",
+        retry={"max_attempts": 1, "on_error": "all"},
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / "unknown-no-effect-home")
+    admitted = _start(store, package, key="unknown-no-effect")
+    now = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    calls = 0
+
+    class UnknownThenSuccess:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="agent_failed",
+                    metadata={
+                        "provider_attempts": 0,
+                        "known_no_effect": True,
+                    },
+                )
+            return NodeExecutionResult(
+                "succeeded", metadata={"provider_attempts": 0}
+            )
+
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors["prompt"] = UnknownThenSuccess()
+    assert scheduler.advance(admitted.run_id)["status"] == "waiting_retry"
+    now += timedelta(seconds=3)
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert calls == 2
+    assert result["nodes"]["work"]["retry_consumed"] == 2
+
+
+def test_archon_deterministic_retry_requires_explicit_block_and_known_outcome(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "deterministic",
+        workflow_writer,
+        node_type="bash",
+        retry={"max_attempts": 1},
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / "deterministic-home")
+    admitted = _start(store, package, key="deterministic")
+    now = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    calls = 0
+
+    class ExitsThenSucceeds:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return NodeExecutionResult("failed", error_code="process_exit")
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors["bash"] = ExitsThenSucceeds()
+    assert scheduler.advance(admitted.run_id)["status"] == "waiting_retry"
+    now += timedelta(seconds=3)
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert calls == 2
+    assert result["nodes"]["work"]["retry_consumed"] == 2
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "authentication",
+        "authorization",
+        "credit_exhausted",
+        "validation",
+        "resource_limit",
+        "structured_output_capability_drift",
+    ],
+)
+def test_archon_all_policy_never_replays_terminal_failure_classes(
+    tmp_path, workflow_writer, error_code
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / error_code,
+        workflow_writer,
+        node_type="prompt",
+        retry={"max_attempts": 5, "on_error": "all"},
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / f"home-{error_code}")
+    admitted = _start(store, package, key=error_code)
+    calls = 0
+
+    class Fatal:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            return NodeExecutionResult(
+                "failed",
+                error_code=error_code,
+                metadata={"provider_attempts": 0},
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = Fatal()
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert calls == 1
+    assert result["nodes"]["work"]["retry_consumed"] == 1
 
 
 def test_retry_delay_is_seeded_and_capped():
@@ -303,7 +739,10 @@ def test_archon_trusted_structured_failure_is_terminal_without_freezing_legacy_r
             return NodeExecutionResult(
                 "failed",
                 error_code="structured_output_invalid",
-                metadata={"archon_terminal_failure": True},
+                metadata={
+                    "archon_terminal_failure": True,
+                    "provider_attempts": 0,
+                },
             )
 
     archon_store = RunStore(tmp_path / "archon-home")
@@ -364,6 +803,42 @@ def test_cancel_wins_over_due_retry_wakeup(tmp_path, workflow_writer):
     store.cancel_run(admitted.run_id)
     assert store.wake_due_retries(admitted.run_id, now=now + timedelta(days=1)) == ()
     assert store.load_run(admitted.run_id)["status"] == "cancelled"
+
+
+def test_archon_cancel_after_claim_wins_before_executor_and_charges_nothing(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_retry_package(
+        tmp_path / "cancel-after-claim",
+        workflow_writer,
+        node_type="prompt",
+        retry=None,
+        combined_total_attempts=5,
+    )
+    store = RunStore(tmp_path / "cancel-after-claim-home")
+    admitted = _start(store, package, key="cancel-after-claim")
+    original = store.mark_node_started
+
+    def cancel_after_mark(claim, **kwargs):
+        original(claim, **kwargs)
+        store.cancel_run(claim.run_id)
+
+    monkeypatch.setattr(store, "mark_node_started", cancel_after_mark)
+    calls = 0
+
+    class MustNotRun:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = MustNotRun()
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "cancelled"
+    assert result["nodes"]["work"].get("retry_consumed", 0) == 0
+    assert calls == 0
 
 
 def test_differently_timed_retries_each_wake_when_due(tmp_path, workflow_writer):

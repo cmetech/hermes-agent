@@ -999,7 +999,6 @@ def test_legacy_initial_request_keeps_declared_provider_selector(tmp_path):
     ("context_changes", "runner_kwargs", "expected_disposition"),
     [
         ({"outward_action": True}, {}, "ineligible_outward_action"),
-        ({"is_cancelled": lambda: True}, {}, "ineligible_cancelled"),
         ({"max_provider_attempts": 1}, {}, "ineligible_provider_attempts"),
         ({}, {"model_calls": (90,)}, "ineligible_model_iterations"),
         (
@@ -1025,6 +1024,38 @@ def test_prompt_adapter_skips_repair_when_safety_or_attempt_allowance_is_gone(
 
     assert result.error_code == "structured_output_invalid"
     assert result.metadata["repair_disposition"] == expected_disposition
+    assert len(runner.requests) == 1
+
+
+def test_prompt_adapter_skips_repair_when_cancelled_after_initial_provider_call(
+    tmp_path,
+):
+    cancelled = False
+
+    class CancelsAfterRun(FakeAgentRunner):
+        def run(self, request, **kwargs):
+            nonlocal cancelled
+            result = super().run(request, **kwargs)
+            cancelled = True
+            return result
+
+    runner = CancelsAfterRun("not json")
+    node = _node(
+        "cancelled-repair",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(
+            tmp_path,
+            node,
+            is_cancelled=lambda: cancelled,
+        )
+    )
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "ineligible_cancelled"
     assert len(runner.requests) == 1
 
 
@@ -1659,6 +1690,24 @@ def test_ai_request_does_not_start_at_exact_attempt_wall_boundary(tmp_path):
 
     assert result.status == "failed"
     assert result.error_code == "provider_timeout"
+    assert runner.requests == []
+
+
+def test_ai_cancellation_wins_before_provider_attempt_allocation(tmp_path):
+    runner = FakeAgentRunner("must not run")
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_text_context(
+            tmp_path,
+            _node("cancelled-before-provider", "work"),
+            is_cancelled=lambda: True,
+            max_provider_attempts=3,
+        )
+    )
+
+    assert result.status == "cancelled"
+    assert result.error_code == "cancelled"
+    assert result.metadata["provider_attempts"] == 0
     assert runner.requests == []
 
 

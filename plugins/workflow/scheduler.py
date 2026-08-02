@@ -53,6 +53,7 @@ from plugins.workflow.language_schema import iter_output_references
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
+    RetryLedgerGrant,
     RetryPolicy,
     RunExecutionLimits,
     WorkflowNode,
@@ -258,6 +259,8 @@ class SealedStructuredOutputDecisionError(ValueError):
 class FailureClass(Enum):
     TRANSIENT = "transient"
     FATAL = "fatal"
+    UNKNOWN_ERROR = "unknown_error"
+    UNKNOWN_OUTCOME = "unknown_outcome"
     CANCELLED = "cancelled"
     RECONCILE = "reconcile"
     EXHAUSTED = "exhausted"
@@ -279,7 +282,11 @@ _FATAL_FAILURES = {
     "validation",
     "invalid_request",
     "output_limit",
-    "process_exit",
+    "resource_limit",
+    "cleanup_failed",
+    "structured_output_capability_drift",
+    "workflow_execution_semantics_mismatch",
+    "workflow_language_snapshot_invalid",
 }
 
 
@@ -289,19 +296,39 @@ def classify_failure(
     workflow_attempt: int = 1,
     provider_attempts: int = 0,
     maximum: int = 5,
+    known_no_effect: bool | None = None,
+    outward_action: bool = False,
 ) -> FailureClass:
     """Map executor failures to a closed retry taxonomy."""
     code = (error_code or "").lower()
     if code in {"cancelled", "shutdown", "interrupted"}:
         return FailureClass.CANCELLED
+    if outward_action:
+        return FailureClass.UNKNOWN_OUTCOME
     if code in {"unknown_side_effect", "outcome_unknown"}:
-        return FailureClass.RECONCILE
+        return (
+            FailureClass.RECONCILE
+            if known_no_effect is None
+            else FailureClass.UNKNOWN_OUTCOME
+        )
+    if code in _FATAL_FAILURES:
+        return FailureClass.FATAL
+    if (
+        known_no_effect is False
+        and code not in _TRANSIENT_FAILURES
+        and code != "process_exit"
+    ):
+        return FailureClass.UNKNOWN_OUTCOME
     if workflow_attempt + provider_attempts >= maximum:
         return FailureClass.EXHAUSTED
     if code in _TRANSIENT_FAILURES:
         return FailureClass.TRANSIENT
-    if code in _FATAL_FAILURES:
-        return FailureClass.FATAL
+    if code == "process_exit" and known_no_effect is True:
+        return FailureClass.TRANSIENT
+    if known_no_effect is True:
+        return FailureClass.UNKNOWN_ERROR
+    if known_no_effect is False:
+        return FailureClass.UNKNOWN_OUTCOME
     return FailureClass.FATAL
 
 
@@ -2850,6 +2877,21 @@ class RunScheduler:
             ),
         )
 
+    @staticmethod
+    def _sealed_retry_grant(
+        node: WorkflowNode,
+        execution_semantics: Phase3ExecutionSemantics,
+        *,
+        retry_consumed: int,
+    ) -> RetryLedgerGrant:
+        retry = execution_semantics.nodes[node.id]["retry"]
+        if not isinstance(retry, Mapping):
+            raise RuntimeError("sealed retry semantics are malformed")
+        return RetryLedgerGrant.from_projection(
+            retry,
+            retry_consumed=retry_consumed,
+        )
+
     def _heartbeat_journal_reserve(
         self,
         node: WorkflowNode,
@@ -2901,14 +2943,31 @@ class RunScheduler:
                         ),
                         execution_limits,
                         language_profile=package.language.effective_profile,
+                        execution_semantics=execution_semantics,
+                        outward_action=(
+                            node.id
+                            in package.sidecar.get("outward_action_nodes", ())
+                        ),
                     )
                     return
                 node_state = dict(projection["nodes"][node.id])
-                retry_policy = self._effective_retry_policy(node, execution_limits)
                 consumed_attempts = max(
                     0, int(node_state.get("retry_consumed", 0))
                 )
-                remaining_attempts = retry_policy.max_attempts - consumed_attempts
+                if execution_semantics is not None:
+                    retry_grant = self._sealed_retry_grant(
+                        node,
+                        execution_semantics,
+                        retry_consumed=consumed_attempts,
+                    )
+                    remaining_attempts = retry_grant.remaining_attempts
+                else:
+                    retry_policy = self._effective_retry_policy(
+                        node, execution_limits
+                    )
+                    remaining_attempts = (
+                        retry_policy.max_attempts - consumed_attempts
+                    )
                 if remaining_attempts <= 0:
                     self._persist_result(
                         claim,
@@ -2920,6 +2979,11 @@ class RunScheduler:
                         ),
                         execution_limits,
                         language_profile=package.language.effective_profile,
+                        execution_semantics=execution_semantics,
+                        outward_action=(
+                            node.id
+                            in package.sidecar.get("outward_action_nodes", ())
+                        ),
                     )
                     return
                 approved_action_digest = self.store.consume_action_grant(claim)
@@ -3157,6 +3221,10 @@ class RunScheduler:
                 result,
                 execution_limits,
                 language_profile=package.language.effective_profile,
+                execution_semantics=execution_semantics,
+                outward_action=(
+                    node.id in package.sidecar.get("outward_action_nodes", ())
+                ),
             )
         except RuntimeError as exc:
             if "execution fence" in str(exc):
@@ -3248,7 +3316,41 @@ class RunScheduler:
         language_profile: WorkflowLanguageProfile = (
             WorkflowLanguageProfile.HERMES_LEGACY
         ),
+        execution_semantics: Phase3ExecutionSemantics | None = None,
+        outward_action: bool = False,
     ) -> None:
+        projection: dict[str, object] | None = None
+        retry_grant: RetryLedgerGrant | None = None
+        retry_charge = None
+        if execution_semantics is not None and result.status not in {
+            "cancelled",
+            "interrupted",
+        }:
+            projection = self.store.load_run(claim.run_id)
+            node_state = projection["nodes"][claim.node_id]
+            consumed_before = int(node_state.get("retry_consumed", 0))
+            retry_grant = self._sealed_retry_grant(
+                node,
+                execution_semantics,
+                retry_consumed=consumed_before,
+            )
+            if retry_grant.remaining_attempts > 0:
+                provider_evidence = (
+                    0
+                    if node.node_type not in {"command", "prompt"}
+                    else result.metadata.get(
+                        "additional_provider_attempts",
+                        result.metadata.get("provider_attempts"),
+                    )
+                )
+                retry_charge = retry_grant.charge(provider_evidence)
+                result = replace(
+                    result,
+                    metadata={
+                        **result.metadata,
+                        **retry_grant.evidence(retry_charge),
+                    },
+                )
         result = self._attach_declared_primary_output(
             node,
             result,
@@ -3350,17 +3452,43 @@ class RunScheduler:
                     metadata=completion_metadata,
                 )
             return
-        policy = self._effective_retry_policy(node, execution_limits)
-        projection = self.store.load_run(claim.run_id)
+        if execution_semantics is not None:
+            assert retry_grant is not None
+            policy = retry_grant.policy
+        else:
+            policy = self._effective_retry_policy(node, execution_limits)
+        if projection is None:
+            projection = self.store.load_run(claim.run_id)
         node_state = projection["nodes"][claim.node_id]
         consumed_before = int(node_state.get("retry_consumed", 0))
-        provider_attempts = int(result.metadata.get("provider_attempts", 0))
-        consumed = min(policy.max_attempts, consumed_before + 1 + provider_attempts)
+        if retry_charge is not None:
+            provider_attempts = retry_charge.additional_provider_attempts
+            consumed = retry_charge.retry_consumed
+        else:
+            provider_attempts = int(result.metadata.get("provider_attempts", 0))
+            consumed = min(
+                policy.max_attempts,
+                consumed_before + 1 + provider_attempts,
+            )
+        known_no_effect = None
+        if execution_semantics is not None:
+            known_no_effect = result.metadata.get("known_no_effect") is True
+            if (
+                node.node_type in {"bash", "script"}
+                and retry_grant is not None
+                and not outward_action
+                and result.error_code in {*_TRANSIENT_FAILURES, "process_exit"}
+            ):
+                known_no_effect = True
         failure = classify_failure(
             result.error_code,
             workflow_attempt=consumed_before + 1,
             provider_attempts=provider_attempts,
             maximum=policy.max_attempts,
+            known_no_effect=known_no_effect,
+            outward_action=(
+                outward_action if execution_semantics is not None else False
+            ),
         )
         never_retry = {
             "authentication",
@@ -3381,15 +3509,24 @@ class RunScheduler:
             is WorkflowLanguageProfile.ARCHON_2026_07
             and result.metadata.get("archon_terminal_failure") is True
         )
-        if (
-            policy.on_error == "all"
-            and failure is FailureClass.FATAL
-            and result.error_code not in never_retry
+        if archon_terminal_failure:
+            failure = FailureClass.FATAL
+        elif execution_semantics is None:
+            if (
+                policy.on_error == "all"
+                and failure is FailureClass.FATAL
+                and result.error_code not in never_retry
+                and not archon_terminal_failure
+            ):
+                failure = FailureClass.TRANSIENT
+        elif (
+            failure is FailureClass.UNKNOWN_ERROR
+            and policy.on_error == "all"
             and not archon_terminal_failure
         ):
             failure = FailureClass.TRANSIENT
         metadata = {**result.metadata, "retry_consumed": consumed}
-        if failure is FailureClass.RECONCILE:
+        if failure in {FailureClass.RECONCILE, FailureClass.UNKNOWN_OUTCOME}:
             self.store.complete_node(
                 claim,
                 status="paused",
