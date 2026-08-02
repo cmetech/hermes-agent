@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import threading
 
 import pytest
+import yaml
 
-from agent.plugin_agent import PluginAgentRunResult
+from agent.plugin_agent import PluginAgentRunResult, PluginAgentRunner
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
@@ -22,6 +29,158 @@ from plugins.workflow.scheduler import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+
+
+class _InlineAuthorityProvider(BaseHTTPRequestHandler):
+    requests: list[dict[str, object]] = []
+    concurrent_children = False
+    block_child = False
+    child_started = threading.Event()
+    release_child = threading.Event()
+    lock = threading.Lock()
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length))
+        with type(self).lock:
+            type(self).requests.append(request)
+        tool_names = {
+            str(tool.get("function", {}).get("name"))
+            for tool in request.get("tools", [])
+            if isinstance(tool, dict)
+        }
+        is_parent = "workflow_agent" in tool_names
+        if not is_parent and type(self).block_child:
+            type(self).child_started.set()
+            type(self).release_child.wait(10)
+        tool_results = [
+            message
+            for message in request.get("messages", [])
+            if message.get("role") == "tool"
+        ]
+        if not is_parent:
+            chunks = [
+                {
+                    "id": "inline-child-final",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "child complete"},
+                        "finish_reason": None,
+                    }],
+                },
+                {
+                    "id": "inline-child-final",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                },
+            ]
+        else:
+            target_children = 3 if type(self).concurrent_children else 2
+            if len(tool_results) >= target_children:
+                chunks = [
+                    {
+                        "id": "inline-parent-final",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": "parent complete"},
+                            "finish_reason": None,
+                        }],
+                    },
+                    {
+                        "id": "inline-parent-final",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    },
+                ]
+            else:
+                indexes = (
+                    range(target_children)
+                    if type(self).concurrent_children
+                    else range(len(tool_results), len(tool_results) + 1)
+                )
+                calls = [
+                    {
+                        "index": index,
+                        "id": f"inline-review-{len(tool_results)}-{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "workflow_agent",
+                            "arguments": json.dumps({
+                                "agent_id": "reviewer",
+                                "task": f"review item {index}",
+                            }),
+                        },
+                    }
+                    for index in indexes
+                ]
+                chunks = [
+                    {
+                        "id": "inline-parent-call",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "tool_calls": calls},
+                            "finish_reason": None,
+                        }],
+                    },
+                    {
+                        "id": "inline-parent-call",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls",
+                        }],
+                    },
+                ]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+def _start_inline_authority_provider(
+    *, concurrent_children: bool, block_child: bool = False
+) -> tuple[ThreadingHTTPServer, str]:
+    _InlineAuthorityProvider.requests = []
+    _InlineAuthorityProvider.concurrent_children = concurrent_children
+    _InlineAuthorityProvider.block_child = block_child
+    _InlineAuthorityProvider.child_started = threading.Event()
+    _InlineAuthorityProvider.release_child = threading.Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _InlineAuthorityProvider)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}/v1"
+
+
+def _write_inline_authority_provider_config(home: Path, base_url: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "model": {
+                "default": "inline-authority-model",
+                "provider": "custom:inline-authority",
+            },
+            "custom_providers": [{
+                "name": "inline-authority",
+                "base_url": base_url,
+                "api_key": "local-test-key",
+                "api_mode": "chat_completions",
+                "model": "inline-authority-model",
+            }],
+        }),
+        encoding="utf-8",
+    )
 
 
 def _start(
@@ -402,6 +561,206 @@ def test_archon_provider_grant_exhaustion_is_terminal_without_reconciliation(
     resumed = restarted.advance(admitted.run_id)
     assert resumed["status"] == "failed"
     assert calls == 1
+
+
+@pytest.mark.parametrize("grant", range(1, 6))
+@pytest.mark.parametrize("concurrent_children", [False, True])
+def test_real_inline_worker_tree_charges_one_durable_provider_ledger(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    grant,
+    concurrent_children,
+) -> None:
+    """The real worker/provider/store seams cannot mint child allowances."""
+
+    home = tmp_path / f"home-{grant}-{concurrent_children}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    server, base_url = _start_inline_authority_provider(
+        concurrent_children=concurrent_children
+    )
+    _write_inline_authority_provider_config(home, base_url)
+    path = workflow_writer(
+        tmp_path / f"package-{grant}-{concurrent_children}",
+        name=f"inline-authority-{grant}-{concurrent_children}",
+        nodes=[{
+            "id": "work",
+            "prompt": "Run every declared review and then finish.",
+            "retry": {"max_attempts": 4, "on_error": "all"},
+            "agents": {
+                "reviewer": {
+                    "description": "Review one item",
+                    "prompt": "Return a short review.",
+                    "tools": [],
+                    "maxTurns": 1,
+                }
+            },
+        }],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        f"limits: {{combined_retries: {grant}}}\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    admitted = _start(
+        store,
+        package,
+        key=f"real-inline-{grant}-{concurrent_children}",
+        execution_limits=RunExecutionLimits(combined_retries=grant),
+    )
+    authority_threads_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("provider-attempt-authority")
+    }
+    scheduler = RunScheduler(
+        store,
+        agent_runner=PluginAgentRunner("workflow"),
+        ai_idle_timeout_seconds=10,
+        ai_wall_timeout_seconds=20,
+        provider_request_timeout_seconds=5,
+        cooperative_shutdown_seconds=0.1,
+        term_grace_seconds=0.2,
+        kill_reap_grace_seconds=0.5,
+    )
+    try:
+        result = scheduler.advance(admitted.run_id)
+        provider_calls = len(_InlineAuthorityProvider.requests)
+        node = result["nodes"]["work"]
+        attempt = node["attempts"][0]
+        evidence = attempt["metadata"]
+
+        assert provider_calls == grant, {
+            "status": result["status"],
+            "last_error": result.get("last_error"),
+            "attempt": attempt,
+        }
+        assert node["retry_consumed"] == grant
+        assert evidence["additional_provider_attempts"] == grant - 1
+        assert evidence["provider_attempts_exact"] is True
+        assert evidence["audit"]["provider_attempts"] == grant
+        assert node.get("pending_interaction") is None
+        assert attempt.get("reconciliation_required") is not True
+        if grant < 5:
+            assert result["status"] == "failed"
+            assert result["last_error"]["code"] == (
+                "provider_attempt_grant_exhausted"
+            )
+            assert attempt["error_code"] == "provider_attempt_grant_exhausted"
+            assert evidence["known_no_effect"] is True
+        else:
+            assert result["status"] == "succeeded"
+
+        restarted = RunScheduler(
+            RunStore(home), agent_runner=PluginAgentRunner("workflow")
+        ).advance(admitted.run_id)
+        assert restarted["status"] == result["status"]
+        assert len(_InlineAuthorityProvider.requests) == provider_calls
+        assert restarted["nodes"]["work"]["retry_consumed"] == grant
+    finally:
+        scheduler.shutdown()
+        server.shutdown()
+        server.server_close()
+
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("provider-attempt-authority")
+    } == authority_threads_before
+
+
+def test_real_inline_worker_tree_cancellation_reaps_broker_and_never_replays(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    home = tmp_path / "cancel-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    server, base_url = _start_inline_authority_provider(
+        concurrent_children=False, block_child=True
+    )
+    _write_inline_authority_provider_config(home, base_url)
+    path = workflow_writer(
+        tmp_path / "cancel-package",
+        name="inline-authority-cancel",
+        nodes=[{
+            "id": "work",
+            "prompt": "Run every declared review and then finish.",
+            "retry": {"max_attempts": 4, "on_error": "all"},
+            "agents": {
+                "reviewer": {
+                    "description": "Review one item",
+                    "prompt": "Return a short review.",
+                    "tools": [],
+                    "maxTurns": 1,
+                }
+            },
+        }],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits: {combined_retries: 5}\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    admitted = _start(
+        store,
+        package,
+        key="real-inline-cancel",
+        execution_limits=RunExecutionLimits(combined_retries=5),
+    )
+    authority_threads_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("provider-attempt-authority")
+    }
+    scheduler = RunScheduler(
+        store,
+        agent_runner=PluginAgentRunner("workflow"),
+        ai_idle_timeout_seconds=10,
+        ai_wall_timeout_seconds=20,
+        provider_request_timeout_seconds=5,
+        cooperative_shutdown_seconds=0.1,
+        term_grace_seconds=0.2,
+        kill_reap_grace_seconds=0.5,
+    )
+    pool = ThreadPoolExecutor(max_workers=1)
+    running = pool.submit(scheduler.advance, admitted.run_id)
+    try:
+        assert _InlineAuthorityProvider.child_started.wait(10)
+        cancelled = store.cancel_run(admitted.run_id)
+        assert (
+            cancelled["status"] == "cancelled"
+            or cancelled["desired_status"] == "cancelled"
+        )
+        _InlineAuthorityProvider.release_child.set()
+        result = running.result(timeout=10)
+        provider_calls = len(_InlineAuthorityProvider.requests)
+        assert result["status"] == "cancelled"
+        assert provider_calls == 2
+        assert provider_calls <= 5
+        restarted = RunScheduler(
+            RunStore(home), agent_runner=PluginAgentRunner("workflow")
+        ).advance(admitted.run_id)
+        assert restarted["status"] == "cancelled"
+        assert len(_InlineAuthorityProvider.requests) == provider_calls
+    finally:
+        _InlineAuthorityProvider.release_child.set()
+        try:
+            running.result(timeout=10)
+        except Exception:
+            pass
+        pool.shutdown(wait=True)
+        scheduler.shutdown()
+        server.shutdown()
+        server.server_close()
+
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("provider-attempt-authority")
+    } == authority_threads_before
 
 
 @pytest.mark.parametrize(

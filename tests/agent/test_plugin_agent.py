@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import queue
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -1514,6 +1518,197 @@ def test_sealed_provider_authority_close_fails_closed_without_reopening() -> Non
         }
     finally:
         replacement.close()
+
+
+def _authority_wire_request(
+    descriptor: dict[str, object],
+    operation: str,
+    *,
+    nonce_bytes: bytes,
+) -> bytes:
+    """Build the private authenticated raw-JSON request independently."""
+
+    nonce = base64.b64encode(nonce_bytes).decode("ascii")
+    unsigned = {
+        "version": 1,
+        "operation": operation,
+        "nonce": nonce,
+    }
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    authkey = base64.b64decode(str(descriptor["authkey"]), validate=True)
+    payload = {
+        **unsigned,
+        "mac": hmac.new(authkey, canonical, hashlib.sha256).hexdigest(),
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return struct.pack("!I", len(body)) + body
+
+
+def test_provider_authority_stalled_unauthenticated_client_cannot_block_reserve(
+) -> None:
+    authority = _ProviderAttemptAuthority(2)
+    stalled = socket.create_connection(
+        (str(authority.descriptor["host"]), int(authority.descriptor["port"])),
+        timeout=1,
+    )
+    time.sleep(0.05)
+    pool = ThreadPoolExecutor(max_workers=1)
+    reservation = pool.submit(
+        _reserve_shared_provider_attempt, authority.descriptor
+    )
+    try:
+        assert reservation.result(timeout=1.0) == 1
+    finally:
+        stalled.close()
+        try:
+            reservation.result(timeout=2.0)
+        except Exception:
+            pass
+        pool.shutdown(wait=True)
+        authority.close()
+
+
+def test_provider_authority_authenticated_partial_frame_cannot_block_reserve(
+) -> None:
+    authority = _ProviderAttemptAuthority(2)
+    stalled = socket.create_connection(
+        (str(authority.descriptor["host"]), int(authority.descriptor["port"])),
+        timeout=1,
+    )
+    frame = _authority_wire_request(
+        dict(authority.descriptor), "snapshot", nonce_bytes=b"p" * 32
+    )
+    stalled.sendall(frame[: len(frame) // 2])
+    time.sleep(0.05)
+    pool = ThreadPoolExecutor(max_workers=1)
+    reservation = pool.submit(
+        _reserve_shared_provider_attempt, authority.descriptor
+    )
+    try:
+        assert reservation.result(timeout=1.0) == 1
+    finally:
+        stalled.close()
+        try:
+            reservation.result(timeout=2.0)
+        except Exception:
+            pass
+        pool.shutdown(wait=True)
+        authority.close()
+
+
+def test_provider_authority_close_unblocks_stalled_client_and_reaps_threads() -> None:
+    before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("provider-attempt-authority")
+    }
+    authority = _ProviderAttemptAuthority(1)
+    stalled = socket.create_connection(
+        (str(authority.descriptor["host"]), int(authority.descriptor["port"])),
+        timeout=1,
+    )
+    time.sleep(0.05)
+    pool = ThreadPoolExecutor(max_workers=1)
+    closed = pool.submit(authority.close)
+    try:
+        closed.result(timeout=1.0)
+    finally:
+        stalled.close()
+        try:
+            closed.result(timeout=2.0)
+        except Exception:
+            pass
+        pool.shutdown(wait=True)
+        authority.close()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        current = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.startswith("provider-attempt-authority")
+        }
+        if current == before:
+            break
+        time.sleep(0.01)
+    assert current == before
+
+
+def test_provider_authority_client_fails_shut_when_server_never_responds() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    accepted = threading.Event()
+    stop = threading.Event()
+
+    def stall_server() -> None:
+        connection, _address = listener.accept()
+        accepted.set()
+        stop.wait(2)
+        connection.close()
+
+    server = threading.Thread(target=stall_server, daemon=True)
+    server.start()
+    descriptor = {
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": listener.getsockname()[1],
+        "authkey": base64.b64encode(b"s" * 32).decode("ascii"),
+    }
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _reserve_shared_provider_attempt(descriptor)
+        assert accepted.wait(1)
+        assert time.monotonic() - started < 1.5
+    finally:
+        stop.set()
+        listener.close()
+        server.join(timeout=1)
+
+
+def test_provider_authority_rejects_replay_malformed_and_oversize_frames() -> None:
+    authority = _ProviderAttemptAuthority(2)
+    address = (
+        str(authority.descriptor["host"]),
+        int(authority.descriptor["port"]),
+    )
+
+    def send_raw(frame: bytes) -> bytes:
+        with socket.create_connection(address, timeout=1) as client:
+            client.settimeout(1)
+            client.sendall(frame)
+            try:
+                return client.recv(2048)
+            except (ConnectionResetError, socket.timeout):
+                return b""
+
+    valid = _authority_wire_request(
+        dict(authority.descriptor), "snapshot", nonce_bytes=b"r" * 32
+    )
+    forged_payload = json.loads(valid[4:])
+    forged_payload["mac"] = "0" * 64
+    forged_body = json.dumps(
+        forged_payload, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    forged = struct.pack("!I", len(forged_body)) + forged_body
+    try:
+        first = send_raw(valid)
+        replay = send_raw(valid)
+        unauthenticated = send_raw(forged)
+        malformed = send_raw(struct.pack("!I", 1) + b"{")
+        oversize = send_raw(struct.pack("!I", 1025))
+        assert first
+        assert replay != first
+        assert unauthenticated == b""
+        assert malformed == b""
+        assert oversize == b""
+        assert _reserve_shared_provider_attempt(authority.descriptor) == 1
+    finally:
+        authority.close()
 
 
 def test_cancelled_sealed_exchange_closes_its_private_authority() -> None:

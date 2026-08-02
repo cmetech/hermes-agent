@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections import deque
 from dataclasses import dataclass, field
+import hashlib
+import hmac
 import json
 import math
-from multiprocessing.connection import AuthenticationError, Client, Listener
 from pathlib import Path
 import queue
 import re
 import secrets
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -82,6 +86,51 @@ class _ProviderAttemptGrantExhausted(RuntimeError):
 _PROVIDER_AUTHORITY_VERSION = 1
 _PROVIDER_AUTHORITY_AUTHKEY_BYTES = 32
 _PROVIDER_AUTHORITY_FRAME_BYTES = 1024
+_PROVIDER_AUTHORITY_NONCE_BYTES = 32
+_PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS = 0.5
+_PROVIDER_AUTHORITY_ACCEPT_TIMEOUT_SECONDS = 0.05
+_PROVIDER_AUTHORITY_MAX_CLIENTS = 8
+_PROVIDER_AUTHORITY_REPLAY_WINDOW = 256
+
+
+def _provider_authority_canonical(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _provider_authority_mac(authkey: bytes, value: Mapping[str, Any]) -> str:
+    return hmac.new(
+        authkey, _provider_authority_canonical(value), hashlib.sha256
+    ).hexdigest()
+
+
+def _recv_provider_authority_frame(connection: socket.socket) -> bytes:
+    header = bytearray()
+    while len(header) < 4:
+        chunk = connection.recv(4 - len(header))
+        if not chunk:
+            raise EOFError("provider authority frame ended before its header")
+        header.extend(chunk)
+    (size,) = struct.unpack("!I", bytes(header))
+    if size < 1 or size > _PROVIDER_AUTHORITY_FRAME_BYTES:
+        raise ValueError("provider authority frame size is invalid")
+    body = bytearray()
+    while len(body) < size:
+        chunk = connection.recv(size - len(body))
+        if not chunk:
+            raise EOFError("provider authority frame ended before its body")
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _send_provider_authority_frame(
+    connection: socket.socket, payload: Mapping[str, Any]
+) -> None:
+    body = _provider_authority_canonical(payload)
+    if len(body) > _PROVIDER_AUTHORITY_FRAME_BYTES:
+        raise ValueError("provider authority frame is too large")
+    connection.sendall(struct.pack("!I", len(body)) + body)
 
 
 def _validated_provider_attempt_authority(
@@ -115,29 +164,49 @@ def _shared_provider_attempt_request(
     descriptor: Mapping[str, Any], operation: str
 ) -> Mapping[str, Any]:
     address, authkey = _validated_provider_attempt_authority(descriptor)
+    nonce = base64.b64encode(
+        secrets.token_bytes(_PROVIDER_AUTHORITY_NONCE_BYTES)
+    ).decode("ascii")
+    unsigned = {
+        "version": _PROVIDER_AUTHORITY_VERSION,
+        "operation": operation,
+        "nonce": nonce,
+    }
     try:
-        connection = Client(address, family="AF_INET", authkey=authkey)
-        try:
-            connection.send_bytes(
-                json.dumps(
-                    {"operation": operation}, separators=(",", ":")
-                ).encode("ascii")
+        with socket.create_connection(
+            address, timeout=_PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS
+        ) as connection:
+            connection.settimeout(_PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS)
+            _send_provider_authority_frame(
+                connection,
+                {**unsigned, "mac": _provider_authority_mac(authkey, unsigned)},
             )
             response = json.loads(
-                connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
+                _recv_provider_authority_frame(connection).decode("ascii")
             )
-        finally:
-            connection.close()
     except (
-        AuthenticationError,
         EOFError,
         json.JSONDecodeError,
         OSError,
         UnicodeDecodeError,
+        ValueError,
     ) as exc:
         raise RuntimeError("sealed provider attempt authority unavailable") from exc
     if not isinstance(response, Mapping):
         raise RuntimeError("sealed provider attempt authority response is invalid")
+    response = dict(response)
+    response_mac = response.pop("mac", None)
+    if (
+        response.get("version") != _PROVIDER_AUTHORITY_VERSION
+        or response.get("nonce") != nonce
+        or not isinstance(response_mac, str)
+        or not hmac.compare_digest(
+            response_mac, _provider_authority_mac(authkey, response)
+        )
+    ):
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    response.pop("version", None)
+    response.pop("nonce", None)
     return response
 
 
@@ -182,11 +251,14 @@ class _ProviderAttemptAuthority:
         self._exhausted = False
         self._state_lock = threading.Lock()
         self._authkey = secrets.token_bytes(_PROVIDER_AUTHORITY_AUTHKEY_BYTES)
-        self._shutdown_nonce = secrets.token_hex(32)
-        self._listener = Listener(
-            ("127.0.0.1", 0), family="AF_INET", authkey=self._authkey
-        )
-        host, port = self._listener.address
+        self._seen_nonces: set[str] = set()
+        self._nonce_order: deque[str] = deque()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(_PROVIDER_AUTHORITY_MAX_CLIENTS * 2)
+        self._listener.settimeout(_PROVIDER_AUTHORITY_ACCEPT_TIMEOUT_SECONDS)
+        host, port = self._listener.getsockname()
         self.descriptor: Mapping[str, Any] = {
             "version": _PROVIDER_AUTHORITY_VERSION,
             "host": host,
@@ -194,6 +266,11 @@ class _ProviderAttemptAuthority:
             "authkey": base64.b64encode(self._authkey).decode("ascii"),
         }
         self._closed = False
+        self._close_event = threading.Event()
+        self._clients = threading.BoundedSemaphore(_PROVIDER_AUTHORITY_MAX_CLIENTS)
+        self._connections_lock = threading.Lock()
+        self._connections: set[socket.socket] = set()
+        self._workers: set[threading.Thread] = set()
         self._thread = threading.Thread(
             target=self._serve,
             name="provider-attempt-authority",
@@ -202,49 +279,119 @@ class _ProviderAttemptAuthority:
         self._thread.start()
 
     def _serve(self) -> None:
-        while True:
+        while not self._close_event.is_set():
             try:
-                connection = self._listener.accept()
-            except (AuthenticationError, OSError):
-                if self._closed:
+                connection, _address = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._close_event.is_set():
                     return
                 continue
-            try:
-                request = json.loads(
-                    connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
-                )
-                operation = request.get("operation") if isinstance(request, Mapping) else None
-                if operation == "reserve":
-                    with self._state_lock:
-                        if self._provider_attempts >= self._grant:
-                            self._exhausted = True
-                            response = {
-                                "reserved": False,
-                                "provider_attempts": self._provider_attempts,
-                            }
-                        else:
-                            self._provider_attempts += 1
-                            response = {
-                                "reserved": True,
-                                "provider_attempts": self._provider_attempts,
-                            }
-                elif operation == "snapshot":
-                    response = self.snapshot()
-                elif (
-                    operation == "shutdown"
-                    and request.get("nonce") == self._shutdown_nonce
-                ):
-                    connection.send_bytes(b'{"closed":true}')
-                    return
-                else:
-                    response = {"error": "invalid operation"}
-                connection.send_bytes(
-                    json.dumps(response, separators=(",", ":")).encode("ascii")
-                )
-            except (EOFError, json.JSONDecodeError, OSError, UnicodeDecodeError):
-                pass
-            finally:
+            if not self._clients.acquire(blocking=False):
                 connection.close()
+                continue
+            worker = threading.Thread(
+                target=self._serve_connection,
+                args=(connection,),
+                name="provider-attempt-authority-client",
+                daemon=True,
+            )
+            with self._connections_lock:
+                if self._close_event.is_set():
+                    self._clients.release()
+                    connection.close()
+                    return
+                self._connections.add(connection)
+                self._workers.add(worker)
+            worker.start()
+
+    def _serve_connection(self, connection: socket.socket) -> None:
+        try:
+            connection.settimeout(_PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS)
+            request = json.loads(
+                _recv_provider_authority_frame(connection).decode("ascii")
+            )
+            if not isinstance(request, Mapping) or set(request) != {
+                "version",
+                "operation",
+                "nonce",
+                "mac",
+            }:
+                return
+            request = dict(request)
+            request_mac = request.pop("mac", None)
+            nonce = request.get("nonce")
+            operation = request.get("operation")
+            if (
+                request.get("version") != _PROVIDER_AUTHORITY_VERSION
+                or operation not in {"reserve", "snapshot"}
+                or not isinstance(nonce, str)
+                or not isinstance(request_mac, str)
+            ):
+                return
+            try:
+                nonce_bytes = base64.b64decode(nonce, validate=True)
+            except (binascii.Error, ValueError):
+                return
+            if (
+                len(nonce_bytes) != _PROVIDER_AUTHORITY_NONCE_BYTES
+                or not hmac.compare_digest(
+                    request_mac, _provider_authority_mac(self._authkey, request)
+                )
+            ):
+                return
+            with self._state_lock:
+                if nonce in self._seen_nonces:
+                    return
+                self._seen_nonces.add(nonce)
+                self._nonce_order.append(nonce)
+                if len(self._nonce_order) > _PROVIDER_AUTHORITY_REPLAY_WINDOW:
+                    expired = self._nonce_order.popleft()
+                    self._seen_nonces.discard(expired)
+                if operation == "reserve":
+                    if self._provider_attempts >= self._grant:
+                        self._exhausted = True
+                        response = {
+                            "reserved": False,
+                            "provider_attempts": self._provider_attempts,
+                        }
+                    else:
+                        self._provider_attempts += 1
+                        response = {
+                            "reserved": True,
+                            "provider_attempts": self._provider_attempts,
+                        }
+                else:
+                    response = {
+                        "provider_attempts": self._provider_attempts,
+                        "exhausted": self._exhausted,
+                    }
+            signed = {
+                "version": _PROVIDER_AUTHORITY_VERSION,
+                "nonce": nonce,
+                **response,
+            }
+            _send_provider_authority_frame(
+                connection,
+                {**signed, "mac": _provider_authority_mac(self._authkey, signed)},
+            )
+        except (
+            EOFError,
+            json.JSONDecodeError,
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
+            pass
+        finally:
+            try:
+                connection.close()
+            finally:
+                with self._connections_lock:
+                    self._connections.discard(connection)
+                    self._workers.discard(threading.current_thread())
+                self._clients.release()
 
     def snapshot(self) -> dict[str, int | bool]:
         with self._state_lock:
@@ -254,27 +401,34 @@ class _ProviderAttemptAuthority:
             }
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._connections_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_event.set()
+            connections = tuple(self._connections)
         try:
-            connection = Client(
-                self._listener.address, family="AF_INET", authkey=self._authkey
-            )
-            try:
-                connection.send_bytes(
-                    json.dumps(
-                        {"operation": "shutdown", "nonce": self._shutdown_nonce},
-                        separators=(",", ":"),
-                    ).encode("ascii")
-                )
-                connection.recv_bytes(_PROVIDER_AUTHORITY_FRAME_BYTES)
-            finally:
-                connection.close()
-        except (AuthenticationError, EOFError, OSError):
+            self._listener.close()
+        except OSError:
             pass
-        self._listener.close()
-        self._thread.join(timeout=2.0)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        self._thread.join(
+            timeout=_PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS
+            + _PROVIDER_AUTHORITY_ACCEPT_TIMEOUT_SECONDS
+        )
+        deadline = time.monotonic() + _PROVIDER_AUTHORITY_IO_TIMEOUT_SECONDS
+        while True:
+            with self._connections_lock:
+                workers = tuple(self._workers)
+            if not workers or time.monotonic() >= deadline:
+                break
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 @dataclass(frozen=True)
