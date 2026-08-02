@@ -12,7 +12,7 @@ from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
 
@@ -141,7 +141,10 @@ class LoopExecutor:
                 id=context.node.id,
                 node_type="prompt",
                 value=prompt,
-                depends_on=("previous",) if share else (),
+                depends_on=tuple(dict.fromkeys((
+                    *context.node.depends_on,
+                    *(("previous",) if share else ()),
+                ))),
                 source_index=context.node.source_index,
                 source_line=context.node.source_line,
                 options=freeze_value(options),
@@ -201,7 +204,15 @@ class LoopExecutor:
                     / context.attempt_id
                     / f"until-{iteration:04d}-variables"
                 )
-                rendered = bash_variables.render_bash(until_bash, spill_directory=spill)
+                bash_renderer = substitution_renderer(
+                    bash_variables,
+                    direct_dependencies=context.node.depends_on,
+                    output_resolver=context.output_resolver,
+                )
+                rendered = bash_renderer.render_bash(
+                    until_bash,
+                    spill_directory=spill,
+                )
                 bash_node = WorkflowNode(
                     id=context.node.id,
                     node_type="bash",

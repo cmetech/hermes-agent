@@ -14,7 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import yaml
 
@@ -732,10 +732,102 @@ class VariableContext:
         return _VARIABLE.sub(replace, template)
 
 
+@dataclass(frozen=True)
+class StrictSubstitutionRenderer:
+    """Dependency-scoped Archon v3 rendering over immutable output facets."""
+
+    variables: VariableContext
+    direct_dependencies: frozenset[str]
+    output_resolver: Callable[
+        [str, tuple[str, ...]], ResolvedOutputReference
+    ] | None = None
+
+    def _output(self, node_id: str, path: tuple[str, ...]) -> str:
+        if node_id not in self.direct_dependencies:
+            raise WorkflowOutputReferenceError(
+                "output_reference_not_declared_dependency",
+                node_id,
+                path,
+            )
+        resolver = self.output_resolver or self.variables.output_reference
+        return resolver(node_id, path).rendered_text
+
+    def _value(self, match: re.Match[str]) -> str | None:
+        node_id = match.group("node")
+        if node_id is not None:
+            raw_path = match.group("dot")
+            return self._output(
+                node_id,
+                tuple(raw_path.split(".")) if raw_path else (),
+            )
+        return self.variables._value(match)
+
+    def render_prompt(self, template: str) -> str:
+        """Render only the requested initial body; replacements are not rescanned."""
+
+        def replace(match: re.Match[str]) -> str:
+            value = self._value(match)
+            return match.group(0) if value is None else value
+
+        return _VARIABLE.sub(replace, template)
+
+    def render_bash(
+        self,
+        template: str,
+        *,
+        spill_directory: str | Path,
+        max_inline_chars: int = 8192,
+    ) -> str:
+        """Keep the existing loop Bash materialization with strict references."""
+        if max_inline_chars <= 0:
+            raise ValueError("max_inline_chars must be positive")
+        resolved_values = tuple(
+            self._value(match) for match in _VARIABLE.finditer(template)
+        )
+        root = Path(spill_directory).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        values = iter(resolved_values)
+
+        def replace(match: re.Match[str]) -> str:
+            value = next(values)
+            if value is None:
+                return match.group(0)
+            if len(value) > max_inline_chars:
+                digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+                path = root / f"variable-{digest}.txt"
+                path.write_text(value, encoding="utf-8")
+                value = str(path)
+            return _quote_shell_value(
+                value, _shell_quote_context(template, match.start())
+            )
+
+        return _VARIABLE.sub(replace, template)
+
+
+def substitution_renderer(
+    variables: VariableContext,
+    *,
+    direct_dependencies: Iterable[str],
+    output_resolver: Callable[
+        [str, tuple[str, ...]], ResolvedOutputReference
+    ] | None = None,
+) -> VariableContext | StrictSubstitutionRenderer:
+    """Select strict v3 rendering without changing legacy substitution."""
+    if variables.normalizer_version != 3:
+        return variables
+    return StrictSubstitutionRenderer(
+        variables=variables,
+        direct_dependencies=frozenset(direct_dependencies),
+        output_resolver=output_resolver,
+    )
+
+
 __all__ = [
     "CommandResource",
     "ResourceResolver",
     "ScriptResource",
+    "StrictSubstitutionRenderer",
     "VariableContext",
     "iter_output_field_references",
+    "substitution_renderer",
 ]

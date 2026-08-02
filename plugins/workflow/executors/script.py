@@ -19,7 +19,11 @@ from plugins.workflow.executors.base import (
     NodeExecutionResult,
     process_tree_active,
 )
-from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.resources import (
+    ResourceResolver,
+    VariableContext,
+    substitution_renderer,
+)
 from plugins.workflow.schema import is_inline_script
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import ManagedProcessTree
@@ -72,6 +76,11 @@ class ScriptExecutor:
         variables = context.variable_context
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
+        renderer = substitution_renderer(
+            variables,
+            direct_dependencies=node.depends_on,
+            output_resolver=context.output_resolver,
+        )
         warnings: tuple[str, ...] = ()
         if runtime == "bun":
             if dependencies:
@@ -81,7 +90,7 @@ class ScriptExecutor:
                     runtime_path,
                     "--no-env-file",
                     "-e",
-                    variables.render_prompt(str(node.value)),
+                    renderer.render_prompt(str(node.value)),
                 ], warnings, None
             resource = ResourceResolver(
                 context.run_directory,
@@ -105,7 +114,7 @@ class ScriptExecutor:
         for dependency in dependencies:
             argv.extend(("--with", dependency))
         if inline:
-            argv.extend(("python", "-c", variables.render_prompt(str(node.value))))
+            argv.extend(("python", "-c", renderer.render_prompt(str(node.value))))
             source_bytes = None
         else:
             resource = ResourceResolver(
@@ -144,13 +153,6 @@ class ScriptExecutor:
                 error_code="runtime_missing",
                 error_message=f"script runtime is not installed: {runtime}",
             )
-        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
-        attempt.mkdir(parents=True, exist_ok=False)
-        stdout_path = attempt / "stdout.txt"
-        stderr_path = attempt / "stderr.txt"
-        artifacts_dir = context.run_directory / "artifacts"
-        artifacts_dir.mkdir(exist_ok=True)
-        artifacts_before = _artifact_snapshot(artifacts_dir)
         try:
             argv, warnings, source_bytes = self._execution_plan(
                 context, runtime_path
@@ -159,6 +161,13 @@ class ScriptExecutor:
             return NodeExecutionResult(
                 "failed", error_code="validation", error_message=str(exc)
             )
+        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+        attempt.mkdir(parents=True, exist_ok=False)
+        stdout_path = attempt / "stdout.txt"
+        stderr_path = attempt / "stderr.txt"
+        artifacts_dir = context.run_directory / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_before = _artifact_snapshot(artifacts_dir)
         allowed_env = {
             key: value
             for key, value in os.environ.items()

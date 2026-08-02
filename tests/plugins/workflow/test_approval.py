@@ -21,7 +21,11 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
-from plugins.workflow.output_resolution import ArchonOutputIntegrityError
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -48,6 +52,48 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     register_cli(parser)
     return parser
+
+
+def test_v3_approval_message_rechecks_direct_dependency_before_pause(tmp_path) -> None:
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({"message": "Approve $producer.output.answer?"}),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        variable_context=VariableContext(
+            normalizer_version=3,
+            node_outputs={
+                "producer": ResolvedNodeOutput(
+                    canonical_bytes=b'{"answer":"ready"}',
+                    value={"answer": "ready"},
+                    text='{"answer":"ready"}',
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="producer",
+                    attempt_id="attempt-winner",
+                    publication_id="a" * 32,
+                    schema_fingerprint="3" * 64,
+                    canonicalization_version=1,
+                )
+            },
+        ),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        ApprovalExecutor().execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
 
 
 def test_approval_survives_restart_captures_trimmed_output_and_continues(
@@ -288,6 +334,60 @@ class ReworkRunner:
             usage={},
             audit={},
         )
+
+
+def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
+    tmp_path,
+) -> None:
+    runner = ReworkRunner()
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {
+                "prompt": "Revise $producer.output.answer: $REJECTION_REASON"
+            },
+        }),
+        depends_on=("producer",),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        workflow_options=freeze_value({"provider": "fake", "model": "fake"}),
+        variable_context=VariableContext(
+            normalizer_version=3,
+            node_outputs={
+                "producer": ResolvedNodeOutput(
+                    canonical_bytes=b'{"answer":"plan"}',
+                    value={"answer": "plan"},
+                    text='{"answer":"plan"}',
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="producer",
+                    attempt_id="attempt-winner",
+                    publication_id="a" * 32,
+                    schema_fingerprint="3" * 64,
+                    canonicalization_version=1,
+                )
+            },
+        ),
+        node_state=freeze_value({
+            "approval_rework": {"reason": "missing evidence"},
+        }),
+    )
+
+    result = ApprovalExecutor(runner).execute(context)
+
+    assert result.status == "paused"
+    assert runner.requests[0].prompt == "Revise plan: missing evidence"
 
 
 def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path):

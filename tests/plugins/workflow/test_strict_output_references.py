@@ -10,7 +10,7 @@ import pytest
 import plugins.workflow.language_schema as language_schema
 from agent.structured_output import normalize_schema
 from plugins.workflow import output_resolution
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.language_schema import (
     definition_json_schema,
@@ -1247,6 +1247,30 @@ def test_v3_variable_context_uses_strict_resolver_without_empty_fallback() -> No
     assert exc.value.code == "output_reference_field_missing"
 
 
+def test_v3_renderer_uses_immutable_whole_and_field_facets_without_rescanning() -> None:
+    variables = VariableContext(
+        node_outputs={
+            "producer": _resolved_output({
+                "answer": "$other.output.value",
+                "items": [3, True],
+            })
+        },
+        normalizer_version=3,
+    )
+    renderer = substitution_renderer(
+        variables,
+        direct_dependencies=("producer",),
+    )
+
+    assert renderer.render_prompt(
+        "whole=$producer.output field=$producer.output.answer "
+        "items=$producer.output.items"
+    ) == (
+        'whole={"answer":"$other.output.value","items":[3,true]} '
+        "field=$other.output.value items=[3,true]"
+    )
+
+
 def test_v3_resolver_requires_publication_path_and_full_schema_identity(
     tmp_path: Path,
 ) -> None:
@@ -1479,6 +1503,21 @@ def test_v3_integrity_failure_does_not_poison_good_publication_cache(
     assert rejected.code == "output_reference_integrity"
     assert isinstance(resolved, output_resolution.ResolvedNodeOutput)
     assert resolved.value == {"answer": "ready"}
+
+
+def test_v3_executor_variable_snapshot_contains_only_requested_dependencies(
+    tmp_path: Path,
+) -> None:
+    projection = _strict_publication_projection(tmp_path)
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    variables = scheduler._variables(
+        projection,
+        tmp_path,
+        output_node_ids=(),
+    )
+
+    assert variables.node_outputs == {}
 
 
 def test_v3_scheduler_rejects_ambiguous_successful_winning_attempts(

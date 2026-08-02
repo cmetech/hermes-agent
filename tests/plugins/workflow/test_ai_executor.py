@@ -15,6 +15,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from agent.structured_output import StructuredOutputStrategy, normalize_schema
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow import output_resolution
+import plugins.workflow.executors.ai as ai_executor_module
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.models import (
@@ -1769,6 +1770,7 @@ def test_v3_prompt_reference_failure_escapes_ai_executor_before_provider(
     node = _node(
         "consumer",
         "Use $producer.output.missing",
+        depends_on=("producer",),
         retry={"max_attempts": 2, "on_error": "all"},
     )
     context = replace(
@@ -1791,3 +1793,152 @@ def test_v3_prompt_reference_failure_escapes_ai_executor_before_provider(
 
     assert exc.value.code == "output_reference_field_missing"
     assert runner.requests == []
+
+
+def test_v3_prompt_rechecks_direct_dependency_before_provider(tmp_path) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    node = _node("consumer", "Use $producer.output.answer")
+    context = replace(
+        _archon_text_context(tmp_path, node),
+        variable_context=VariableContext(
+            workflow_id="run-1",
+            normalizer_version=3,
+            node_outputs={
+                "producer": output_resolution.ResolvedNodeOutput(
+                    canonical_bytes=b'{"answer":"ready"}',
+                    value={"answer": "ready"},
+                    text='{"answer":"ready"}',
+                    media_type="application/json",
+                    sha256=hashlib.sha256(b'{"answer":"ready"}').hexdigest(),
+                    node_id="producer",
+                    attempt_id="attempt-winner",
+                    publication_id="a" * 32,
+                    schema_fingerprint="3" * 64,
+                    canonicalization_version=1,
+                )
+            },
+        ),
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        AgentNodeExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
+
+
+def test_v3_prompt_resolves_before_authenticated_mcp_materialization(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    node = _node(
+        "consumer",
+        "Use $producer.output.answer",
+        mcp="mcp.yaml",
+    )
+    context = replace(
+        _archon_text_context(tmp_path, node),
+        variable_context=VariableContext(normalizer_version=3),
+        sealed_resource_paths=frozenset({"mcp.yaml"}),
+        sealed_resource_bytes={"mcp.yaml": b"mcp_servers: {}\n"},
+    )
+
+    def materialized_too_early():
+        pytest.fail("MCP materialization ran before strict prompt resolution")
+
+    monkeypatch.setattr(
+        ai_executor_module,
+        "AuthenticatedExecutionMaterializer",
+        materialized_too_early,
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        AgentNodeExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
+
+
+def test_v3_substitution_changes_only_initial_prompt_not_node_configuration(
+    tmp_path,
+) -> None:
+    runner = FakeAgentRunner("done")
+    node = _node(
+        "consumer",
+        "Use $producer.output.answer",
+        depends_on=("producer",),
+        allowed_tools=["read_file"],
+        systemPrompt="System keeps $producer.output.answer literal",
+    )
+    variables = VariableContext(
+        workflow_id="run-1",
+        normalizer_version=3,
+        node_outputs={
+            "producer": output_resolution.ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256=hashlib.sha256(b'{"answer":"ready"}').hexdigest(),
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        replace(_archon_text_context(tmp_path, node), variable_context=variables)
+    )
+
+    assert result.status == "succeeded"
+    request = runner.requests[0]
+    assert request.prompt == "Use ready"
+    assert request.allowed_tools == ("read_file",)
+    assert request.ephemeral_system_prompt == (
+        "System keeps $producer.output.answer literal"
+    )
+
+
+def test_v3_authenticated_command_renders_sealed_body_bytes(tmp_path) -> None:
+    runner = FakeAgentRunner("done")
+    node = WorkflowNode(
+        id="consumer",
+        node_type="command",
+        value="consume",
+        depends_on=("producer",),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": output_resolution.ResolvedNodeOutput(
+                canonical_bytes=b"ready",
+                value="ready",
+                text="ready",
+                media_type="text/plain",
+                sha256=hashlib.sha256(b"ready").hexdigest(),
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+            )
+        },
+    )
+    context = replace(
+        _archon_text_context(tmp_path, node),
+        variable_context=variables,
+        sealed_resource_paths=frozenset({"commands/consume.md"}),
+        sealed_resource_bytes={
+            "commands/consume.md": b"Authenticated $producer.output\n"
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].prompt == "Authenticated ready\n"

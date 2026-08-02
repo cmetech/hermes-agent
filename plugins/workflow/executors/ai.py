@@ -42,6 +42,7 @@ from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
     ResourceResolver,
     VariableContext,
+    substitution_renderer,
 )
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import ArtifactRef
@@ -620,7 +621,12 @@ class AgentNodeExecutor:
         variables = context.variable_context
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
-        prompt = variables.render_prompt(template)
+        renderer = substitution_renderer(
+            variables,
+            direct_dependencies=node.depends_on,
+            output_resolver=context.output_resolver,
+        )
+        prompt = renderer.render_prompt(template)
         if node.options.get("skills"):
             skill_text = ResourceResolver(
                 context.run_directory,
@@ -667,6 +673,7 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        prompt = self._prompt(context)
         materializer: AuthenticatedExecutionMaterializer | None = None
         try:
             agent_runner = entitled_agent_runner(
@@ -891,7 +898,7 @@ class AgentNodeExecutor:
             if web_mode is not None:
                 request_overrides["web_search_mode"] = web_mode
             request = PluginAgentRunRequest(
-                prompt=self._prompt(context),
+                prompt=prompt,
                 provider=(
                     self._requested_provider(context)
                     if structured_request is not None

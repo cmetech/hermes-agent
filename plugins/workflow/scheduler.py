@@ -1058,6 +1058,7 @@ class RunScheduler:
         *,
         sealed_resource_paths: frozenset[str] | None = None,
         sealed_resource_bytes: Mapping[str, bytes] | None = None,
+        output_node_ids: Iterable[str] | None = None,
     ):
         arguments = ""
         if sealed_resource_bytes is not None:
@@ -1086,7 +1087,11 @@ class RunScheduler:
             node: value
             if isinstance(value, str | ResolvedNodeOutput | WorkflowOutputReferenceError)
             else json.dumps(value, sort_keys=True)
-            for node, value in self._output_values(projection, run_directory).items()
+            for node, value in self._output_values(
+                projection,
+                run_directory,
+                node_ids=output_node_ids,
+            ).items()
         }
         language_snapshot = read_language_snapshot(projection.get("language"))
         return VariableContext(
@@ -2856,6 +2861,11 @@ class RunScheduler:
                         self.store.run_directory(run_id),
                         sealed_resource_paths=sealed_resource_paths,
                         sealed_resource_bytes=sealed_resource_bytes,
+                        output_node_ids=(
+                            node.depends_on
+                            if package.language.normalizer_version == 3
+                            else None
+                        ),
                     )
                     loop_input = projection["nodes"][node.id].get(
                         "loop_user_input_artifact"

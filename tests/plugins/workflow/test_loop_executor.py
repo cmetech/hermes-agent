@@ -3,11 +3,17 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.loop import LoopExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -40,6 +46,7 @@ def _context(
     variable_context: VariableContext | None = None,
     node_state: dict[str, object] | None = None,
     is_cancelled=None,
+    depends_on: tuple[str, ...] = (),
 ) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
     run_directory.mkdir(exist_ok=True)
@@ -50,7 +57,7 @@ def _context(
             id="iterate",
             node_type="loop",
             value=freeze_value(loop),
-            depends_on=(),
+            depends_on=depends_on,
             source_index=0,
             source_line=1,
             options=freeze_value({}),
@@ -65,6 +72,41 @@ def _context(
         node_state=node_state or {},
         is_cancelled=is_cancelled,
     )
+
+
+def test_v3_loop_prompt_rechecks_direct_dependency_before_iteration(tmp_path) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Use $producer.output.answer",
+            "until": "DONE",
+            "max_iterations": 1,
+        },
+        variable_context=VariableContext(
+            normalizer_version=3,
+            node_outputs={
+                "producer": ResolvedNodeOutput(
+                    canonical_bytes=b'{"answer":"ready"}',
+                    value={"answer": "ready"},
+                    text='{"answer":"ready"}',
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="producer",
+                    attempt_id="attempt-winner",
+                    publication_id="a" * 32,
+                    schema_fingerprint="3" * 64,
+                    canonicalization_version=1,
+                )
+            },
+        ),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
 
 
 def _artifact_text(context: NodeExecutionContext, result, index: int = -1) -> str:
@@ -182,6 +224,64 @@ def test_until_bash_exit_zero_completes_using_shell_quoted_previous_output(
     assert result.status == "succeeded"
     assert result.metadata["loop_state"]["completed_by"] == "until_bash"
     assert _artifact_text(context, result) == "value with spaces"
+
+
+def test_v3_loop_prompt_and_until_bash_share_strict_rendered_field(tmp_path) -> None:
+    runner = FakeAgentRunner("keep going")
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"value with spaces"}',
+                value={"answer": "value with spaces"},
+                text='{"answer":"value with spaces"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Use $producer.output.answer",
+            "until": "DONE",
+            "until_bash": "test $producer.output.answer = 'value with spaces'",
+            "max_iterations": 2,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert runner.requests[0].prompt == "Use value with spaces"
+
+
+def test_v3_until_bash_reference_failure_precedes_spill_side_effect(tmp_path) -> None:
+    runner = FakeAgentRunner("keep going")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Work",
+            "until": "DONE",
+            "until_bash": "test $producer.output.answer = ready",
+            "max_iterations": 2,
+        },
+        variable_context=VariableContext(normalizer_version=3),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert list(context.run_directory.glob("**/until-0001-variables")) == []
 
 
 def test_interactive_loop_pauses_and_resume_injects_user_input_fresh(

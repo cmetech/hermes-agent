@@ -13,7 +13,10 @@ from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
-from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+)
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -254,6 +257,7 @@ def _context(
     deps: tuple[str, ...] = (),
     timeout_seconds: float = 3,
     variable_context: VariableContext | None = None,
+    depends_on: tuple[str, ...] = (),
     termination_policy: TerminationPolicy | None = None,
 ) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
@@ -262,7 +266,7 @@ def _context(
         id="script",
         node_type="script",
         value=script,
-        depends_on=(),
+        depends_on=depends_on,
         source_index=0,
         source_line=1,
         options=freeze_value({"runtime": runtime, "deps": deps}),
@@ -280,6 +284,77 @@ def _context(
             else {}
         ),
     )
+
+
+def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Path) -> None:
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script="print('$producer.output.answer')\n",
+        variable_context=variables,
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        ScriptExecutor(runtime_locator=lambda _runtime: "/fake/uv").execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert not (context.run_directory / "nodes").exists()
+
+
+def test_v3_named_script_bytes_are_never_interpolated(tmp_path: Path) -> None:
+    source = b"print('$producer.output.answer')\n"
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="named",
+            variable_context=variables,
+            depends_on=("producer",),
+        ),
+        sealed_resource_paths=frozenset({"scripts/named.py"}),
+        sealed_resource_bytes={"scripts/named.py": source},
+    )
+
+    _argv, _warnings, source_bytes = ScriptExecutor()._execution_plan(
+        context,
+        "/fake/uv",
+    )
+
+    assert source_bytes == source
 
 
 def test_uv_dependencies_are_distinct_argv_without_shell_interpolation(

@@ -17,7 +17,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionResult,
     conservative_provider_retry_count,
 )
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
 
@@ -48,7 +48,12 @@ class ApprovalExecutor:
         message = str(approval["message"])
         variables = context.variable_context
         if isinstance(variables, VariableContext):
-            message = variables.render_prompt(message)
+            renderer = substitution_renderer(
+                variables,
+                direct_dependencies=context.node.depends_on,
+                output_resolver=context.output_resolver,
+            )
+            message = renderer.render_prompt(message)
         identity = hashlib.sha256(
             f"{context.run_id}\0{context.node.id}\0{generation}\0{message}".encode()
         ).hexdigest()
@@ -110,7 +115,12 @@ class ApprovalExecutor:
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
         variables = replace(variables, rejection_reason=str(rework.get("reason") or ""))
-        prompt = variables.render_prompt(str(on_reject["prompt"]))
+        renderer = substitution_renderer(
+            variables,
+            direct_dependencies=context.node.depends_on,
+            output_resolver=context.output_resolver,
+        )
+        prompt = renderer.render_prompt(str(on_reject["prompt"]))
         wall_timeout = (
             context.deadline_budget.remaining_wall(context.monotonic())
             if context.deadline_budget is not None
