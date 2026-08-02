@@ -244,6 +244,12 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_showcase_schedule_e2e.py",
         "tests/plugins/workflow/test_scheduled_runs.py",
         "tests/plugins/workflow/test_schedule_revalidation.py",
+        "tests/plugins/workflow/test_phase3_language.py",
+        "tests/plugins/workflow/test_phase3_execution_semantics.py",
+        "tests/plugins/workflow/test_phase3_code_catalog.py",
+        "tests/plugins/workflow/test_strict_output_references.py",
+        "tests/plugins/workflow/test_phase3_conditions.py",
+        "tests/plugins/workflow/test_phase3_resolution_waits.py",
         *PHASE_1_LANGUAGE_BACKEND_SUITES,
     ):
         assert selected_python.count(path) == 1

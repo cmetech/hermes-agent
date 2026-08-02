@@ -407,6 +407,12 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
+      tests/plugins/workflow/test_phase3_language.py \
+      tests/plugins/workflow/test_phase3_execution_semantics.py \
+      tests/plugins/workflow/test_phase3_code_catalog.py \
+      tests/plugins/workflow/test_strict_output_references.py \
+      tests/plugins/workflow/test_phase3_conditions.py \
+      tests/plugins/workflow/test_phase3_resolution_waits.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
