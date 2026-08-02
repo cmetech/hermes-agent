@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from plugins.workflow.models import RunExecutionLimits
+from plugins.workflow.models import ExecutionFence, RunExecutionLimits
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
 from plugins.workflow.cli import _runtime_config, register_cli
@@ -43,6 +43,19 @@ def _execution_semantics_module():
         return importlib.import_module("plugins.workflow.execution_semantics")
     except ModuleNotFoundError:
         pytest.fail("Phase 3 effective execution semantics codec is not implemented")
+
+
+class _RecordingAuthorizationRunStore(RunStore):
+    """Observe real store-issued authorizations without replacing verification."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.issued_scheduled_authorizations: list[object] = []
+
+    def _scheduled_promotion_authorization(self, *args, **kwargs):
+        authorization = super()._scheduled_promotion_authorization(*args, **kwargs)
+        self.issued_scheduled_authorizations.append(authorization)
+        return authorization
 
 
 def _archon_package(tmp_path, workflow_writer, *, nodes, sidecar=None):
@@ -380,12 +393,13 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     capsys,
 ) -> None:
     home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     path = workflow_writer(
         home / "workflows",
         name="archon-execution-parity",
         filename="archon-execution-parity.yaml",
         nodes=[
-            {"id": "shell", "bash": "true", "timeout": 90_000},
+            {"id": "a-shell", "bash": "true", "timeout": 90_000},
             {
                 "id": "scripted",
                 "script": "print('ok')",
@@ -473,6 +487,32 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     assert coordinator_lease.is_leader
     values = {"arguments": "same-input"}
     run_ids: dict[str, str] = {}
+    authority = ApiAdmissionAuthority(
+        principal="execution-parity",
+        namespace="execution-parity",
+        operator_scope=None,
+        source_instance="desktop:execution-parity",
+        assurance="local_admin_claim",
+        trigger_source="desktop",
+    )
+    due = now.replace(microsecond=0) + timedelta(minutes=5)
+    scheduled = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values=values,
+        idempotency_key="execution-parity-scheduled",
+        concurrency_policy="allow",
+        authority=authority,
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=now,
+    )
+    assert scheduled["run_id"] is not None
+    run_ids["scheduled"] = str(scheduled["run_id"])
 
     cli_parser = argparse.ArgumentParser()
     register_cli(cli_parser)
@@ -518,14 +558,6 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     assert gateway["result"]["run_id"] is not None
     run_ids["gateway"] = str(gateway["result"]["run_id"])
 
-    authority = ApiAdmissionAuthority(
-        principal="execution-parity",
-        namespace="execution-parity",
-        operator_scope=None,
-        source_instance="desktop:execution-parity",
-        assurance="local_admin_claim",
-        trigger_source="desktop",
-    )
     api = start_api_run(
         store,
         hermes_home=home,
@@ -541,25 +573,6 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     )
     assert api["run_id"] is not None
     run_ids["api"] = str(api["run_id"])
-
-    due = now.replace(microsecond=0) + timedelta(minutes=5)
-    scheduled = start_api_run(
-        store,
-        hermes_home=home,
-        workdir=tmp_path,
-        user_home=tmp_path,
-        workflow_name=package.definition.name,
-        values=values,
-        idempotency_key="execution-parity-scheduled",
-        concurrency_policy="queue",
-        authority=authority,
-        catalog_source="profile",
-        runner_binding=binding,
-        schedule_at=due.isoformat().replace("+00:00", "Z"),
-        schedule_now_utc=now,
-    )
-    assert scheduled["run_id"] is not None
-    run_ids["scheduled"] = str(scheduled["run_id"])
 
     base_scenario = showcase_module.load_showcase_catalog()["resilience"]
     scenario = replace(
@@ -629,28 +642,87 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
         assert hashlib.sha256(resource_bytes).hexdigest() == expected_digest, surface
         assert store.load_run(run_id)["input_manifest_digest"] == expected_digest
 
-    restarted_store = RunStore(home)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "entries": {
+                        "workflow": {
+                            "runtime": {
+                                "ai_idle_timeout_seconds": 300,
+                                "ai_wall_timeout_seconds": 1800,
+                                "provider_request_timeout_seconds": 300,
+                                "subprocess_timeout_seconds": 120,
+                                "combined_retries": 1,
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    restarted_store = _RecordingAuthorizationRunStore(
+        home,
+        max_executing_runs=8,
+    )
+    restarted_coordinator = CoordinatorStore(restarted_store.database)
+    restarted_identity = CoordinatorIdentity(
+        owner_id="execution-parity-restarted",
+        host_kind="web",
+        host_instance_id="execution-parity-restarted",
+        pid=1,
+        process_start_time=None,
+    )
+    restarted_lease = restarted_coordinator.try_acquire(
+        restarted_identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=300,
+    )
+    assert restarted_lease.is_leader
     changed_scheduler = RunScheduler(
         restarted_store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(
+            restarted_identity.owner_id,
+            restarted_lease.lease.epoch,
+        ),
+        utcnow=lambda: due,
         ai_idle_timeout_seconds=300.0,
         ai_wall_timeout_seconds=1800.0,
         provider_request_timeout_seconds=300.0,
         subprocess_timeout_seconds=120.0,
         default_max_attempts=1,
     )
-    authorization = restarted_store._scheduled_promotion_authorization(
-        run_ids["scheduled"], lambda _projection: None
-    )
     try:
-        resumed = changed_scheduler._prepare_run_package(
+        resumed = changed_scheduler.advance(
             run_ids["scheduled"],
-            authorization,
+            max_nodes=1,
         )
     finally:
         changed_scheduler.shutdown(deadline_seconds=2)
-    assert resumed is not None
-    assert "resources.json" in resumed[2]
-    assert resumed[3]["resources.json"] == direct_resources
+    assert resumed["status"] == "running"
+    assert resumed["nodes"]["a-shell"]["state"] == "succeeded"
+    assert resumed["schedule_revalidation"] == {
+        "execution_identity": resumed["run_metadata"]["execution_identity"],
+        "admission_state_version": 1,
+    }
+    assert (
+        restarted_store.run_directory(run_ids["scheduled"]) / "resources.json"
+    ).read_bytes() == direct_resources
+    assert len(restarted_store.issued_scheduled_authorizations) == 1
+    with pytest.raises(RuntimeError, match="already consumed"):
+        restarted_store._consume_scheduled_promotion_authorization(
+            restarted_store.issued_scheduled_authorizations[0],
+            run_ids["scheduled"],
+            resumed,
+        )
+    promoted = [
+        event
+        for event in restarted_store.tail_events(run_ids["scheduled"])
+        if event["event_type"] == "run_promoted"
+    ]
+    assert len(promoted) == 1
 
 
 def _admit_snapshot(store: RunStore, package, prepared, *, key: str) -> str:
@@ -681,13 +753,23 @@ def _reseal_resources(
     (run_directory / "resources.json").write_bytes(encoded)
     from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
 
+    projection = store.load_run(run_id)
+    snapshot_digest = sealed_snapshot_digest(run_directory)
+    updates = {
+        "input_manifest_digest": hashlib.sha256(encoded).hexdigest(),
+        "sealed_snapshot_digest": snapshot_digest,
+    }
+    metadata = projection.get("run_metadata")
+    if isinstance(metadata, dict) and "sealed_input_digest" in metadata:
+        updates["run_metadata"] = {
+            **metadata,
+            "sealed_input_digest": updates["input_manifest_digest"],
+            "sealed_snapshot_digest": snapshot_digest,
+        }
     store.append_event(
         run_id,
         "test_reseal_resources",
-        projection_updates={
-            "input_manifest_digest": hashlib.sha256(encoded).hexdigest(),
-            "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
-        },
+        projection_updates=updates,
     )
 
 
@@ -838,68 +920,78 @@ def test_scheduled_promotion_preserves_execution_semantics_mismatch(
     workflow_writer,
     monkeypatch,
 ) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     package = _archon_package(
-        tmp_path / "package",
+        home / "workflows",
         workflow_writer,
         nodes=[{"id": "shell", "bash": "true"}],
     )
-    store = RunStore(tmp_path / "home")
-    prepared = store.prepare_run_snapshot(package)
+    binding = production_workflow_runner_binding()
+    context = background_execution_context(binding, requires_ai=False)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
     due = datetime.now(timezone.utc)
-    assert CoordinatorStore(store.database).try_acquire(
-        CoordinatorIdentity(
-            owner_id="scheduled-semantics-tamper",
-            host_kind="web",
-            host_instance_id="scheduled-semantics-tamper",
-            pid=1,
-            process_start_time=None,
-        ),
+    identity = CoordinatorIdentity(
+        owner_id="scheduled-semantics-tamper",
+        host_kind="web",
+        host_instance_id="scheduled-semantics-tamper",
+        pid=1,
+        process_start_time=None,
+    )
+    lease = CoordinatorStore(store.database).try_acquire(
+        identity,
         now=due,
         lease_seconds=60,
-    ).is_leader
-    admitted = store.start_run(
-        RunAdmissionRequest(
-            workflow_name=package.definition.name,
-            definition_digest=prepared.definition_digest,
-            policy_digest=prepared.policy_digest,
-            input_manifest_digest=prepared.input_manifest_digest,
-            trigger_source="api",
-            idempotency_key="scheduled-semantics-tamper",
-            concurrency_key="scheduled-semantics-tamper",
-            execution_mode="background",
-            run_metadata={
-                "schedule_at": due.isoformat().replace("+00:00", "Z"),
-                "execution_identity": "a" * 64,
-            },
-        ),
-        immutable_snapshot=prepared,
     )
-    assert admitted.run_id is not None
-    run_id = admitted.run_id
-    resources_path = store.run_directory(run_id) / "resources.json"
+    assert lease.is_leader
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values={},
+        idempotency_key="scheduled-semantics-tamper",
+        concurrency_policy="queue",
+        authority=ApiAdmissionAuthority(
+            principal="scheduled-semantics-tamper",
+            namespace="scheduled-semantics-tamper",
+            operator_scope=None,
+            source_instance="desktop:scheduled-semantics-tamper",
+            assurance="local_admin_claim",
+            trigger_source="desktop",
+        ),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    run_id = str(admitted["run_id"])
+    restarted_store = _RecordingAuthorizationRunStore(home)
+    resources_path = restarted_store.run_directory(run_id) / "resources.json"
     resources = json.loads(resources_path.read_bytes())
     resources["phase3_execution_semantics"]["nodes"]["shell"]["retry"][
         "effective_total_attempts"
     ] = 5
     _reseal_resources(
-        store,
+        restarted_store,
         run_id,
         json.dumps(resources, sort_keys=True, separators=(",", ":")).encode(),
     )
 
-    scheduler = RunScheduler(store, utcnow=lambda: due)
-    authorization = None
-
-    def authorize(loaded_run_id, _projection):
-        nonlocal authorization
-        authorization = store._scheduled_promotion_authorization(
-            loaded_run_id,
-            lambda _current: None,
-        )
-        return True, authorization
-
+    scheduler = RunScheduler(
+        restarted_store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, lease.lease.epoch),
+        utcnow=lambda: due,
+    )
     executor_calls: list[object] = []
-    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
     monkeypatch.setattr(
         scheduler,
         "_execute_claim",
@@ -914,18 +1006,22 @@ def test_scheduled_promotion_preserves_execution_semantics_mismatch(
     assert terminal["last_error"]["code"] == "workflow_execution_semantics_mismatch"
     assert terminal["nodes"]["shell"]["attempts"] == []
     assert executor_calls == []
-    assert authorization is not None
+    assert len(restarted_store.issued_scheduled_authorizations) == 1
     with pytest.raises(RuntimeError, match="already consumed"):
-        store._consume_scheduled_promotion_authorization(
-            authorization,
+        restarted_store._consume_scheduled_promotion_authorization(
+            restarted_store.issued_scheduled_authorizations[0],
             run_id,
             terminal,
         )
+    with restarted_store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
     assert any(
         event["event_type"] == "run_failed"
         and event["payload"].get("validation_code")
         == "workflow_execution_semantics_mismatch"
-        for event in store.tail_events(run_id, limit=20)
+        for event in restarted_store.tail_events(run_id, limit=20)
     )
 
 
