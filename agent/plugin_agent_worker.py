@@ -31,6 +31,13 @@ class PackageMCPUnavailable(RuntimeError):
     failure_kind = "package_mcp_unavailable"
 
 
+class _ProviderAttemptGrantExhausted(RuntimeError):
+    """The isolated request has spent its sealed provider-call authority."""
+
+    failure_kind = "provider_attempt_grant_exhausted"
+    status_code = 400
+
+
 _AUTHORITY_DESCRIPTOR_KEY = "__hermes_authenticated_local_mcp"
 _AUTHORITY_CWD_KEY = "__hermes_private_mcp_cwd"
 _AUTHORITY_ROOT_PREFIX = "hermes-workflow-authority-"
@@ -1529,6 +1536,8 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             )
             agent._api_max_retries = request.max_api_attempts
             provider_attempt_counter = [0]
+            provider_attempt_grant_exhausted = [False]
+            provider_attempt_lock = threading.Lock()
             counted_provider_methods = 0
             for method_name in (
                 "_interruptible_streaming_api_call",
@@ -1542,7 +1551,22 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 def counted_provider_call(
                     *args, _original_method=original_method, **kwargs
                 ):
-                    provider_attempt_counter[0] += 1
+                    if _cancel_event.is_set() or getattr(
+                        agent, "_interrupt_requested", False
+                    ):
+                        raise InterruptedError(
+                            "Agent interrupted before isolated provider call"
+                        )
+                    with provider_attempt_lock:
+                        if (
+                            provider_attempt_counter[0]
+                            >= request.max_api_attempts
+                        ):
+                            provider_attempt_grant_exhausted[0] = True
+                            raise _ProviderAttemptGrantExhausted(
+                                "sealed provider attempt grant exhausted"
+                            )
+                        provider_attempt_counter[0] += 1
                     return _original_method(*args, **kwargs)
 
                 setattr(agent, method_name, counted_provider_call)
@@ -1650,6 +1674,26 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     provider_attempts=provider_attempts,
                     model_calls=model_calls,
                 )
+            audit = {
+                "plugin_id": plugin_id,
+                "tool_names": sorted(agent.valid_tool_names),
+                "api_calls": int(response.get("api_calls", 0) or 0),
+                "provider_attempts": provider_attempts,
+                "model_calls": model_calls,
+                "hook_events": hook_events,
+                "max_budget_usd": request.max_budget_usd,
+                "sandbox_policy_declared": request.sandbox_policy is not None,
+                **(
+                    {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
+                    if structured_evidence is not None
+                    else {}
+                ),
+                **(structured_evidence or {}),
+            }
+            if provider_attempt_grant_exhausted[0]:
+                audit["failure_kind"] = (
+                    _ProviderAttemptGrantExhausted.failure_kind
+                )
             return {
                 "final_response": _sanitize(
                     response.get("final_response", ""), 500_000
@@ -1662,22 +1706,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 else ("failed" if failed else "completed"),
                 "pending_interaction": pending[0] if pending else None,
                 "usage": usage,
-                "audit": {
-                    "plugin_id": plugin_id,
-                    "tool_names": sorted(agent.valid_tool_names),
-                    "api_calls": int(response.get("api_calls", 0) or 0),
-                    "provider_attempts": provider_attempts,
-                    "model_calls": model_calls,
-                    "hook_events": hook_events,
-                    "max_budget_usd": request.max_budget_usd,
-                    "sandbox_policy_declared": request.sandbox_policy is not None,
-                    **(
-                        {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
-                        if structured_evidence is not None
-                        else {}
-                    ),
-                    **(structured_evidence or {}),
-                },
+                "audit": audit,
                 "structured_output": structured_evidence,
             }
     finally:

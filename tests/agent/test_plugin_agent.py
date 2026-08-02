@@ -12,6 +12,8 @@ import queue
 import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import psutil
@@ -37,6 +39,154 @@ from agent.structured_output import (
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 from tools.registry import ToolRegistry
+
+
+class _WorkerRateLimitError(Exception):
+    status_code = 429
+
+    def __init__(self) -> None:
+        super().__init__("rate limit exceeded")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"message": "rate limit exceeded"}}
+
+
+def _worker_response(content: str) -> SimpleNamespace:
+    message = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], model="fake-model", usage=None)
+
+
+def _run_real_worker_retry_cycles(
+    monkeypatch,
+    *,
+    grant: int,
+    outcomes: tuple[str, ...] = (),
+    recover_primary: bool,
+    fallback_model: str | None,
+    structured_output: StructuredOutputRequest | None = None,
+) -> tuple[dict, list[tuple[str, str]]]:
+    """Drive the real worker wrapper and real AIAgent conversation retry loop.
+
+    Only the external provider transport and persistence are replaced. The
+    production change this helper protects is removal/bypass of the worker's
+    request-wide launch guard: that mutation makes the recorded provider calls
+    exceed ``grant`` when the real loop resets its per-cycle retry counter.
+    """
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    calls: list[tuple[str, str]] = []
+    primary_system_prefix: list[tuple[str, ...]] = []
+
+    class FakeDB:
+        def update_system_prompt(self, *_args, **_kwargs):
+            return None
+
+        def create_session(self, *_args, **_kwargs):
+            return None
+
+    def fake_provider_call(agent, api_kwargs):
+        calls.append((agent.provider, agent.model))
+        messages = api_kwargs["messages"]
+        system_prefix = tuple(
+            message["content"]
+            for message in messages
+            if message.get("role") == "system"
+        )
+        if agent.model == "primary-model":
+            if primary_system_prefix:
+                assert system_prefix == primary_system_prefix[0]
+            else:
+                primary_system_prefix.append(system_prefix)
+        assert api_kwargs.get("tools") in (None, [])
+        assert any(
+            "PROVIDER-GRANT-PROMPT-BYTES" in str(message.get("content", ""))
+            for message in messages
+            if message.get("role") == "user"
+        )
+        index = len(calls) - 1
+        outcome = outcomes[index] if index < len(outcomes) else "timeout"
+        if outcome == "timeout":
+            raise TimeoutError("provider timed out")
+        if outcome == "rate_limit":
+            raise _WorkerRateLimitError()
+        return _worker_response(outcome)
+
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fake-key"
+    fallback_client.base_url = "https://fake.invalid/v1"
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    recovery_available = [recover_primary]
+
+    def recover_once(*_args, **_kwargs):
+        if not recovery_available[0]:
+            return False
+        recovery_available[0] = False
+        return True
+
+    monkeypatch.setattr(worker, "_configured_model", lambda _requested: "primary-model")
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake-provider",
+            "model": "primary-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "fake-key",
+        },
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        run_agent, "check_toolset_requirements", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        run_agent.AIAgent, "_interruptible_api_call", fake_provider_call
+    )
+    monkeypatch.setattr(
+        run_agent.AIAgent,
+        "_try_recover_primary_transport",
+        recover_once,
+    )
+    monkeypatch.setattr(run_agent.AIAgent, "_persist_session", lambda *args: None)
+    monkeypatch.setattr(run_agent.AIAgent, "_save_trajectory", lambda *args: None)
+    monkeypatch.setattr(
+        run_agent.AIAgent, "_cleanup_task_resources", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *args, **kwargs: (fallback_client, fallback_model or "fallback-model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_normalize.normalize_model_for_provider",
+        lambda model, _provider: model,
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length", lambda *_args, **_kwargs: 200000
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.jittered_backoff", lambda *args, **kwargs: 0.0
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.adaptive_rate_limit_backoff",
+        lambda *args, **kwargs: (0.0, None),
+    )
+
+    request = PluginAgentRunRequest(
+        prompt="PROVIDER-GRANT-PROMPT-BYTES",
+        allowed_tools=(),
+        fallback_model=fallback_model,
+        max_api_attempts=grant,
+        structured_output=structured_output,
+    )
+    result = worker._run({"plugin_id": "test-plugin", "request": request.to_wire()})
+    return result, calls
 
 
 def _register(registry: ToolRegistry, name: str) -> None:
@@ -1216,6 +1366,119 @@ def test_structured_provider_exception_keeps_exact_bounded_attempt_evidence(
     assert result["structured_output"]["schema_fingerprint"] == (
         structured.schema.schema_fingerprint
     )
+
+
+@pytest.mark.parametrize("grant", range(1, 6))
+def test_worker_sealed_provider_grant_caps_recovery_and_fallback_cycles(
+    monkeypatch, grant
+) -> None:
+    from plugins.workflow.executors.base import validated_provider_total_call_count
+    from plugins.workflow.models import RetryLedgerGrant
+
+    result, calls = _run_real_worker_retry_cycles(
+        monkeypatch,
+        grant=grant,
+        recover_primary=True,
+        fallback_model="fallback-model",
+    )
+
+    assert len(calls) == grant
+    assert result["status"] == "failed"
+    assert result["audit"]["provider_attempts"] == grant
+    assert result["audit"]["failure_kind"] == "provider_attempt_grant_exhausted"
+    assert all(provider == "fake-provider" for provider, _model in calls)
+    assert calls[0] == ("fake-provider", "primary-model")
+    assert {model for _provider, model in calls} <= {
+        "primary-model",
+        "fallback-model",
+    }
+    if grant >= 3:
+        assert ("fake-provider", "fallback-model") in calls
+    assert "PROVIDER-GRANT-PROMPT-BYTES" not in repr(result["audit"])
+    additional = validated_provider_total_call_count(
+        result["audit"]["provider_attempts"], granted_attempts=grant
+    )
+    assert additional == grant - 1
+    ledger = RetryLedgerGrant(
+        explicit=True,
+        requested_retries=grant - 1,
+        requested_total_attempts=grant,
+        effective_total_attempts=grant,
+        delay_ms=1000,
+        on_error="all",
+        capped=False,
+        retry_consumed=0,
+    )
+    charge = ledger.charge(additional, provider_attempts_exact=True)
+    assert charge.charged_attempts == grant
+    assert charge.retry_consumed == grant
+    assert charge.remaining_attempts == 0
+    assert charge.provider_attempts_exact is True
+
+
+def test_worker_fallback_calls_draw_from_same_sealed_provider_grant(
+    monkeypatch,
+) -> None:
+    result, calls = _run_real_worker_retry_cycles(
+        monkeypatch,
+        grant=3,
+        outcomes=("rate_limit", "timeout", "timeout"),
+        recover_primary=False,
+        fallback_model="fallback-model",
+    )
+
+    assert calls == [
+        ("fake-provider", "primary-model"),
+        ("fake-provider", "fallback-model"),
+        ("fake-provider", "fallback-model"),
+    ]
+    assert result["status"] == "failed"
+    assert result["audit"]["provider_attempts"] == 3
+    assert result["audit"]["failure_kind"] == "provider_attempt_grant_exhausted"
+
+
+def test_structured_repair_worker_cannot_exceed_its_residual_provider_grant(
+    monkeypatch,
+) -> None:
+    structured = _structured_request()
+    result, calls = _run_real_worker_retry_cycles(
+        monkeypatch,
+        grant=2,
+        recover_primary=True,
+        fallback_model=None,
+        structured_output=structured,
+    )
+
+    assert len(calls) == 2
+    assert result["status"] == "failed"
+    assert result["audit"]["provider_attempts"] == 2
+    assert result["audit"]["failure_kind"] == "provider_attempt_grant_exhausted"
+    assert result["structured_output"] == {
+        "provider_attempts": 2,
+        "model_calls": 1,
+        "strategy": "prompt_json_schema",
+        "adapter_version": 1,
+        "schema_fingerprint": structured.schema.schema_fingerprint,
+        "declaration_source": "managed_loop_default",
+    }
+
+
+def test_cancelled_worker_launches_no_provider_call(monkeypatch) -> None:
+    import agent.plugin_agent_worker as worker
+
+    worker._cancel_event.set()
+    try:
+        result, calls = _run_real_worker_retry_cycles(
+            monkeypatch,
+            grant=3,
+            recover_primary=True,
+            fallback_model="fallback-model",
+        )
+    finally:
+        worker._cancel_event.clear()
+
+    assert calls == []
+    assert result["audit"]["provider_attempts"] == 0
 
 
 def test_approval_digest_is_validated_before_worker_start(monkeypatch) -> None:
