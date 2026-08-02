@@ -767,7 +767,11 @@ class StrictSubstitutionRenderer:
         try:
             return tuple(iter_output_references(template, normalizer_version=3))
         except WorkflowReferenceSyntaxError as exc:
-            candidate = _REFERENCE_NODE_CANDIDATE.search(template)
+            candidate = (
+                _REFERENCE_NODE_CANDIDATE.match(template, exc.start)
+                if exc.start is not None
+                else None
+            )
             raise WorkflowOutputReferenceError(
                 exc.code,
                 candidate.group("node") if candidate is not None else "invalid",
@@ -839,6 +843,12 @@ class StrictSubstitutionRenderer:
         ]
         if include_scalar_variables:
             for match in _SCALAR_VARIABLE.finditer(template):
+                if any(
+                    match.start() < reference.end
+                    and match.end() > reference.start
+                    for reference in references
+                ):
+                    continue
                 value = self._scalar(match)
                 if value is not None:
                     substitutions.append((match.start(), match.end(), value))

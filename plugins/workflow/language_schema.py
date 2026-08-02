@@ -112,6 +112,10 @@ class WorkflowReferenceSyntaxError(ValueError):
 
     code = "output_reference_path_unsupported"
 
+    def __init__(self, message: str, *, start: int | None = None) -> None:
+        self.start = start
+        super().__init__(message)
+
 
 _ARCHON_V3_NODE_ID = re.compile(rf"^(?:{ARCHON_V3_NODE_ID_PATTERN})$", re.ASCII)
 _ARCHON_V3_OUTPUT_REFERENCE = re.compile(
@@ -157,7 +161,8 @@ def _output_reference_at(
         end = match.end()
         if not _complete_reference_at(template, start):
             raise WorkflowReferenceSyntaxError(
-                "output reference uses an unsupported path"
+                "output reference uses an unsupported path",
+                start=start,
             )
         raw_path = match.group("path")
         return OutputReferenceToken(
@@ -172,7 +177,8 @@ def _output_reference_at(
         r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII
     ):
         raise WorkflowReferenceSyntaxError(
-            "output reference uses an unsupported path"
+            "output reference uses an unsupported path",
+            start=start,
         )
     return None
 

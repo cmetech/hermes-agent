@@ -4,6 +4,7 @@ import copy
 from pathlib import Path
 import hashlib
 import json
+import subprocess
 
 import pytest
 
@@ -1269,6 +1270,94 @@ def test_v3_renderer_uses_immutable_whole_and_field_facets_without_rescanning() 
         'whole={"answer":"$other.output.value","items":[3,true]} '
         "field=$other.output.value items=[3,true]"
     )
+
+
+@pytest.mark.parametrize(
+    "producer_id",
+    (
+        "ARGUMENTS",
+        "USER_MESSAGE",
+        "ARTIFACTS_DIR",
+        "WORKFLOW_ID",
+        "BASE_BRANCH",
+        "DOCS_DIR",
+        "CONTEXT",
+        "LOOP_USER_INPUT",
+        "LOOP_PREV_OUTPUT",
+        "REJECTION_REASON",
+    ),
+)
+def test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash(
+    tmp_path: Path,
+    producer_id: str,
+) -> None:
+    variables = VariableContext(
+        arguments="neighbor value",
+        user_message="user value",
+        artifacts_dir=tmp_path / "artifacts",
+        workflow_id="workflow value",
+        base_branch="base value",
+        docs_dir=tmp_path / "docs",
+        context="context value",
+        loop_user_input="loop input value",
+        loop_prev_output="loop previous value",
+        rejection_reason="rejection value",
+        node_outputs={
+            producer_id: _resolved_output(
+                {"answer": "field value"},
+                node_id=producer_id,
+            ),
+        },
+        normalizer_version=3,
+    )
+    renderer = substitution_renderer(
+        variables,
+        direct_dependencies=(producer_id,),
+    )
+    template = (
+        f"whole=${producer_id}.output field=${producer_id}.output.answer "
+        "scalar=$ARGUMENTS"
+    )
+
+    assert renderer.render_prompt(template) == (
+        'whole={"answer":"field value"} field=field value '
+        "scalar=neighbor value"
+    )
+
+    rendered_bash = renderer.render_bash(
+        f'''printf '%s\n%s\n%s' "${producer_id}.output" '''
+        f'''"${producer_id}.output.answer" "$ARGUMENTS"''',
+        spill_directory=tmp_path / f"spill-{producer_id}",
+    )
+    completed = subprocess.run(
+        ["/bin/sh", "-c", rendered_bash],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.splitlines() == [
+        '{"answer":"field value"}',
+        "field value",
+        "neighbor value",
+    ]
+
+
+def test_v3_malformed_later_reference_reports_its_exact_producer() -> None:
+    renderer = substitution_renderer(
+        VariableContext(
+            node_outputs={"good": _resolved_output("good")},
+            normalizer_version=3,
+        ),
+        direct_dependencies=("good", "bad"),
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        renderer.render_prompt("$good.output then $bad.output-field")
+
+    assert exc.value.code == "output_reference_path_unsupported"
+    assert exc.value.node_id == "bad"
+    assert exc.value.path == ()
 
 
 @pytest.mark.parametrize(

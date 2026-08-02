@@ -270,6 +270,56 @@ def test_v3_loop_prompt_and_until_bash_share_strict_rendered_field(tmp_path) -> 
     assert runner.requests[0].prompt == "Use value with spaces"
 
 
+def test_v3_loop_prompt_renders_authored_tokens_once_without_rescanning_output(
+    tmp_path,
+) -> None:
+    runner = FakeAgentRunner("DONE")
+    literal_output = (
+        "$ARGUMENTS|$other.output.value|$bad.output-field|$LOOP_PREV_OUTPUT"
+    )
+    variables = VariableContext(
+        arguments="must not replace output data",
+        loop_prev_output="must not replace output data",
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=(
+                    b'{"answer":"$ARGUMENTS|$other.output.value|'
+                    b'$bad.output-field|$LOOP_PREV_OUTPUT"}'
+                ),
+                value={"answer": literal_output},
+                text=(
+                    '{"answer":"$ARGUMENTS|$other.output.value|'
+                    '$bad.output-field|$LOOP_PREV_OUTPUT"}'
+                ),
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Previous=<$LOOP_PREV_OUTPUT> data=<$producer.output.answer>",
+            "until": "DONE",
+            "max_iterations": 1,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].prompt == f"Previous=<> data=<{literal_output}>"
+
+
 def test_v3_until_bash_reference_failure_precedes_spill_side_effect(tmp_path) -> None:
     runner = FakeAgentRunner("keep going")
     context = _context(

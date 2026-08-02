@@ -119,11 +119,6 @@ class LoopExecutor:
                 return reference_snapshot[(node_id, tuple(path))]
 
             loop_output_resolver = frozen_output_resolver
-            strict_renderer = replace(
-                strict_renderer,
-                output_resolver=frozen_output_resolver,
-            )
-            prompt = strict_renderer.render_outputs(prompt)
         previous_output = ""
         previous_metadata: Mapping[str, object] | None = None
         resumed = isinstance(previous_state, Mapping)
@@ -179,6 +174,7 @@ class LoopExecutor:
                 node=child,
                 attempt_id=f"{context.attempt_id}/iteration-{iteration:04d}",
                 variable_context=variables,
+                output_resolver=loop_output_resolver,
                 predecessor_results=(
                     {"previous": previous_metadata}
                     if previous_metadata is not None and share
