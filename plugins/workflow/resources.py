@@ -91,6 +91,33 @@ def _shell_quote_context(template: str, end: int) -> str | None:
     return quote
 
 
+def _iter_shell_quote_contexts(
+    template: str,
+    ends: Iterable[int],
+) -> Iterable[str | None]:
+    """Yield quote contexts for ordered offsets with one template scan."""
+    quote: str | None = None
+    escaped = False
+    position = 0
+    for end in ends:
+        if end < position:
+            raise ValueError("shell quote offsets must be ordered")
+        while position < end:
+            character = template[position]
+            position += 1
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
+            if character == "'" and quote != '"':
+                quote = None if quote == "'" else "'"
+            elif character == '"' and quote != "'":
+                quote = None if quote == '"' else '"'
+        yield quote
+
+
 def _quote_shell_value(value: str, quote: str | None) -> str:
     if quote == "'":
         return value.replace("'", "'\\''")
@@ -799,15 +826,22 @@ class StrictSubstitutionRenderer:
                 resolved[key] = resolver(reference.node_id, reference.path)
         return MappingProxyType(resolved)
 
-    def _scalar(self, match: re.Match[str]) -> str | None:
+    def _scalar(
+        self,
+        match: re.Match[str],
+        *,
+        positional_values: list[str] | None,
+    ) -> str | None:
         position = match.group("position")
         if position is not None:
-            try:
-                values = shlex.split(self.variables.arguments)
-            except ValueError:
-                values = self.variables.arguments.split()
             index = int(position) - 1
-            return values[index] if index < len(values) else ""
+            if positional_values is None:
+                raise ValueError("positional values must be parsed before rendering")
+            return (
+                positional_values[index]
+                if index < len(positional_values)
+                else ""
+            )
         values = {
             "ARGUMENTS": self.variables.arguments,
             "USER_MESSAGE": self.variables.user_message,
@@ -843,6 +877,7 @@ class StrictSubstitutionRenderer:
         ]
         if include_scalar_variables:
             reference_cursor = 0
+            positional_values: list[str] | None = None
             for match in _SCALAR_VARIABLE.finditer(template):
                 while (
                     reference_cursor < len(references)
@@ -854,7 +889,15 @@ class StrictSubstitutionRenderer:
                     and match.end() > references[reference_cursor].start
                 ):
                     continue
-                value = self._scalar(match)
+                if match.group("position") is not None and positional_values is None:
+                    try:
+                        positional_values = shlex.split(self.variables.arguments)
+                    except ValueError:
+                        positional_values = self.variables.arguments.split()
+                value = self._scalar(
+                    match,
+                    positional_values=positional_values,
+                )
                 if value is not None:
                     substitutions.append((match.start(), match.end(), value))
         substitutions.sort(key=lambda item: item[0])
@@ -905,7 +948,15 @@ class StrictSubstitutionRenderer:
         root.mkdir(parents=True, exist_ok=True)
         rendered: list[str] = []
         position = 0
-        for start, end, raw_value in substitutions:
+        quote_contexts = _iter_shell_quote_contexts(
+            template,
+            (start for start, _, _ in substitutions),
+        )
+        for (start, end, raw_value), quote_context in zip(
+            substitutions,
+            quote_contexts,
+            strict=True,
+        ):
             rendered.append(template[position:start])
             value = raw_value
             if len(value) > max_inline_chars:
@@ -914,7 +965,7 @@ class StrictSubstitutionRenderer:
                 path.write_text(value, encoding="utf-8")
                 value = str(path)
             rendered.append(
-                _quote_shell_value(value, _shell_quote_context(template, start))
+                _quote_shell_value(value, quote_context)
             )
             position = end
         rendered.append(template[position:])

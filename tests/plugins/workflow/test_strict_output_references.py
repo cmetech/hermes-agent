@@ -1418,6 +1418,102 @@ def test_v3_output_and_scalar_span_composition_scales_with_token_count(
     assert large_reads <= small_reads * 5
 
 
+def test_v3_bash_quote_context_scan_scales_with_template_size(
+    tmp_path: Path,
+) -> None:
+    scanned_characters = 0
+
+    class CountingTemplate(str):
+        def __getitem__(self, key: int | slice) -> str:
+            nonlocal scanned_characters
+            value = super().__getitem__(key)
+            scanned_characters += len(value)
+            return value
+
+    renderer = substitution_renderer(
+        VariableContext(
+            arguments="scalar value",
+            node_outputs={
+                "ARGUMENTS": _resolved_output(
+                    "output value",
+                    structured=False,
+                    node_id="ARGUMENTS",
+                )
+            },
+            normalizer_version=3,
+        ),
+        direct_dependencies=("ARGUMENTS",),
+    )
+
+    def render(group_count: int) -> tuple[int, list[str]]:
+        nonlocal scanned_characters
+        scanned_characters = 0
+        adjacent_values = " ".join(
+            (
+                "$ARGUMENTS.output$ARGUMENTS",
+                '"$ARGUMENTS.output$ARGUMENTS"',
+                "'$ARGUMENTS.output$ARGUMENTS'",
+            )
+            * group_count
+        )
+        command = renderer.render_bash(
+            CountingTemplate(f"printf '%s\\n' {adjacent_values}"),
+            spill_directory=tmp_path / f"spill-{group_count}",
+        )
+        completed = subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return scanned_characters, completed.stdout.splitlines()
+
+    small_scans, _ = render(16)
+    large_scans, lines = render(64)
+
+    assert lines == ["output valuescalar value"] * (64 * 3)
+    assert large_scans <= small_scans * 5
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_pair"),
+    (
+        ("first 'second value'", "firstsecond value"),
+        ("'broken argument", "'brokenargument"),
+    ),
+)
+def test_v3_positional_scalars_parse_arguments_once_per_render(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: str,
+    expected_pair: str,
+) -> None:
+    real_split = workflow_resources.shlex.split
+    parse_calls = 0
+
+    def counting_split(value: str) -> list[str]:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_split(value)
+
+    monkeypatch.setattr(workflow_resources.shlex, "split", counting_split)
+    renderer = substitution_renderer(
+        VariableContext(
+            arguments=arguments,
+            node_outputs={"producer": _resolved_output("output")},
+            normalizer_version=3,
+        ),
+        direct_dependencies=("producer",),
+    )
+    positional_tokens = "$1$2" * 128
+
+    rendered = renderer.render_prompt(
+        f"before:$producer.output:{positional_tokens}:after"
+    )
+
+    assert rendered == f"before:output:{expected_pair * 128}:after"
+    assert parse_calls == 1
+
+
 def test_v3_malformed_later_reference_reports_its_exact_producer() -> None:
     renderer = substitution_renderer(
         VariableContext(
@@ -1446,6 +1542,7 @@ def test_v3_malformed_later_reference_reports_its_exact_producer() -> None:
 )
 def test_v3_renderer_rejects_noncanonical_candidates_without_partial_substitution(
     template: str,
+    tmp_path: Path,
 ) -> None:
     renderer = substitution_renderer(
         VariableContext(
@@ -1464,6 +1561,15 @@ def test_v3_renderer_rejects_noncanonical_candidates_without_partial_substitutio
         renderer.render_prompt(template)
 
     assert exc.value.code == "output_reference_path_unsupported"
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as bash_exc:
+        renderer.render_bash(
+            template,
+            spill_directory=tmp_path / "malformed-spill",
+        )
+
+    assert bash_exc.value.code == "output_reference_path_unsupported"
+    assert not (tmp_path / "malformed-spill").exists()
 
 
 def test_v3_resolver_requires_publication_path_and_full_schema_identity(
