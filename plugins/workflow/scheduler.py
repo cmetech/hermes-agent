@@ -1214,6 +1214,13 @@ class RunScheduler:
                 condition = node.options.get("when")
                 if isinstance(condition, str):
                     if strict_v3:
+                        if not self._revalidate_retained_output_resolution(
+                            run_id,
+                            node,
+                            projection,
+                            condition=True,
+                        ):
+                            continue
                         resolved_identities: dict[str, dict[str, object]] = {}
                         try:
                             matches = evaluate_v3_condition(
@@ -1343,6 +1350,83 @@ class RunScheduler:
             templates.append(resolver.command(str(node.value)).body)
         return tuple(templates)
 
+    def _revalidate_retained_output_resolution(
+        self,
+        run_id: str,
+        node: WorkflowNode,
+        projection: Mapping[str, object],
+        *,
+        condition: bool,
+    ) -> bool:
+        """Fence a due wake to its retained producer before any other read."""
+        current = self.store.load_run(run_id)["nodes"][node.id]
+        retained = current.get("resolution_producer_identity")
+        if not isinstance(retained, Mapping):
+            return True
+        producer_id = retained.get("node_id")
+        if not isinstance(producer_id, str) or not producer_id:
+            self.store.transition_v3_reference_node(
+                run_id,
+                node.id,
+                code="output_reference_integrity",
+                message="output reference producer identity is invalid",
+            )
+            return False
+
+        output = self._output_values(
+            projection,
+            self.store.run_directory(run_id),
+            node_ids=(producer_id,),
+        ).get(producer_id)
+        error = (
+            output
+            if isinstance(output, WorkflowOutputReferenceError)
+            else None
+        )
+        if error is None and not isinstance(output, ResolvedNodeOutput):
+            error = WorkflowOutputReferenceError(
+                "output_reference_missing", producer_id
+            )
+        if error is not None:
+            if (
+                error.code == "output_reference_temporarily_unavailable"
+                and error.producer_identity is not None
+            ):
+                self.store.defer_output_resolution(
+                    run_id,
+                    node.id,
+                    producer_identity=error.producer_identity,
+                    now=self._utcnow(),
+                )
+            elif condition:
+                self.store.transition_v3_condition_node(
+                    run_id,
+                    node.id,
+                    state="failed",
+                    code=error.code,
+                    message=str(error),
+                )
+            else:
+                self.store.transition_v3_reference_node(
+                    run_id,
+                    node.id,
+                    code=error.code,
+                    message=str(error),
+                )
+            return False
+
+        assert isinstance(output, ResolvedNodeOutput)
+        self.store.clear_output_resolution(
+            run_id,
+            node.id,
+            producer_identity=resolved_output_publication_identity(output),
+        )
+        refreshed = self.store.load_run(run_id)["nodes"][node.id]
+        return (
+            refreshed.get("state") in {"pending", "ready"}
+            and "resolution_producer_identity" not in refreshed
+        )
+
     def _preflight_strict_node_references(
         self,
         run_id: str,
@@ -1360,6 +1444,13 @@ class RunScheduler:
             or package.language.normalizer_version != 3
         ):
             return True
+        if not self._revalidate_retained_output_resolution(
+            run_id,
+            node,
+            projection,
+            condition=False,
+        ):
+            return False
         run_directory = self.store.run_directory(run_id)
         references = tuple(dict.fromkeys(
             (reference.node_id, reference.path)
@@ -3623,6 +3714,8 @@ class RunScheduler:
                 done, _pending = wait(futures)
                 for future in done:
                     future.result()
+            for run_id in run_ids:
+                self._resolve_graph(run_id, packages[run_id].definition.nodes)
             return {
                 **package_failures,
                 **{run_id: self.store.load_run(run_id) for run_id in run_ids},

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
+import time
 
 import pytest
 
 from plugins.workflow import scheduler as scheduler_module
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.output_resolution import (
     ArchonOutputUnavailableError,
     WorkflowOutputReferenceError,
@@ -15,6 +20,7 @@ from plugins.workflow.output_resolution import (
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import ArtifactRef, RunStore
+from tools.managed_process import ProcessIdentity
 
 
 _PRODUCER_IDENTITY = {
@@ -65,11 +71,17 @@ def _start_archon_run(tmp_path, workflow_writer, *, name: str) -> tuple[RunStore
     return store, admitted.run_id
 
 
-def _complete_producer(store: RunStore, run_id: str, content: bytes = b"ready") -> None:
-    claim = store.claim_node(run_id, "producer", "resolution-producer")
+def _complete_producer(
+    store: RunStore,
+    run_id: str,
+    content: bytes = b"ready",
+    *,
+    node_id: str = "producer",
+) -> None:
+    claim = store.claim_node(run_id, node_id, f"resolution-{node_id}")
     assert claim is not None
     store.mark_node_started(claim)
-    relative = f"nodes/producer/{claim.attempt_id}/stdout.log"
+    relative = f"nodes/{node_id}/{claim.attempt_id}/stdout.log"
     output = store.run_directory(run_id) / relative
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(content)
@@ -85,6 +97,96 @@ def _complete_producer(store: RunStore, run_id: str, content: bytes = b"ready") 
             ),
         ),
     )
+
+
+def _start_multi_reference_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    name: str,
+    condition: bool,
+) -> tuple[RunStore, str]:
+    consumer = {
+        "id": "consumer",
+        "bash": "printf '%s:%s' $p1.output $p2.output",
+        "depends_on": ["p1", "p2"],
+    }
+    if condition:
+        consumer["when"] = (
+            "$p1.output == 'ready' && $p2.output == 'ready'"
+        )
+        consumer["bash"] = "true"
+    package_path = workflow_writer(
+        tmp_path / name,
+        name=name,
+        nodes=[
+            {"id": "p1", "bash": "printf ready"},
+            {"id": "p2", "bash": "printf ready"},
+            consumer,
+        ],
+    )
+    package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(package_path)
+    store = RunStore(tmp_path / f"home-{name}")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    _complete_producer(store, admitted.run_id, node_id="p1")
+    _complete_producer(store, admitted.run_id, node_id="p2")
+    return store, admitted.run_id
+
+
+def _start_noncondition_reference_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    name: str,
+) -> tuple[RunStore, str]:
+    package_path = workflow_writer(
+        tmp_path / name,
+        name=name,
+        nodes=[
+            {"id": "producer", "bash": "printf ready"},
+            {
+                "id": "consumer",
+                "bash": "printf '%s' $producer.output",
+                "depends_on": ["producer"],
+                "retry": {"max_attempts": 2, "on_error": "all"},
+            },
+        ],
+    )
+    package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(package_path)
+    store = RunStore(tmp_path / f"home-{name}")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    _complete_producer(store, admitted.run_id)
+    return store, admitted.run_id
 
 
 def test_store_persists_exact_resolution_backoff_and_exhausts_on_sixth_read(
@@ -360,6 +462,126 @@ def test_scheduler_retries_on_due_wake_then_clears_wait_after_success(
     assert calls == 2
 
 
+def test_condition_due_wake_rejects_changed_successful_publication_identity(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    """Catch a condition clearing retained A after a successful reread of B."""
+    store, run_id = _start_archon_run(
+        tmp_path, workflow_writer, name="resolution-condition-drift"
+    )
+    _complete_producer(store, run_id)
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    current = [observed]
+    scheduler = RunScheduler(store, utcnow=lambda: current[0])
+    real_resolve = scheduler_module.resolve_node_output
+    calls = 0
+
+    def transient_a_then_success_b(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ArchonOutputUnavailableError("host read temporarily unavailable")
+        return replace(real_resolve(**kwargs), publication_id="c" * 32)
+
+    monkeypatch.setattr(
+        scheduler_module, "resolve_node_output", transient_a_then_success_b
+    )
+    nodes = load_workflow(
+        store.run_directory(run_id) / "definition.yaml"
+    ).definition.nodes
+
+    scheduler._resolve_graph(run_id, nodes)
+    due = observed + timedelta(milliseconds=250)
+    current[0] = due
+    assert store.wake_due_output_resolutions(run_id, now=due) == ("consumer",)
+    scheduler._resolve_graph(run_id, nodes)
+
+    projection = store.load_run(run_id)
+    consumer = projection["nodes"]["consumer"]
+    assert projection["status"] == "failed"
+    assert consumer["state"] == "failed"
+    assert consumer["attempts"] == []
+    assert consumer["retry_consumed"] == 0
+    assert projection["last_error"]["code"] == "output_reference_integrity"
+    assert calls == 2
+
+
+@pytest.mark.parametrize("condition", (True, False), ids=("condition", "template"))
+def test_restart_revalidates_retained_producer_before_alternating_transient_reads(
+    tmp_path, workflow_writer, monkeypatch, condition: bool
+) -> None:
+    """Catch unrelated transient producers masquerading as publication drift."""
+    store, run_id = _start_multi_reference_run(
+        tmp_path,
+        workflow_writer,
+        name=f"resolution-alternating-{condition}",
+        condition=condition,
+    )
+    real_resolve = scheduler_module.resolve_node_output
+    phase = [1]
+
+    def alternating_transients(**kwargs):
+        node_id = kwargs["node_id"]
+        if (phase[0], node_id) in {(1, "p2"), (2, "p1")}:
+            raise ArchonOutputUnavailableError("host read temporarily unavailable")
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(scheduler_module, "resolve_node_output", alternating_transients)
+    nodes = load_workflow(
+        store.run_directory(run_id) / "definition.yaml"
+    ).definition.nodes
+    consumer = next(node for node in nodes if node.id == "consumer")
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+
+    first = RunScheduler(store, utcnow=lambda: observed)
+    package, sealed_paths, sealed_bytes = first._load_verified_run_package(run_id)
+
+    def observe(scheduler: RunScheduler) -> bool:
+        if condition:
+            scheduler._resolve_graph(run_id, nodes)
+            return store.load_run(run_id)["nodes"]["consumer"]["state"] == "ready"
+        else:
+            scheduler._resolve_graph(run_id, nodes)
+            projection = store.load_run(run_id)
+            return scheduler._preflight_strict_node_references(
+                run_id,
+                consumer,
+                package,
+                projection,
+                sealed_resource_paths=sealed_paths,
+                sealed_resource_bytes=sealed_bytes,
+            )
+
+    assert not observe(first)
+    first_wait = store.load_run(run_id)["nodes"]["consumer"]
+    assert first_wait["state"] == "waiting_resolution"
+    assert first_wait["resolution_producer_identity"]["node_id"] == "p2"
+
+    first_due = observed + timedelta(milliseconds=250)
+    assert store.wake_due_output_resolutions(run_id, now=first_due) == ("consumer",)
+    phase[0] = 2
+    second = RunScheduler(store, utcnow=lambda: first_due)
+    assert second._resolved_output_cache == {}
+    assert not observe(second)
+    second_wait = store.load_run(run_id)["nodes"]["consumer"]
+    assert second_wait["state"] == "waiting_resolution"
+    assert second_wait["resolution_read_count"] == 1
+    assert second_wait["resolution_producer_identity"]["node_id"] == "p1"
+    assert second_wait["attempts"] == []
+    assert second_wait["retry_consumed"] == 0
+
+    second_due = first_due + timedelta(milliseconds=250)
+    assert store.wake_due_output_resolutions(run_id, now=second_due) == ("consumer",)
+    phase[0] = 3
+    third = RunScheduler(store, utcnow=lambda: second_due)
+    assert observe(third)
+    completed_read = store.load_run(run_id)["nodes"]["consumer"]
+    assert completed_read["state"] == "ready"
+    assert completed_read["attempts"] == []
+    assert completed_read["retry_consumed"] == 0
+    assert not any(key.startswith("resolution_") for key in completed_read)
+
+
 def test_scheduler_advance_selects_due_resolution_wake_before_runnable_work(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
@@ -507,6 +729,104 @@ def test_scheduler_preflight_terminal_reference_failure_is_zero_attempt(
     assert consumer["retry_consumed"] == 0
     assert result["last_error"]["code"] == "output_reference_integrity"
     assert "next_resolution_at" not in consumer
+
+
+@pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
+def test_unbounded_scheduler_entrypoints_finalize_terminal_preflight_in_one_call(
+    tmp_path, workflow_writer, monkeypatch, entrypoint: str
+) -> None:
+    """Catch advance_all returning running after preflight failed the final node."""
+    store, run_id = _start_noncondition_reference_run(
+        tmp_path, workflow_writer, name=f"resolution-finalize-{entrypoint}"
+    )
+    scheduler = RunScheduler(store)
+    executor_calls = []
+
+    def terminal_read(**_kwargs):
+        raise WorkflowOutputReferenceError(
+            "output_reference_integrity", "producer"
+        )
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("executor allocated after terminal reference preflight")
+
+    monkeypatch.setattr(scheduler_module, "resolve_node_output", terminal_read)
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    if entrypoint == "advance":
+        result = scheduler.advance(run_id)
+    else:
+        result = scheduler.advance_all([run_id])[run_id]
+
+    consumer = result["nodes"]["consumer"]
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "output_reference_integrity"
+    assert consumer["state"] == "failed"
+    assert consumer["attempts"] == []
+    assert consumer["retry_consumed"] == 0
+    assert executor_calls == []
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_coordinator_submission_finalizes_terminal_preflight_before_return(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    """Catch coordinator-submitted work needing an unrelated second sweep."""
+    store, run_id = _start_noncondition_reference_run(
+        tmp_path, workflow_writer, name="resolution-finalize-submit"
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="resolution-finalize-submit",
+        host_kind="gateway",
+        host_instance_id="resolution-finalize-submit-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    scheduler = RunScheduler(store, execution_fence=fence)
+    executor_calls = []
+
+    def terminal_read(**_kwargs):
+        raise WorkflowOutputReferenceError(
+            "output_reference_integrity", "producer"
+        )
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("executor allocated after terminal reference preflight")
+
+    monkeypatch.setattr(scheduler_module, "resolve_node_output", terminal_read)
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    assert scheduler.submit(run_id, fence)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with scheduler._activity:
+            if run_id not in scheduler._submitted_runs:
+                break
+        time.sleep(0.01)
+    try:
+        result = store.load_run(run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    consumer = result["nodes"]["consumer"]
+    assert run_id not in scheduler._submitted_runs
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "output_reference_integrity"
+    assert consumer["state"] == "failed"
+    assert consumer["attempts"] == []
+    assert consumer["retry_consumed"] == 0
+    assert executor_calls == []
 
 
 @pytest.mark.parametrize(
