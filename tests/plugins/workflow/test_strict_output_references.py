@@ -500,6 +500,164 @@ def test_v3_static_schema_feasibility_accepts_possible_sequence_indexes(
     ("schema", "reference"),
     (
         (
+            {
+                "type": "object",
+                "properties": {"0": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "$producer.output.0",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "object",
+                        "properties": {
+                            "0": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                                "additionalProperties": False,
+                            }
+                        },
+                        "additionalProperties": False,
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "$producer.output.rows.0.name",
+        ),
+        (
+            {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {"0": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    {"type": "array", "maxItems": 0},
+                ]
+            },
+            "$producer.output.0",
+        ),
+        (
+            {
+                "allOf": [
+                    {"type": "object"},
+                    {
+                        "properties": {"0": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+            "$producer.output.0",
+        ),
+    ),
+)
+def test_v3_numeric_segments_accept_exact_mapping_keys_when_schema_allows_them(
+    workflow_writer,
+    tmp_path: Path,
+    schema: dict[str, object],
+    reference: str,
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {"id": "producer", "prompt": "produce", "output_format": schema},
+            _consumer("prompt", reference, depends_on=["producer"]),
+        ],
+    )
+
+    assert load_workflow(path).definition.nodes[-1].id == "consumer"
+
+
+def test_v3_numeric_mapping_key_still_exposes_an_unaddressable_dotted_child(
+    workflow_writer, tmp_path: Path
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {
+                        "0": {
+                            "type": "object",
+                            "properties": {"dotted.key": {"type": "string"}},
+                            "additionalProperties": False,
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            _consumer(
+                "prompt",
+                "$producer.output.0.dotted.key",
+                depends_on=["producer"],
+            ),
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert _codes(exc) == ["output_reference_path_unsupported"]
+
+
+def test_v3_numeric_segment_rejects_a_closed_object_without_the_exact_key(
+    workflow_writer, tmp_path: Path
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"other": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            _consumer(
+                "prompt", "$producer.output.0", depends_on=["producer"]
+            ),
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert _codes(exc) == ["structured_output_field_impossible"]
+
+
+def test_v3_when_reference_iterator_yields_absolute_offsets_before_late_syntax_error() -> None:
+    expression = (
+        "  $first.output.value == 'ready' && "
+        "$second.output.0 >= 2 || $broken.output."
+    )
+    references = language_schema.iter_when_output_references(
+        expression, normalizer_version=3
+    )
+
+    first = next(references)
+    second = next(references)
+
+    assert expression[first.start : first.end] == "$first.output.value"
+    assert expression[second.start : second.end] == "$second.output.0"
+    with pytest.raises(language_schema.WorkflowReferenceSyntaxError):
+        next(references)
+
+
+@pytest.mark.parametrize(
+    ("schema", "reference"),
+    (
+        (
             {"type": "array", "maxItems": 0, "items": {"type": "string"}},
             "$producer.output.0",
         ),

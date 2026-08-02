@@ -112,13 +112,41 @@ def _complete_reference_at(template: str, start: int) -> bool:
     match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
     if match is None:
         return False
-    following = template[match.end() : match.end() + 1]
+    following = template[match.end()] if match.end() < len(template) else ""
     return not following or not (
         following in ".[\\/-"
         or following == "_"
         or following.isalnum()
         or not following.isascii()
     )
+
+
+def _output_reference_at(
+    template: str, start: int
+) -> OutputReferenceToken | None:
+    match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
+    if match is not None:
+        end = match.end()
+        if not _complete_reference_at(template, start):
+            raise WorkflowReferenceSyntaxError(
+                "output reference uses an unsupported path"
+            )
+        raw_path = match.group("path")
+        return OutputReferenceToken(
+            node_id=match.group("node"),
+            path=tuple(raw_path[1:].split(".")) if raw_path else (),
+            start=start,
+            end=end,
+        )
+    candidate_end = _reference_candidate_end(template, start)
+    candidate = template[start:candidate_end]
+    if ".output" in candidate or re.search(
+        r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII
+    ):
+        raise WorkflowReferenceSyntaxError(
+            "output reference uses an unsupported path"
+        )
+    return None
 
 
 def iter_output_references(
@@ -134,30 +162,12 @@ def iter_output_references(
         start = template.find("$", position)
         if start < 0:
             return
-        match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
-        if match is not None:
-            end = match.end()
-            if not _complete_reference_at(template, start):
-                raise WorkflowReferenceSyntaxError(
-                    "output reference uses an unsupported path"
-                )
-            raw_path = match.group("path")
-            yield OutputReferenceToken(
-                node_id=match.group("node"),
-                path=tuple(raw_path[1:].split(".")) if raw_path else (),
-                start=start,
-                end=end,
-            )
-            position = end
+        token = _output_reference_at(template, start)
+        if token is not None:
+            yield token
+            position = token.end
             continue
         candidate_end = _reference_candidate_end(template, start)
-        candidate = template[start:candidate_end]
-        if ".output" in candidate or re.search(
-            r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII
-        ):
-            raise WorkflowReferenceSyntaxError(
-                "output reference uses an unsupported path"
-            )
         position = max(start + 1, candidate_end)
 
 
@@ -187,26 +197,13 @@ def iter_when_output_references(
     """Yield only v3 condition operands; quoted RHS text stays literal."""
     if normalizer_version != 3:
         raise ValueError("strict output references require normalizer version 3")
-    tokens: list[OutputReferenceToken] = []
     position = 0
     while position < len(expression) and expression[position].isspace():
         position += 1
     while position < len(expression):
-        relative = next(
-            iter_output_references(
-                expression[position:], normalizer_version=normalizer_version
-            ),
-            None,
-        )
-        if relative is None or relative.start != 0:
+        token = _output_reference_at(expression, position)
+        if token is None:
             return
-        token = OutputReferenceToken(
-            node_id=relative.node_id,
-            path=relative.path,
-            start=position,
-            end=position + relative.end,
-        )
-        tokens.append(token)
         position = token.end
         while position < len(expression) and expression[position].isspace():
             position += 1
@@ -229,6 +226,7 @@ def iter_when_output_references(
             if number is None:
                 return
             position = number.end()
+        yield token
         while position < len(expression) and expression[position].isspace():
             position += 1
         if expression.startswith("&&", position) or expression.startswith(
@@ -239,7 +237,6 @@ def iter_when_output_references(
                 position += 1
             continue
         break
-    yield from tokens
 
 
 @dataclass(frozen=True, slots=True)

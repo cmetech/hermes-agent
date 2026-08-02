@@ -13,10 +13,59 @@ from plugins.workflow.coordinator_store import (
     record_coordinator_wake,
 )
 from plugins.workflow.lease_clock import LeaseClockSample
+from plugins.workflow.language_schema import iter_when_output_references
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.topology import project_topology
+
+
+class _SliceAccountingText(str):
+    """A string that records copied slice volume across derived slices."""
+
+    def __new__(
+        cls, value: str, account: dict[str, int] | None = None
+    ) -> _SliceAccountingText:
+        instance = super().__new__(cls, value)
+        instance.account = account if account is not None else {"characters": 0}
+        return instance
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if isinstance(key, slice):
+            start, stop, step = key.indices(len(self))
+            if step == 1:
+                self.account["characters"] += max(0, stop - start)
+            if isinstance(value, str):
+                return type(self)(value, self.account)
+        return value
+
+
+def _condition_reference_slice_volume(clauses: int) -> tuple[int, int, int]:
+    expression = _SliceAccountingText(
+        " && ".join(
+            f"$producer.output.field == {index}" for index in range(clauses)
+        )
+    )
+
+    references = tuple(
+        iter_when_output_references(expression, normalizer_version=3)
+    )
+
+    assert len(references) == clauses
+    assert references[0].start == 0
+    assert references[-1].end == str(expression).rfind(" == ")
+    return len(expression), expression.account["characters"], len(references)
+
+
+def test_many_clause_condition_reference_discovery_copies_only_linear_bytes() -> None:
+    small_bytes, small_slices, _ = _condition_reference_slice_volume(512)
+    large_bytes, large_slices, count = _condition_reference_slice_volume(1024)
+
+    assert count == 1024
+    assert large_bytes > small_bytes
+    assert large_slices <= (3 * small_slices) + large_bytes
+    assert large_slices <= 4 * large_bytes
 
 
 def test_thousand_node_projection_is_bounded_and_disables_mermaid(

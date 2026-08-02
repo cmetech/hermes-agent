@@ -835,7 +835,26 @@ def _schema_has_unaddressable_dotted_key(
             ):
                 return True
         segment = path_parts[index]
-        if segment.isascii() and segment.isdigit():
+        schema_type = current.get("type")
+        object_capable = not (
+            isinstance(schema_type, str) and schema_type != "object"
+        ) and not (
+            isinstance(schema_type, tuple | list) and "object" not in schema_type
+        )
+        array_capable = not (
+            isinstance(schema_type, str) and schema_type != "array"
+        ) and not (
+            isinstance(schema_type, tuple | list) and "array" not in schema_type
+        )
+        if object_capable:
+            properties = current.get("properties")
+            if isinstance(properties, Mapping):
+                remaining = ".".join(path_parts[index:])
+                if "." in remaining and remaining in properties:
+                    return True
+                if segment in properties and visit(properties[segment], index + 1):
+                    return True
+        if array_capable and segment.isascii() and segment.isdigit():
             sequence_index = int(segment)
             prefix = current.get("prefixItems")
             if isinstance(prefix, tuple | list) and sequence_index < len(prefix):
@@ -851,13 +870,7 @@ def _schema_has_unaddressable_dotted_key(
                 else:
                     child = items
             return visit(child, index + 1)
-        properties = current.get("properties")
-        if not isinstance(properties, Mapping):
-            return False
-        remaining = ".".join(path_parts[index:])
-        if "." in remaining and remaining in properties:
-            return True
-        return visit(properties.get(path_parts[index]), index + 1)
+        return False
 
     return visit(schema, 0)
 
@@ -889,7 +902,29 @@ def _v3_schema_path_impossible(
 
     segment = path_parts[0]
     index = int(segment) if segment.isascii() and segment.isdigit() else None
-    expected_type = "array" if index is not None else "object"
+    interpretations = ("object", "array") if index is not None else ("object",)
+    return all(
+        _v3_schema_path_interpretation_impossible(
+            schema,
+            path_parts,
+            root,
+            resolving,
+            expected_type=expected_type,
+            sequence_index=index,
+        )
+        for expected_type in interpretations
+    )
+
+
+def _v3_schema_path_interpretation_impossible(
+    schema: Mapping[str, object],
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+    *,
+    expected_type: str,
+    sequence_index: int | None,
+) -> bool:
     schema_type = schema.get("type")
     if isinstance(schema_type, str) and schema_type != expected_type:
         return True
@@ -899,25 +934,38 @@ def _v3_schema_path_impossible(
     reference = schema.get("$ref")
     if isinstance(reference, str) and reference not in resolving:
         target = _resolve_v3_local_ref(root, reference)
-        if target is not None and _v3_schema_path_impossible(
+        if isinstance(target, Mapping) and _v3_schema_path_interpretation_impossible(
             target,
             path_parts,
             root,
             resolving | frozenset({reference}),
+            expected_type=expected_type,
+            sequence_index=sequence_index,
         ):
+            return True
+        if target is False:
             return True
 
-    if index is None:
-        if _v3_object_path_impossible(
-            schema, path_parts, root, resolving
-        ):
+    if expected_type == "object":
+        if _v3_object_path_impossible(schema, path_parts, root, resolving):
             return True
-    elif _v3_array_path_impossible(schema, index, path_parts[1:], root, resolving):
+    elif sequence_index is not None and _v3_array_path_impossible(
+        schema, sequence_index, path_parts[1:], root, resolving
+    ):
         return True
 
     all_of = schema.get("allOf")
     if isinstance(all_of, tuple | list) and any(
-        _v3_schema_path_impossible(branch, path_parts, root, resolving)
+        isinstance(branch, Mapping)
+        and _v3_schema_path_interpretation_impossible(
+            branch,
+            path_parts,
+            root,
+            resolving,
+            expected_type=expected_type,
+            sequence_index=sequence_index,
+        )
+        or branch is False
         for branch in all_of
     ):
         return True
@@ -927,7 +975,18 @@ def _v3_schema_path_impossible(
             isinstance(branches, tuple | list)
             and branches
             and all(
-                _v3_schema_path_impossible(branch, path_parts, root, resolving)
+                branch is False
+                or (
+                    isinstance(branch, Mapping)
+                    and _v3_schema_path_interpretation_impossible(
+                        branch,
+                        path_parts,
+                        root,
+                        resolving,
+                        expected_type=expected_type,
+                        sequence_index=sequence_index,
+                    )
+                )
                 for branch in branches
             )
         ):
