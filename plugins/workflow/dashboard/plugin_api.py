@@ -302,7 +302,7 @@ class WorkflowDetailLanguageStatus(BaseModel):
     declared_profile: WorkflowLanguageProfile | None
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
-    normalizer_version: StrictInt = Field(..., ge=1, le=2)
+    normalizer_version: StrictInt = Field(..., ge=1, le=3)
     normalized_definition_digest: str = Field(
         ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )

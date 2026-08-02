@@ -323,11 +323,11 @@ def test_workflow_compatibility_models_accept_real_producer_state_variants(
         ),
         ("mapped", None, {}, CompatibilityLevel.MAPPED, True),
         (
-            "blocking",
+            "timeout",
             {"language_compatibility": "archon-2026-07"},
             {"nodes": [{"id": "start", "bash": "true", "timeout": 1}]},
-            CompatibilityLevel.UNSUPPORTED,
-            False,
+            CompatibilityLevel.PORTABLE,
+            True,
         ),
         (
             "nonblocking-unsupported",

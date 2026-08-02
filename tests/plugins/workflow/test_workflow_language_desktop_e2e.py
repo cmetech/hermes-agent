@@ -151,8 +151,8 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
             "legacy": False,
         }
         assert archon_row["compatibility"] == {
-            "level": "unsupported",
-            "runnable": False,
+            "level": "portable",
+            "runnable": True,
         }
         assert legacy_row["language"] == {
             "effective_profile": "hermes-legacy",
@@ -190,7 +190,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert detail["language"]["declared_profile"] == "archon-2026-07"
         assert detail["language"]["effective_profile"] == "archon-2026-07"
         assert detail["language"]["legacy"] is False
-        assert detail["language"]["normalizer_version"] == 2
+        assert detail["language"]["normalizer_version"] == 3
         assert len(detail["language"]["normalized_definition_digest"]) == 64
         assert set(detail["language"]) == {
             "declared_profile",
@@ -199,10 +199,13 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
             "normalizer_version",
             "normalized_definition_digest",
         }
-        assert detail["compatibility"]["runnable"] is False
-        assert any(
-            finding["blocking"] for finding in detail["compatibility"]["findings"]
-        )
+        assert detail["compatibility"] == {
+            "level": "portable",
+            "runnable": True,
+            "findings": [],
+            "finding_count": 0,
+            "findings_truncated": False,
+        }
         assert "authoring_schema" not in detail
         assert _tree_snapshot(home) == before_home
         assert _tree_snapshot(workdir) == before_project

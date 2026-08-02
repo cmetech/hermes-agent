@@ -314,6 +314,9 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
     assert module.WorkflowDetailLanguageStatus.model_validate(
         {**detail_status, "normalizer_version": 2}
     )
+    assert module.WorkflowDetailLanguageStatus.model_validate(
+        {**detail_status, "normalizer_version": 3}
+    )
 
     invalid_list = [
         {**list_status, "declared_profile": None},
@@ -329,7 +332,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**detail_status, "effective_profile": "hermes-legacy"},
         {**detail_status, "legacy": 0},
         {**detail_status, "normalizer_version": True},
-        {**detail_status, "normalizer_version": 3},
+        {**detail_status, "normalizer_version": 4},
         {**detail_status, "normalized_definition_digest": "A" * 64},
         {**detail_status, "normalized_definition_digest": "a" * 63},
     ]
@@ -1408,8 +1411,8 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
         "legacy": False,
     }
     assert row["compatibility"] == {
-        "level": "unsupported",
-        "runnable": False,
+        "level": "portable",
+        "runnable": True,
     }
     assert set(row["language"]) == {"effective_profile", "legacy"}
     assert set(row["compatibility"]) == {"level", "runnable"}
