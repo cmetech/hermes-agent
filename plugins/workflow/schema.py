@@ -15,13 +15,14 @@ from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
-    WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
+    WorkflowSemanticNormalizationError,
     WorkflowStructuredOutputNormalizationError,
     language_compatibility_findings,
     normalize_workflow,
     prove_output_path_impossible,
     resolve_language_profile,
+    select_normalizer_version,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
@@ -547,7 +548,14 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
                 )
 
 
-def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode:
+def _normalize_node(
+    raw: Any,
+    index: int,
+    lines: dict[str, int],
+    *,
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> WorkflowNode:
     path = f"nodes[{index}]"
     node = _mapping(raw, path)
     if "kind" in node:
@@ -576,7 +584,14 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
-    structurally_invalid = sorted(set(node) - structural_node_field_names(node_type))
+    structural_fields = set(structural_node_field_names(node_type))
+    archon_v3 = (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version == 3
+    )
+    if archon_v3:
+        structural_fields.update({"timeout", "idle_timeout", "retry"})
+    structurally_invalid = sorted(set(node) - structural_fields)
     if structurally_invalid:
         field = structurally_invalid[0]
         _fail(
@@ -611,11 +626,12 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
             "invalid_context",
             f"{path}.context must be fresh or shared",
         )
-    for timeout_name in ("idle_timeout", "timeout"):
-        if timeout_name in node:
-            _positive_number(node[timeout_name], f"{path}.{timeout_name}")
-    if "retry" in node:
-        _validate_retry(node["retry"], f"{path}.retry")
+    if not archon_v3:
+        for timeout_name in ("idle_timeout", "timeout"):
+            if timeout_name in node:
+                _positive_number(node[timeout_name], f"{path}.{timeout_name}")
+        if "retry" in node:
+            _validate_retry(node["retry"], f"{path}.retry")
     if "hooks" in node:
         _validate_hook_fields(node["hooks"], f"{path}.hooks")
     if "when" in node:
@@ -979,7 +995,7 @@ def _load_workflow_bytes(
     sidecar_bytes: bytes | None | object,
     source: str,
     precedence: int,
-    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
+    normalizer_version: int | None = None,
 ) -> WorkflowPackage:
     if len(data) > MAX_WORKFLOW_DOCUMENT_BYTES:
         _fail(
@@ -1022,6 +1038,9 @@ def _load_workflow_bytes(
         selection = resolve_language_profile(sidecar)
     except WorkflowLanguageCompatibilityError as exc:
         _fail("sidecar.language_compatibility", exc.code, str(exc))
+    selected_normalizer_version = select_normalizer_version(
+        selection, normalizer_version
+    )
     unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
     if (
         unknown_top
@@ -1063,7 +1082,11 @@ def _load_workflow_bytes(
         _fail("nodes", "invalid_nodes", "nodes must be a non-empty list")
     nodes = tuple(
         _normalize_node(
-            node, index, node_lines[index] if index < len(node_lines) else {}
+            node,
+            index,
+            node_lines[index] if index < len(node_lines) else {},
+            profile=selection.effective_profile,
+            normalizer_version=selected_normalizer_version,
         )
         for index, node in enumerate(raw_nodes)
     )
@@ -1086,13 +1109,19 @@ def _load_workflow_bytes(
         normalized = normalize_workflow(
             definition,
             selection=selection,
-            normalizer_version=normalizer_version,
+            normalizer_version=selected_normalizer_version,
         )
     except WorkflowStructuredOutputNormalizationError as exc:
         _fail(
             f"nodes[{exc.source_index}].output_format",
             "invalid_output_format",
             "output_format is not a valid bounded structured-output schema",
+        )
+    except WorkflowSemanticNormalizationError as exc:
+        _fail(
+            f"nodes[{exc.source_index}].{exc.field}",
+            exc.code,
+            str(exc),
         )
     _validate_structured_output_field_references(
         normalized.definition.nodes, normalized.metadata.structured_outputs
@@ -1140,7 +1169,7 @@ def load_workflow_snapshot(
     sidecar_bytes: bytes | None,
     source: str = "explicit",
     precedence: int = 0,
-    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
+    normalizer_version: int | None = None,
 ) -> WorkflowPackage:
     """Parse caller-authenticated bytes without reopening definition files."""
     workflow_path = Path(path).expanduser().absolute()

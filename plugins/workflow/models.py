@@ -137,12 +137,23 @@ class WorkflowLanguageMetadata:
     structured_outputs: Mapping[str, "WorkflowStructuredOutput"] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    node_semantics: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "structured_outputs",
             MappingProxyType(dict(self.structured_outputs)),
+        )
+        object.__setattr__(
+            self,
+            "node_semantics",
+            MappingProxyType({
+                node_id: freeze_value(value)
+                for node_id, value in self.node_semantics.items()
+            }),
         )
 
 

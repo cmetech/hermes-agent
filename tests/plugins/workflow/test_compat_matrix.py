@@ -644,27 +644,6 @@ def test_legacy_profile_finding_is_stable_for_default_and_explicit_declarations(
         ),
         (
             "archon-2026-07",
-            {"idle_timeout": 2},
-            "archon_idle_timeout_semantics_unavailable",
-            True,
-            "error",
-        ),
-        (
-            "archon-2026-07",
-            {"timeout": 2},
-            "archon_timeout_semantics_unavailable",
-            True,
-            "error",
-        ),
-        (
-            "archon-2026-07",
-            {"retry": {"max_attempts": 2}},
-            "archon_retry_semantics_unavailable",
-            True,
-            "error",
-        ),
-        (
-            "archon-2026-07",
             {"maxBudgetUsd": 1},
             "archon_budget_enforcement_unavailable",
             True,

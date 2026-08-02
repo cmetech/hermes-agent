@@ -48,7 +48,7 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
 
     assert contract["schema_version"] == 1
     assert contract["profile"] == "archon-2026-07"
-    assert contract["normalizer_version"] == 2
+    assert contract["normalizer_version"] == 3
     assert (
         contract["definition_schema"]["$schema"]
         == "https://json-schema.org/draft/2020-12/schema"
@@ -140,6 +140,19 @@ def test_node_kind_descriptors_cover_each_applicable_node_field_once(profile):
             f"nodes[].{spec.yaml_name}"
             for spec in FIELD_INVENTORY
             if spec.scope == "node" and node_type in spec.applicable_node_types
+            and not (
+                profile is WorkflowLanguageProfile.ARCHON_2026_07
+                and (
+                    (
+                        spec.yaml_name == "idle_timeout"
+                        and node_type not in {"command", "prompt"}
+                    )
+                    or (
+                        spec.yaml_name == "retry"
+                        and node_type not in {"command", "prompt", "bash", "script"}
+                    )
+                )
+            )
         }
 
         assert expected_direct_paths <= set(paths)
@@ -335,7 +348,7 @@ def test_editor_compatibility_and_documentation_are_complete(profile):
     assert output_format["widget"] == "json-schema"
 
 
-def test_nested_descriptors_never_upgrade_a_deferred_parent_field():
+def test_nested_retry_descriptors_follow_the_supported_archon_v3_parent():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
     command = next(item for item in contract["node_kinds"] if item["id"] == "command")
     retry_fields = [
@@ -345,7 +358,7 @@ def test_nested_descriptors_never_upgrade_a_deferred_parent_field():
     ]
 
     assert retry_fields
-    assert {field["status"] for field in retry_fields} == {"deferred"}
+    assert {field["status"] for field in retry_fields} == {"supported"}
 
 
 def test_nested_descriptor_keeps_supported_child_under_warning_parent():
@@ -377,7 +390,7 @@ def test_nested_descriptor_keeps_supported_child_under_warning_parent():
     assert descriptor["status"] == "supported"
 
 
-def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
+def test_editor_status_distinguishes_legacy_advisories_from_archon_v3_support():
     legacy = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
     archon = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
@@ -390,12 +403,9 @@ def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
         )
 
     assert command_field(legacy, "nodes[].idle_timeout")["status"] == "supported"
-    assert command_field(archon, "nodes[].idle_timeout")["status"] == "deferred"
+    assert command_field(archon, "nodes[].idle_timeout")["status"] == "supported"
 
     legacy_code = legacy["compatibility_codes"]["legacy_idle_timeout_seconds"]
-    archon_code = archon["compatibility_codes"][
-        "archon_idle_timeout_semantics_unavailable"
-    ]
     assert (
         legacy_code["status"],
         legacy_code["runtime_status"],
@@ -405,15 +415,9 @@ def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
         "warning",
         False,
     )
-    assert (
-        archon_code["status"],
-        archon_code["runtime_status"],
-        archon_code["blocking"],
-    ) == (
-        "deferred",
-        "blocking",
-        True,
-    )
+    assert "archon_idle_timeout_semantics_unavailable" not in archon[
+        "compatibility_codes"
+    ]
 
 
 def test_schema_publishes_loader_defaults_and_identifier_pattern():
@@ -943,14 +947,6 @@ def test_interactive_gate_message_json_truthiness_matches_loader(
 @pytest.mark.parametrize(
     ("node_type", "field", "code", "phase"),
     [
-        (
-            "bash",
-            "idle_timeout",
-            "archon_idle_timeout_semantics_unavailable",
-            3,
-        ),
-        ("bash", "timeout", "archon_timeout_semantics_unavailable", 3),
-        ("bash", "retry", "archon_retry_semantics_unavailable", 3),
         ("prompt", "maxBudgetUsd", "archon_budget_enforcement_unavailable", 5),
         ("prompt", "sandbox", "archon_sandbox_enforcement_unavailable", 5),
     ],
@@ -1064,7 +1060,8 @@ def test_companion_schema_has_strict_profile_enum_and_field_parity():
         (
             WorkflowLanguageProfile.ARCHON_2026_07,
             {
-                "archon_idle_timeout_semantics_unavailable",
+                "archon_idle_timeout_node_unsupported",
+                "archon_retry_node_unsupported",
                 "archon_unknown_top_level_field",
             },
         ),
@@ -1161,9 +1158,12 @@ def test_dynamic_catalog_codes_are_emitted_by_real_runtime_paths():
 
 
 def test_generated_language_codes_are_covered_by_authoring_references():
-    generated_codes = set().union(
-        *(compatibility_code_catalog(profile) for profile in WorkflowLanguageProfile)
-    )
+    generated_codes = {
+        code
+        for profile in WorkflowLanguageProfile
+        for code, metadata in compatibility_code_catalog(profile).items()
+        if metadata.get("compatibility", True)
+    }
     root = Path(__file__).parents[3]
     references = (
         root / "website/docs/user-guide/features/workflow-yaml-reference.md",

@@ -504,6 +504,13 @@ def build_risk_summary(
     )
     risk_fields = {
         "package_digest": package_digest,
+        "language_identity": {
+            "effective_profile": package.language.effective_profile.value,
+            "normalizer_version": package.language.normalizer_version,
+            "normalized_definition_digest": (
+                package.language.normalized_definition_digest
+            ),
+        },
         "shell_or_script_nodes": shell_nodes,
         "requested_tools": requested_tools,
         "requested_skills": requested_skills,
@@ -525,7 +532,11 @@ def build_risk_summary(
         **{
             key: value
             for key, value in risk_fields.items()
-            if key not in {"compatibility", "blocking_findings"}
+            if key not in {
+                "compatibility",
+                "blocking_findings",
+                "language_identity",
+            }
         },
     )
 

@@ -11,8 +11,8 @@ from types import MappingProxyType
 from typing import Any
 
 from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
-    WORKFLOW_NORMALIZER_VERSION,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -90,6 +90,117 @@ class StructuralRequirement:
     equals: object
     required_field: str
     required_shape: str
+
+
+@dataclass(frozen=True, slots=True)
+class DurableWorkflowCode:
+    """Bounded public metadata for one versioned durable workflow code."""
+
+    code: str
+    public_meaning: str
+    area: str
+    profiles: frozenset[WorkflowLanguageProfile]
+    normalizer_versions: frozenset[int]
+    compatibility: bool
+    runtime_failure: bool
+    evidence: bool
+    fields: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "public_meaning": self.public_meaning,
+            "area": self.area,
+            "profiles": sorted(profile.value for profile in self.profiles),
+            "normalizer_versions": sorted(self.normalizer_versions),
+            "compatibility": self.compatibility,
+            "runtime_failure": self.runtime_failure,
+            "evidence": self.evidence,
+            "fields": list(self.fields),
+        }
+
+
+_ARCHON_V3 = frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
+_NORMALIZER_V3 = frozenset({3})
+PHASE3_DURABLE_CODES = (
+    DurableWorkflowCode(
+        "archon_timeout_node_unsupported",
+        "timeout is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_idle_timeout_node_unsupported",
+        "idle_timeout is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].idle_timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_node_unsupported",
+        "retry is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_max_attempts_required",
+        "deterministic retries require max_attempts",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry.max_attempts",),
+    ),
+    DurableWorkflowCode(
+        "archon_timeout_invalid",
+        "timeout must be a positive finite millisecond number",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_idle_timeout_invalid",
+        "idle_timeout must be a positive finite millisecond number",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].idle_timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_invalid",
+        "retry must use the bounded Archon v3 shape",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry",),
+    ),
+)
 
 
 def _compatibility(
@@ -478,8 +589,6 @@ _NODE_FIELDS = (
         phase=3,
         legacy_status="warning",
         legacy_code="legacy_idle_timeout_seconds",
-        archon_status="blocking",
-        archon_code="archon_idle_timeout_semantics_unavailable",
     ),
     _field(
         "node",
@@ -488,8 +597,6 @@ _NODE_FIELDS = (
         "retry",
         node_types=_NON_LOOP_NODE_TYPES,
         phase=3,
-        archon_status="blocking",
-        archon_code="archon_retry_semantics_unavailable",
     ),
     _field("node", "always_run", "boolean", "boolean", node_types=NODE_TYPES),
     _field(
@@ -667,8 +774,6 @@ _NODE_FIELDS = (
         phase=3,
         legacy_status="warning",
         legacy_code="legacy_timeout_seconds",
-        archon_status="blocking",
-        archon_code="archon_timeout_semantics_unavailable",
     ),
 )
 
@@ -880,6 +985,22 @@ def structural_node_field_names(node_type: str) -> frozenset[str]:
     )
 
 
+def _node_field_is_structural(
+    spec: WorkflowFieldSpec,
+    node_type: str,
+    profile: WorkflowLanguageProfile,
+) -> bool:
+    if node_type not in spec.structural_node_types:
+        return False
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return True
+    if spec.yaml_name == "idle_timeout":
+        return node_type in _AI_NODE_TYPES
+    if spec.yaml_name == "retry":
+        return node_type in {"command", "prompt", "bash", "script"}
+    return True
+
+
 def inapplicable_node_fields(node_type: str) -> dict[str, frozenset[str]]:
     """Return structurally valid fields that are not semantically applicable."""
     if node_type not in NODE_TYPES:
@@ -962,7 +1083,11 @@ def _field_unit(
     if spec.yaml_name == "delay_ms":
         return "milliseconds"
     if spec.yaml_name in {"idle_timeout", "timeout"}:
-        return "seconds" if profile is WorkflowLanguageProfile.HERMES_LEGACY else None
+        return (
+            "seconds"
+            if profile is WorkflowLanguageProfile.HERMES_LEGACY
+            else "milliseconds"
+        )
     if spec.yaml_name == "maxBudgetUsd":
         return "USD"
     if spec.yaml_name in {"max_iterations", "max_attempts", "maxTurns"}:
@@ -1229,7 +1354,7 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
         properties = {
             spec.yaml_name: True
             for spec in specs
-            if node_type in spec.structural_node_types
+            if _node_field_is_structural(spec, node_type, profile)
         }
         variants.append({
             "type": "object",
@@ -1340,6 +1465,25 @@ def compatibility_code_catalog(
             "enforcement_phase": spec.enforcement_phase,
             "fields": list(spec.fields),
         }
+    for spec in PHASE3_DURABLE_CODES:
+        if selected not in spec.profiles:
+            continue
+        grouped[spec.code] = {
+            "status": "deferred",
+            "description": spec.public_meaning,
+            "migration": _compatibility_migration(spec.code),
+            "runtime_status": "blocking",
+            "severity": "error",
+            "blocking": True,
+            "enforcement_phase": 3,
+            "fields": list(spec.fields),
+            "area": spec.area,
+            "profiles": sorted(profile.value for profile in spec.profiles),
+            "normalizer_versions": sorted(spec.normalizer_versions),
+            "compatibility": spec.compatibility,
+            "runtime_failure": spec.runtime_failure,
+            "evidence": spec.evidence,
+        }
     return {
         code: {**entry, "fields": sorted(entry["fields"])}
         for code, entry in sorted(grouped.items())
@@ -1347,10 +1491,13 @@ def compatibility_code_catalog(
 
 
 def _nested_specs_for_kind(
-    node_type: str,
+    node_type: str, profile: WorkflowLanguageProfile,
 ) -> tuple[tuple[WorkflowFieldSpec, str], ...]:
     nested: list[tuple[WorkflowFieldSpec, str]] = []
-    if node_type != "loop":
+    if node_type != "loop" and not (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and node_type not in {"command", "prompt", "bash", "script"}
+    ):
         nested.extend(
             (spec, f"nodes[].retry.{spec.yaml_name}") for spec in _specs("retry")
         )
@@ -1467,6 +1614,7 @@ def node_kind_descriptors(
             )
             for spec in _specs("node")
             if node_type in spec.applicable_node_types
+            and _node_field_is_structural(spec, node_type, selected)
         ]
         fields.extend(
             _field_descriptor(
@@ -1491,7 +1639,7 @@ def node_kind_descriptors(
                     }[spec.scope]
                 ),
             )
-            for spec, field_path in _nested_specs_for_kind(node_type)
+            for spec, field_path in _nested_specs_for_kind(node_type, selected)
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
         descriptors.append({
@@ -1766,7 +1914,7 @@ def workflow_authoring_contract(
         "schema_version": 1,
         "contract_reader_version": CONTRACT_READER_VERSION,
         "profile": selected.value,
-        "normalizer_version": WORKFLOW_NORMALIZER_VERSION,
+        "normalizer_version": CURRENT_NORMALIZER_BY_PROFILE[selected],
         "definition_schema": definition_json_schema(selected),
         "sidecar_schema": sidecar_json_schema(selected),
         "node_kinds": node_kind_descriptors(selected),

@@ -31,8 +31,14 @@ from plugins.workflow.models import (
 )
 
 
+LATEST_NORMALIZER_VERSION = 3
+# Pre-language legacy snapshots used this public fallback. Keep it at v2.
 WORKFLOW_NORMALIZER_VERSION = 2
-SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2})
+CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
+    WorkflowLanguageProfile.HERMES_LEGACY: 2,
+    WorkflowLanguageProfile.ARCHON_2026_07: 3,
+})
+SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
 # The normalized type-tag document expands the already bounded workflow and
@@ -81,6 +87,16 @@ class WorkflowStructuredOutputNormalizationError(StructuredOutputError):
     def __init__(self, source_index: int, error: StructuredOutputError):
         self.source_index = source_index
         super().__init__(str(error))
+
+
+class WorkflowSemanticNormalizationError(ValueError):
+    """Attach a stable v3 semantic failure to its authored node field."""
+
+    def __init__(self, source_index: int, field: str, code: str, message: str):
+        self.source_index = source_index
+        self.field = field
+        self.code = code
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,12 +157,23 @@ class WorkflowLanguageSnapshot:
     structured_outputs: Mapping[str, WorkflowStructuredOutput] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    node_semantics: Mapping[str, Mapping[str, object]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "structured_outputs",
             MappingProxyType(dict(self.structured_outputs)),
+        )
+        object.__setattr__(
+            self,
+            "node_semantics",
+            MappingProxyType({
+                node_id: freeze_value(value)
+                for node_id, value in self.node_semantics.items()
+            }),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -156,9 +183,13 @@ class WorkflowLanguageSnapshot:
             "normalized_definition_digest": self.normalized_definition_digest,
             "semantic_fingerprint": self.semantic_fingerprint,
         }
-        if self.normalizer_version == 2:
+        if self.normalizer_version >= 2:
             value["structured_outputs"] = _structured_outputs_projection(
                 self.structured_outputs
+            )
+        if self.normalizer_version == 3:
+            value["node_semantics"] = _node_semantics_projection(
+                self.node_semantics
             )
         return value
 
@@ -195,24 +226,23 @@ def normalize_workflow(
     source_definition: WorkflowDefinition,
     *,
     selection: WorkflowLanguageSelection,
-    normalizer_version: int,
+    normalizer_version: int | None,
 ) -> NormalizedWorkflow:
     """Bind immutable workflow semantics to a supported normalizer version."""
-    if (
-        isinstance(normalizer_version, bool)
-        or not isinstance(normalizer_version, int)
-        or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
-    ):
-        raise WorkflowLanguageCompatibilityError(
-            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
-            f"workflow normalizer version {normalizer_version!r} is unsupported",
-        )
+    normalizer_version = select_normalizer_version(selection, normalizer_version)
 
     normalized_definition = source_definition
     structured_outputs: Mapping[str, WorkflowStructuredOutput] = MappingProxyType({})
-    if normalizer_version == 2:
+    node_semantics: Mapping[str, Mapping[str, object]] = MappingProxyType({})
+    if normalizer_version >= 2:
         normalized_definition, structured_outputs = _normalize_v2(
             source_definition, selection.effective_profile
+        )
+    if normalizer_version == 3:
+        normalized_definition, structured_outputs, node_semantics = _normalize_v3(
+            normalized_definition,
+            selection.effective_profile,
+            structured_outputs,
         )
 
     normalized_document_value: dict[str, object] = {
@@ -234,9 +264,13 @@ def normalize_workflow(
             "options": normalized_definition.options,
         },
     }
-    if normalizer_version == 2:
+    if normalizer_version >= 2:
         normalized_document_value["structured_outputs"] = (
             _structured_outputs_projection(structured_outputs)
+        )
+    if normalizer_version == 3:
+        normalized_document_value["node_semantics"] = _node_semantics_projection(
+            node_semantics
         )
     normalized_document = _json_safe(normalized_document_value)
     metadata = WorkflowLanguageMetadata(
@@ -245,8 +279,39 @@ def normalize_workflow(
         normalizer_version=normalizer_version,
         normalized_definition_digest=_sha256_json(normalized_document),
         structured_outputs=structured_outputs,
+        node_semantics=node_semantics,
     )
     return NormalizedWorkflow(definition=normalized_definition, metadata=metadata)
+
+
+def select_normalizer_version(
+    selection: WorkflowLanguageSelection,
+    requested_version: int | None,
+) -> int:
+    """Resolve a new-run version or validate an explicitly sealed version."""
+    normalizer_version = (
+        CURRENT_NORMALIZER_BY_PROFILE[selection.effective_profile]
+        if requested_version is None
+        else requested_version
+    )
+    if (
+        isinstance(normalizer_version, bool)
+        or not isinstance(normalizer_version, int)
+        or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
+    ):
+        raise WorkflowLanguageCompatibilityError(
+            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
+            f"workflow normalizer version {normalizer_version!r} is unsupported",
+        )
+    if (
+        normalizer_version == 3
+        and selection.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowLanguageCompatibilityError(
+            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
+            "workflow normalizer version 3 requires archon-2026-07",
+        )
+    return normalizer_version
 
 
 def _normalize_v2(
@@ -288,6 +353,170 @@ def _normalize_v2(
     return replace(source_definition, nodes=tuple(normalized_nodes)), MappingProxyType(
         structured_outputs
     )
+
+
+def _normalize_v3(
+    normalized_definition: WorkflowDefinition,
+    profile: WorkflowLanguageProfile,
+    structured_outputs: Mapping[str, WorkflowStructuredOutput],
+) -> tuple[
+    WorkflowDefinition,
+    Mapping[str, WorkflowStructuredOutput],
+    Mapping[str, Mapping[str, object]],
+]:
+    """Normalize requested Phase 3 semantics without applying run policy."""
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return normalized_definition, structured_outputs, MappingProxyType({})
+
+    semantics: dict[str, Mapping[str, object]] = {}
+    for node in normalized_definition.nodes:
+        options = node.options
+        entry: dict[str, object] = {}
+        if "timeout" in options and node.node_type not in {"bash", "script"}:
+            raise WorkflowSemanticNormalizationError(
+                node.source_index,
+                "timeout",
+                "archon_timeout_node_unsupported",
+                "Archon timeout applies only to bash and script nodes",
+            )
+        if "idle_timeout" in options and node.node_type not in {"command", "prompt"}:
+            raise WorkflowSemanticNormalizationError(
+                node.source_index,
+                "idle_timeout",
+                "archon_idle_timeout_node_unsupported",
+                "Archon idle_timeout applies only to command and prompt nodes",
+            )
+        if "retry" in options and node.node_type not in {
+            "command",
+            "prompt",
+            "bash",
+            "script",
+        }:
+            raise WorkflowSemanticNormalizationError(
+                node.source_index,
+                "retry",
+                "archon_retry_node_unsupported",
+                "Archon retry applies only to command, prompt, bash, and script nodes",
+            )
+
+        if node.node_type in {"bash", "script"}:
+            timeout = options.get("timeout", 120_000)
+            entry["wall_timeout_seconds"] = _milliseconds_to_seconds(
+                timeout,
+                node=node,
+                field="timeout",
+            )
+        elif node.node_type in {"command", "prompt"} and "idle_timeout" in options:
+            entry["idle_timeout_seconds"] = _milliseconds_to_seconds(
+                options["idle_timeout"],
+                node=node,
+                field="idle_timeout",
+            )
+
+        if node.node_type in {"command", "prompt", "bash", "script"}:
+            authored = options.get("retry")
+            explicit = authored is not None
+            retry = _normalize_v3_retry(authored, node=node)
+            if explicit and node.node_type in {"bash", "script"} and "max_attempts" not in retry:
+                raise WorkflowSemanticNormalizationError(
+                    node.source_index,
+                    "retry.max_attempts",
+                    "archon_retry_max_attempts_required",
+                    "Archon bash and script retry requires max_attempts",
+                )
+            requested_retries = retry.get(
+                "max_attempts", 2 if node.node_type in {"command", "prompt"} else 0
+            )
+            entry["retry"] = {
+                "explicit": explicit,
+                "requested_retries": requested_retries,
+                "requested_total_attempts": requested_retries + 1,
+                "delay_ms": retry.get("delay_ms", 3000),
+                "on_error": retry.get("on_error", "transient"),
+            }
+        if entry:
+            semantics[node.id] = freeze_value(entry)
+    return normalized_definition, structured_outputs, MappingProxyType(semantics)
+
+
+def _normalize_v3_retry(
+    value: object | None, *, node: WorkflowNode
+) -> Mapping[str, object]:
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping) or set(value) - {
+        "max_attempts",
+        "delay_ms",
+        "on_error",
+    }:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "retry",
+            "archon_retry_invalid",
+            "Archon retry must contain only max_attempts, delay_ms, and on_error",
+        )
+    maximum = value.get("max_attempts")
+    if maximum is not None and (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or not 1 <= maximum <= 5
+    ):
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "retry.max_attempts",
+            "archon_retry_invalid",
+            "Archon retry.max_attempts must be an integer from 1 through 5",
+        )
+    delay = value.get("delay_ms", 3000)
+    if (
+        isinstance(delay, bool)
+        or not isinstance(delay, int)
+        or not 1000 <= delay <= 60_000
+    ):
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "retry.delay_ms",
+            "archon_retry_invalid",
+            "Archon retry.delay_ms must be an integer from 1000 through 60000",
+        )
+    on_error = value.get("on_error", "transient")
+    if not isinstance(on_error, str) or on_error not in {"transient", "all"}:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "retry.on_error",
+            "archon_retry_invalid",
+            "Archon retry.on_error must be transient or all",
+        )
+    return value
+
+
+def _milliseconds_to_seconds(
+    value: object, *, node: WorkflowNode, field: str
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            field,
+            f"archon_{field}_invalid",
+            f"Archon {field} must be a positive finite number of milliseconds",
+        )
+    try:
+        seconds = float(value) / 1000.0
+    except OverflowError as exc:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            field,
+            f"archon_{field}_invalid",
+            f"Archon {field} must be a positive finite number of milliseconds",
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            field,
+            f"archon_{field}_invalid",
+            f"Archon {field} must be a positive finite number of milliseconds",
+        )
+    return seconds
 
 
 def language_compatibility_findings(
@@ -341,7 +570,7 @@ def language_compatibility_findings(
                     f"{prefix}.idle_timeout",
                     "legacy_idle_timeout_seconds",
                     "legacy idle_timeout is interpreted in seconds",
-                    "Convert idle_timeout seconds to milliseconds only after Phase 3 Archon semantics are available.",
+                    "Multiply idle_timeout seconds by 1,000 to author Archon milliseconds.",
                     blocking=False,
                 )
             if "timeout" in options:
@@ -349,7 +578,7 @@ def language_compatibility_findings(
                     f"{prefix}.timeout",
                     "legacy_timeout_seconds",
                     "legacy timeout is interpreted in seconds",
-                    "Convert timeout seconds to milliseconds before changing profiles.",
+                    "Multiply timeout seconds by 1,000 to author Archon milliseconds before changing profiles.",
                     blocking=False,
                 )
             retry = options.get("retry")
@@ -358,7 +587,7 @@ def language_compatibility_findings(
                     f"{prefix}.retry.max_attempts",
                     "legacy_retry_total_attempts",
                     "legacy retry.max_attempts counts total attempts",
-                    "Account for Archon retry-count semantics in Phase 3 before changing profiles.",
+                    "For legacy total attempts N >= 2, author Archon max_attempts as N - 1 and check the sealed combined cap.",
                     blocking=False,
                 )
             if "output_format" in options:
@@ -379,7 +608,7 @@ def language_compatibility_findings(
                 )
             continue
 
-        if "idle_timeout" in options:
+        if metadata.normalizer_version < 3 and "idle_timeout" in options:
             add(
                 f"{prefix}.idle_timeout",
                 "archon_idle_timeout_semantics_unavailable",
@@ -387,7 +616,7 @@ def language_compatibility_findings(
                 "Remove idle_timeout or wait for Phase 3 millisecond normalization.",
                 blocking=True,
             )
-        if "timeout" in options:
+        if metadata.normalizer_version < 3 and "timeout" in options:
             add(
                 f"{prefix}.timeout",
                 "archon_timeout_semantics_unavailable",
@@ -395,7 +624,7 @@ def language_compatibility_findings(
                 "Remove timeout or wait for Phase 3 timeout semantics.",
                 blocking=True,
             )
-        if "retry" in options:
+        if metadata.normalizer_version < 3 and "retry" in options:
             add(
                 f"{prefix}.retry",
                 "archon_retry_semantics_unavailable",
@@ -460,9 +689,13 @@ def bind_semantic_fingerprint(
         "normalizer_version": metadata.normalizer_version,
         "normalized_definition_digest": metadata.normalized_definition_digest,
     }
-    if metadata.normalizer_version == 2:
+    if metadata.normalizer_version >= 2:
         document["structured_outputs"] = _structured_outputs_projection(
             metadata.structured_outputs
+        )
+    if metadata.normalizer_version == 3:
+        document["node_semantics"] = _node_semantics_projection(
+            metadata.node_semantics
         )
     return _sha256_json(document)
 
@@ -481,6 +714,7 @@ def make_language_snapshot(
         structured_outputs=_copy_structured_outputs(
             package.language.structured_outputs
         ),
+        node_semantics=_copy_node_semantics(package.language.node_semantics),
     )
 
 
@@ -531,10 +765,20 @@ def read_language_snapshot(
             WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
+    if (
+        normalizer_version == 3
+        and profile is not WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowLanguageCompatibilityError(
+            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
+            "workflow normalizer version 3 requires archon-2026-07",
+        )
 
-    expected_keys = (
-        v1_keys if normalizer_version == 1 else v1_keys | {"structured_outputs"}
-    )
+    expected_keys = v1_keys
+    if normalizer_version >= 2:
+        expected_keys = expected_keys | {"structured_outputs"}
+    if normalizer_version == 3:
+        expected_keys = expected_keys | {"node_semantics"}
     if set(value) != expected_keys:
         raise WorkflowLanguageCompatibilityError(
             "workflow_language_snapshot_invalid",
@@ -558,12 +802,18 @@ def read_language_snapshot(
         if normalizer_version == 1
         else _read_structured_outputs(value["structured_outputs"])
     )
+    node_semantics = (
+        _read_node_semantics(value["node_semantics"])
+        if normalizer_version == 3
+        else MappingProxyType({})
+    )
     return WorkflowLanguageSnapshot(
         effective_profile=profile,
         normalizer_version=normalizer_version,
         normalized_definition_digest=normalized_digest,
         semantic_fingerprint=fingerprint,
         structured_outputs=structured_outputs,
+        node_semantics=node_semantics,
     )
 
 
@@ -632,6 +882,117 @@ def _copy_structured_outputs(
         )
         for node_id, output in structured_outputs.items()
     })
+
+
+def _node_semantics_projection(
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        node_id: _thaw(value)
+        for node_id, value in sorted(node_semantics.items())
+    }
+
+
+def _copy_node_semantics(
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> Mapping[str, Mapping[str, object]]:
+    return MappingProxyType({
+        node_id: freeze_value(_thaw(value))
+        for node_id, value in node_semantics.items()
+    })
+
+
+def _read_node_semantics(
+    value: object,
+) -> Mapping[str, Mapping[str, object]]:
+    if not isinstance(value, Mapping) or len(value) > 512:
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_invalid",
+            "workflow language snapshot node semantics are invalid",
+        )
+    try:
+        canonical_json_bytes(
+            _thaw(value),
+            max_bytes=_MAX_NORMALIZED_DEFINITION_CANONICAL_BYTES,
+        )
+    except (StructuredOutputError, TypeError, ValueError) as exc:
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_invalid",
+            "workflow language snapshot node semantics are invalid",
+        ) from exc
+    result: dict[str, Mapping[str, object]] = {}
+    allowed_node_keys = {"wall_timeout_seconds", "idle_timeout_seconds", "retry"}
+    retry_keys = {
+        "explicit",
+        "requested_retries",
+        "requested_total_attempts",
+        "delay_ms",
+        "on_error",
+    }
+    for node_id, raw in value.items():
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(raw, Mapping)
+            or not raw
+            or not set(raw) <= allowed_node_keys
+            or "retry" not in raw
+            or (
+                "wall_timeout_seconds" in raw
+                and "idle_timeout_seconds" in raw
+            )
+        ):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_invalid",
+                "workflow language snapshot node semantics are invalid",
+            )
+        for timeout_key in ("wall_timeout_seconds", "idle_timeout_seconds"):
+            timeout = raw.get(timeout_key)
+            try:
+                timeout_is_finite = math.isfinite(float(timeout))
+            except (TypeError, ValueError, OverflowError):
+                timeout_is_finite = False
+            if timeout is not None and (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, int | float)
+                or not timeout_is_finite
+                or timeout <= 0
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_language_snapshot_invalid",
+                    "workflow language snapshot node semantics are invalid",
+                )
+        retry = raw.get("retry")
+        if not isinstance(retry, Mapping) or set(retry) != retry_keys:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_invalid",
+                "workflow language snapshot node semantics are invalid",
+            )
+        explicit = retry["explicit"]
+        requested = retry["requested_retries"]
+        total = retry["requested_total_attempts"]
+        delay = retry["delay_ms"]
+        on_error = retry["on_error"]
+        if (
+            not isinstance(explicit, bool)
+            or isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or not 0 <= requested <= 5
+            or isinstance(total, bool)
+            or not isinstance(total, int)
+            or total != requested + 1
+            or isinstance(delay, bool)
+            or not isinstance(delay, int)
+            or not 1000 <= delay <= 60_000
+            or not isinstance(on_error, str)
+            or on_error not in {"transient", "all"}
+        ):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_invalid",
+                "workflow language snapshot node semantics are invalid",
+            )
+        result[node_id] = freeze_value(_thaw(raw))
+    return MappingProxyType(result)
 
 
 def _read_structured_outputs(value: object) -> Mapping[str, WorkflowStructuredOutput]:

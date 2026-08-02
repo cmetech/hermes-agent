@@ -293,7 +293,7 @@ def test_admission_seals_package_bound_language_metadata(tmp_path, workflow_writ
     resources = json.loads((prepared.staging_directory / "resources.json").read_text())
 
     assert resources["language"]["effective_profile"] == "archon-2026-07"
-    assert resources["language"]["normalizer_version"] == 2
+    assert resources["language"]["normalizer_version"] == 3
     assert resources["language"]["structured_outputs"] == {
         "producer": {
             "canonical_schema": {
@@ -305,6 +305,17 @@ def test_admission_seals_package_bound_language_metadata(tmp_path, workflow_writ
                 "producer"
             ].schema_fingerprint,
             "canonicalization_version": 1,
+        }
+    }
+    assert resources["language"]["node_semantics"] == {
+        "producer": {
+            "retry": {
+                "explicit": False,
+                "requested_retries": 2,
+                "requested_total_attempts": 3,
+                "delay_ms": 3000,
+                "on_error": "transient",
+            }
         }
     }
     assert (
@@ -346,6 +357,7 @@ def test_admission_projects_the_same_bounded_language_metadata(
         "normalized_definition_digest",
         "semantic_fingerprint",
         "structured_outputs",
+        "node_semantics",
     }
 
 

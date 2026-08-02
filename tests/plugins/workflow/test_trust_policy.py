@@ -16,7 +16,7 @@ from plugins.workflow.api_admission import (
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.models import WorkflowValidationError
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
@@ -81,6 +81,29 @@ def _package(workflow_writer, root):
         encoding="utf-8",
     )
     return load_workflow(path)
+
+
+def test_archon_normalizer_upgrade_changes_risk_identity_without_source_change(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(tmp_path / "risk-upgrade")
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    v3 = load_workflow(path)
+    v2 = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=2,
+    )
+
+    v3_summary = build_risk_summary(v3, assess_compatibility(v3))
+    v2_summary = build_risk_summary(v2, assess_compatibility(v2))
+
+    assert compute_package_digest(v3) == compute_package_digest(v2)
+    assert v3_summary.risk_digest != v2_summary.risk_digest
 
 
 def _resource_boundary_package(
