@@ -24,7 +24,11 @@ from plugins.workflow.runner_binding import (
     assess_package_execution,
     background_execution_context,
 )
-from plugins.workflow.models import ExecutionFence
+from plugins.workflow.models import (
+    ExecutionFence,
+    ValidationIssue,
+    WorkflowValidationError,
+)
 from plugins.workflow.scheduler import RunScheduler
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.schema import load_workflow
@@ -1753,7 +1757,7 @@ def test_invalid_scheduled_package_does_not_abort_valid_advance_all_peer(
         )
 
 
-def _admit_scheduled_impossible_authenticated_command(
+def _admit_scheduled_authenticated_command(
     home: Path,
     workflow_writer,
     *,
@@ -1762,7 +1766,7 @@ def _admit_scheduled_impossible_authenticated_command(
 ):
     (home / "commands").mkdir(parents=True, exist_ok=True)
     (home / "commands/consume.md").write_text(
-        "Use $producer.output.missing\n", encoding="utf-8"
+        "Use $producer.output.present\n", encoding="utf-8"
     )
     workflow = workflow_writer(
         home / "workflows",
@@ -1831,7 +1835,7 @@ def test_scheduled_package_validation_matches_immediate_durable_failure(
     runner = _RecordingAIRunner()
     binding = _binding(real_runner=runner)
     store, run_id, due, identity, epoch = (
-        _admit_scheduled_impossible_authenticated_command(
+        _admit_scheduled_authenticated_command(
             home,
             workflow_writer,
             name=f"scheduled-package-validation-{entrypoint}",
@@ -1848,6 +1852,17 @@ def test_scheduled_package_validation_matches_immediate_durable_failure(
     authorization = None
     original_authorize = scheduler._authorize_scheduled_promotion
 
+    def reject_authenticated_command(_package, _command_bodies):
+        raise WorkflowValidationError(
+            ValidationIssue(
+                path="nodes[1].command",
+                code="structured_output_field_impossible",
+                message=(
+                    "structured output field missing is impossible for node producer"
+                ),
+            )
+        )
+
     def record_authorization(loaded_run_id, projection):
         nonlocal authorization
         result = original_authorize(loaded_run_id, projection)
@@ -1860,6 +1875,10 @@ def test_scheduled_package_validation_matches_immediate_durable_failure(
 
     monkeypatch.setattr(
         scheduler, "_authorize_scheduled_promotion", record_authorization
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.scheduler.validate_authenticated_command_references",
+        reject_authenticated_command,
     )
     monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
     try:
@@ -1914,7 +1933,7 @@ def test_scheduled_package_validation_revalidates_before_terminal_mutation(
     runner = _RecordingAIRunner()
     binding = _binding(real_runner=runner)
     store, run_id, due, identity, epoch = (
-        _admit_scheduled_impossible_authenticated_command(
+        _admit_scheduled_authenticated_command(
             home,
             workflow_writer,
             name="scheduled-package-validation-revalidation",
@@ -2022,7 +2041,7 @@ def test_scheduled_package_validation_propagates_unexpected_verifier_fault(
     monkeypatch.setenv("HERMES_HOME", str(home))
     binding = _binding(real_runner=_RecordingAIRunner())
     store, run_id, due, identity, epoch = (
-        _admit_scheduled_impossible_authenticated_command(
+        _admit_scheduled_authenticated_command(
             home,
             workflow_writer,
             name="scheduled-package-validation-verifier-fault",
