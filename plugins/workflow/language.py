@@ -414,8 +414,15 @@ def _normalize_v3(
             )
 
         if node.node_type in {"command", "prompt", "bash", "script"}:
-            authored = options.get("retry")
-            explicit = authored is not None
+            explicit = "retry" in options
+            authored = options["retry"] if explicit else None
+            if explicit and not isinstance(authored, Mapping):
+                raise WorkflowSemanticNormalizationError(
+                    node.source_index,
+                    "retry",
+                    "archon_retry_invalid",
+                    "Archon retry must be a mapping",
+                )
             retry = _normalize_v3_retry(authored, node=node)
             if explicit and node.node_type in {"bash", "script"} and "max_attempts" not in retry:
                 raise WorkflowSemanticNormalizationError(
@@ -456,7 +463,7 @@ def _normalize_v3_retry(
             "Archon retry must contain only max_attempts, delay_ms, and on_error",
         )
     maximum = value.get("max_attempts")
-    if maximum is not None and (
+    if "max_attempts" in value and (
         isinstance(maximum, bool)
         or not isinstance(maximum, int)
         or not 1 <= maximum <= 5
@@ -557,7 +564,12 @@ def language_compatibility_findings(
             "sidecar.language_compatibility",
             "legacy_language_profile",
             "workflow uses permissive Hermes legacy language semantics",
-            "Declare archon-2026-07 after workflow doctor reports no blocking findings.",
+            "Declare archon-2026-07 after workflow doctor reports no blocking "
+            "findings. Add every referenced producer directly to depends_on and "
+            "add output_format before using .field references. Replace boolean, "
+            "object, array, or string-number coercion conditions with a structured "
+            "scalar decision value. Validate Bash substitution at the 32,768-byte "
+            "UTF-8 boundary and remove pathname assumptions.",
             blocking=False,
         )
 
@@ -583,11 +595,31 @@ def language_compatibility_findings(
                 )
             retry = options.get("retry")
             if isinstance(retry, Mapping) and "max_attempts" in retry:
+                total_attempts = retry["max_attempts"]
+                if total_attempts == 1 and node.node_type in {"bash", "script"}:
+                    retry_migration = (
+                        "For one total deterministic attempt under Archon, omit "
+                        "retry."
+                    )
+                elif total_attempts == 1 and node.node_type in {
+                    "command",
+                    "prompt",
+                }:
+                    retry_migration = (
+                        "An AI node requiring exactly one total attempt cannot "
+                        "migrate until a compatible explicit opt-out exists; "
+                        "Archon v3 defaults AI nodes to three total attempts."
+                    )
+                else:
+                    retry_migration = (
+                        "For legacy total attempts N >= 2, author Archon "
+                        "max_attempts as N - 1 and check the sealed combined cap."
+                    )
                 add(
                     f"{prefix}.retry.max_attempts",
                     "legacy_retry_total_attempts",
                     "legacy retry.max_attempts counts total attempts",
-                    "For legacy total attempts N >= 2, author Archon max_attempts as N - 1 and check the sealed combined cap.",
+                    retry_migration,
                     blocking=False,
                 )
             if "output_format" in options:
@@ -595,7 +627,8 @@ def language_compatibility_findings(
                     f"{prefix}.output_format",
                     "legacy_output_format_post_validation",
                     "legacy output_format is validated after model execution",
-                    "Wait for Phase 2 output-format enforcement before changing profiles.",
+                    "Keep output_format on each structured producer before using "
+                    ".field references under Archon.",
                     blocking=False,
                 )
             if "output_type" in options:
@@ -603,7 +636,8 @@ def language_compatibility_findings(
                     f"{prefix}.output_type",
                     "legacy_output_type_not_published",
                     "legacy output_type does not publish a typed artifact",
-                    "Wait for Phase 2 typed artifacts before changing profiles.",
+                    "Add output_format for typed publication before changing "
+                    "profiles; output_type alone does not authorize .field access.",
                     blocking=False,
                 )
             continue

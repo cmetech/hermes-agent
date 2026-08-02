@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 import shutil
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -104,6 +106,64 @@ def test_archon_normalizer_upgrade_changes_risk_identity_without_source_change(
 
     assert compute_package_digest(v3) == compute_package_digest(v2)
     assert v3_summary.risk_digest != v2_summary.risk_digest
+
+
+def _phase2_risk_digest(compatibility, summary) -> str:
+    document = {
+        "package_digest": summary.package_digest,
+        "shell_or_script_nodes": summary.shell_or_script_nodes,
+        "requested_tools": summary.requested_tools,
+        "requested_skills": summary.requested_skills,
+        "local_mcp_servers": summary.local_mcp_servers,
+        "providers": summary.providers,
+        "outward_action_nodes": summary.outward_action_nodes,
+        "required_secret_names": summary.required_secret_names,
+        "execution_environment": summary.execution_environment,
+        "compatibility": compatibility.level.value,
+        "blocking_findings": tuple(
+            finding.path for finding in compatibility.blocking_findings
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_phase2_archon_risk_digest_remains_exact(
+    tmp_path, workflow_writer, version
+) -> None:
+    path = workflow_writer(tmp_path / f"archon-v{version}")
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=version,
+    )
+    compatibility = assess_compatibility(package)
+    summary = build_risk_summary(package, compatibility)
+
+    assert summary.risk_digest == _phase2_risk_digest(compatibility, summary)
+
+
+def test_phase2_legacy_risk_digest_fixture_remains_exact() -> None:
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "portable"
+        / "workflows"
+        / "minimal.yaml"
+    )
+    package = load_workflow(path)
+
+    assert package.language.normalizer_version == 2
+    assert build_risk_summary(
+        package, assess_compatibility(package)
+    ).risk_digest == "355856bdcfd7a05272773f82309d566a6b83dfb7c22046d52277465d6afa84f9"
 
 
 def _resource_boundary_package(

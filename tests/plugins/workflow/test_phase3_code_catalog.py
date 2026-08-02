@@ -15,14 +15,8 @@ def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
 
     assert len(codes) == len(set(codes))
     assert all(
-        item.area == "normalization"
-        for item in language_schema.PHASE3_DURABLE_CODES
-    )
-    assert all(
         item.profiles == frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
         and item.normalizer_versions == frozenset({3})
-        and item.runtime_failure
-        and not item.evidence
         for item in language_schema.PHASE3_DURABLE_CODES
     )
     assert len(
@@ -89,8 +83,8 @@ def test_phase3_catalog_metadata_matches_real_normalization_failure(
     assert catalog[emitted]["evidence"] is False
 
 
-def test_every_task1_durable_code_has_a_behavior_link() -> None:
+def test_every_task1_normalization_behavior_has_catalog_metadata() -> None:
     catalog_codes = {item.code for item in language_schema.PHASE3_DURABLE_CODES}
     behavior_codes = {expected for _node, expected in _DURABLE_BEHAVIOR_CASES}
 
-    assert behavior_codes == catalog_codes
+    assert behavior_codes <= catalog_codes

@@ -504,13 +504,6 @@ def build_risk_summary(
     )
     risk_fields = {
         "package_digest": package_digest,
-        "language_identity": {
-            "effective_profile": package.language.effective_profile.value,
-            "normalizer_version": package.language.normalizer_version,
-            "normalized_definition_digest": (
-                package.language.normalized_definition_digest
-            ),
-        },
         "shell_or_script_nodes": shell_nodes,
         "requested_tools": requested_tools,
         "requested_skills": requested_skills,
@@ -524,6 +517,17 @@ def build_risk_summary(
             finding.path for finding in compatibility.blocking_findings
         ),
     }
+    if (
+        package.language.effective_profile.value == "archon-2026-07"
+        and package.language.normalizer_version == 3
+    ):
+        risk_fields["language_identity"] = {
+            "effective_profile": package.language.effective_profile.value,
+            "normalizer_version": package.language.normalizer_version,
+            "normalized_definition_digest": (
+                package.language.normalized_definition_digest
+            ),
+        }
     risk_digest = hashlib.sha256(
         json.dumps(risk_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

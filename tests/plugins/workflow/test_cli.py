@@ -156,7 +156,7 @@ def _write(workflow_writer, workdir):
 
 
 def _archon_package(workflow_writer, tmp_path, *, field, value):
-    """Write one declared Archon package with a Phase 1 deferred field."""
+    """Write one declared Archon package with the requested field."""
     node = (
         {"id": "start", "bash": "true", field: value}
         if field == "timeout"
@@ -177,8 +177,6 @@ def _archon_package(workflow_writer, tmp_path, *, field, value):
 @pytest.mark.parametrize(
     "field, value, code",
     [
-        ("timeout", 1000, "archon_timeout_semantics_unavailable"),
-        ("retry", {"max_attempts": 2}, "archon_retry_semantics_unavailable"),
         ("maxBudgetUsd", 1.0, "archon_budget_enforcement_unavailable"),
         ("sandbox", {"enabled": True}, "archon_sandbox_enforcement_unavailable"),
     ],
@@ -232,6 +230,32 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("timeout", 1000),
+        ("retry", {"max_attempts": 2}),
+    ],
+)
+def test_archon_phase3_timeout_and_retry_fields_validate(
+    workflow_writer, tmp_path, capsys, field, value
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    result = _json_result(capsys)
+    assert result["valid"] is True
+    assert result["issues"] == []
+    assert result["language"]["normalizer_version"] == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("output_format", {"type": "object"}),
         ("output_type", "report"),
     ],
@@ -263,7 +287,7 @@ def test_archon_validate_text_reports_field_specific_compatibility_finding(
     workflow_writer, tmp_path, capsys
 ):
     path = _archon_package(
-        workflow_writer, tmp_path, field="timeout", value=1000
+        workflow_writer, tmp_path, field="maxBudgetUsd", value=1.0
     )
     args = _parser().parse_args([
         "--workdir",
@@ -275,9 +299,9 @@ def test_archon_validate_text_reports_field_specific_compatibility_finding(
     assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
     output = capsys.readouterr()
     assert output.err == ""
-    assert "archon-timeout: invalid" in output.out
-    assert "nodes[0].timeout" in output.out
-    assert "Archon timeout semantics are not enforceable in Phase 1" in output.out
+    assert "archon-maxBudgetUsd: invalid" in output.out
+    assert "nodes[0].maxBudgetUsd" in output.out
+    assert "Archon budget enforcement is not available in Phase 1" in output.out
 
 
 def test_module_entrypoint_propagates_blocking_doctor_exit(
@@ -288,7 +312,7 @@ def test_module_entrypoint_propagates_blocking_doctor_exit(
     path = workflow_writer(
         workdir / ".hermes" / "workflows",
         name="sample",
-        nodes=[{"id": "start", "bash": "true", "timeout": 1_000}],
+        nodes=[{"id": "start", "prompt": "work", "maxBudgetUsd": 1.0}],
     )
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n",
@@ -363,7 +387,7 @@ def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
 ):
     """Catch doctor text that omits actionable safe finding diagnostics."""
     path = _archon_package(
-        workflow_writer, tmp_path, field="timeout", value=1_000
+        workflow_writer, tmp_path, field="maxBudgetUsd", value=1.0
     )
     args = _parser().parse_args([
         "--workdir",
@@ -377,9 +401,9 @@ def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
     output = capsys.readouterr()
     assert output.err == ""
-    assert "archon_timeout_semantics_unavailable" in output.out
-    assert "nodes[0].timeout" in output.out
-    assert "Remove timeout or wait for Phase 3 timeout semantics." in output.out
+    assert "archon_budget_enforcement_unavailable" in output.out
+    assert "nodes[0].maxBudgetUsd" in output.out
+    assert "Remove maxBudgetUsd or wait for Phase 5 budget enforcement." in output.out
     assert "SECRET_BODY" not in output.out
     assert str(tmp_path) not in output.out
 

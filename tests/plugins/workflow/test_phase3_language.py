@@ -308,6 +308,38 @@ def test_archon_v3_rejects_inapplicable_requested_semantics(
             {"id": "agent", "prompt": "work", "retry": {"on_error": []}},
             "archon_retry_invalid",
         ),
+        (
+            {"id": "agent", "prompt": "work", "retry": None},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "shell", "bash": "true", "retry": None},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "agent", "prompt": "work", "retry": {"max_attempts": None}},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "shell", "bash": "true", "retry": {"max_attempts": None}},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "agent", "prompt": "work", "retry": {"delay_ms": None}},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "shell", "bash": "true", "retry": {"delay_ms": None}},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "agent", "prompt": "work", "retry": {"on_error": None}},
+            "archon_retry_invalid",
+        ),
+        (
+            {"id": "shell", "bash": "true", "retry": {"on_error": None}},
+            "archon_retry_invalid",
+        ),
     ],
 )
 def test_archon_v3_rejects_invalid_requested_semantics(
@@ -383,25 +415,54 @@ def test_phase3_archon_fields_are_implemented_and_legacy_guidance_is_exact(
         tmp_path / "legacy",
         nodes=[
             {
-                "id": "shell",
+                "id": "single-shell",
                 "bash": "true",
                 "timeout": 120,
+                "retry": {"max_attempts": 1},
+                "output_format": {"type": "object"},
+                "output_type": "report",
+            },
+            {
+                "id": "retried-shell",
+                "bash": "true",
                 "retry": {"max_attempts": 3},
-            }
+            },
+            {
+                "id": "single-agent",
+                "prompt": "choose",
+                "retry": {"max_attempts": 1},
+            },
         ],
     )
 
     archon_codes = {
         finding.code for finding in load_workflow(archon_path).compatibility_findings
     }
-    legacy_findings = {
-        finding.code: finding for finding in load_workflow(legacy_path).compatibility_findings
-    }
+    legacy_findings = load_workflow(legacy_path).compatibility_findings
+    by_path = {finding.path: finding for finding in legacy_findings}
 
     assert not {
         "archon_timeout_semantics_unavailable",
         "archon_idle_timeout_semantics_unavailable",
         "archon_retry_semantics_unavailable",
     } & archon_codes
-    assert "milliseconds" in legacy_findings["legacy_timeout_seconds"].migration
-    assert "N - 1" in legacy_findings["legacy_retry_total_attempts"].migration
+    assert "1,000" in by_path["nodes[0].timeout"].migration
+    assert "omit retry" in by_path["nodes[0].retry.max_attempts"].migration
+    assert "N - 1" in by_path["nodes[1].retry.max_attempts"].migration
+    assert "cannot migrate" in by_path["nodes[2].retry.max_attempts"].migration
+    assert "three total attempts" in by_path["nodes[2].retry.max_attempts"].migration
+
+    profile_guidance = by_path["sidecar.language_compatibility"].migration
+    assert "directly to depends_on" in profile_guidance
+    assert "output_format" in profile_guidance
+    assert ".field" in profile_guidance
+    assert "structured scalar decision value" in profile_guidance
+    assert "32,768" in profile_guidance
+    assert "pathname" in profile_guidance
+
+    output_format_guidance = by_path["nodes[0].output_format"].migration
+    output_type_guidance = by_path["nodes[0].output_type"].migration
+    assert "Phase 2" not in output_format_guidance
+    assert "Phase 2" not in output_type_guidance
+    assert "before using .field" in output_format_guidance
+    assert "output_format" in output_type_guidance
