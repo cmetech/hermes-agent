@@ -19,6 +19,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionResult,
     process_tree_active,
 )
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.resources import (
     ResourceResolver,
     VariableContext,
@@ -153,14 +154,19 @@ class ScriptExecutor:
                 error_code="runtime_missing",
                 error_message=f"script runtime is not installed: {runtime}",
             )
-        try:
-            argv, warnings, source_bytes = self._execution_plan(
-                context, runtime_path
-            )
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            return NodeExecutionResult(
-                "failed", error_code="validation", error_message=str(exc)
-            )
+        strict_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and isinstance(context.variable_context, VariableContext)
+            and context.variable_context.normalizer_version == 3
+        )
+        execution_plan = None
+        if strict_v3:
+            try:
+                execution_plan = self._execution_plan(context, runtime_path)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                return NodeExecutionResult(
+                    "failed", error_code="validation", error_message=str(exc)
+                )
         attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
@@ -168,6 +174,14 @@ class ScriptExecutor:
         artifacts_dir = context.run_directory / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
         artifacts_before = _artifact_snapshot(artifacts_dir)
+        if execution_plan is None:
+            try:
+                execution_plan = self._execution_plan(context, runtime_path)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                return NodeExecutionResult(
+                    "failed", error_code="validation", error_message=str(exc)
+                )
+        argv, warnings, source_bytes = execution_plan
         allowed_env = {
             key: value
             for key, value in os.environ.items()

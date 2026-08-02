@@ -15,8 +15,10 @@ from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorS
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.output_resolution import (
     ArchonOutputUnavailableError,
+    ResolvedOutputReference,
     WorkflowOutputReferenceError,
 )
+from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import ArtifactRef, RunStore
@@ -673,6 +675,58 @@ def test_scheduler_preflights_noncondition_reference_before_claim(
     assert consumer["attempts"] == []
     assert consumer["retry_consumed"] == 0
     assert scheduler._resolved_output_cache == {}
+
+
+def test_preclaim_snapshot_is_the_only_read_authority_carried_into_executor(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store, run_id = _start_noncondition_reference_run(
+        tmp_path, workflow_writer, name="resolution-preclaim-snapshot"
+    )
+    scheduler = RunScheduler(store)
+    real_output_values = scheduler._output_values
+    real_resolve_reference = scheduler_module.resolve_output_reference
+    read_calls = 0
+    preflight_facets: list[ResolvedOutputReference] = []
+    executor_facets: list[ResolvedOutputReference] = []
+
+    def one_authoritative_read(*args, **kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls > 1:
+            raise ArchonOutputUnavailableError(
+                "cache eviction exposed a forbidden post-claim storage reread"
+            )
+        values = real_output_values(*args, **kwargs)
+        scheduler._purge_run_output_cache(run_id)
+        return values
+
+    def record_preflight_facet(*args, **kwargs):
+        facet = real_resolve_reference(*args, **kwargs)
+        preflight_facets.append(facet)
+        return facet
+
+    class CapturingExecutor:
+        def execute(self, context):
+            assert context.output_resolver is not None
+            executor_facets.append(context.output_resolver("producer", ()))
+            return NodeExecutionResult("succeeded")
+
+    monkeypatch.setattr(scheduler, "_output_values", one_authoritative_read)
+    monkeypatch.setattr(
+        scheduler_module, "resolve_output_reference", record_preflight_facet
+    )
+    scheduler.executors["bash"] = CapturingExecutor()
+
+    result = scheduler.advance(run_id, max_nodes=1)
+
+    consumer = result["nodes"]["consumer"]
+    assert consumer["state"] == "succeeded"
+    assert len(consumer["attempts"]) == 1
+    assert read_calls == 1
+    assert len(preflight_facets) == 1
+    assert executor_facets == [preflight_facets[0]]
+    assert executor_facets[0] is preflight_facets[0]
 
 
 def test_scheduler_preflight_terminal_reference_failure_is_zero_attempt(

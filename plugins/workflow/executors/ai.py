@@ -673,7 +673,12 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
-        prompt = self._prompt(context)
+        strict_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and isinstance(context.variable_context, VariableContext)
+            and context.variable_context.normalizer_version == 3
+        )
+        prompt = self._prompt(context) if strict_v3 else None
         materializer: AuthenticatedExecutionMaterializer | None = None
         try:
             agent_runner = entitled_agent_runner(
@@ -898,7 +903,7 @@ class AgentNodeExecutor:
             if web_mode is not None:
                 request_overrides["web_search_mode"] = web_mode
             request = PluginAgentRunRequest(
-                prompt=prompt,
+                prompt=prompt if prompt is not None else self._prompt(context),
                 provider=(
                     self._requested_provider(context)
                     if structured_request is not None

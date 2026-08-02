@@ -12,7 +12,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
@@ -304,11 +304,14 @@ def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Pa
             )
         },
     )
-    context = _context(
-        tmp_path,
-        runtime="uv",
-        script="print('$producer.output.answer')\n",
-        variable_context=variables,
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('$producer.output.answer')\n",
+            variable_context=variables,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
     )
 
     with pytest.raises(WorkflowOutputReferenceError) as exc:
@@ -316,6 +319,23 @@ def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Pa
 
     assert exc.value.code == "output_reference_not_declared_dependency"
     assert not (context.run_directory / "nodes").exists()
+
+
+@pytest.mark.parametrize("runtime", ("uv", "bun"))
+def test_legacy_missing_named_script_preserves_attempt_tree_before_validation(
+    tmp_path: Path,
+    runtime: str,
+) -> None:
+    context = _context(tmp_path, runtime=runtime, script="missing")
+
+    result = ScriptExecutor(runtime_locator=lambda selected: f"/fake/{selected}").execute(
+        context
+    )
+
+    assert result.error_code == "validation"
+    attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+    assert attempt.is_dir()
+    assert (context.run_directory / "artifacts").is_dir()
 
 
 def test_v3_named_script_bytes_are_never_interpolated(tmp_path: Path) -> None:

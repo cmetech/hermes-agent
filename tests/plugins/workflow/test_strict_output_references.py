@@ -1271,6 +1271,37 @@ def test_v3_renderer_uses_immutable_whole_and_field_facets_without_rescanning() 
     )
 
 
+@pytest.mark.parametrize(
+    "template",
+    (
+        "$producer.output.1-child",
+        "$producer.output-field",
+        "$producer.output..answer",
+        "$producer.output[answer]",
+    ),
+)
+def test_v3_renderer_rejects_noncanonical_candidates_without_partial_substitution(
+    template: str,
+) -> None:
+    renderer = substitution_renderer(
+        VariableContext(
+            node_outputs={
+                "producer": _resolved_output({
+                    "1-child": "must-not-render",
+                    "answer": "must-not-render",
+                })
+            },
+            normalizer_version=3,
+        ),
+        direct_dependencies=("producer",),
+    )
+
+    with pytest.raises(output_resolution.WorkflowOutputReferenceError) as exc:
+        renderer.render_prompt(template)
+
+    assert exc.value.code == "output_reference_path_unsupported"
+
+
 def test_v3_resolver_requires_publication_path_and_full_schema_identity(
     tmp_path: Path,
 ) -> None:

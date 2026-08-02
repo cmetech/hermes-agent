@@ -16,6 +16,7 @@ from agent.structured_output import StructuredOutputStrategy, normalize_schema
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow import output_resolution
 import plugins.workflow.executors.ai as ai_executor_module
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.models import (
@@ -1792,6 +1793,81 @@ def test_v3_prompt_reference_failure_escapes_ai_executor_before_provider(
         AgentNodeExecutor(runner).execute(context)
 
     assert exc.value.code == "output_reference_field_missing"
+    assert runner.requests == []
+
+
+def _legacy_missing_command_context(
+    tmp_path: Path,
+    *,
+    entitlement=None,
+    shared: bool = False,
+) -> NodeExecutionContext:
+    node = WorkflowNode(
+        id="consumer",
+        node_type="command",
+        value="missing",
+        depends_on=("producer",) if shared else (),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({"context": "shared"} if shared else {}),
+    )
+    kwargs = {}
+    if entitlement is not None:
+        kwargs["ai_entitlement"] = entitlement
+    if shared:
+        kwargs["predecessor_results"] = {
+            "producer": {
+                "session_id": "session-old",
+                "cache_fingerprint": "incompatible",
+            }
+        }
+    return _context(tmp_path, node, **kwargs)
+
+
+def test_legacy_missing_command_preserves_unavailable_runner_precedence(
+    tmp_path: Path,
+) -> None:
+    result = AgentNodeExecutor(None).execute(_legacy_missing_command_context(tmp_path))
+
+    assert result.error_code == "agent_runner_unavailable"
+
+
+def test_legacy_missing_command_preserves_entitlement_integrity_precedence(
+    tmp_path: Path,
+) -> None:
+    result = AgentNodeExecutor(FakeAgentRunner("unused")).execute(
+        _legacy_missing_command_context(
+            tmp_path,
+            entitlement=AIEntitlementResolution(
+                "real",
+                error_code="execution_integrity",
+                error_message="sealed entitlement mismatch",
+            ),
+        )
+    )
+
+    assert result.error_code == "execution_integrity"
+
+
+def test_legacy_missing_command_preserves_shared_context_precedence(
+    tmp_path: Path,
+) -> None:
+    runner = FakeAgentRunner("unused")
+    result = AgentNodeExecutor(runner).execute(
+        _legacy_missing_command_context(tmp_path, shared=True)
+    )
+
+    assert result.error_code == "context_incompatible"
+    assert runner.requests == []
+
+
+def test_legacy_missing_command_with_runner_remains_guarded_network_failure(
+    tmp_path: Path,
+) -> None:
+    runner = FakeAgentRunner("unused")
+    result = AgentNodeExecutor(runner).execute(_legacy_missing_command_context(tmp_path))
+
+    assert result.error_code == "network_error"
     assert runner.requests == []
 
 

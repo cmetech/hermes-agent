@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
@@ -67,6 +67,7 @@ from plugins.workflow.output_resolution import (
     PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
     PrimaryOutputCandidate,
     ResolvedNodeOutput,
+    ResolvedOutputReference,
     WorkflowOutputReferenceError,
     primary_output_candidate_from_identity,
     primary_output_candidate_identity,
@@ -108,6 +109,26 @@ _CLAUSE = re.compile(
     re.UNICODE,
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _StrictReferenceSnapshot:
+    """Immutable pre-claim output authority carried into one executor claim."""
+
+    outputs: Mapping[
+        str, ResolvedNodeOutput | WorkflowOutputReferenceError
+    ]
+    references: Mapping[tuple[str, tuple[str, ...]], ResolvedOutputReference]
+
+    def resolve(
+        self, node_id: str, path: tuple[str, ...]
+    ) -> ResolvedOutputReference:
+        try:
+            return self.references[(node_id, tuple(path))]
+        except KeyError as exc:
+            raise WorkflowOutputReferenceError(
+                "output_reference_integrity", node_id, tuple(path)
+            ) from exc
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
 _OUTPUT_RESOLUTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
@@ -1059,6 +1080,9 @@ class RunScheduler:
         sealed_resource_paths: frozenset[str] | None = None,
         sealed_resource_bytes: Mapping[str, bytes] | None = None,
         output_node_ids: Iterable[str] | None = None,
+        resolved_outputs: Mapping[
+            str, ResolvedNodeOutput | WorkflowOutputReferenceError
+        ] | None = None,
     ):
         arguments = ""
         if sealed_resource_bytes is not None:
@@ -1083,15 +1107,20 @@ class RunScheduler:
                     arguments = self._read_text(
                         run_directory / entry["relative_path"]
                     )
+        raw_outputs = (
+            resolved_outputs
+            if resolved_outputs is not None
+            else self._output_values(
+                projection,
+                run_directory,
+                node_ids=output_node_ids,
+            )
+        )
         outputs = {
             node: value
             if isinstance(value, str | ResolvedNodeOutput | WorkflowOutputReferenceError)
             else json.dumps(value, sort_keys=True)
-            for node, value in self._output_values(
-                projection,
-                run_directory,
-                node_ids=output_node_ids,
-            ).items()
+            for node, value in raw_outputs.items()
         }
         language_snapshot = read_language_snapshot(projection.get("language"))
         return VariableContext(
@@ -1362,7 +1391,7 @@ class RunScheduler:
         projection: Mapping[str, object],
         *,
         condition: bool,
-    ) -> bool:
+    ) -> bool | ResolvedNodeOutput:
         """Fence a due wake to its retained producer before any other read."""
         current = self.store.load_run(run_id)["nodes"][node.id]
         retained = current.get("resolution_producer_identity")
@@ -1427,10 +1456,12 @@ class RunScheduler:
             producer_identity=resolved_output_publication_identity(output),
         )
         refreshed = self.store.load_run(run_id)["nodes"][node.id]
-        return (
+        if (
             refreshed.get("state") in {"pending", "ready"}
             and "resolution_producer_identity" not in refreshed
-        )
+        ):
+            return output
+        return False
 
     def _preflight_strict_node_references(
         self,
@@ -1441,7 +1472,7 @@ class RunScheduler:
         *,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
-    ) -> bool:
+    ) -> bool | _StrictReferenceSnapshot:
         """Resolve v3 references before claim without rendering Task 7 consumers."""
         if (
             package.language.effective_profile
@@ -1449,12 +1480,13 @@ class RunScheduler:
             or package.language.normalizer_version != 3
         ):
             return True
-        if not self._revalidate_retained_output_resolution(
+        retained_output = self._revalidate_retained_output_resolution(
             run_id,
             node,
             projection,
             condition=False,
-        ):
+        )
+        if not retained_output:
             return False
         run_directory = self.store.run_directory(run_id)
         references = tuple(dict.fromkeys(
@@ -1469,25 +1501,41 @@ class RunScheduler:
                 template, normalizer_version=3
             )
         ))
-        if not references:
-            return True
-        outputs = self._output_values(
-            projection,
-            run_directory,
-            node_ids=(producer_id for producer_id, _path in references),
+        retained_node_id = (
+            retained_output.node_id
+            if isinstance(retained_output, ResolvedNodeOutput)
+            else None
         )
+        remaining_dependencies = tuple(
+            dependency
+            for dependency in node.depends_on
+            if dependency != retained_node_id
+        )
+        outputs = (
+            self._output_values(
+                projection,
+                run_directory,
+                node_ids=remaining_dependencies,
+            )
+            if remaining_dependencies
+            else {}
+        )
+        if isinstance(retained_output, ResolvedNodeOutput):
+            outputs[retained_output.node_id] = retained_output
         resolved_identities: list[dict[str, object]] = []
+        resolved_references: dict[
+            tuple[str, tuple[str, ...]], ResolvedOutputReference
+        ] = {}
         try:
             for producer_id, path in references:
                 output = outputs.get(producer_id)
                 if isinstance(output, WorkflowOutputReferenceError):
                     raise output
-                resolved = resolve_output_reference(
+                resolved_references[(producer_id, path)] = resolve_output_reference(
                     output if isinstance(output, ResolvedNodeOutput) else None,
                     node_id=producer_id,
                     path=path,
                 )
-                del resolved
                 assert isinstance(output, ResolvedNodeOutput)
                 resolved_identities.append(
                     resolved_output_publication_identity(output)
@@ -1541,7 +1589,10 @@ class RunScheduler:
                     message="output reference producer identity changed during resolution",
                 )
                 return False
-        return True
+        return _StrictReferenceSnapshot(
+            outputs=MappingProxyType(dict(outputs)),
+            references=MappingProxyType(resolved_references),
+        )
 
     def _load_verified_run_package(
         self,
@@ -2753,6 +2804,7 @@ class RunScheduler:
         node: WorkflowNode,
         package,
         projection: dict[str, object],
+        strict_reference_snapshot: _StrictReferenceSnapshot | None,
         execution_limits: RunExecutionLimits,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
@@ -2866,6 +2918,11 @@ class RunScheduler:
                             if package.language.normalizer_version == 3
                             else None
                         ),
+                        resolved_outputs=(
+                            strict_reference_snapshot.outputs
+                            if strict_reference_snapshot is not None
+                            else None
+                        ),
                     )
                     loop_input = projection["nodes"][node.id].get(
                         "loop_user_input_artifact"
@@ -2904,7 +2961,9 @@ class RunScheduler:
                             workflow_options=package.definition.options,
                             variable_context=variables,
                             output_resolver=(
-                                variables.output_reference
+                                strict_reference_snapshot.resolve
+                                if strict_reference_snapshot is not None
+                                else variables.output_reference
                                 if package.language.normalizer_version == 3
                                 else None
                             ),
@@ -3368,11 +3427,14 @@ class RunScheduler:
                     "waiting_retry",
                 }:
                     break
-                ready = [
-                    node_id
-                    for node_id in sorted(projection["nodes"])
-                    if projection["nodes"][node_id]["state"] == "ready"
-                    and self._preflight_strict_node_references(
+                ready: list[str] = []
+                strict_reference_snapshots: dict[
+                    str, _StrictReferenceSnapshot
+                ] = {}
+                for node_id in sorted(projection["nodes"]):
+                    if projection["nodes"][node_id]["state"] != "ready":
+                        continue
+                    preflight = self._preflight_strict_node_references(
                         run_id,
                         by_id[node_id],
                         package,
@@ -3380,7 +3442,11 @@ class RunScheduler:
                         sealed_resource_paths=sealed_resource_paths,
                         sealed_resource_bytes=sealed_resource_bytes,
                     )
-                ]
+                    if not preflight:
+                        continue
+                    ready.append(node_id)
+                    if isinstance(preflight, _StrictReferenceSnapshot):
+                        strict_reference_snapshots[node_id] = preflight
                 remaining = None if max_nodes is None else max_nodes - executed
                 capacity = min(
                     self.max_parallel_nodes,
@@ -3424,9 +3490,14 @@ class RunScheduler:
                         fence_lost = True
                         break
                     if claim is not None:
-                        claims.append((claim, by_id[node_id], projection))
+                        claims.append((
+                            claim,
+                            by_id[node_id],
+                            projection,
+                            strict_reference_snapshots.get(node_id),
+                        ))
                 if fence_lost:
-                    for claim, _node, _projection in claims:
+                    for claim, _node, _projection, _strict_snapshot in claims:
                         self.store.release_claim_before_execution(claim)
                     break
                 if not claims:
@@ -3443,11 +3514,12 @@ class RunScheduler:
                             node,
                             package,
                             snapshot,
+                            strict_snapshot,
                             execution_limits,
                             sealed_resource_paths,
                             sealed_resource_bytes,
                         )
-                        for claim, node, snapshot in claims
+                        for claim, node, snapshot, strict_snapshot in claims
                     ]
                     for future in futures:
                         future.result()
@@ -3553,6 +3625,9 @@ class RunScheduler:
                         future.result()
                 candidates: dict[str, list[str]] = {}
                 snapshots = {}
+                strict_reference_snapshots: dict[
+                    tuple[str, str], _StrictReferenceSnapshot
+                ] = {}
                 active = []
                 for run_id in run_ids:
                     if not self._renew_execution_owner(run_id):
@@ -3580,11 +3655,11 @@ class RunScheduler:
                         continue
                     active.append(run_id)
                     snapshots[run_id] = projection
-                    candidates[run_id] = [
-                        node_id
-                        for node_id in sorted(projection["nodes"])
-                        if projection["nodes"][node_id]["state"] == "ready"
-                        and self._preflight_strict_node_references(
+                    candidates[run_id] = []
+                    for node_id in sorted(projection["nodes"]):
+                        if projection["nodes"][node_id]["state"] != "ready":
+                            continue
+                        preflight = self._preflight_strict_node_references(
                             run_id,
                             next(
                                 node
@@ -3596,7 +3671,11 @@ class RunScheduler:
                             sealed_resource_paths=sealed_resource_paths[run_id],
                             sealed_resource_bytes=sealed_resource_bytes[run_id],
                         )
-                    ]
+                        if not preflight:
+                            continue
+                        candidates[run_id].append(node_id)
+                        if isinstance(preflight, _StrictReferenceSnapshot):
+                            strict_reference_snapshots[(run_id, node_id)] = preflight
                 if not active and not futures:
                     break
                 claims = []
@@ -3687,6 +3766,7 @@ class RunScheduler:
                             node,
                             packages[run_id],
                             snapshots[run_id],
+                            strict_reference_snapshots.get((run_id, node_id)),
                             execution_limits[run_id],
                             sealed_resource_paths[run_id],
                             sealed_resource_bytes[run_id],
@@ -3704,6 +3784,7 @@ class RunScheduler:
                         _node,
                         _package,
                         _snapshot,
+                        _strict_snapshot,
                         _limits,
                         _sealed_paths,
                         _sealed_bytes,

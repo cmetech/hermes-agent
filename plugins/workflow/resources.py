@@ -14,11 +14,15 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 import yaml
 
-from plugins.workflow.language_schema import iter_output_references
+from plugins.workflow.language_schema import (
+    WorkflowReferenceSyntaxError,
+    iter_output_references,
+)
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     ResolvedOutputReference,
@@ -42,6 +46,12 @@ _VARIABLE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|"
     r"(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output(?:\.(?P<dot>[A-Za-z0-9_.-]+))?|"
     r"(?P<name>[A-Z][A-Z0-9_]*))"
+)
+_SCALAR_VARIABLE = re.compile(
+    r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"
+)
+_REFERENCE_NODE_CANDIDATE = re.compile(
+    r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
 )
 
 
@@ -752,24 +762,115 @@ class StrictSubstitutionRenderer:
         resolver = self.output_resolver or self.variables.output_reference
         return resolver(node_id, path).rendered_text
 
-    def _value(self, match: re.Match[str]) -> str | None:
-        node_id = match.group("node")
-        if node_id is not None:
-            raw_path = match.group("dot")
-            return self._output(
-                node_id,
-                tuple(raw_path.split(".")) if raw_path else (),
+    @staticmethod
+    def _references(template: str):
+        try:
+            return tuple(iter_output_references(template, normalizer_version=3))
+        except WorkflowReferenceSyntaxError as exc:
+            candidate = _REFERENCE_NODE_CANDIDATE.search(template)
+            raise WorkflowOutputReferenceError(
+                exc.code,
+                candidate.group("node") if candidate is not None else "invalid",
+            ) from exc
+
+    def resolve_outputs(
+        self, *templates: str
+    ) -> Mapping[tuple[str, tuple[str, ...]], ResolvedOutputReference]:
+        """Resolve each canonical output facet once without rendering text."""
+        resolved: dict[
+            tuple[str, tuple[str, ...]], ResolvedOutputReference
+        ] = {}
+        resolver = self.output_resolver or self.variables.output_reference
+        for template in templates:
+            for reference in self._references(template):
+                key = (reference.node_id, reference.path)
+                if key in resolved:
+                    continue
+                if reference.node_id not in self.direct_dependencies:
+                    raise WorkflowOutputReferenceError(
+                        "output_reference_not_declared_dependency",
+                        reference.node_id,
+                        reference.path,
+                    )
+                resolved[key] = resolver(reference.node_id, reference.path)
+        return MappingProxyType(resolved)
+
+    def _scalar(self, match: re.Match[str]) -> str | None:
+        position = match.group("position")
+        if position is not None:
+            try:
+                values = shlex.split(self.variables.arguments)
+            except ValueError:
+                values = self.variables.arguments.split()
+            index = int(position) - 1
+            return values[index] if index < len(values) else ""
+        values = {
+            "ARGUMENTS": self.variables.arguments,
+            "USER_MESSAGE": self.variables.user_message,
+            "ARTIFACTS_DIR": (
+                str(self.variables.artifacts_dir)
+                if self.variables.artifacts_dir
+                else ""
+            ),
+            "WORKFLOW_ID": self.variables.workflow_id,
+            "BASE_BRANCH": self.variables.base_branch,
+            "DOCS_DIR": str(self.variables.docs_dir) if self.variables.docs_dir else "",
+            "CONTEXT": self.variables.context,
+            "LOOP_USER_INPUT": self.variables.loop_user_input,
+            "LOOP_PREV_OUTPUT": self.variables.loop_prev_output,
+            "REJECTION_REASON": self.variables.rejection_reason,
+        }
+        return values.get(match.group("name"))
+
+    def _substitutions(
+        self,
+        template: str,
+        *,
+        include_scalar_variables: bool,
+    ) -> tuple[tuple[int, int, str], ...]:
+        references = self._references(template)
+        substitutions = [
+            (
+                reference.start,
+                reference.end,
+                self._output(reference.node_id, reference.path),
             )
-        return self.variables._value(match)
+            for reference in references
+        ]
+        if include_scalar_variables:
+            for match in _SCALAR_VARIABLE.finditer(template):
+                value = self._scalar(match)
+                if value is not None:
+                    substitutions.append((match.start(), match.end(), value))
+        substitutions.sort(key=lambda item: item[0])
+        return tuple(substitutions)
+
+    @staticmethod
+    def _replace(
+        template: str,
+        substitutions: Iterable[tuple[int, int, str]],
+    ) -> str:
+        rendered: list[str] = []
+        position = 0
+        for start, end, value in substitutions:
+            rendered.extend((template[position:start], value))
+            position = end
+        rendered.append(template[position:])
+        return "".join(rendered)
+
+    def render_outputs(self, template: str) -> str:
+        """Resolve only canonical output tokens, leaving dynamic variables intact."""
+        return self._replace(
+            template,
+            self._substitutions(template, include_scalar_variables=False),
+        )
 
     def render_prompt(self, template: str) -> str:
         """Render only the requested initial body; replacements are not rescanned."""
-
-        def replace(match: re.Match[str]) -> str:
-            value = self._value(match)
-            return match.group(0) if value is None else value
-
-        return _VARIABLE.sub(replace, template)
+        return self._replace(
+            template,
+            self._substitutions(template, include_scalar_variables=True),
+        )
 
     def render_bash(
         self,
@@ -781,27 +882,28 @@ class StrictSubstitutionRenderer:
         """Keep the existing loop Bash materialization with strict references."""
         if max_inline_chars <= 0:
             raise ValueError("max_inline_chars must be positive")
-        resolved_values = tuple(
-            self._value(match) for match in _VARIABLE.finditer(template)
+        substitutions = self._substitutions(
+            template,
+            include_scalar_variables=True,
         )
         root = Path(spill_directory).resolve()
         root.mkdir(parents=True, exist_ok=True)
-        values = iter(resolved_values)
-
-        def replace(match: re.Match[str]) -> str:
-            value = next(values)
-            if value is None:
-                return match.group(0)
+        rendered: list[str] = []
+        position = 0
+        for start, end, raw_value in substitutions:
+            rendered.append(template[position:start])
+            value = raw_value
             if len(value) > max_inline_chars:
                 digest = hashlib.sha256(value.encode()).hexdigest()[:16]
                 path = root / f"variable-{digest}.txt"
                 path.write_text(value, encoding="utf-8")
                 value = str(path)
-            return _quote_shell_value(
-                value, _shell_quote_context(template, match.start())
+            rendered.append(
+                _quote_shell_value(value, _shell_quote_context(template, start))
             )
-
-        return _VARIABLE.sub(replace, template)
+            position = end
+        rendered.append(template[position:])
+        return "".join(rendered)
 
 
 def substitution_renderer(

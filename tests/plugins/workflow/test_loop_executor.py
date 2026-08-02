@@ -9,7 +9,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.loop import LoopExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
@@ -50,6 +50,7 @@ def _context(
 ) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
     run_directory.mkdir(exist_ok=True)
+    variables = variable_context or VariableContext(workflow_id="run-1")
     return NodeExecutionContext(
         run_id="run-1",
         run_directory=run_directory,
@@ -68,7 +69,12 @@ def _context(
             "provider": "fake-provider",
             "model": "fake-model",
         }),
-        variable_context=variable_context or VariableContext(workflow_id="run-1"),
+        variable_context=variables,
+        language_profile=(
+            WorkflowLanguageProfile.ARCHON_2026_07
+            if variables.normalizer_version == 3
+            else WorkflowLanguageProfile.HERMES_LEGACY
+        ),
         node_state=node_state or {},
         is_cancelled=is_cancelled,
     )
@@ -281,7 +287,85 @@ def test_v3_until_bash_reference_failure_precedes_spill_side_effect(tmp_path) ->
         LoopExecutor(runner).execute(context)
 
     assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
     assert list(context.run_directory.glob("**/until-0001-variables")) == []
+
+
+def test_v3_until_bash_field_failure_precedes_provider_and_bash_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Work",
+            "until": "DONE",
+            "until_bash": "test $producer.output.missing = ready",
+            "max_iterations": 2,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+    bash_calls: list[NodeExecutionContext] = []
+
+    def reject_bash(_self, bash_context):
+        bash_calls.append(bash_context)
+        pytest.fail("Bash launched before until_bash strict preflight")
+
+    monkeypatch.setattr(
+        "plugins.workflow.executors.bash.BashExecutor.execute",
+        reject_bash,
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_field_missing"
+    assert runner.requests == []
+    assert bash_calls == []
+    assert not (context.run_directory / "nodes").exists()
+
+
+def test_v3_until_bash_preflight_keeps_loop_previous_output_dynamic(tmp_path) -> None:
+    runner = FakeAgentRunner("first value", "second value")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Previous: $LOOP_PREV_OUTPUT",
+            "until": "DONE",
+            "until_bash": "test $LOOP_PREV_OUTPUT = 'second value'",
+            "max_iterations": 2,
+            "fresh_context": True,
+        },
+        variable_context=VariableContext(normalizer_version=3),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert [request.prompt for request in runner.requests] == [
+        "Previous: ",
+        "Previous: first value",
+    ]
 
 
 def test_interactive_loop_pauses_and_resume_injects_user_input_fresh(

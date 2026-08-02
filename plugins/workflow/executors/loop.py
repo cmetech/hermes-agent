@@ -11,7 +11,7 @@ from typing import Mapping
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
@@ -99,6 +99,31 @@ class LoopExecutor:
         base_variables = context.variable_context
         if not isinstance(base_variables, VariableContext):
             base_variables = VariableContext(workflow_id=context.run_id)
+        until_bash_template = loop.get("until_bash")
+        loop_output_resolver = context.output_resolver
+        if (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and base_variables.normalizer_version == 3
+        ):
+            strict_renderer = substitution_renderer(
+                base_variables,
+                direct_dependencies=context.node.depends_on,
+                output_resolver=context.output_resolver,
+            )
+            reference_snapshot = strict_renderer.resolve_outputs(
+                prompt,
+                until_bash_template if isinstance(until_bash_template, str) else "",
+            )
+
+            def frozen_output_resolver(node_id, path):
+                return reference_snapshot[(node_id, tuple(path))]
+
+            loop_output_resolver = frozen_output_resolver
+            strict_renderer = replace(
+                strict_renderer,
+                output_resolver=frozen_output_resolver,
+            )
+            prompt = strict_renderer.render_outputs(prompt)
         previous_output = ""
         previous_metadata: Mapping[str, object] | None = None
         resumed = isinstance(previous_state, Mapping)
@@ -194,7 +219,7 @@ class LoopExecutor:
                 return NodeExecutionResult(
                     "succeeded", tuple(artifacts), metadata={"loop_state": state}
                 )
-            until_bash = loop.get("until_bash")
+            until_bash = until_bash_template
             if isinstance(until_bash, str) and until_bash:
                 bash_variables = replace(variables, loop_prev_output=cleaned)
                 spill = (
@@ -207,7 +232,7 @@ class LoopExecutor:
                 bash_renderer = substitution_renderer(
                     bash_variables,
                     direct_dependencies=context.node.depends_on,
-                    output_resolver=context.output_resolver,
+                    output_resolver=loop_output_resolver,
                 )
                 rendered = bash_renderer.render_bash(
                     until_bash,
