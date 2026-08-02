@@ -376,6 +376,42 @@ upstream_changes:
     including native Windows Job Object ownership and query-proven descendant
     quiescence across direct-child exit and recovery.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: managed-process-inherited-descriptors
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tools/managed_process.py
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ManagedProcessTree.spawn
+  owned_invariants:
+  - explicit bounded inherited_descriptors spawn contract
+  - exact POSIX descriptor inheritance with unrelated descriptors closed
+  - caller ownership of inherited descriptors across spawn success and failure
+  - native Windows nonempty inheritance requests fail closed before child creation
+  tests:
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(process): inherit bounded child descriptors'
+  upstream_candidate: true
+  merge_guidance: >-
+    Reconcile this narrow generic spawn seam with upstream process ownership.
+    Preserve validation of at most 64 unique open integer descriptors above
+    stdin/stdout/stderr, exact POSIX pass_fds inheritance with every unrelated
+    descriptor closed, caller ownership of nominated handles, and native Windows
+    fail-closed behavior for every nonempty request. Keep workflow values, spill
+    files, shell rendering, and evidence out of the managed-process primitive,
+    while retaining the historical Job Object, process identity, termination,
+    escalation, resource, and wait/reap contracts in the adjacent entry.
+  removal_condition: >-
+    Remove when upstream's generic managed-process primitive exposes equivalent
+    bounded exact child-descriptor inheritance on POSIX and fail-closed native
+    Windows behavior without weakening process-tree ownership or caller handle
+    ownership.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: plugin-agent-runner
   change_class: agent-core-generic
   owner: workflow-orchestration

@@ -47,6 +47,178 @@ def test_spawn_requires_a_nonempty_string_argv(argv) -> None:
         ManagedProcessTree.spawn(argv)
 
 
+@pytest.mark.parametrize(
+    ("inherited_descriptors", "expected_exception", "message"),
+    [
+        ([0], ValueError, "standard"),
+        ([1], ValueError, "standard"),
+        ([2], ValueError, "standard"),
+        ([-1], ValueError, "standard"),
+        ([3, 3], ValueError, "unique"),
+        ([True], TypeError, "integer"),
+        ([3.0], TypeError, "integer"),
+        (["3"], TypeError, "integer"),
+        (list(range(3, 68)), ValueError, "at most 64"),
+    ],
+)
+def test_spawn_rejects_invalid_inherited_descriptor_contract(
+    inherited_descriptors,
+    expected_exception,
+    message,
+) -> None:
+    with pytest.raises(expected_exception, match=message):
+        ManagedProcessTree.spawn(
+            _sleep_argv(0.01),
+            inherited_descriptors=inherited_descriptors,
+        )
+
+
+def test_spawn_rejects_raw_pass_fds_escape_hatch() -> None:
+    with pytest.raises(TypeError, match="inherited_descriptors"):
+        ManagedProcessTree.spawn(_sleep_argv(0.01), pass_fds=())
+
+
+def test_spawn_rejects_closed_inherited_descriptor() -> None:
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        with pytest.raises(ValueError, match="closed"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(0.01),
+                inherited_descriptors=[read_fd],
+            )
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_spawn_inherits_only_exact_nominated_read_only_descriptor() -> None:
+    inherited_read, inherited_write = os.pipe()
+    unrelated = os.open(__file__, os.O_RDONLY)
+    os.set_inheritable(unrelated, True)
+    payload = b"exact nominated bytes"
+    os.write(inherited_write, payload)
+    os.close(inherited_write)
+    code = (
+        "import os,sys;"
+        f"data=os.read({inherited_read},4096);"
+        f"\ntry: os.fstat({unrelated})\nexcept OSError: unrelated='closed'"
+        "\nelse: unrelated='open'"
+        "\nprint(data.decode(), unrelated, os.getsid(0)==os.getpid(), sep='|')"
+    )
+    tree = None
+    try:
+        tree = ManagedProcessTree.spawn(
+            [sys.executable, "-c", code],
+            inherited_descriptors=[inherited_read],
+            close_fds=False,
+        )
+        os.fstat(inherited_read)
+        stdout, _ = tree.process.communicate(timeout=5)
+        assert stdout.decode().strip() == "exact nominated bytes|closed|True"
+    finally:
+        if tree is not None:
+            tree.close()
+        os.close(inherited_read)
+        os.close(unrelated)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_descriptor_spawn_preserves_process_tree_termination() -> None:
+    read_fd, write_fd = os.pipe()
+    child_code = "import time; time.sleep(60)"
+    parent_code = (
+        "import os,subprocess,sys,time;"
+        f"os.read({read_fd},1);"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        "print(p.pid,flush=True);time.sleep(60)"
+    )
+    os.write(write_fd, b"x")
+    os.close(write_fd)
+    tree = ManagedProcessTree.spawn(
+        [sys.executable, "-c", parent_code],
+        inherited_descriptors=[read_fd],
+        policy=TerminationPolicy(
+            cooperative_grace_seconds=0,
+            term_grace_seconds=0.2,
+            kill_grace_seconds=0.5,
+            wait_timeout_seconds=1.0,
+        ),
+    )
+    os.close(read_fd)
+    assert tree.process.stdout is not None
+    descendant_pid = int(tree.process.stdout.readline().decode().strip())
+    try:
+        tree.terminate("descriptor tree cleanup")
+        assert tree.reaped is True
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                descendant = psutil.Process(descendant_pid)
+                if (
+                    not descendant.is_running()
+                    or descendant.status() == psutil.STATUS_ZOMBIE
+                ):
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"descendant pid {descendant_pid} survived managed cleanup")
+    finally:
+        if not tree.reaped:
+            tree.close()
+
+
+def test_spawn_failure_does_not_close_caller_owned_inherited_descriptor(
+    monkeypatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+    try:
+        with pytest.raises(OSError, match="spawn failed"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(),
+                inherited_descriptors=[read_fd],
+            )
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_windows_nonempty_inherited_descriptors_fail_before_job_creation(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    read_fd, write_fd = os.pipe()
+    created: list[bool] = []
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "create",
+        classmethod(lambda cls: created.append(True)),
+    )
+    try:
+        with pytest.raises(ValueError, match="Windows"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(),
+                inherited_descriptors=[read_fd],
+            )
+        assert created == []
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 @pytest.mark.live_system_guard_bypass
 def test_spawn_records_identity_and_close_reaps_child() -> None:
     tree = ManagedProcessTree.spawn(_sleep_argv())

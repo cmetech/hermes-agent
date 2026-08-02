@@ -36,6 +36,7 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _CREATE_SUSPENDED = 0x00000004
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
+_MAX_INHERITED_DESCRIPTORS = 64
 
 
 class _WindowsJob:
@@ -482,6 +483,7 @@ class ManagedProcessTree:
         argv: Sequence[str],
         *,
         policy: TerminationPolicy | None = None,
+        inherited_descriptors: Sequence[int] = (),
         **popen_kwargs: Any,
     ) -> "ManagedProcessTree":
         if isinstance(argv, (str, bytes)):
@@ -495,6 +497,33 @@ class ManagedProcessTree:
         if any(not part for part in argv):
             raise ValueError("argv elements must not be empty")
 
+        if isinstance(inherited_descriptors, (str, bytes)) or not isinstance(
+            inherited_descriptors, Sequence
+        ):
+            raise TypeError("inherited_descriptors must be a sequence of integers")
+        inherited = tuple(inherited_descriptors)
+        if len(inherited) > _MAX_INHERITED_DESCRIPTORS:
+            raise ValueError("inherited_descriptors accepts at most 64 descriptors")
+        if any(type(descriptor) is not int for descriptor in inherited):
+            raise TypeError("every inherited descriptor must be an integer")
+        if any(descriptor <= 2 for descriptor in inherited):
+            raise ValueError("standard and negative descriptors cannot be inherited")
+        if len(set(inherited)) != len(inherited):
+            raise ValueError("inherited descriptors must be unique")
+        if "pass_fds" in popen_kwargs:
+            raise TypeError(
+                "pass_fds is not supported; use inherited_descriptors instead"
+            )
+        if _IS_WINDOWS and inherited:
+            raise ValueError("inherited descriptors are not supported on native Windows")
+        for descriptor in inherited:
+            try:
+                os.fstat(descriptor)
+            except OSError as exc:
+                raise ValueError(
+                    f"inherited descriptor {descriptor} is closed"
+                ) from exc
+
         kwargs = dict(popen_kwargs)
         kwargs.setdefault("stdin", subprocess.DEVNULL)
         kwargs.setdefault("stdout", subprocess.PIPE)
@@ -506,6 +535,9 @@ class ManagedProcessTree:
             )
         else:
             kwargs.setdefault("start_new_session", True)
+            if inherited:
+                kwargs["close_fds"] = True
+                kwargs["pass_fds"] = inherited
 
         windows_job = _WindowsJob.create() if _IS_WINDOWS else None
         process = None
