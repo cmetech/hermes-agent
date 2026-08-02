@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
@@ -92,6 +92,34 @@ class NodeExecutionResult:
     error_message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     primary_output: PrimaryOutputCandidate | None = None
+
+
+def sealed_provider_request_for_launch(
+    context: NodeExecutionContext,
+    request: Any,
+) -> Any | None:
+    """Intersect a v3 provider handoff with the latest absolute attempt budget."""
+    if not context.sealed_attempt_timeout:
+        return request
+    if context.deadline_budget is None:
+        raise RuntimeError("sealed provider launch requires an attempt deadline")
+    remaining = context.deadline_budget.remaining_wall(context.monotonic())
+    if remaining <= 0:
+        return None
+    return replace(
+        request,
+        wall_timeout_seconds=remaining,
+        idle_timeout_seconds=min(
+            request.idle_timeout_seconds,
+            context.deadline_budget.idle_seconds,
+            remaining,
+        ),
+        provider_request_timeout_seconds=min(
+            request.provider_request_timeout_seconds,
+            context.deadline_budget.provider_seconds,
+            remaining,
+        ),
+    )
 
 
 def validated_provider_retry_count(

@@ -321,6 +321,86 @@ def test_archon_script_does_not_resolve_runtime_at_exact_attempt_wall_boundary(
     assert result.error_code == "timeout"
 
 
+def test_archon_script_rechecks_wall_after_runtime_resolution_before_spawn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    clock = {"now": 10.0}
+    spawn_calls = []
+
+    def locate(_runtime):
+        clock["now"] = 11.0
+        return "/fake/uv"
+
+    context = replace(
+        _context(tmp_path, runtime="uv", script="print('must not run')\n"),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.executors.script.ManagedProcessTree.spawn",
+        lambda *_args, **_kwargs: spawn_calls.append(True),
+    )
+
+    result = ScriptExecutor(runtime_locator=locate).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+    assert spawn_calls == []
+
+
+def test_legacy_script_preserves_separate_absolute_and_elapsed_clock_samples(
+    tmp_path: Path,
+) -> None:
+    wrapper = tmp_path / "fake-uv"
+    wrapper.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    samples = iter((10.0, 10.5, 11.0))
+
+    def monotonic():
+        try:
+            return next(samples)
+        except StopIteration as exc:
+            raise AssertionError(
+                "legacy script sampled beyond its timeout boundary"
+            ) from exc
+
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('ignored')\n",
+            timeout_seconds=1.0,
+            termination_policy=TerminationPolicy(
+                cooperative_grace_seconds=0,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+                wait_timeout_seconds=0.1,
+            ),
+        ),
+        deadline_budget=DeadlineBudget.create(
+            now=10.0,
+            wall_seconds=100.0,
+            idle_seconds=100.0,
+            provider_seconds=100.0,
+        ),
+        monotonic=monotonic,
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(wrapper)
+    ).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+
+
 def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Path) -> None:
     variables = VariableContext(
         normalizer_version=3,

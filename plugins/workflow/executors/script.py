@@ -162,6 +162,15 @@ class ScriptExecutor:
                 error_code="runtime_missing",
                 error_message=f"script runtime is not installed: {runtime}",
             )
+        if (
+            context.sealed_attempt_timeout
+            and context.deadline_budget.wall_expired(context.monotonic())
+        ):
+            return NodeExecutionResult(
+                "failed",
+                error_code="timeout",
+                error_message="script node exceeded its timeout",
+            )
         strict_v3 = (
             context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
             and isinstance(context.variable_context, VariableContext)
@@ -208,6 +217,16 @@ class ScriptExecutor:
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )
+        if (
+            context.sealed_attempt_timeout
+            and context.deadline_budget.wall_expired(context.monotonic())
+        ):
+            output.close()
+            return NodeExecutionResult(
+                "failed",
+                error_code="timeout",
+                error_message="script node exceeded its timeout",
+            )
         executor_nonce = uuid.uuid4().hex
         if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
             output.close()
@@ -219,6 +238,18 @@ class ScriptExecutor:
                 source_stream.write(source_bytes)
                 source_stream.flush()
                 source_stream.seek(0)
+            if (
+                context.sealed_attempt_timeout
+                and context.deadline_budget.wall_expired(context.monotonic())
+            ):
+                output.close()
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, "timeout")
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="timeout",
+                    error_message="script node exceeded its timeout",
+                )
             tree = ManagedProcessTree.spawn(
                 argv,
                 policy=context.termination_policy,
@@ -255,15 +286,16 @@ class ScriptExecutor:
                     cancelled = True
                     tree.terminate("workflow run cancelled")
                     break
-                now = context.monotonic()
                 if context.sealed_attempt_timeout:
                     assert context.deadline_budget is not None
-                    deadline_expired = context.deadline_budget.wall_expired(now)
+                    deadline_expired = context.deadline_budget.wall_expired(
+                        context.monotonic()
+                    )
                 else:
                     deadline_expired = (
                         context.deadline_budget is not None
-                        and context.deadline_budget.wall_expired(now)
-                    ) or now - started >= context.timeout_seconds
+                        and context.deadline_budget.wall_expired(context.monotonic())
+                    ) or context.monotonic() - started >= context.timeout_seconds
                 if deadline_expired:
                     timed_out = True
                     tree.terminate("workflow script timeout")

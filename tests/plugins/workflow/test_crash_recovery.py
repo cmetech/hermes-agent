@@ -183,6 +183,117 @@ def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     assert stopped["process_stop"]["cleaned"] is True
 
 
+def test_v3_restart_classifies_zero_effect_claim_before_fresh_attempt_budget(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "restart-zero-effect",
+        nodes=[{"id": "start", "bash": "true", "timeout": 2_000}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(tmp_path / "restart-zero-effect-home")
+    admitted = _run(
+        store,
+        load_workflow(workflow),
+        idempotency_key="restart-zero-effect",
+    )
+    old = store.claim_node(
+        admitted.run_id,
+        "start",
+        "dead-owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="replay_safe",
+    )
+    assert old is not None
+    observed = []
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: old.lease_expires_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_claim",
+        lambda *_args: observed.append((_args[1], _args[-1])),
+    )
+    try:
+        interrupted = scheduler.advance(admitted.run_id, max_nodes=1)
+        assert interrupted["status"] == "interrupted"
+        assert observed == []
+        scheduler.store.resume_run(
+            admitted.run_id,
+            always_run_nodes=scheduler.verified_always_run_nodes(admitted.run_id),
+        )
+        scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert len(observed) == 1
+    replacement, budget = observed[0]
+    assert replacement.attempt_id != old.attempt_id
+    assert budget.remaining_wall(budget.last_semantic_progress) == 2.0
+    event_types = [event["event_type"] for event in store.tail_events(admitted.run_id)]
+    assert event_types.index("node_interrupted") < event_types.index(
+        "node_claimed", event_types.index("node_claimed") + 1
+    )
+
+
+def test_v3_restart_classifies_active_process_before_any_duplicate_launch(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "restart-active-process",
+        nodes=[{"id": "start", "bash": "true", "timeout": 2_000}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(tmp_path / "restart-active-process-home")
+    admitted = _run(
+        store,
+        load_workflow(workflow),
+        idempotency_key="restart-active-process",
+    )
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "dead-owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_992, start_time=12346, group_id=999_992)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    launches = []
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: claim.lease_expires_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    monkeypatch.setattr(
+        scheduler, "_execute_claim", lambda *_args: launches.append(_args)
+    )
+    try:
+        recovered = scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert recovered["status"] == "paused"
+    assert recovered["nodes"]["start"]["recovery"]["observation"] == "still_running"
+    assert recovered["nodes"]["start"]["attempts"][-1]["attempt_id"] == (
+        claim.attempt_id
+    )
+    assert [
+        event["event_type"] for event in store.tail_events(admitted.run_id)
+    ].count("node_claimed") == 1
+    assert launches == []
+
+
 def test_spawn_intent_without_process_identity_is_outcome_uncertain(
     tmp_path, workflow_writer
 ) -> None:

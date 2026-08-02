@@ -2783,8 +2783,11 @@ class RunScheduler:
         node: WorkflowNode,
         execution_limits: RunExecutionLimits,
         execution_semantics: Phase3ExecutionSemantics | None,
+        *,
+        now: float | None = None,
     ) -> DeadlineBudget:
-        now = self._monotonic()
+        if now is None:
+            now = self._monotonic()
         if execution_semantics is not None:
             node_semantics = execution_semantics.nodes[node.id]
             attempt_wall = float(
@@ -2871,6 +2874,7 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
+        claimed_deadline_budget: DeadlineBudget | None = None,
     ) -> None:
         with self._activity:
             self._active_executions += 1
@@ -2954,11 +2958,18 @@ class RunScheduler:
                 )
                 heartbeat_thread.start()
                 try:
-                    deadline_budget = self._attempt_deadline_budget(
-                        node,
-                        execution_limits,
-                        execution_semantics,
-                    )
+                    if execution_semantics is not None:
+                        if claimed_deadline_budget is None:
+                            raise RuntimeError(
+                                "sealed attempt deadline was not captured at claim"
+                            )
+                        deadline_budget = claimed_deadline_budget
+                    else:
+                        deadline_budget = self._attempt_deadline_budget(
+                            node,
+                            execution_limits,
+                            execution_semantics,
+                        )
                     variables = self._variables(
                         projection,
                         self.store.run_directory(run_id),
@@ -3510,6 +3521,7 @@ class RunScheduler:
                 claims = []
                 fence_lost = False
                 for node_id in ready[:capacity]:
+                    claim_now = self._monotonic()
                     try:
                         claim = self.store.claim_node(
                             run_id,
@@ -3517,7 +3529,7 @@ class RunScheduler:
                             self.owner_id,
                             lease_seconds=self.lease_seconds,
                             now=self._utcnow(),
-                            monotonic_now=self._monotonic(),
+                            monotonic_now=claim_now,
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
                                 by_id[node_id],
                                 execution_limits,
@@ -3545,14 +3557,25 @@ class RunScheduler:
                         fence_lost = True
                         break
                     if claim is not None:
+                        claimed_deadline_budget = (
+                            self._attempt_deadline_budget(
+                                by_id[node_id],
+                                execution_limits,
+                                execution_semantics,
+                                now=claim_now,
+                            )
+                            if execution_semantics is not None
+                            else None
+                        )
                         claims.append((
                             claim,
                             by_id[node_id],
                             projection,
                             strict_reference_snapshots.get(node_id),
+                            claimed_deadline_budget,
                         ))
                 if fence_lost:
-                    for claim, _node, _projection, _strict_snapshot in claims:
+                    for claim, *_rest in claims:
                         self.store.release_claim_before_execution(claim)
                     break
                 if not claims:
@@ -3574,8 +3597,9 @@ class RunScheduler:
                             execution_semantics,
                             sealed_resource_paths,
                             sealed_resource_bytes,
+                            budget,
                         )
-                        for claim, node, snapshot, strict_snapshot in claims
+                        for claim, node, snapshot, strict_snapshot, budget in claims
                     ]
                     for future in futures:
                         future.result()
@@ -3765,6 +3789,12 @@ class RunScheduler:
                         ):
                             continue
                         node_id = candidates[run_id].pop(0)
+                        node = next(
+                            node
+                            for node in packages[run_id].definition.nodes
+                            if node.id == node_id
+                        )
+                        claim_now = self._monotonic()
                         try:
                             claim = self.store.claim_node(
                                 run_id,
@@ -3772,21 +3802,13 @@ class RunScheduler:
                                 self.owner_id,
                                 lease_seconds=self.lease_seconds,
                                 now=self._utcnow(),
-                                monotonic_now=self._monotonic(),
+                                monotonic_now=claim_now,
                                 journal_reserve_bytes=self._heartbeat_journal_reserve(
-                                    next(
-                                        node
-                                        for node in packages[run_id].definition.nodes
-                                        if node.id == node_id
-                                    ),
+                                    node,
                                     execution_limits[run_id],
                                     execution_semantics[run_id],
                                 ),
-                                executor_id=next(
-                                    node.node_type
-                                    for node in packages[run_id].definition.nodes
-                                    if node.id == node_id
-                                ),
+                                executor_id=node.node_type,
                                 owner_epoch=self.owner_id,
                                 effect_classification=self.store.node_effect_classification(
                                     run_id,
@@ -3814,10 +3836,15 @@ class RunScheduler:
                             break
                         if claim is None:
                             continue
-                        node = next(
-                            node
-                            for node in packages[run_id].definition.nodes
-                            if node.id == node_id
+                        claimed_deadline_budget = (
+                            self._attempt_deadline_budget(
+                                node,
+                                execution_limits[run_id],
+                                execution_semantics[run_id],
+                                now=claim_now,
+                            )
+                            if execution_semantics[run_id] is not None
+                            else None
                         )
                         claims.append((
                             run_id,
@@ -3830,6 +3857,7 @@ class RunScheduler:
                             execution_semantics[run_id],
                             sealed_resource_paths[run_id],
                             sealed_resource_bytes[run_id],
+                            claimed_deadline_budget,
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
@@ -3838,18 +3866,8 @@ class RunScheduler:
                     if not claimed_this_round:
                         break
                 if fence_lost:
-                    for (
-                        _run_id,
-                        claim,
-                        _node,
-                        _package,
-                        _snapshot,
-                        _strict_snapshot,
-                        _limits,
-                        _sealed_paths,
-                        _sealed_bytes,
-                    ) in claims:
-                        self.store.release_claim_before_execution(claim)
+                    for work_item in claims:
+                        self.store.release_claim_before_execution(work_item[1])
                     break
                 for claim in claims:
                     future = pool.submit(self._execute_claim, *claim)

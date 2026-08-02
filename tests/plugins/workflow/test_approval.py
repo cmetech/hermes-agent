@@ -9,6 +9,7 @@ import time
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+import plugins.workflow.executors.approval as approval_executor_module
 import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import register_cli
@@ -463,6 +464,69 @@ def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path
     assert request.term_grace_seconds == limits.term_grace_seconds
     assert request.kill_reap_grace_seconds == limits.kill_reap_grace_seconds
     assert request.max_iterations == 90
+
+
+def test_approval_rework_rechecks_wall_after_prompt_preparation(
+    tmp_path, monkeypatch
+):
+    runner = ReworkRunner()
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+        }),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    clock = {"now": 10.0}
+    original_renderer = approval_executor_module.substitution_renderer
+
+    def renderer_then_expire(*args, **kwargs):
+        renderer = original_renderer(*args, **kwargs)
+
+        class CrossingRenderer:
+            def render_prompt(self, value):
+                rendered = renderer.render_prompt(value)
+                clock["now"] = 11.0
+                return rendered
+
+        return CrossingRenderer()
+
+    monkeypatch.setattr(
+        approval_executor_module, "substitution_renderer", renderer_then_expire
+    )
+    result = ApprovalExecutor(runner).execute(
+        NodeExecutionContext(
+            run_id="run-1",
+            run_directory=run_directory,
+            node=node,
+            attempt_id="attempt-1",
+            workflow_options=freeze_value({"provider": "fake", "model": "fake"}),
+            variable_context=VariableContext(workflow_id="run-1"),
+            node_state=freeze_value({
+                "approval_rework": {"reason": "missing evidence"},
+            }),
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: clock["now"],
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_timeout"
+    assert runner.requests == []
 
 
 def test_rejection_runs_bounded_rework_with_reason_then_cancels(

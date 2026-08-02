@@ -1108,6 +1108,45 @@ def test_prompt_adapter_skips_repair_after_shared_wall_deadline_expires(tmp_path
     assert len(runner.requests) == 1
 
 
+def test_prompt_adapter_rechecks_wall_after_repair_preparation(tmp_path, monkeypatch):
+    runner = FakeAgentRunner("not json", "must not repair")
+    node = _node(
+        "repair-crossed",
+        "work",
+        output_format={"type": "object"},
+    )
+    clock = {"now": 10.0}
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    executor = AgentNodeExecutor(runner)
+    original = executor._bounded_repair_request
+
+    def prepare_then_expire(*args, **kwargs):
+        request = original(*args, **kwargs)
+        clock["now"] = 11.0
+        return request
+
+    monkeypatch.setattr(executor, "_bounded_repair_request", prepare_then_expire)
+    result = executor.execute(
+        _archon_context(
+            tmp_path,
+            node,
+            max_provider_attempts=3,
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: clock["now"],
+        )
+    )
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "ineligible_wall_time"
+    assert len(runner.requests) == 1
+
+
 def test_prompt_adapter_makes_only_one_repair_when_repair_is_still_invalid(tmp_path):
     runner = FakeAgentRunner("not json", "still not json")
     node = _node(
@@ -1577,18 +1616,20 @@ def test_ai_request_receives_remaining_absolute_deadline_and_retry_budget(tmp_pa
         provider_seconds=6,
     )
 
+    times = iter((14.0, 15.0))
     result = AgentNodeExecutor(runner).execute(
         _context(
             tmp_path,
             _node("bounded", "work"),
             deadline_budget=budget,
-            monotonic=lambda: 14,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: next(times),
             max_provider_attempts=2,
         )
     )
 
     assert result.status == "succeeded"
-    assert runner.requests[0].wall_timeout_seconds == 16
+    assert runner.requests[0].wall_timeout_seconds == 15
     assert runner.requests[0].idle_timeout_seconds == 8
     assert runner.requests[0].provider_request_timeout_seconds == 6
     assert runner.requests[0].max_api_attempts == 2
@@ -1613,6 +1654,39 @@ def test_ai_request_does_not_start_at_exact_attempt_wall_boundary(tmp_path):
             deadline_budget=budget,
             sealed_attempt_timeout=True,
             monotonic=lambda: 11,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_timeout"
+    assert runner.requests == []
+
+
+def test_ai_request_rechecks_wall_after_request_preparation_before_provider(
+    tmp_path, monkeypatch
+):
+    runner = FakeAgentRunner("must not run")
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=1,
+        idle_seconds=1,
+        provider_seconds=1,
+    )
+    clock = {"now": 10.0}
+    executor = AgentNodeExecutor(runner)
+
+    def prepare_inline_agents(_context):
+        clock["now"] = 11.0
+        return {}
+
+    monkeypatch.setattr(executor, "_inline_agents", prepare_inline_agents)
+    result = executor.execute(
+        _context(
+            tmp_path,
+            _node("crossed", "work"),
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: clock["now"],
         )
     )
 

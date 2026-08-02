@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 
@@ -9,7 +10,12 @@ from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.loop import LoopExecutor
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    DeadlineBudget,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    freeze_value,
+)
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
@@ -112,6 +118,41 @@ def test_v3_loop_prompt_rechecks_direct_dependency_before_iteration(tmp_path) ->
         LoopExecutor(runner).execute(context)
 
     assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
+
+
+def test_loop_child_rechecks_shared_attempt_wall_before_provider(
+    tmp_path, monkeypatch
+) -> None:
+    runner = FakeAgentRunner("must not run")
+    clock = {"now": 10.0}
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    executor = LoopExecutor(runner)
+
+    def prepare_inline_agents(_context):
+        clock["now"] = 11.0
+        return {}
+
+    monkeypatch.setattr(executor._agent, "_inline_agents", prepare_inline_agents)
+    context = replace(
+        _context(
+            tmp_path,
+            {"prompt": "Work", "until": "DONE", "max_iterations": 1},
+        ),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: clock["now"],
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_timeout"
     assert runner.requests == []
 
 

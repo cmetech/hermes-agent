@@ -29,6 +29,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     conservative_provider_retry_count,
+    sealed_provider_request_for_launch,
     validated_provider_retry_count,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
@@ -519,6 +520,9 @@ class AgentNodeExecutor:
         )
         if repair_request is None:
             return failed("ineligible_repair_prompt_too_large")
+        repair_request = sealed_provider_request_for_launch(context, repair_request)
+        if repair_request is None:
+            return failed("ineligible_wall_time")
         try:
             repair_result = agent_runner.run(
                 repair_request,
@@ -984,6 +988,14 @@ class AgentNodeExecutor:
                     else context.termination_policy.kill_grace_seconds
                 ),
             )
+            request = sealed_provider_request_for_launch(context, request)
+            if request is None:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_timeout",
+                    error_message="workflow attempt deadline expired",
+                    metadata={"provider_attempts": 0},
+                )
             result = agent_runner.run(
                 request,
                 is_cancelled=context.is_cancelled,

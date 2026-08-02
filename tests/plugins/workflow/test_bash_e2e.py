@@ -10,6 +10,7 @@ from plugins.workflow.models import DeadlineBudget, WorkflowNode, freeze_value
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+from tools.managed_process import TerminationPolicy
 
 
 def _start(store, package, *, key="e2e", values=None):
@@ -61,6 +62,101 @@ def test_archon_bash_does_not_spawn_at_exact_attempt_wall_boundary(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "timeout"
     assert not marker.exists()
+
+
+def test_archon_bash_rechecks_wall_after_substitution_before_spawn(
+    tmp_path, monkeypatch
+):
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value="printf safe",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    clock = {"now": 10.0}
+    spawn_calls = []
+
+    class CrossingRenderer:
+        def render_bash(self, command, *, spill_directory):
+            clock["now"] = 11.0
+            return command
+
+    monkeypatch.setattr(
+        "plugins.workflow.executors.bash.ManagedProcessTree.spawn",
+        lambda *_args, **_kwargs: spawn_calls.append(True),
+    )
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="run-1",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=CrossingRenderer(),
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: clock["now"],
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+    assert spawn_calls == []
+
+
+def test_legacy_bash_preserves_separate_absolute_and_elapsed_clock_samples(
+    tmp_path
+):
+    samples = iter((10.0, 10.5, 11.0))
+
+    def monotonic():
+        try:
+            return next(samples)
+        except StopIteration as exc:
+            raise AssertionError("legacy bash sampled beyond its timeout boundary") from exc
+
+    node = WorkflowNode(
+        id="legacy-shell",
+        node_type="bash",
+        value="sleep 5",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="legacy-run",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-legacy",
+            timeout_seconds=1.0,
+            deadline_budget=DeadlineBudget.create(
+                now=10.0,
+                wall_seconds=100.0,
+                idle_seconds=100.0,
+                provider_seconds=100.0,
+            ),
+            monotonic=monotonic,
+            termination_policy=TerminationPolicy(
+                cooperative_grace_seconds=0,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+                wait_timeout_seconds=0.1,
+            ),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
 
 
 def test_two_dependent_bash_nodes_execute_and_persist_artifacts(

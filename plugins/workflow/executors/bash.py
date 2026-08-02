@@ -69,16 +69,47 @@ class BashExecutor:
         })
         policy = context.termination_policy
         started = context.monotonic()
+        if (
+            context.sealed_attempt_timeout
+            and context.deadline_budget.wall_expired(started)
+        ):
+            return NodeExecutionResult(
+                "failed",
+                error_code="timeout",
+                error_message="bash node exceeded its timeout",
+            )
         timed_out = False
         cancelled = False
         resource_violation = None
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )
+        if (
+            context.sealed_attempt_timeout
+            and context.deadline_budget.wall_expired(context.monotonic())
+        ):
+            output.close()
+            return NodeExecutionResult(
+                "failed",
+                error_code="timeout",
+                error_message="bash node exceeded its timeout",
+            )
         executor_nonce = uuid.uuid4().hex
         if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
             output.close()
             raise RuntimeError("executor spawn intent was rejected")
+        if (
+            context.sealed_attempt_timeout
+            and context.deadline_budget.wall_expired(context.monotonic())
+        ):
+            output.close()
+            if context.spawn_failed is not None:
+                context.spawn_failed(executor_nonce, "timeout")
+            return NodeExecutionResult(
+                "failed",
+                error_code="timeout",
+                error_message="bash node exceeded its timeout",
+            )
         try:
             tree = ManagedProcessTree.spawn(
                 argv,
@@ -106,15 +137,16 @@ class BashExecutor:
                     cancelled = True
                     tree.terminate("workflow run cancelled")
                     break
-                now = context.monotonic()
                 if context.sealed_attempt_timeout:
                     assert context.deadline_budget is not None
-                    deadline_expired = context.deadline_budget.wall_expired(now)
+                    deadline_expired = context.deadline_budget.wall_expired(
+                        context.monotonic()
+                    )
                 else:
                     deadline_expired = (
                         context.deadline_budget is not None
-                        and context.deadline_budget.wall_expired(now)
-                    ) or now - started >= context.timeout_seconds
+                        and context.deadline_budget.wall_expired(context.monotonic())
+                    ) or context.monotonic() - started >= context.timeout_seconds
                 if deadline_expired:
                     timed_out = True
                     tree.terminate("workflow node timeout")
