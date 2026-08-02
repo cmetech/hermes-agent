@@ -578,11 +578,21 @@ def language_compatibility_findings(
         prefix = f"nodes[{index}]"
         if profile is WorkflowLanguageProfile.HERMES_LEGACY:
             if "idle_timeout" in options:
+                if node.node_type in {"command", "prompt"}:
+                    idle_timeout_migration = (
+                        "Multiply idle_timeout seconds by 1,000 to author "
+                        "Archon milliseconds."
+                    )
+                else:
+                    idle_timeout_migration = (
+                        "idle_timeout on this node kind cannot migrate under "
+                        "Archon v3; remove idle_timeout or redesign the workflow."
+                    )
                 add(
                     f"{prefix}.idle_timeout",
                     "legacy_idle_timeout_seconds",
                     "legacy idle_timeout is interpreted in seconds",
-                    "Multiply idle_timeout seconds by 1,000 to author Archon milliseconds.",
+                    idle_timeout_migration,
                     blocking=False,
                 )
             if "timeout" in options:
@@ -596,7 +606,12 @@ def language_compatibility_findings(
             retry = options.get("retry")
             if isinstance(retry, Mapping) and "max_attempts" in retry:
                 total_attempts = retry["max_attempts"]
-                if total_attempts == 1 and node.node_type in {"bash", "script"}:
+                if node.node_type not in {"command", "prompt", "bash", "script"}:
+                    retry_migration = (
+                        "Retry on this node kind cannot migrate under Archon v3; "
+                        "remove the retry block or redesign the workflow."
+                    )
+                elif total_attempts == 1 and node.node_type in {"bash", "script"}:
                     retry_migration = (
                         "For one total deterministic attempt under Archon, omit "
                         "retry."

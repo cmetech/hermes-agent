@@ -466,3 +466,71 @@ def test_phase3_archon_fields_are_implemented_and_legacy_guidance_is_exact(
     assert "Phase 2" not in output_type_guidance
     assert "before using .field" in output_format_guidance
     assert "output_format" in output_type_guidance
+
+
+@pytest.mark.parametrize(
+    ("node", "total_attempts"),
+    [
+        ({"id": "approval", "approval": {"message": "Continue?"}}, 1),
+        ({"id": "approval", "approval": {"message": "Continue?"}}, 2),
+        ({"id": "cancel", "cancel": "Stop safely"}, 1),
+        ({"id": "cancel", "cancel": "Stop safely"}, 2),
+    ],
+)
+def test_legacy_retry_guidance_rejects_inapplicable_archon_node_kinds(
+    tmp_path, workflow_writer, node, total_attempts
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                **node,
+                "retry": {"max_attempts": total_attempts},
+            }
+        ],
+    )
+
+    finding = next(
+        item
+        for item in load_workflow(path).compatibility_findings
+        if item.code == "legacy_retry_total_attempts"
+    )
+
+    assert "cannot migrate under Archon v3" in finding.migration
+    assert "remove the retry block or redesign" in finding.migration
+    assert "N - 1" not in finding.migration
+    assert "omit retry" not in finding.migration
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"id": "shell", "bash": "true"},
+        {
+            "id": "loop",
+            "loop": {"prompt": "again", "until": "done", "max_iterations": 2},
+        },
+    ],
+)
+def test_legacy_idle_timeout_guidance_rejects_inapplicable_archon_node_kinds(
+    tmp_path, workflow_writer, node
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                **node,
+                "idle_timeout": 10,
+            }
+        ],
+    )
+
+    finding = next(
+        item
+        for item in load_workflow(path).compatibility_findings
+        if item.code == "legacy_idle_timeout_seconds"
+    )
+
+    assert "cannot migrate under Archon v3" in finding.migration
+    assert "remove idle_timeout or redesign" in finding.migration
+    assert "Multiply" not in finding.migration
