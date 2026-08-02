@@ -41,6 +41,28 @@ def _capture_spawn_error(
     pytest.fail(f"DID NOT RAISE {expected_exception!r}")
 
 
+def _capture_exception(spawn) -> tuple[type[BaseException], tuple[object, ...]]:
+    try:
+        result = spawn()
+    except BaseException as exc:
+        error = (type(exc), exc.args)
+        exc.__traceback__ = None
+        return error
+    if isinstance(result, ManagedProcessTree):
+        result.close()
+    pytest.fail("DID NOT RAISE")
+
+
+class _RaisingExecutablePath:
+    def __fspath__(self) -> str:
+        raise RuntimeError("executable path conversion failed")
+
+
+class _RaisingSignalTruth:
+    def __bool__(self) -> bool:
+        raise RuntimeError("restore_signals truth conversion failed")
+
+
 def test_termination_policy_resolves_to_bounded_deadlines() -> None:
     policy = TerminationPolicy()
 
@@ -572,6 +594,176 @@ def test_inherited_descriptor_successful_custom_executable_preserves_argv() -> N
         os.write(write_fd, b"x")
         assert os.read(read_fd, 1) == b"x"
     finally:
+        if tree is not None:
+            tree.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    "executable",
+    [object(), _RaisingExecutablePath()],
+    ids=["invalid-object", "raising-pathlike"],
+)
+def test_invalid_executable_setup_matches_direct_without_descriptor_leaks(
+    tmp_path,
+    executable,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    effect = tmp_path / "invalid-executable-must-not-run"
+    argv = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(effect)!r}).write_text('ran')",
+    ]
+    direct_error = _capture_exception(
+        lambda: subprocess.Popen(argv, executable=executable),
+    )
+    before = psutil.Process().num_fds()
+    try:
+        for _ in range(3):
+            managed_error = _capture_exception(
+                lambda: ManagedProcessTree.spawn(
+                    argv,
+                    executable=executable,
+                    inherited_descriptors=[read_fd],
+                ),
+            )
+            assert managed_error == direct_error
+            assert psutil.Process().num_fds() == before
+            assert not effect.exists()
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+def test_invalid_restore_signals_matches_direct_without_descriptor_leaks(
+    tmp_path,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    effect = tmp_path / "invalid-restore-signals-must-not-run"
+    argv = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(effect)!r}).write_text('ran')",
+    ]
+    restore_signals = _RaisingSignalTruth()
+    direct_error = _capture_exception(
+        lambda: subprocess.Popen(argv, restore_signals=restore_signals),
+    )
+    before = psutil.Process().num_fds()
+    try:
+        for _ in range(3):
+            managed_error = _capture_exception(
+                lambda: ManagedProcessTree.spawn(
+                    argv,
+                    restore_signals=restore_signals,
+                    inherited_descriptors=[read_fd],
+                ),
+            )
+            assert managed_error == direct_error
+            assert psutil.Process().num_fds() == before
+            assert not effect.exists()
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("executable_kind", ["pathlike", "bytes"])
+def test_missing_non_string_executable_preserves_direct_filename_identity(
+    tmp_path,
+    executable_kind,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    effect = tmp_path / "missing-non-string-executable-must-not-run"
+    missing_path = tmp_path / "missing-non-string-executable"
+    executable = (
+        missing_path
+        if executable_kind == "pathlike"
+        else os.fsencode(missing_path) + b"-\xff"
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(effect)!r}).write_text('ran')",
+    ]
+    before = psutil.Process().num_fds()
+    try:
+        direct_error = _capture_spawn_error(
+            FileNotFoundError,
+            lambda: subprocess.Popen(argv, executable=executable),
+        )
+        managed_error = _capture_spawn_error(
+            direct_error[0],
+            lambda: ManagedProcessTree.spawn(
+                argv,
+                executable=executable,
+                inherited_descriptors=[read_fd],
+            ),
+        )
+        assert managed_error == direct_error
+        assert type(managed_error[2]) is type(direct_error[2])
+        assert psutil.Process().num_fds() == before
+        assert not effect.exists()
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal contract")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    ("restore_signals", "parent_disposition"),
+    [(False, signal.SIG_DFL), (True, signal.SIG_IGN)],
+    ids=["preserve-default", "restore-default"],
+)
+def test_inherited_descriptor_signal_behavior_matches_direct_popen(
+    restore_signals,
+    parent_disposition,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    before = psutil.Process().num_fds()
+    previous_disposition = signal.getsignal(signal.SIGPIPE)
+    argv = ["/bin/sh", "-c", "kill -PIPE $$; printf survived"]
+    tree = None
+    try:
+        signal.signal(signal.SIGPIPE, parent_disposition)
+        direct = subprocess.Popen(
+            argv,
+            restore_signals=restore_signals,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        direct_stdout, _ = direct.communicate(timeout=5)
+        tree = ManagedProcessTree.spawn(
+            argv,
+            restore_signals=restore_signals,
+            inherited_descriptors=[read_fd],
+        )
+        managed_stdout, _ = tree.process.communicate(timeout=5)
+        assert (tree.process.returncode, managed_stdout) == (
+            direct.returncode,
+            direct_stdout,
+        )
+        assert tree.identity.pid == tree.process.pid
+        assert psutil.Process().num_fds() == before
+        os.write(write_fd, b"x")
+        assert os.read(read_fd, 1) == b"x"
+    finally:
+        signal.signal(signal.SIGPIPE, previous_disposition)
         if tree is not None:
             tree.close()
         os.close(read_fd)

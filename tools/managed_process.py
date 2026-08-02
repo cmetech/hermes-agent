@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import errno
 import logging
 import math
+import operator
 import os
 import signal
 import subprocess
@@ -47,7 +48,12 @@ import signal
 import sys
 
 status_fd = int(sys.argv[1])
-restore_signals = sys.argv[2] == "1"
+signal_states = tuple(
+    (int(number), ignored == "1")
+    for number, ignored in (
+        item.split(":", 1) for item in sys.argv[2].split(",") if item
+    )
+)
 use_argv_zero = sys.argv[3] == "1"
 executable = sys.argv[6] if use_argv_zero else sys.argv[4]
 pairs = tuple(
@@ -61,11 +67,8 @@ try:
         os.dup2(pin, target, inheritable=True)
     for pin, _target in pairs:
         os.close(pin)
-    if restore_signals:
-        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
-            value = getattr(signal, name, None)
-            if value is not None:
-                signal.signal(value, signal.SIG_DFL)
+    for number, ignored in signal_states:
+        signal.signal(number, signal.SIG_IGN if ignored else signal.SIG_DFL)
     os.execvpe(executable, argv, os.environ)
 except BaseException as exc:
     error_number = getattr(exc, "errno", None) or errno.EIO
@@ -176,6 +179,21 @@ def _open_internal_pipe_above(minimum: int) -> tuple[int, int]:
         raise
     finally:
         _close_descriptors((read_descriptor, write_descriptor))
+
+
+def _descriptor_bootstrap_signal_states(restore_signals: bool) -> str:
+    """Serialize final-exec dispositions that Python startup may overwrite."""
+    states: list[str] = []
+    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+        value = getattr(signal, name, None)
+        if value is None:
+            continue
+        disposition = (
+            signal.SIG_DFL if restore_signals else signal.getsignal(value)
+        )
+        ignored = disposition == signal.SIG_IGN
+        states.append(f"{int(value)}:{'1' if ignored else '0'}")
+    return ",".join(states)
 
 
 class _WindowsJob:
@@ -670,35 +688,44 @@ class ManagedProcessTree:
         pinned: tuple[tuple[int, int], ...] = ()
         status_read: int | None = None
         status_write: int | None = None
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = (
-                int(kwargs.get("creationflags", windows_hide_flags()))
-                | _CREATE_SUSPENDED
+        resolved_executable: object = argv[0]
+        use_argv_zero = True
+        executable = ""
+        restore_signals = True
+        bootstrap_signal_states = ""
+        if inherited and not _IS_WINDOWS:
+            raw_executable = kwargs.pop("executable", None)
+            use_argv_zero = raw_executable is None
+            if not use_argv_zero:
+                executable = os.fsdecode(os.fspath(raw_executable))
+                resolved_executable = raw_executable
+            restore_signals = bool(
+                operator.index(kwargs.get("restore_signals", True))
             )
-        else:
-            kwargs.setdefault("start_new_session", True)
+            kwargs["restore_signals"] = restore_signals
+            bootstrap_signal_states = _descriptor_bootstrap_signal_states(
+                restore_signals
+            )
+
+        windows_job = None
+        process = None
+        try:
+            if _IS_WINDOWS:
+                kwargs["creationflags"] = (
+                    int(kwargs.get("creationflags", windows_hide_flags()))
+                    | _CREATE_SUSPENDED
+                )
+            else:
+                kwargs.setdefault("start_new_session", True)
             if inherited:
                 pinned = _pin_read_only_descriptors(inherited)
-                try:
-                    status_read, status_write = _open_internal_pipe_above(
-                        max(
-                            *inherited,
-                            *(pin for pin, _target in pinned),
-                        )
-                        + 1
+                status_read, status_write = _open_internal_pipe_above(
+                    max(
+                        *inherited,
+                        *(pin for pin, _target in pinned),
                     )
-                except BaseException:
-                    _close_descriptors(tuple(pin for pin, _target in pinned))
-                    raise
-                raw_executable = kwargs.pop("executable", None)
-                use_argv_zero = raw_executable is None
-                executable = (
-                    ""
-                    if use_argv_zero
-                    else os.fsdecode(os.fspath(raw_executable))
+                    + 1
                 )
-                resolved_executable = argv[0] if use_argv_zero else executable
-                restore_signals = bool(kwargs.get("restore_signals", True))
                 mapping = ",".join(
                     f"{pin}:{target}" for pin, target in pinned
                 )
@@ -709,7 +736,7 @@ class ManagedProcessTree:
                     "-c",
                     _POSIX_DESCRIPTOR_BOOTSTRAP,
                     str(status_write),
-                    "1" if restore_signals else "0",
+                    bootstrap_signal_states,
                     "1" if use_argv_zero else "0",
                     executable,
                     mapping,
@@ -721,9 +748,7 @@ class ManagedProcessTree:
                     status_write,
                 )
 
-        windows_job = _WindowsJob.create() if _IS_WINDOWS else None
-        process = None
-        try:
+            windows_job = _WindowsJob.create() if _IS_WINDOWS else None
             # noqa: subprocess-stdin — stdin IS set: kwargs.setdefault("stdin",
             # subprocess.DEVNULL) above. The scanner reads the call text only and
             # cannot see kwargs populated earlier in the function.
