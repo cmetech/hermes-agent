@@ -12,6 +12,10 @@ from typing import Any
 import yaml
 
 from agent.structured_output import parse_exact_decimal_integer
+from plugins.workflow.conditions import (
+    WorkflowConditionError,
+    validate_v3_condition_syntax,
+)
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
@@ -27,7 +31,6 @@ from plugins.workflow.language import (
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
-    ARCHON_V3_WHEN_EXPRESSION_PATTERN,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
     agent_field_names,
@@ -129,9 +132,6 @@ _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
-_ARCHON_V3_WHEN_EXPRESSION = re.compile(
-    ARCHON_V3_WHEN_EXPRESSION_PATTERN, re.ASCII
-)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 
 
@@ -654,11 +654,16 @@ def _normalize_node(
         when = _string(node["when"], f"{path}.when")
         if archon_v3:
             try:
-                tuple(iter_when_output_references(when, normalizer_version=3))
-            except WorkflowReferenceSyntaxError as exc:
-                _fail(f"{path}.when", exc.code, str(exc))
-        expression_pattern = _ARCHON_V3_WHEN_EXPRESSION if archon_v3 else _WHEN_EXPRESSION
-        if not expression_pattern.fullmatch(when):
+                validate_v3_condition_syntax(when)
+            except WorkflowConditionError as exc:
+                if isinstance(exc.__cause__, WorkflowReferenceSyntaxError):
+                    _fail(f"{path}.when", exc.__cause__.code, str(exc.__cause__))
+                _fail(
+                    f"{path}.when",
+                    "malformed_condition",
+                    f"{path}.when is a statically malformed condition",
+                )
+        elif not _WHEN_EXPRESSION.fullmatch(when):
             _fail(
                 f"{path}.when",
                 "malformed_condition",

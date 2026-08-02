@@ -10207,6 +10207,74 @@ class RunStore:
                 changed.append(node_id)
         return tuple(changed)
 
+    def transition_v3_condition_node(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        state: str,
+        code: str,
+        message: str,
+    ) -> bool:
+        """CAS one Archon v3 condition outcome before any executor claim."""
+        if state not in {"skipped", "failed"}:
+            raise ValueError("v3 condition state must be skipped or failed")
+        if state == "skipped" and code != "condition_false":
+            raise ValueError("v3 skipped condition must use condition_false")
+        if (
+            not isinstance(code, str)
+            or not code
+            or len(code.encode("utf-8")) > 128
+            or not isinstance(message, str)
+            or not message
+        ):
+            raise ValueError("v3 condition diagnostics must be bounded text")
+        safe_message = _sanitize_diagnostic(message)
+        if safe_message is None:
+            raise ValueError("v3 condition message must be bounded text")
+
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("v3 condition transition requires an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") != "pending":
+                return False
+            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
+                raise RuntimeError("pending condition node already consumed an attempt")
+
+            node["state"] = state
+            node["retry_consumed"] = 0
+            payload: dict[str, object]
+            if state == "skipped":
+                node["skip_reason"] = code
+                payload = {"reason": code}
+                if code not in projection["warnings"]:
+                    projection["warnings"].append(code)
+            else:
+                projection["last_error"] = {
+                    "code": code,
+                    "message": safe_message,
+                    "node_id": node_id,
+                }
+                payload = {"error_code": code, "error_message": safe_message}
+            self._append_locked(
+                directory,
+                projection,
+                f"node_{state}",
+                payload,
+                node_id=node_id,
+            )
+            return True
+
     def finalize_if_complete(self, run_id: str) -> bool:
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock), workflow_lock(

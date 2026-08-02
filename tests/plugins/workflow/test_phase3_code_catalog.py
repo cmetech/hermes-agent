@@ -8,6 +8,11 @@ import pytest
 import plugins.workflow.language_schema as language_schema
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.execution_semantics import WorkflowExecutionSemanticsError
+from plugins.workflow.conditions import (
+    WorkflowConditionError,
+    evaluate_v3_condition,
+    validate_v3_condition_syntax,
+)
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.language_schema import compatibility_code_catalog
 from plugins.workflow.output_resolution import (
@@ -37,6 +42,27 @@ def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
     assert len(
         json.dumps([item.to_dict() for item in language_schema.PHASE3_DURABLE_CODES])
     ) < 8_192
+
+
+def test_runtime_only_codes_omit_editor_only_compatibility_projection_fields() -> None:
+    """Catch bounded runtime metadata acquiring irrelevant migration/editor prose."""
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+    editor_only = {
+        "migration",
+        "runtime_status",
+        "severity",
+        "blocking",
+        "enforcement_phase",
+    }
+
+    for code in language_schema.PHASE3_DURABLE_CODES:
+        projected = catalog[code.code]
+        if not code.compatibility:
+            assert not editor_only & set(projected)
+        assert projected["description"] == code.public_meaning
+        assert projected["status"] == "deferred"
+        assert projected["profiles"] == ["archon-2026-07"]
+        assert projected["normalizer_versions"] == [3]
 
 
 _DURABLE_BEHAVIOR_CASES = (
@@ -300,6 +326,75 @@ def test_task4_runtime_reference_codes_have_behavior_linked_catalog_entries() ->
     catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
     for code in emitted:
         assert catalog[code]["area"] == "references"
+        assert catalog[code]["normalizer_versions"] == [3]
+        assert catalog[code]["runtime_failure"] is True
+        assert catalog[code]["evidence"] is False
+
+
+def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
+    canonical = b'"2"'
+    structured_string = ResolvedNodeOutput(
+        canonical_bytes=canonical,
+        value="2",
+        text=canonical.decode("utf-8"),
+        media_type="application/json",
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="c" * 32,
+        schema_fingerprint="4" * 64,
+    )
+    invalid_numeric = b"not-a-number"
+    schemaless = ResolvedNodeOutput(
+        canonical_bytes=invalid_numeric,
+        value=invalid_numeric.decode("utf-8"),
+        text=invalid_numeric.decode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        sha256=hashlib.sha256(invalid_numeric).hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="d" * 32,
+    )
+    finite = ResolvedNodeOutput(
+        canonical_bytes=b"1",
+        value=1,
+        text="1",
+        media_type="application/json",
+        sha256=hashlib.sha256(b"1").hexdigest(),
+        node_id="producer",
+        attempt_id="attempt-winner",
+        publication_id="e" * 32,
+        schema_fingerprint="5" * 64,
+    )
+    object.__setattr__(finite, "value", float("inf"))
+
+    emitters = (
+        lambda: validate_v3_condition_syntax("$producer.output"),
+        lambda: evaluate_v3_condition(
+            "$producer.output == 2", {"producer": structured_string}
+        ),
+        lambda: evaluate_v3_condition(
+            "$producer.output > 1", {"producer": finite}
+        ),
+        lambda: evaluate_v3_condition(
+            "$producer.output > 1", {"producer": schemaless}
+        ),
+    )
+    emitted: set[str] = set()
+    for emit in emitters:
+        with pytest.raises(WorkflowConditionError) as exc:
+            emit()
+        emitted.add(exc.value.code)
+
+    assert emitted == {
+        "condition_operand_type",
+        "condition_operand_nonfinite",
+        "condition_numeric_invalid",
+        "condition_runtime_syntax_invalid",
+    }
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+    for code in emitted:
+        assert catalog[code]["area"] == "conditions"
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False

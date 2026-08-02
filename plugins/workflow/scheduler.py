@@ -25,6 +25,10 @@ from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
+from plugins.workflow.conditions import (
+    WorkflowConditionError,
+    evaluate_v3_condition,
+)
 from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
 from plugins.workflow.execution_semantics import (
     Phase3ExecutionSemantics,
@@ -1113,7 +1117,15 @@ class RunScheduler:
         while True:
             projection = self.store.load_run(run_id)
             outputs = self._output_values(projection, self.store.run_directory(run_id))
+            language_snapshot = read_language_snapshot(projection.get("language"))
+            strict_v3 = (
+                language_snapshot is not None
+                and language_snapshot.effective_profile
+                is WorkflowLanguageProfile.ARCHON_2026_07
+                and language_snapshot.normalizer_version == 3
+            )
             transitions: dict[str, tuple[str, str | None]] = {}
+            condition_transitions: dict[str, tuple[str, str, str]] = {}
             for node in nodes:
                 state = projection["nodes"][node.id]["state"]
                 if state != "pending":
@@ -1133,20 +1145,46 @@ class RunScheduler:
                     continue
                 condition = node.options.get("when")
                 if isinstance(condition, str):
-                    try:
-                        if not evaluate_condition(condition, outputs):
-                            transitions[node.id] = ("skipped", "condition_false")
+                    if strict_v3:
+                        try:
+                            matches = evaluate_v3_condition(condition, outputs)
+                        except (WorkflowConditionError, WorkflowOutputReferenceError) as exc:
+                            condition_transitions[node.id] = (
+                                "failed",
+                                exc.code,
+                                str(exc),
+                            )
                             continue
-                    except ConditionEvaluationError as exc:
-                        transitions[node.id] = (
-                            "skipped",
-                            f"condition_evaluation_failed: {exc}",
-                        )
-                        continue
+                        if not matches:
+                            condition_transitions[node.id] = (
+                                "skipped",
+                                "condition_false",
+                                "condition evaluated false",
+                            )
+                            continue
+                    else:
+                        try:
+                            if not evaluate_condition(condition, outputs):
+                                transitions[node.id] = ("skipped", "condition_false")
+                                continue
+                        except ConditionEvaluationError as exc:
+                            transitions[node.id] = (
+                                "skipped",
+                                f"condition_evaluation_failed: {exc}",
+                            )
+                            continue
                 transitions[node.id] = ("ready", None)
-            if not transitions:
+            if not transitions and not condition_transitions:
                 self.store.finalize_if_complete(run_id)
                 return
+            for node_id, (state, code, message) in condition_transitions.items():
+                self.store.transition_v3_condition_node(
+                    run_id,
+                    node_id,
+                    state=state,
+                    code=code,
+                    message=message,
+                )
             self.store.transition_pending_nodes(run_id, transitions)
 
     def _load_verified_run_package(

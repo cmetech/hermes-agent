@@ -22,6 +22,10 @@ _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _PROFILES = tuple(WorkflowLanguageProfile)
 MAX_WORKFLOW_DOCUMENT_BYTES = 2 * 1024 * 1024
 DURABLE_METADATA_STRING_MAX_CHARS = 16_384
+ARCHON_V3_CONDITION_MAX_BYTES = 16_384
+ARCHON_V3_CONDITION_MAX_TOKENS = 256
+ARCHON_V3_CONDITION_MAX_NESTING = 3
+ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES = 2_000
 CONTRACT_READER_VERSION = 1
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -33,6 +37,7 @@ ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
     rf"\$(?P<node>{ARCHON_V3_NODE_ID_PATTERN})\.output"
     rf"(?P<path>(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*)"
 )
+ARCHON_V3_DECIMAL_NUMBER_PATTERN = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
 ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
     rf"\$({ARCHON_V3_NODE_ID_PATTERN})\.output"
     rf"(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*"
@@ -40,7 +45,7 @@ ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
 ARCHON_V3_WHEN_CLAUSE_PATTERN = (
     rf"{ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN}\s*"
     r"(?:==|!=|<=|>=|<|>)\s*"
-    r"(?:'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))"
+    rf"(?:'[^']*'|\"[^\"]*\"|{ARCHON_V3_DECIMAL_NUMBER_PATTERN})"
 )
 ARCHON_V3_WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{ARCHON_V3_WHEN_CLAUSE_PATTERN}"
@@ -91,7 +96,7 @@ _ARCHON_V3_OUTPUT_REFERENCE = re.compile(
 )
 _ARCHON_V3_WHEN_OPERATOR = re.compile(r"(?:==|!=|<=|>=|<|>)", re.ASCII)
 _ARCHON_V3_WHEN_NUMBER = re.compile(
-    r"-?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII
+    ARCHON_V3_DECIMAL_NUMBER_PATTERN, re.ASCII
 )
 _REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
 
@@ -558,6 +563,50 @@ PHASE3_DURABLE_CODES = (
         True,
         False,
         ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "condition_operand_type",
+        "condition operands have incompatible canonical types",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_operand_nonfinite",
+        "condition numeric operand is not finite",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_numeric_invalid",
+        "condition numeric text is not an exact finite decimal",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_runtime_syntax_invalid",
+        "sealed condition no longer matches the admitted v3 grammar",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
     ),
 )
 
@@ -1833,14 +1882,9 @@ def compatibility_code_catalog(
     for spec in PHASE3_DURABLE_CODES:
         if selected not in spec.profiles:
             continue
-        grouped[spec.code] = {
+        entry = {
             "status": "deferred",
             "description": spec.public_meaning,
-            "migration": _compatibility_migration(spec.code),
-            "runtime_status": "blocking",
-            "severity": "error",
-            "blocking": True,
-            "enforcement_phase": 3,
             "fields": list(spec.fields),
             "area": spec.area,
             "profiles": sorted(profile.value for profile in spec.profiles),
@@ -1849,6 +1893,15 @@ def compatibility_code_catalog(
             "runtime_failure": spec.runtime_failure,
             "evidence": spec.evidence,
         }
+        if spec.compatibility:
+            entry.update({
+                "migration": _compatibility_migration(spec.code),
+                "runtime_status": "blocking",
+                "severity": "error",
+                "blocking": True,
+                "enforcement_phase": 3,
+            })
+        grouped[spec.code] = entry
     return {
         code: {**entry, "fields": sorted(entry["fields"])}
         for code, entry in sorted(grouped.items())
