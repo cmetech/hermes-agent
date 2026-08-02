@@ -122,6 +122,7 @@ def test_task3_static_reference_codes_have_additive_catalog_metadata() -> None:
         "output_reference_path_unsupported",
         "structured_output_field_impossible",
         "named_script_output_reference_unsupported",
+        "invalid_command_resource",
     ):
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
@@ -226,12 +227,29 @@ def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
         compute_package_digest(load_workflow(named))
     emitted.add(named_exc.value.issues[0].code)
 
+    invalid_command_root = tmp_path / "invalid-command"
+    (invalid_command_root / "commands").mkdir(parents=True)
+    (invalid_command_root / "commands" / "consume.md").write_bytes(b"\xff")
+    invalid_command = workflow_writer(
+        invalid_command_root,
+        nodes=[{"id": "consumer", "command": "consume"}],
+    )
+    invalid_command.with_name(
+        f"{invalid_command.stem}.hermes.yaml"
+    ).write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    with pytest.raises(WorkflowValidationError) as invalid_command_exc:
+        compute_package_digest(load_workflow(invalid_command))
+    emitted.add(invalid_command_exc.value.issues[0].code)
+
     assert emitted == {
         "archon_node_id_not_reference_safe",
         "output_reference_not_declared_dependency",
         "output_reference_path_unsupported",
         "structured_output_field_impossible",
         "named_script_output_reference_unsupported",
+        "invalid_command_resource",
     }
 
 

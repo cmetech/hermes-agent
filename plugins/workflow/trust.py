@@ -19,6 +19,7 @@ import yaml
 from plugins.workflow.compat import ARCHON_TOOL_ALIASES, CompatibilityReport
 from plugins.workflow.models import (
     ValidationIssue,
+    WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowValidationError,
 )
@@ -371,6 +372,11 @@ def compute_package_digest(
     resources: dict[str, bytes] = {}
     command_bodies: dict[str, str] = {}
     named_script_bodies: dict[str, str] = {}
+    strict_v3_resources = (
+        package.language.effective_profile
+        is WorkflowLanguageProfile.ARCHON_2026_07
+        and package.language.normalizer_version == 3
+    )
 
     def add(path: Path) -> tuple[str, bytes]:
         relative, data = _contained_resource(root, path, read_budget=read_budget)
@@ -388,10 +394,18 @@ def compute_package_digest(
             relative, data = add(
                 _command_path(package, str(node.value), read_budget)
             )
-            command_bodies[node.id] = parse_command_resource(
-                root / relative,
-                data.decode("utf-8"),
-            ).body
+            if strict_v3_resources:
+                try:
+                    command_bodies[node.id] = parse_command_resource(
+                        root / relative,
+                        data.decode("utf-8"),
+                    ).body
+                except (UnicodeError, ValueError, yaml.YAMLError) as exc:
+                    raise _validation_error(
+                        f"nodes[{node.source_index}].command",
+                        "invalid_command_resource",
+                        "authenticated command resource is invalid",
+                    ) from exc
         elif node.node_type == "script" and isinstance(node.value, str):
             if not is_inline_script(node.value):
                 _relative, data = add(
@@ -402,9 +416,10 @@ def compute_package_digest(
                         read_budget,
                     )
                 )
-                named_script_bodies[node.id] = data.decode(
-                    "utf-8", errors="surrogateescape"
-                )
+                if strict_v3_resources:
+                    named_script_bodies[node.id] = data.decode(
+                        "utf-8", errors="surrogateescape"
+                    )
         mcp_value = node.options.get("mcp")
         references = (
             (mcp_value,)
@@ -439,11 +454,12 @@ def compute_package_digest(
                     ) or resource.exists() or resource.is_symlink():
                         add(resource)
 
-    validate_authenticated_resource_references(
-        package,
-        command_bodies=command_bodies,
-        named_script_bodies=named_script_bodies,
-    )
+    if strict_v3_resources:
+        validate_authenticated_resource_references(
+            package,
+            command_bodies=command_bodies,
+            named_script_bodies=named_script_bodies,
+        )
 
     digest = hashlib.sha256()
     for relative in sorted(resources):

@@ -40,8 +40,10 @@ from plugins.workflow.language_schema import (
     hook_event_names,
     hook_response_field_names,
     hook_specific_field_names,
+    contains_output_reference,
     is_reference_safe_node_id,
     iter_output_references,
+    iter_when_output_references,
     loop_field_names,
     retry_field_names,
     sidecar_field_names,
@@ -652,7 +654,7 @@ def _normalize_node(
         when = _string(node["when"], f"{path}.when")
         if archon_v3:
             try:
-                tuple(iter_output_references(when, normalizer_version=3))
+                tuple(iter_when_output_references(when, normalizer_version=3))
             except WorkflowReferenceSyntaxError as exc:
                 _fail(f"{path}.when", exc.code, str(exc))
         expression_pattern = _ARCHON_V3_WHEN_EXPRESSION if archon_v3 else _WHEN_EXPRESSION
@@ -832,6 +834,23 @@ def _schema_has_unaddressable_dotted_key(
                 visit(branch, index) for branch in branches
             ):
                 return True
+        segment = path_parts[index]
+        if segment.isascii() and segment.isdigit():
+            sequence_index = int(segment)
+            prefix = current.get("prefixItems")
+            if isinstance(prefix, tuple | list) and sequence_index < len(prefix):
+                child: object = prefix[sequence_index]
+            else:
+                items = current.get("items", True)
+                if isinstance(items, tuple | list):
+                    child = (
+                        items[sequence_index]
+                        if sequence_index < len(items)
+                        else current.get("additionalItems", True)
+                    )
+                else:
+                    child = items
+            return visit(child, index + 1)
         properties = current.get("properties")
         if not isinstance(properties, Mapping):
             return False
@@ -841,6 +860,157 @@ def _schema_has_unaddressable_dotted_key(
         return visit(properties.get(path_parts[index]), index + 1)
 
     return visit(schema, 0)
+
+
+def _v3_output_path_impossible(
+    schema: Mapping[str, object], path_parts: tuple[str, ...]
+) -> bool:
+    """Prove a v3 mapping-key/sequence-index path impossible conservatively."""
+    if not path_parts:
+        return False
+    return _v3_schema_path_impossible(
+        schema,
+        path_parts,
+        schema,
+        frozenset(),
+    )
+
+
+def _v3_schema_path_impossible(
+    schema: object,
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    if schema is False:
+        return True
+    if schema is True or not isinstance(schema, Mapping):
+        return False
+
+    segment = path_parts[0]
+    index = int(segment) if segment.isascii() and segment.isdigit() else None
+    expected_type = "array" if index is not None else "object"
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str) and schema_type != expected_type:
+        return True
+    if isinstance(schema_type, tuple | list) and expected_type not in schema_type:
+        return True
+
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference not in resolving:
+        target = _resolve_v3_local_ref(root, reference)
+        if target is not None and _v3_schema_path_impossible(
+            target,
+            path_parts,
+            root,
+            resolving | frozenset({reference}),
+        ):
+            return True
+
+    if index is None:
+        if _v3_object_path_impossible(
+            schema, path_parts, root, resolving
+        ):
+            return True
+    elif _v3_array_path_impossible(schema, index, path_parts[1:], root, resolving):
+        return True
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, tuple | list) and any(
+        _v3_schema_path_impossible(branch, path_parts, root, resolving)
+        for branch in all_of
+    ):
+        return True
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if (
+            isinstance(branches, tuple | list)
+            and branches
+            and all(
+                _v3_schema_path_impossible(branch, path_parts, root, resolving)
+                for branch in branches
+            )
+        ):
+            return True
+    return False
+
+
+def _v3_object_path_impossible(
+    schema: Mapping[str, object],
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    property_name, *remaining = path_parts
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping) and property_name in properties:
+        child = properties[property_name]
+        if not remaining:
+            return child is False
+        return _v3_schema_path_impossible(
+            child, tuple(remaining), root, resolving
+        )
+    patterns = schema.get("patternProperties")
+    if isinstance(patterns, Mapping) and patterns:
+        return False
+    additional = schema.get("additionalProperties", True)
+    if additional is False:
+        return True
+    if isinstance(additional, Mapping) and remaining:
+        return _v3_schema_path_impossible(
+            additional, tuple(remaining), root, resolving
+        )
+    return False
+
+
+def _v3_array_path_impossible(
+    schema: Mapping[str, object],
+    index: int,
+    remaining: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    maximum = schema.get("maxItems")
+    if isinstance(maximum, int) and not isinstance(maximum, bool) and index >= maximum:
+        return True
+
+    prefix = schema.get("prefixItems")
+    if isinstance(prefix, tuple | list) and index < len(prefix):
+        child: object = prefix[index]
+    else:
+        items = schema.get("items", True)
+        if isinstance(items, tuple | list):
+            if index < len(items):
+                child = items[index]
+            else:
+                child = schema.get("additionalItems", True)
+        else:
+            child = items
+    if not remaining:
+        return child is False
+    return _v3_schema_path_impossible(child, remaining, root, resolving)
+
+
+def _resolve_v3_local_ref(
+    root: Mapping[str, object], reference: str
+) -> object | None:
+    if not reference.startswith("#/"):
+        return None
+    current: object = root
+    for raw_part in reference[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif (
+            isinstance(current, tuple | list)
+            and part.isascii()
+            and part.isdigit()
+            and int(part) < len(current)
+        ):
+            current = current[int(part)]
+        else:
+            return None
+    return current
 
 
 def _validate_v3_static_output_references(
@@ -857,7 +1027,11 @@ def _validate_v3_static_output_references(
         ):
             try:
                 references = tuple(
-                    iter_output_references(template, normalizer_version=3)
+                    (
+                        iter_when_output_references
+                        if surface_path.endswith(".when")
+                        else iter_output_references
+                    )(template, normalizer_version=3)
                 )
             except WorkflowReferenceSyntaxError as exc:
                 issues.append(
@@ -889,7 +1063,7 @@ def _validate_v3_static_output_references(
                         )
                     )
                     continue
-                if prove_output_path_impossible(schema, reference.path):
+                if _v3_output_path_impossible(schema, reference.path):
                     if _schema_has_unaddressable_dotted_key(schema, reference.path):
                         code = "output_reference_path_unsupported"
                         message = (
@@ -983,13 +1157,7 @@ def validate_authenticated_resource_references(
             body = named_script_bodies.get(node.id)
             if body is None:
                 continue
-            try:
-                references = tuple(
-                    iter_output_references(body, normalizer_version=3)
-                )
-            except WorkflowReferenceSyntaxError:
-                references = ()
-            if references:
+            if contains_output_reference(body, normalizer_version=3):
                 issues.append(
                     _issue(
                         f"nodes[{node.source_index}].script",

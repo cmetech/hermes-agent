@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 
 import pytest
 
@@ -60,6 +61,8 @@ def test_v3_reference_iterator_uses_the_exact_ascii_grammar() -> None:
         "$producer.output..field",
         "$producer.output.01",
         "$producer.output[field]",
+        "$producer.output-field",
+        "$producer.output.1-child",
         "$producer.output.field\N{COMBINING ACUTE ACCENT}",
     ),
 )
@@ -251,6 +254,43 @@ def test_v3_accepts_a_whole_output_from_a_direct_dependency(
     assert load_workflow(path).definition.nodes[-1].id == "consumer"
 
 
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_v3_when_quoted_rhs_reference_text_remains_literal(
+    workflow_writer, tmp_path: Path, quote: str
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "produce",
+                "output_format": {"type": "string"},
+            },
+            {
+                "id": "consumer",
+                "prompt": "consume",
+                "depends_on": ["producer"],
+                "when": (
+                    f"$producer.output == {quote}$literal.output.01{quote}"
+                ),
+            },
+        ],
+    )
+
+    package = load_workflow(path)
+
+    references = tuple(
+        language_schema.iter_when_output_references(
+            str(package.definition.nodes[-1].options["when"]),
+            normalizer_version=3,
+        )
+    )
+    assert [(item.node_id, item.path) for item in references] == [
+        ("producer", ())
+    ]
+
+
 def test_v3_preserves_dependency_cycle_as_the_topology_error(
     workflow_writer, tmp_path: Path
 ) -> None:
@@ -296,31 +336,48 @@ def test_v3_field_reference_requires_a_declared_structured_output(
 
 
 @pytest.mark.parametrize(
-    "schema",
+    ("schema", "reference"),
     (
-        {
-            "type": "object",
-            "properties": {"dotted.key": {"type": "string"}},
-            "additionalProperties": False,
-        },
-        {
-            "anyOf": [
-                {
+        (
+            {
+                "type": "object",
+                "properties": {"dotted.key": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "$producer.output.dotted.key",
+        ),
+        (
+            {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {"dotted.key": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+            "$producer.output.dotted.key",
+        ),
+        (
+            {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {"dotted.key": {"type": "string"}},
                     "additionalProperties": False,
                 },
-                {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            ]
-        },
+            },
+            "$producer.output.0.dotted.key",
+        ),
     ),
 )
 def test_v3_rejects_an_attempt_to_address_a_dotted_mapping_key(
-    workflow_writer, tmp_path: Path, schema: dict[str, object]
+    workflow_writer, tmp_path: Path, schema: dict[str, object], reference: str
 ) -> None:
     path = _archon(
         workflow_writer,
@@ -332,7 +389,9 @@ def test_v3_rejects_an_attempt_to_address_a_dotted_mapping_key(
                 "output_format": schema,
             },
             _consumer(
-                "prompt", "$producer.output.dotted.key", depends_on=["producer"]
+                "prompt",
+                reference,
+                depends_on=["producer"],
             ),
         ],
     )
@@ -341,6 +400,160 @@ def test_v3_rejects_an_attempt_to_address_a_dotted_mapping_key(
         load_workflow(path)
 
     assert _codes(exc) == ["output_reference_path_unsupported"]
+
+
+@pytest.mark.parametrize(
+    ("schema", "reference"),
+    (
+        (
+            {"type": "array", "items": {"type": "string"}},
+            "$producer.output.0",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string"},
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "$producer.output.items.0",
+        ),
+        (
+            {
+                "type": "array",
+                "prefixItems": [
+                    False,
+                    {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                ],
+                "items": False,
+                "minItems": 2,
+                "maxItems": 2,
+            },
+            "$producer.output.1.name",
+        ),
+        (
+            {
+                "anyOf": [
+                    {"type": "array", "maxItems": 0},
+                    {"type": "array", "items": {"type": "number"}},
+                ]
+            },
+            "$producer.output.0",
+        ),
+        (
+            {
+                "allOf": [
+                    {"type": "array"},
+                    {
+                        "items": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "additionalProperties": False,
+                        }
+                    },
+                ]
+            },
+            "$producer.output.0.name",
+        ),
+        (
+            {
+                "$defs": {
+                    "rows": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    }
+                },
+                "$ref": "#/$defs/rows",
+            },
+            "$producer.output.0",
+        ),
+    ),
+)
+def test_v3_static_schema_feasibility_accepts_possible_sequence_indexes(
+    workflow_writer,
+    tmp_path: Path,
+    schema: dict[str, object],
+    reference: str,
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {"id": "producer", "prompt": "produce", "output_format": schema},
+            _consumer("prompt", reference, depends_on=["producer"]),
+        ],
+    )
+
+    assert load_workflow(path).definition.nodes[-1].id == "consumer"
+
+
+@pytest.mark.parametrize(
+    ("schema", "reference"),
+    (
+        (
+            {"type": "array", "maxItems": 0, "items": {"type": "string"}},
+            "$producer.output.0",
+        ),
+        (
+            {
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": False,
+            },
+            "$producer.output.1",
+        ),
+        (
+            {"type": "array", "prefixItems": [False], "items": True},
+            "$producer.output.0",
+        ),
+        (
+            {
+                "allOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"maxItems": 0},
+                ]
+            },
+            "$producer.output.0",
+        ),
+        (
+            {
+                "anyOf": [
+                    {"type": "array", "maxItems": 0},
+                    {"type": "object", "additionalProperties": False},
+                ]
+            },
+            "$producer.output.0",
+        ),
+    ),
+)
+def test_v3_static_schema_feasibility_rejects_proven_impossible_indexes(
+    workflow_writer,
+    tmp_path: Path,
+    schema: dict[str, object],
+    reference: str,
+) -> None:
+    path = _archon(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {"id": "producer", "prompt": "produce", "output_format": schema},
+            _consumer("prompt", reference, depends_on=["producer"]),
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert _codes(exc) == ["structured_output_field_impossible"]
 
 
 def test_authenticated_command_body_is_scanned_before_snapshot_promotion(
@@ -392,6 +605,34 @@ def test_authenticated_command_body_accepts_a_direct_dependency(
     assert compute_package_digest(package).sha256
 
 
+def test_authenticated_command_body_rejects_malformed_hyphen_continuation(
+    workflow_writer, tmp_path: Path
+) -> None:
+    (tmp_path / "commands").mkdir()
+    (tmp_path / "commands" / "consume.md").write_text(
+        "consume $producer.output-field\n", encoding="utf-8"
+    )
+    package = load_workflow(
+        _archon(
+            workflow_writer,
+            tmp_path,
+            nodes=[
+                {"id": "producer", "prompt": "produce"},
+                {
+                    "id": "consumer",
+                    "command": "consume",
+                    "depends_on": ["producer"],
+                },
+            ],
+        )
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        compute_package_digest(package)
+
+    assert _codes(exc) == ["output_reference_path_unsupported"]
+
+
 def test_recognized_reference_in_authenticated_named_script_is_blocking(
     workflow_writer, tmp_path: Path
 ) -> None:
@@ -441,3 +682,133 @@ def test_named_script_keeps_ordinary_dollar_syntax_and_reference_free_bytes(
 
     assert compute_package_digest(package).sha256
     assert script.read_bytes() == b"print('$HOME', '$1', '${VALUE}')\n"
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b"$producer.output $bad.output.\n",
+        b"$bad.output. $producer.output\n",
+        b"\xff before $producer.output after \xfe\n",
+    ),
+)
+def test_named_script_scan_never_loses_a_valid_reference_around_other_bytes(
+    workflow_writer, tmp_path: Path, body: bytes
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "consume.py").write_bytes(body)
+    package = load_workflow(
+        _archon(
+            workflow_writer,
+            tmp_path,
+            nodes=[
+                {"id": "producer", "prompt": "produce"},
+                {
+                    "id": "consumer",
+                    "script": "consume.py",
+                    "runtime": "uv",
+                    "depends_on": ["producer"],
+                },
+            ],
+        )
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        compute_package_digest(package)
+
+    assert _codes(exc) == ["named_script_output_reference_unsupported"]
+
+
+@pytest.mark.parametrize("normalizer_version", (1, 2))
+@pytest.mark.parametrize(
+    "body",
+    (b"\xff---\nnot: parsed\n", b"---\n- not\n- a\n- mapping\n---\nbody\n"),
+)
+def test_pre_v3_archon_command_digest_preserves_raw_command_bytes(
+    workflow_writer, tmp_path: Path, normalizer_version: int, body: bytes
+) -> None:
+    root = tmp_path / f"v{normalizer_version}"
+    (root / "commands").mkdir(parents=True)
+    command = root / "commands" / "consume.md"
+    command.write_bytes(body)
+    path = _archon(
+        workflow_writer,
+        root,
+        nodes=[{"id": "consumer", "command": "consume"}],
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=normalizer_version,
+    )
+
+    first = compute_package_digest(package)
+    command.write_bytes(b"changed\n" + body)
+    second = compute_package_digest(package)
+
+    assert first.covered_relative_paths == (
+        "commands/consume.md",
+        "example.hermes.yaml",
+        "example.yaml",
+    )
+    assert first.sha256 != second.sha256
+    assert all(len(value) == 64 for value in (first.sha256, second.sha256))
+
+
+@pytest.mark.parametrize(
+    "body",
+    (b"\xff---\nnot: parsed\n", b"---\n- not\n- a\n- mapping\n---\nbody\n"),
+)
+def test_legacy_command_digest_preserves_raw_command_bytes(
+    workflow_writer, tmp_path: Path, body: bytes
+) -> None:
+    (tmp_path / "commands").mkdir()
+    command = tmp_path / "commands" / "consume.md"
+    command.write_bytes(body)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path,
+            name="legacy-command-bytes",
+            nodes=[{"id": "consumer", "command": "consume"}],
+        )
+    )
+
+    observed = compute_package_digest(package)
+
+    digest = hashlib.sha256()
+    for relative in observed.covered_relative_paths:
+        data = (package.root / relative).read_bytes()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    assert observed.sha256 == digest.hexdigest()
+
+
+@pytest.mark.parametrize(
+    "body",
+    (b"\xff", b"---\n- not\n- a\n- mapping\n---\nbody\n", b"---\nunclosed\n"),
+)
+def test_v3_invalid_authenticated_command_has_a_bounded_stable_error(
+    workflow_writer, tmp_path: Path, body: bytes
+) -> None:
+    (tmp_path / "commands").mkdir()
+    (tmp_path / "commands" / "consume.md").write_bytes(body)
+    package = load_workflow(
+        _archon(
+            workflow_writer,
+            tmp_path,
+            nodes=[{"id": "consumer", "command": "consume"}],
+        )
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        compute_package_digest(package)
+
+    assert _codes(exc) == ["invalid_command_resource"]
+    assert exc.value.issues[0].path == "nodes[0].command"
+    assert len(exc.value.issues[0].message.encode("utf-8")) <= 128

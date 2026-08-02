@@ -89,6 +89,10 @@ _ARCHON_V3_NODE_ID = re.compile(rf"^(?:{ARCHON_V3_NODE_ID_PATTERN})$", re.ASCII)
 _ARCHON_V3_OUTPUT_REFERENCE = re.compile(
     ARCHON_V3_OUTPUT_REFERENCE_PATTERN, re.ASCII
 )
+_ARCHON_V3_WHEN_OPERATOR = re.compile(r"(?:==|!=|<=|>=|<|>)", re.ASCII)
+_ARCHON_V3_WHEN_NUMBER = re.compile(
+    r"-?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII
+)
 _REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
 
 
@@ -102,6 +106,19 @@ def _reference_candidate_end(template: str, start: int) -> int:
     while end < len(template) and template[end] not in _REFERENCE_CANDIDATE_END:
         end += 1
     return end
+
+
+def _complete_reference_at(template: str, start: int) -> bool:
+    match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
+    if match is None:
+        return False
+    following = template[match.end() : match.end() + 1]
+    return not following or not (
+        following in ".[\\/-"
+        or following == "_"
+        or following.isalnum()
+        or not following.isascii()
+    )
 
 
 def iter_output_references(
@@ -120,13 +137,7 @@ def iter_output_references(
         match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
         if match is not None:
             end = match.end()
-            following = template[end : end + 1]
-            if following and (
-                following in ".[/\\"
-                or following == "_"
-                or following.isalnum()
-                or not following.isascii()
-            ):
+            if not _complete_reference_at(template, start):
                 raise WorkflowReferenceSyntaxError(
                     "output reference uses an unsupported path"
                 )
@@ -148,6 +159,87 @@ def iter_output_references(
                 "output reference uses an unsupported path"
             )
         position = max(start + 1, candidate_end)
+
+
+def contains_output_reference(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> bool:
+    """Find any complete v3 reference despite other malformed candidates."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return False
+        if _complete_reference_at(template, start):
+            return True
+        position = start + 1
+
+
+def iter_when_output_references(
+    expression: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Yield only v3 condition operands; quoted RHS text stays literal."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    tokens: list[OutputReferenceToken] = []
+    position = 0
+    while position < len(expression) and expression[position].isspace():
+        position += 1
+    while position < len(expression):
+        relative = next(
+            iter_output_references(
+                expression[position:], normalizer_version=normalizer_version
+            ),
+            None,
+        )
+        if relative is None or relative.start != 0:
+            return
+        token = OutputReferenceToken(
+            node_id=relative.node_id,
+            path=relative.path,
+            start=position,
+            end=position + relative.end,
+        )
+        tokens.append(token)
+        position = token.end
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        operator = _ARCHON_V3_WHEN_OPERATOR.match(expression, position)
+        if operator is None:
+            return
+        position = operator.end()
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        if position >= len(expression):
+            return
+        quote = expression[position]
+        if quote in "'\"":
+            closing = expression.find(quote, position + 1)
+            if closing < 0:
+                return
+            position = closing + 1
+        else:
+            number = _ARCHON_V3_WHEN_NUMBER.match(expression, position)
+            if number is None:
+                return
+            position = number.end()
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        if expression.startswith("&&", position) or expression.startswith(
+            "||", position
+        ):
+            position += 2
+            while position < len(expression) and expression[position].isspace():
+                position += 1
+            continue
+        break
+    yield from tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +495,17 @@ PHASE3_DURABLE_CODES = (
         True,
         False,
         ("nodes[].script",),
+    ),
+    DurableWorkflowCode(
+        "invalid_command_resource",
+        "authenticated command bytes cannot be decoded and parsed safely",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].command",),
     ),
 )
 

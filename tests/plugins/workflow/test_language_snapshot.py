@@ -425,7 +425,7 @@ def test_resume_reads_sealed_definition_after_installed_source_changes(
     assert loaded.language.effective_profile.value == "archon-2026-07"
 
 
-def test_verified_load_checks_command_references_from_sealed_bytes_only(
+def test_v3_command_reference_is_checked_before_snapshot_promotion(
     tmp_path, workflow_writer
 ):
     root = tmp_path / "package"
@@ -458,7 +458,55 @@ def test_verified_load_checks_command_references_from_sealed_bytes_only(
     )
     package = load_workflow(path)
     store = RunStore(tmp_path / "home")
-    _prepared, admitted = _start(store, package, key="sealed-command-reference")
+
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        store.prepare_run_snapshot(package)
+
+    assert [(issue.path, issue.code) for issue in exc_info.value.issues] == [
+        ("nodes[1].command", "structured_output_field_impossible")
+    ]
+
+
+def test_v2_verified_load_checks_command_references_from_sealed_bytes_only(
+    tmp_path, workflow_writer
+):
+    root = tmp_path / "package-v2"
+    commands = root / "commands"
+    commands.mkdir(parents=True)
+    command = commands / "consume.md"
+    command.write_text("Use $producer.output.missing\n", encoding="utf-8")
+    path = workflow_writer(
+        root / "workflows",
+        name="sealed-command-reference-v2",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=2,
+    )
+    store = RunStore(tmp_path / "home-v2")
+    _prepared, admitted = _start(store, package, key="sealed-command-reference-v2")
     command.write_text("Use $producer.output.present\n", encoding="utf-8")
 
     with pytest.raises(WorkflowValidationError) as exc_info:
