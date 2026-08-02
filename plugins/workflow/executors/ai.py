@@ -821,6 +821,13 @@ class AgentNodeExecutor:
                 if context.deadline_budget is not None
                 else float(context.timeout_seconds)
             )
+            if context.sealed_attempt_timeout and wall_timeout <= 0:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_timeout",
+                    error_message="workflow attempt deadline expired",
+                    metadata={"provider_attempts": 0},
+                )
             wall_deadline = (
                 context.deadline_budget.wall_deadline
                 if context.deadline_budget is not None

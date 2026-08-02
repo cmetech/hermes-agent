@@ -2589,6 +2589,7 @@ class RunScheduler:
                         read_budget=read_budget,
                     )
                 )
+            semantics = None
             if (
                 package.language.effective_profile
                 is WorkflowLanguageProfile.ARCHON_2026_07
@@ -2634,7 +2635,7 @@ class RunScheduler:
                 )
             else:
                 execution_limits = self._run_execution_limits(package)
-            return package, execution_limits, sealed_paths, sealed_bytes
+            return package, execution_limits, sealed_paths, sealed_bytes, semantics
         except WorkflowValidationError as exc:
             if not exc.issues:
                 raise
@@ -2761,13 +2762,72 @@ class RunScheduler:
         self,
         node: WorkflowNode,
         execution_limits: RunExecutionLimits | None = None,
+        execution_semantics: Phase3ExecutionSemantics | None = None,
     ) -> float:
+        if execution_semantics is not None:
+            return float(
+                execution_semantics.nodes[node.id][
+                    "attempt_wall_timeout_seconds"
+                ]
+            )
         limits = execution_limits or self.profile_execution_limits
         if node.node_type in {"command", "prompt", "loop", "approval"}:
             return float(limits.ai_wall_timeout_seconds)
         return min(
             float(node.options.get("timeout", limits.subprocess_timeout_seconds)),
             float(limits.subprocess_timeout_seconds),
+        )
+
+    def _attempt_deadline_budget(
+        self,
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits,
+        execution_semantics: Phase3ExecutionSemantics | None,
+    ) -> DeadlineBudget:
+        now = self._monotonic()
+        if execution_semantics is not None:
+            node_semantics = execution_semantics.nodes[node.id]
+            attempt_wall = float(
+                node_semantics["attempt_wall_timeout_seconds"]
+            )
+            sealed_idle = node_semantics["idle_timeout_seconds"]
+            sealed_provider = node_semantics["provider_request_timeout_seconds"]
+            return DeadlineBudget.from_attempt_semantics(
+                now=now,
+                attempt_wall_seconds=attempt_wall,
+                idle_seconds=(
+                    float(sealed_idle)
+                    if sealed_idle is not None
+                    else min(execution_limits.ai_idle_timeout_seconds, attempt_wall)
+                ),
+                provider_seconds=(
+                    float(sealed_provider)
+                    if sealed_provider is not None
+                    else min(
+                        execution_limits.provider_request_timeout_seconds,
+                        attempt_wall,
+                    )
+                ),
+            )
+        timeout = self._node_timeout(node, execution_limits)
+        idle_timeout = min(
+            float(
+                node.options.get(
+                    "idle_timeout",
+                    execution_limits.ai_idle_timeout_seconds,
+                )
+            ),
+            execution_limits.ai_idle_timeout_seconds,
+            timeout,
+        )
+        return DeadlineBudget.create(
+            now=now,
+            wall_seconds=timeout,
+            idle_seconds=idle_timeout,
+            provider_seconds=min(
+                execution_limits.provider_request_timeout_seconds,
+                timeout,
+            ),
         )
 
     @staticmethod
@@ -2791,9 +2851,11 @@ class RunScheduler:
         self,
         node: WorkflowNode,
         execution_limits: RunExecutionLimits | None = None,
+        execution_semantics: Phase3ExecutionSemantics | None = None,
     ) -> int:
         heartbeat_count = math.ceil(
-            self._node_timeout(node, execution_limits) / self.heartbeat_seconds
+            self._node_timeout(node, execution_limits, execution_semantics)
+            / self.heartbeat_seconds
         )
         return heartbeat_count * 4096
 
@@ -2806,6 +2868,7 @@ class RunScheduler:
         projection: dict[str, object],
         strict_reference_snapshot: _StrictReferenceSnapshot | None,
         execution_limits: RunExecutionLimits,
+        execution_semantics: Phase3ExecutionSemantics | None,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
     ) -> None:
@@ -2859,7 +2922,9 @@ class RunScheduler:
                 node_state.pop("action_grant", None)
                 if approved_action_digest is not None:
                     node_state["approved_action_digest"] = approved_action_digest
-                timeout = self._node_timeout(node, execution_limits)
+                timeout = self._node_timeout(
+                    node, execution_limits, execution_semantics
+                )
                 heartbeat_stop = threading.Event()
                 ownership_lost = threading.Event()
 
@@ -2889,24 +2954,10 @@ class RunScheduler:
                 )
                 heartbeat_thread.start()
                 try:
-                    idle_timeout = min(
-                        float(
-                            node.options.get(
-                                "idle_timeout",
-                                execution_limits.ai_idle_timeout_seconds,
-                            )
-                        ),
-                        execution_limits.ai_idle_timeout_seconds,
-                        timeout,
-                    )
-                    deadline_budget = DeadlineBudget.create(
-                        now=self._monotonic(),
-                        wall_seconds=timeout,
-                        idle_seconds=idle_timeout,
-                        provider_seconds=min(
-                            execution_limits.provider_request_timeout_seconds,
-                            timeout,
-                        ),
+                    deadline_budget = self._attempt_deadline_budget(
+                        node,
+                        execution_limits,
+                        execution_semantics,
                     )
                     variables = self._variables(
                         projection,
@@ -2997,6 +3048,7 @@ class RunScheduler:
                                 max_descendants=execution_limits.max_descendants,
                             ),
                             deadline_budget=deadline_budget,
+                            sealed_attempt_timeout=(execution_semantics is not None),
                             # Provider and workflow attempts draw from the same
                             # frozen per-run allowance, so the retry layers do not multiply.
                             max_provider_attempts=remaining_attempts,
@@ -3384,6 +3436,7 @@ class RunScheduler:
             execution_limits,
             sealed_resource_paths,
             sealed_resource_bytes,
+            execution_semantics,
         ) = prepared_package
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
@@ -3466,7 +3519,9 @@ class RunScheduler:
                             now=self._utcnow(),
                             monotonic_now=self._monotonic(),
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
-                                by_id[node_id], execution_limits
+                                by_id[node_id],
+                                execution_limits,
+                                execution_semantics,
                             ),
                             executor_id=by_id[node_id].node_type,
                             owner_epoch=self.owner_id,
@@ -3516,6 +3571,7 @@ class RunScheduler:
                             snapshot,
                             strict_snapshot,
                             execution_limits,
+                            execution_semantics,
                             sealed_resource_paths,
                             sealed_resource_bytes,
                         )
@@ -3585,6 +3641,7 @@ class RunScheduler:
         execution_limits = {}
         sealed_resource_paths = {}
         sealed_resource_bytes = {}
+        execution_semantics = {}
         package_failures = {}
         prepared_run_ids = []
         for run_id in run_ids:
@@ -3596,11 +3653,12 @@ class RunScheduler:
             if prepared_package is None:
                 package_failures[run_id] = self.store.load_run(run_id)
                 continue
-            package, limits, paths, resource_bytes = prepared_package
+            package, limits, paths, resource_bytes, semantics = prepared_package
             packages[run_id] = package
             execution_limits[run_id] = limits
             sealed_resource_paths[run_id] = paths
             sealed_resource_bytes[run_id] = resource_bytes
+            execution_semantics[run_id] = semantics
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -3722,6 +3780,7 @@ class RunScheduler:
                                         if node.id == node_id
                                     ),
                                     execution_limits[run_id],
+                                    execution_semantics[run_id],
                                 ),
                                 executor_id=next(
                                     node.node_type
@@ -3768,6 +3827,7 @@ class RunScheduler:
                             snapshots[run_id],
                             strict_reference_snapshots.get((run_id, node_id)),
                             execution_limits[run_id],
+                            execution_semantics[run_id],
                             sealed_resource_paths[run_id],
                             sealed_resource_bytes[run_id],
                         ))

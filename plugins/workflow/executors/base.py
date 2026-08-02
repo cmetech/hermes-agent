@@ -81,6 +81,7 @@ class NodeExecutionContext:
     output_resolver: (
         Callable[[str, tuple[str, ...]], ResolvedOutputReference] | None
     ) = None
+    sealed_attempt_timeout: bool = False
 
 
 @dataclass(frozen=True)

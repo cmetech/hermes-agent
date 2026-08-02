@@ -284,6 +284,24 @@ class DeadlineBudget:
             raise ValueError("now must be finite")
         return cls(float(now) + wall, idle, provider, float(now), float(now))
 
+    @classmethod
+    def from_attempt_semantics(
+        cls,
+        *,
+        now: float,
+        attempt_wall_seconds: float,
+        idle_seconds: float,
+        provider_seconds: float,
+    ) -> "DeadlineBudget":
+        """Create one attempt budget from already-normalized effective values."""
+        wall = _bounded_seconds(attempt_wall_seconds, "attempt_wall_seconds")
+        return cls.create(
+            now=now,
+            wall_seconds=wall,
+            idle_seconds=idle_seconds,
+            provider_seconds=provider_seconds,
+        )
+
     def child(
         self,
         *,

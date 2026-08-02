@@ -12,7 +12,12 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    DeadlineBudget,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    freeze_value,
+)
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
@@ -284,6 +289,36 @@ def _context(
             else {}
         ),
     )
+
+
+def test_archon_script_does_not_resolve_runtime_at_exact_attempt_wall_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    context = replace(
+        _context(tmp_path, runtime="uv", script="print('must not run')\n"),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: 11.0,
+    )
+    executor = ScriptExecutor()
+    monkeypatch.setattr(
+        executor,
+        "_runtime_locator",
+        lambda _runtime: (_ for _ in ()).throw(
+            AssertionError("expired attempt resolved a script runtime")
+        ),
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
 
 
 def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Path) -> None:

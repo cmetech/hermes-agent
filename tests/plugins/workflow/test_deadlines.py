@@ -5,11 +5,17 @@ import shlex
 import sys
 
 import pytest
+import yaml
 
 import plugins.workflow.models as workflow_models
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.execution_semantics import build_phase3_execution_semantics
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.models import DeadlineBudget, WorkflowRuntimeConfig
+from plugins.workflow.models import (
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowRuntimeConfig,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -247,6 +253,173 @@ def test_scheduler_threads_limits_from_sealed_snapshot_to_process_boundary(
     assert context.termination_policy.cooperative_grace_seconds == 1
     assert context.termination_policy.term_grace_seconds == 2
     assert context.termination_policy.kill_grace_seconds == 1
+
+
+@pytest.mark.parametrize(
+    ("node", "subprocess_ceiling", "expected_wall"),
+    [
+        ({"id": "shell", "bash": "true", "timeout": 1_500.5}, 30.0, 1.5005),
+        ({"id": "shell", "bash": "true"}, 60.0, 60.0),
+        ({"id": "shell", "bash": "true"}, 120.0, 120.0),
+        ({"id": "shell", "bash": "true"}, 240.0, 120.0),
+    ],
+)
+def test_archon_claim_uses_sealed_per_attempt_subprocess_wall(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    node,
+    subprocess_ceiling,
+    expected_wall,
+):
+    workflow = workflow_writer(tmp_path / "package", nodes=[node])
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=RunExecutionLimits(
+            subprocess_timeout_seconds=subprocess_ceiling,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"sealed-{subprocess_ceiling}-{expected_wall}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = []
+
+    class CaptureBoundary:
+        def execute(self, context):
+            observed.append(context)
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(store, subprocess_timeout_seconds=1.0)
+    scheduler.executors["bash"] = CaptureBoundary()
+    monkeypatch.setattr(
+        scheduler,
+        "_run_execution_limits",
+        lambda _package: (_ for _ in ()).throw(
+            AssertionError("resumed v3 consulted current timeout config")
+        ),
+    )
+    try:
+        result = scheduler.advance(
+            admitted.run_id,
+            max_nodes=1 if "timeout" in node else None,
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    context = observed[0]
+    assert context.timeout_seconds == pytest.approx(expected_wall)
+    assert context.deadline_budget is not None
+    assert context.deadline_budget.remaining_wall(
+        context.deadline_budget.last_semantic_progress
+    ) == pytest.approx(expected_wall)
+
+
+def test_archon_claim_uses_sealed_ai_wall_idle_and_provider_intersection(
+    tmp_path, workflow_writer
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[{"id": "agent", "prompt": "work", "idle_timeout": 1_250.5}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=RunExecutionLimits(
+            ai_idle_timeout_seconds=3.0,
+            ai_wall_timeout_seconds=4.0,
+            provider_request_timeout_seconds=2.0,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="sealed-ai-timeouts",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = []
+
+    class CaptureBoundary:
+        def execute(self, context):
+            observed.append(context)
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(
+        store,
+        ai_idle_timeout_seconds=100.0,
+        ai_wall_timeout_seconds=100.0,
+        provider_request_timeout_seconds=100.0,
+    )
+    scheduler.executors["prompt"] = CaptureBoundary()
+    try:
+        result = scheduler.advance(admitted.run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    context = observed[0]
+    assert context.timeout_seconds == 4.0
+    assert context.deadline_budget is not None
+    assert context.deadline_budget.idle_seconds == pytest.approx(1.2505)
+    assert context.deadline_budget.provider_seconds == 2.0
+
+
+def test_archon_workflow_retry_gets_a_fresh_sealed_attempt_budget_after_backoff(
+    tmp_path, workflow_writer
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[{"id": "shell", "bash": "true", "timeout": 1_500.5}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    limits = RunExecutionLimits(subprocess_timeout_seconds=30.0)
+    semantics = build_phase3_execution_semantics(package, limits)
+    samples = iter((10.0, 50.0))
+    scheduler = RunScheduler(
+        RunStore(tmp_path / "home"),
+        monotonic=lambda: next(samples),
+    )
+    node = package.definition.nodes[0]
+    try:
+        first = scheduler._attempt_deadline_budget(node, limits, semantics)
+        second = scheduler._attempt_deadline_budget(node, limits, semantics)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert first.wall_deadline == pytest.approx(11.5005)
+    assert second.wall_deadline == pytest.approx(51.5005)
+    assert first.remaining_wall(10.0) == pytest.approx(1.5005)
+    assert second.remaining_wall(50.0) == pytest.approx(1.5005)
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])

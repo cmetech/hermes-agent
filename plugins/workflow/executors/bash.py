@@ -30,6 +30,14 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
 
 class BashExecutor:
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
+        if context.sealed_attempt_timeout:
+            assert context.deadline_budget is not None
+            if context.deadline_budget.wall_expired(context.monotonic()):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="timeout",
+                    error_message="bash node exceeded its timeout",
+                )
         attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
@@ -98,10 +106,16 @@ class BashExecutor:
                     cancelled = True
                     tree.terminate("workflow run cancelled")
                     break
-                if (
-                    context.deadline_budget is not None
-                    and context.deadline_budget.wall_expired(context.monotonic())
-                ) or context.monotonic() - started >= context.timeout_seconds:
+                now = context.monotonic()
+                if context.sealed_attempt_timeout:
+                    assert context.deadline_budget is not None
+                    deadline_expired = context.deadline_budget.wall_expired(now)
+                else:
+                    deadline_expired = (
+                        context.deadline_budget is not None
+                        and context.deadline_budget.wall_expired(now)
+                    ) or now - started >= context.timeout_seconds
+                if deadline_expired:
                     timed_out = True
                     tree.terminate("workflow node timeout")
                     break

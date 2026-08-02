@@ -4,6 +4,9 @@ import threading
 import time
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.executors.base import NodeExecutionContext
+from plugins.workflow.executors.bash import BashExecutor
+from plugins.workflow.models import DeadlineBudget, WorkflowNode, freeze_value
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -23,6 +26,41 @@ def _start(store, package, *, key="e2e", values=None):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def test_archon_bash_does_not_spawn_at_exact_attempt_wall_boundary(tmp_path):
+    marker = tmp_path / "spawned"
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=f"touch {marker}",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="run-1",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: 11.0,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+    assert not marker.exists()
 
 
 def test_two_dependent_bash_nodes_execute_and_persist_artifacts(

@@ -1597,6 +1597,30 @@ def test_ai_request_receives_remaining_absolute_deadline_and_retry_budget(tmp_pa
     assert runner.requests[0].kill_reap_grace_seconds == 2
 
 
+def test_ai_request_does_not_start_at_exact_attempt_wall_boundary(tmp_path):
+    runner = FakeAgentRunner("must not run")
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=1,
+        idle_seconds=1,
+        provider_seconds=1,
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _context(
+            tmp_path,
+            _node("expired", "work"),
+            deadline_budget=budget,
+            sealed_attempt_timeout=True,
+            monotonic=lambda: 11,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_timeout"
+    assert runner.requests == []
+
+
 def test_ai_request_maps_every_run_execution_limit_exactly(tmp_path):
     runner = FakeAgentRunner("done")
     limits = RunExecutionLimits(
