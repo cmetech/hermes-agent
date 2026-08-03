@@ -699,3 +699,72 @@ locally. The generic nonempty-inheritance Windows fail-closed contract remains
 covered by its existing tests and native CI authority. No Task 12+, Phase 4,
 literal `main`, base checkout, plugin tool surface, prompt cache, workflow value,
 or filesystem-path evidence changed.
+
+## Fix Round 5 — logical Bash continuations and array subscripts
+
+### RED evidence and root causes
+
+The first focused wrapper run added scalar/output admission checks, direct
+inline/spill no-launch checks, scheduler-preflight checks, physical-coordinate
+checks, and a linear-read bound for the two remaining review findings. It
+failed 71 of 187 tests: every joined logical-operator and indexed-array case
+was admitted by the physical-only lexer.
+
+Two compatibility-driven RED cycles then prevented over-correction. Ordinary
+argument text resembling `[[ ... ]]` or `items[...]` failed 6 cases before
+top-level command-position tracking was added. An escaped even-length
+backslash run failed 6 cases because the initial logicalizer erased a real
+newline, and compound-assignment value text failed 3 cases because every `[`
+inside the compound was initially treated as an element subscript.
+
+The root causes were:
+
+- Bash removes an active backslash-newline before operator recognition, while
+  the lexer previously classified only physical adjacent characters;
+- indexed-array assignment subscripts are arithmetic contexts even though
+  their brackets were previously treated as ordinary punctuation; and
+- safe classification requires distinguishing command/assignment positions,
+  escaped-backslash parity, and `[subscript]=` at compound element-word starts.
+
+### Fixes
+
+- `classify_bash_reference_spans()` now validates physical spans, constructs a
+  bounded linear logical stream with physical-to-logical boundary mapping, and
+  maps admitted decisions back to the original coordinates. The scan honors
+  backslash-run parity, so only active continuations erase their newline.
+- The existing bounded classifier remains the shared authority used by static
+  admission, scheduler preflight, inline rendering, and spill rendering. It now
+  recognizes joined bare arithmetic, command/arithmetic/parameter expansions,
+  legacy arithmetic, conditionals, heredocs, and sibling operator prefixes.
+- Top-level indexed assignments, augmented assignments, compound assignments,
+  and compound append assignments mark references in their subscript ranges as
+  unsupported before rendering, spill publication, or process launch.
+- Command-position and compound-element boundaries preserve quoted punctuation,
+  ordinary argument brackets/conditionals, embedded bracket text in compound
+  values, escaped references, continued comments, and unrelated continuations.
+
+### GREEN and static evidence
+
+The final focused Bash substitution file passed 186/186. The required exact
+six-file Task 11 command passed 334/334, and the expanded eleven-file suite
+passed 581/581. A dedicated affected-surface run covering resources, the serial
+and parallel schedulers, and performance bounds passed 101/101.
+
+Ruff lint passed for all four changed Python files. Ruff format validation
+passed for the three files that were format-clean on entry; the retained
+performance file was not mechanically reformatted across pre-existing drift.
+`git diff --check` passed. No customization ledger or release-gate file changed,
+so the strict customization/base gate was not rerun.
+
+### Files changed and residual risk
+
+- `plugins/workflow/bash_rendering.py`
+- `tests/plugins/workflow/test_performance_bounds.py`
+- `tests/plugins/workflow/test_phase3_bash_reference_ordering.py`
+- `tests/plugins/workflow/test_phase3_bash_substitution.py`
+
+The real shell execution evidence was collected on Darwin with `/bin/sh`;
+Windows skips those platform-specific executions. The admission, scheduler,
+no-launch, coordinate, and complexity contracts are platform-neutral. No Task
+12+, Phase 4, release gate, customization ledger, literal `main`, base checkout,
+tool surface, or prompt-cache behavior changed.
