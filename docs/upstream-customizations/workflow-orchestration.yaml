@@ -385,12 +385,15 @@ upstream_changes:
   - tests/tools/test_process_registry.py
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
+  - InheritedDescriptorIdentity
   - ManagedProcessTree.spawn
   owned_invariants:
   - explicit bounded inherited_descriptors spawn contract
   - nominated POSIX descriptors are proven read-only before child creation
   - pinned open-file identity is remapped to the exact nominated child number
     with unrelated descriptors closed
+  - optional path-free expected identities are checked on race-safe pinned
+    duplicates before child creation
   - internal pins and bootstrap status descriptors close on every launch outcome
   - caller ownership of inherited descriptors across spawn success and failure
   - native Windows nonempty inheritance requests fail closed before child creation
@@ -405,12 +408,15 @@ upstream_changes:
     Preserve validation of at most 64 unique open integer descriptors above
     stdin/stdout/stderr, read-only access-mode enforcement, and pinned open-file
     identity remapped to the exact nominated POSIX child descriptor number while
-    every unrelated descriptor is closed. Preserve caller ownership of nominated
-    handles, internal-pin cleanup on every outcome, and native Windows fail-closed
-    behavior for every nonempty request. Keep workflow values, spill files, shell
-    rendering, and evidence out of the managed-process primitive, while retaining
-    the historical Job Object, process identity, termination, escalation,
-    resource, and wait/reap contracts in the adjacent entry.
+    every unrelated descriptor is closed. When a caller supplies path-free
+    expected identities, preserve verification against the newly pinned
+    duplicates before child creation so descriptor-number reuse fails closed.
+    Preserve caller ownership of nominated handles, internal-pin cleanup on every
+    outcome, and native Windows fail-closed behavior for every nonempty request.
+    Keep workflow values, spill files, shell rendering, and evidence out of the
+    managed-process primitive, while retaining the historical Job Object, process
+    identity, termination, escalation, resource, and wait/reap contracts in the
+    adjacent entry.
   removal_condition: >-
     Remove when upstream's generic managed-process primitive exposes equivalent
     bounded exact child-descriptor inheritance on POSIX and fail-closed native
@@ -3954,6 +3960,7 @@ upstream_changes:
   owned_invariants:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
+  - Phase 3 Bash security base merge-gate suite selection
   - relative PYTHON_BIN canonicalization before repository switching
   - canonical per-file test isolation in the base merge gate
   - tests/plugins/workflow/test_language.py gate membership
@@ -3967,6 +3974,10 @@ upstream_changes:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_language_schema.py
   - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase3_bash_substitution.py
+  - tests/plugins/workflow/test_phase3_bash_descriptor_faults.py
+  - tests/plugins/workflow/test_phase3_bash_lexer_security.py
+  - tests/plugins/workflow/test_phase3_bash_reference_ordering.py
   - apps/desktop/src/app/workflows/index.test.tsx
   - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
   - tests/scripts/test_workflow_merge_gate.py

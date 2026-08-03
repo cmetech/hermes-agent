@@ -5,13 +5,18 @@ from __future__ import annotations
 from bisect import bisect_left
 import hashlib
 import os
+import re
 import selectors
 import shlex
 import stat
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
+
+
+if TYPE_CHECKING:
+    from tools.managed_process import InheritedDescriptorIdentity
 
 
 BASH_INLINE_MAX_BYTES = 32_768
@@ -19,6 +24,21 @@ BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 BASH_SPILL_MAX_TOTAL_BYTES = 2_000_000
 _BASH_LEXER_MAX_NESTING = 64
+_BASH_SCALAR_REFERENCE = re.compile(
+    r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"
+)
+_BASH_SCALAR_NAMES = frozenset({
+    "ARGUMENTS",
+    "USER_MESSAGE",
+    "ARTIFACTS_DIR",
+    "WORKFLOW_ID",
+    "BASE_BRANCH",
+    "DOCS_DIR",
+    "CONTEXT",
+    "LOOP_USER_INPUT",
+    "LOOP_PREV_OUTPUT",
+    "REJECTION_REASON",
+})
 _NATIVE_WINDOWS = os.name == "nt"
 _DESCRIPTOR_SPILLS_SUPPORTED = (
     hasattr(os, "O_NOFOLLOW")
@@ -57,9 +77,11 @@ class _SpillTransport:
     def __init__(
         self,
         read_descriptors: tuple[int, ...],
+        read_descriptor_identities: tuple[InheritedDescriptorIdentity, ...],
         publications: tuple[tuple[int, bytes], ...],
     ) -> None:
         self.read_descriptors = read_descriptors
+        self.read_descriptor_identities = read_descriptor_identities
         self._publications = publications
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -70,17 +92,21 @@ class _SpillTransport:
 
     @classmethod
     def from_snapshots(cls, snapshots: tuple[bytes, ...]) -> _SpillTransport:
+        from tools.managed_process import InheritedDescriptorIdentity
+
         reads: list[int] = []
+        identities: list[InheritedDescriptorIdentity] = []
         publications: list[tuple[int, bytes]] = []
         try:
             for snapshot in snapshots:
                 read_descriptor, write_descriptor = os.pipe()
                 reads.append(read_descriptor)
+                identities.append(InheritedDescriptorIdentity.capture(read_descriptor))
                 publications.append((write_descriptor, snapshot))
                 os.set_inheritable(read_descriptor, False)
                 os.set_inheritable(write_descriptor, False)
                 os.set_blocking(write_descriptor, False)
-            return cls(tuple(reads), tuple(publications))
+            return cls(tuple(reads), tuple(identities), tuple(publications))
         except BaseException:
             for descriptor in reads:
                 try:
@@ -221,6 +247,11 @@ class RenderedBashCommand:
 
     command: str
     inherited_descriptors: tuple[int, ...] = ()
+    inherited_descriptor_identities: tuple[InheritedDescriptorIdentity, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
     template_sha256: str = ""
     template_size_bytes: int = 0
     rendered_sha256: str = ""
@@ -632,6 +663,13 @@ def classify_bash_reference_spans(
                 word_start = kind == "command"
                 continue
 
+        if quote is None and not frames and template.startswith("((", position):
+            check_nesting_bound()
+            frames.append(_NestingFrame("arithmetic", quote))
+            position += 2
+            word_start = False
+            continue
+
         if (
             quote is None
             and frames
@@ -867,22 +905,44 @@ def classify_bash_reference_spans(
 
 
 def bash_output_references(template: str):
-    """Parse strict output references only after Bash literal filtering."""
+    """Parse outputs after validating every substituted Bash reference context."""
     # Local import preserves bash_rendering's dependency-neutral lexer surface.
     from plugins.workflow.language_schema import (
         iter_output_reference_candidate_spans,
         iter_output_references_in_spans,
     )
 
-    candidates = tuple(
+    output_candidates = tuple(
         iter_output_reference_candidate_spans(template, normalizer_version=3)
     )
+    scalar_candidates: list[tuple[int, int]] = []
+    output_cursor = 0
+    for match in _BASH_SCALAR_REFERENCE.finditer(template):
+        if (
+            match.group("position") is None
+            and match.group("name") not in _BASH_SCALAR_NAMES
+        ):
+            continue
+        start, end = match.span()
+        while (
+            output_cursor < len(output_candidates)
+            and output_candidates[output_cursor][1] <= start
+        ):
+            output_cursor += 1
+        if output_cursor < len(output_candidates):
+            output_start, output_end = output_candidates[output_cursor]
+            if start < output_end and end > output_start:
+                continue
+        scalar_candidates.append((start, end))
+    candidates = tuple(sorted((*output_candidates, *scalar_candidates)))
+    output_candidate_set = frozenset(output_candidates)
     admitted = tuple(
         (start, end)
         for start, end, _quote in classify_bash_reference_spans(
             template,
             candidates,
         )
+        if (start, end) in output_candidate_set
     )
     return tuple(
         iter_output_references_in_spans(
@@ -1140,6 +1200,9 @@ def render_v3_bash(
             "Bash spill descriptor materialization failed integrity checks",
         ) from exc
     descriptors = transport.read_descriptors if transport is not None else ()
+    descriptor_identities = (
+        transport.read_descriptor_identities if transport is not None else ()
+    )
     try:
         variables = {
             data: f"__HERMES_WF_SPILL_{digest}"
@@ -1177,6 +1240,7 @@ def render_v3_bash(
         return RenderedBashCommand(
             command=rendered_command,
             inherited_descriptors=descriptors,
+            inherited_descriptor_identities=descriptor_identities,
             template_sha256=hashlib.sha256(template_bytes).hexdigest(),
             template_size_bytes=len(template_bytes),
             rendered_sha256=hashlib.sha256(rendered_bytes).hexdigest(),

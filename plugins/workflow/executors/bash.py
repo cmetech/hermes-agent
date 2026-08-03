@@ -216,6 +216,9 @@ class BashExecutor:
                     argv,
                     policy=policy,
                     inherited_descriptors=rendered_command.inherited_descriptors,
+                    inherited_descriptor_identities=(
+                        rendered_command.inherited_descriptor_identities
+                    ),
                     cwd=context.run_directory,
                     env=allowed_env,
                     stdout=output.stdout,

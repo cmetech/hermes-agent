@@ -223,6 +223,8 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert len(selected_python) == len(set(selected_python))
     assert len(selected_desktop) == len(set(selected_desktop))
     for path in (
+        "tests/tools/test_managed_process.py",
+        "tests/tools/test_process_registry.py",
         "tests/gateway/test_plugin_background_services.py",
         "tests/gateway/test_plugin_delivery.py",
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
@@ -250,6 +252,10 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_strict_output_references.py",
         "tests/plugins/workflow/test_phase3_conditions.py",
         "tests/plugins/workflow/test_phase3_resolution_waits.py",
+        "tests/plugins/workflow/test_phase3_bash_substitution.py",
+        "tests/plugins/workflow/test_phase3_bash_descriptor_faults.py",
+        "tests/plugins/workflow/test_phase3_bash_lexer_security.py",
+        "tests/plugins/workflow/test_phase3_bash_reference_ordering.py",
         *PHASE_1_LANGUAGE_BACKEND_SUITES,
     ):
         assert selected_python.count(path) == 1

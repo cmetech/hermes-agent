@@ -413,6 +413,10 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_strict_output_references.py \
       tests/plugins/workflow/test_phase3_conditions.py \
       tests/plugins/workflow/test_phase3_resolution_waits.py \
+      tests/plugins/workflow/test_phase3_bash_substitution.py \
+      tests/plugins/workflow/test_phase3_bash_descriptor_faults.py \
+      tests/plugins/workflow/test_phase3_bash_lexer_security.py \
+      tests/plugins/workflow/test_phase3_bash_reference_ordering.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \

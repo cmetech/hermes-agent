@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import psutil
 
+import tools.managed_process as managed_process_module
 from tools.managed_process import (
     ManagedProcessTree,
     ProcessIdentity,
@@ -341,6 +342,48 @@ def test_inherited_descriptor_identity_is_pinned_across_close_and_number_reuse(
             tree.close()
         os.close(original_read)
         os.close(replacement_read)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")
+def test_inherited_descriptor_expected_identity_rejects_reuse_before_pin(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    identity_type = getattr(
+        managed_process_module,
+        "InheritedDescriptorIdentity",
+        None,
+    )
+    assert identity_type is not None, (
+        "managed process lacks descriptor identity binding"
+    )
+    original_read, original_write = os.pipe()
+    expected_identity = identity_type.capture(original_read)
+    replacement_path = tmp_path / "readable-replacement"
+    replacement_path.write_bytes(b"replacement")
+    os.close(original_read)
+    replacement_descriptor = os.open(replacement_path, os.O_RDONLY)
+    if replacement_descriptor != original_read:
+        os.dup2(replacement_descriptor, original_read)
+        os.close(replacement_descriptor)
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawned.append(True),
+    )
+    try:
+        with pytest.raises(ValueError, match="identity"):
+            ManagedProcessTree.spawn(
+                _sleep_argv(0.01),
+                inherited_descriptors=[original_read],
+                inherited_descriptor_identities=[expected_identity],
+            )
+        assert spawned == []
+        assert os.fstat(original_read).st_ino == replacement_path.stat().st_ino
+    finally:
+        os.close(original_read)
+        os.close(original_write)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor contract")

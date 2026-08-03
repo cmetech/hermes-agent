@@ -8,6 +8,7 @@ import stat
 import pytest
 
 import plugins.workflow.bash_rendering as bash_rendering
+import tools.managed_process as managed_process_module
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
     render_v3_bash,
@@ -15,6 +16,7 @@ from plugins.workflow.bash_rendering import (
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.output_resolution import ResolvedOutputReference
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.schema import WorkflowValidationError, load_workflow
 from tools.managed_process import ManagedProcessTree
@@ -97,6 +99,8 @@ def _archon_bash_package(workflow_writer, root, command: str, *, depends_on=()):
         "printf '%s' \"$(printf '%s' $producer.output)\"",
         "printf '%s' `printf '%s' $producer.output`",
         "printf '%s' \"$((1 + $producer.output))\"",
+        "(( $producer.output ))",
+        "for ((i=$producer.output; i<2; i++)); do :; done",
         "printf '%s' \"${OTHER:-$producer.output}\"",
         "printf '%s' \"$producer.output",
         "printf '%s' $(printf '%s' \"$producer.output\"",
@@ -117,6 +121,40 @@ def test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission(
         "bash_reference_context_unsupported"
     ]
     assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "(( $USER_MESSAGE ))",
+        "for ((i=$USER_MESSAGE; i<2; i++)); do :; done",
+    ),
+)
+def test_v3_bash_rejects_bare_arithmetic_scalar_references_during_admission(
+    tmp_path,
+    workflow_writer,
+    command,
+) -> None:
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    package = _archon_bash_package(
+        workflow_writer,
+        tmp_path,
+        "printf '%s' \"$USER_MESSAGE\"",
+    )
+
+    assert package.definition.nodes[1].value == "printf '%s' \"$USER_MESSAGE\""
 
 
 def test_v3_bash_context_rejection_precedes_dependency_validation(
@@ -320,6 +358,120 @@ def test_v3_bash_rejects_references_in_unsupported_shell_contexts_before_launch(
     assert launched == []
     assert output is None
     assert not (tmp_path / "must-not-run").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("template", "reference"),
+    (
+        ("(( {reference} ))", "$USER_MESSAGE"),
+        ("for ((i={reference}; i<2; i++)); do :; done", "$USER_MESSAGE"),
+        ("(( {reference} ))", "$producer.output"),
+        ("for ((i={reference}; i<2; i++)); do :; done", "$producer.output"),
+    ),
+    ids=("scalar-command", "scalar-for", "output-command", "output-for"),
+)
+@pytest.mark.parametrize(
+    "value",
+    ("1", "1" * 32_769),
+    ids=("inline-sized", "spill-sized"),
+)
+def test_v3_bash_rejects_bare_arithmetic_references_before_executor_launch(
+    tmp_path,
+    template,
+    reference,
+    value,
+) -> None:
+    command = template.format(reference=reference)
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    variables = VariableContext(
+        user_message=value,
+        normalizer_version=3,
+    )
+    renderer = substitution_renderer(
+        variables,
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="bare-arithmetic",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "bash_reference_context_unsupported"
+    assert launched == []
+    assert not (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_keeps_arithmetic_punctuation_as_quoted_simple_token_data(
+    tmp_path,
+    reference,
+) -> None:
+    value = "simple token " + "q" * 32_769
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=f"printf '%s' \"(( {reference} ))\"",
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="quoted-arithmetic-data",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").read_text(
+        encoding="utf-8"
+    ) == f"(( {value} ))"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
@@ -615,6 +767,57 @@ def test_v3_bash_maps_closed_spill_descriptor_to_integrity_failure(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real POSIX descriptor contract")
+def test_v3_bash_never_pairs_original_evidence_with_reused_descriptor_bytes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    value = "verified original " + "v" * 32_769
+    original = value.encode("utf-8")
+    replacement = b"readable replacement bytes"
+    replacement_path = tmp_path / "replacement"
+    replacement_path.write_bytes(replacement)
+    original_spawn = ManagedProcessTree.spawn
+
+    def reuse_descriptor_before_managed_pin(
+        argv,
+        *,
+        inherited_descriptors=(),
+        **kwargs,
+    ):
+        assert len(inherited_descriptors) == 1
+        exposed = inherited_descriptors[0]
+        os.close(exposed)
+        replacement_descriptor = os.open(replacement_path, os.O_RDONLY)
+        if replacement_descriptor != exposed:
+            os.dup2(replacement_descriptor, exposed)
+            os.close(replacement_descriptor)
+        return original_spawn(
+            argv,
+            inherited_descriptors=inherited_descriptors,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "spawn",
+        staticmethod(reuse_descriptor_before_managed_pin),
+    )
+
+    result, output = _run_v3_bash(
+        tmp_path,
+        command="printf '%s' $USER_MESSAGE",
+        value=value,
+    )
+
+    evidence = result.metadata["bash"]
+    assert evidence["spill_content_sha256"] == [hashlib.sha256(original).hexdigest()]
+    assert output != replacement
+    assert (result.status == "succeeded" and output == original) or (
+        result.status == "failed" and result.error_code == "bash_spill_integrity"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real POSIX descriptor contract")
 def test_v3_bash_closes_spill_descriptors_when_spawn_intent_is_rejected(
     tmp_path,
     monkeypatch,
@@ -792,13 +995,9 @@ def test_v3_shell_read_failure_after_launch_is_not_masked_by_sentinel(
         spill_directory=tmp_path / "prepared-spill",
     )
     descriptor = rendered.inherited_descriptors[0]
-    directory_descriptor = os.open(tmp_path, os.O_RDONLY)
-    try:
-        os.dup2(directory_descriptor, descriptor)
-    finally:
-        os.close(directory_descriptor)
     captured_trees: list[ManagedProcessTree] = []
     original_spawn = ManagedProcessTree.spawn
+    original_pin = managed_process_module._pin_read_only_descriptors
 
     class ReadFailureRenderer:
         @staticmethod
@@ -812,6 +1011,20 @@ def test_v3_shell_read_failure_after_launch_is_not_masked_by_sentinel(
         captured_trees.append(tree)
         return tree
 
+    def corrupt_pin_after_identity_check(descriptors, expected_identities=()):
+        pins = original_pin(descriptors, expected_identities)
+        directory_descriptor = os.open(tmp_path, os.O_RDONLY)
+        try:
+            os.dup2(directory_descriptor, pins[0][0])
+        finally:
+            os.close(directory_descriptor)
+        return pins
+
+    monkeypatch.setattr(
+        managed_process_module,
+        "_pin_read_only_descriptors",
+        corrupt_pin_after_identity_check,
+    )
     monkeypatch.setattr(
         ManagedProcessTree,
         "spawn",

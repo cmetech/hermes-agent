@@ -16,6 +16,7 @@ import math
 import operator
 import os
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -166,6 +167,33 @@ except BaseException as exc:
 """
 
 
+@dataclass(frozen=True, slots=True)
+class InheritedDescriptorIdentity:
+    """Path-free POSIX object identity expected at descriptor pinning."""
+
+    device: int
+    inode: int
+    file_type: int
+
+    def __post_init__(self) -> None:
+        for name in ("device", "inode", "file_type"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+    @classmethod
+    def capture(cls, descriptor: int) -> "InheritedDescriptorIdentity":
+        """Capture one open descriptor without retaining path authority."""
+        if type(descriptor) is not int:
+            raise TypeError("descriptor must be an integer")
+        observed = os.fstat(descriptor)
+        return cls(
+            device=int(observed.st_dev),
+            inode=int(observed.st_ino),
+            file_type=int(stat.S_IFMT(observed.st_mode)),
+        )
+
+
 def _serialize_descriptor_bootstrap_environment(
     environment: object,
     target_executable: str,
@@ -229,6 +257,7 @@ def _close_descriptors(descriptors: Sequence[int]) -> None:
 
 def _pin_read_only_descriptors(
     descriptors: tuple[int, ...],
+    expected_identities: tuple[InheritedDescriptorIdentity, ...] = (),
 ) -> tuple[tuple[int, int], ...]:
     """Own stable POSIX duplicates without changing ownership of caller fds."""
     import fcntl
@@ -236,7 +265,7 @@ def _pin_read_only_descriptors(
     pins: list[tuple[int, int]] = []
     next_descriptor = max(descriptors, default=2) + 1
     try:
-        for descriptor in descriptors:
+        for index, descriptor in enumerate(descriptors):
             try:
                 pin = int(
                     fcntl.fcntl(
@@ -255,6 +284,17 @@ def _pin_read_only_descriptors(
                 ) from exc
             pins.append((pin, descriptor))
             next_descriptor = pin + 1
+            if expected_identities:
+                try:
+                    pinned_identity = InheritedDescriptorIdentity.capture(pin)
+                except OSError as exc:
+                    raise ValueError(
+                        f"inherited descriptor {descriptor} identity could not be inspected"
+                    ) from exc
+                if pinned_identity != expected_identities[index]:
+                    raise ValueError(
+                        f"inherited descriptor {descriptor} identity changed before pinning"
+                    )
             try:
                 flags = int(fcntl.fcntl(pin, fcntl.F_GETFL))
             except OSError as exc:
@@ -779,6 +819,7 @@ class ManagedProcessTree:
         *,
         policy: TerminationPolicy | None = None,
         inherited_descriptors: Sequence[int] = (),
+        inherited_descriptor_identities: Sequence[InheritedDescriptorIdentity] = (),
         **popen_kwargs: Any,
     ) -> "ManagedProcessTree":
         if isinstance(argv, (str, bytes)):
@@ -805,6 +846,24 @@ class ManagedProcessTree:
             raise ValueError("standard and negative descriptors cannot be inherited")
         if len(set(inherited)) != len(inherited):
             raise ValueError("inherited descriptors must be unique")
+        if isinstance(inherited_descriptor_identities, (str, bytes)) or not isinstance(
+            inherited_descriptor_identities,
+            Sequence,
+        ):
+            raise TypeError("inherited_descriptor_identities must be a sequence")
+        expected_identities = tuple(inherited_descriptor_identities)
+        if expected_identities and len(expected_identities) != len(inherited):
+            raise ValueError(
+                "inherited descriptor identities must align with descriptors"
+            )
+        if any(
+            not isinstance(identity, InheritedDescriptorIdentity)
+            for identity in expected_identities
+        ):
+            raise TypeError(
+                "every inherited descriptor identity must be an "
+                "InheritedDescriptorIdentity"
+            )
         if "pass_fds" in popen_kwargs:
             raise TypeError(
                 "pass_fds is not supported; use inherited_descriptors instead"
@@ -868,7 +927,10 @@ class ManagedProcessTree:
             else:
                 kwargs.setdefault("start_new_session", True)
             if inherited:
-                pinned = _pin_read_only_descriptors(inherited)
+                pinned = _pin_read_only_descriptors(
+                    inherited,
+                    expected_identities,
+                )
                 status_read, status_write = _open_internal_pipe_above(
                     max(
                         *inherited,
