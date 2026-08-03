@@ -455,6 +455,35 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-persistent-session-missing-classification
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - tests/agent/test_plugin_agent.py
+  owned_symbols:
+  - PluginAgentSessionMissingError
+  - _correlate_persistent_session_result
+  - _persistent_session_missing_failure
+  owned_invariants:
+  - exact profile-local shared-session parent preflight
+  - persistent_session_missing worker failure framing and correlation
+  tests:
+  - tests/agent/test_plugin_agent.py
+  expected_commit_subject: 'feat(agent): classify missing plugin sessions'
+  upstream_candidate: true
+  merge_guidance: Preserve confirmed exact profile-local SessionDB absence as
+    a typed zero-provider parent outcome, while leaving database open, read,
+    corruption, ambiguity, and access failures operationally distinct. Preserve
+    the child-load race as a sanitized failed result with exact zero-provider
+    evidence, no session, history, exception, or provider content, and strict
+    parent correlation. Keep workflow recovery and fresh-session policy outside
+    the generic agent core.
+  removal_condition: Remove when upstream provides equivalent typed exact-session
+    preflight and strictly correlated zero-provider child-race classification
+    without choosing caller recovery policy.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-agent-override-inspection
   change_class: agent-core-generic
   owner: workflow-orchestration

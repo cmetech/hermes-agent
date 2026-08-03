@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import queue
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    PluginAgentSessionMissingError,
     _ProviderAttemptAuthority,
     _PluginAgentCancelled,
     _PluginAgentResourceExceeded,
@@ -869,6 +871,330 @@ def test_invalid_workdir_and_shared_session_fail_before_worker_start(
         PluginAgentRunner("test-plugin").run(
             PluginAgentRunRequest(prompt="x", context_mode="shared", session_id=None)
         )
+
+
+def _completed_worker_frame(session_id: str) -> dict:
+    return {
+        "protocol_version": 1,
+        "type": "result",
+        "result": {
+            "final_response": "done",
+            "session_id": session_id,
+            "provider": "fake",
+            "model": "fake-model",
+            "status": "completed",
+            "pending_interaction": None,
+            "usage": {},
+            "audit": {"plugin_id": "test-plugin"},
+        },
+    }
+
+
+def test_missing_shared_session_is_a_typed_zero_provider_preflight(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import hermes_state
+
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", profile_home / "state.db")
+    db = hermes_state.SessionDB()
+    db.close()
+    started = False
+
+    def should_not_start(*args, **kwargs):
+        nonlocal started
+        started = True
+        raise AssertionError("worker started")
+
+    monkeypatch.setattr(plugin_agent, "_exchange_worker", should_not_start)
+    missing_id = "private-missing-session-id"
+
+    with pytest.raises(PluginAgentSessionMissingError) as caught:
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(
+                prompt="x", context_mode="shared", session_id=missing_id
+            )
+        )
+
+    assert caught.value.provider_attempts == 0
+    assert caught.value.model_calls == 0
+    assert caught.value.__dict__ == {}
+    assert not hasattr(caught.value, "history")
+    assert not hasattr(caught.value, "provider_response")
+    assert missing_id not in str(caught.value)
+    assert started is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        sqlite3.OperationalError("database read failed"),
+        sqlite3.DatabaseError("database disk image is malformed or ambiguous"),
+        PermissionError("database access denied"),
+    ],
+    ids=("read-error", "corrupt-or-ambiguous", "denied"),
+)
+def test_shared_session_preflight_preserves_operational_database_failures(
+    monkeypatch, tmp_path: Path, failure: Exception
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import hermes_state
+
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    real_db = hermes_state.SessionDB(db_path=profile_home / "state.db")
+    monkeypatch.setattr(
+        real_db,
+        "get_session",
+        lambda _session_id: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: real_db)
+    monkeypatch.setattr(
+        plugin_agent,
+        "_exchange_worker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("worker started")
+        ),
+    )
+
+    with pytest.raises(type(failure)) as caught:
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(
+                prompt="x", context_mode="shared", session_id="exact-session-id"
+            )
+        )
+
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize("message_count", [0, 1], ids=("empty", "history-light"))
+def test_existing_shared_session_reaches_worker_even_with_little_history(
+    monkeypatch, tmp_path: Path, message_count: int
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import hermes_state
+
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", profile_home / "state.db")
+    session_id = f"existing-{message_count}"
+    db = hermes_state.SessionDB()
+    db.create_session(session_id, source="test")
+    if message_count:
+        db.append_message(session_id, "user", "one prior message")
+    db.close()
+    started = False
+
+    def exchange(*args, **kwargs):
+        nonlocal started
+        started = True
+        return _completed_worker_frame(session_id)
+
+    monkeypatch.setattr(plugin_agent, "_exchange_worker", exchange)
+
+    result = PluginAgentRunner("test-plugin").run(
+        PluginAgentRunRequest(
+            prompt="x", context_mode="shared", session_id=session_id
+        )
+    )
+
+    assert started is True
+    assert result.status == "completed"
+    assert result.session_id == session_id
+
+
+def test_worker_classifies_session_deleted_after_parent_preflight_without_provider_use(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", profile_home / "state.db")
+    session_id = "private-raced-session-id"
+    db = hermes_state.SessionDB()
+    db.create_session(session_id, source="test")
+    db.append_message(session_id, "user", "private prior history")
+    db.close()
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "private-provider-response",
+        },
+    )
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider-capable agent constructed")
+        ),
+    )
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+
+    def exchange(payload, **kwargs):
+        deleting_db = hermes_state.SessionDB()
+        try:
+            assert deleting_db.delete_session(session_id) is True
+        finally:
+            deleting_db.close()
+        return {
+            "protocol_version": 1,
+            "type": "result",
+            "result": worker._run(payload),
+        }
+
+    monkeypatch.setattr(plugin_agent, "_exchange_worker", exchange)
+
+    result = PluginAgentRunner("test-plugin").run(
+        PluginAgentRunRequest(
+            prompt="must not reach a provider",
+            context_mode="shared",
+            session_id=session_id,
+            allowed_tools=(),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.final_response == ""
+    assert result.session_id == ""
+    assert result.provider == ""
+    assert result.model == ""
+    assert result.pending_interaction is None
+    assert result.usage == {}
+    assert result.structured_output is None
+    assert dict(result.audit) == {
+        "plugin_id": "test-plugin",
+        "failure_kind": "persistent_session_missing",
+        "provider_attempts": 0,
+        "model_calls": 0,
+    }
+    assert session_id not in json.dumps(result.to_wire(), sort_keys=True)
+    assert "private prior history" not in json.dumps(result.to_wire(), sort_keys=True)
+    assert "private-provider-response" not in json.dumps(
+        result.to_wire(), sort_keys=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("audit.extra", "unknown-worker-field"),
+        ("audit.provider_attempts", 1),
+        ("audit.model_calls", 1),
+        ("audit.plugin_id", "another-plugin"),
+        ("session_id", "private-session-content"),
+        ("final_response", "private-exception-content"),
+        ("provider", "private-provider-response"),
+        ("usage", {"input_tokens": 1}),
+    ],
+    ids=(
+        "unknown-audit-field",
+        "spoofed-provider-attempts",
+        "spoofed-model-calls",
+        "wrong-plugin",
+        "raw-session",
+        "raw-exception",
+        "raw-provider",
+        "spoofed-usage",
+    ),
+)
+def test_parent_rejects_uncorrelated_persistent_session_missing_frames(
+    monkeypatch, field: str, value
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import hermes_state
+
+    class ExistingSessionDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def close(self):
+            return None
+
+    result = {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": "test-plugin",
+            "failure_kind": "persistent_session_missing",
+            "provider_attempts": 0,
+            "model_calls": 0,
+        },
+        "structured_output": None,
+    }
+    target = result
+    name = field
+    if field.startswith("audit."):
+        target = result["audit"]
+        name = field.removeprefix("audit.")
+    target[name] = value
+    monkeypatch.setattr(hermes_state, "SessionDB", ExistingSessionDB)
+    monkeypatch.setattr(
+        plugin_agent,
+        "_exchange_worker",
+        lambda *args, **kwargs: {
+            "protocol_version": 1,
+            "type": "result",
+            "result": result,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="persistent session"):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(
+                prompt="x", context_mode="shared", session_id="existing-session"
+            )
+        )
+
+
+def test_parent_rejects_persistent_session_missing_frame_for_fresh_context(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent as plugin_agent
+
+    monkeypatch.setattr(
+        plugin_agent,
+        "_exchange_worker",
+        lambda *args, **kwargs: {
+            "protocol_version": 1,
+            "type": "result",
+            "result": {
+                "final_response": "",
+                "session_id": "",
+                "provider": "",
+                "model": "",
+                "status": "failed",
+                "pending_interaction": None,
+                "usage": {},
+                "audit": {
+                    "plugin_id": "test-plugin",
+                    "failure_kind": "persistent_session_missing",
+                    "provider_attempts": 0,
+                    "model_calls": 0,
+                },
+                "structured_output": None,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="persistent session"):
+        PluginAgentRunner("test-plugin").run(PluginAgentRunRequest(prompt="x"))
 
 
 @pytest.mark.parametrize("field", ["provider", "model"])

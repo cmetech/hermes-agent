@@ -66,6 +66,9 @@ _STRUCTURED_EVIDENCE_TEXT_LIMITS = {
     "schema_fingerprint": 64,
     "declaration_source": 64,
 }
+_PERSISTENT_SESSION_MISSING_AUDIT_FIELDS = frozenset(
+    {"plugin_id", "failure_kind", "provider_attempts", "model_calls"}
+)
 
 
 class _PluginAgentCancelled(RuntimeError):
@@ -74,6 +77,14 @@ class _PluginAgentCancelled(RuntimeError):
 
 class _PluginAgentResourceExceeded(RuntimeError):
     """Internal control flow for bounded worker-tree enforcement."""
+
+
+class PluginAgentSessionMissingError(RuntimeError):
+    """A requested persistent session was confirmed absent before provider use."""
+
+    failure_kind = "persistent_session_missing"
+    provider_attempts = 0
+    model_calls = 0
 
 
 class _ProviderAttemptGrantExhausted(RuntimeError):
@@ -867,6 +878,36 @@ def _correlate_structured_result(
         raise RuntimeError("structured output evidence does not match request")
 
 
+def _correlate_persistent_session_result(
+    plugin_id: str,
+    request: PluginAgentRunRequest,
+    result: PluginAgentRunResult,
+) -> bool:
+    if result.audit.get("failure_kind") != "persistent_session_missing":
+        return False
+    audit = result.audit
+    valid = (
+        request.context_mode == "shared"
+        and result.status == "failed"
+        and result.final_response == ""
+        and result.session_id == ""
+        and result.provider == ""
+        and result.model == ""
+        and result.pending_interaction is None
+        and not result.usage
+        and result.structured_output is None
+        and set(audit) == _PERSISTENT_SESSION_MISSING_AUDIT_FIELDS
+        and audit.get("plugin_id") == plugin_id
+        and type(audit.get("provider_attempts")) is int
+        and audit.get("provider_attempts") == 0
+        and type(audit.get("model_calls")) is int
+        and audit.get("model_calls") == 0
+    )
+    if not valid:
+        raise RuntimeError("persistent session missing result is invalid")
+    return True
+
+
 def _validate_name_list(label: str, values: tuple[str, ...] | None) -> None:
     if values is None:
         return
@@ -1318,8 +1359,8 @@ class PluginAgentRunner:
             session_db = SessionDB()
             try:
                 if session_db.get_session(request.session_id) is None:
-                    raise ValueError(
-                        "session_id does not identify an existing Hermes session"
+                    raise PluginAgentSessionMissingError(
+                        "persistent plugin-agent session is missing"
                     )
             finally:
                 session_db.close()
@@ -1350,7 +1391,10 @@ class PluginAgentRunner:
             if not isinstance(result, dict):
                 raise RuntimeError("plugin-agent result payload is missing")
             parsed_result = PluginAgentRunResult.from_wire(result)
-            _correlate_structured_result(request, parsed_result)
+            if not _correlate_persistent_session_result(
+                self.plugin_id, request, parsed_result
+            ):
+                _correlate_structured_result(request, parsed_result)
             return parsed_result
         except TimeoutError as exc:
             kind = "idle_timeout" if "idle" in str(exc) else "wall_timeout"
@@ -1392,4 +1436,9 @@ class PluginAgentRunner:
             )
 
 
-__all__ = ["PluginAgentRunRequest", "PluginAgentRunResult", "PluginAgentRunner"]
+__all__ = [
+    "PluginAgentRunRequest",
+    "PluginAgentRunResult",
+    "PluginAgentRunner",
+    "PluginAgentSessionMissingError",
+]

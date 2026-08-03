@@ -1191,6 +1191,25 @@ def _structured_output_failure(
     }
 
 
+def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "persistent_session_missing",
+            "provider_attempts": 0,
+            "model_calls": 0,
+        },
+        "structured_output": None,
+    }
+
+
 def _prompt_with_structured_output(prompt: str, request) -> str:
     schema = request.schema.canonical_schema_bytes.decode("utf-8")
     block = (
@@ -1472,7 +1491,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             history = None
             if request.context_mode == "shared":
                 if session_db.get_session(request.session_id) is None:
-                    raise ValueError("session_id does not identify an existing session")
+                    return _persistent_session_missing_failure(plugin_id)
                 history = session_db.get_messages_as_conversation(request.session_id)
 
             prompt = request.prompt
