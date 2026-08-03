@@ -963,6 +963,56 @@ def test_shared_session_preflight_preserves_real_database_open_failures(
     assert started is False
 
 
+def test_shared_session_preflight_preserves_real_post_open_read_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import hermes_state
+
+    profile_home = tmp_path / "profile"
+    state_path = profile_home / "state.db"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", state_path)
+    real_db = hermes_state.SessionDB()
+    real_db.create_session("readable-session", source="test")
+    assert real_db.get_session("readable-session")["id"] == "readable-session"
+
+    # Induce a real query failure only after construction and a successful
+    # read. The parent still invokes SessionDB.get_session itself; no method or
+    # preconstructed exception replaces the SQLite execution path.
+    with real_db._lock:
+        real_db._conn.execute("DROP TABLE sessions")
+    with pytest.raises(sqlite3.OperationalError, match="no such table: sessions"):
+        real_db.get_session("readable-session")
+
+    started = False
+
+    def should_not_start(*args, **kwargs):
+        nonlocal started
+        started = True
+        raise AssertionError("worker started")
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: real_db)
+    monkeypatch.setattr(plugin_agent, "_exchange_worker", should_not_start)
+    try:
+        with pytest.raises(
+            sqlite3.OperationalError, match="no such table: sessions"
+        ) as caught:
+            PluginAgentRunner("test-plugin").run(
+                PluginAgentRunRequest(
+                    prompt="x",
+                    context_mode="shared",
+                    session_id="readable-session",
+                )
+            )
+    finally:
+        real_db.close()
+
+    assert not isinstance(caught.value, PluginAgentSessionMissingError)
+    assert started is False
+    assert real_db._conn is None
+
+
 def test_shared_session_preflight_preserves_real_permission_denial(
     monkeypatch, tmp_path: Path
 ) -> None:
