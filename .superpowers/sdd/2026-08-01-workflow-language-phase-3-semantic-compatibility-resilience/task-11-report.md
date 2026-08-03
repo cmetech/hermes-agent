@@ -997,3 +997,88 @@ Ruff, retained formatting checks, and staged/unstaged whitespace checks pass.
 Both package bodies were verified byte-identical to their corresponding Git
 diff ranges. Task 12 and Phase 4 remain untouched pending independent Task 11
 specification and quality closure.
+
+## Fix Round 8 closure correction — authored Bash token ends
+
+Implementation commit: `49ffbccfe4b9424f3b6542cfdf9df4bc9ef537e0`
+(tree `7560124795fca2d7c2f167874423e38042f40d83`).
+
+### Root cause and strict RED evidence
+
+The authored-source lexer already recognized shell words joined by active
+backslash-newline continuations, but several consumers discarded the returned
+physical end and advanced by the logical token length. That left the scan
+inside authored continuation bytes for `function`, `coproc`, nested command
+prefixes, and `case`/`in`/`esac`, allowing unsafe references to be classified
+outside their real Bash context.
+
+Before any production edit, the representative authored-end matrix ran with
+retries disabled and reported 28 selected tests: 11 passed and 17 failed. The
+failures covered every internal split and the immediately-after-token form for
+`function` and named `coproc`, plus all internal `then` splits. Existing
+fail-closed sibling contexts supplied controls.
+
+### Correction and coverage
+
+- Replaced the boolean shell-word probe with a boundary-checked helper that
+  returns the authored physical end, including transparent continuations.
+- Made function/coproc declaration consumers, nested command prefixes,
+  conditionals, and case-state transitions advance to that authored end.
+- Added every internal continuation split and immediately-after-token form for
+  the complete bounded shell-word consumer set, across scalar and strict-output
+  references, admission, scheduler preflight, and inline/spill direct execution
+  with no resolver, launch, stdout, or spill side effect.
+- Added literal/quoted physical-offset controls and a continued-token nested
+  command complexity canary with both a doubling bound and calibrated absolute
+  read cap. Existing performance bounds were unchanged.
+
+### GREEN and static evidence
+
+All Python tests used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`:
+
+- representative authored-end matrix: 28 passed;
+- expanded authored-end integration set: 326 passed;
+- exact eleven-file closure set: 1,799 passed, 0 failed, with the existing
+  native-Windows managed-process platform skip (baseline 1,338 plus 461 new);
+  and
+- exact resource, serial/parallel scheduler, and performance set: 106 passed,
+  0 failed (baseline 105 plus one new canary).
+
+The root controller independently reran the exact eleven-file set after the
+commit: 1,799 passed and 0 failed in 26.2 seconds with retries disabled.
+Ruff lint passed on all four changed Python files. Ruff format validation
+passed on the three format-clean files; the performance file retained its
+pre-existing whole-file formatting drift. Staged and unstaged whitespace
+checks passed, and a consumer audit found no remaining raw logical-length
+advancement for the corrected shell words.
+
+### Authenticated closure-correction review packages
+
+- Fix Round 8 closure-correction code-only package:
+  `task-11-fix8-closure1-review.diff`, SHA-256
+  `53fc3cf6af6cecebaed042b3aba88982af42ce5753209103a33494d5be4c3b40`.
+- Complete Task 11 code package after the closure correction:
+  `task-11-final-review-6.diff`, SHA-256
+  `8d422cdade6b549f17aa7f43988f800e2d072a0fec903e2bfb5c8ec02f7f8fa6`.
+
+Both package bodies were verified byte-identical to their corresponding Git
+diff ranges.
+
+### Files changed and residual risk
+
+- `plugins/workflow/bash_rendering.py`
+- `tests/plugins/workflow/test_performance_bounds.py`
+- `tests/plugins/workflow/test_phase3_bash_lexer_security.py`
+- `tests/plugins/workflow/test_phase3_bash_substitution.py`
+
+The implementation remains a deliberately bounded Bash classifier, not a
+general parser. The complete approved shell-word consumer set now has authored
+physical-end, unsafe-reference, false-positive, integration, and linear-read
+contracts. Real-shell behavior retains the existing Windows platform skip;
+the classifier, admission, scheduler, and no-launch coverage is
+platform-neutral. No Task 12+, Phase 4, release gate, base checkout, literal
+`main`, model-tool surface, prompt cache, raw value/path evidence, or legacy
+workflow behavior changed. No known functional concern remains in this
+closure-correction scope.
