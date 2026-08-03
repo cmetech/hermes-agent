@@ -87,10 +87,11 @@ def _quote_inline_value(value: str, quote: str | None) -> str:
     return shlex.quote(value)
 
 
-def _reference_contexts(
+def classify_bash_reference_spans(
     template: str,
     spans: Iterable[tuple[int, int]],
 ) -> tuple[tuple[int, int, str | None], ...]:
+    """Return admitted Bash spans and quote contexts, ignoring literal spans."""
     ordered = tuple(spans)
     if any(
         type(start) is not int
@@ -525,7 +526,7 @@ def render_v3_bash(
 ) -> RenderedBashCommand:
     """Render one v3 command without reopening a spill pathname in the shell."""
     requested = tuple(substitutions)
-    admitted = _reference_contexts(
+    admitted = classify_bash_reference_spans(
         template,
         ((start, end) for start, end, _value in requested),
     )
@@ -636,5 +637,6 @@ __all__ = [
     "BASH_SPILL_MAX_VALUE_BYTES",
     "BashRenderingError",
     "RenderedBashCommand",
+    "classify_bash_reference_spans",
     "render_v3_bash",
 ]

@@ -37,6 +37,10 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
 
 class BashExecutor:
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
+        secure_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and context.normalizer_version == 3
+        )
         if context.sealed_attempt_timeout:
             assert context.deadline_budget is not None
             if context.deadline_budget.wall_expired(context.monotonic()):
@@ -49,28 +53,20 @@ class BashExecutor:
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
-        variable_spill = attempt / (
-            "variables-v3"
-            if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            else "variables"
-        )
+        variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
         artifacts_dir = context.run_directory / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
         command = str(context.node.value)
         try:
             if context.variable_context is not None:
                 renderer = context.variable_context
-                if (
-                    isinstance(renderer, VariableContext)
-                    and context.language_profile
-                    is WorkflowLanguageProfile.ARCHON_2026_07
-                ):
+                if isinstance(renderer, VariableContext) and secure_v3:
                     renderer = substitution_renderer(
                         renderer,
                         direct_dependencies=context.node.depends_on,
                         output_resolver=context.output_resolver,
                     )
-                if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07:
+                if secure_v3:
                     command = renderer.render_bash(
                         command,
                         spill_directory=variable_spill,
@@ -80,10 +76,7 @@ class BashExecutor:
                     command = renderer.render_bash(
                         command, spill_directory=variable_spill
                     )
-            if (
-                context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-                and not isinstance(command, RenderedBashCommand)
-            ):
+            if secure_v3 and not isinstance(command, RenderedBashCommand):
                 command = render_v3_bash(
                     str(command),
                     (),
@@ -101,11 +94,7 @@ class BashExecutor:
             if isinstance(command, RenderedBashCommand)
             else RenderedBashCommand(str(command))
         )
-        bash_metadata = (
-            {"bash": rendered_command.evidence()}
-            if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            else {}
-        )
+        bash_metadata = {"bash": rendered_command.evidence()} if secure_v3 else {}
         owned_descriptors = list(rendered_command.inherited_descriptors)
 
         def close_owned_descriptors() -> None:

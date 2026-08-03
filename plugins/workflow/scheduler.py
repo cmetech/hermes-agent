@@ -3168,6 +3168,7 @@ class RunScheduler:
                             sealed_resource_paths=sealed_resource_paths,
                             sealed_resource_bytes=sealed_resource_bytes,
                             language_profile=package.language.effective_profile,
+                            normalizer_version=package.language.normalizer_version,
                             structured_output=structured_output,
                             structured_output_decision=structured_output_decision,
                             outward_action=(

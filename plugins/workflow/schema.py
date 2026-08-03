@@ -12,6 +12,10 @@ from typing import Any
 import yaml
 
 from agent.structured_output import parse_exact_decimal_integer
+from plugins.workflow.bash_rendering import (
+    BashRenderingError,
+    classify_bash_reference_spans,
+)
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     validate_v3_condition_syntax,
@@ -1102,6 +1106,33 @@ def _validate_v3_static_output_references(
                     _issue(surface_path, exc.code, str(exc), line=node.source_line)
                 )
                 continue
+            if surface_path.endswith(".bash"):
+                try:
+                    admitted_spans = {
+                        (start, end)
+                        for start, end, _quote in classify_bash_reference_spans(
+                            template,
+                            (
+                                (reference.start, reference.end)
+                                for reference in references
+                            ),
+                        )
+                    }
+                except BashRenderingError as exc:
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            exc.code,
+                            str(exc),
+                            line=node.source_line,
+                        )
+                    )
+                    continue
+                references = tuple(
+                    reference
+                    for reference in references
+                    if (reference.start, reference.end) in admitted_spans
+                )
             for reference in references:
                 if reference.node_id not in node.depends_on:
                     issues.append(

@@ -8,11 +8,15 @@ import stat
 import pytest
 
 import plugins.workflow.bash_rendering as bash_rendering
-from plugins.workflow.bash_rendering import BashRenderingError, render_v3_bash
+from plugins.workflow.bash_rendering import (
+    BashRenderingError,
+    render_v3_bash,
+)
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
 from plugins.workflow.resources import VariableContext, substitution_renderer
+from plugins.workflow.schema import WorkflowValidationError, load_workflow
 from tools.managed_process import ManagedProcessTree
 
 
@@ -55,12 +59,137 @@ def _run_v3_bash(
             max_output_bytes=600_000,
             variable_context=renderer,
             language_profile=profile,
+            normalizer_version=3,
             spawn_intent=spawn_intent,
         )
     )
     output_path = tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt"
     output = output_path.read_bytes() if output_path.exists() else None
     return result, output
+
+
+def _archon_bash_package(workflow_writer, root, command: str, *, depends_on=()):
+    workflow = workflow_writer(
+        root,
+        name="bash-admission-context",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "consumer",
+                "bash": command,
+                "depends_on": list(depends_on),
+            },
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return load_workflow(workflow)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "cat <<$producer.output\nbody\n",
+        "cat <<EOF\n$producer.output\nEOF\n",
+        "cat <<'EOF'\n$producer.output\nEOF\n",
+        "cat <<\\EOF\n$producer.output\nEOF\n",
+        "printf '%s' \"$(printf '%s' $producer.output)\"",
+        "printf '%s' `printf '%s' $producer.output`",
+        "printf '%s' \"$((1 + $producer.output))\"",
+        "printf '%s' \"${OTHER:-$producer.output}\"",
+        "printf '%s' \"$producer.output",
+        "printf '%s' $(printf '%s' \"$producer.output\"",
+    ),
+)
+def test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission(
+    tmp_path, workflow_writer, command
+) -> None:
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+def test_v3_bash_context_rejection_precedes_dependency_validation(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            "printf '%s' \"$(printf $producer.output)\"",
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "printf '%s' \\$producer.output",
+        "# $producer.output\nprintf safe",
+        "\\\n# $producer.output\nprintf safe",
+        "printf '%s' \"$( # $producer.output\nprintf safe)\"",
+    ),
+)
+def test_v3_bash_ignores_escaped_and_comment_output_references_at_admission(
+    tmp_path, workflow_writer, command
+) -> None:
+    package = _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert package.definition.nodes[-1].depends_on == ()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    (
+        ("printf '%s' \\$producer.output", b"$producer.output"),
+        ("# $producer.output\nprintf safe", b"safe"),
+    ),
+)
+def test_v3_bash_ignores_literal_output_references_during_execution(
+    tmp_path,
+    command,
+    expected,
+) -> None:
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="literal-reference",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=VariableContext(normalizer_version=3),
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert (
+        tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt"
+    ).read_bytes() == expected
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
@@ -581,6 +710,131 @@ def test_v3_large_bash_substitution_requires_descriptor_safe_host_support(
 
     assert exc.value.code == "bash_spill_integrity"
     assert not (tmp_path / "variables-v3").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX host simulates Windows argv gate")
+def test_v3_native_windows_inline_executor_keeps_exact_argv_and_containment(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    command = "sleep 0.05; printf '%s' \"$USER_MESSAGE\""
+    value = "inline value"
+    captured: dict[str, object] = {}
+    original_name = os.name
+    original_spawn = ManagedProcessTree.spawn
+
+    def capture_spawn(argv, *, inherited_descriptors=(), **kwargs):
+        captured["argv"] = list(argv)
+        captured["inherited_descriptors"] = tuple(inherited_descriptors)
+        monkeypatch.setattr(os, "name", original_name)
+        tree = original_spawn(
+            argv,
+            inherited_descriptors=inherited_descriptors,
+            **kwargs,
+        )
+        captured["tree"] = tree
+        return tree
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr("tools.environments.local._find_bash", lambda: "/bin/sh")
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "spawn",
+        staticmethod(capture_spawn),
+    )
+
+    result, output = _run_v3_bash(
+        tmp_path,
+        command=command,
+        value=value,
+    )
+
+    assert result.status == "succeeded"
+    assert output == b"inline value"
+    assert captured["argv"] == [
+        "/bin/sh",
+        "-c",
+        "sleep 0.05; printf '%s' \"inline value\"",
+    ]
+    assert captured["inherited_descriptors"] == ()
+    tree = captured["tree"]
+    assert isinstance(tree, ManagedProcessTree)
+    assert tree.identity.group_id == tree.identity.pid
+    assert tree.reaped is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh descriptor failure contract")
+def test_v3_shell_read_failure_after_launch_is_not_masked_by_sentinel(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    template = "printf '%s' $USER_MESSAGE"
+    value = "read failure " + "r" * 32_769
+    rendered = render_v3_bash(
+        template,
+        ((template.index("$USER_MESSAGE"), len(template), value),),
+        spill_directory=tmp_path / "prepared-spill",
+    )
+    descriptor = rendered.inherited_descriptors[0]
+    directory_descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        os.dup2(directory_descriptor, descriptor)
+    finally:
+        os.close(directory_descriptor)
+    captured_trees: list[ManagedProcessTree] = []
+    original_spawn = ManagedProcessTree.spawn
+
+    class ReadFailureRenderer:
+        @staticmethod
+        def render_bash(command, *, spill_directory, secure_v3):
+            assert command == template
+            assert secure_v3 is True
+            return rendered
+
+    def capture_spawn(argv, **kwargs):
+        tree = original_spawn(argv, **kwargs)
+        captured_trees.append(tree)
+        return tree
+
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "spawn",
+        staticmethod(capture_spawn),
+    )
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=template,
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="read-failure",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=ReadFailureRenderer(),
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "process_exit"
+    assert (
+        tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt"
+    ).read_bytes() == b""
+    assert (
+        tmp_path / "nodes" / "shell" / "attempt-1" / "stderr.txt"
+    ).stat().st_size > 0
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert len(captured_trees) == 1
+    assert captured_trees[0].reaped is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")

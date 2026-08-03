@@ -75,6 +75,7 @@ class NodeExecutionContext:
     sealed_resource_paths: frozenset[str] | None = None
     sealed_resource_bytes: Mapping[str, bytes] | None = None
     language_profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY
+    normalizer_version: int = 2
     structured_output: WorkflowStructuredOutput | None = None
     structured_output_decision: StructuredOutputCapabilityDecision | None = None
     outward_action: bool = False

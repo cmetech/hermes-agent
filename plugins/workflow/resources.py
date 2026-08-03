@@ -23,7 +23,11 @@ from plugins.workflow.language_schema import (
     WorkflowReferenceSyntaxError,
     iter_output_references,
 )
-from plugins.workflow.bash_rendering import RenderedBashCommand, render_v3_bash
+from plugins.workflow.bash_rendering import (
+    RenderedBashCommand,
+    classify_bash_reference_spans,
+    render_v3_bash,
+)
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     ResolvedOutputReference,
@@ -866,8 +870,22 @@ class StrictSubstitutionRenderer:
         template: str,
         *,
         include_scalar_variables: bool,
+        classify_bash_contexts: bool = False,
     ) -> tuple[tuple[int, int, str], ...]:
         references = self._references(template)
+        if classify_bash_contexts:
+            admitted_spans = {
+                (start, end)
+                for start, end, _quote in classify_bash_reference_spans(
+                    template,
+                    ((reference.start, reference.end) for reference in references),
+                )
+            }
+            references = tuple(
+                reference
+                for reference in references
+                if (reference.start, reference.end) in admitted_spans
+            )
         substitutions = [
             (
                 reference.start,
@@ -945,6 +963,7 @@ class StrictSubstitutionRenderer:
         substitutions = self._substitutions(
             template,
             include_scalar_variables=True,
+            classify_bash_contexts=secure_v3,
         )
         if secure_v3:
             return render_v3_bash(
