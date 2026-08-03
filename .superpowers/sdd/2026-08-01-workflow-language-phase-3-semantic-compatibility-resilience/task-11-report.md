@@ -768,3 +768,84 @@ Windows skips those platform-specific executions. The admission, scheduler,
 no-launch, coordinate, and complexity contracts are platform-neutral. No Task
 12+, Phase 4, release gate, customization ledger, literal `main`, base checkout,
 tool surface, or prompt-cache behavior changed.
+
+## Fix Round 6 — complete indexed contexts and physical heredoc semantics
+
+Commit `58dc9defa` (`fix(workflow): close Bash context classification gaps`)
+closes the remaining quality-closure findings with one production lexer change
+and focused behavioral regressions.
+
+### RED evidence and root causes
+
+The production-free focused run through the mandatory wrapper reported 207
+passed and 122 failed across the substitution and performance files. The RED
+covered admission, scheduler preflight, and direct inline/spill execution for
+leading redirections, function and coprocess bodies, assignment-builtin
+prefixes, quoted assignment arguments, escaped subscript candidates, and
+quoted here-document body continuations. The bounded-read regression also
+failed before implementation.
+
+Three requested shell-compatibility probes added after the first implementation
+produced a second clean RED: the substitution file reported 321 passed and 48
+failed for `command -p`, `command --`, `builtin --`, a quoted here-document
+whose `<<` operator is joined by an active continuation, and an unquoted
+delimiter split by an active continuation. Here-document-looking text on a
+continued comment was already green and remains covered.
+
+The remaining causes were:
+
+- top-level command tracking consumed leading redirection operands and wrapper
+  options as command words instead of preserving assignment-command position;
+- literal escaped scalar/output candidates could be overwritten later by an
+  enclosing unsupported subscript range;
+- global continuation removal incorrectly changed physical bytes inside
+  single-, double-, and backslash-quoted here-document bodies; and
+- an active continuation joining a delimiter token was incorrectly treated as
+  delimiter quoting.
+
+### Fixes
+
+- Top-level command state now preserves position across leading redirection
+  operands, `function`, direct/named `coproc`, `command`/`builtin` prefixes,
+  their supported option separators, and assignment builtins. Quoted
+  `declare`/`typeset`/`local`/`readonly`/`export` arguments share the indexed
+  assignment rejection path. Ordinary arguments and compound value bracket
+  text remain data.
+- Literal escaped candidates win over later unsupported-range marking, so
+  direct and compound subscript-looking words neither acquire dependencies nor
+  substitute or spill their escaped scalar/output text.
+- A shared bounded delimiter parser identifies quote removal once. The physical
+  logicalizer preserves backslash-newline bytes only in quoted here-document
+  bodies, including a logically joined `<<`; active removal remains unchanged
+  elsewhere and in unquoted bodies. Physical reference offsets continue to map
+  to the authored template.
+
+### GREEN and static evidence
+
+All tests used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`:
+
+- focused substitution + performance: 2 files, 379 passed;
+- exact required Task 11 contract: 6 files, 518 passed;
+- expanded acceptance set: 11 files, 765 passed; and
+- affected resources, serial/parallel schedulers, and performance: 4 files,
+  102 passed.
+
+Ruff lint passed for all three changed Python files. Ruff format validation
+passed for the two format-clean files; the retained performance file was not
+mechanically rewritten across its pre-existing whole-file drift. Both staged
+and unstaged whitespace checks passed before the commit.
+
+### Files changed and residual risk
+
+- `plugins/workflow/bash_rendering.py`
+- `tests/plugins/workflow/test_performance_bounds.py`
+- `tests/plugins/workflow/test_phase3_bash_substitution.py`
+
+The real-shell contracts ran on Darwin and retain the existing Windows skip;
+admission, scheduler, no-launch, offset, and complexity coverage is
+platform-neutral. No Task 12+, Phase 4, release gate, customization ledger,
+base checkout, literal `main`, model-tool surface, prompt cache, raw value/path
+evidence, or legacy workflow behavior changed. No known functional concern
+remains in the Fix Round 6 scope.
