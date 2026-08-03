@@ -15,6 +15,98 @@ from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.schema import WorkflowValidationError, load_workflow
 
 
+_CONTINUED_SHELL_WORD_CONTEXTS = (
+    (
+        "function",
+        "printf '%s' \"$({token} f { case x in x) printf {reference};; esac; }; f)\"",
+    ),
+    (
+        "coproc",
+        "printf '%s' \"$({token} worker { case x in x) printf {reference};; esac; }; wait)\"",
+    ),
+    (
+        "while",
+        "printf '%s' \"$({token} false; do case x in x) printf {reference};; esac; done)\"",
+    ),
+    (
+        "until",
+        "printf '%s' \"$({token} true; do case x in x) printf {reference};; esac; done)\"",
+    ),
+    (
+        "select",
+        "printf '%s' \"$({token} x in x; do case x in x) printf {reference};; esac; break; done)\"",
+    ),
+    (
+        "then",
+        "printf '%s' \"$(if true; {token} case x in x) printf {reference};; esac; fi)\"",
+    ),
+    (
+        "else",
+        "printf '%s' \"$(if false; then :; {token} case x in x) printf {reference};; esac; fi)\"",
+    ),
+    (
+        "elif",
+        "printf '%s' \"$(if false; then :; {token} true; then case x in x) printf {reference};; esac; fi)\"",
+    ),
+    (
+        "time",
+        "printf '%s' \"$({token} case x in x) printf {reference};; esac)\"",
+    ),
+    (
+        "for",
+        "printf '%s' \"$({token} x in x; do case x in x) printf {reference};; esac; done)\"",
+    ),
+    (
+        "if",
+        "printf '%s' \"$({token} case x in x) printf {reference};; esac; then :; fi)\"",
+    ),
+    (
+        "do",
+        "printf '%s' \"$(while false; {token} case x in x) printf {reference};; esac; done)\"",
+    ),
+    (
+        "-p",
+        "printf '%s' \"$(command {token} printf {reference})\"",
+    ),
+    (
+        "!",
+        "printf '%s' \"$({token} case x in x) printf {reference};; esac)\"",
+    ),
+    (
+        "{",
+        "printf '%s' \"$({token} case x in x) printf {reference};; esac; })\"",
+    ),
+    (
+        "case",
+        "printf '%s' \"$({token} x in x) printf {reference};; esac)\"",
+    ),
+    (
+        "in",
+        "printf '%s' \"$(case x {token} x) printf {reference};; esac)\"",
+    ),
+    (
+        "esac",
+        "printf '%s' \"$(case x in x) :;; {token}; printf {reference})\"",
+    ),
+)
+
+
+def _continued_shell_word_cases():
+    for word, template in _CONTINUED_SHELL_WORD_CONTEXTS:
+        for split in range(1, len(word)):
+            authored = f"{word[:split]}\\\n{word[split:]}"
+            yield pytest.param(
+                authored,
+                template,
+                id=f"{word}-split-{split}",
+            )
+        yield pytest.param(
+            f"{word}\\\n",
+            template,
+            id=f"{word}-after",
+        )
+
+
 def _archon_bash_package(workflow_writer, root, command: str):
     workflow = workflow_writer(
         root,
@@ -64,6 +156,64 @@ def _execute_scalar(tmp_path, *, command: str, value: str, spawn_intent=None):
     )
     stdout = tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt"
     return result, stdout.read_bytes() if stdout.exists() else None
+
+
+@pytest.mark.parametrize(
+    ("authored_word", "template"), tuple(_continued_shell_word_cases())
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_lexer_uses_authored_end_for_continued_shell_words(
+    authored_word,
+    template,
+    reference,
+) -> None:
+    command = template.replace("{token}", authored_word).replace(
+        "{reference}", reference
+    )
+    start = command.index(reference)
+
+    with pytest.raises(BashRenderingError) as exc:
+        classify_bash_reference_spans(
+            command,
+            ((start, start + len(reference)),),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported"
+
+
+@pytest.mark.parametrize(
+    ("authored_word", "_template"), tuple(_continued_shell_word_cases())
+)
+def test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text(
+    authored_word,
+    _template,
+) -> None:
+    literal = f"printf '%s' '{authored_word} $USER_MESSAGE'"
+    start = literal.index("$USER_MESSAGE")
+    end = start + len("$USER_MESSAGE")
+
+    assert classify_bash_reference_spans(literal, ((start, end),)) == (
+        (start, end, "'"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("authored_word", "_template"), tuple(_continued_shell_word_cases())
+)
+def test_v3_lexer_keeps_escaped_shell_word_and_reference_text_literal(
+    authored_word,
+    _template,
+) -> None:
+    literal = f"printf '%s' \\{authored_word} \\$USER_MESSAGE"
+    start = literal.index("$USER_MESSAGE")
+
+    assert (
+        classify_bash_reference_spans(
+            literal,
+            ((start, start + len("$USER_MESSAGE")),),
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize(

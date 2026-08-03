@@ -636,12 +636,12 @@ def _classify_authored_bash_reference_spans(
         pending_heredocs.append((delimiter, strip_tabs, delimiter_quoted))
         return cursor
 
-    def shell_word_at(start: int, word: str) -> bool:
+    def shell_word_end(start: int, word: str) -> int | None:
         if start >= len(template) or template[start] != word[0]:
-            return False
+            return None
         match = _logical_token_match(template, start, word)
         if match is None:
-            return False
+            return None
         before_cursor = start
         while before_cursor >= 2 and template.startswith(
             "\\\n",
@@ -652,7 +652,7 @@ def _classify_authored_bash_reference_spans(
         end = _skip_bash_continuations(template, match[0])
         after = template[end] if end < len(template) else " "
         separators = " \t\r\n;|&()<>"
-        return before in separators and after in separators
+        return end if before in separators and after in separators else None
 
     def brace_expansion_end(start: int) -> int | None:
         """Return the authored end of a brace word that can multiply words."""
@@ -808,9 +808,10 @@ def _classify_authored_bash_reference_spans(
 
     def function_declaration_name_end(start: int) -> int | None:
         """Consume Bash's `function WORD` prefix without parsing its body."""
-        if not shell_word_at(start, "function"):
+        keyword_end = shell_word_end(start, "function")
+        if keyword_end is None:
             return None
-        cursor = start + len("function")
+        cursor = keyword_end
         if cursor >= len(template) or template[cursor] not in " \t":
             return None
         while cursor < len(template) and template[cursor] in " \t":
@@ -833,9 +834,9 @@ def _classify_authored_bash_reference_spans(
 
     def coprocess_declaration_end(start: int) -> int | None:
         """Consume `coproc` and a possible name before a compound command."""
-        if not shell_word_at(start, "coproc"):
+        keyword_end = shell_word_end(start, "coproc")
+        if keyword_end is None:
             return None
-        keyword_end = start + len("coproc")
         if keyword_end >= len(template) or template[keyword_end] not in " \t":
             return keyword_end
         cursor = keyword_end
@@ -857,7 +858,7 @@ def _classify_authored_bash_reference_spans(
             "(",
             "[[",
         )
-        if any(shell_word_at(cursor, word) for word in compound_starters):
+        if any(shell_word_end(cursor, word) is not None for word in compound_starters):
             return keyword_end
         name_start = cursor
         separators = " \t\r\n;|&()<>"
@@ -1063,9 +1064,10 @@ def _classify_authored_bash_reference_spans(
             word_start = False
             continue
 
+        conditional_open_end = shell_word_end(position, "[[") if quote is None else None
         if (
             quote is None
-            and shell_word_at(position, "[[")
+            and conditional_open_end is not None
             and (
                 (not frames and top_level_command_position)
                 or (
@@ -1079,13 +1081,11 @@ def _classify_authored_bash_reference_spans(
                 )
             )
         ):
-            conditional_open = _logical_token_match(template, position, "[[")
-            assert conditional_open is not None
             check_nesting_bound()
             mark_current_command_word()
             frames.append(_NestingFrame("conditional", quote))
             quote = None
-            position = conditional_open[0]
+            position = conditional_open_end
             word_start = True
             continue
 
@@ -1223,14 +1223,13 @@ def _classify_authored_bash_reference_spans(
         if frames and quote is None:
             frame = frames[-1]
             if frame.kind == "conditional":
-                conditional_close = _logical_token_match(template, position, "]]")
-                if shell_word_at(position, "]]"):
+                conditional_close_end = shell_word_end(position, "]]")
+                if conditional_close_end is not None:
                     frames.pop()
                     quote = frame.resume_quote
                     if frames and frames[-1].kind == "command":
                         frames[-1].command_position = False
-                    assert conditional_close is not None
-                    position = conditional_close[0]
+                    position = conditional_close_end
                     word_start = False
                     continue
                 position += 1
@@ -1269,9 +1268,9 @@ def _classify_authored_bash_reference_spans(
                     word_start = True
                     position = function_name_end
                     continue
-                command_prefix = next(
+                command_prefix_end = next(
                     (
-                        word
+                        authored_end
                         for word in (
                             "while",
                             "until",
@@ -1289,13 +1288,13 @@ def _classify_authored_bash_reference_spans(
                         )
                         if frame.command_position
                         and case_state in {None, "body"}
-                        and shell_word_at(position, word)
+                        and (authored_end := shell_word_end(position, word)) is not None
                     ),
                     None,
                 )
-                if command_prefix is not None:
+                if command_prefix_end is not None:
                     word_start = False
-                    position += len(command_prefix)
+                    position = command_prefix_end
                     continue
                 terminator = next(
                     (
@@ -1311,32 +1310,37 @@ def _classify_authored_bash_reference_spans(
                     word_start = True
                     position += len(terminator)
                     continue
-                if (
-                    case_state in {"pattern", "body"}
-                    and frame.command_position
-                    and shell_word_at(position, "esac")
-                ):
+                esac_end = (
+                    shell_word_end(position, "esac")
+                    if case_state in {"pattern", "body"} and frame.command_position
+                    else None
+                )
+                if esac_end is not None:
                     frame.case_states.pop()
                     frame.command_position = False
                     word_start = False
-                    position += len("esac")
+                    position = esac_end
                     continue
-                if case_state == "word" and shell_word_at(position, "in"):
+                in_end = (
+                    shell_word_end(position, "in") if case_state == "word" else None
+                )
+                if in_end is not None:
                     frame.case_states[-1] = "pattern"
                     frame.command_position = True
                     word_start = False
-                    position += len("in")
+                    position = in_end
                     continue
-                if (
-                    frame.command_position
-                    and case_state in {None, "body"}
-                    and shell_word_at(position, "case")
-                ):
+                case_end = (
+                    shell_word_end(position, "case")
+                    if frame.command_position and case_state in {None, "body"}
+                    else None
+                )
+                if case_end is not None:
                     check_nesting_bound()
                     frame.case_states.append("word")
                     frame.command_position = False
                     word_start = False
-                    position += len("case")
+                    position = case_end
                     continue
                 closed = False
                 if character == ")" and frame.case_states:

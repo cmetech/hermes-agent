@@ -199,6 +199,47 @@ _PHASE_REENTRY_SAFE_CONTEXTS = (
     ),
 )
 
+
+_AUTHORED_END_FAIL_OPEN_TEMPLATES = (
+    (
+        "function",
+        "printf '%s' \"$({token} f { case x in x) printf {reference};; esac; }; f)\"",
+        "function",
+    ),
+    (
+        "coproc",
+        "printf '%s' \"$({token} { case x in x) printf {reference};; esac; }; wait)\"",
+        "direct-coproc",
+    ),
+    (
+        "coproc",
+        "printf '%s' \"$({token} worker { case x in x) printf {reference};; esac; }; wait)\"",
+        "named-coproc",
+    ),
+    (
+        "then",
+        "printf '%s' \"$(if true; {token} case x in x) printf {reference};; esac; fi)\"",
+        "then-case",
+    ),
+)
+
+
+def _continued_authored_end_fail_open_contexts():
+    for word, template, context in _AUTHORED_END_FAIL_OPEN_TEMPLATES:
+        for split in range(1, len(word)):
+            authored = f"{word[:split]}\\\n{word[split:]}"
+            yield pytest.param(
+                template.replace("{token}", authored),
+                id=f"{context}-split-{split}",
+            )
+        yield pytest.param(
+            template.replace("{token}", f"{word}\\\n"),
+            id=f"{context}-after",
+        )
+
+
+_AUTHORED_END_FAIL_OPEN_CONTEXTS = tuple(_continued_authored_end_fail_open_contexts())
+
 _PRIOR_CONTINUATION_COMMENT_HEREDOC_CONTEXTS = tuple(
     (
         f": \\\n# comment \\\n<<{delimiter} >/dev/null\n{{reference}}\nEOF\n",
@@ -573,6 +614,30 @@ def test_v3_bash_rejects_prefixed_arithmetic_array_subscripts_at_admission(
     assert [issue.code for issue in exc.value.issues] == [
         "bash_reference_context_unsupported"
     ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize("template", _AUTHORED_END_FAIL_OPEN_CONTEXTS)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_continued_declarations_and_then_case_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    reference,
+) -> None:
+    command = template.replace("{reference}", reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
     assert exc.value.issues[0].path == "nodes[1].bash"
 
 
@@ -1432,6 +1497,23 @@ def test_v3_bash_rejects_prefixed_array_subscripts_before_launch(
     assert not (attempt / "variables-v3").exists(), context
 
 
+@pytest.mark.parametrize("template", _AUTHORED_END_FAIL_OPEN_CONTEXTS)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_continued_declarations_and_then_case_before_side_effects(
+    tmp_path,
+    template,
+    reference,
+    size,
+) -> None:
+    _execute_rejected_bash_context(
+        tmp_path / reference.removeprefix("$"),
+        command=template.replace("{reference}", reference),
+        reference=reference,
+        size=size,
+    )
+
+
 @pytest.mark.parametrize(
     ("template", "context"),
     (*_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS, *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS),
@@ -2117,6 +2199,27 @@ def test_v3_scheduler_rejects_prefixed_array_subscript_contexts(
         )
 
     assert exc.value.code == "bash_reference_context_unsupported", context
+
+
+@pytest.mark.parametrize("template", _AUTHORED_END_FAIL_OPEN_CONTEXTS)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_scheduler_rejects_continued_declarations_and_then_case(
+    tmp_path,
+    monkeypatch,
+    template,
+    reference,
+) -> None:
+    command = template.replace("{reference}", reference)
+
+    with pytest.raises(BashRenderingError) as exc:
+        _scheduler_preflight_bash_template(
+            tmp_path,
+            monkeypatch,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported"
 
 
 @pytest.mark.parametrize(

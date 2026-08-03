@@ -131,6 +131,31 @@ def test_line_continuation_logical_bash_lexing_reads_only_linear_characters() ->
     assert large_reads <= 6 * large_bytes
 
 
+def _continued_shell_word_lexer_reads(repetitions: int) -> tuple[int, int]:
+    body = "if true; then\\\n :; fi; " * repetitions
+    suffix = "printf $USER_MESSAGE"
+    template = _IndexAccountingText(f'printf \'%s\' "$({body}{suffix})"')
+    start = template.index("$USER_MESSAGE")
+
+    with pytest.raises(BashRenderingError) as exc:
+        classify_bash_reference_spans(
+            template,
+            ((start, start + len("$USER_MESSAGE")),),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported"
+    return len(template), template.index_reads
+
+
+def test_continued_shell_word_authored_ends_are_classified_in_linear_time() -> None:
+    small_bytes, small_reads = _continued_shell_word_lexer_reads(2_048)
+    large_bytes, large_reads = _continued_shell_word_lexer_reads(4_096)
+
+    assert large_bytes > small_bytes
+    assert large_reads <= (3 * small_reads) + large_bytes
+    assert large_reads <= 10 * large_bytes
+
+
 def _quoted_heredoc_lexer_reads(repetitions: int) -> tuple[int, int]:
     prefix = "cat <<'EOF' >/dev/null\n" + "line\\\n" * repetitions + "EOF\n"
     suffix = 'printf \'%s\' "$USER_MESSAGE"'
