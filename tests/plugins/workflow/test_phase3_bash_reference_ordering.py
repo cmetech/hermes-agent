@@ -165,6 +165,19 @@ def test_logical_line_continuations_preserve_physical_reference_offsets() -> Non
     assert exc.value.start == len(prefix)
 
 
+def test_joined_multi_heredoc_mapping_preserves_the_authored_reference_offset() -> None:
+    prefix = (
+        ": 3<\\\n<-\\\n'ONE' 4<<-\\\n\"TWO\"\n"
+        "\tone\\\n\tONE\n\ttwo\\\n\tTWO\n"
+        "printf '%s' "
+    )
+
+    with pytest.raises(WorkflowReferenceSyntaxError) as exc:
+        bash_output_references(f"{prefix}$bad.output-field")
+
+    assert exc.value.start == len(prefix)
+
+
 def test_bounded_bash_reference_error_reports_the_exact_producer(tmp_path) -> None:
     renderer = substitution_renderer(
         VariableContext(normalizer_version=3),

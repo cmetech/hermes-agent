@@ -72,9 +72,81 @@ _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS = (
     ('export "items[{reference}]=9"', "quoted-export"),
 )
 
+_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS = tuple(
+    (
+        f"{descriptor}{operator}EOF items[{{reference}}]=9\n{tab}body\n{tab}EOF\n",
+        f"fd-{descriptor}-{context}",
+    )
+    for descriptor in range(10)
+    for operator, tab, context in (("<<", "", "heredoc"), ("<<-", "\t", "strip-tabs"))
+) + (
+    (
+        ">/dev/null 0<<'ONE' 3>/dev/null 4<<-TWO "
+        "items[{reference}]=9\none\nONE\n\ttwo\n\tTWO\n",
+        "multiple-leading-redirections-and-heredocs",
+    ),
+)
+
+_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS = (
+    ('"command" declare -a "items[{reference}]"=9', "double-wrapper"),
+    ("'command' declare -a \"items[{reference}]\"=9", "single-wrapper"),
+    ('comm\\and declare -a "items[{reference}]"=9', "escaped-wrapper"),
+    ('c"om"mand -- d"ecl"are -a "items[{reference}]"=9', "concatenated-wrapper"),
+    ('command "-p" "declare" -a "items[{reference}]"=9', "quoted-command-p-option"),
+    ('command "--" "declare" -a "items[{reference}]"=9', "quoted-command-option"),
+    ('builtin "--" "declare" -a "items[{reference}]"=9', "quoted-builtin-option"),
+    ('"declare" -a "items[{reference}]"=9', "double-declare"),
+    ("'typeset' -a \"items[{reference}]\"=9", "single-typeset"),
+    ('l"oc"al -a "items[{reference}]"=9', "concatenated-local"),
+    ('read\\only -a "items[{reference}]"=9', "escaped-readonly"),
+    ('ex"port" "items[{reference}]"=9', "concatenated-export"),
+    ('declare -a i"tems["{reference}"]"=9', "concatenated-assignment-word"),
+)
+
+_JOINED_HEREDOC_CONTEXTS = (
+    (
+        "cat <\\\n<-\\\n'EOF' >/dev/null\n\tline\\\n\tEOF\nprintf '%s' \"{reference}\"",
+        "between-less-and-after-dash",
+    ),
+    (
+        "cat <<\\\n-'EOF' >/dev/null\n\tline\\\n\tEOF\nprintf '%s' \"{reference}\"",
+        "between-operator-and-dash",
+    ),
+    (
+        "cat <<-\\\n'EOF' >/dev/null\n\tline\\\n\tEOF\nprintf '%s' \"{reference}\"",
+        "after-dash",
+    ),
+    (
+        "cat <<-EO\\\nF >/dev/null\n\tbody\n\tEOF\nprintf '%s' \"{reference}\"",
+        "split-unquoted-delimiter",
+    ),
+    (
+        ": 3<\\\n<-\\\n'ONE' 4<<-\\\n\"TWO\"\n"
+        "\tone\\\n\tONE\n\ttwo\\\n\tTWO\n"
+        "printf '%s' \"{reference}\"",
+        "multiple-queued-strip-tabs",
+    ),
+)
+
+_COMMENT_FOLLOWED_HEREDOC_DELIMITERS = (
+    ("EOF", "unquoted"),
+    ("'EOF'", "single-quoted"),
+    ('"EOF"', "double-quoted"),
+    ("\\EOF", "backslash-quoted"),
+)
+
+_FALSE_HEREDOC_TOKEN_CONTEXTS = (
+    ('printf ignored "<<\\\n-EOF"; printf \'%s\' "$USER_MESSAGE"', "quoted"),
+    ("(( shifted = 1 << 2 )); printf '%s' \"$USER_MESSAGE\"", "arithmetic"),
+    ('[[ "<<-EOF" == "<<-EOF" ]]; printf \'%s\' "$USER_MESSAGE"', "conditional"),
+    ("# false <<-EOF \\\nprintf '%s' \"$USER_MESSAGE\"", "comment"),
+)
+
 _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS = (
     ("items[\\{reference}]=9", "escaped-direct-subscript"),
     ("items=([\\{reference}]=9)", "escaped-compound-subscript"),
+    ('"declare" -a "items[\\{reference}]"=9', "escaped-quoted-declare"),
+    ('c"om"mand declare -a "items[\\{reference}]"=9', "escaped-concat-wrapper"),
 )
 
 _QUOTED_HEREDOC_DELIMITERS = (
@@ -188,6 +260,56 @@ def _scheduler_preflight_bash_template(
         sealed_resource_paths=frozenset(),
         sealed_resource_bytes={},
     )
+
+
+def _execute_rejected_bash_context(
+    tmp_path,
+    *,
+    command: str,
+    reference: str,
+    size: int,
+) -> None:
+    value = "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    resolver = MagicMock(
+        side_effect=AssertionError("unsupported output reference was resolved")
+    )
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=resolver if output_reference else None,
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="unsupported-context",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "bash_reference_context_unsupported"
+    assert launched == []
+    attempt = tmp_path / "nodes" / "shell" / "attempt-1"
+    assert not (attempt / "stdout.txt").exists()
+    assert not (attempt / "variables-v3").exists()
 
 
 @pytest.mark.parametrize(
@@ -334,6 +456,41 @@ def test_v3_bash_rejects_prefixed_arithmetic_array_subscripts_at_admission(
 
 @pytest.mark.parametrize(
     ("template", "context"),
+    (*_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS, *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS),
+    ids=[
+        context
+        for _template, context in (
+            *_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS,
+            *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS,
+        )
+    ],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_dequoted_and_fd_heredoc_array_subscripts_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
     _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
     ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
 )
@@ -447,6 +604,59 @@ def test_v3_bash_does_not_treat_a_split_unquoted_delimiter_as_quoted(
     ]
 
 
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _JOINED_HEREDOC_CONTEXTS,
+    ids=[context for _template, context in _JOINED_HEREDOC_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_parses_logically_joined_heredocs_at_every_operator_boundary(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    package = _archon_bash_package(
+        workflow_writer,
+        tmp_path,
+        command,
+        depends_on=("producer",) if reference == "$producer.output" else (),
+    )
+
+    assert package.definition.nodes[1].value == command, context
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _COMMENT_FOLLOWED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _COMMENT_FOLLOWED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_physical_comment_newline_exposes_following_real_heredoc_at_admission(
+    tmp_path,
+    workflow_writer,
+    delimiter,
+    delimiter_kind,
+    reference,
+) -> None:
+    command = f"# physical comment \\\n<<{delimiter}\n{reference}\nEOF\n"
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], delimiter_kind
+
+
 def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
     tmp_path,
     workflow_writer,
@@ -493,15 +703,36 @@ def test_v3_bash_keeps_quoted_brackets_and_unrelated_line_continuations_compatib
     assert package.definition.nodes[1].value == command
 
 
-def test_v3_bash_treats_reference_after_continued_comment_as_literal_at_admission(
+@pytest.mark.parametrize(
+    ("command", "context"),
+    _FALSE_HEREDOC_TOKEN_CONTEXTS,
+    ids=[context for _command, context in _FALSE_HEREDOC_TOKEN_CONTEXTS],
+)
+def test_v3_bash_does_not_invent_heredocs_from_quoted_or_nested_tokens_at_admission(
+    tmp_path,
+    workflow_writer,
+    command,
+    context,
+) -> None:
+    package = _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert package.definition.nodes[1].value == command, context
+
+
+def test_v3_bash_ends_a_physical_comment_before_the_following_safe_reference(
     tmp_path,
     workflow_writer,
 ) -> None:
-    command = "# continued comment \\\n$producer.output\nprintf safe"
+    command = "# physical comment \\\nprintf '%s' \"$producer.output\""
 
-    package = _archon_bash_package(workflow_writer, tmp_path, command)
+    package = _archon_bash_package(
+        workflow_writer,
+        tmp_path,
+        command,
+        depends_on=("producer",),
+    )
 
-    assert package.definition.nodes[1].depends_on == ()
+    assert package.definition.nodes[1].depends_on == ("producer",)
 
 
 def test_v3_bash_context_rejection_precedes_dependency_validation(
@@ -900,6 +1131,34 @@ def test_v3_bash_rejects_prefixed_array_subscripts_before_launch(
 
 @pytest.mark.parametrize(
     ("template", "context"),
+    (*_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS, *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS),
+    ids=[
+        context
+        for _template, context in (
+            *_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS,
+            *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS,
+        )
+    ],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_dequoted_and_fd_heredoc_subscripts_before_resolution_or_launch(
+    tmp_path,
+    template,
+    context,
+    reference,
+    size,
+) -> None:
+    _execute_rejected_bash_context(
+        tmp_path / context / reference.removeprefix("$"),
+        command=template.format(reference=reference),
+        reference=reference,
+        size=size,
+    )
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
     _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
     ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
 )
@@ -1051,6 +1310,84 @@ def test_v3_bash_preserves_quoted_heredoc_body_after_joined_operator(
     assert result.metadata["bash"]["spill_count"] == (size > 32_768)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _JOINED_HEREDOC_CONTEXTS,
+    ids=[context for _template, context in _JOINED_HEREDOC_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_executes_logically_joined_heredocs_with_exact_following_reference(
+    tmp_path,
+    template,
+    context,
+    reference,
+    size,
+) -> None:
+    value = "safe-" + "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=template.format(reference=reference),
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id=f"joined-heredoc-{context}",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded", context
+    assert (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").read_text(
+        encoding="utf-8"
+    ) == value
+    assert result.metadata["bash"]["spill_count"] == (size > 32_768)
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _COMMENT_FOLLOWED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _COMMENT_FOLLOWED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_a_real_heredoc_after_a_physical_comment_before_side_effects(
+    tmp_path,
+    delimiter,
+    delimiter_kind,
+    reference,
+    size,
+) -> None:
+    _execute_rejected_bash_context(
+        tmp_path / delimiter_kind / reference.removeprefix("$"),
+        command=f"# physical comment \\\n<<{delimiter}\n{reference}\nEOF\n",
+        reference=reference,
+        size=size,
+    )
+
+
 @pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
 @pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
 def test_v3_bash_rejects_active_unquoted_heredoc_continuations_before_launch(
@@ -1155,7 +1492,7 @@ def test_v3_bash_rejects_split_unquoted_delimiter_continuations_before_launch(
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
 @pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
-def test_v3_bash_does_not_invent_a_heredoc_on_a_continued_comment_line(
+def test_v3_bash_ends_a_physical_comment_before_rendering_a_following_safe_reference(
     tmp_path,
     reference,
 ) -> None:
@@ -1171,7 +1508,9 @@ def test_v3_bash_does_not_invent_a_heredoc_on_a_continued_comment_line(
             else None
         ),
     )
-    command = "# ignored \\\n<<'EOF'\n: \\\nEOF\nprintf '%s' \"" + reference + '"'
+    command = (
+        "# false <<-'EOF' and literal backslash \\\nprintf '%s' \"" + reference + '"'
+    )
     node = WorkflowNode(
         id="shell",
         node_type="bash",
@@ -1184,7 +1523,7 @@ def test_v3_bash_does_not_invent_a_heredoc_on_a_continued_comment_line(
 
     result = BashExecutor().execute(
         NodeExecutionContext(
-            run_id="continued-comment-heredoc-text",
+            run_id="physical-comment-safe-reference",
             run_directory=tmp_path,
             node=node,
             attempt_id="attempt-1",
@@ -1202,14 +1541,14 @@ def test_v3_bash_does_not_invent_a_heredoc_on_a_continued_comment_line(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
-def test_v3_bash_does_not_substitute_a_reference_continued_inside_a_comment(
+def test_v3_bash_does_not_substitute_a_reference_in_physical_comment_text(
     tmp_path,
 ) -> None:
     value = "7" * 32_769
 
     result, output = _run_v3_bash(
         tmp_path,
-        command="# continued comment \\\n$USER_MESSAGE\nprintf safe",
+        command="# comment reference $USER_MESSAGE and backslash \\\nprintf safe",
         value=value,
     )
 
@@ -1276,6 +1615,28 @@ def test_v3_bash_keeps_quoted_operator_and_bracket_text_as_exact_data(
 
     assert result.status == "succeeded"
     assert output == expected_template.format(value=value).encode("utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("command", "context"),
+    _FALSE_HEREDOC_TOKEN_CONTEXTS,
+    ids=[context for _command, context in _FALSE_HEREDOC_TOKEN_CONTEXTS],
+)
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_executes_safe_references_after_false_heredoc_tokens(
+    tmp_path,
+    command,
+    context,
+    size,
+) -> None:
+    value = "safe-" + "7" * size
+
+    result, output = _run_v3_bash(tmp_path, command=command, value=value)
+
+    assert result.status == "succeeded", context
+    assert output is not None and output.endswith(value.encode("utf-8")), context
+    assert result.metadata["bash"]["spill_count"] == (size > 32_768)
 
 
 @pytest.mark.parametrize(
@@ -1362,6 +1723,38 @@ def test_v3_scheduler_rejects_prefixed_array_subscript_contexts(
 
 @pytest.mark.parametrize(
     ("template", "context"),
+    (*_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS, *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS),
+    ids=[
+        context
+        for _template, context in (
+            *_FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS,
+            *_QUOTE_REMOVED_ARRAY_SUBSCRIPT_CONTEXTS,
+        )
+    ],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_scheduler_rejects_dequoted_and_fd_heredoc_array_subscripts(
+    tmp_path,
+    monkeypatch,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(BashRenderingError) as exc:
+        _scheduler_preflight_bash_template(
+            tmp_path,
+            monkeypatch,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported", context
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
     _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
     ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
 )
@@ -1406,6 +1799,52 @@ def test_v3_scheduler_preserves_quoted_heredoc_body_continuations(
     )
 
     assert result, delimiter_kind
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _JOINED_HEREDOC_CONTEXTS,
+    ids=[context for _template, context in _JOINED_HEREDOC_CONTEXTS],
+)
+def test_v3_scheduler_parses_logically_joined_heredocs(
+    tmp_path,
+    monkeypatch,
+    template,
+    context,
+) -> None:
+    command = template.format(reference="$USER_MESSAGE")
+
+    assert _scheduler_preflight_bash_template(
+        tmp_path,
+        monkeypatch,
+        command,
+    ), context
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _COMMENT_FOLLOWED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _COMMENT_FOLLOWED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_scheduler_rejects_real_heredocs_after_physical_comments(
+    tmp_path,
+    monkeypatch,
+    delimiter,
+    delimiter_kind,
+    reference,
+) -> None:
+    command = f"# physical comment \\\n<<{delimiter}\n{reference}\nEOF\n"
+
+    with pytest.raises(BashRenderingError) as exc:
+        _scheduler_preflight_bash_template(
+            tmp_path,
+            monkeypatch,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported", delimiter_kind
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
