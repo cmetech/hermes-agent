@@ -13,7 +13,10 @@ from plugins.workflow.coordinator_store import (
     record_coordinator_wake,
 )
 from plugins.workflow.lease_clock import LeaseClockSample
-from plugins.workflow.language_schema import iter_when_output_references
+from plugins.workflow.language_schema import (
+    iter_output_reference_candidate_spans,
+    iter_when_output_references,
+)
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -41,6 +44,20 @@ class _SliceAccountingText(str):
         return value
 
 
+class _IndexAccountingText(str):
+    """A string that records direct character reads during candidate scans."""
+
+    def __new__(cls, value: str) -> _IndexAccountingText:
+        instance = super().__new__(cls, value)
+        instance.index_reads = 0
+        return instance
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            self.index_reads += 1
+        return super().__getitem__(key)
+
+
 def _condition_reference_slice_volume(clauses: int) -> tuple[int, int, int]:
     expression = _SliceAccountingText(
         " && ".join(
@@ -66,6 +83,21 @@ def test_many_clause_condition_reference_discovery_copies_only_linear_bytes() ->
     assert large_bytes > small_bytes
     assert large_slices <= (3 * small_slices) + large_bytes
     assert large_slices <= 4 * large_bytes
+
+
+def test_dollar_dense_bash_candidate_discovery_reads_only_linear_characters() -> None:
+    small = _IndexAccountingText("$" * 16_384)
+    large = _IndexAccountingText("$" * 32_768)
+
+    assert (
+        tuple(iter_output_reference_candidate_spans(small, normalizer_version=3)) == ()
+    )
+    assert (
+        tuple(iter_output_reference_candidate_spans(large, normalizer_version=3)) == ()
+    )
+
+    assert large.index_reads <= (3 * small.index_reads) + len(large)
+    assert large.index_reads <= 4 * len(large)
 
 
 def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(

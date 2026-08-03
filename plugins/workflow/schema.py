@@ -14,7 +14,7 @@ import yaml
 from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
-    classify_bash_reference_spans,
+    bash_output_references,
 )
 from plugins.workflow.conditions import (
     WorkflowConditionError,
@@ -1094,45 +1094,27 @@ def _validate_v3_static_output_references(
             node, command_bodies=command_bodies
         ):
             try:
-                references = tuple(
-                    (
-                        iter_when_output_references
-                        if surface_path.endswith(".when")
-                        else iter_output_references
-                    )(template, normalizer_version=3)
-                )
-            except WorkflowReferenceSyntaxError as exc:
+                if surface_path.endswith(".when"):
+                    references = tuple(
+                        iter_when_output_references(
+                            template,
+                            normalizer_version=3,
+                        )
+                    )
+                elif surface_path.endswith(".bash"):
+                    references = bash_output_references(template)
+                else:
+                    references = tuple(
+                        iter_output_references(
+                            template,
+                            normalizer_version=3,
+                        )
+                    )
+            except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
                 issues.append(
                     _issue(surface_path, exc.code, str(exc), line=node.source_line)
                 )
                 continue
-            if surface_path.endswith(".bash"):
-                try:
-                    admitted_spans = {
-                        (start, end)
-                        for start, end, _quote in classify_bash_reference_spans(
-                            template,
-                            (
-                                (reference.start, reference.end)
-                                for reference in references
-                            ),
-                        )
-                    }
-                except BashRenderingError as exc:
-                    issues.append(
-                        _issue(
-                            surface_path,
-                            exc.code,
-                            str(exc),
-                            line=node.source_line,
-                        )
-                    )
-                    continue
-                references = tuple(
-                    reference
-                    for reference in references
-                    if (reference.start, reference.end) in admitted_spans
-                )
             for reference in references:
                 if reference.node_id not in node.depends_on:
                     issues.append(

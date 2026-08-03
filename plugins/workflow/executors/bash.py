@@ -94,17 +94,32 @@ class BashExecutor:
             if isinstance(command, RenderedBashCommand)
             else RenderedBashCommand(str(command))
         )
+        try:
+            return self._execute_rendered(
+                context,
+                rendered_command,
+                secure_v3=secure_v3,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                artifacts_dir=artifacts_dir,
+            )
+        finally:
+            # Ownership begins as soon as rendering returns. This guard covers
+            # evidence, argv/env construction, deadline and store callbacks,
+            # output setup, spawn, and every post-spawn exit.
+            rendered_command.close()
+
+    def _execute_rendered(
+        self,
+        context: NodeExecutionContext,
+        rendered_command: RenderedBashCommand,
+        *,
+        secure_v3: bool,
+        stdout_path: Path,
+        stderr_path: Path,
+        artifacts_dir: Path,
+    ) -> NodeExecutionResult:
         bash_metadata = {"bash": rendered_command.evidence()} if secure_v3 else {}
-        owned_descriptors = list(rendered_command.inherited_descriptors)
-
-        def close_owned_descriptors() -> None:
-            while owned_descriptors:
-                descriptor = owned_descriptors.pop()
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
         if os.name == "nt":  # pragma: no cover - Windows CI path
             from tools.environments.local import _find_bash
 
@@ -127,7 +142,6 @@ class BashExecutor:
         if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
             started
         ):
-            close_owned_descriptors()
             return NodeExecutionResult(
                 "failed",
                 error_code="timeout",
@@ -137,184 +151,266 @@ class BashExecutor:
         timed_out = False
         cancelled = False
         resource_violation = None
-        output = BoundedProcessOutput(
-            stdout_path, stderr_path, limit=context.max_output_bytes
-        )
-        if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
-            context.monotonic()
-        ):
-            output.close()
-            close_owned_descriptors()
-            return NodeExecutionResult(
-                "failed",
-                error_code="timeout",
-                error_message="bash node exceeded its timeout",
-                metadata=bash_metadata,
-            )
-        executor_nonce = uuid.uuid4().hex
-        if context.spawn_intent is not None and not context.spawn_intent(
-            executor_nonce
-        ):
-            output.close()
-            close_owned_descriptors()
-            raise RuntimeError("executor spawn intent was rejected")
-        if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
-            context.monotonic()
-        ):
-            output.close()
-            close_owned_descriptors()
-            if context.spawn_failed is not None:
-                context.spawn_failed(executor_nonce, "timeout")
-            return NodeExecutionResult(
-                "failed",
-                error_code="timeout",
-                error_message="bash node exceeded its timeout",
-                metadata=bash_metadata,
-            )
-        try:
-            tree = ManagedProcessTree.spawn(
-                argv,
-                policy=policy,
-                inherited_descriptors=rendered_command.inherited_descriptors,
-                cwd=context.run_directory,
-                env=allowed_env,
-                stdout=output.stdout,
-                stderr=output.stderr,
-            )
-        except ValueError as exc:
-            close_owned_descriptors()
-            output.close()
-            if not rendered_command.inherited_descriptors:
-                if context.spawn_failed is not None:
-                    context.spawn_failed(executor_nonce, type(exc).__name__)
-                raise
-            if context.spawn_failed is not None:
-                context.spawn_failed(executor_nonce, "bash_spill_integrity")
-            return NodeExecutionResult(
-                "failed",
-                error_code="bash_spill_integrity",
-                error_message="Bash spill descriptor failed launch integrity checks",
-                metadata={**bash_metadata, "archon_terminal_failure": True},
-            )
-        except BaseException as exc:
-            close_owned_descriptors()
-            output.close()
-            if context.spawn_failed is not None:
-                context.spawn_failed(executor_nonce, type(exc).__name__)
-            raise
-        close_owned_descriptors()
-        if context.process_started is not None and not context.process_started(
-            tree.identity
-        ):
-            cancelled = True
-            tree.terminate("workflow cancellation won process registration")
+        output: BoundedProcessOutput | None = None
+        output_closed = False
+        tree: ManagedProcessTree | None = None
+        tree_closed = False
+        process_started_completed = False
+        process_stopped_reported = False
+        spill_integrity_failed = False
         output_limited = False
         cleanup_error = None
         try:
-            while process_tree_active(tree):
-                if context.is_cancelled is not None and context.is_cancelled():
-                    cancelled = True
-                    tree.terminate("workflow run cancelled")
-                    break
-                if context.sealed_attempt_timeout:
-                    assert context.deadline_budget is not None
-                    deadline_expired = context.deadline_budget.wall_expired(
-                        context.monotonic()
-                    )
-                else:
-                    deadline_expired = (
-                        context.deadline_budget is not None
-                        and context.deadline_budget.wall_expired(context.monotonic())
-                    ) or context.monotonic() - started >= context.timeout_seconds
-                if deadline_expired:
-                    timed_out = True
-                    tree.terminate("workflow node timeout")
-                    break
-                limit_exceeded, output_grew = output.poll()
-                if output_grew and context.deadline_budget is not None:
-                    context.deadline_budget.semantic_progress(context.monotonic())
-                if limit_exceeded:
-                    output_limited = True
-                    tree.terminate("workflow output limit")
-                    break
-                if tree.process.poll() is None:
-                    resource_violation = tree.resource_violation(
-                        context.resource_limits
-                    )
-                    if resource_violation is not None:
-                        tree.terminate("workflow resource limit")
-                        break
-                time.sleep(0.01)
-        except RuntimeError as exc:
-            cleanup_error = str(exc)
-        finally:
-            try:
-                tree.close()
-            except RuntimeError as exc:
-                cleanup_error = cleanup_error or str(exc)
-            output_limited = output.close() or output_limited
-            if context.process_stopped is not None:
-                context.process_stopped(
-                    tree.identity, cleanup_error is None and tree.reaped
+            output = BoundedProcessOutput(
+                stdout_path,
+                stderr_path,
+                limit=context.max_output_bytes,
+            )
+            if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
+                context.monotonic()
+            ):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="timeout",
+                    error_message="bash node exceeded its timeout",
+                    metadata=bash_metadata,
                 )
-        returncode = tree.process.returncode
-        artifacts = [_artifact(stdout_path, context.run_directory, "text/plain")]
-        if stderr_path.stat().st_size:
-            artifacts.append(
-                _artifact(stderr_path, context.run_directory, "text/plain")
+            executor_nonce = uuid.uuid4().hex
+            if context.spawn_intent is not None and not context.spawn_intent(
+                executor_nonce
+            ):
+                raise RuntimeError("executor spawn intent was rejected")
+            if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
+                context.monotonic()
+            ):
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, "timeout")
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="timeout",
+                    error_message="bash node exceeded its timeout",
+                    metadata=bash_metadata,
+                )
+            try:
+                rendered_command.start_publication()
+            except BashRenderingError:
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, "bash_spill_integrity")
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="bash_spill_integrity",
+                    error_message="Bash spill publication failed integrity checks",
+                    metadata={**bash_metadata, "archon_terminal_failure": True},
+                )
+            if rendered_command.publication_error() is not None:
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, "bash_spill_integrity")
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="bash_spill_integrity",
+                    error_message="Bash spill publication failed integrity checks",
+                    metadata={**bash_metadata, "archon_terminal_failure": True},
+                )
+            try:
+                tree = ManagedProcessTree.spawn(
+                    argv,
+                    policy=policy,
+                    inherited_descriptors=rendered_command.inherited_descriptors,
+                    cwd=context.run_directory,
+                    env=allowed_env,
+                    stdout=output.stdout,
+                    stderr=output.stderr,
+                )
+            except ValueError as exc:
+                if not rendered_command.inherited_descriptors:
+                    if context.spawn_failed is not None:
+                        context.spawn_failed(executor_nonce, type(exc).__name__)
+                    raise
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, "bash_spill_integrity")
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="bash_spill_integrity",
+                    error_message=(
+                        "Bash spill descriptor failed launch integrity checks"
+                    ),
+                    metadata={**bash_metadata, "archon_terminal_failure": True},
+                )
+            except BaseException as exc:
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, type(exc).__name__)
+                raise
+            # ManagedProcessTree has pinned and exec-confirmed these descriptors;
+            # only the child may retain a read end from this point onward.
+            rendered_command.release_inherited_descriptors()
+            if context.process_started is not None and not context.process_started(
+                tree.identity
+            ):
+                process_started_completed = True
+                cancelled = True
+                tree.terminate("workflow cancellation won process registration")
+            else:
+                process_started_completed = True
+            try:
+                while process_tree_active(tree):
+                    if rendered_command.publication_error() is not None:
+                        spill_integrity_failed = True
+                        tree.terminate("workflow Bash spill publication failure")
+                        break
+                    if context.is_cancelled is not None and context.is_cancelled():
+                        cancelled = True
+                        tree.terminate("workflow run cancelled")
+                        break
+                    if context.sealed_attempt_timeout:
+                        assert context.deadline_budget is not None
+                        deadline_expired = context.deadline_budget.wall_expired(
+                            context.monotonic()
+                        )
+                    else:
+                        deadline_expired = (
+                            context.deadline_budget is not None
+                            and context.deadline_budget.wall_expired(
+                                context.monotonic()
+                            )
+                        ) or context.monotonic() - started >= context.timeout_seconds
+                    if deadline_expired:
+                        timed_out = True
+                        tree.terminate("workflow node timeout")
+                        break
+                    limit_exceeded, output_grew = output.poll()
+                    if output_grew and context.deadline_budget is not None:
+                        context.deadline_budget.semantic_progress(context.monotonic())
+                    if limit_exceeded:
+                        output_limited = True
+                        tree.terminate("workflow output limit")
+                        break
+                    if tree.process.poll() is None:
+                        resource_violation = tree.resource_violation(
+                            context.resource_limits
+                        )
+                        if resource_violation is not None:
+                            tree.terminate("workflow resource limit")
+                            break
+                    time.sleep(0.01)
+                spill_integrity_failed = (
+                    rendered_command.publication_error() is not None
+                    or spill_integrity_failed
+                )
+            except RuntimeError as exc:
+                cleanup_error = str(exc)
+            finally:
+                try:
+                    tree.close()
+                    tree_closed = True
+                except RuntimeError as exc:
+                    cleanup_error = cleanup_error or str(exc)
+                output_limited = output.close() or output_limited
+                output_closed = True
+                if context.process_stopped is not None:
+                    process_stopped_reported = True
+                    context.process_stopped(
+                        tree.identity,
+                        cleanup_error is None and tree.reaped,
+                    )
+            # Freeze publisher status only after the child has exited and all
+            # publication ownership has synchronously joined.
+            rendered_command.close()
+            spill_integrity_failed = (
+                rendered_command.publication_error() is not None
+                or spill_integrity_failed
             )
-        if cleanup_error is not None:
+            returncode = tree.process.returncode
+            artifacts = [_artifact(stdout_path, context.run_directory, "text/plain")]
+            if stderr_path.stat().st_size:
+                artifacts.append(
+                    _artifact(stderr_path, context.run_directory, "text/plain")
+                )
+            if spill_integrity_failed:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "bash_spill_integrity",
+                    "Bash spill publication failed integrity checks",
+                    {**bash_metadata, "archon_terminal_failure": True},
+                )
+            if cleanup_error is not None:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "cleanup_failed",
+                    cleanup_error,
+                    bash_metadata,
+                )
+            if cancelled:
+                reason = (
+                    context.cancellation_reason()
+                    if context.cancellation_reason is not None
+                    else "cancelled"
+                )
+                return NodeExecutionResult(
+                    "interrupted" if reason == "shutdown" else "cancelled",
+                    tuple(artifacts),
+                    reason or "cancelled",
+                    metadata=bash_metadata,
+                )
+            if timed_out:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "timeout",
+                    "bash node exceeded its timeout",
+                    bash_metadata,
+                )
+            if output_limited:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "output_limit",
+                    "bash node exceeded its output limit",
+                    bash_metadata,
+                )
+            if resource_violation is not None:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "resource_limit",
+                    f"bash node exceeded {resource_violation}",
+                    {**bash_metadata, "resource_code": resource_violation},
+                )
+            if returncode != 0:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "process_exit",
+                    f"bash node exited with status {returncode}",
+                    bash_metadata,
+                )
             return NodeExecutionResult(
-                "failed",
+                "succeeded",
                 tuple(artifacts),
-                "cleanup_failed",
-                cleanup_error,
-                bash_metadata,
-            )
-        if cancelled:
-            reason = (
-                context.cancellation_reason()
-                if context.cancellation_reason is not None
-                else "cancelled"
-            )
-            return NodeExecutionResult(
-                "interrupted" if reason == "shutdown" else "cancelled",
-                tuple(artifacts),
-                reason or "cancelled",
                 metadata=bash_metadata,
             )
-        if timed_out:
-            return NodeExecutionResult(
-                "failed",
-                tuple(artifacts),
-                "timeout",
-                "bash node exceeded its timeout",
-                bash_metadata,
-            )
-        if output_limited:
-            return NodeExecutionResult(
-                "failed",
-                tuple(artifacts),
-                "output_limit",
-                "bash node exceeded its output limit",
-                bash_metadata,
-            )
-        if resource_violation is not None:
-            return NodeExecutionResult(
-                "failed",
-                tuple(artifacts),
-                "resource_limit",
-                f"bash node exceeded {resource_violation}",
-                {**bash_metadata, "resource_code": resource_violation},
-            )
-        if returncode != 0:
-            return NodeExecutionResult(
-                "failed",
-                tuple(artifacts),
-                "process_exit",
-                f"bash node exited with status {returncode}",
-                bash_metadata,
-            )
-        return NodeExecutionResult(
-            "succeeded", tuple(artifacts), metadata=bash_metadata
-        )
+        finally:
+            # Emergency cleanup never masks the triggering exception. Normal
+            # completion sets the flags above, so this is only active for a
+            # fault in callbacks, construction, publication, or artifact work.
+            if tree is not None and not tree_closed:
+                try:
+                    tree.close()
+                except BaseException:
+                    pass
+            if output is not None and not output_closed:
+                try:
+                    output.close()
+                except BaseException:
+                    pass
+            if (
+                tree is not None
+                and process_started_completed
+                and not process_stopped_reported
+                and context.process_stopped is not None
+            ):
+                try:
+                    context.process_stopped(tree.identity, tree.reaped)
+                except BaseException:
+                    pass

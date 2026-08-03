@@ -211,7 +211,8 @@ def test_v3_bash_preserves_exact_bytes_across_inline_and_spill_boundary(
     assert result.status == "succeeded", context
     assert output == value.encode("utf-8"), context
     spill_root = tmp_path / "nodes" / "shell" / "attempt-1" / "variables-v3"
-    assert spill_root.exists() is (byte_count > 32_768)
+    assert not spill_root.exists()
+    assert result.metadata["bash"]["spill_count"] == int(byte_count > 32_768)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
@@ -438,8 +439,7 @@ def test_v3_bash_accepts_exact_per_value_and_total_spill_byte_limits(
         assert rendered.spill_total_bytes == 2_000_000
         assert len(rendered.inherited_descriptors) == 4
     finally:
-        for descriptor in rendered.inherited_descriptors:
-            os.close(descriptor)
+        rendered.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
@@ -501,19 +501,21 @@ def test_v3_bash_deduplicates_spills_and_records_bounded_descriptor_evidence(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real POSIX descriptor contract")
-def test_v3_bash_uses_verified_descriptor_after_spill_path_replacement(
+def test_v3_bash_ignores_recreated_spill_path_after_snapshot_detachment(
     tmp_path,
     monkeypatch,
 ) -> None:
     value = "verified original " + "v" * 32_769 + "x\n\n"
     replacement = b"attacker replacement"
     original_spawn = ManagedProcessTree.spawn
+    path_presence: list[bool] = []
 
     def replace_path_before_spawn(argv, **kwargs):
         spill = (
             tmp_path / "nodes" / "shell" / "attempt-1" / "variables-v3" / "spill-0000"
         )
-        spill.unlink()
+        path_presence.append(spill.exists())
+        spill.parent.mkdir()
         spill.write_bytes(replacement)
         return original_spawn(argv, **kwargs)
 
@@ -531,6 +533,7 @@ def test_v3_bash_uses_verified_descriptor_after_spill_path_replacement(
 
     assert result.status == "succeeded"
     assert output == value.encode()
+    assert path_presence == [False]
     assert replacement != output
 
 
@@ -617,17 +620,17 @@ def test_v3_bash_closes_spill_descriptors_when_spawn_intent_is_rejected(
     monkeypatch,
 ) -> None:
     observed: list[int] = []
-    original_verify = bash_rendering._verified_spill_descriptor
+    original_materialize = bash_rendering._materialize_spills
 
-    def record_descriptor(*args, **kwargs):
-        descriptor = original_verify(*args, **kwargs)
-        observed.append(descriptor)
-        return descriptor
+    def record_descriptors(*args, **kwargs):
+        transport = original_materialize(*args, **kwargs)
+        observed.extend(transport.read_descriptors)
+        return transport
 
     monkeypatch.setattr(
         bash_rendering,
-        "_verified_spill_descriptor",
-        record_descriptor,
+        "_materialize_spills",
+        record_descriptors,
     )
 
     with pytest.raises(RuntimeError, match="spawn intent was rejected"):
@@ -644,30 +647,43 @@ def test_v3_bash_closes_spill_descriptors_when_spawn_intent_is_rejected(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real POSIX descriptor contract")
-def test_bash_spill_materializer_enforces_64_file_bound_and_modes(tmp_path) -> None:
+def test_bash_spill_materializer_enforces_64_file_bound_and_modes(
+    tmp_path,
+    monkeypatch,
+) -> None:
     spills = tuple(
         (bytes([index]), hashlib.sha256(bytes([index])).hexdigest())
         for index in range(64)
     )
+    observed_files: list[os.stat_result] = []
+    original_unlink = bash_rendering.os.unlink
 
-    descriptors = bash_rendering._materialize_spills(
+    def record_verified_file(path, *, dir_fd=None):
+        observed_files.append(os.stat(path, dir_fd=dir_fd, follow_symlinks=False))
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(bash_rendering.os, "unlink", record_verified_file)
+
+    transport = bash_rendering._materialize_spills(
         tmp_path / "sixty-four",
         spills,
     )
 
     try:
-        assert len(descriptors) == 64
-        for index, descriptor in enumerate(descriptors):
+        assert len(transport.read_descriptors) == 64
+        assert len(observed_files) == 64
+        assert not (tmp_path / "sixty-four").exists()
+        for descriptor in transport.read_descriptors:
             descriptor_stat = os.fstat(descriptor)
-            path_stat = (tmp_path / "sixty-four" / f"spill-{index:04d}").stat()
-            assert stat.S_ISREG(descriptor_stat.st_mode)
-            assert descriptor_stat.st_nlink == 1
-            assert stat.S_IMODE(path_stat.st_mode) == 0o600
+            assert stat.S_ISFIFO(descriptor_stat.st_mode)
             with pytest.raises(OSError):
                 os.write(descriptor, b"not writable")
     finally:
-        for descriptor in descriptors:
-            os.close(descriptor)
+        transport.close()
+
+    assert all(stat.S_ISREG(item.st_mode) for item in observed_files)
+    assert all(item.st_nlink == 1 for item in observed_files)
+    assert all(stat.S_IMODE(item.st_mode) == 0o600 for item in observed_files)
 
     with pytest.raises(BashRenderingError) as exc:
         bash_rendering._materialize_spills(

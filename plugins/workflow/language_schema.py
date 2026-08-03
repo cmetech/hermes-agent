@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -138,6 +138,84 @@ def _reference_candidate_end(template: str, start: int) -> int:
     while end < len(template) and template[end] not in _REFERENCE_CANDIDATE_END:
         end += 1
     return end
+
+
+def _bash_reference_candidate_end(template: str, start: int) -> int:
+    """Bound one shell candidate without swallowing a following dollar token."""
+    end = start + 1
+    while (
+        end < len(template)
+        and template[end] != "$"
+        and template[end] not in _REFERENCE_CANDIDATE_END
+    ):
+        end += 1
+    return end
+
+
+def _reference_like_candidate(template: str, start: int, end: int) -> bool:
+    """Recognize a possible output token without applying the strict grammar."""
+    if start + 1 >= end:
+        return False
+    first = template[start + 1]
+    if not (first == "_" or first.isalnum() or not first.isascii()):
+        return False
+    candidate = template[start:end]
+    return ".output" in candidate or bool(
+        re.search(r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII)
+    )
+
+
+def iter_output_reference_candidate_spans(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield reference-like dollar ranges without rejecting their grammar."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return
+        end = _bash_reference_candidate_end(template, start)
+        if _reference_like_candidate(template, start, end):
+            yield start, end
+        # Inspect nested dollars independently (for ${...}, $[], $(), and
+        # ANSI-C quote contexts) rather than trusting the outer shell token.
+        position = start + 1
+
+
+def iter_output_references_in_spans(
+    template: str,
+    spans: Iterable[tuple[int, int]],
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Apply the strict grammar only to lexically admitted candidate spans."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    previous_end = 0
+    for start, end in spans:
+        if start < previous_end or start < 0 or end <= start or end > len(template):
+            raise ValueError("output reference candidate spans are invalid")
+        previous_end = end
+        candidate = template[start:end]
+        try:
+            token = _output_reference_at(candidate, 0)
+        except WorkflowReferenceSyntaxError as exc:
+            local_start = exc.start if exc.start is not None else 0
+            raise WorkflowReferenceSyntaxError(
+                str(exc),
+                start=start + local_start,
+            ) from exc
+        if token is not None:
+            yield OutputReferenceToken(
+                node_id=token.node_id,
+                path=token.path,
+                start=start + token.start,
+                end=start + token.end,
+            )
 
 
 def _complete_reference_at(template: str, start: int) -> bool:

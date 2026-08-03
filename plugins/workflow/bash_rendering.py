@@ -5,9 +5,11 @@ from __future__ import annotations
 from bisect import bisect_left
 import hashlib
 import os
+import selectors
 import shlex
 import stat
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -21,8 +23,12 @@ _NATIVE_WINDOWS = os.name == "nt"
 _DESCRIPTOR_SPILLS_SUPPORTED = (
     hasattr(os, "O_NOFOLLOW")
     and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "pipe")
+    and hasattr(os, "set_blocking")
     and os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and os.rmdir in os.supports_dir_fd
 )
 
 
@@ -39,6 +45,174 @@ class _NestingFrame:
     kind: str
     resume_quote: str | None
     parenthesis_depth: int = 1
+    bracket_depth: int = 1
+    case_states: list[str] = field(default_factory=list)
+    command_position: bool = True
+    pending_heredocs: list[tuple[str, bool]] = field(default_factory=list)
+
+
+class _SpillTransport:
+    """Own anonymous verified-byte publication into inherited read pipes."""
+
+    def __init__(
+        self,
+        read_descriptors: tuple[int, ...],
+        publications: tuple[tuple[int, bytes], ...],
+    ) -> None:
+        self.read_descriptors = read_descriptors
+        self._publications = publications
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._error: str | None = None
+        self._closed = False
+        self._reads_released = False
+
+    @classmethod
+    def from_snapshots(cls, snapshots: tuple[bytes, ...]) -> _SpillTransport:
+        reads: list[int] = []
+        publications: list[tuple[int, bytes]] = []
+        try:
+            for snapshot in snapshots:
+                read_descriptor, write_descriptor = os.pipe()
+                reads.append(read_descriptor)
+                publications.append((write_descriptor, snapshot))
+                os.set_inheritable(read_descriptor, False)
+                os.set_inheritable(write_descriptor, False)
+                os.set_blocking(write_descriptor, False)
+            return cls(tuple(reads), tuple(publications))
+        except BaseException:
+            for descriptor in reads:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            for descriptor, _snapshot in publications:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+
+    def _record_error(self, exc: BaseException) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = f"{type(exc).__name__}: {exc}"
+
+    def _publish(self, selector: selectors.BaseSelector) -> None:
+        pending = {
+            descriptor: memoryview(snapshot)
+            for descriptor, snapshot in self._publications
+        }
+        held_after_error: set[int] = set()
+        try:
+            while pending and not self._stop.is_set():
+                for key, _mask in selector.select(timeout=0.05):
+                    descriptor = int(key.fd)
+                    payload = pending.get(descriptor)
+                    if payload is None:
+                        continue
+                    try:
+                        written = os.write(descriptor, payload[: 64 * 1024])
+                        if written <= 0:
+                            raise OSError("short write while publishing Bash spill")
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        # The shell's read-status path remains authoritative when
+                        # its descriptor was closed or replaced before `cat`.
+                        selector.unregister(descriptor)
+                        pending.pop(descriptor, None)
+                        os.close(descriptor)
+                        continue
+                    except BaseException as exc:
+                        self._record_error(exc)
+                        selector.unregister(descriptor)
+                        pending.pop(descriptor, None)
+                        # Keep the writer open so `cat` cannot observe a clean,
+                        # truncated EOF before the executor notices the error.
+                        held_after_error.add(descriptor)
+                        continue
+                    remaining = payload[written:]
+                    if remaining:
+                        pending[descriptor] = remaining
+                    else:
+                        selector.unregister(descriptor)
+                        pending.pop(descriptor, None)
+                        os.close(descriptor)
+        except BaseException as exc:  # pragma: no cover - selector host failure
+            self._record_error(exc)
+            held_after_error.update(pending)
+        finally:
+            if held_after_error:
+                self._stop.wait()
+            selector.close()
+            for descriptor in set(pending).union(held_after_error):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def start(self) -> None:
+        """Start one bounded publisher only after all pre-spawn work succeeds."""
+        if not self._publications or self._thread is not None:
+            return
+        if self._closed:
+            raise BashRenderingError(
+                "bash_spill_integrity",
+                "Bash spill publication ownership was already closed",
+            )
+        selector = selectors.DefaultSelector()
+        try:
+            for descriptor, _snapshot in self._publications:
+                selector.register(descriptor, selectors.EVENT_WRITE)
+            thread = threading.Thread(
+                target=self._publish,
+                args=(selector,),
+                name="hermes-bash-spill-publisher",
+                daemon=False,
+            )
+            thread.start()
+        except BaseException as exc:
+            selector.close()
+            self.close()
+            raise BashRenderingError(
+                "bash_spill_integrity",
+                "Bash spill publication could not start",
+            ) from exc
+        self._thread = thread
+
+    def publication_error(self) -> str | None:
+        with self._lock:
+            return self._error
+
+    def release_inherited(self) -> None:
+        """Close parent read ends after Task 10 pins and exec-confirms them."""
+        with self._lock:
+            if self._reads_released:
+                return
+            self._reads_released = True
+        for descriptor in self.read_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        """Abort or finish publication and synchronously join its sole thread."""
+        if self._closed:
+            return
+        self._closed = True
+        self.release_inherited()
+        self._stop.set()
+        if self._thread is None:
+            for descriptor, _snapshot in self._publications:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            return
+        self._thread.join()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +229,21 @@ class RenderedBashCommand:
     spill_total_bytes: int = 0
     spill_content_sha256: tuple[str, ...] = ()
     descriptor_manifest: tuple[tuple[int, str], ...] = ()
+    _transport: _SpillTransport | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _descriptor_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
+    _descriptors_released: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
 
     def evidence(self) -> dict[str, object]:
         """Return bounded metadata without values or spill pathnames."""
@@ -71,6 +260,35 @@ class RenderedBashCommand:
                 for descriptor, digest in self.descriptor_manifest
             ],
         }
+
+    def start_publication(self) -> None:
+        if self._transport is not None:
+            self._transport.start()
+
+    def publication_error(self) -> str | None:
+        return (
+            self._transport.publication_error() if self._transport is not None else None
+        )
+
+    def release_inherited_descriptors(self) -> None:
+        if self._transport is not None:
+            self._transport.release_inherited()
+            return
+        with self._descriptor_lock:
+            if self._descriptors_released:
+                return
+            object.__setattr__(self, "_descriptors_released", True)
+        for descriptor in self.inherited_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._transport is not None:
+            self._transport.close()
+        else:
+            self.release_inherited_descriptors()
 
 
 def _quote_inline_value(value: str, quote: str | None) -> str:
@@ -117,7 +335,7 @@ def classify_bash_reference_spans(
     decisions: dict[int, str | None | bool] = {}
     quote: str | None = None
     frames: list[_NestingFrame] = []
-    pending_heredocs: list[tuple[str, bool]] = []
+    top_level_heredocs: list[tuple[str, bool]] = []
     word_start = True
     position = 0
 
@@ -130,7 +348,10 @@ def classify_bash_reference_spans(
     def unsupported_range(start: int, end: int) -> None:
         decide_range(start, end, False)
 
-    def consume_heredocs(start: int) -> int:
+    def consume_heredocs(
+        start: int,
+        pending_heredocs: list[tuple[str, bool]],
+    ) -> int:
         cursor = start
         for delimiter, strip_tabs in pending_heredocs:
             body_start = cursor
@@ -157,6 +378,142 @@ def classify_bash_reference_spans(
         pending_heredocs.clear()
         return cursor
 
+    def begin_heredoc(start: int) -> int | None:
+        if not template.startswith("<<", start) or template.startswith("<<<", start):
+            return None
+        cursor = start + 2
+        strip_tabs = cursor < len(template) and template[cursor] == "-"
+        if strip_tabs:
+            cursor += 1
+        while cursor < len(template) and template[cursor] in " \t":
+            cursor += 1
+        delimiter_start = cursor
+        delimiter: list[str] = []
+        delimiter_quote: str | None = None
+        while cursor < len(template):
+            item = template[cursor]
+            if delimiter_quote is None and item in " \t\r\n;&|<>()":
+                break
+            if item == "\\" and delimiter_quote != "'":
+                following = template[cursor + 1] if cursor + 1 < len(template) else ""
+                if not following:
+                    delimiter_quote = "ambiguous"
+                    break
+                if following == "\n":
+                    cursor += 2
+                    continue
+                if delimiter_quote == '"' and following not in '$`"\\':
+                    delimiter.extend(("\\", following))
+                else:
+                    delimiter.append(following)
+                cursor += 2
+                continue
+            elif item == "'" and delimiter_quote != '"':
+                delimiter_quote = None if delimiter_quote == "'" else "'"
+            elif item == '"' and delimiter_quote != "'":
+                delimiter_quote = None if delimiter_quote == '"' else '"'
+            else:
+                delimiter.append(item)
+            cursor += 1
+        unsupported_range(delimiter_start, cursor)
+        if not delimiter or delimiter_quote is not None:
+            raise BashRenderingError(
+                "bash_reference_context_unsupported",
+                "Bash reference appears near an ambiguous here-document delimiter",
+            )
+        pending_heredocs = (
+            frames[-1].pending_heredocs
+            if frames and frames[-1].kind == "command"
+            else top_level_heredocs
+        )
+        pending_heredocs.append(("".join(delimiter), strip_tabs))
+        return cursor
+
+    def shell_word_at(start: int, word: str) -> bool:
+        if not template.startswith(word, start):
+            return False
+        before = template[start - 1] if start else " "
+        end = start + len(word)
+        after = template[end] if end < len(template) else " "
+        separators = " \t\r\n;|&()<>"
+        return before in separators and after in separators
+
+    def function_declaration_name_end(start: int) -> int | None:
+        """Consume Bash's `function WORD` prefix without parsing its body."""
+        if not shell_word_at(start, "function"):
+            return None
+        cursor = start + len("function")
+        if cursor >= len(template) or template[cursor] not in " \t":
+            return None
+        while cursor < len(template) and template[cursor] in " \t":
+            cursor += 1
+        name_start = cursor
+        separators = " \t\r\n;|&()<>"
+        while cursor < len(template) and template[cursor] not in separators:
+            if template[cursor] in "'\"\\$`":
+                raise BashRenderingError(
+                    "bash_reference_context_unsupported",
+                    "Bash reference follows an ambiguous function declaration",
+                )
+            cursor += 1
+        if cursor == name_start:
+            raise BashRenderingError(
+                "bash_reference_context_unsupported",
+                "Bash reference follows an ambiguous function declaration",
+            )
+        return cursor
+
+    def coprocess_declaration_end(start: int) -> int | None:
+        """Consume `coproc` and a possible name before a compound command."""
+        if not shell_word_at(start, "coproc"):
+            return None
+        keyword_end = start + len("coproc")
+        if keyword_end >= len(template) or template[keyword_end] not in " \t":
+            return keyword_end
+        cursor = keyword_end
+        while cursor < len(template) and template[cursor] in " \t":
+            cursor += 1
+        compound_starters = (
+            "case",
+            "if",
+            "for",
+            "select",
+            "while",
+            "until",
+            "function",
+            "coproc",
+            "time",
+            "!",
+            "{",
+            "((",
+            "(",
+            "[[",
+        )
+        if any(shell_word_at(cursor, word) for word in compound_starters):
+            return keyword_end
+        name_start = cursor
+        separators = " \t\r\n;|&()<>"
+        while cursor < len(template) and template[cursor] not in separators:
+            if template[cursor] in "'\"\\$`":
+                raise BashRenderingError(
+                    "bash_reference_context_unsupported",
+                    "Bash reference follows an ambiguous coprocess declaration",
+                )
+            cursor += 1
+        return cursor if cursor > name_start else keyword_end
+
+    def check_nesting_bound(extra: int = 1) -> None:
+        case_depth = sum(len(frame.case_states) for frame in frames)
+        if len(frames) + case_depth + extra > _BASH_LEXER_MAX_NESTING:
+            raise BashRenderingError(
+                "bash_reference_context_unsupported",
+                "Bash reference nesting exceeds its lexer bound",
+            )
+
+    def mark_current_command_word() -> None:
+        if frames and frames[-1].kind == "command":
+            frames[-1].command_position = False
+
     while position < len(template):
         if position in by_start:
             if frames:
@@ -165,6 +522,17 @@ def classify_bash_reference_spans(
                 decisions[position] = quote
 
         character = template[position]
+        if frames and frames[-1].kind == "ansi_c":
+            if character == "\\":
+                position = min(len(template), position + 2)
+            elif character == "'":
+                frame = frames.pop()
+                quote = frame.resume_quote
+                position += 1
+            else:
+                position += 1
+            word_start = False
+            continue
         if quote != "'" and character == "\\":
             escaped_position = position + 1
             if escaped_position in by_start:
@@ -175,6 +543,7 @@ def classify_bash_reference_spans(
             position = min(len(template), position + 2)
             if escaped_character != "\n":
                 word_start = False
+                mark_current_command_word()
             continue
 
         comments_allowed = not frames or frames[-1].kind in {"command", "backtick"}
@@ -195,11 +564,14 @@ def classify_bash_reference_spans(
             word_start = False
             continue
         if character == "'" and quote is None:
+            mark_current_command_word()
             quote = "'"
             position += 1
             word_start = False
             continue
         if character == '"':
+            if quote is None:
+                mark_current_command_word()
             quote = None if quote == '"' else '"'
             position += 1
             word_start = False
@@ -216,10 +588,20 @@ def classify_bash_reference_spans(
                         "bash_reference_context_unsupported",
                         "Bash reference nesting exceeds its lexer bound",
                     )
+                mark_current_command_word()
                 frames.append(_NestingFrame("backtick", quote))
                 quote = None
                 word_start = True
             position += 1
+            continue
+
+        if template.startswith("$$", position):
+            second_dollar = position + 1
+            if second_dollar in by_start:
+                decisions[second_dollar] = True
+            mark_current_command_word()
+            position += 2
+            word_start = False
             continue
 
         if character == "$" and position + 1 < len(template):
@@ -229,6 +611,12 @@ def classify_bash_reference_spans(
             elif template.startswith("$(", position):
                 kind = "command"
                 width = 2
+            elif template.startswith("$[", position):
+                kind = "legacy_arithmetic"
+                width = 2
+            elif quote is None and template.startswith("$'", position):
+                kind = "ansi_c"
+                width = 2
             elif template.startswith("${", position):
                 kind = "parameter"
                 width = 2
@@ -236,29 +624,162 @@ def classify_bash_reference_spans(
                 kind = ""
                 width = 0
             if kind:
-                if len(frames) >= _BASH_LEXER_MAX_NESTING:
-                    raise BashRenderingError(
-                        "bash_reference_context_unsupported",
-                        "Bash reference nesting exceeds its lexer bound",
-                    )
+                check_nesting_bound()
+                mark_current_command_word()
                 frames.append(_NestingFrame(kind, quote))
                 quote = None
                 position += width
                 word_start = kind == "command"
                 continue
 
+        if (
+            quote is None
+            and frames
+            and frames[-1].kind == "command"
+            and frames[-1].command_position
+            and (not frames[-1].case_states or frames[-1].case_states[-1] == "body")
+            and shell_word_at(position, "[[")
+        ):
+            check_nesting_bound()
+            mark_current_command_word()
+            frames.append(_NestingFrame("conditional", quote))
+            quote = None
+            position += 2
+            word_start = True
+            continue
+
+        heredoc_cursor = (
+            begin_heredoc(position)
+            if quote is None and (not frames or frames[-1].kind == "command")
+            else None
+        )
+        if heredoc_cursor is not None:
+            position = heredoc_cursor
+            word_start = False
+            continue
+
         if frames and quote is None:
             frame = frames[-1]
+            if frame.kind == "conditional":
+                if shell_word_at(position, "]]"):
+                    frames.pop()
+                    quote = frame.resume_quote
+                    if frames and frames[-1].kind == "command":
+                        frames[-1].command_position = False
+                    position += 2
+                    word_start = False
+                    continue
+                position += 1
+                word_start = character in " \t\r\n"
+                continue
             if frame.kind == "parameter" and character == "}":
                 frames.pop()
                 quote = frame.resume_quote
                 position += 1
                 continue
             if frame.kind == "command":
+                case_state = frame.case_states[-1] if frame.case_states else None
+                coprocess_end = (
+                    coprocess_declaration_end(position)
+                    if frame.command_position and case_state in {None, "body"}
+                    else None
+                )
+                if coprocess_end is not None:
+                    frame.command_position = True
+                    word_start = True
+                    position = coprocess_end
+                    continue
+                function_name_end = (
+                    function_declaration_name_end(position)
+                    if frame.command_position and case_state in {None, "body"}
+                    else None
+                )
+                if function_name_end is not None:
+                    frame.command_position = True
+                    word_start = True
+                    position = function_name_end
+                    continue
+                command_prefix = next(
+                    (
+                        word
+                        for word in (
+                            "while",
+                            "until",
+                            "select",
+                            "then",
+                            "else",
+                            "elif",
+                            "time",
+                            "for",
+                            "if",
+                            "do",
+                            "-p",
+                            "!",
+                            "{",
+                        )
+                        if frame.command_position
+                        and case_state in {None, "body"}
+                        and shell_word_at(position, word)
+                    ),
+                    None,
+                )
+                if command_prefix is not None:
+                    word_start = False
+                    position += len(command_prefix)
+                    continue
+                terminator = next(
+                    (
+                        token
+                        for token in (";;&", ";;", ";&")
+                        if case_state == "body" and template.startswith(token, position)
+                    ),
+                    None,
+                )
+                if terminator is not None:
+                    frame.case_states[-1] = "pattern"
+                    frame.command_position = True
+                    word_start = True
+                    position += len(terminator)
+                    continue
+                if (
+                    case_state in {"pattern", "body"}
+                    and frame.command_position
+                    and shell_word_at(position, "esac")
+                ):
+                    frame.case_states.pop()
+                    frame.command_position = False
+                    word_start = False
+                    position += len("esac")
+                    continue
+                if case_state == "word" and shell_word_at(position, "in"):
+                    frame.case_states[-1] = "pattern"
+                    frame.command_position = True
+                    word_start = False
+                    position += len("in")
+                    continue
+                if (
+                    frame.command_position
+                    and case_state in {None, "body"}
+                    and shell_word_at(position, "case")
+                ):
+                    check_nesting_bound()
+                    frame.case_states.append("word")
+                    frame.command_position = False
+                    word_start = False
+                    position += len("case")
+                    continue
                 closed = False
-                if character == "(":
+                if character == ")" and frame.case_states:
+                    if frame.case_states[-1] == "pattern":
+                        frame.case_states[-1] = "body"
+                        frame.command_position = True
+                        word_start = True
+                        position += 1
+                        continue
+                elif character == "(" and not frame.case_states:
                     frame.parenthesis_depth += 1
-                elif character == ")":
+                    frame.command_position = True
+                elif character == ")" and not frame.case_states:
                     frame.parenthesis_depth -= 1
                     if frame.parenthesis_depth == 0:
                         frames.pop()
@@ -266,11 +787,26 @@ def classify_bash_reference_spans(
                         closed = True
                 if closed:
                     word_start = False
-                elif character in " \t\r\n;|&()<>":
+                elif character == ")" and not frame.case_states:
+                    # A nested pair can be a POSIX function declaration
+                    # (`name() { ...; }`).  The following command group must
+                    # remain in command position so its `case` body is parsed.
                     word_start = True
+                    frame.command_position = True
+                elif character in " \t\r<>":
+                    word_start = True
+                elif character in "\n;|&":
+                    word_start = True
+                    frame.command_position = True
                 else:
                     word_start = False
+                    frame.command_position = False
                 position += 1
+                if character == "\n" and frame.pending_heredocs:
+                    position = consume_heredocs(
+                        position,
+                        frame.pending_heredocs,
+                    )
                 continue
             if frame.kind == "arithmetic":
                 if character == "(":
@@ -288,54 +824,22 @@ def classify_bash_reference_spans(
                     frame.parenthesis_depth -= 1
                 position += 1
                 continue
-
-        if (
-            not frames
-            and quote is None
-            and template.startswith("<<", position)
-            and not template.startswith("<<<", position)
-        ):
-            cursor = position + 2
-            strip_tabs = cursor < len(template) and template[cursor] == "-"
-            if strip_tabs:
-                cursor += 1
-            while cursor < len(template) and template[cursor] in " \t":
-                cursor += 1
-            delimiter_start = cursor
-            delimiter: list[str] = []
-            delimiter_quote: str | None = None
-            while cursor < len(template):
-                item = template[cursor]
-                if delimiter_quote is None and item in " \t\r\n;&|<>()":
-                    break
-                if item == "\\" and delimiter_quote != "'":
-                    cursor += 1
-                    if cursor >= len(template) or template[cursor] == "\n":
-                        break
-                    delimiter.append(template[cursor])
-                elif item == "'" and delimiter_quote != '"':
-                    delimiter_quote = None if delimiter_quote == "'" else "'"
-                elif item == '"' and delimiter_quote != "'":
-                    delimiter_quote = None if delimiter_quote == '"' else '"'
-                else:
-                    delimiter.append(item)
-                cursor += 1
-            unsupported_range(delimiter_start, cursor)
-            if not delimiter or delimiter_quote is not None:
-                raise BashRenderingError(
-                    "bash_reference_context_unsupported",
-                    "Bash reference appears near an ambiguous here-document delimiter",
-                )
-            pending_heredocs.append(("".join(delimiter), strip_tabs))
-            position = cursor
-            word_start = False
-            continue
+            if frame.kind == "legacy_arithmetic":
+                if character == "[":
+                    frame.bracket_depth += 1
+                elif character == "]":
+                    frame.bracket_depth -= 1
+                    if frame.bracket_depth == 0:
+                        frames.pop()
+                        quote = frame.resume_quote
+                position += 1
+                continue
 
         if character == "\n":
             position += 1
             word_start = True
-            if pending_heredocs:
-                position = consume_heredocs(position)
+            if top_level_heredocs:
+                position = consume_heredocs(position, top_level_heredocs)
             continue
         if character in " \t\r;|&()<>" and quote is None:
             word_start = True
@@ -343,7 +847,7 @@ def classify_bash_reference_spans(
             word_start = False
         position += 1
 
-    if ordered and (quote is not None or frames or pending_heredocs):
+    if ordered and (quote is not None or frames or top_level_heredocs):
         raise BashRenderingError(
             "bash_reference_context_unsupported",
             "Bash reference appears in an unterminated or ambiguous shell state",
@@ -359,6 +863,33 @@ def classify_bash_reference_spans(
         (start, end, decisions[start] if isinstance(decisions[start], str) else None)
         for start, end in ordered
         if decisions.get(start) is not True
+    )
+
+
+def bash_output_references(template: str):
+    """Parse strict output references only after Bash literal filtering."""
+    # Local import preserves bash_rendering's dependency-neutral lexer surface.
+    from plugins.workflow.language_schema import (
+        iter_output_reference_candidate_spans,
+        iter_output_references_in_spans,
+    )
+
+    candidates = tuple(
+        iter_output_reference_candidate_spans(template, normalizer_version=3)
+    )
+    admitted = tuple(
+        (start, end)
+        for start, end, _quote in classify_bash_reference_spans(
+            template,
+            candidates,
+        )
+    )
+    return tuple(
+        iter_output_references_in_spans(
+            template,
+            admitted,
+            normalizer_version=3,
+        )
     )
 
 
@@ -407,12 +938,12 @@ def _open_directory_chain(path: Path) -> int:
         raise
 
 
-def _verified_spill_descriptor(
+def _verified_spill_snapshot(
     directory_descriptor: int,
     filename: str,
     data: bytes,
     digest: str,
-) -> int:
+) -> bytes:
     create_flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -420,14 +951,17 @@ def _verified_spill_descriptor(
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    write_descriptor = os.open(
-        filename,
-        create_flags,
-        0o600,
-        dir_fd=directory_descriptor,
-    )
+    write_descriptor: int | None = None
     read_descriptor: int | None = None
+    created = False
     try:
+        write_descriptor = os.open(
+            filename,
+            create_flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        created = True
         os.fchmod(write_descriptor, 0o600)
         _write_all(write_descriptor, data)
         os.fsync(write_descriptor)
@@ -453,28 +987,39 @@ def _verified_spill_descriptor(
             raise OSError("Bash spill identity changed during verification")
         observed = hashlib.sha256()
         remaining = len(data)
+        snapshot = bytearray()
         while remaining:
             chunk = os.read(read_descriptor, min(remaining, 64 * 1024))
             if not chunk:
                 raise OSError("Bash spill ended before its verified size")
             observed.update(chunk)
+            snapshot.extend(chunk)
             remaining -= len(chunk)
         if os.read(read_descriptor, 1) or observed.hexdigest() != digest:
             raise OSError("Bash spill content failed verification")
-        os.lseek(read_descriptor, 0, os.SEEK_SET)
-        return read_descriptor
-    except BaseException:
-        if read_descriptor is not None:
-            os.close(read_descriptor)
-        raise
+        return bytes(snapshot)
     finally:
-        os.close(write_descriptor)
+        if read_descriptor is not None:
+            try:
+                os.close(read_descriptor)
+            except OSError:
+                pass
+        if write_descriptor is not None:
+            try:
+                os.close(write_descriptor)
+            except OSError:
+                pass
+        if created:
+            # The verified snapshot is already detached in bounded memory.
+            # Unlinking here removes future pathname authority; a writer that
+            # opened before this syscall can mutate only the orphaned inode.
+            os.unlink(filename, dir_fd=directory_descriptor)
 
 
 def _materialize_spills(
     spill_directory: Path,
     spills: tuple[tuple[bytes, str], ...],
-) -> tuple[int, ...]:
+) -> _SpillTransport:
     if (
         len(spills) > BASH_SPILL_MAX_FILES
         or any(len(data) > BASH_SPILL_MAX_VALUE_BYTES for data, _digest in spills)
@@ -487,9 +1032,12 @@ def _materialize_spills(
     parent = spill_directory.parent
     parent_descriptor = _open_directory_chain(parent)
     directory_descriptor: int | None = None
-    descriptors: list[int] = []
+    snapshots: list[bytes] = []
+    transport: _SpillTransport | None = None
+    directory_created = False
     try:
         os.mkdir(spill_directory.name, 0o700, dir_fd=parent_descriptor)
+        directory_created = True
         directory_descriptor = os.open(
             spill_directory.name,
             _open_flags(directory=True),
@@ -499,18 +1047,26 @@ def _materialize_spills(
         if not stat.S_ISDIR(directory_stat.st_mode):
             raise OSError("Bash spill root is not a directory")
         for index, (data, digest) in enumerate(spills):
-            descriptors.append(
-                _verified_spill_descriptor(
+            snapshots.append(
+                _verified_spill_snapshot(
                     directory_descriptor,
                     f"spill-{index:04d}",
                     data,
                     digest,
                 )
             )
-        return tuple(descriptors)
+        transport = _SpillTransport.from_snapshots(tuple(snapshots))
+        os.rmdir(spill_directory.name, dir_fd=parent_descriptor)
+        directory_created = False
+        return transport
     except BaseException:
-        for descriptor in descriptors:
-            os.close(descriptor)
+        if transport is not None:
+            transport.close()
+        if directory_created:
+            try:
+                os.rmdir(spill_directory.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
         raise
     finally:
         if directory_descriptor is not None:
@@ -570,64 +1126,71 @@ def render_v3_bash(
             "Secure Bash spill descriptors are unavailable on this host",
         )
     try:
-        descriptors = (
+        transport = (
             _materialize_spills(
                 Path(spill_directory),
                 tuple(spill_values),
             )
             if spill_values
-            else ()
+            else None
         )
     except (OSError, NotImplementedError) as exc:
         raise BashRenderingError(
             "bash_spill_integrity",
             "Bash spill descriptor materialization failed integrity checks",
         ) from exc
-    variables = {
-        data: f"__HERMES_WF_SPILL_{digest}"
-        for data, (digest, _index) in spill_by_value.items()
-    }
-    prologue = "".join(
-        (
-            f"{variables[data]}=$(command cat <&{descriptors[index]}; "
-            '__hermes_rc=$?; printf x; exit "$__hermes_rc") || exit $?\n'
-            f"{variables[data]}=${{{variables[data]}%x}}\n"
+    descriptors = transport.read_descriptors if transport is not None else ()
+    try:
+        variables = {
+            data: f"__HERMES_WF_SPILL_{digest}"
+            for data, (digest, _index) in spill_by_value.items()
+        }
+        prologue = "".join(
+            (
+                f"{variables[data]}=$(command cat <&{descriptors[index]}; "
+                '__hermes_rc=$?; printf x; exit "$__hermes_rc") || exit $?\n'
+                f"{variables[data]}=${{{variables[data]}%x}}\n"
+            )
+            for data, (_digest, index) in spill_by_value.items()
         )
-        for data, (_digest, index) in spill_by_value.items()
-    )
-    rendered: list[str] = [prologue]
-    position = 0
-    for start, end, value, quote in ordered:
-        rendered.append(template[position:start])
-        encoded = value.encode("utf-8")
-        if encoded in variables:
-            variable = variables[encoded]
-            replacement = {
-                None: f'"${{{variable}}}"',
-                '"': f"${{{variable}}}",
-                "'": f"'\"${{{variable}}}\"'",
-            }[quote]
-        else:
-            replacement = _quote_inline_value(value, quote)
-        rendered.append(replacement)
-        position = end
-    rendered.append(template[position:])
-    rendered_command = "".join(rendered)
-    template_bytes = template.encode("utf-8")
-    rendered_bytes = rendered_command.encode("utf-8")
-    spill_digests = tuple(digest for _data, digest in spill_values)
-    return RenderedBashCommand(
-        command=rendered_command,
-        inherited_descriptors=descriptors,
-        template_sha256=hashlib.sha256(template_bytes).hexdigest(),
-        template_size_bytes=len(template_bytes),
-        rendered_sha256=hashlib.sha256(rendered_bytes).hexdigest(),
-        rendered_size_bytes=len(rendered_bytes),
-        spill_count=len(spill_values),
-        spill_total_bytes=spill_total_bytes,
-        spill_content_sha256=spill_digests,
-        descriptor_manifest=tuple(zip(descriptors, spill_digests, strict=True)),
-    )
+        rendered: list[str] = [prologue]
+        position = 0
+        for start, end, value, quote in ordered:
+            rendered.append(template[position:start])
+            encoded = value.encode("utf-8")
+            if encoded in variables:
+                variable = variables[encoded]
+                replacement = {
+                    None: f'"${{{variable}}}"',
+                    '"': f"${{{variable}}}",
+                    "'": f"'\"${{{variable}}}\"'",
+                }[quote]
+            else:
+                replacement = _quote_inline_value(value, quote)
+            rendered.append(replacement)
+            position = end
+        rendered.append(template[position:])
+        rendered_command = "".join(rendered)
+        template_bytes = template.encode("utf-8")
+        rendered_bytes = rendered_command.encode("utf-8")
+        spill_digests = tuple(digest for _data, digest in spill_values)
+        return RenderedBashCommand(
+            command=rendered_command,
+            inherited_descriptors=descriptors,
+            template_sha256=hashlib.sha256(template_bytes).hexdigest(),
+            template_size_bytes=len(template_bytes),
+            rendered_sha256=hashlib.sha256(rendered_bytes).hexdigest(),
+            rendered_size_bytes=len(rendered_bytes),
+            spill_count=len(spill_values),
+            spill_total_bytes=spill_total_bytes,
+            spill_content_sha256=spill_digests,
+            descriptor_manifest=tuple(zip(descriptors, spill_digests, strict=True)),
+            _transport=transport,
+        )
+    except BaseException:
+        if transport is not None:
+            transport.close()
+        raise
 
 
 __all__ = [
@@ -637,6 +1200,7 @@ __all__ = [
     "BASH_SPILL_MAX_VALUE_BYTES",
     "BashRenderingError",
     "RenderedBashCommand",
+    "bash_output_references",
     "classify_bash_reference_spans",
     "render_v3_bash",
 ]

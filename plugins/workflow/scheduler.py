@@ -25,7 +25,7 @@ from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
-from plugins.workflow.bash_rendering import classify_bash_reference_spans
+from plugins.workflow.bash_rendering import bash_output_references
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     evaluate_v3_condition,
@@ -1526,25 +1526,11 @@ class RunScheduler:
             sealed_resource_paths=sealed_resource_paths,
             sealed_resource_bytes=sealed_resource_bytes,
         ):
-            template_references = tuple(
-                iter_output_references(template, normalizer_version=3)
+            template_references = (
+                bash_output_references(template)
+                if node.node_type == "bash"
+                else tuple(iter_output_references(template, normalizer_version=3))
             )
-            if node.node_type == "bash":
-                admitted_spans = {
-                    (start, end)
-                    for start, end, _quote in classify_bash_reference_spans(
-                        template,
-                        (
-                            (reference.start, reference.end)
-                            for reference in template_references
-                        ),
-                    )
-                }
-                template_references = tuple(
-                    reference
-                    for reference in template_references
-                    if (reference.start, reference.end) in admitted_spans
-                )
             reference_keys.extend(
                 (reference.node_id, reference.path) for reference in template_references
             )
