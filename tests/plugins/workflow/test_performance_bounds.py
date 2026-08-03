@@ -131,6 +131,28 @@ def test_line_continuation_logical_bash_lexing_reads_only_linear_characters() ->
     assert large_reads <= 6 * large_bytes
 
 
+def _quoted_heredoc_lexer_reads(repetitions: int) -> tuple[int, int]:
+    prefix = "cat <<'EOF' >/dev/null\n" + "line\\\n" * repetitions + "EOF\n"
+    suffix = 'printf \'%s\' "$USER_MESSAGE"'
+    template = _IndexAccountingText(prefix + suffix)
+    start = len(prefix) + suffix.index("$USER_MESSAGE")
+
+    assert classify_bash_reference_spans(
+        template,
+        ((start, start + len("$USER_MESSAGE")),),
+    ) == ((start, start + len("$USER_MESSAGE"), '"'),)
+    return len(template), template.index_reads
+
+
+def test_quoted_heredoc_literal_continuations_are_classified_in_linear_time() -> None:
+    small_bytes, small_reads = _quoted_heredoc_lexer_reads(4_096)
+    large_bytes, large_reads = _quoted_heredoc_lexer_reads(8_192)
+
+    assert large_bytes > small_bytes
+    assert large_reads <= (3 * small_reads) + large_bytes
+    assert large_reads <= 8 * large_bytes
+
+
 def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(
     tmp_path, workflow_writer
 ) -> None:

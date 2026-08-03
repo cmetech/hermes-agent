@@ -52,6 +52,37 @@ _ARRAY_SUBSCRIPT_CONTEXTS = (
     ("items+=([{reference}]=9)", "compound-append-assignment"),
 )
 
+_PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS = (
+    ("> /dev/null items[{reference}]=9", "leading-redirection"),
+    ("function f {{ items[{reference}]=9; }}; f", "function-keyword"),
+    ("coproc {{ items[{reference}]=9; }}; wait", "direct-coproc"),
+    ("coproc worker {{ items[{reference}]=9; }}; wait", "named-coproc"),
+    ("command declare -a items[{reference}]=9", "command-declare"),
+    ("command -p declare -a items[{reference}]=9", "command-p-declare"),
+    ("command -- declare -a items[{reference}]=9", "command-dashdash-declare"),
+    ("builtin declare -a items[{reference}]=9", "builtin-declare"),
+    ("builtin -- declare -a items[{reference}]=9", "builtin-dashdash-declare"),
+    ('declare -a "items[{reference}]=9"', "quoted-declare"),
+    ('typeset -a "items[{reference}]=9"', "quoted-typeset"),
+    (
+        'function f {{ local -a "items[{reference}]=9"; }}; f',
+        "quoted-local",
+    ),
+    ('readonly -a "items[{reference}]=9"', "quoted-readonly"),
+    ('export "items[{reference}]=9"', "quoted-export"),
+)
+
+_ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS = (
+    ("items[\\{reference}]=9", "escaped-direct-subscript"),
+    ("items=([\\{reference}]=9)", "escaped-compound-subscript"),
+)
+
+_QUOTED_HEREDOC_DELIMITERS = (
+    ("'EOF'", "single-quoted"),
+    ('"EOF"', "double-quoted"),
+    ("\\EOF", "backslash-quoted"),
+)
+
 
 def _run_v3_bash(
     tmp_path,
@@ -111,6 +142,52 @@ def _archon_bash_package(workflow_writer, root, command: str, *, depends_on=()):
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     return load_workflow(workflow)
+
+
+def _scheduler_preflight_bash_template(
+    tmp_path,
+    monkeypatch,
+    command: str,
+    *,
+    depends_on=(),
+):
+    store = MagicMock()
+    store.run_directory.return_value = tmp_path
+    scheduler = object.__new__(RunScheduler)
+    scheduler.store = store
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=depends_on,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    package = SimpleNamespace(
+        language=SimpleNamespace(
+            effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_revalidate_retained_output_resolution",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_strict_reference_templates",
+        lambda *_args, **_kwargs: (command,),
+    )
+    return scheduler._preflight_strict_node_references(
+        "run-1",
+        node,
+        package,
+        {"nodes": {"shell": {"state": "ready"}}},
+        sealed_resource_paths=frozenset(),
+        sealed_resource_bytes={},
+    )
 
 
 @pytest.mark.parametrize(
@@ -226,6 +303,150 @@ def test_v3_bash_rejects_arithmetic_array_subscripts_at_admission(
     assert exc.value.issues[0].path == "nodes[1].bash"
 
 
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_prefixed_arithmetic_array_subscripts_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_ignores_escaped_array_subscript_candidates_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    package = _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert package.definition.nodes[1].depends_on == (), context
+    assert package.definition.nodes[1].value == command
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _QUOTED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _QUOTED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_preserves_literal_continuations_in_quoted_heredoc_bodies_at_admission(
+    tmp_path,
+    workflow_writer,
+    delimiter,
+    delimiter_kind,
+    reference,
+) -> None:
+    command = f"cat <<{delimiter} >/dev/null\nline\\\nEOF\nprintf '%s' \"{reference}\""
+
+    package = _archon_bash_package(
+        workflow_writer,
+        tmp_path,
+        command,
+        depends_on=("producer",) if reference == "$producer.output" else (),
+    )
+
+    assert package.definition.nodes[1].value == command, delimiter_kind
+
+
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_keeps_continuation_removal_active_in_unquoted_heredoc_bodies(
+    tmp_path,
+    workflow_writer,
+    reference,
+) -> None:
+    command = "cat <<EOF >/dev/null\nline\\\nEOF\nprintf '%s' " + reference
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _QUOTED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _QUOTED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_preserves_quoted_heredoc_joined_operator_at_admission(
+    tmp_path,
+    workflow_writer,
+    delimiter,
+    delimiter_kind,
+    reference,
+) -> None:
+    command = (
+        f"cat <\\\n<{delimiter} >/dev/null\nline\\\nEOF\nprintf '%s' \"{reference}\""
+    )
+
+    package = _archon_bash_package(
+        workflow_writer,
+        tmp_path,
+        command,
+        depends_on=("producer",) if reference == "$producer.output" else (),
+    )
+
+    assert package.definition.nodes[1].value == command, delimiter_kind
+
+
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_does_not_treat_a_split_unquoted_delimiter_as_quoted(
+    tmp_path,
+    workflow_writer,
+    reference,
+) -> None:
+    command = "cat <<EO\\\nF >/dev/null\nline\\\nEOF\nprintf '%s' " + reference
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ]
+
+
 def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
     tmp_path,
     workflow_writer,
@@ -245,6 +466,8 @@ def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
         "printf '%s' \"items[$USER_MESSAGE]=9\"",
         "printf '%s' \"items=([$USER_MESSAGE]=9)\"",
         "printf '%s' items[$USER_MESSAGE]=9",
+        "command printf '%s' items[$USER_MESSAGE]=9",
+        "builtin printf '%s' items[$USER_MESSAGE]=9",
         "printf '%s' [[ $USER_MESSAGE ]]",
         ("items=([0]=prefix[$USER_MESSAGE]=9); printf '%s' \"${items[0]}\""),
         "(\\\n( 1 )); printf '%s' \"$USER_MESSAGE\"",
@@ -253,6 +476,8 @@ def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
         "quoted-index",
         "quoted-compound-index",
         "argument-index-text",
+        "command-argument-index-text",
+        "builtin-argument-index-text",
         "argument-conditional-text",
         "compound-value-bracket-text",
         "later-safe-reference",
@@ -615,6 +840,367 @@ def test_v3_bash_rejects_joined_operators_and_array_subscripts_before_launch(
     assert not (attempt / "variables-v3").exists(), context
 
 
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_prefixed_array_subscripts_before_launch(
+    tmp_path,
+    template,
+    context,
+    reference,
+    size,
+) -> None:
+    value = "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=template.format(reference=reference),
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id=f"prefixed-array-{context}",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed", context
+    assert result.error_code == "bash_reference_context_unsupported", context
+    assert launched == [], context
+    attempt = tmp_path / "nodes" / "shell" / "attempt-1"
+    assert not (attempt / "stdout.txt").exists(), context
+    assert not (attempt / "variables-v3").exists(), context
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_keeps_escaped_array_subscript_candidates_literal_without_spilling(
+    tmp_path,
+    template,
+    context,
+    reference,
+) -> None:
+    resolver = MagicMock(side_effect=AssertionError("literal output was resolved"))
+    renderer = substitution_renderer(
+        VariableContext(user_message="7" * 32_769, normalizer_version=3),
+        direct_dependencies=(),
+        output_resolver=resolver,
+    )
+    command = template.format(reference=reference)
+    spill_directory = tmp_path / context / "variables-v3"
+
+    rendered = renderer.render_bash(
+        command,
+        spill_directory=spill_directory,
+        secure_v3=True,
+    )
+
+    try:
+        assert rendered.command == command, context
+        assert rendered.spill_count == 0, context
+        assert rendered.inherited_descriptors == (), context
+        assert not spill_directory.exists(), context
+        resolver.assert_not_called()
+    finally:
+        rendered.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _QUOTED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _QUOTED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_preserves_quoted_heredoc_body_continuations_during_execution(
+    tmp_path,
+    delimiter,
+    delimiter_kind,
+    reference,
+    size,
+) -> None:
+    value = "safe-" + "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    command = f"cat <<{delimiter} >/dev/null\nline\\\nEOF\nprintf '%s' \"{reference}\""
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id=f"quoted-heredoc-{delimiter_kind}",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded", delimiter_kind
+    assert (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").read_text(
+        encoding="utf-8"
+    ) == value
+    assert result.metadata["bash"]["spill_count"] == (size > 32_768)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _QUOTED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _QUOTED_HEREDOC_DELIMITERS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_preserves_quoted_heredoc_body_after_joined_operator(
+    tmp_path,
+    delimiter,
+    delimiter_kind,
+    reference,
+    size,
+) -> None:
+    value = "safe-" + "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    command = (
+        f"cat <\\\n<{delimiter} >/dev/null\nline\\\nEOF\nprintf '%s' \"{reference}\""
+    )
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id=f"joined-quoted-heredoc-{delimiter_kind}",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded", delimiter_kind
+    assert (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").read_text(
+        encoding="utf-8"
+    ) == value
+    assert result.metadata["bash"]["spill_count"] == (size > 32_768)
+
+
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_active_unquoted_heredoc_continuations_before_launch(
+    tmp_path,
+    reference,
+    size,
+) -> None:
+    value = "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value="cat <<EOF >/dev/null\nline\\\nEOF\nprintf '%s' " + reference,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="unquoted-heredoc-continuation",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "bash_reference_context_unsupported"
+    assert launched == []
+    attempt = tmp_path / "nodes" / "shell" / "attempt-1"
+    assert not (attempt / "stdout.txt").exists()
+    assert not (attempt / "variables-v3").exists()
+
+
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_split_unquoted_delimiter_continuations_before_launch(
+    tmp_path,
+    reference,
+    size,
+) -> None:
+    value = "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value="cat <<EO\\\nF >/dev/null\nline\\\nEOF\nprintf '%s' " + reference,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="split-unquoted-heredoc-delimiter",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "bash_reference_context_unsupported"
+    assert launched == []
+    attempt = tmp_path / "nodes" / "shell" / "attempt-1"
+    assert not (attempt / "stdout.txt").exists()
+    assert not (attempt / "variables-v3").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_does_not_invent_a_heredoc_on_a_continued_comment_line(
+    tmp_path,
+    reference,
+) -> None:
+    value = "safe-" + "7" * 32_769
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    command = "# ignored \\\n<<'EOF'\n: \\\nEOF\nprintf '%s' \"" + reference + '"'
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id="continued-comment-heredoc-text",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").read_text(
+        encoding="utf-8"
+    ) == value
+    assert result.metadata["bash"]["spill_count"] == 1
+
+
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
 def test_v3_bash_does_not_substitute_a_reference_continued_inside_a_comment(
     tmp_path,
@@ -658,6 +1244,8 @@ def test_v3_bash_ignores_an_escaped_reference_after_a_line_continuation(
         ),
         ("printf '%s' \"(\\\n( $USER_MESSAGE ))\"", "(( {value} ))"),
         ("printf '%s' items[$USER_MESSAGE]=9", "items[{value}]=9"),
+        ("command printf '%s' items[$USER_MESSAGE]=9", "items[{value}]=9"),
+        ("builtin printf '%s' items[$USER_MESSAGE]=9", "items[{value}]=9"),
         ("printf '%s' [[ $USER_MESSAGE ]]", "[[{value}]]"),
         (
             "items=([0]=prefix[$USER_MESSAGE]=9); printf '%s' \"${items[0]}\"",
@@ -669,6 +1257,8 @@ def test_v3_bash_ignores_an_escaped_reference_after_a_line_continuation(
         "quoted-compound-index",
         "quoted-joined-operator",
         "argument-index-text",
+        "command-argument-index-text",
+        "builtin-argument-index-text",
         "argument-conditional-text",
         "compound-value-bracket-text",
     ),
@@ -742,6 +1332,80 @@ def test_v3_scheduler_preflight_uses_the_bash_context_authority(
         )
 
     assert exc.value.code == "bash_reference_context_unsupported"
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_scheduler_rejects_prefixed_array_subscript_contexts(
+    tmp_path,
+    monkeypatch,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(BashRenderingError) as exc:
+        _scheduler_preflight_bash_template(
+            tmp_path,
+            monkeypatch,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported", context
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _ESCAPED_ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_scheduler_ignores_escaped_array_subscript_candidates(
+    tmp_path,
+    monkeypatch,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    result = _scheduler_preflight_bash_template(
+        tmp_path,
+        monkeypatch,
+        command,
+    )
+
+    assert result, context
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "delimiter_kind"),
+    _QUOTED_HEREDOC_DELIMITERS,
+    ids=[kind for _delimiter, kind in _QUOTED_HEREDOC_DELIMITERS],
+)
+def test_v3_scheduler_preserves_quoted_heredoc_body_continuations(
+    tmp_path,
+    monkeypatch,
+    delimiter,
+    delimiter_kind,
+) -> None:
+    command = (
+        f"cat <<{delimiter} >/dev/null\nline\\\nEOF\nprintf '%s' \"$USER_MESSAGE\""
+    )
+
+    result = _scheduler_preflight_bash_template(
+        tmp_path,
+        monkeypatch,
+        command,
+    )
+
+    assert result, delimiter_kind
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")

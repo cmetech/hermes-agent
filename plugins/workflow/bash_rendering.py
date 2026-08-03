@@ -361,16 +361,175 @@ def _validate_bash_reference_spans(
     return ordered
 
 
+def _parse_bash_heredoc_delimiter(
+    template: str,
+    start: int,
+    *,
+    operator_end: int | None = None,
+) -> tuple[int, int, str, bool, bool] | None:
+    if operator_end is None:
+        if not template.startswith("<<", start) or template.startswith("<<<", start):
+            return None
+        cursor = start + 2
+    else:
+        cursor = operator_end
+    strip_tabs = cursor < len(template) and template[cursor] == "-"
+    if strip_tabs:
+        cursor += 1
+    while cursor < len(template) and template[cursor] in " \t":
+        cursor += 1
+    delimiter_start = cursor
+    delimiter: list[str] = []
+    delimiter_quote: str | None = None
+    delimiter_quoted = False
+    while cursor < len(template):
+        item = template[cursor]
+        if delimiter_quote is None and item in " \t\r\n;&|<>()":
+            break
+        if item == "\\" and delimiter_quote != "'":
+            following = template[cursor + 1] if cursor + 1 < len(template) else ""
+            if not following:
+                delimiter_quote = "ambiguous"
+                break
+            if following == "\n":
+                cursor += 2
+                continue
+            delimiter_quoted = True
+            if delimiter_quote == '"' and following not in '$`"\\':
+                delimiter.extend(("\\", following))
+            else:
+                delimiter.append(following)
+            cursor += 2
+            continue
+        if item == "'" and delimiter_quote != '"':
+            delimiter_quoted = True
+            delimiter_quote = None if delimiter_quote == "'" else "'"
+        elif item == '"' and delimiter_quote != "'":
+            delimiter_quoted = True
+            delimiter_quote = None if delimiter_quote == '"' else '"'
+        else:
+            delimiter.append(item)
+        cursor += 1
+    if not delimiter or delimiter_quote is not None:
+        raise BashRenderingError(
+            "bash_reference_context_unsupported",
+            "Bash reference appears near an ambiguous here-document delimiter",
+        )
+    return cursor, delimiter_start, "".join(delimiter), strip_tabs, delimiter_quoted
+
+
+def _quoted_heredoc_body_ranges(template: str) -> tuple[tuple[int, int], ...]:
+    """Locate physical bodies whose quoted delimiters disable continuations."""
+    ranges: list[tuple[int, int]] = []
+    pending: list[tuple[str, bool, bool]] = []
+    quote: str | None = None
+    word_start = True
+    position = 0
+
+    def consume_bodies(start: int) -> int:
+        cursor = start
+        for delimiter, strip_tabs, delimiter_quoted in pending:
+            body_start = cursor
+            while cursor <= len(template):
+                newline = template.find("\n", cursor)
+                line_end = len(template) if newline < 0 else newline
+                line = template[cursor:line_end]
+                compared = line.lstrip("\t") if strip_tabs else line
+                if compared == delimiter:
+                    if delimiter_quoted:
+                        ranges.append((body_start, cursor))
+                    cursor = len(template) if newline < 0 else newline + 1
+                    break
+                if newline < 0:
+                    return len(template)
+                cursor = newline + 1
+        pending.clear()
+        return cursor
+
+    while position < len(template):
+        character = template[position]
+        delimiter = None
+        if quote is None:
+            delimiter = _parse_bash_heredoc_delimiter(template, position)
+            if delimiter is None and character == "<":
+                second = position + 1
+                while template.startswith("\\\n", second):
+                    second += 2
+                if second < len(template) and template[second] == "<":
+                    third = second + 1
+                    while template.startswith("\\\n", third):
+                        third += 2
+                    if third >= len(template) or template[third] != "<":
+                        delimiter = _parse_bash_heredoc_delimiter(
+                            template,
+                            position,
+                            operator_end=second + 1,
+                        )
+        if delimiter is not None:
+            cursor, _delimiter_start, text, strip_tabs, delimiter_quoted = delimiter
+            pending.append((text, strip_tabs, delimiter_quoted))
+            position = cursor
+            word_start = False
+            continue
+        if quote != "'" and character == "\\":
+            position = min(len(template), position + 2)
+            word_start = False
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            position += 1
+            word_start = False
+            continue
+        if character == "'" and quote is None:
+            quote = "'"
+            position += 1
+            word_start = False
+            continue
+        if character == '"':
+            quote = None if quote == '"' else '"'
+            position += 1
+            word_start = False
+            continue
+        if quote is None and character == "#" and word_start:
+            newline = template.find("\n", position)
+            position = len(template) if newline < 0 else newline
+            continue
+        if character == "\n":
+            position += 1
+            word_start = True
+            if pending:
+                position = consume_bodies(position)
+            continue
+        word_start = character in " \t\r;|&()<>"
+        position += 1
+    return tuple(ranges)
+
+
 def _logical_bash_input(template: str) -> tuple[str, tuple[int, ...]]:
     """Remove physical continuations and map every physical boundary."""
     logical: list[str] = []
     physical_to_logical = [0] * (len(template) + 1)
+    quoted_heredoc_ranges = _quoted_heredoc_body_ranges(template)
+    range_index = 0
     position = 0
     consecutive_backslashes = 0
     while position < len(template):
         physical_to_logical[position] = len(logical)
+        while (
+            range_index < len(quoted_heredoc_ranges)
+            and position >= quoted_heredoc_ranges[range_index][1]
+        ):
+            range_index += 1
+        in_quoted_heredoc = (
+            range_index < len(quoted_heredoc_ranges)
+            and quoted_heredoc_ranges[range_index][0]
+            <= position
+            < quoted_heredoc_ranges[range_index][1]
+        )
         if (
-            template[position] == "\\"
+            not in_quoted_heredoc
+            and template[position] == "\\"
             and position + 1 < len(template)
             and template[position + 1] == "\n"
             and consecutive_backslashes % 2 == 0
@@ -439,12 +598,16 @@ def _classify_logical_bash_reference_spans(
     array_subscript_depth = 0
     top_level_command_position = True
     top_level_assignment_builtin = False
+    top_level_command_wrapper: str | None = None
+    top_level_redirection_operand = False
     top_level_word_start: int | None = None
 
     def decide_range(start: int, end: int, decision: bool) -> None:
         first = bisect_left(reference_starts, start)
         last = bisect_left(reference_starts, end, lo=first)
         for reference_start in reference_starts[first:last]:
+            if decision is False and decisions.get(reference_start) is True:
+                continue
             decisions[reference_start] = decision
 
     def unsupported_range(start: int, end: int) -> None:
@@ -481,54 +644,17 @@ def _classify_logical_bash_reference_spans(
         return cursor
 
     def begin_heredoc(start: int) -> int | None:
-        if not template.startswith("<<", start) or template.startswith("<<<", start):
+        parsed = _parse_bash_heredoc_delimiter(template, start)
+        if parsed is None:
             return None
-        cursor = start + 2
-        strip_tabs = cursor < len(template) and template[cursor] == "-"
-        if strip_tabs:
-            cursor += 1
-        while cursor < len(template) and template[cursor] in " \t":
-            cursor += 1
-        delimiter_start = cursor
-        delimiter: list[str] = []
-        delimiter_quote: str | None = None
-        while cursor < len(template):
-            item = template[cursor]
-            if delimiter_quote is None and item in " \t\r\n;&|<>()":
-                break
-            if item == "\\" and delimiter_quote != "'":
-                following = template[cursor + 1] if cursor + 1 < len(template) else ""
-                if not following:
-                    delimiter_quote = "ambiguous"
-                    break
-                if following == "\n":
-                    cursor += 2
-                    continue
-                if delimiter_quote == '"' and following not in '$`"\\':
-                    delimiter.extend(("\\", following))
-                else:
-                    delimiter.append(following)
-                cursor += 2
-                continue
-            elif item == "'" and delimiter_quote != '"':
-                delimiter_quote = None if delimiter_quote == "'" else "'"
-            elif item == '"' and delimiter_quote != "'":
-                delimiter_quote = None if delimiter_quote == '"' else '"'
-            else:
-                delimiter.append(item)
-            cursor += 1
+        cursor, delimiter_start, delimiter, strip_tabs, _delimiter_quoted = parsed
         unsupported_range(delimiter_start, cursor)
-        if not delimiter or delimiter_quote is not None:
-            raise BashRenderingError(
-                "bash_reference_context_unsupported",
-                "Bash reference appears near an ambiguous here-document delimiter",
-            )
         pending_heredocs = (
             frames[-1].pending_heredocs
             if frames and frames[-1].kind == "command"
             else top_level_heredocs
         )
-        pending_heredocs.append(("".join(delimiter), strip_tabs))
+        pending_heredocs.append((delimiter, strip_tabs))
         return cursor
 
     def shell_word_at(start: int, word: str) -> bool:
@@ -540,7 +666,7 @@ def _classify_logical_bash_reference_spans(
         separators = " \t\r\n;|&()<>"
         return before in separators and after in separators
 
-    def assignment_name_before(end: int) -> bool:
+    def assignment_name_before(end: int, *, allow_quote_boundary: bool = False) -> bool:
         cursor = end
         while cursor > 0 and (
             template[cursor - 1].isascii()
@@ -552,7 +678,11 @@ def _classify_logical_bash_reference_spans(
             and (template[cursor].isalpha() or template[cursor] == "_")
         ):
             return False
-        return cursor == 0 or template[cursor - 1] in " \t\r\n;|&(<>)"
+        return (
+            cursor == 0
+            or template[cursor - 1] in " \t\r\n;|&(<>)"
+            or (allow_quote_boundary and template[cursor - 1] in "'\"")
+        )
 
     def begins_compound_assignment(start: int) -> bool:
         if start == 0 or template[start - 1] != "=":
@@ -593,11 +723,16 @@ def _classify_logical_bash_reference_spans(
     def finish_top_level_word(end: int) -> None:
         nonlocal top_level_assignment_builtin
         nonlocal top_level_command_position
+        nonlocal top_level_command_wrapper
+        nonlocal top_level_redirection_operand
         nonlocal top_level_word_start
         if top_level_word_start is None:
             return
         start = top_level_word_start
         top_level_word_start = None
+        if top_level_redirection_operand:
+            top_level_redirection_operand = False
+            return
         if not top_level_command_position:
             return
         word = template[start:end]
@@ -605,6 +740,14 @@ def _classify_logical_bash_reference_spans(
             return
         if top_level_assignment_builtin:
             return
+        if word in {"builtin", "command"}:
+            top_level_command_wrapper = word
+            return
+        if top_level_command_wrapper == "command" and word in {"-p", "--"}:
+            return
+        if top_level_command_wrapper == "builtin" and word == "--":
+            return
+        top_level_command_wrapper = None
         if word in {"declare", "export", "local", "readonly", "typeset"}:
             top_level_assignment_builtin = True
             return
@@ -713,6 +856,23 @@ def _classify_logical_bash_reference_spans(
             not frames
             and quote is None
             and compound_assignment_depth == 0
+            and top_level_command_position
+            and top_level_word_start is None
+        ):
+            coprocess_end = coprocess_declaration_end(position)
+            if coprocess_end is not None:
+                position = coprocess_end
+                word_start = True
+                continue
+            function_name_end = function_declaration_name_end(position)
+            if function_name_end is not None:
+                position = function_name_end
+                word_start = True
+                continue
+        if (
+            not frames
+            and quote is None
+            and compound_assignment_depth == 0
             and top_level_word_start is None
             and character not in " \t\r\n;|&()<>"
         ):
@@ -740,6 +900,24 @@ def _classify_logical_bash_reference_spans(
                 word_start = False
                 mark_current_command_word()
             continue
+
+        if not frames and top_level_assignment_builtin and quote in {"'", '"'}:
+            if array_subscript_start is not None:
+                if character == "[":
+                    array_subscript_depth += 1
+                elif character == "]":
+                    array_subscript_depth -= 1
+                    if array_subscript_depth == 0:
+                        suffix = template[position + 1 : position + 3]
+                        if suffix.startswith("=") or suffix.startswith("+="):
+                            unsupported_range(array_subscript_start, position + 1)
+                        array_subscript_start = None
+            elif character == "[" and assignment_name_before(
+                position,
+                allow_quote_boundary=True,
+            ):
+                array_subscript_start = position
+                array_subscript_depth = 1
 
         comments_allowed = not frames or frames[-1].kind in {"command", "backtick"}
         if quote is None and comments_allowed and character == "#" and word_start:
@@ -869,6 +1047,20 @@ def _classify_logical_bash_reference_spans(
             position = heredoc_cursor
             word_start = False
             continue
+
+        if (
+            quote is None
+            and not frames
+            and compound_assignment_depth == 0
+            and top_level_command_position
+            and character in "<>"
+        ):
+            if (
+                top_level_word_start is not None
+                and template[top_level_word_start:position].isdigit()
+            ):
+                top_level_word_start = None
+            top_level_redirection_operand = True
 
         closed_compound_assignment = False
         if quote is None and not frames:
@@ -1094,6 +1286,7 @@ def _classify_logical_bash_reference_spans(
             ):
                 top_level_command_position = True
                 top_level_assignment_builtin = False
+                top_level_command_wrapper = None
 
         if character == "\n":
             position += 1
