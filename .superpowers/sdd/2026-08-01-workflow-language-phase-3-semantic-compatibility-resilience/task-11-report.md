@@ -1082,3 +1082,38 @@ platform-neutral. No Task 12+, Phase 4, release gate, base checkout, literal
 `main`, model-tool surface, prompt cache, raw value/path evidence, or legacy
 workflow behavior changed. No known functional concern remains in this
 closure-correction scope.
+
+## Final Task 11 closure
+
+The final implementation is
+`49ffbccfe4b9424f3b6542cfdf9df4bc9ef537e0` with tree
+`7560124795fca2d7c2f167874423e38042f40d83`.
+
+Fresh independent closure rereviews both passed against that exact tree:
+
+- specification: PASS, 0 Critical / 0 Important / 0 Minor,
+  `task-11-spec-closure-review-6.md`, SHA-256
+  `41210a8ea7f94ad1de8ef12da35adc146c70e2696d820d95aee6fa305cbb3ce9`;
+- quality and resilience: PASS, 0 Critical / 0 Important / 0 Minor,
+  `task-11-quality-closure-review-6.md`, SHA-256
+  `538e4addc2541f8a108be16cb3fc03721099bf558fdfd85d0fb92f0d16a59207`.
+
+The reviewers freshly passed the exact eleven-file closure set at 1,799 tests
+and the affected resource/scheduler/performance set at 106 tests, with retries
+disabled. Ruff and correction/full-range diff checks passed.
+
+From the clean committed closure-review tree, the live final gates passed:
+
+```text
+../../.venv/bin/python scripts/check_upstream_customizations.py \
+  --strict --base-ref HEAD
+scripts/test_workflow_merge_gate.sh --phase base
+```
+
+The strict checker exited 0. The canonical base gate passed 4,070 Python tests
+across 57 files, the installed-distribution integration test 1/1, and Desktop
+155/155 across 11 files. It sealed
+`TESTED_BASE_SHA=b4ec323ae86cd82cca2d23ef7df686ce34695ec1`.
+
+Task 11 is complete. Task 12 and Phase 4 remain unstarted, and the shared base
+checkout and literal `main` remain untouched.
