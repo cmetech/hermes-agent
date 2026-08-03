@@ -410,6 +410,22 @@ def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
         assert catalog[code]["evidence"] is False
 
 
+def test_task11_bash_codes_have_bounded_runtime_catalog_entries() -> None:
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+
+    for code in (
+        "bash_substitution_nul",
+        "bash_substitution_limit",
+        "bash_spill_integrity",
+        "bash_reference_context_unsupported",
+    ):
+        assert catalog[code]["area"] == "bash"
+        assert catalog[code]["normalizer_versions"] == [3]
+        assert catalog[code]["runtime_failure"] is True
+        assert catalog[code]["evidence"] is False
+        assert catalog[code]["fields"] == ["nodes[].bash"]
+
+
 def test_task6_resolution_wait_codes_have_real_state_machine_emitters(
     tmp_path, workflow_writer
 ) -> None:

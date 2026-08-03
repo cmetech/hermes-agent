@@ -8,6 +8,11 @@ import time
 import uuid
 from pathlib import Path
 
+from plugins.workflow.bash_rendering import (
+    BashRenderingError,
+    RenderedBashCommand,
+    render_v3_bash,
+)
 from plugins.workflow.executors.base import (
     BoundedProcessOutput,
     NodeExecutionContext,
@@ -15,6 +20,8 @@ from plugins.workflow.executors.base import (
     process_tree_active,
 )
 from plugins.workflow.store import ArtifactRef
+from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from tools.managed_process import ManagedProcessTree
 
 
@@ -42,20 +49,79 @@ class BashExecutor:
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
-        variable_spill = attempt / "variables"
+        variable_spill = attempt / (
+            "variables-v3"
+            if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            else "variables"
+        )
         artifacts_dir = context.run_directory / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
         command = str(context.node.value)
-        if context.variable_context is not None:
-            command = context.variable_context.render_bash(
-                command, spill_directory=variable_spill
+        try:
+            if context.variable_context is not None:
+                renderer = context.variable_context
+                if (
+                    isinstance(renderer, VariableContext)
+                    and context.language_profile
+                    is WorkflowLanguageProfile.ARCHON_2026_07
+                ):
+                    renderer = substitution_renderer(
+                        renderer,
+                        direct_dependencies=context.node.depends_on,
+                        output_resolver=context.output_resolver,
+                    )
+                if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07:
+                    command = renderer.render_bash(
+                        command,
+                        spill_directory=variable_spill,
+                        secure_v3=True,
+                    )
+                else:
+                    command = renderer.render_bash(
+                        command, spill_directory=variable_spill
+                    )
+            if (
+                context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+                and not isinstance(command, RenderedBashCommand)
+            ):
+                command = render_v3_bash(
+                    str(command),
+                    (),
+                    spill_directory=variable_spill,
+                )
+        except BashRenderingError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code=exc.code,
+                error_message=str(exc),
+                metadata={"archon_terminal_failure": True},
             )
+        rendered_command = (
+            command
+            if isinstance(command, RenderedBashCommand)
+            else RenderedBashCommand(str(command))
+        )
+        bash_metadata = (
+            {"bash": rendered_command.evidence()}
+            if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            else {}
+        )
+        owned_descriptors = list(rendered_command.inherited_descriptors)
+
+        def close_owned_descriptors() -> None:
+            while owned_descriptors:
+                descriptor = owned_descriptors.pop()
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
         if os.name == "nt":  # pragma: no cover - Windows CI path
             from tools.environments.local import _find_bash
 
-            argv = [_find_bash(), "-c", command]
+            argv = [_find_bash(), "-c", rendered_command.command]
         else:
-            argv = ["/bin/sh", "-c", command]
+            argv = ["/bin/sh", "-c", rendered_command.command]
         allowed_env = {
             key: value
             for key, value in os.environ.items()
@@ -69,14 +135,15 @@ class BashExecutor:
         })
         policy = context.termination_policy
         started = context.monotonic()
-        if (
-            context.sealed_attempt_timeout
-            and context.deadline_budget.wall_expired(started)
+        if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
+            started
         ):
+            close_owned_descriptors()
             return NodeExecutionResult(
                 "failed",
                 error_code="timeout",
                 error_message="bash node exceeded its timeout",
+                metadata=bash_metadata,
             )
         timed_out = False
         cancelled = False
@@ -84,46 +151,69 @@ class BashExecutor:
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )
-        if (
-            context.sealed_attempt_timeout
-            and context.deadline_budget.wall_expired(context.monotonic())
+        if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
+            context.monotonic()
         ):
             output.close()
+            close_owned_descriptors()
             return NodeExecutionResult(
                 "failed",
                 error_code="timeout",
                 error_message="bash node exceeded its timeout",
+                metadata=bash_metadata,
             )
         executor_nonce = uuid.uuid4().hex
-        if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
-            output.close()
-            raise RuntimeError("executor spawn intent was rejected")
-        if (
-            context.sealed_attempt_timeout
-            and context.deadline_budget.wall_expired(context.monotonic())
+        if context.spawn_intent is not None and not context.spawn_intent(
+            executor_nonce
         ):
             output.close()
+            close_owned_descriptors()
+            raise RuntimeError("executor spawn intent was rejected")
+        if context.sealed_attempt_timeout and context.deadline_budget.wall_expired(
+            context.monotonic()
+        ):
+            output.close()
+            close_owned_descriptors()
             if context.spawn_failed is not None:
                 context.spawn_failed(executor_nonce, "timeout")
             return NodeExecutionResult(
                 "failed",
                 error_code="timeout",
                 error_message="bash node exceeded its timeout",
+                metadata=bash_metadata,
             )
         try:
             tree = ManagedProcessTree.spawn(
                 argv,
                 policy=policy,
+                inherited_descriptors=rendered_command.inherited_descriptors,
                 cwd=context.run_directory,
                 env=allowed_env,
                 stdout=output.stdout,
                 stderr=output.stderr,
             )
+        except ValueError as exc:
+            close_owned_descriptors()
+            output.close()
+            if not rendered_command.inherited_descriptors:
+                if context.spawn_failed is not None:
+                    context.spawn_failed(executor_nonce, type(exc).__name__)
+                raise
+            if context.spawn_failed is not None:
+                context.spawn_failed(executor_nonce, "bash_spill_integrity")
+            return NodeExecutionResult(
+                "failed",
+                error_code="bash_spill_integrity",
+                error_message="Bash spill descriptor failed launch integrity checks",
+                metadata={**bash_metadata, "archon_terminal_failure": True},
+            )
         except BaseException as exc:
+            close_owned_descriptors()
             output.close()
             if context.spawn_failed is not None:
                 context.spawn_failed(executor_nonce, type(exc).__name__)
             raise
+        close_owned_descriptors()
         if context.process_started is not None and not context.process_started(
             tree.identity
         ):
@@ -190,6 +280,7 @@ class BashExecutor:
                 tuple(artifacts),
                 "cleanup_failed",
                 cleanup_error,
+                bash_metadata,
             )
         if cancelled:
             reason = (
@@ -201,10 +292,15 @@ class BashExecutor:
                 "interrupted" if reason == "shutdown" else "cancelled",
                 tuple(artifacts),
                 reason or "cancelled",
+                metadata=bash_metadata,
             )
         if timed_out:
             return NodeExecutionResult(
-                "failed", tuple(artifacts), "timeout", "bash node exceeded its timeout"
+                "failed",
+                tuple(artifacts),
+                "timeout",
+                "bash node exceeded its timeout",
+                bash_metadata,
             )
         if output_limited:
             return NodeExecutionResult(
@@ -212,6 +308,7 @@ class BashExecutor:
                 tuple(artifacts),
                 "output_limit",
                 "bash node exceeded its output limit",
+                bash_metadata,
             )
         if resource_violation is not None:
             return NodeExecutionResult(
@@ -219,7 +316,7 @@ class BashExecutor:
                 tuple(artifacts),
                 "resource_limit",
                 f"bash node exceeded {resource_violation}",
-                {"resource_code": resource_violation},
+                {**bash_metadata, "resource_code": resource_violation},
             )
         if returncode != 0:
             return NodeExecutionResult(
@@ -227,5 +324,8 @@ class BashExecutor:
                 tuple(artifacts),
                 "process_exit",
                 f"bash node exited with status {returncode}",
+                bash_metadata,
             )
-        return NodeExecutionResult("succeeded", tuple(artifacts))
+        return NodeExecutionResult(
+            "succeeded", tuple(artifacts), metadata=bash_metadata
+        )

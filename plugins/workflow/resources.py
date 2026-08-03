@@ -23,6 +23,7 @@ from plugins.workflow.language_schema import (
     WorkflowReferenceSyntaxError,
     iter_output_references,
 )
+from plugins.workflow.bash_rendering import RenderedBashCommand, render_v3_bash
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     ResolvedOutputReference,
@@ -936,7 +937,8 @@ class StrictSubstitutionRenderer:
         *,
         spill_directory: str | Path,
         max_inline_chars: int = 8192,
-    ) -> str:
+        secure_v3: bool = False,
+    ) -> str | RenderedBashCommand:
         """Keep the existing loop Bash materialization with strict references."""
         if max_inline_chars <= 0:
             raise ValueError("max_inline_chars must be positive")
@@ -944,6 +946,12 @@ class StrictSubstitutionRenderer:
             template,
             include_scalar_variables=True,
         )
+        if secure_v3:
+            return render_v3_bash(
+                template,
+                substitutions,
+                spill_directory=spill_directory,
+            )
         root = Path(spill_directory).resolve()
         root.mkdir(parents=True, exist_ok=True)
         rendered: list[str] = []

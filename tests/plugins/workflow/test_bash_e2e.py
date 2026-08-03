@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 
@@ -236,6 +238,19 @@ def test_archon_bash_declared_output_publishes_real_stdout(
 
     result = RunScheduler(store).advance(admitted.run_id)
 
+    assert result["status"] == "succeeded", result["nodes"]["produce"]["attempts"][
+        -1
+    ].get("error_message")
+    bash_evidence = result["nodes"]["produce"]["attempts"][-1]["metadata"]["bash"]
+    template = "printf 'bash output'"
+    assert bash_evidence["template_sha256"] == hashlib.sha256(
+        template.encode()
+    ).hexdigest()
+    assert bash_evidence["template_size_bytes"] == len(template.encode())
+    assert bash_evidence["rendered_sha256"] == bash_evidence["template_sha256"]
+    assert bash_evidence["rendered_size_bytes"] == len(template.encode())
+    assert bash_evidence["spill_count"] == 0
+    assert "bash output" not in json.dumps(bash_evidence, sort_keys=True)
     published = [
         artifact
         for artifact in result["artifacts"]
