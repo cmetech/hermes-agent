@@ -461,25 +461,33 @@ upstream_changes:
   files:
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
+  - hermes_state.py
   - tests/agent/test_plugin_agent.py
+  - tests/test_hermes_state.py
+  - tests/plugins/workflow/test_node_mcp.py
   owned_symbols:
   - PluginAgentSessionMissingError
   - _correlate_persistent_session_result
   - _persistent_session_missing_failure
+  - SessionDB.get_existing_session_conversation
   owned_invariants:
   - exact profile-local shared-session parent preflight
-  - persistent_session_missing worker failure framing and correlation
+  - atomic single-snapshot shared-session existence and conversation load
+  - persistent_session_missing exact-origin worker framing and correlation
   tests:
   - tests/agent/test_plugin_agent.py
+  - tests/test_hermes_state.py
+  - tests/plugins/workflow/test_node_mcp.py
   expected_commit_subject: 'feat(agent): classify missing plugin sessions'
   upstream_candidate: true
   merge_guidance: Preserve confirmed exact profile-local SessionDB absence as
     a typed zero-provider parent outcome, while leaving database open, read,
     corruption, ambiguity, and access failures operationally distinct. Preserve
-    the child-load race as a sanitized failed result with exact zero-provider
-    evidence, no session, history, exception, or provider content, and strict
-    parent correlation. Keep workflow recovery and fresh-session policy outside
-    the generic agent core.
+    the child-load race as one atomic existence-plus-history snapshot taken
+    before MCP/runtime/structured-output side effects, returning a sanitized
+    failed result with exact zero-provider evidence, no session, history,
+    exception, or provider content, and strict parent correlation. Keep
+    workflow recovery and fresh-session policy outside the generic agent core.
   removal_condition: Remove when upstream provides equivalent typed exact-session
     preflight and strictly correlated zero-provider child-race classification
     without choosing caller recovery policy.

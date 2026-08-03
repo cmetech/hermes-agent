@@ -16,7 +16,6 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from agent.plugin_agent import (
-    PluginAgentSessionMissingError,
     _ProviderAttemptGrantExhausted,
     _reserve_shared_provider_attempt,
     _snapshot_shared_provider_attempts,
@@ -1212,10 +1211,12 @@ def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
 
 
 def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
-    if isinstance(exc, PluginAgentSessionMissingError):
-        return _persistent_session_missing_failure(plugin_id)
     failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
-    if not isinstance(failure_kind, str) or not failure_kind:
+    if (
+        not isinstance(failure_kind, str)
+        or not failure_kind
+        or failure_kind == "persistent_session_missing"
+    ):
         failure_kind = type(exc).__name__
     return {
         "final_response": "",
@@ -1277,8 +1278,25 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
     original_node_hooks = None
     original_node_middleware = None
     original_registry_generation = None
+    history = None
 
     try:
+        # Persistent replay eligibility is one atomic SessionDB read and is
+        # established before request-carried service configuration, runtime
+        # resolution, structured-output negotiation, or agent construction.
+        # Returning the privileged missing-state wire shape only at this exact
+        # DB observation prevents later plugin/provider exceptions from
+        # forging worker-origin zero-attempt evidence.
+        from hermes_state import SessionDB
+
+        if request.context_mode == "shared":
+            session_db = SessionDB()
+            history = session_db.get_existing_session_conversation(
+                request.session_id
+            )
+            if history is None:
+                return _persistent_session_missing_failure(plugin_id)
+
         # A node worker sees only the MCP definitions carried by its immutable
         # request. Environment placeholders resolve here, after IPC, and
         # resolved values are never returned to the plugin or parent process.
@@ -1465,8 +1483,6 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             return {"success": False, "stored_as": name, "validated": False}
 
         with registry.scoped_names(allowed_names=allowed, denied_names=denied):
-            from hermes_state import SessionDB
-
             known = set(registry._tools)
             unknown = sorted(
                 (set(request.allowed_tools or ()) | set(request.denied_tools)) - known
@@ -1510,14 +1526,8 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                         failure_kind="structured_output_capability_drift",
                     )
 
-            session_db = SessionDB()
-            history = None
-            if request.context_mode == "shared":
-                if session_db.get_session(request.session_id) is None:
-                    raise PluginAgentSessionMissingError(
-                        "persistent plugin-agent session is missing"
-                    )
-                history = session_db.get_messages_as_conversation(request.session_id)
+            if session_db is None:
+                session_db = SessionDB()
 
             prompt = request.prompt
             if request.skills:
