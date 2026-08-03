@@ -1048,10 +1048,14 @@ def test_worker_classifies_session_deleted_after_parent_preflight_without_provid
             assert deleting_db.delete_session(session_id) is True
         finally:
             deleting_db.close()
+        with pytest.raises(PluginAgentSessionMissingError) as caught:
+            worker._run(payload)
         return {
             "protocol_version": 1,
             "type": "result",
-            "result": worker._run(payload),
+            "result": worker._worker_failure_result(
+                "test-plugin", caught.value
+            ),
         }
 
     monkeypatch.setattr(plugin_agent, "_exchange_worker", exchange)

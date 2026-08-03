@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from agent.plugin_agent import (
+    PluginAgentSessionMissingError,
     _ProviderAttemptGrantExhausted,
     _reserve_shared_provider_attempt,
     _snapshot_shared_provider_attempts,
@@ -1210,6 +1211,28 @@ def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
     }
 
 
+def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, PluginAgentSessionMissingError):
+        return _persistent_session_missing_failure(plugin_id)
+    failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
+    if not isinstance(failure_kind, str) or not failure_kind:
+        failure_kind = type(exc).__name__
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": failure_kind,
+            "error": _sanitize(exc),
+        },
+    }
+
+
 def _prompt_with_structured_output(prompt: str, request) -> str:
     schema = request.schema.canonical_schema_bytes.decode("utf-8")
     block = (
@@ -1491,7 +1514,9 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             history = None
             if request.context_mode == "shared":
                 if session_db.get_session(request.session_id) is None:
-                    return _persistent_session_missing_failure(plugin_id)
+                    raise PluginAgentSessionMissingError(
+                        "persistent plugin-agent session is missing"
+                    )
                 history = session_db.get_messages_as_conversation(request.session_id)
 
             prompt = request.prompt
@@ -1861,23 +1886,7 @@ def main() -> int:
             plugin_id = str(payload.get("plugin_id") or "")
         except Exception:
             pass
-        failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
-        if not isinstance(failure_kind, str) or not failure_kind:
-            failure_kind = type(exc).__name__
-        result = {
-            "final_response": "",
-            "session_id": "",
-            "provider": "",
-            "model": "",
-            "status": "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
-            "pending_interaction": None,
-            "usage": {},
-            "audit": {
-                "plugin_id": plugin_id,
-                "failure_kind": failure_kind,
-                "error": _sanitize(exc),
-            },
-        }
+        result = _worker_failure_result(plugin_id, exc)
     _emit("result", result=result)
     # Keep the direct worker alive until the coordinator acknowledges receipt
     # by closing its stdin lifeline. This closes the tiny result/exit race in

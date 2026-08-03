@@ -79,7 +79,7 @@ class _PluginAgentResourceExceeded(RuntimeError):
     """Internal control flow for bounded worker-tree enforcement."""
 
 
-class PluginAgentSessionMissingError(RuntimeError):
+class PluginAgentSessionMissingError(ValueError):
     """A requested persistent session was confirmed absent before provider use."""
 
     failure_kind = "persistent_session_missing"
