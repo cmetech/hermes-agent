@@ -1063,6 +1063,72 @@ class NodeSessionRecord:
     updated_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class PersistentSessionRecoverySelection:
+    """Private exact authority used to journal a bounded recovery selection."""
+
+    key: NodeSessionKey
+    expected_generation: int
+    missing_session_id: str
+    cache_fingerprint: str
+    run_id: str
+    attempt_id: str
+    source: str = "cross_run_registry"
+
+    def __post_init__(self) -> None:
+        bounded = (
+            self.key.workflow,
+            self.key.node_id,
+            self.key.scope,
+            self.key.provider,
+            self.key.profile,
+            self.run_id,
+            self.attempt_id,
+        )
+        if any(not value or len(value) > 256 for value in bounded):
+            raise ValueError("persistent session recovery identity is invalid")
+        if self.expected_generation < 0:
+            raise ValueError("expected_generation must be non-negative")
+        if not self.missing_session_id or not self.cache_fingerprint:
+            raise ValueError("persistent session recovery values must be non-empty")
+        if self.source != "cross_run_registry":
+            raise ValueError("persistent session recovery source is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRegistryUpdateCandidate:
+    """Private winning identity for one durable generation-CAS obligation."""
+
+    key: NodeSessionKey
+    expected_generation: int
+    new_session_id: str
+    cache_fingerprint: str
+    winning_run_id: str
+    winning_node_id: str
+    winning_attempt_id: str
+    recovery_selected: bool = False
+
+    def __post_init__(self) -> None:
+        bounded = (
+            self.key.workflow,
+            self.key.node_id,
+            self.key.scope,
+            self.key.provider,
+            self.key.profile,
+            self.winning_run_id,
+            self.winning_node_id,
+            self.winning_attempt_id,
+        )
+        if any(not value or len(value) > 256 for value in bounded):
+            raise ValueError("session registry update identity is invalid")
+        if self.key.node_id != self.winning_node_id:
+            raise ValueError("session registry update node identity is inconsistent")
+        if self.expected_generation < 0:
+            raise ValueError("expected_generation must be non-negative")
+        if not self.new_session_id or not self.cache_fingerprint:
+            raise ValueError("session registry update values must be non-empty")
+
+
 class NodeSessionRegistry:
     """Generation-CAS registry; profiles never share its database."""
 
@@ -1125,6 +1191,23 @@ class NodeSessionRegistry:
         session_id: str,
         cache_fingerprint: str,
     ) -> bool:
+        return (
+            self.compare_and_set_or_observe(
+                key,
+                expected_generation,
+                session_id,
+                cache_fingerprint,
+            )
+            == "stale_entry_replaced"
+        )
+
+    def compare_and_set_or_observe(
+        self,
+        key: NodeSessionKey,
+        expected_generation: int,
+        session_id: str,
+        cache_fingerprint: str,
+    ) -> str:
         if expected_generation < 0:
             raise ValueError("expected_generation must be non-negative")
         if not session_id or not cache_fingerprint:
@@ -1134,14 +1217,23 @@ class NodeSessionRegistry:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT generation FROM node_sessions WHERE workflow=? AND "
+                    "SELECT session_id, cache_fingerprint, generation "
+                    "FROM node_sessions WHERE workflow=? AND "
                     "node_id=? AND scope=? AND provider=? AND profile=?",
                     self._values(key),
                 ).fetchone()
                 generation = int(row["generation"]) if row is not None else 0
+                if (
+                    generation == expected_generation + 1
+                    and row is not None
+                    and row["session_id"] == session_id
+                    and row["cache_fingerprint"] == cache_fingerprint
+                ):
+                    connection.rollback()
+                    return "stale_entry_replaced_already_applied"
                 if generation != expected_generation:
                     connection.rollback()
-                    return False
+                    return "newer_entry_retained"
                 if row is None:
                     connection.execute(
                         "INSERT INTO node_sessions VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1167,7 +1259,7 @@ class NodeSessionRegistry:
                         ),
                     )
                 connection.commit()
-                return True
+                return "stale_entry_replaced"
 
     def reset(
         self, workflow: str, *, scope: str | None = None, node_id: str | None = None
@@ -1208,6 +1300,8 @@ __all__ = [
     "NodeSessionKey",
     "NodeSessionRecord",
     "NodeSessionRegistry",
+    "PersistentSessionRecoverySelection",
+    "SessionRegistryUpdateCandidate",
     "TypedMirrorIntegrityError",
     "TypedMirrorObligation",
     "TypedMirrorRecord",

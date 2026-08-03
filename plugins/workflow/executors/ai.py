@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent.plugin_agent import PluginAgentRunRequest
+from agent.plugin_agent import (
+    PluginAgentRunRequest,
+    PluginAgentSessionMissingError,
+)
 from agent.structured_output import (
     MAX_OUTPUT_BYTES,
     StructuredOutputError,
@@ -46,7 +50,12 @@ from plugins.workflow.resources import (
     VariableContext,
     substitution_renderer,
 )
-from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    NodeSessionRegistry,
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
+)
 from plugins.workflow.store import ArtifactRef
 
 
@@ -169,6 +178,20 @@ class AgentNodeExecutor:
     @staticmethod
     def _failure(code: str, message: str) -> NodeExecutionResult:
         return NodeExecutionResult("failed", (), code, message)
+
+    @staticmethod
+    def _recovery_unavailable() -> NodeExecutionResult:
+        return NodeExecutionResult(
+            "failed",
+            error_code="persistent_session_recovery_unavailable",
+            error_message="persistent session could not be verified",
+            metadata={
+                "provider_attempts": 0,
+                "provider_attempts_exact": True,
+                "known_no_effect": True,
+                "archon_terminal_failure": True,
+            },
+        )
 
     @staticmethod
     def _requested_provider(context: NodeExecutionContext) -> str | None:
@@ -771,6 +794,20 @@ class AgentNodeExecutor:
         warnings: list[str] = []
         registry_key = None
         expected_generation = 0
+        session_source: str | None = None
+        stale_session_id: str | None = None
+        stale_cache_fingerprint: str | None = None
+        recovery_selected = False
+
+        def with_recovery_failure(
+            failure: NodeExecutionResult,
+        ) -> NodeExecutionResult:
+            if recovery_selected and failure.status == "failed":
+                return replace(
+                    failure,
+                    session_recovery_outcome="fresh_execution_failed",
+                )
+            return failure
 
         if explicit_context == "shared":
             predecessors = [
@@ -796,6 +833,7 @@ class AgentNodeExecutor:
                     "shared predecessor has no resumable session; use fresh context",
                 )
             context_mode = "shared"
+            session_source = "same_run_predecessor"
         else:
             persist = bool(
                 node.options.get(
@@ -821,12 +859,20 @@ class AgentNodeExecutor:
                     provider,
                     self.profile_name,
                 )
-                record = self.session_registry.get(registry_key)
+                try:
+                    record = self.session_registry.get(registry_key)
+                except (OSError, PermissionError, ValueError, sqlite3.DatabaseError):
+                    if strict_v3:
+                        return self._recovery_unavailable()
+                    raise
                 if record is not None:
                     expected_generation = record.generation
                     if record.cache_fingerprint == fingerprint:
                         context_mode = "shared"
                         session_id = record.session_id
+                        session_source = "cross_run_registry"
+                        stale_session_id = record.session_id
+                        stale_cache_fingerprint = record.cache_fingerprint
                     else:
                         warnings.append(
                             "stale persistent session replaced after cache change"
@@ -1029,41 +1075,131 @@ class AgentNodeExecutor:
                     error_code="cancelled",
                     metadata={"provider_attempts": 0},
                 )
-            result = agent_runner.run(
-                request,
-                is_cancelled=context.is_cancelled,
+
+            def select_fresh_recovery() -> bool:
+                nonlocal recovery_selected
+                callback = context.record_session_recovery_selection
+                if (
+                    callback is None
+                    or registry_key is None
+                    or stale_session_id is None
+                    or stale_cache_fingerprint is None
+                ):
+                    return False
+                selected = callback(
+                    PersistentSessionRecoverySelection(
+                        key=registry_key,
+                        expected_generation=expected_generation,
+                        missing_session_id=stale_session_id,
+                        cache_fingerprint=stale_cache_fingerprint,
+                        run_id=context.run_id,
+                        attempt_id=context.attempt_id,
+                    )
+                )
+                recovery_selected = selected
+                return selected
+
+            try:
+                result = agent_runner.run(
+                    request,
+                    is_cancelled=context.is_cancelled,
+                )
+            except PluginAgentSessionMissingError:
+                if not strict_v3:
+                    raise
+                if session_source == "same_run_predecessor":
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="context_missing_session",
+                        error_message="shared predecessor session is missing",
+                        metadata={
+                            "provider_attempts": 0,
+                            "provider_attempts_exact": True,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                if session_source != "cross_run_registry":
+                    raise
+                if not select_fresh_recovery():
+                    return self._recovery_unavailable()
+                request = replace(request, context_mode="fresh", session_id=None)
+                result = agent_runner.run(
+                    request,
+                    is_cancelled=context.is_cancelled,
+                )
+            except (OSError, PermissionError, ValueError) as exc:
+                if strict_v3 and session_source == "cross_run_registry":
+                    return self._recovery_unavailable()
+                raise
+            missing_after_worker_load = (
+                result.status == "failed"
+                and result.audit.get("failure_kind") == "persistent_session_missing"
+                and result.audit.get("provider_attempts") == 0
+                and result.audit.get("model_calls") == 0
             )
+            if missing_after_worker_load and strict_v3:
+                if session_source == "same_run_predecessor":
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="context_missing_session",
+                        error_message="shared predecessor session is missing",
+                        metadata={
+                            "provider_attempts": 0,
+                            "provider_attempts_exact": True,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                if session_source == "cross_run_registry":
+                    if not select_fresh_recovery():
+                        return self._recovery_unavailable()
+                    request = replace(
+                        request,
+                        context_mode="fresh",
+                        session_id=None,
+                    )
+                    result = agent_runner.run(
+                        request,
+                        is_cancelled=context.is_cancelled,
+                    )
         except PermissionError as exc:
-            return self._failure("authorization", str(exc))
+            return with_recovery_failure(
+                self._failure("authorization", str(exc))
+            )
         except OSError as exc:
-            return NodeExecutionResult(
-                "failed",
-                error_code="network_error",
-                error_message=str(exc),
-                metadata={
-                    "provider_attempts": conservative_provider_retry_count(
-                        None,
-                        granted_attempts=granted_provider_attempts,
-                    ),
-                    **({"provider_attempts_exact": False} if strict_v3 else {}),
-                },
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="network_error",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": conservative_provider_retry_count(
+                            None,
+                            granted_attempts=granted_provider_attempts,
+                        ),
+                        **({"provider_attempts_exact": False} if strict_v3 else {}),
+                    },
+                )
             )
         except ValueError as exc:
-            return self._failure("validation", str(exc))
+            return with_recovery_failure(self._failure("validation", str(exc)))
         except WorkflowOutputReferenceError:
             raise
         except RuntimeError as exc:
-            return NodeExecutionResult(
-                "failed",
-                error_code="agent_execution_failed",
-                error_message=str(exc),
-                metadata={
-                    "provider_attempts": conservative_provider_retry_count(
-                        None,
-                        granted_attempts=granted_provider_attempts,
-                    ),
-                    **({"provider_attempts_exact": False} if strict_v3 else {}),
-                },
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="agent_execution_failed",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": conservative_provider_retry_count(
+                            None,
+                            granted_attempts=granted_provider_attempts,
+                        ),
+                        **({"provider_attempts_exact": False} if strict_v3 else {}),
+                    },
+                )
             )
         finally:
             if materializer is not None:
@@ -1119,11 +1255,13 @@ class AgentNodeExecutor:
                 if strict_v3:
                     metadata["provider_attempts_exact"] = True
             metadata["archon_terminal_failure"] = True
-            return NodeExecutionResult(
-                "failed",
-                error_code=negotiation_failure,
-                error_message=error_message,
-                metadata=metadata,
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code=negotiation_failure,
+                    error_message=error_message,
+                    metadata=metadata,
+                )
             )
         if structured_request is not None and result.structured_output is not None:
             try:
@@ -1140,22 +1278,26 @@ class AgentNodeExecutor:
                 )
             except ValueError as exc:
                 metadata["archon_terminal_failure"] = True
-                return NodeExecutionResult(
-                    "failed",
-                    error_code="structured_output_capability_drift",
-                    error_message=str(exc),
-                    metadata=metadata,
+                return with_recovery_failure(
+                    NodeExecutionResult(
+                        "failed",
+                        error_code="structured_output_capability_drift",
+                        error_message=str(exc),
+                        metadata=metadata,
+                    )
                 )
             metadata["provider_attempts"] = max(0, structured_counts[0] - 1)
             if strict_v3:
                 metadata["provider_attempts_exact"] = True
         elif structured_request is not None and result.status == "completed":
             metadata["archon_terminal_failure"] = True
-            return NodeExecutionResult(
-                "failed",
-                error_code="structured_output_capability_drift",
-                error_message="structured output evidence is missing",
-                metadata=metadata,
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_capability_drift",
+                    error_message="structured output evidence is missing",
+                    metadata=metadata,
+                )
             )
         else:
             provider_attempts = (
@@ -1229,12 +1371,14 @@ class AgentNodeExecutor:
                 )
                 if strict_v3:
                     metadata["provider_attempts_exact"] = False
-            return NodeExecutionResult(
-                "failed",
-                (),
-                error_code,
-                "isolated agent execution failed",
-                metadata,
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    (),
+                    error_code,
+                    "isolated agent execution failed",
+                    metadata,
+                )
             )
 
         output = result.final_response
@@ -1292,10 +1436,26 @@ class AgentNodeExecutor:
                         canonicalization_version=(
                             structured_value.canonicalization_version
                         ),
-                    )
+                )
                 if archon_result.status != "succeeded":
-                    return archon_result
+                    return with_recovery_failure(archon_result)
             if registry_key is not None and self.session_registry is not None:
+                if strict_v3:
+                    if not result.session_id:
+                        return self._recovery_unavailable()
+                    return replace(
+                        archon_result,
+                        session_registry_update=SessionRegistryUpdateCandidate(
+                            key=registry_key,
+                            expected_generation=expected_generation,
+                            new_session_id=result.session_id,
+                            cache_fingerprint=fingerprint,
+                            winning_run_id=context.run_id,
+                            winning_node_id=node.id,
+                            winning_attempt_id=context.attempt_id,
+                            recovery_selected=recovery_selected,
+                        ),
+                    )
                 updated = self.session_registry.compare_and_set(
                     registry_key,
                     expected_generation,

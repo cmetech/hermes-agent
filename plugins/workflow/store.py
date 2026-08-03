@@ -85,6 +85,9 @@ from plugins.workflow.sanitize import (
     workflow_input_names_are_portable,
 )
 from plugins.workflow.sessions import (
+    NodeSessionKey,
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
     TypedMirrorIntegrityError,
     TypedMirrorObligation,
     TypedMirrorStore,
@@ -180,6 +183,108 @@ class ArtifactRef:
     sha256: str
 
 
+def _session_registry_candidate_payload(
+    candidate: SessionRegistryUpdateCandidate,
+    *,
+    retry_count: int = 0,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "key": {
+            "workflow": candidate.key.workflow,
+            "node_id": candidate.key.node_id,
+            "scope": candidate.key.scope,
+            "provider": candidate.key.provider,
+            "profile": candidate.key.profile,
+        },
+        "expected_generation": candidate.expected_generation,
+        "new_session_id": candidate.new_session_id,
+        "cache_fingerprint": candidate.cache_fingerprint,
+        "winning_run_id": candidate.winning_run_id,
+        "winning_node_id": candidate.winning_node_id,
+        "winning_attempt_id": candidate.winning_attempt_id,
+        "recovery_selected": candidate.recovery_selected,
+        "retry_count": retry_count,
+    }
+
+
+def _session_registry_candidate_from_payload(
+    value: object,
+) -> tuple[SessionRegistryUpdateCandidate, int]:
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        raise JournalRecoveryError("session registry obligation is malformed")
+    key = value.get("key")
+    if not isinstance(key, Mapping) or set(key) != {
+        "workflow",
+        "node_id",
+        "scope",
+        "provider",
+        "profile",
+    }:
+        raise JournalRecoveryError("session registry obligation key is malformed")
+    retry_count = value.get("retry_count")
+    if (
+        isinstance(retry_count, bool)
+        or not isinstance(retry_count, int)
+        or not 0 <= retry_count <= 5
+    ):
+        raise JournalRecoveryError("session registry obligation retry is malformed")
+    bounded_text = (
+        key.get("workflow"),
+        key.get("node_id"),
+        key.get("scope"),
+        key.get("provider"),
+        key.get("profile"),
+        value.get("new_session_id"),
+        value.get("cache_fingerprint"),
+        value.get("winning_run_id"),
+        value.get("winning_node_id"),
+        value.get("winning_attempt_id"),
+    )
+    if any(
+        not isinstance(item, str) or not item or len(item) > 16_384
+        for item in bounded_text
+    ):
+        raise JournalRecoveryError(
+            "session registry obligation identity is malformed"
+        )
+    try:
+        candidate = SessionRegistryUpdateCandidate(
+            key=NodeSessionKey(
+                workflow=key["workflow"],
+                node_id=key["node_id"],
+                scope=key["scope"],
+                provider=key["provider"],
+                profile=key["profile"],
+            ),
+            expected_generation=value["expected_generation"],
+            new_session_id=value["new_session_id"],
+            cache_fingerprint=value["cache_fingerprint"],
+            winning_run_id=value["winning_run_id"],
+            winning_node_id=value["winning_node_id"],
+            winning_attempt_id=value["winning_attempt_id"],
+            recovery_selected=value.get("recovery_selected") is True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalRecoveryError(
+            "session registry obligation identity is malformed"
+        ) from exc
+    if set(value) != {
+        "schema_version",
+        "key",
+        "expected_generation",
+        "new_session_id",
+        "cache_fingerprint",
+        "winning_run_id",
+        "winning_node_id",
+        "winning_attempt_id",
+        "recovery_selected",
+        "retry_count",
+    }:
+        raise JournalRecoveryError("session registry obligation fields are malformed")
+    return candidate, retry_count
+
+
 @dataclass(frozen=True, slots=True)
 class TypedPublicationCandidate:
     attempt_relative_path: str
@@ -265,7 +370,14 @@ class ForegroundExecutionLease:
     lease_seconds: float | None = None
 
 
-_NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
+_NONTERMINAL = {
+    "queued",
+    "running",
+    "waiting_retry",
+    "recovery_pending",
+    "paused",
+    "interrupted",
+}
 _EXECUTING = {"running"}
 _RUN_SCOPED_REPAIR_REASONS = frozenset(
     {
@@ -310,6 +422,7 @@ _PROJECTION_STATUSES = {
     "queued",
     "running",
     "waiting_retry",
+    "recovery_pending",
     "paused",
     "interrupted",
     "succeeded",
@@ -1626,6 +1739,17 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS attempt_journal_reserves_run
                     ON attempt_journal_reserves(run_id);
+                    CREATE TABLE IF NOT EXISTS obligation_journal_reserves (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        terminal_reserve_bytes INTEGER NOT NULL,
+                        projection_limit_bytes INTEGER NOT NULL,
+                        consumed_bytes INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS obligation_journal_reserves_run
+                    ON obligation_journal_reserves(run_id);
                     CREATE TABLE IF NOT EXISTS store_repair_state (
                         run_id TEXT NOT NULL,
                         attempt_id TEXT NOT NULL,
@@ -3729,11 +3853,13 @@ class RunStore:
         """Converge the capacity ledger with durable run projections."""
         active: dict[str, tuple[str, str, str, str]] = {}
         reserves: dict[str, TerminalJournalReserve] = {}
+        obligation_reserves: dict[str, tuple[str, TerminalJournalReserve]] = {}
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT run_id, run_directory FROM runs "
                 "WHERE admission_state='published' AND status IN "
-                "('running','waiting_retry','paused','interrupted')"
+                "('running','waiting_retry','paused','interrupted',"
+                "'recovery_pending')"
             ).fetchall()
         for row in rows:
             try:
@@ -3744,6 +3870,37 @@ class RunStore:
                 )
             except (OSError, json.JSONDecodeError):
                 continue
+            pending = projection.get("pending_session_registry_update")
+            if pending is not None:
+                try:
+                    candidate, _retry_count = (
+                        _session_registry_candidate_from_payload(pending)
+                    )
+                except JournalRecoveryError:
+                    candidate = None
+                if (
+                    candidate is not None
+                    and candidate.winning_run_id == row["run_id"]
+                ):
+                    projection_bytes = len(
+                        json.dumps(
+                            projection,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    )
+                    reserve = TerminalJournalReserve.for_projection(
+                        projection_bytes
+                    )
+                    obligation_reserves[candidate.winning_attempt_id] = (
+                        row["run_id"],
+                        TerminalJournalReserve(
+                            projection_limit_bytes=reserve.projection_limit_bytes,
+                            terminal_reserve_bytes=(
+                                2 * reserve.terminal_reserve_bytes
+                            ),
+                        ),
+                    )
             for node_id, node in projection.get("nodes", {}).items():
                 claim = node.get("claim") if isinstance(node, dict) else None
                 if not isinstance(claim, dict) and isinstance(node, dict):
@@ -3811,6 +3968,30 @@ class RunStore:
                     (
                         attempt_id,
                         values[0],
+                        reserve.terminal_reserve_bytes,
+                        reserve.projection_limit_bytes,
+                        _utc_now(),
+                    ),
+                )
+            retained_obligations = set(obligation_reserves)
+            if retained_obligations:
+                placeholders = ",".join("?" for _ in retained_obligations)
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves "
+                    f"WHERE attempt_id NOT IN ({placeholders})",
+                    tuple(sorted(retained_obligations)),
+                )
+            else:
+                connection.execute("DELETE FROM obligation_journal_reserves")
+            for attempt_id, (run_id, reserve) in obligation_reserves.items():
+                connection.execute(
+                    "INSERT OR IGNORE INTO obligation_journal_reserves ("
+                    "attempt_id, run_id, terminal_reserve_bytes, "
+                    "projection_limit_bytes, consumed_bytes, created_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?)",
+                    (
+                        attempt_id,
+                        run_id,
                         reserve.terminal_reserve_bytes,
                         reserve.projection_limit_bytes,
                         _utc_now(),
@@ -4274,9 +4455,12 @@ class RunStore:
         ) as reserve_connection:
             rows = reserve_connection.execute(
                 "SELECT attempt_id, terminal_reserve_bytes, "
-                "projection_limit_bytes, consumed_bytes "
-                "FROM attempt_journal_reserves WHERE run_id=?",
-                (run_id,),
+                "projection_limit_bytes, consumed_bytes, 'attempt' AS kind "
+                "FROM attempt_journal_reserves WHERE run_id=? "
+                "UNION ALL SELECT attempt_id, terminal_reserve_bytes, "
+                "projection_limit_bytes, consumed_bytes, 'obligation' AS kind "
+                "FROM obligation_journal_reserves WHERE run_id=?",
+                (run_id, run_id),
             ).fetchall()
         if not rows:
             if journal_bytes + frame_bytes > self.max_journal_bytes:
@@ -4300,7 +4484,10 @@ class RunStore:
                         "terminal_journal_reserve exhausted before durable completion"
                     )
                 remaining -= frame_bytes
-            elif projection_bytes > int(row["projection_limit_bytes"]):
+            elif (
+                row["kind"] == "attempt"
+                and projection_bytes > int(row["projection_limit_bytes"])
+            ):
                 # A concurrently live sibling reserved against the projection as
                 # it stood when that sibling claimed. Ordinary progress -- every
                 # other sibling in the same fan-out completing and appending its
@@ -4370,6 +4557,13 @@ class RunStore:
                 "AND consumed_bytes+?<=terminal_reserve_bytes",
                 (frame_bytes, attempt_id, frame_bytes),
             ).rowcount
+            if updated != 1:
+                updated = reserve_connection.execute(
+                    "UPDATE obligation_journal_reserves "
+                    "SET consumed_bytes=consumed_bytes+? WHERE attempt_id=? "
+                    "AND consumed_bytes+?<=terminal_reserve_bytes",
+                    (frame_bytes, attempt_id, frame_bytes),
+                ).rowcount
         if updated != 1:
             raise StorageQuotaError(
                 "terminal_journal_reserve consumption could not be indexed"
@@ -5564,6 +5758,63 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
+        pending = value.get("pending_session_registry_update")
+        next_registry_update_at = value.get("next_registry_update_at")
+        if pending is None:
+            return next_registry_update_at is None
+        try:
+            candidate, retry_count = _session_registry_candidate_from_payload(
+                pending
+            )
+        except JournalRecoveryError:
+            return False
+        winning_node = nodes.get(candidate.winning_node_id)
+        if (
+            candidate.winning_run_id != run_id
+            or candidate.key.workflow != value.get("workflow")
+            or candidate.key.node_id != candidate.winning_node_id
+            or candidate.key.scope
+            != str(value.get("operator_scope_digest") or "local")
+            or not isinstance(winning_node, dict)
+            or winning_node.get("state") != "succeeded"
+            or value.get("status")
+            in {"succeeded", "failed", "cancelled", "abandoned"}
+        ):
+            return False
+        winning_attempts = [
+            attempt
+            for attempt in winning_node.get("attempts", ())
+            if isinstance(attempt, Mapping)
+            and attempt.get("attempt_id") == candidate.winning_attempt_id
+            and attempt.get("state") == "succeeded"
+        ]
+        if len(winning_attempts) != 1:
+            return False
+        if retry_count == 0:
+            if next_registry_update_at is not None:
+                return False
+        else:
+            if not isinstance(next_registry_update_at, str):
+                return False
+            try:
+                wake = datetime.fromisoformat(next_registry_update_at)
+            except ValueError:
+                return False
+            if wake.tzinfo is None or wake.utcoffset() is None:
+                return False
+        if value.get("status") == "recovery_pending" and retry_count != 5:
+            return False
+        if candidate.recovery_selected:
+            recoveries = winning_node.get("session_recoveries")
+            matches = [
+                recovery
+                for recovery in recoveries
+                if isinstance(recoveries, list)
+                and isinstance(recovery, Mapping)
+                and recovery.get("attempt_id") == candidate.winning_attempt_id
+            ] if isinstance(recoveries, list) else []
+            if len(matches) != 1:
+                return False
         return True
 
     def _rebuild_projection(
@@ -6489,11 +6740,27 @@ class RunStore:
                     projection,
                     indexed=row["scheduled_at"],
                 )
-        page = rows[:limit]
+        raw_page = rows[:limit]
+        page = []
+        for row in raw_page:
+            if row["status"] == "running":
+                projection = self._load_run_metadata(str(row["run_id"]))
+                recovery_due_at = projection.get("next_registry_update_at")
+                if isinstance(recovery_due_at, str):
+                    try:
+                        if datetime.fromisoformat(recovery_due_at) > now:
+                            continue
+                    except ValueError:
+                        # Full projection validation owns malformed durable data.
+                        self.load_run(str(row["run_id"]))
+                        raise JournalRecoveryError(
+                            "session registry obligation wake is invalid"
+                        )
+            page.append(row)
         exhausted = len(rows) <= limit
         cursor = (
-            (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
-            if page
+            (str(raw_page[-1]["created_at"]), str(raw_page[-1]["run_id"]))
+            if raw_page
             else after
         )
         return tuple(dict(row) for row in page), cursor, exhausted
@@ -6905,7 +7172,7 @@ class RunStore:
         ]
         values: list[object] = [observed_at.isoformat()]
         attention_states = [
-            "runs.status IN ('failed','paused')",
+            "runs.status IN ('failed','paused','recovery_pending')",
             "(runs.status='running' AND ("
             "(runs.execution_mode='foreground' AND "
             "(runs.foreground_lease_expires_at IS NULL OR "
@@ -7641,6 +7908,8 @@ class RunStore:
             if _metadata_only
             else self.load_run(run_id, operator_scope=operator_scope)
         )
+        run = dict(run)
+        run.pop("pending_session_registry_update", None)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
@@ -7746,8 +8015,10 @@ class RunStore:
         blocking_reason = None
         if status in {"succeeded", "failed", "cancelled", "abandoned"}:
             health = "terminal"
-        elif status == "paused":
+        elif status in {"paused", "recovery_pending"}:
             health = "user_wait"
+            if status == "recovery_pending":
+                blocking_reason = "persistent_session_registry_update_pending"
         elif status == "interrupted":
             health = "interrupted"
         elif status == "queued":
@@ -7960,6 +8231,7 @@ class RunStore:
         now: datetime | None = None,
         monotonic_now: float | None = None,
         journal_reserve_bytes: int = 0,
+        terminal_journal_reserve_bytes: int = 0,
         executor_id: str = "unknown",
         owner_epoch: str | None = None,
         effect_classification: str = "replay_safe",
@@ -7992,6 +8264,14 @@ class RunStore:
             or max_run_workers <= 0
         ):
             raise ValueError("max_run_workers must be a positive integer")
+        if (
+            isinstance(terminal_journal_reserve_bytes, bool)
+            or not isinstance(terminal_journal_reserve_bytes, int)
+            or terminal_journal_reserve_bytes < 0
+        ):
+            raise ValueError(
+                "terminal_journal_reserve_bytes must be a non-negative integer"
+            )
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -8162,7 +8442,8 @@ class RunStore:
                         (
                             attempt_id,
                             run_id,
-                            reserve.terminal_reserve_bytes,
+                            reserve.terminal_reserve_bytes
+                            + terminal_journal_reserve_bytes,
                             reserve.projection_limit_bytes,
                             _utc_now(),
                         ),
@@ -8205,6 +8486,50 @@ class RunStore:
             connection.execute(
                 "DELETE FROM worker_claims WHERE attempt_id=?", (attempt_id,)
             )
+
+    def _transfer_obligation_journal_reserve(
+        self,
+        attempt_id: str,
+        run_id: str,
+        *,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Retain pre-provider capacity after the worker claim is released."""
+        row = connection.execute(
+            "SELECT terminal_reserve_bytes, projection_limit_bytes, "
+            "consumed_bytes FROM attempt_journal_reserves WHERE attempt_id=? "
+            "AND run_id=?",
+            (attempt_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise StorageQuotaError(
+                "persistent session obligation journal reserve is missing"
+            )
+        remaining = int(row["terminal_reserve_bytes"]) - int(
+            row["consumed_bytes"]
+        )
+        if remaining <= 0:
+            raise StorageQuotaError(
+                "persistent session obligation journal reserve is exhausted"
+            )
+        connection.execute(
+            "INSERT INTO obligation_journal_reserves ("
+            "attempt_id, run_id, terminal_reserve_bytes, "
+            "projection_limit_bytes, consumed_bytes, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?) "
+            "ON CONFLICT(attempt_id) DO UPDATE SET "
+            "run_id=excluded.run_id, "
+            "terminal_reserve_bytes=excluded.terminal_reserve_bytes, "
+            "projection_limit_bytes=excluded.projection_limit_bytes, "
+            "consumed_bytes=0",
+            (
+                attempt_id,
+                run_id,
+                remaining,
+                int(row["projection_limit_bytes"]),
+                _utc_now(),
+            ),
+        )
 
     def release_claim_before_execution(self, claim: NodeClaim) -> bool:
         """Durably make a fenced claim retryable only when no executor ran."""
@@ -8281,6 +8606,155 @@ class RunStore:
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
             )
+
+    def record_persistent_session_recovery_selection(
+        self,
+        claim: NodeClaim,
+        selection: PersistentSessionRecoverySelection,
+        *,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Journal a bounded active-claim recovery choice before provider use."""
+        if (
+            selection.run_id != claim.run_id
+            or selection.attempt_id != claim.attempt_id
+            or selection.key.node_id != claim.node_id
+        ):
+            raise ValueError("persistent session recovery selection is misbound")
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if (
+                    projection.get("status") != "running"
+                    or active.get("attempt_id") != claim.attempt_id
+                    or selection.key.workflow != projection.get("workflow")
+                    or selection.key.scope
+                    != str(projection.get("operator_scope_digest") or "local")
+                ):
+                    return False
+                recoveries = node.setdefault("session_recoveries", [])
+                if not isinstance(recoveries, list) or len(recoveries) > 6:
+                    raise JournalRecoveryError(
+                        "persistent session recovery projection is malformed"
+                    )
+                existing = next(
+                    (
+                        item
+                        for item in recoveries
+                        if isinstance(item, Mapping)
+                        and item.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return existing.get("outcome") == "fresh_start_selected"
+                if len(recoveries) == 6:
+                    raise StorageQuotaError(
+                        "persistent session recovery evidence is full"
+                    )
+                public_selection = {
+                    "attempt_id": claim.attempt_id,
+                    "registry_generation": selection.expected_generation,
+                    "missing_session_sha256": _sha256(
+                        selection.missing_session_id.encode("utf-8")
+                    ),
+                    "cache_fingerprint_sha256": _sha256(
+                        selection.cache_fingerprint.encode("utf-8")
+                    ),
+                    "source": selection.source,
+                    "provider": selection.key.provider,
+                    "runtime_profile": selection.key.profile,
+                    "provider_attempts_before_recovery": 0,
+                    "outcome": "fresh_start_selected",
+                }
+                recoveries.append(public_selection)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "persistent_session_missing_fresh_start",
+                    public_selection,
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_persistent_session_recovery_outcome(
+        self,
+        claim: NodeClaim,
+        *,
+        outcome: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Journal a bounded recovery result while the winning claim is active."""
+        if outcome != "fresh_execution_failed":
+            raise ValueError("invalid active persistent session recovery outcome")
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if (
+                    projection.get("status") != "running"
+                    or active.get("attempt_id") != claim.attempt_id
+                ):
+                    return False
+                recoveries = node.get("session_recoveries")
+                if not isinstance(recoveries, list):
+                    raise JournalRecoveryError(
+                        "persistent session recovery evidence is missing"
+                    )
+                matches = [
+                    item
+                    for item in recoveries
+                    if isinstance(item, dict)
+                    and item.get("attempt_id") == claim.attempt_id
+                ]
+                if len(matches) != 1:
+                    raise JournalRecoveryError(
+                        "persistent session recovery evidence is uncorroborated"
+                    )
+                if matches[0].get("outcome") == outcome:
+                    return True
+                if matches[0].get("outcome") != "fresh_start_selected":
+                    raise JournalRecoveryError(
+                        "persistent session recovery outcome conflicts"
+                    )
+                matches[0]["outcome"] = outcome
+                self._append_locked(
+                    directory,
+                    projection,
+                    "persistent_session_recovery_outcome",
+                    {"outcome": outcome},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     @staticmethod
     def _executor_nonce(value: str) -> str:
@@ -9575,6 +10049,7 @@ class RunStore:
         error_code: str | None = None,
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
+        session_registry_update: SessionRegistryUpdateCandidate | None = None,
         now: LeaseClockSample | None = None,
     ) -> None:
         if status not in {
@@ -9627,8 +10102,29 @@ class RunStore:
             if (
                 projection["status"] in {"cancelled", "abandoned"}
                 or projection.get("desired_status") == "cancelled"
-            ) and status != "cancelled":
+            ) and status != "cancelled" and not (
+                status == "succeeded" and session_registry_update is not None
+            ):
                 raise RuntimeError("stale completion for terminal run")
+            if session_registry_update is not None:
+                if (
+                    status != "succeeded"
+                    or session_registry_update.winning_run_id != claim.run_id
+                    or session_registry_update.winning_node_id != claim.node_id
+                    or session_registry_update.winning_attempt_id
+                    != claim.attempt_id
+                    or session_registry_update.key.workflow
+                    != projection.get("workflow")
+                    or session_registry_update.key.scope
+                    != str(projection.get("operator_scope_digest") or "local")
+                ):
+                    raise ValueError(
+                        "session registry update does not match winning completion"
+                    )
+                if projection.get("pending_session_registry_update") is not None:
+                    raise JournalRecoveryError(
+                        "run already has a pending session registry update"
+                    )
             if status == "paused":
                 with (
                     nullcontext(fence_connection)
@@ -9757,6 +10253,10 @@ class RunStore:
                     projection["artifacts"][existing_indices[0]] = entry
                 elif not existing_indices:
                     projection["artifacts"].append(entry)
+            if session_registry_update is not None:
+                projection["pending_session_registry_update"] = (
+                    _session_registry_candidate_payload(session_registry_update)
+                )
             self._append_locked(
                 directory,
                 projection,
@@ -9800,6 +10300,8 @@ class RunStore:
                 "interrupted",
             }:
                 terminal = "failed" if "failed" in states else "succeeded"
+            if projection.get("pending_session_registry_update") is not None:
+                terminal = None
             if terminal:
                 projection["status"] = terminal
                 self._append_locked(
@@ -9873,13 +10375,245 @@ class RunStore:
                         (directory / "events.jsonl").read_bytes()
                     ),
                 )
+                if session_registry_update is not None:
+                    self._transfer_obligation_journal_reserve(
+                        claim.attempt_id,
+                        claim.run_id,
+                        connection=final_connection,
+                    )
                 self._release_worker_claim(
                     claim.attempt_id, connection=final_connection
                 )
                 if fence_connection is None:
                     final_connection.commit()
-            if terminal or projection["status"] == "waiting_retry":
+            if session_registry_update is not None:
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as pending_connection:
+                    self._record_coordinator_wake(
+                        pending_connection,
+                        run_id=claim.run_id,
+                        reason_code="pending_session_registry_update",
+                    )
+            if (
+                terminal
+                or projection["status"] == "waiting_retry"
+                or session_registry_update is not None
+            ):
                 self._notify_coordinator()
+
+    @staticmethod
+    def _set_session_recovery_outcome(
+        projection: dict[str, object],
+        candidate: SessionRegistryUpdateCandidate,
+        outcome: str,
+    ) -> None:
+        if not candidate.recovery_selected:
+            return
+        node = projection.get("nodes", {}).get(candidate.winning_node_id)
+        recoveries = node.get("session_recoveries") if isinstance(node, dict) else None
+        if not isinstance(recoveries, list):
+            raise JournalRecoveryError(
+                "persistent session recovery evidence is missing"
+            )
+        matches = [
+            item
+            for item in recoveries
+            if isinstance(item, dict)
+            and item.get("attempt_id") == candidate.winning_attempt_id
+        ]
+        if len(matches) != 1:
+            raise JournalRecoveryError(
+                "persistent session recovery evidence is uncorroborated"
+            )
+        matches[0]["outcome"] = outcome
+
+    def pending_session_registry_update(
+        self,
+        run_id: str,
+    ) -> tuple[SessionRegistryUpdateCandidate, int, str | None] | None:
+        projection = self.load_run(run_id)
+        value = projection.get("pending_session_registry_update")
+        if value is None:
+            return None
+        candidate, retry_count = _session_registry_candidate_from_payload(value)
+        if candidate.winning_run_id != run_id:
+            raise JournalRecoveryError("session registry obligation run is invalid")
+        next_at = projection.get("next_registry_update_at")
+        if next_at is not None and not isinstance(next_at, str):
+            raise JournalRecoveryError("session registry obligation wake is invalid")
+        return candidate, retry_count, next_at
+
+    def defer_session_registry_update(
+        self,
+        run_id: str,
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        now: datetime,
+    ) -> int:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            current, retry_count = _session_registry_candidate_from_payload(
+                projection.get("pending_session_registry_update")
+            )
+            if current != candidate or retry_count >= 5:
+                raise RuntimeError("stale session registry obligation deferral")
+            attempt = retry_count + 1
+            delay_seconds = (1, 2, 4, 8, 16)[retry_count]
+            projection["pending_session_registry_update"] = (
+                _session_registry_candidate_payload(
+                    candidate,
+                    retry_count=attempt,
+                )
+            )
+            projection["next_registry_update_at"] = (
+                now.astimezone(timezone.utc) + timedelta(seconds=delay_seconds)
+            ).isoformat()
+            self._set_session_recovery_outcome(
+                projection,
+                candidate,
+                "registry_update_deferred",
+            )
+            if attempt == 5:
+                projection["status"] = "recovery_pending"
+                projection["last_error"] = {
+                    "code": "persistent_session_registry_update_pending",
+                    "message": "persistent session registry update remains pending",
+                    "node_id": candidate.winning_node_id,
+                }
+            self._append_locked(
+                directory,
+                projection,
+                "persistent_session_registry_update_deferred",
+                {
+                    "attempt_id": candidate.winning_attempt_id,
+                    "registry_generation": candidate.expected_generation,
+                    "outcome": "registry_update_deferred",
+                    "registry_update_attempt": attempt,
+                    "next_registry_update_at": projection[
+                        "next_registry_update_at"
+                    ],
+                },
+                node_id=candidate.winning_node_id,
+                attempt_id=candidate.winning_attempt_id,
+                terminal_reserve_attempt_id=candidate.winning_attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+            self._notify_coordinator()
+            return attempt
+
+    def resolve_session_registry_update(
+        self,
+        run_id: str,
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        outcome: str,
+    ) -> str:
+        if outcome not in {
+            "stale_entry_replaced",
+            "stale_entry_replaced_already_applied",
+            "newer_entry_retained",
+        }:
+            raise ValueError("invalid session registry update outcome")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            current, _retry_count = _session_registry_candidate_from_payload(
+                projection.get("pending_session_registry_update")
+            )
+            if current != candidate:
+                raise RuntimeError("stale session registry update outcome")
+            self._set_session_recovery_outcome(projection, candidate, outcome)
+            projection.pop("pending_session_registry_update", None)
+            projection.pop("next_registry_update_at", None)
+            if (
+                isinstance(projection.get("last_error"), Mapping)
+                and projection["last_error"].get("code")
+                == "persistent_session_registry_update_pending"
+            ):
+                projection["last_error"] = None
+            if outcome == "newer_entry_retained":
+                warning = "newer persistent session retained"
+                if warning not in projection["warnings"]:
+                    projection["warnings"].append(warning)
+            terminal = None
+            if projection.get("desired_status") == "cancelled":
+                projection["desired_status"] = None
+                for node in projection["nodes"].values():
+                    if node["state"] not in {"succeeded", "failed", "skipped"}:
+                        node.pop("claim", None)
+                        node["state"] = "cancelled"
+                terminal = "cancelled"
+            else:
+                states = {
+                    node["state"] for node in projection["nodes"].values()
+                }
+                if states and states <= {
+                    "succeeded",
+                    "failed",
+                    "skipped",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    terminal = "failed" if "failed" in states else "succeeded"
+            projection["status"] = terminal or "running"
+            event_type = (
+                f"run_{terminal}"
+                if terminal is not None
+                else "persistent_session_registry_update_resolved"
+            )
+            self._append_locked(
+                directory,
+                projection,
+                event_type,
+                {
+                    "attempt_id": candidate.winning_attempt_id,
+                    "registry_generation": candidate.expected_generation,
+                    "outcome": outcome,
+                },
+                node_id=candidate.winning_node_id,
+                attempt_id=candidate.winning_attempt_id,
+                terminal_reserve_attempt_id=candidate.winning_attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (candidate.winning_attempt_id,),
+                )
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code=event_type,
+                )
+            self._notify_coordinator()
+            return outcome
 
     def record_loop_iteration(
         self,
@@ -10585,6 +11319,8 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] != "running":
+                return False
+            if projection.get("pending_session_registry_update") is not None:
                 return False
             states = {node["state"] for node in projection["nodes"].values()}
             if states - {
@@ -11804,6 +12540,52 @@ class RunStore:
             if failed_cleanup:
                 return {**projection, "cancellation_outcome": "cleanup_failed"}
 
+            if projection.get("pending_session_registry_update") is not None:
+                if projection.get("status") == "recovery_pending":
+                    candidate, _retry_count = (
+                        _session_registry_candidate_from_payload(
+                            projection["pending_session_registry_update"]
+                        )
+                    )
+                    projection["pending_session_registry_update"] = (
+                        _session_registry_candidate_payload(
+                            candidate,
+                            retry_count=0,
+                        )
+                    )
+                    projection.pop("next_registry_update_at", None)
+                    projection["status"] = "running"
+                    projection["last_error"] = None
+                self._append_locked(
+                    directory,
+                    projection,
+                    "cancel_registry_update_pending",
+                    {"reason_code": "pending_session_registry_update"},
+                )
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status=?, desired_status='cancelled', "
+                        "updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="cancel_registry_update_pending",
+                    )
+                self._notify_coordinator()
+                return {
+                    **projection,
+                    "cancellation_outcome": "registry_update_pending",
+                }
+
             projection["status"] = "cancelled"
             projection["desired_status"] = None
             for node in projection["nodes"].values():
@@ -11853,6 +12635,26 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise WorkflowConflict("stale resume decision")
+            if projection["status"] == "recovery_pending":
+                candidate, _retry_count = _session_registry_candidate_from_payload(
+                    projection.get("pending_session_registry_update")
+                )
+                projection["pending_session_registry_update"] = (
+                    _session_registry_candidate_payload(candidate, retry_count=0)
+                )
+                projection.pop("next_registry_update_at", None)
+                projection["last_error"] = None
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_resumed",
+                    {"reason_code": "persistent_session_registry_update_retry"},
+                )
+                return self._request_runnable_locked(
+                    directory,
+                    projection,
+                    reason="persistent_session_registry_update_retry",
+                )
             if projection["status"] not in {"failed", "interrupted"}:
                 if (
                     projection.get("status") == "running"

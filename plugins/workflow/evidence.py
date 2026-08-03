@@ -328,12 +328,24 @@ class EvidenceReader:
                 if isinstance(artifact, Mapping)
             ]
         if kind == "recovery":
-            return [
+            process_recovery = [
                 {"node_id": node_id, "recovery": node["recovery"]}
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance(node.get("recovery"), Mapping)
             ]
+            persistent_session_recovery = [
+                {
+                    "node_id": node_id,
+                    "recovery_kind": "persistent_session",
+                    **recovery,
+                }
+                for node_id, node in node_items
+                if isinstance(node, Mapping)
+                for recovery in node.get("session_recoveries", ())
+                if isinstance(recovery, Mapping)
+            ]
+            return [*process_recovery, *persistent_session_recovery]
         if kind == "coordinator":
             return [
                 {

@@ -20,6 +20,10 @@ from plugins.workflow.output_resolution import (
     PrimaryOutputCandidate,
     ResolvedOutputReference,
 )
+from plugins.workflow.sessions import (
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
+)
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
     ProcessIdentity,
@@ -83,6 +87,9 @@ class NodeExecutionContext:
         Callable[[str, tuple[str, ...]], ResolvedOutputReference] | None
     ) = None
     sealed_attempt_timeout: bool = False
+    record_session_recovery_selection: (
+        Callable[[PersistentSessionRecoverySelection], bool] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,8 @@ class NodeExecutionResult:
     error_message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     primary_output: PrimaryOutputCandidate | None = None
+    session_registry_update: SessionRegistryUpdateCandidate | None = None
+    session_recovery_outcome: str | None = None
 
 
 def sealed_provider_request_for_launch(

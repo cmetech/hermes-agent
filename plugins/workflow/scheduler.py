@@ -57,6 +57,7 @@ from plugins.workflow.models import (
     RetryLedgerGrant,
     RetryPolicy,
     RunExecutionLimits,
+    TerminalJournalReserve,
     WorkflowNode,
     WorkflowLanguageProfile,
     WorkflowPackage,
@@ -562,6 +563,9 @@ class RunScheduler:
             else None
         )
         self.store = store
+        self.session_registry = session_registry or NodeSessionRegistry(
+            store.hermes_home
+        )
         self.owner_id = owner_id or f"scheduler-{os.getpid()}-{uuid.uuid4().hex}"
         if (execution_owner_id is None) != (execution_owner_epoch is None):
             raise ValueError(
@@ -637,10 +641,9 @@ class RunScheduler:
             ),
         }
         if agent_runner is not None:
-            registry = session_registry or NodeSessionRegistry(store.hermes_home)
             ai_executor = AgentNodeExecutor(
                 agent_runner,
-                session_registry=registry,
+                session_registry=self.session_registry,
                 profile_name=profile_name,
                 deterministic_runner=deterministic_runner,
             )
@@ -652,6 +655,39 @@ class RunScheduler:
                     deterministic_runner=deterministic_runner,
                 ),
             })
+
+    def _reconcile_session_registry_update(self, run_id: str) -> bool:
+        pending = self.store.pending_session_registry_update(run_id)
+        if pending is None:
+            return False
+        candidate, retry_count, next_at = pending
+        projection = self.store.load_run(run_id)
+        if projection.get("status") == "recovery_pending":
+            return False
+        now = self._utcnow()
+        if next_at is not None and datetime.fromisoformat(next_at) > now:
+            return False
+        try:
+            outcome = self.session_registry.compare_and_set_or_observe(
+                candidate.key,
+                expected_generation=candidate.expected_generation,
+                session_id=candidate.new_session_id,
+                cache_fingerprint=candidate.cache_fingerprint,
+            )
+        except Exception:
+            if retry_count < 5:
+                self.store.defer_session_registry_update(
+                    run_id,
+                    candidate,
+                    now=now,
+                )
+            return False
+        self.store.resolve_session_registry_update(
+            run_id,
+            candidate,
+            outcome=outcome,
+        )
+        return True
 
     def _renew_execution_owner(self, run_id: str) -> bool:
         if self.execution_fence is not None:
@@ -2911,6 +2947,38 @@ class RunScheduler:
         )
         return heartbeat_count * 4096
 
+    @staticmethod
+    def _persistent_session_recovery_reserve(
+        node: WorkflowNode,
+        package: WorkflowPackage,
+        projection: Mapping[str, object],
+    ) -> int:
+        """Reserve selection, winning obligation, and outcome frames up front."""
+        if (
+            package.language.effective_profile
+            is not WorkflowLanguageProfile.ARCHON_2026_07
+            or package.language.normalizer_version != 3
+            or node.node_type not in {"command", "prompt"}
+            or node.options.get("context") == "fresh"
+            or not bool(
+                node.options.get(
+                    "persist_session",
+                    package.definition.options.get("persist_sessions", False),
+                )
+            )
+        ):
+            return 0
+        projection_bytes = len(
+            json.dumps(
+                projection,
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        return 2 * TerminalJournalReserve.for_projection(
+            projection_bytes
+        ).terminal_reserve_bytes
+
     def _execute_claim(
         self,
         run_id: str,
@@ -3170,6 +3238,12 @@ class RunScheduler:
                                     claim, identity, cleaned=cleaned
                                 )
                             ),
+                            record_session_recovery_selection=lambda selection: (
+                                self.store.record_persistent_session_recovery_selection(
+                                    claim,
+                                    selection,
+                                )
+                            ),
                             sealed_resource_paths=sealed_resource_paths,
                             sealed_resource_bytes=sealed_resource_bytes,
                             language_profile=package.language.effective_profile,
@@ -3327,6 +3401,14 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None = None,
         outward_action: bool = False,
     ) -> None:
+        if result.session_recovery_outcome is not None:
+            if not self.store.record_persistent_session_recovery_outcome(
+                claim,
+                outcome=result.session_recovery_outcome,
+            ):
+                raise RuntimeError(
+                    "persistent session recovery outcome lost its active claim"
+                )
         projection: dict[str, object] | None = None
         retry_grant: RetryLedgerGrant | None = None
         retry_charge = None
@@ -3460,6 +3542,9 @@ class RunScheduler:
                             error_code=result.error_code,
                             error_message=result.error_message,
                             metadata=completion_metadata,
+                            session_registry_update=(
+                                result.session_registry_update
+                            ),
                         )
                     except BaseException:
                         self._purge_attempt_output_cache(claim)
@@ -3472,6 +3557,7 @@ class RunScheduler:
                     error_code=result.error_code,
                     error_message=result.error_message,
                     metadata=completion_metadata,
+                    session_registry_update=result.session_registry_update,
                 )
             return
         if execution_semantics is not None:
@@ -3582,6 +3668,7 @@ class RunScheduler:
     def advance(self, run_id: str, *, max_nodes: int | None = None):
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
+        self._reconcile_session_registry_update(run_id)
         if max_nodes is None:
             advanced = self.advance_all([run_id])
             return advanced.get(run_id, self.store.load_run(run_id))
@@ -3681,6 +3768,13 @@ class RunScheduler:
                 fence_lost = False
                 for node_id in ready[:capacity]:
                     claim_now = self._monotonic()
+                    session_recovery_reserve = (
+                        self._persistent_session_recovery_reserve(
+                            by_id[node_id],
+                            package,
+                            projection,
+                        )
+                    )
                     try:
                         claim = self.store.claim_node(
                             run_id,
@@ -3693,6 +3787,10 @@ class RunScheduler:
                                 by_id[node_id],
                                 execution_limits,
                                 execution_semantics,
+                            )
+                            + session_recovery_reserve,
+                            terminal_journal_reserve_bytes=(
+                                session_recovery_reserve
                             ),
                             executor_id=by_id[node_id].node_type,
                             owner_epoch=self.owner_id,
@@ -3762,6 +3860,7 @@ class RunScheduler:
                     ]
                     for future in futures:
                         future.result()
+                    self._reconcile_session_registry_update(run_id)
                 executed += len(claims)
             self._resolve_graph(run_id, package.definition.nodes)
             return self.store.load_run(run_id)
@@ -3802,6 +3901,8 @@ class RunScheduler:
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
+        for run_id in run_ids:
+            self._reconcile_session_registry_update(run_id)
         authorizations = {}
         preparation_state_versions = {}
         authorized_run_ids = []
@@ -3862,8 +3963,9 @@ class RunScheduler:
                 if len(futures) >= self.max_parallel_nodes:
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.pop(future)
+                        completed_run_id = futures.pop(future)
                         future.result()
+                        self._reconcile_session_registry_update(completed_run_id)
                 candidates: dict[str, list[str]] = {}
                 snapshots = {}
                 strict_reference_snapshots: dict[
@@ -3954,6 +4056,13 @@ class RunScheduler:
                             if node.id == node_id
                         )
                         claim_now = self._monotonic()
+                        session_recovery_reserve = (
+                            self._persistent_session_recovery_reserve(
+                                node,
+                                packages[run_id],
+                                snapshots[run_id],
+                            )
+                        )
                         try:
                             claim = self.store.claim_node(
                                 run_id,
@@ -3966,6 +4075,10 @@ class RunScheduler:
                                     node,
                                     execution_limits[run_id],
                                     execution_semantics[run_id],
+                                )
+                                + session_recovery_reserve,
+                                terminal_journal_reserve_bytes=(
+                                    session_recovery_reserve
                                 ),
                                 executor_id=node.node_type,
                                 owner_epoch=self.owner_id,
@@ -4036,12 +4149,15 @@ class RunScheduler:
                         break
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.pop(future)
+                        completed_run_id = futures.pop(future)
                         future.result()
+                        self._reconcile_session_registry_update(completed_run_id)
             if futures:
                 done, _pending = wait(futures)
                 for future in done:
+                    completed_run_id = futures[future]
                     future.result()
+                    self._reconcile_session_registry_update(completed_run_id)
             for run_id in run_ids:
                 self._resolve_graph(run_id, packages[run_id].definition.nodes)
             return {
