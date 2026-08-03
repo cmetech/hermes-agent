@@ -1,0 +1,35 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience.md
+
+Task 1: complete
+Task 2: complete
+Task 3: complete
+Task 4: complete
+Task 5: complete
+Task 6: complete
+Task 7: complete
+Task 8: complete
+Task 9: complete
+Task 10: complete (final implementation 9976161faf55f461f3f9ab3b56760a995bf6170f; review clean)
+Task 11: in progress (base 25fc0397aafcd9b373169c189a2566a2fa570aff)
+Task 11: fix round 1/3 (2 addressed, 1 open — scheduler preflight still context-blindly resolves escaped/comment Bash references; commit 9e0e6cb3aa87aef2051d966a8a5a4383f55c6991)
+Task 11: fix round 2/3 (1 addressed, 0 open — scheduler preflight shares bounded Bash classifier; commit 6a824d52a0fab0bf7c4e50c39f4102d315e9c54d)
+Task 11: fix round 3/3 (3 original quality findings addressed, 1 original and 1 new Important open — bare Bash arithmetic contexts remain admitted; anonymous read descriptor identity is not atomically bound through Task 10 pinning; commit 0afb27113e97278394d5e2b680cde66bbc02bb72)
+Task 11: fix round 4 authorized — bounded to bare Bash arithmetic rejection and atomic descriptor-identity binding; narrow Task 10 seam amendment authorized if RED proves necessary
+Task 11: fix round 4 implemented at fb866299d46031f16e6eb557891e4f216c3ca9c6 — descriptor identity finding closed; independent specification and quality closure reviews FAIL with remaining arithmetic-context gaps (line-continuation operator joining and indexed-array subscripts)
+Task 11: fix round 5 authorized — bounded to logical backslash-newline operator handling and indexed-array arithmetic/subscript contexts; Task 12 remains pending
+Task 11: fix round 5 implemented at 4e762aeed7add45de8396d58a481f106ae04a033 — direct joined operators and direct array forms closed; independent closure reviews FAIL with escaped-array literal precedence, command-position/prefix/redirection subscript variants, and quoted-heredoc continuation restoration open
+Task 11: fix round 6 authorized — bounded to command-position/prefix/redirection subscript variants, escaped-array literal precedence, and quoted-heredoc continuation restoration; Task 12 remains pending
+Task 11: fix round 6 implemented at 58dc9defa31c7319b2a5e1c9730622c06609e9dd — retained direct cases closed; independent closure reviews FAIL with fd-prefixed heredoc command position, quote-removed wrapper/assignment words, joined <<- parsing, and physical-comment/heredoc phase ordering open
+Task 11: fix round 7 authorized — bounded to fd-prefixed heredoc command position, quote-removed wrapper/assignment words, joined <<- parsing, and physical-comment/heredoc phase ordering; Task 12 remains pending
+Task 11: fix round 7 implemented at edd0f9ce4c96f844045a4894d7faba218e01850c — all four retained closure-review-3 findings closed; independent closure reviews FAIL with process-substitution command bodies, phase-blind physical heredoc recognition, and continuation/comment word-start state open
+Task 11: BLOCKED pending explicit authorization for bounded fix round 8; Task 12 remains pending
+Task 11: fix round 8 authorized — bounded to process-substitution command contexts and a phase-aware physical/logical lexer correction for heredoc, continuation, comment, arithmetic, nesting, and authored-offset state; Task 12 remains pending
+Task 11: fix round 8 implemented at 7fdcbee8158aa57bef00ace43fab94e82cf566e8 — dual physical/logical authorities replaced by one authored-source phase-state lexer; proactive here-string, extglob, and brace-expansion siblings covered; independent closure reviews pending
+Task 11: fix round 8 closure reviews FAIL with one shared Important authored-end finding — logical joined reserved words are recognized but function/coproc, command-prefix, and case/in/esac consumers advance by raw token length; bounded Round 8 closure correction authorized by the user's close-all request
+Task 11: fix round 8 closure correction implemented at 49ffbccfe4b9424f3b6542cfdf9df4bc9ef537e0 (tree 7560124795fca2d7c2f167874423e38042f40d83) — all bounded shell-word consumers preserve authored physical ends; strict RED 11 passed/17 failed, representative GREEN 28 passed, expanded integration 326 passed, exact closure 1,799 passed with one existing platform skip, and exact resource/scheduler/parallel/performance set 106 passed; independent closure review pending
+Task 11: independent specification and quality closure rereviews PASS at implementation 49ffbccfe4b9424f3b6542cfdf9df4bc9ef537e0 — 0 Critical, 0 Important, 0 Minor; final live customization/base gates pending
+Task 11: complete — strict customization PASS; canonical base gate 4,070 Python, installed distribution 1, Desktop 155; TESTED_BASE_SHA b4ec323ae86cd82cca2d23ef7df686ce34695ec1; Task 12 remains pending
+Task 12: initial implementation at 2d4529924581a5b46178f1bb7dbf2becef12052b — independent specification review found 1 Critical, 1 Important, 1 Minor; independent quality review found 2 Important, 1 Minor
+Task 12: fix round 1/3 implemented at c026d1ef569720f7e47fbc9792b5d1b9378c9ec4 — atomic SessionDB load, pre-MCP missing classification, origin-bound worker frame, real subprocess race, and adversarial coverage; quality rereview PASS, specification rereview retained 1 Minor evidence gap
+Task 12: fix round 2/3 implemented at b9c57e31cd42bc77685a31ce0f7bd9808deb6d1e (tree fda7669405741e23c19a68a06bb939f794d857b9) — real post-open SQLite read-failure evidence added; no production change
+Task 12: complete — independent specification and quality closure reviews PASS with 0 Critical, 0 Important, 0 Minor; controller focused gate 863 passed; strict customization, Ruff, and diff checks PASS; canonical base gate 4,098 Python, installed distribution 1, Desktop 155; TESTED_BASE_SHA b9c57e31cd42bc77685a31ce0f7bd9808deb6d1e; Task 13 remains pending
