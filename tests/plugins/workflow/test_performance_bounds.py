@@ -4,8 +4,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.bash_rendering import (
+    BashRenderingError,
+    classify_bash_reference_spans,
+)
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
@@ -98,6 +104,31 @@ def test_dollar_dense_bash_candidate_discovery_reads_only_linear_characters() ->
 
     assert large.index_reads <= (3 * small.index_reads) + len(large)
     assert large.index_reads <= 4 * len(large)
+
+
+def _continued_bash_lexer_reads(repetitions: int) -> tuple[int, int]:
+    prefix = "word\\\n" * repetitions
+    suffix = "(\\\n( $USER_MESSAGE ))"
+    template = _IndexAccountingText(prefix + suffix)
+    start = len(prefix) + suffix.index("$USER_MESSAGE")
+
+    with pytest.raises(BashRenderingError) as exc:
+        classify_bash_reference_spans(
+            template,
+            ((start, start + len("$USER_MESSAGE")),),
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported"
+    return len(template), template.index_reads
+
+
+def test_line_continuation_logical_bash_lexing_reads_only_linear_characters() -> None:
+    small_bytes, small_reads = _continued_bash_lexer_reads(4_096)
+    large_bytes, large_reads = _continued_bash_lexer_reads(8_192)
+
+    assert large_bytes > small_bytes
+    assert large_reads <= (3 * small_reads) + large_bytes
+    assert large_reads <= 6 * large_bytes
 
 
 def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(

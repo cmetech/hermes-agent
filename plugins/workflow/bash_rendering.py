@@ -336,11 +336,10 @@ def _quote_inline_value(value: str, quote: str | None) -> str:
     return shlex.quote(value)
 
 
-def classify_bash_reference_spans(
+def _validate_bash_reference_spans(
     template: str,
     spans: Iterable[tuple[int, int]],
-) -> tuple[tuple[int, int, str | None], ...]:
-    """Return admitted Bash spans and quote contexts, ignoring literal spans."""
+) -> tuple[tuple[int, int], ...]:
     ordered = tuple(spans)
     if any(
         type(start) is not int
@@ -359,6 +358,72 @@ def classify_bash_reference_spans(
         )
     ):
         raise ValueError("bash substitution offsets must be ordered and disjoint")
+    return ordered
+
+
+def _logical_bash_input(template: str) -> tuple[str, tuple[int, ...]]:
+    """Remove physical continuations and map every physical boundary."""
+    logical: list[str] = []
+    physical_to_logical = [0] * (len(template) + 1)
+    position = 0
+    consecutive_backslashes = 0
+    while position < len(template):
+        physical_to_logical[position] = len(logical)
+        if (
+            template[position] == "\\"
+            and position + 1 < len(template)
+            and template[position + 1] == "\n"
+            and consecutive_backslashes % 2 == 0
+        ):
+            physical_to_logical[position + 1] = len(logical)
+            physical_to_logical[position + 2] = len(logical)
+            position += 2
+            consecutive_backslashes = 0
+            continue
+        character = template[position]
+        logical.append(character)
+        position += 1
+        physical_to_logical[position] = len(logical)
+        consecutive_backslashes = (
+            consecutive_backslashes + 1 if character == "\\" else 0
+        )
+    return "".join(logical), tuple(physical_to_logical)
+
+
+def classify_bash_reference_spans(
+    template: str,
+    spans: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int, str | None], ...]:
+    """Return admitted physical spans after classifying shell logical input."""
+    ordered = _validate_bash_reference_spans(template, spans)
+    if "\\\n" not in template:
+        return _classify_logical_bash_reference_spans(template, ordered)
+
+    logical_template, physical_to_logical = _logical_bash_input(template)
+    logical_to_physical: dict[tuple[int, int], tuple[int, int]] = {}
+    logical_spans: list[tuple[int, int]] = []
+    for start, end in ordered:
+        logical_span = (physical_to_logical[start], physical_to_logical[end])
+        if logical_span[0] >= logical_span[1] or logical_span in logical_to_physical:
+            raise ValueError("bash substitution offsets collapse in logical input")
+        logical_to_physical[logical_span] = (start, end)
+        logical_spans.append(logical_span)
+
+    admitted = _classify_logical_bash_reference_spans(
+        logical_template,
+        tuple(logical_spans),
+    )
+    return tuple(
+        (*logical_to_physical[(start, end)], quote) for start, end, quote in admitted
+    )
+
+
+def _classify_logical_bash_reference_spans(
+    template: str,
+    spans: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int, str | None], ...]:
+    """Classify spans in input after shell continuation removal."""
+    ordered = _validate_bash_reference_spans(template, spans)
     by_start = {start: (start, end) for start, end in ordered}
     if len(by_start) != len(ordered):
         raise ValueError("bash substitution offsets must be unique")
@@ -369,6 +434,12 @@ def classify_bash_reference_spans(
     top_level_heredocs: list[tuple[str, bool]] = []
     word_start = True
     position = 0
+    compound_assignment_depth = 0
+    array_subscript_start: int | None = None
+    array_subscript_depth = 0
+    top_level_command_position = True
+    top_level_assignment_builtin = False
+    top_level_word_start: int | None = None
 
     def decide_range(start: int, end: int, decision: bool) -> None:
         first = bisect_left(reference_starts, start)
@@ -469,6 +540,91 @@ def classify_bash_reference_spans(
         separators = " \t\r\n;|&()<>"
         return before in separators and after in separators
 
+    def assignment_name_before(end: int) -> bool:
+        cursor = end
+        while cursor > 0 and (
+            template[cursor - 1].isascii()
+            and (template[cursor - 1].isalnum() or template[cursor - 1] == "_")
+        ):
+            cursor -= 1
+        if cursor == end or not (
+            template[cursor].isascii()
+            and (template[cursor].isalpha() or template[cursor] == "_")
+        ):
+            return False
+        return cursor == 0 or template[cursor - 1] in " \t\r\n;|&(<>)"
+
+    def begins_compound_assignment(start: int) -> bool:
+        if start == 0 or template[start - 1] != "=":
+            return False
+        name_end = start - 1
+        if name_end > 0 and template[name_end - 1] == "+":
+            name_end -= 1
+        return assignment_name_before(name_end)
+
+    def assignment_word(start: int, end: int) -> bool:
+        cursor = start
+        if cursor >= end or not (
+            template[cursor].isascii()
+            and (template[cursor].isalpha() or template[cursor] == "_")
+        ):
+            return False
+        cursor += 1
+        while cursor < end and (
+            template[cursor].isascii()
+            and (template[cursor].isalnum() or template[cursor] == "_")
+        ):
+            cursor += 1
+        if cursor < end and template[cursor] == "[":
+            bracket_depth = 1
+            cursor += 1
+            while cursor < end and bracket_depth:
+                if template[cursor] == "[":
+                    bracket_depth += 1
+                elif template[cursor] == "]":
+                    bracket_depth -= 1
+                cursor += 1
+            if bracket_depth:
+                return False
+        if cursor < end and template[cursor] == "+":
+            cursor += 1
+        return cursor < end and template[cursor] == "="
+
+    def finish_top_level_word(end: int) -> None:
+        nonlocal top_level_assignment_builtin
+        nonlocal top_level_command_position
+        nonlocal top_level_word_start
+        if top_level_word_start is None:
+            return
+        start = top_level_word_start
+        top_level_word_start = None
+        if not top_level_command_position:
+            return
+        word = template[start:end]
+        if assignment_word(start, end):
+            return
+        if top_level_assignment_builtin:
+            return
+        if word in {"declare", "export", "local", "readonly", "typeset"}:
+            top_level_assignment_builtin = True
+            return
+        if word in {
+            "!",
+            "do",
+            "elif",
+            "else",
+            "for",
+            "if",
+            "select",
+            "then",
+            "time",
+            "until",
+            "while",
+            "{",
+        }:
+            return
+        top_level_command_position = False
+
     def function_declaration_name_end(start: int) -> int | None:
         """Consume Bash's `function WORD` prefix without parsing its body."""
         if not shell_word_at(start, "function"):
@@ -553,6 +709,14 @@ def classify_bash_reference_spans(
                 decisions[position] = quote
 
         character = template[position]
+        if (
+            not frames
+            and quote is None
+            and compound_assignment_depth == 0
+            and top_level_word_start is None
+            and character not in " \t\r\n;|&()<>"
+        ):
+            top_level_word_start = position
         if frames and frames[-1].kind == "ansi_c":
             if character == "\\":
                 position = min(len(template), position + 2)
@@ -582,6 +746,8 @@ def classify_bash_reference_spans(
             newline = template.find("\n", position)
             end = len(template) if newline < 0 else newline
             decide_range(position, end, True)
+            if not frames and top_level_word_start == position:
+                top_level_word_start = None
             if newline < 0:
                 position = len(template)
                 continue
@@ -672,11 +838,19 @@ def classify_bash_reference_spans(
 
         if (
             quote is None
-            and frames
-            and frames[-1].kind == "command"
-            and frames[-1].command_position
-            and (not frames[-1].case_states or frames[-1].case_states[-1] == "body")
             and shell_word_at(position, "[[")
+            and (
+                (not frames and top_level_command_position)
+                or (
+                    frames
+                    and frames[-1].kind == "command"
+                    and frames[-1].command_position
+                    and (
+                        not frames[-1].case_states
+                        or frames[-1].case_states[-1] == "body"
+                    )
+                )
+            )
         ):
             check_nesting_bound()
             mark_current_command_word()
@@ -695,6 +869,39 @@ def classify_bash_reference_spans(
             position = heredoc_cursor
             word_start = False
             continue
+
+        closed_compound_assignment = False
+        if quote is None and not frames:
+            if array_subscript_start is not None:
+                if character == "[":
+                    array_subscript_depth += 1
+                elif character == "]":
+                    array_subscript_depth -= 1
+                    if array_subscript_depth == 0:
+                        suffix = template[position + 1 : position + 3]
+                        if suffix.startswith("=") or suffix.startswith("+="):
+                            unsupported_range(array_subscript_start, position + 1)
+                        array_subscript_start = None
+            elif character == "[" and (
+                (compound_assignment_depth > 0 and word_start)
+                or (top_level_command_position and assignment_name_before(position))
+            ):
+                array_subscript_start = position
+                array_subscript_depth = 1
+
+            if array_subscript_start is None:
+                if (
+                    character == "("
+                    and top_level_command_position
+                    and begins_compound_assignment(position)
+                ):
+                    compound_assignment_depth = 1
+                elif compound_assignment_depth > 0:
+                    if character == "(":
+                        compound_assignment_depth += 1
+                    elif character == ")":
+                        compound_assignment_depth -= 1
+                        closed_compound_assignment = compound_assignment_depth == 0
 
         if frames and quote is None:
             frame = frames[-1]
@@ -872,6 +1079,21 @@ def classify_bash_reference_spans(
                         quote = frame.resume_quote
                 position += 1
                 continue
+
+        if (
+            quote is None
+            and not frames
+            and compound_assignment_depth == 0
+            and character in " \t\r\n;|&()<>"
+        ):
+            finish_top_level_word(
+                position + 1 if closed_compound_assignment else position
+            )
+            if character in "\n;|&" or (
+                character in "()" and not closed_compound_assignment
+            ):
+                top_level_command_position = True
+                top_level_assignment_builtin = False
 
         if character == "\n":
             position += 1

@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import stat
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,6 +20,7 @@ from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
 from plugins.workflow.output_resolution import ResolvedOutputReference
 from plugins.workflow.resources import VariableContext, substitution_renderer
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import WorkflowValidationError, load_workflow
 from tools.managed_process import ManagedProcessTree
 
@@ -27,6 +30,27 @@ _SHELL_CONTEXTS = {
     "double-quoted": "printf '%s' \"$USER_MESSAGE\"",
     "single-quoted": "printf '%s' '$USER_MESSAGE'",
 }
+
+_JOINED_UNSUPPORTED_CONTEXTS = (
+    ("(\\\n( {reference} ))", "bare-arithmetic"),
+    ("printf '%s' \"$\\\n(printf '%s' {reference})\"", "command-substitution"),
+    ("printf '%s' \"$\\\n((1 + {reference}))\"", "arithmetic-expansion"),
+    ("printf '%s' \"$\\\n{{OTHER:-{reference}}}\"", "parameter-expansion"),
+    ("printf '%s' \"$\\\n[{reference}]\"", "legacy-arithmetic"),
+    ("[\\\n[ -n {reference} ]]", "conditional-command"),
+    ("cat <\\\n<EOF\n{reference}\nEOF\n", "heredoc"),
+    (
+        "printf ignored " + "\\\\" + "\n(( {reference} ))",
+        "escaped-backslash-line-break",
+    ),
+)
+
+_ARRAY_SUBSCRIPT_CONTEXTS = (
+    ("items[{reference}]=9", "indexed-assignment"),
+    ("items[{reference}]+=9", "indexed-augmented-assignment"),
+    ("items=([{reference}]=9)", "compound-assignment"),
+    ("items+=([{reference}]=9)", "compound-append-assignment"),
+)
 
 
 def _run_v3_bash(
@@ -144,6 +168,64 @@ def test_v3_bash_rejects_bare_arithmetic_scalar_references_during_admission(
     assert exc.value.issues[0].path == "nodes[1].bash"
 
 
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _JOINED_UNSUPPORTED_CONTEXTS,
+    ids=[context for _template, context in _JOINED_UNSUPPORTED_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_line_continuations_that_form_unsupported_operators_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ARRAY_SUBSCRIPT_CONTEXTS,
+    ids=[context for _template, context in _ARRAY_SUBSCRIPT_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_arithmetic_array_subscripts_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
 def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
     tmp_path,
     workflow_writer,
@@ -155,6 +237,46 @@ def test_v3_bash_admits_quoted_scalar_reference_as_simple_token_data(
     )
 
     assert package.definition.nodes[1].value == "printf '%s' \"$USER_MESSAGE\""
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "printf '%s' \"items[$USER_MESSAGE]=9\"",
+        "printf '%s' \"items=([$USER_MESSAGE]=9)\"",
+        "printf '%s' items[$USER_MESSAGE]=9",
+        "printf '%s' [[ $USER_MESSAGE ]]",
+        ("items=([0]=prefix[$USER_MESSAGE]=9); printf '%s' \"${items[0]}\""),
+        "(\\\n( 1 )); printf '%s' \"$USER_MESSAGE\"",
+    ),
+    ids=(
+        "quoted-index",
+        "quoted-compound-index",
+        "argument-index-text",
+        "argument-conditional-text",
+        "compound-value-bracket-text",
+        "later-safe-reference",
+    ),
+)
+def test_v3_bash_keeps_quoted_brackets_and_unrelated_line_continuations_compatible(
+    tmp_path,
+    workflow_writer,
+    command,
+) -> None:
+    package = _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert package.definition.nodes[1].value == command
+
+
+def test_v3_bash_treats_reference_after_continued_comment_as_literal_at_admission(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    command = "# continued comment \\\n$producer.output\nprintf safe"
+
+    package = _archon_bash_package(workflow_writer, tmp_path, command)
+
+    assert package.definition.nodes[1].depends_on == ()
 
 
 def test_v3_bash_context_rejection_precedes_dependency_validation(
@@ -426,6 +548,200 @@ def test_v3_bash_rejects_bare_arithmetic_references_before_executor_launch(
     assert result.error_code == "bash_reference_context_unsupported"
     assert launched == []
     assert not (tmp_path / "nodes" / "shell" / "attempt-1" / "stdout.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("template", "context"),
+    (*_JOINED_UNSUPPORTED_CONTEXTS, *_ARRAY_SUBSCRIPT_CONTEXTS),
+    ids=[
+        context
+        for _template, context in (
+            *_JOINED_UNSUPPORTED_CONTEXTS,
+            *_ARRAY_SUBSCRIPT_CONTEXTS,
+        )
+    ],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_joined_operators_and_array_subscripts_before_launch(
+    tmp_path,
+    template,
+    context,
+    reference,
+    size,
+) -> None:
+    value = "7" * size
+    output_reference = reference == "$producer.output"
+    dependencies = ("producer",) if output_reference else ()
+    renderer = substitution_renderer(
+        VariableContext(user_message=value, normalizer_version=3),
+        direct_dependencies=dependencies,
+        output_resolver=(
+            (lambda _node_id, _path: ResolvedOutputReference(value, value))
+            if output_reference
+            else None
+        ),
+    )
+    launched: list[str] = []
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=template.format(reference=reference),
+        depends_on=dependencies,
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+
+    result = BashExecutor().execute(
+        NodeExecutionContext(
+            run_id=f"unsupported-{context}",
+            run_directory=tmp_path,
+            node=node,
+            attempt_id="attempt-1",
+            variable_context=renderer,
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+            spawn_intent=lambda nonce: launched.append(nonce) or True,
+        )
+    )
+
+    assert result.status == "failed", context
+    assert result.error_code == "bash_reference_context_unsupported", context
+    assert launched == [], context
+    attempt = tmp_path / "nodes" / "shell" / "attempt-1"
+    assert not (attempt / "stdout.txt").exists(), context
+    assert not (attempt / "variables-v3").exists(), context
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+def test_v3_bash_does_not_substitute_a_reference_continued_inside_a_comment(
+    tmp_path,
+) -> None:
+    value = "7" * 32_769
+
+    result, output = _run_v3_bash(
+        tmp_path,
+        command="# continued comment \\\n$USER_MESSAGE\nprintf safe",
+        value=value,
+    )
+
+    assert result.status == "succeeded"
+    assert output == b"safe"
+    assert result.metadata["bash"]["spill_count"] == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+def test_v3_bash_ignores_an_escaped_reference_after_a_line_continuation(
+    tmp_path,
+) -> None:
+    result, output = _run_v3_bash(
+        tmp_path,
+        command="printf '%s' \\\n\\$USER_MESSAGE",
+        value="7" * 32_769,
+    )
+
+    assert result.status == "succeeded"
+    assert output == b"$USER_MESSAGE"
+    assert result.metadata["bash"]["spill_count"] == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
+@pytest.mark.parametrize(
+    ("command", "expected_template"),
+    (
+        ("printf '%s' \"items[$USER_MESSAGE]=9\"", "items[{value}]=9"),
+        (
+            "printf '%s' \"items=([$USER_MESSAGE]=9)\"",
+            "items=([{value}]=9)",
+        ),
+        ("printf '%s' \"(\\\n( $USER_MESSAGE ))\"", "(( {value} ))"),
+        ("printf '%s' items[$USER_MESSAGE]=9", "items[{value}]=9"),
+        ("printf '%s' [[ $USER_MESSAGE ]]", "[[{value}]]"),
+        (
+            "items=([0]=prefix[$USER_MESSAGE]=9); printf '%s' \"${items[0]}\"",
+            "prefix[{value}]=9",
+        ),
+    ),
+    ids=(
+        "quoted-index",
+        "quoted-compound-index",
+        "quoted-joined-operator",
+        "argument-index-text",
+        "argument-conditional-text",
+        "compound-value-bracket-text",
+    ),
+)
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_keeps_quoted_operator_and_bracket_text_as_exact_data(
+    tmp_path,
+    command,
+    expected_template,
+    size,
+) -> None:
+    value = "7" * size
+
+    result, output = _run_v3_bash(tmp_path, command=command, value=value)
+
+    assert result.status == "succeeded"
+    assert output == expected_template.format(value=value).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "(\\\n( $USER_MESSAGE ))",
+        "items[$USER_MESSAGE]=9",
+    ),
+    ids=("joined-arithmetic", "array-subscript"),
+)
+def test_v3_scheduler_preflight_uses_the_bash_context_authority(
+    tmp_path,
+    monkeypatch,
+    command,
+) -> None:
+    store = MagicMock()
+    store.run_directory.return_value = tmp_path
+    scheduler = object.__new__(RunScheduler)
+    scheduler.store = store
+    node = WorkflowNode(
+        id="shell",
+        node_type="bash",
+        value=command,
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    package = SimpleNamespace(
+        language=SimpleNamespace(
+            effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=3,
+        )
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_revalidate_retained_output_resolution",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_strict_reference_templates",
+        lambda *_args, **_kwargs: (command,),
+    )
+
+    with pytest.raises(BashRenderingError) as exc:
+        scheduler._preflight_strict_node_references(
+            "run-1",
+            node,
+            package,
+            {"nodes": {"shell": {"state": "ready"}}},
+            sealed_resource_paths=frozenset(),
+            sealed_resource_bytes={},
+        )
+
+    assert exc.value.code == "bash_reference_context_unsupported"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real /bin/sh contract")
