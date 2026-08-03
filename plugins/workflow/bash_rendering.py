@@ -68,7 +68,7 @@ class _NestingFrame:
     bracket_depth: int = 1
     case_states: list[str] = field(default_factory=list)
     command_position: bool = True
-    pending_heredocs: list[tuple[str, bool]] = field(default_factory=list)
+    pending_heredocs: list[tuple[str, bool, bool]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,23 +368,43 @@ def _validate_bash_reference_spans(
     return ordered
 
 
-def _parse_bash_heredoc_delimiter(
+def _logical_token_match(
     template: str,
     start: int,
-    *,
-    operator_end: int | None = None,
-    strip_tabs: bool | None = None,
-) -> tuple[int, int, str, bool, bool] | None:
-    if operator_end is None:
-        if not template.startswith("<<", start) or template.startswith("<<<", start):
+    token: str,
+) -> tuple[int, tuple[int, ...]] | None:
+    """Match one fixed shell token across active physical continuations."""
+    cursor = start
+    physical_starts: list[int] = []
+    for expected in token:
+        while template.startswith("\\\n", cursor):
+            cursor += 2
+        if cursor >= len(template) or template[cursor] != expected:
             return None
-        cursor = start + 2
-    else:
-        cursor = operator_end
-    if strip_tabs is None:
-        strip_tabs = cursor < len(template) and template[cursor] == "-"
-    if strip_tabs and cursor < len(template) and template[cursor] == "-":
+        physical_starts.append(cursor)
         cursor += 1
+    return cursor, tuple(physical_starts)
+
+
+def _skip_bash_continuations(template: str, start: int) -> int:
+    cursor = start
+    while template.startswith("\\\n", cursor):
+        cursor += 2
+    return cursor
+
+
+def _parse_physical_bash_heredoc_delimiter(
+    template: str,
+    start: int,
+) -> tuple[int, int, str, bool, bool] | None:
+    """Parse one context-approved heredoc from authored source bytes."""
+    operator = _logical_token_match(template, start, "<<")
+    if operator is None or _logical_token_match(template, start, "<<<") is not None:
+        return None
+    cursor = _skip_bash_continuations(template, operator[0])
+    strip_tabs = cursor < len(template) and template[cursor] == "-"
+    if strip_tabs and cursor < len(template) and template[cursor] == "-":
+        cursor = _skip_bash_continuations(template, cursor + 1)
     while cursor < len(template) and template[cursor] in " \t":
         cursor += 1
     delimiter_start = cursor
@@ -427,157 +447,6 @@ def _parse_bash_heredoc_delimiter(
     return cursor, delimiter_start, "".join(delimiter), strip_tabs, delimiter_quoted
 
 
-def _skip_bash_continuations(template: str, start: int) -> int:
-    cursor = start
-    while template.startswith("\\\n", cursor):
-        cursor += 2
-    return cursor
-
-
-def _parse_physical_bash_heredoc_delimiter(
-    template: str,
-    start: int,
-) -> tuple[int, int, str, bool, bool] | None:
-    """Parse a heredoc operator whose tokens may cross physical lines."""
-    if start >= len(template) or template[start] != "<":
-        return None
-    second = _skip_bash_continuations(template, start + 1)
-    if second >= len(template) or template[second] != "<":
-        return None
-    cursor = _skip_bash_continuations(template, second + 1)
-    if cursor < len(template) and template[cursor] == "<":
-        return None
-    strip_tabs = cursor < len(template) and template[cursor] == "-"
-    if strip_tabs:
-        cursor = _skip_bash_continuations(template, cursor + 1)
-    return _parse_bash_heredoc_delimiter(
-        template,
-        start,
-        operator_end=cursor,
-        strip_tabs=strip_tabs,
-    )
-
-
-def _continuation_preserved_ranges(template: str) -> tuple[tuple[int, int], ...]:
-    """Locate physical text where backslash-newline stays literal."""
-    ranges: list[tuple[int, int]] = []
-    pending: list[tuple[str, bool, bool]] = []
-    quote: str | None = None
-    word_start = True
-    position = 0
-
-    def consume_bodies(start: int) -> int:
-        cursor = start
-        for delimiter, strip_tabs, delimiter_quoted in pending:
-            body_start = cursor
-            while cursor <= len(template):
-                newline = template.find("\n", cursor)
-                line_end = len(template) if newline < 0 else newline
-                line = template[cursor:line_end]
-                compared = line.lstrip("\t") if strip_tabs else line
-                if compared == delimiter:
-                    if delimiter_quoted:
-                        ranges.append((body_start, cursor))
-                    cursor = len(template) if newline < 0 else newline + 1
-                    break
-                if newline < 0:
-                    return len(template)
-                cursor = newline + 1
-        pending.clear()
-        return cursor
-
-    while position < len(template):
-        character = template[position]
-        delimiter = (
-            _parse_physical_bash_heredoc_delimiter(template, position)
-            if quote is None
-            else None
-        )
-        if delimiter is not None:
-            cursor, _delimiter_start, text, strip_tabs, delimiter_quoted = delimiter
-            pending.append((text, strip_tabs, delimiter_quoted))
-            position = cursor
-            word_start = False
-            continue
-        if quote != "'" and character == "\\":
-            position = min(len(template), position + 2)
-            word_start = False
-            continue
-        if quote == "'":
-            if character == "'":
-                quote = None
-            position += 1
-            word_start = False
-            continue
-        if character == "'" and quote is None:
-            quote = "'"
-            position += 1
-            word_start = False
-            continue
-        if character == '"':
-            quote = None if quote == '"' else '"'
-            position += 1
-            word_start = False
-            continue
-        if quote is None and character == "#" and word_start:
-            newline = template.find("\n", position)
-            ranges.append((position, len(template) if newline < 0 else newline))
-            position = len(template) if newline < 0 else newline
-            continue
-        if character == "\n":
-            position += 1
-            word_start = True
-            if pending:
-                position = consume_bodies(position)
-            continue
-        word_start = character in " \t\r;|&()<>"
-        position += 1
-    return tuple(ranges)
-
-
-def _logical_bash_input(template: str) -> tuple[str, tuple[int, ...]]:
-    """Remove physical continuations and map every physical boundary."""
-    logical: list[str] = []
-    physical_to_logical = [0] * (len(template) + 1)
-    preserved_ranges = _continuation_preserved_ranges(template)
-    range_index = 0
-    position = 0
-    consecutive_backslashes = 0
-    while position < len(template):
-        physical_to_logical[position] = len(logical)
-        while (
-            range_index < len(preserved_ranges)
-            and position >= preserved_ranges[range_index][1]
-        ):
-            range_index += 1
-        continuation_is_literal = (
-            range_index < len(preserved_ranges)
-            and preserved_ranges[range_index][0]
-            <= position
-            < preserved_ranges[range_index][1]
-        )
-        if (
-            not continuation_is_literal
-            and template[position] == "\\"
-            and position + 1 < len(template)
-            and template[position + 1] == "\n"
-            and consecutive_backslashes % 2 == 0
-        ):
-            physical_to_logical[position + 1] = len(logical)
-            physical_to_logical[position + 2] = len(logical)
-            position += 2
-            consecutive_backslashes = 0
-            continue
-        character = template[position]
-        logical.append(character)
-        position += 1
-        physical_to_logical[position] = len(logical)
-        consecutive_backslashes = (
-            consecutive_backslashes + 1 if character == "\\" else 0
-        )
-    return "".join(logical), tuple(physical_to_logical)
-
-
 def _quote_removed_bash_word(template: str, start: int, end: int) -> _DequotedBashWord:
     """Remove shell word quotes while retaining scanner-source coordinates."""
     text: list[str] = []
@@ -610,6 +479,9 @@ def _quote_removed_bash_word(template: str, start: int, end: int) -> _DequotedBa
             continue
         if character == "\\" and cursor + 1 < end:
             following = template[cursor + 1]
+            if following == "\n" and quote != "'":
+                cursor += 2
+                continue
             if quote != '"' or following in '$`"\\':
                 append(following, cursor, cursor + 2)
                 cursor += 2
@@ -663,35 +535,16 @@ def classify_bash_reference_spans(
     template: str,
     spans: Iterable[tuple[int, int]],
 ) -> tuple[tuple[int, int, str | None], ...]:
-    """Return admitted physical spans after classifying shell logical input."""
+    """Return admitted physical spans from one authored-source shell scan."""
     ordered = _validate_bash_reference_spans(template, spans)
-    if "\\\n" not in template:
-        return _classify_logical_bash_reference_spans(template, ordered)
-
-    logical_template, physical_to_logical = _logical_bash_input(template)
-    logical_to_physical: dict[tuple[int, int], tuple[int, int]] = {}
-    logical_spans: list[tuple[int, int]] = []
-    for start, end in ordered:
-        logical_span = (physical_to_logical[start], physical_to_logical[end])
-        if logical_span[0] >= logical_span[1] or logical_span in logical_to_physical:
-            raise ValueError("bash substitution offsets collapse in logical input")
-        logical_to_physical[logical_span] = (start, end)
-        logical_spans.append(logical_span)
-
-    admitted = _classify_logical_bash_reference_spans(
-        logical_template,
-        tuple(logical_spans),
-    )
-    return tuple(
-        (*logical_to_physical[(start, end)], quote) for start, end, quote in admitted
-    )
+    return _classify_authored_bash_reference_spans(template, ordered)
 
 
-def _classify_logical_bash_reference_spans(
+def _classify_authored_bash_reference_spans(
     template: str,
     spans: Iterable[tuple[int, int]],
 ) -> tuple[tuple[int, int, str | None], ...]:
-    """Classify spans in input after shell continuation removal."""
+    """Classify spans while preserving authored coordinates and lexer phase."""
     ordered = _validate_bash_reference_spans(template, spans)
     by_start = {start: (start, end) for start, end in ordered}
     if len(by_start) != len(ordered):
@@ -700,7 +553,7 @@ def _classify_logical_bash_reference_spans(
     decisions: dict[int, str | None | bool] = {}
     quote: str | None = None
     frames: list[_NestingFrame] = []
-    top_level_heredocs: list[tuple[str, bool]] = []
+    top_level_heredocs: list[tuple[str, bool, bool]] = []
     word_start = True
     position = 0
     compound_assignment_depth = 0
@@ -725,15 +578,31 @@ def _classify_logical_bash_reference_spans(
 
     def consume_heredocs(
         start: int,
-        pending_heredocs: list[tuple[str, bool]],
+        pending_heredocs: list[tuple[str, bool, bool]],
     ) -> int:
         cursor = start
-        for delimiter, strip_tabs in pending_heredocs:
+        for delimiter, strip_tabs, delimiter_quoted in pending_heredocs:
             body_start = cursor
             while cursor <= len(template):
-                newline = template.find("\n", cursor)
-                line_end = len(template) if newline < 0 else newline
-                line = template[cursor:line_end]
+                line_parts: list[str] = []
+                line_end = cursor
+                while True:
+                    newline = template.find("\n", line_end)
+                    physical_end = len(template) if newline < 0 else newline
+                    part = template[line_end:physical_end]
+                    trailing_backslashes = len(part) - len(part.rstrip("\\"))
+                    if (
+                        not delimiter_quoted
+                        and newline >= 0
+                        and trailing_backslashes % 2 == 1
+                    ):
+                        line_parts.append(part[:-1])
+                        line_end = newline + 1
+                        continue
+                    line_parts.append(part)
+                    line_end = physical_end
+                    break
+                line = "".join(line_parts)
                 compared = line.lstrip("\t") if strip_tabs else line
                 if compared == delimiter:
                     unsupported_range(body_start, line_end)
@@ -754,27 +623,78 @@ def _classify_logical_bash_reference_spans(
         return cursor
 
     def begin_heredoc(start: int) -> int | None:
-        parsed = _parse_bash_heredoc_delimiter(template, start)
+        parsed = _parse_physical_bash_heredoc_delimiter(template, start)
         if parsed is None:
             return None
-        cursor, delimiter_start, delimiter, strip_tabs, _delimiter_quoted = parsed
+        cursor, delimiter_start, delimiter, strip_tabs, delimiter_quoted = parsed
         unsupported_range(delimiter_start, cursor)
         pending_heredocs = (
             frames[-1].pending_heredocs
-            if frames and frames[-1].kind == "command"
+            if frames and frames[-1].kind in {"command", "backtick"}
             else top_level_heredocs
         )
-        pending_heredocs.append((delimiter, strip_tabs))
+        pending_heredocs.append((delimiter, strip_tabs, delimiter_quoted))
         return cursor
 
     def shell_word_at(start: int, word: str) -> bool:
-        if not template.startswith(word, start):
+        if start >= len(template) or template[start] != word[0]:
             return False
-        before = template[start - 1] if start else " "
-        end = start + len(word)
+        match = _logical_token_match(template, start, word)
+        if match is None:
+            return False
+        before_cursor = start
+        while before_cursor >= 2 and template.startswith(
+            "\\\n",
+            before_cursor - 2,
+        ):
+            before_cursor -= 2
+        before = template[before_cursor - 1] if before_cursor else " "
+        end = _skip_bash_continuations(template, match[0])
         after = template[end] if end < len(template) else " "
         separators = " \t\r\n;|&()<>"
         return before in separators and after in separators
+
+    def brace_expansion_end(start: int) -> int | None:
+        """Return the authored end of a brace word that can multiply words."""
+        cursor = start + 1
+        depth = 1
+        nested_quote: str | None = None
+        has_separator = False
+        while cursor < len(template):
+            character = template[cursor]
+            if nested_quote == "'":
+                if character == "'":
+                    nested_quote = None
+                cursor += 1
+                continue
+            if character == "\\":
+                cursor = min(len(template), cursor + 2)
+                continue
+            if character == "'":
+                nested_quote = "'"
+                cursor += 1
+                continue
+            if character == '"':
+                nested_quote = None if nested_quote == '"' else '"'
+                cursor += 1
+                continue
+            if nested_quote is not None:
+                cursor += 1
+                continue
+            if character in " \t\r\n;|&<>()":
+                return None
+            if character == "{":
+                depth += 1
+                if depth > _BASH_LEXER_MAX_NESTING:
+                    return None
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1 if has_separator else None
+            elif character == "," or template.startswith("..", cursor):
+                has_separator = True
+            cursor += 1
+        return None
 
     def assignment_name_before(end: int, *, allow_quote_boundary: bool = False) -> bool:
         cursor = end
@@ -1088,47 +1008,58 @@ def _classify_logical_bash_reference_spans(
             position += 1
             continue
 
-        if template.startswith("$$", position):
-            second_dollar = position + 1
+        double_dollar = (
+            _logical_token_match(template, position, "$$") if character == "$" else None
+        )
+        if double_dollar is not None:
+            second_dollar = double_dollar[1][1]
             if second_dollar in by_start:
                 decisions[second_dollar] = True
             mark_current_command_word()
-            position += 2
+            position = double_dollar[0]
             word_start = False
             continue
 
         if character == "$" and position + 1 < len(template):
-            if template.startswith("$((", position):
+            arithmetic_open = _logical_token_match(template, position, "$((")
+            command_open = _logical_token_match(template, position, "$(")
+            legacy_open = _logical_token_match(template, position, "$[")
+            ansi_open = _logical_token_match(template, position, "$'")
+            parameter_open = _logical_token_match(template, position, "${")
+            if arithmetic_open is not None:
                 kind = "arithmetic"
-                width = 3
-            elif template.startswith("$(", position):
+                frame_end = arithmetic_open[0]
+            elif command_open is not None:
                 kind = "command"
-                width = 2
-            elif template.startswith("$[", position):
+                frame_end = command_open[0]
+            elif legacy_open is not None:
                 kind = "legacy_arithmetic"
-                width = 2
-            elif quote is None and template.startswith("$'", position):
+                frame_end = legacy_open[0]
+            elif quote is None and ansi_open is not None:
                 kind = "ansi_c"
-                width = 2
-            elif template.startswith("${", position):
+                frame_end = ansi_open[0]
+            elif parameter_open is not None:
                 kind = "parameter"
-                width = 2
+                frame_end = parameter_open[0]
             else:
                 kind = ""
-                width = 0
+                frame_end = position
             if kind:
                 check_nesting_bound()
                 mark_current_command_word()
                 frames.append(_NestingFrame(kind, quote))
                 quote = None
-                position += width
+                position = frame_end
                 word_start = kind == "command"
                 continue
 
-        if quote is None and not frames and template.startswith("((", position):
+        top_arithmetic_open = (
+            _logical_token_match(template, position, "((") if character == "(" else None
+        )
+        if quote is None and not frames and top_arithmetic_open is not None:
             check_nesting_bound()
             frames.append(_NestingFrame("arithmetic", quote))
-            position += 2
+            position = top_arithmetic_open[0]
             word_start = False
             continue
 
@@ -1148,17 +1079,84 @@ def _classify_logical_bash_reference_spans(
                 )
             )
         ):
+            conditional_open = _logical_token_match(template, position, "[[")
+            assert conditional_open is not None
             check_nesting_bound()
             mark_current_command_word()
             frames.append(_NestingFrame("conditional", quote))
             quote = None
-            position += 2
+            position = conditional_open[0]
+            word_start = True
+            continue
+
+        process_substitution = (
+            _logical_token_match(template, position, f"{character}(")
+            if character in "<>"
+            else None
+        )
+        if (
+            quote is None
+            and process_substitution is not None
+            and (not frames or frames[-1].kind in {"command", "backtick"})
+        ):
+            check_nesting_bound()
+            mark_current_command_word()
+            frames.append(_NestingFrame("command", quote))
+            quote = None
+            position = process_substitution[0]
+            word_start = True
+            continue
+
+        extglob_open = (
+            _logical_token_match(template, position, f"{character}(")
+            if character in "@!+?*"
+            else None
+        )
+        if quote is None and extglob_open is not None:
+            check_nesting_bound()
+            mark_current_command_word()
+            frames.append(_NestingFrame("extglob", quote))
+            quote = None
+            position = extglob_open[0]
+            word_start = False
+            continue
+
+        if (
+            quote is None
+            and not frames
+            and character == "{"
+            and brace_expansion_end(position) is not None
+        ):
+            check_nesting_bound()
+            frames.append(_NestingFrame("brace", quote))
+            position += 1
+            word_start = False
+            continue
+
+        here_string = (
+            _logical_token_match(template, position, "<<<")
+            if character == "<"
+            and quote is None
+            and (not frames or frames[-1].kind in {"command", "backtick"})
+            else None
+        )
+        if here_string is not None:
+            if not frames and compound_assignment_depth == 0:
+                if (
+                    top_level_word_start is not None
+                    and template[top_level_word_start:position].isdigit()
+                ):
+                    top_level_word_start = None
+                top_level_redirection_operand = True
+            position = here_string[0]
             word_start = True
             continue
 
         heredoc_cursor = (
             begin_heredoc(position)
-            if quote is None and (not frames or frames[-1].kind == "command")
+            if character == "<"
+            and quote is None
+            and (not frames or frames[-1].kind in {"command", "backtick"})
             else None
         )
         if heredoc_cursor is not None:
@@ -1225,12 +1223,14 @@ def _classify_logical_bash_reference_spans(
         if frames and quote is None:
             frame = frames[-1]
             if frame.kind == "conditional":
+                conditional_close = _logical_token_match(template, position, "]]")
                 if shell_word_at(position, "]]"):
                     frames.pop()
                     quote = frame.resume_quote
                     if frames and frames[-1].kind == "command":
                         frames[-1].command_position = False
-                    position += 2
+                    assert conditional_close is not None
+                    position = conditional_close[0]
                     word_start = False
                     continue
                 position += 1
@@ -1240,6 +1240,12 @@ def _classify_logical_bash_reference_spans(
                 frames.pop()
                 quote = frame.resume_quote
                 position += 1
+                continue
+            if frame.kind == "backtick":
+                position += 1
+                word_start = character in " \t\r\n;|&()<>"
+                if character == "\n" and frame.pending_heredocs:
+                    position = consume_heredocs(position, frame.pending_heredocs)
                 continue
             if frame.kind == "command":
                 case_state = frame.case_states[-1] if frame.case_states else None
@@ -1372,18 +1378,35 @@ def _classify_logical_bash_reference_spans(
                         frame.pending_heredocs,
                     )
                 continue
+            if frame.kind == "extglob":
+                if character == "(":
+                    frame.parenthesis_depth += 1
+                elif character == ")":
+                    frame.parenthesis_depth -= 1
+                    if frame.parenthesis_depth == 0:
+                        frames.pop()
+                        quote = frame.resume_quote
+                position += 1
+                continue
+            if frame.kind == "brace":
+                if character == "{":
+                    frame.bracket_depth += 1
+                elif character == "}":
+                    frame.bracket_depth -= 1
+                    if frame.bracket_depth == 0:
+                        frames.pop()
+                        quote = frame.resume_quote
+                position += 1
+                continue
             if frame.kind == "arithmetic":
                 if character == "(":
                     frame.parenthesis_depth += 1
                 elif character == ")":
-                    if (
-                        frame.parenthesis_depth == 1
-                        and position + 1 < len(template)
-                        and template[position + 1] == ")"
-                    ):
+                    arithmetic_close = _logical_token_match(template, position, "))")
+                    if frame.parenthesis_depth == 1 and arithmetic_close is not None:
                         frames.pop()
                         quote = frame.resume_quote
-                        position += 2
+                        position = arithmetic_close[0]
                         continue
                     frame.parenthesis_depth -= 1
                 position += 1

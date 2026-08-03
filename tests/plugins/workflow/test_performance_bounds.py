@@ -203,6 +203,32 @@ def test_joined_multiple_strip_heredocs_are_classified_in_linear_time() -> None:
     assert large_reads <= 10 * large_bytes
 
 
+def _phase_reentry_lexer_reads(repetitions: int) -> tuple[int, int]:
+    prefix = (
+        "(( shifted = 1 << 2 )); " * repetitions
+        + ": \\\n# comment \\\n" * repetitions
+        + "cat <<'EOF' >/dev/null\nline\\\nEOF\n"
+    )
+    suffix = 'printf \'%s\' "$USER_MESSAGE"'
+    template = _IndexAccountingText(prefix + suffix)
+    start = len(prefix) + suffix.index("$USER_MESSAGE")
+
+    assert classify_bash_reference_spans(
+        template,
+        ((start, start + len("$USER_MESSAGE")),),
+    ) == ((start, start + len("$USER_MESSAGE"), '"'),)
+    return len(template), template.index_reads
+
+
+def test_shared_phase_state_classification_reads_only_linear_characters() -> None:
+    small_bytes, small_reads = _phase_reentry_lexer_reads(2_048)
+    large_bytes, large_reads = _phase_reentry_lexer_reads(4_096)
+
+    assert large_bytes > small_bytes
+    assert large_reads <= (3 * small_reads) + large_bytes
+    assert large_reads <= 12 * large_bytes
+
+
 def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(
     tmp_path, workflow_writer
 ) -> None:

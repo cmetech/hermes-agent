@@ -178,6 +178,37 @@ def test_joined_multi_heredoc_mapping_preserves_the_authored_reference_offset() 
     assert exc.value.start == len(prefix)
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "(( shifted = 1 << 2 )); cat <<'EOF' >/dev/null\nline\\\nEOF\n",
+        ("printf '%s' \"$(cat <<'EOF' >/dev/null\nline\\\nEOF\nprintf nested)\"; "),
+        ("printf '%s' \"`cat <<'EOF' >/dev/null\nline\\\nEOF\nprintf nested`\"; "),
+        ": \\\n# comment \\\nprintf '%s' ",
+    ),
+)
+def test_phase_reentry_mapping_preserves_authored_reference_offsets(prefix) -> None:
+    with pytest.raises(WorkflowReferenceSyntaxError) as exc:
+        bash_output_references(f"{prefix}$bad.output-field")
+
+    assert exc.value.start == len(prefix)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "read value <\\\n<<literal; printf '%s' ",
+        "printf '%s' '@(literal|x)'; printf '%s' ",
+        "printf '%s' 'pre{literal,x}'; printf '%s' ",
+    ),
+)
+def test_maximal_munch_and_word_expansion_mapping_preserve_offsets(prefix) -> None:
+    with pytest.raises(WorkflowReferenceSyntaxError) as exc:
+        bash_output_references(f"{prefix}$bad.output-field")
+
+    assert exc.value.start == len(prefix)
+
+
 def test_bounded_bash_reference_error_reports_the_exact_producer(tmp_path) -> None:
     renderer = substitution_renderer(
         VariableContext(normalizer_version=3),
