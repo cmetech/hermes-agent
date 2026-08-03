@@ -849,3 +849,86 @@ platform-neutral. No Task 12+, Phase 4, release gate, customization ledger,
 base checkout, literal `main`, model-tool surface, prompt cache, raw value/path
 evidence, or legacy workflow behavior changed. No known functional concern
 remains in the Fix Round 6 scope.
+
+## Fix Round 7 — quote removal, descriptor heredocs, and physical input semantics
+
+Commit `edd0f9ce4` (`fix(workflow): close bash parser compatibility gaps`)
+closes the four retained Task 11 closure-review findings in the bounded Bash
+classifier and its behavioral contract tests.
+
+### RED evidence and root causes
+
+Before any production edit, the authoritative three-file wrapper run reported
+436 passed and 236 failed. The failures covered file-descriptor-prefixed
+heredocs, quote-removed command words and assignment-builtin operands, joined
+`<<-` operators and multiple heredocs, and physical comment termination across
+admission, scheduler preflight, and direct inline/spill no-launch contracts.
+
+The root causes were:
+
+- a numeric descriptor immediately before `<<` remained recorded as the
+  top-level command word, so subsequent references were classified as
+  arguments instead of command-position content;
+- wrapper names, wrapper options, assignment-builtin names, and assignment
+  operands were compared in their authored form rather than after shell quote
+  removal;
+- the physical heredoc pre-scan recognized only a subset of active
+  continuation joins and did not consistently queue `<<-` or multiple
+  heredocs while retaining authored-coordinate mapping; and
+- the logicalizer erased backslash-newline inside physical comments even
+  though Bash comments terminate at the physical newline and preserve that
+  text literally.
+
+### Fixes
+
+- Descriptor words `0` through `9` are cleared when they prefix `<<` or
+  `<<-`, including leading/multiple redirections, so command position remains
+  correct without widening ordinary numeric-word behavior.
+- A bounded quote-removal helper retains source coordinates while dequoting
+  single-, double-, backslash-, and concatenated shell words. Wrapper and
+  assignment-builtin recognition now uses the dequoted word, and indexed
+  assignment subscripts map rejection back to the authored range even when
+  the name, option, or assignment word is quoted or escaped.
+- The physical heredoc parser now follows active continuations at every
+  operator boundary, including between the two `<` characters and around the
+  `-` in `<<-`; it queues multiple delimiters, preserves tab-stripping
+  semantics, and keeps quoted bodies and physical offsets stable.
+- Continuation preservation now covers physical comment text through its
+  physical newline as well as quoted heredoc bodies. False heredoc-looking
+  tokens in quotes, arithmetic, conditionals, and comments remain data.
+- End-of-input finalization applies the same top-level quote-removal and
+  assignment checks when a shell word ends at EOF.
+
+### GREEN and static evidence
+
+All tests used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`:
+
+- final focused amended files: 3 files, 752 passed;
+- exact required Task 11 contract: 6 files, 883 passed;
+- expanded acceptance set: 11 files, 1,131 passed; and
+- affected resources, serial/parallel schedulers, and performance: 4 files,
+  104 passed.
+
+Ruff lint passed for all four changed Python files. Ruff format validation
+passed for the three files that were format-clean on entry; the retained
+performance file was not mechanically rewritten across its pre-existing
+whole-file drift. Staged and unstaged whitespace checks passed before commit.
+
+### Files changed and residual risk
+
+- `plugins/workflow/bash_rendering.py`
+- `tests/plugins/workflow/test_performance_bounds.py`
+- `tests/plugins/workflow/test_phase3_bash_reference_ordering.py`
+- `tests/plugins/workflow/test_phase3_bash_substitution.py`
+
+The implementation remains a deliberately bounded classifier rather than a
+general Bash parser; the four retained compatibility classes are covered by
+matrix, admission, scheduler, no-launch, physical-offset, false-positive, and
+linear-read contracts. Real-shell execution ran on Darwin with the existing
+Windows platform skip; the classifier and scheduler contracts are
+platform-neutral. No Task 12+, Phase 4, release gate, customization ledger,
+base checkout, literal `main`, model-tool surface, prompt cache, raw value/path
+evidence, or legacy workflow behavior changed. No known functional concern
+remains in the Fix Round 7 scope.
