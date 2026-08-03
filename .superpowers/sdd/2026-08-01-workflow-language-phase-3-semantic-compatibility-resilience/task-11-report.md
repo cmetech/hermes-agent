@@ -932,3 +932,68 @@ platform-neutral. No Task 12+, Phase 4, release gate, customization ledger,
 base checkout, literal `main`, model-tool surface, prompt cache, raw value/path
 evidence, or legacy workflow behavior changed. No known functional concern
 remains in the Fix Round 7 scope.
+
+## Fix Round 8 — unified Bash parser phase state
+
+Implementation commit: `7fdcbee8158aa57bef00ace43fab94e82cf566e8`
+(tree `7e0d50d38b3171ad5e6b3dcfc03ad16a4800555a`).
+
+### Root cause and RED evidence
+
+The retained failures were one architectural class rather than independent
+tokens: a shallow physical pre-scan guessed continuation, comment, quote, and
+heredoc behavior before a separate richer logical classifier reconstructed
+nesting and command state. The two authorities diverged whenever Bash phases
+interacted.
+
+Before any production edit, retry-disabled wrapper tests proved RED:
+
+- process substitution, phase re-entry, and prior-continuation comments:
+  8 passed and 71 failed; and
+- proactive here-string, extglob, and brace-expansion siblings: 4 passed and
+  86 failed.
+
+### Correction
+
+- Removed the divergent physical preservation scan and whole-template logical
+  rewrite from reference classification.
+- Made the bounded classifier operate on authored source with direct physical
+  offsets and continuation-aware token matching.
+- Kept one contextual quote/frame/comment/heredoc state, including command,
+  arithmetic, parameter, backtick, process-substitution, extglob, and brace
+  boundaries.
+- Added maximal-munch redirection recognition so `<<<` is not reconsidered as
+  overlapping `<<`, while ordinary and quoted literal contexts retain their
+  approved behavior.
+- Kept operator probes first-character guarded so the existing linear-read
+  bound remains enforced.
+
+### GREEN and static evidence
+
+All Python tests used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`:
+
+- combined new regression set: 169 passed;
+- full substitution plus authored-offset surfaces: 940 passed;
+- exact required six-file Task 11 gate: 1,078 passed;
+- exact Closure Review 4 eleven-file set: 1,338 passed, with the existing
+  native-Windows managed-process platform skip; and
+- affected resources, serial/parallel schedulers, and performance: 105 passed.
+
+The root controller independently reran the exact eleven-file set after the
+commit: 1,338 passed and 0 failed in 21.6 seconds with retries disabled.
+Ruff, retained formatting checks, and staged/unstaged whitespace checks pass.
+
+### Authenticated review packages
+
+- Fix Round 8 code-only package:
+  `task-11-fix8-review.diff`, SHA-256
+  `33c6a551ee786927e92f484d0a0867cfe5dbede3f7b02e032cb6efc88029f6a3`.
+- Complete Task 11 code package:
+  `task-11-final-review-5.diff`, SHA-256
+  `2cde354a98ab67d47cb4e053e703b5ebf921d7f3c41a968b79687970d662623d`.
+
+Both package bodies were verified byte-identical to their corresponding Git
+diff ranges. Task 12 and Phase 4 remain untouched pending independent Task 11
+specification and quality closure.
