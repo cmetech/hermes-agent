@@ -317,6 +317,42 @@ def test_bash_nodes_substitute_arguments_predecessor_output_and_run_id_safely(
     assert not (store.run_directory(admitted.run_id) / "injected").exists()
 
 
+def test_archon_v3_scheduler_ignores_literal_bash_output_references(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "literal-output-references",
+        name="literal-output-references",
+        nodes=[
+            {
+                "id": "shell",
+                "bash": (
+                    "printf '%s' \\$producer.output\n"
+                    "# $producer.output is literal comment text"
+                ),
+            }
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, key="literal-output-references")
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded", result.get("last_error")
+    stdout = next(
+        artifact
+        for artifact in result["artifacts"]
+        if artifact["node_id"] == "shell" and "stdout" in artifact["relative_path"]
+    )
+    assert (store.run_directory(admitted.run_id) / stdout["relative_path"]).read_text(
+        encoding="utf-8"
+    ) == "$producer.output"
+
+
 @pytest.mark.parametrize("normalizer_version", (2, 3))
 def test_resumed_archon_bash_uses_its_sealed_normalizer_version(
     tmp_path, workflow_writer, normalizer_version

@@ -25,6 +25,7 @@ from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
+from plugins.workflow.bash_rendering import classify_bash_reference_spans
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     evaluate_v3_condition,
@@ -1518,18 +1519,36 @@ class RunScheduler:
         if not retained_output:
             return False
         run_directory = self.store.run_directory(run_id)
-        references = tuple(dict.fromkeys(
-            (reference.node_id, reference.path)
-            for template in self._strict_reference_templates(
-                node,
-                run_directory=run_directory,
-                sealed_resource_paths=sealed_resource_paths,
-                sealed_resource_bytes=sealed_resource_bytes,
+        reference_keys: list[tuple[str, tuple[str, ...]]] = []
+        for template in self._strict_reference_templates(
+            node,
+            run_directory=run_directory,
+            sealed_resource_paths=sealed_resource_paths,
+            sealed_resource_bytes=sealed_resource_bytes,
+        ):
+            template_references = tuple(
+                iter_output_references(template, normalizer_version=3)
             )
-            for reference in iter_output_references(
-                template, normalizer_version=3
+            if node.node_type == "bash":
+                admitted_spans = {
+                    (start, end)
+                    for start, end, _quote in classify_bash_reference_spans(
+                        template,
+                        (
+                            (reference.start, reference.end)
+                            for reference in template_references
+                        ),
+                    )
+                }
+                template_references = tuple(
+                    reference
+                    for reference in template_references
+                    if (reference.start, reference.end) in admitted_spans
+                )
+            reference_keys.extend(
+                (reference.node_id, reference.path) for reference in template_references
             )
-        ))
+        references = tuple(dict.fromkeys(reference_keys))
         retained_node_id = (
             retained_output.node_id
             if isinstance(retained_output, ResolvedNodeOutput)
