@@ -218,27 +218,11 @@ class LoopExecutor:
             until_bash = until_bash_template
             if isinstance(until_bash, str) and until_bash:
                 bash_variables = replace(variables, loop_prev_output=cleaned)
-                spill = (
-                    context.run_directory
-                    / "nodes"
-                    / context.node.id
-                    / context.attempt_id
-                    / f"until-{iteration:04d}-variables"
-                )
-                bash_renderer = substitution_renderer(
-                    bash_variables,
-                    direct_dependencies=context.node.depends_on,
-                    output_resolver=loop_output_resolver,
-                )
-                rendered = bash_renderer.render_bash(
-                    until_bash,
-                    spill_directory=spill,
-                )
                 bash_node = WorkflowNode(
                     id=context.node.id,
                     node_type="bash",
-                    value=rendered,
-                    depends_on=(),
+                    value=until_bash,
+                    depends_on=context.node.depends_on,
                     source_index=context.node.source_index,
                     source_line=context.node.source_line,
                     options=freeze_value({}),
@@ -249,6 +233,7 @@ class LoopExecutor:
                         node=bash_node,
                         attempt_id=f"{context.attempt_id}/until-{iteration:04d}",
                         variable_context=bash_variables,
+                        output_resolver=loop_output_resolver,
                         predecessor_results={},
                         node_state={},
                     )

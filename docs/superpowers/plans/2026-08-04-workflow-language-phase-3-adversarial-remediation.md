@@ -28,8 +28,8 @@
 - Modify: `plugins/workflow/language_schema.py`
 - Modify: `plugins/workflow/bash_rendering.py`
 - Modify: `plugins/workflow/executors/loop.py`
-- Modify: `docs/workflows/portable-schema.md`
-- Modify: `website/docs/user-guide/features/workflows/portable-schema.md`
+- Modify: `skills/software-development/workflow-builder/references/portable-schema.md`
+- Modify: `website/docs/user-guide/features/workflow-yaml-reference.md`
 - Test: `tests/plugins/workflow/test_language_schema.py`
 - Test: `tests/plugins/workflow/test_phase3_bash_substitution.py`
 - Test: `tests/plugins/workflow/test_loop_executor.py`
@@ -124,4 +124,3 @@
 3. Inspect `git diff --check`, worktree status, and the full commit range.
 4. Record which findings were confirmed, which were scope-corrected, the fix commit for each, and exact verification evidence.
 5. Commit documentation reconciliation as `docs(workflow): record adversarial remediation` if artifacts changed.
-

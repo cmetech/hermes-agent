@@ -54,6 +54,11 @@ def test_bash_runtime_bounds_are_reexported_from_the_language_contract() -> None
         == language_schema.BASH_SPILL_MAX_TOTAL_BYTES
         == 2_000_000
     )
+    assert (
+        bash_rendering.BASH_RENDERED_COMMAND_MAX_BYTES
+        == language_schema.BASH_RENDERED_COMMAND_MAX_BYTES
+        == 96 * 1024
+    )
 
 _JOINED_UNSUPPORTED_CONTEXTS = (
     ("(\\\n( {reference} ))", "bare-arithmetic"),
@@ -2670,6 +2675,26 @@ def test_v3_bash_rejects_total_spill_bytes_before_materialization(tmp_path) -> N
 
     assert exc.value.code == "bash_substitution_limit"
     assert not (tmp_path / "variables-v3").exists()
+
+
+def test_v3_bash_rejects_aggregate_inline_command_bytes_before_launch(
+    tmp_path,
+) -> None:
+    launched: list[str] = []
+    command = ": " + " ".join("$USER_MESSAGE" for _index in range(4))
+
+    result, output = _run_v3_bash(
+        tmp_path,
+        command=command,
+        value="x" * 32_768,
+        spawn_intent=lambda nonce: launched.append(nonce) or True,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "bash_substitution_limit"
+    assert launched == []
+    assert output is None
+    assert not (tmp_path / "nodes" / "shell" / "attempt-1" / "variables-v3").exists()
 
 
 def test_v3_bash_accepts_exact_per_value_and_total_spill_byte_limits(

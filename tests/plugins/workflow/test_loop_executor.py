@@ -20,7 +20,7 @@ from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
 )
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import StrictSubstitutionRenderer, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -456,6 +456,48 @@ def test_v3_until_bash_preflight_keeps_loop_previous_output_dynamic(tmp_path) ->
     assert [request.prompt for request in runner.requests] == [
         "Previous: ",
         "Previous: first value",
+    ]
+
+
+def test_v3_until_bash_does_not_rescan_reference_like_model_output(
+    tmp_path, monkeypatch
+) -> None:
+    runner = FakeAgentRunner("$ARGUMENTS")
+    render_calls: list[tuple[str, bool]] = []
+    original_render = StrictSubstitutionRenderer.render_bash
+
+    def count_render(self, template, **kwargs):
+        render_calls.append((template, bool(kwargs.get("secure_v3", False))))
+        return original_render(self, template, **kwargs)
+
+    monkeypatch.setattr(
+        StrictSubstitutionRenderer,
+        "render_bash",
+        count_render,
+    )
+    context = replace(
+        _context(
+            tmp_path,
+            {
+                "prompt": "Produce a literal token",
+                "until": "DONE",
+                "until_bash": "test $LOOP_PREV_OUTPUT = \\$ARGUMENTS",
+                "max_iterations": 1,
+            },
+            variable_context=VariableContext(
+                arguments="must-not-replace-model-output",
+                normalizer_version=3,
+            ),
+        ),
+        normalizer_version=3,
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert render_calls == [
+        ("test $LOOP_PREV_OUTPUT = \\$ARGUMENTS", True),
     ]
 
 

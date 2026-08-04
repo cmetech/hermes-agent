@@ -198,7 +198,9 @@ uses the opaque ID.
 Phase 3 Bash values through the 32,768-byte UTF-8 boundary render inline;
 larger values are consumed as bounded contents, never pathnames. Only ordinary
 authenticated token contexts are rewritten. Escaped/comment references stay
-literal, and ambiguous expansions fail before launch.
+literal, and ambiguous expansions fail before launch. The complete rendered
+command, including descriptor prologue and every inline replacement, is capped
+at 98,304 UTF-8 bytes before materialization or launch.
 
 Only a confirmed missing cross-run session may select one fresh execution,
 with zero provider attempts before recovery. Same-run missing context fails;

@@ -167,6 +167,7 @@ def test_archon_contract_describes_phase3_authoring_semantics_from_inventory():
 
     assert _node_property(schema, "bash", "bash")["x-hermes-semantics"] == {
         "inline_utf8_bytes": 32_768,
+        "rendered_command_utf8_bytes": 96 * 1024,
         "spill_value_utf8_bytes": 500_000,
         "spill_files": 64,
         "spill_total_utf8_bytes": 2_000_000,

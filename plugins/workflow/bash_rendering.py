@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Iterable
 
 from plugins.workflow.language_schema import (
     BASH_INLINE_MAX_BYTES,
+    BASH_RENDERED_COMMAND_MAX_BYTES,
     BASH_SPILL_MAX_FILES,
     BASH_SPILL_MAX_TOTAL_BYTES,
     BASH_SPILL_MAX_VALUE_BYTES,
@@ -1735,6 +1736,43 @@ def _materialize_spills(
         os.close(parent_descriptor)
 
 
+def _compose_v3_bash_command(
+    template: str,
+    ordered: tuple[tuple[int, int, str, str | None], ...],
+    variables: dict[bytes, str],
+    descriptors: tuple[int | str, ...],
+) -> str:
+    prologue = "".join(
+        (
+            f"{variables[data]}=$(command cat <&{descriptors[index]}; "
+            '__hermes_rc=$?; printf x; exit "$__hermes_rc") || exit $?\n'
+            f"{variables[data]}=${{{variables[data]}%x}}\n"
+        )
+        for data, index in (
+            (data, position)
+            for position, data in enumerate(variables)
+        )
+    )
+    rendered: list[str] = [prologue]
+    position = 0
+    for start, end, value, quote in ordered:
+        rendered.append(template[position:start])
+        encoded = value.encode("utf-8")
+        if encoded in variables:
+            variable = variables[encoded]
+            replacement = {
+                None: f'"${{{variable}}}"',
+                '"': f"${{{variable}}}",
+                "'": f"'\"${{{variable}}}\"'",
+            }[quote]
+        else:
+            replacement = _quote_inline_value(value, quote)
+        rendered.append(replacement)
+        position = end
+    rendered.append(template[position:])
+    return "".join(rendered)
+
+
 def render_v3_bash(
     template: str,
     substitutions: Iterable[tuple[int, int, str]],
@@ -1781,6 +1819,21 @@ def render_v3_bash(
             "bash_substitution_limit",
             "Bash substitutions exceed aggregate spill limits",
         )
+    variables = {
+        data: f"__HERMES_WF_SPILL_{digest}"
+        for data, (digest, _index) in spill_by_value.items()
+    }
+    projected = _compose_v3_bash_command(
+        template,
+        ordered,
+        variables,
+        tuple("9" * 20 for _value in spill_values),
+    )
+    if len(projected.encode("utf-8")) > BASH_RENDERED_COMMAND_MAX_BYTES:
+        raise BashRenderingError(
+            "bash_substitution_limit",
+            "rendered Bash command exceeds its aggregate byte limit",
+        )
     if spill_values and (_NATIVE_WINDOWS or not _DESCRIPTOR_SPILLS_SUPPORTED):
         raise BashRenderingError(
             "bash_spill_integrity",
@@ -1805,38 +1858,19 @@ def render_v3_bash(
         transport.read_descriptor_identities if transport is not None else ()
     )
     try:
-        variables = {
-            data: f"__HERMES_WF_SPILL_{digest}"
-            for data, (digest, _index) in spill_by_value.items()
-        }
-        prologue = "".join(
-            (
-                f"{variables[data]}=$(command cat <&{descriptors[index]}; "
-                '__hermes_rc=$?; printf x; exit "$__hermes_rc") || exit $?\n'
-                f"{variables[data]}=${{{variables[data]}%x}}\n"
-            )
-            for data, (_digest, index) in spill_by_value.items()
+        rendered_command = _compose_v3_bash_command(
+            template,
+            ordered,
+            variables,
+            descriptors,
         )
-        rendered: list[str] = [prologue]
-        position = 0
-        for start, end, value, quote in ordered:
-            rendered.append(template[position:start])
-            encoded = value.encode("utf-8")
-            if encoded in variables:
-                variable = variables[encoded]
-                replacement = {
-                    None: f'"${{{variable}}}"',
-                    '"': f"${{{variable}}}",
-                    "'": f"'\"${{{variable}}}\"'",
-                }[quote]
-            else:
-                replacement = _quote_inline_value(value, quote)
-            rendered.append(replacement)
-            position = end
-        rendered.append(template[position:])
-        rendered_command = "".join(rendered)
         template_bytes = template.encode("utf-8")
         rendered_bytes = rendered_command.encode("utf-8")
+        if len(rendered_bytes) > BASH_RENDERED_COMMAND_MAX_BYTES:
+            raise BashRenderingError(
+                "bash_substitution_limit",
+                "rendered Bash command exceeds its aggregate byte limit",
+            )
         spill_digests = tuple(digest for _data, digest in spill_values)
         return RenderedBashCommand(
             command=rendered_command,
@@ -1860,6 +1894,7 @@ def render_v3_bash(
 
 __all__ = [
     "BASH_INLINE_MAX_BYTES",
+    "BASH_RENDERED_COMMAND_MAX_BYTES",
     "BASH_SPILL_MAX_FILES",
     "BASH_SPILL_MAX_TOTAL_BYTES",
     "BASH_SPILL_MAX_VALUE_BYTES",

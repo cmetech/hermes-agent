@@ -209,10 +209,12 @@ operand fails before an executor attempt instead of becoming false.
 Bash substitution measures UTF-8 bytes. Values through 32,768 bytes are
 rendered inline. Larger values are read as contents, not pathnames, with a
 500,000-byte per-value ceiling, at most 64 distinct spills, and a 2,000,000-byte
-total per attempt. Authenticated tokens in ordinary unquoted, double-quoted,
-and safely rewritten single-quoted command-word contexts preserve contents;
-escaped tokens and comments remain literal. Ambiguous shell expansions fail
-before launch.
+total per attempt. The complete rendered command has a separate 98,304-byte
+UTF-8 ceiling, including inline values and the descriptor prologue.
+Authenticated tokens in ordinary unquoted, double-quoted, and safely rewritten
+single-quoted command-word contexts preserve contents; escaped tokens and
+comments remain literal. Ambiguous shell expansions and aggregate command
+overflow fail before launch.
 
 For persistent AI sessions, a missing same-run shared session fails without a
 provider attempt. Only a confirmed missing cross-run registry session may

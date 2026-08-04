@@ -40,6 +40,7 @@ ARCHON_V3_CONDITION_PRECEDENCE = (
 ARCHON_V3_CONDITION_EVALUATION_ORDER = "left_to_right"
 ARCHON_V3_CONDITION_SHORT_CIRCUIT = True
 BASH_INLINE_MAX_BYTES = 32_768
+BASH_RENDERED_COMMAND_MAX_BYTES = 96 * 1024
 BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 BASH_SPILL_MAX_TOTAL_BYTES = 2_000_000
@@ -1036,6 +1037,7 @@ def _field_semantics(
         },
         ("node", "bash"): {
             "inline_utf8_bytes": BASH_INLINE_MAX_BYTES,
+            "rendered_command_utf8_bytes": BASH_RENDERED_COMMAND_MAX_BYTES,
             "spill_value_utf8_bytes": BASH_SPILL_MAX_VALUE_BYTES,
             "spill_files": BASH_SPILL_MAX_FILES,
             "spill_total_utf8_bytes": BASH_SPILL_MAX_TOTAL_BYTES,
