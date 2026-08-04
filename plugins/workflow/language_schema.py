@@ -995,7 +995,7 @@ def _field_description(
 ) -> str:
     """Return stable prose; structured profile semantics are projected separately."""
     if _field_semantics(spec, profile) is not None:
-        return "Semantics."
+        return "v3."
     return spec.description
 
 
@@ -1223,6 +1223,11 @@ def _field(
 NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
+_AI_EXTENSION_NODE_OPTIONS = (
+    ("mcp", "string", "nonempty_string"),
+    ("skills", "array", "string_list"),
+)
+ARCHON_EXTENSION_EXPANSION_PHASE = 4
 
 
 _DEFINITION_FIELDS = (
@@ -1383,21 +1388,16 @@ _NODE_FIELDS = (
         node_types=_AI_NODE_TYPES,
         structural_node_types=NODE_TYPES,
     ),
-    _field(
-        "node",
-        "mcp",
-        "string",
-        "nonempty_string",
-        node_types=_AI_NODE_TYPES,
-        structural_node_types=NODE_TYPES,
-    ),
-    _field(
-        "node",
-        "skills",
-        "array",
-        "string_list",
-        node_types=_AI_NODE_TYPES,
-        structural_node_types=NODE_TYPES,
+    *(
+        _field(
+            "node",
+            name,
+            json_type,
+            shape,
+            node_types=_AI_NODE_TYPES,
+            structural_node_types=NODE_TYPES,
+        )
+        for name, json_type, shape in _AI_EXTENSION_NODE_OPTIONS
     ),
     _field(
         "node",
@@ -2591,13 +2591,24 @@ def contract_documentation(
         separators=(",", ":"),
     )
     phase3_topics = (
-        [{
-            "id": "persistent-session-recovery",
-            "operator_surfaces": [
-                "workflow doctor",
-                "Run Inspector recovery evidence",
-            ],
-        }]
+        [
+            {
+                "id": "persistent-session-recovery",
+                "operator_surfaces": [
+                    "workflow doctor",
+                    "Run Inspector recovery evidence",
+                ],
+            },
+            {
+                "id": "extension-options",
+                "parameters": {
+                    "_".join(
+                        name for name, _json_type, _shape in _AI_EXTENSION_NODE_OPTIONS
+                    ): "options_not_node_kinds",
+                    "loops_includes_phase": ARCHON_EXTENSION_EXPANSION_PHASE,
+                },
+            },
+        ]
         if selected is WorkflowLanguageProfile.ARCHON_2026_07
         else []
     )

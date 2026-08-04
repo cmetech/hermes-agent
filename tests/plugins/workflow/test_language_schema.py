@@ -179,7 +179,20 @@ def test_archon_contract_documentation_derives_stable_codes_and_phase_boundaries
         "workflow doctor",
         "Run Inspector recovery evidence",
     ]
-    assert "extension-options" not in topics
+    assert topics["extension-options"] == {
+        "id": "extension-options",
+        "parameters": {
+            "mcp_skills": "options_not_node_kinds",
+            "loops_includes_phase": 4,
+        },
+    }
+    legacy_topics = {
+        item["id"]: item
+        for item in workflow_authoring_contract(
+            WorkflowLanguageProfile.HERMES_LEGACY
+        )["documentation"]["topics"]
+    }
+    assert "extension-options" not in legacy_topics
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))

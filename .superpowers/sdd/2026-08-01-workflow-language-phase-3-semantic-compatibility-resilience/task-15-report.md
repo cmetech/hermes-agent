@@ -21,7 +21,7 @@ The specification-review correction also projects units and compact semantic
 IDs into editor field descriptors. `resolve_field_semantics()` resolves those
 IDs through the same inventory authority as the inline JSON Schema annotation;
 legacy descriptors retain seconds and expose no v3 semantic ID. The stricter
-default-`json.dumps` envelope remains bounded at 255,907 bytes.
+default-`json.dumps` envelope remains bounded at 255,795 bytes.
 
 ## TDD Evidence
 
@@ -54,6 +54,11 @@ default-`json.dumps` envelope remains bounded at 255,907 bytes.
 - Specification-review I3 GREEN: the provenance-linked portable suite reported
   **4 passed / 0 failed** after real retry, typed-condition, 32,768/32,769-byte
   Bash, and confirmed-missing recovery execution.
+- Specification-rereview I4 RED/GREEN: generated-contract coverage reported
+  **598 passed / 1 failed** on the absent phase-boundary record, then **599
+  passed / 0 failed** after restoring an Archon-only `extension-options` topic
+  derived from the AI extension-option inventory and Phase 4 constant. The
+  focused schema/operator/builder gate passed **608 / 608**.
 
 All Python evidence used `scripts/run_tests.sh` with file retries disabled.
 
@@ -63,12 +68,11 @@ With the project `.venv` active:
 
 ```text
 ./hermes workflow schema --profile archon-2026-07 --json
-profile=archon-2026-07 normalizer_version=3 bytes=255907
+profile=archon-2026-07 normalizer_version=3 bytes=255795 compatibility_codes=39 semantic_refs=25 extension_options=true
 timeout semantics={omitted: 120000, scope: attempt, unit: milliseconds}
 
 ./hermes workflow schema --profile hermes-legacy --json
-profile=hermes-legacy normalizer_version=2 timeout_unit=seconds
-v3 semantics absent
+profile=hermes-legacy normalizer_version=2 bytes=249839 compatibility_codes=9 semantic_refs=0 extension_options=false
 ```
 
 The first probe before activating `.venv` selected the host Python and failed
