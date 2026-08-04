@@ -3007,7 +3007,7 @@ if release_raw:
     def execute_release(nonce: str) -> bool:
         release_seen.append(nonce)
         if cancel_at == "after-release-linearization":
-            threading.Timer(0.05, cancelled.set).start()
+            cancelled.set()
         return True
 
     try:

@@ -1283,7 +1283,11 @@ def _exchange_worker_once(
     try:
         while True:
             now = time.monotonic()
-            if is_cancelled is not None and is_cancelled():
+            if (
+                not provider_released
+                and is_cancelled is not None
+                and is_cancelled()
+            ):
                 raise _PluginAgentCancelled("plugin-agent run cancelled")
             violation = tree.resource_violation(limits)
             if violation is not None:
