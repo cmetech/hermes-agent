@@ -17,6 +17,12 @@ The four Bash bounds are centralized in the dependency-neutral language
 inventory and mechanically re-exported by `bash_rendering.py`, so runtime and
 generated metadata cannot drift.
 
+The specification-review correction also projects units and compact semantic
+IDs into editor field descriptors. `resolve_field_semantics()` resolves those
+IDs through the same inventory authority as the inline JSON Schema annotation;
+legacy descriptors retain seconds and expose no v3 semantic ID. The stricter
+default-`json.dumps` envelope remains bounded at 255,907 bytes.
+
 ## TDD Evidence
 
 - Initial RED: the four-file generated-contract/docs/skill gate reported
@@ -36,7 +42,18 @@ generated metadata cannot drift.
   32,769-byte spill behavior.
 - Installed GREEN: the integration-marked installed-distribution test built and
   installed the wheel, used a clean temporary `HERMES_HOME`, and reported
-  **1 passed / 0 failed** while querying the dynamic Archon schema.
+  **1 passed / 0 failed** while querying the dynamic Archon schema and executing
+  the representative retry/typed-condition flow from the installed artifact.
+- Specification-review I1 RED/GREEN: editor projection reported **597 passed /
+  2 failed** on missing semantic/unit metadata, then **599 passed / 0 failed**
+  after the shared-authority projection and bounded compaction.
+- Specification-review I2 RED/GREEN: the exact durable-code authority reported
+  **19 passed / 1 failed**, identifying the four Bash and four session emitters,
+  then **20 passed / 0 failed** after every one of the 34 observed codes was
+  derived from an invoked production behavior path.
+- Specification-review I3 GREEN: the provenance-linked portable suite reported
+  **4 passed / 0 failed** after real retry, typed-condition, 32,768/32,769-byte
+  Bash, and confirmed-missing recovery execution.
 
 All Python evidence used `scripts/run_tests.sh` with file retries disabled.
 
@@ -46,7 +63,7 @@ With the project `.venv` active:
 
 ```text
 ./hermes workflow schema --profile archon-2026-07 --json
-profile=archon-2026-07 normalizer_version=3 bytes=255992
+profile=archon-2026-07 normalizer_version=3 bytes=255907
 timeout semantics={omitted: 120000, scope: attempt, unit: milliseconds}
 
 ./hermes workflow schema --profile hermes-legacy --json
@@ -74,7 +91,8 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_phase3_bash_substitution.py
 ```
 
-Result: **1,755 passed / 0 failed**. The default marker selection filters the
+Result after the specification-review correction: **1,758 passed / 0 failed**.
+The default marker selection filters the
 installed integration test in this aggregate run; its separate `-m integration`
 run passed 1/1 as recorded above.
 
@@ -89,6 +107,7 @@ successfully, and the Archon envelope remains below its original bound.
 - `skills/software-development/workflow-builder/references/portable-schema.md`
 - `skills/software-development/workflow-builder/references/authoring-checklist.md`
 - `tests/plugins/workflow/test_language_schema.py`
+- `tests/plugins/workflow/test_phase3_code_catalog.py`
 - `tests/plugins/workflow/test_portable_compatibility_e2e.py`
 - `tests/plugins/workflow/test_installed_distribution_e2e.py`
 - `tests/plugins/workflow/test_phase3_bash_substitution.py`

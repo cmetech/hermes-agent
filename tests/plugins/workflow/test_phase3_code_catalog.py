@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
 import plugins.workflow.language_schema as language_schema
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.bash_rendering import BashRenderingError, render_v3_bash
 from plugins.workflow.execution_semantics import WorkflowExecutionSemanticsError
 from plugins.workflow.conditions import (
     WorkflowConditionError,
@@ -27,6 +30,7 @@ from plugins.workflow.models import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import compute_package_digest
 
@@ -116,14 +120,200 @@ _DURABLE_BEHAVIOR_CASES = (
         ),
 )
 
+def _emit_bash_catalog_codes(tmp_path) -> set[str]:
+    template = "$producer.output"
+    span = (0, len(template))
+    emitted: set[str] = set()
+    for index, value in enumerate(("before\0after", "x" * 500_001)):
+        with pytest.raises(BashRenderingError) as exc:
+            render_v3_bash(
+                template,
+                [(span[0], span[1], value)],
+                spill_directory=tmp_path / f"bounds-{index}",
+            )
+        emitted.add(exc.value.code)
+
+    context = "printf '%s' $(( $producer.output ))"
+    start = context.index("$producer.output")
+    with pytest.raises(BashRenderingError) as context_exc:
+        render_v3_bash(
+            context,
+            [(start, start + len(template), "2")],
+            spill_directory=tmp_path / "context",
+        )
+    emitted.add(context_exc.value.code)
+
+    if os.name != "nt":
+        escape = tmp_path / "spill-escape"
+        (escape / "attempt").mkdir(parents=True)
+        alias = tmp_path / "spill-alias"
+        alias.symlink_to(escape, target_is_directory=True)
+        with pytest.raises(BashRenderingError) as spill_exc:
+            render_v3_bash(
+                template,
+                [(span[0], span[1], "x" * 32_769)],
+                spill_directory=alias / "attempt" / "variables-v3",
+            )
+        emitted.add(spill_exc.value.code)
+    else:  # pragma: no cover - POSIX CI owns the descriptor implementation.
+        pytest.skip("real spill-descriptor emitter requires POSIX")
+    return emitted
+
+
+class _CatalogSessionRunner:
+    def __init__(self) -> None:
+        self.requests = []
+        self.shared_failure: BaseException | None = None
+
+    def run(self, request, **_kwargs):
+        self.requests.append(request)
+        if request.context_mode == "shared" and self.shared_failure is not None:
+            raise self.shared_failure
+        return PluginAgentRunResult(
+            final_response="ok",
+            session_id=f"catalog-session-{len(self.requests)}",
+            provider="catalog-provider",
+            model="catalog-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={"provider_attempts": 1},
+        )
+
+
+def _catalog_session_package(workflow_writer, root, *, name, nodes=None):
+    path = workflow_writer(
+        root,
+        name=name,
+        persist_sessions=True,
+        provider="catalog-provider",
+        model="catalog-model",
+        nodes=nodes or [{"id": "analyze", "prompt": "Analyze"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return load_workflow(path)
+
+
+def _run_catalog_session(store, package, runner, registry, key):
+    run_id = _admit_catalog_snapshot(store, package, key=key)
+    return run_id, RunScheduler(
+        store, agent_runner=runner, session_registry=registry
+    ).advance(run_id)
+
+
+def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
+    emitted: set[str] = set()
+    same_package = _catalog_session_package(
+        workflow_writer,
+        tmp_path / "same-package",
+        name="same-session",
+        nodes=[
+            {"id": "first", "prompt": "First"},
+            {
+                "id": "second",
+                "prompt": "Second",
+                "depends_on": ["first"],
+                "context": "shared",
+            },
+        ],
+    )
+    same_home = tmp_path / "same-home"
+    same_runner = _CatalogSessionRunner()
+    same_runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    _same_id, same = _run_catalog_session(
+        RunStore(same_home),
+        same_package,
+        same_runner,
+        NodeSessionRegistry(same_home),
+        "same-run",
+    )
+    emitted.add(same["nodes"]["second"]["attempts"][0]["error_code"])
+
+    package = _catalog_session_package(
+        workflow_writer, tmp_path / "cross-package", name="cross-session"
+    )
+    home = tmp_path / "cross-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _CatalogSessionRunner()
+    _run_catalog_session(store, package, runner, registry, "seed")
+    runner.shared_failure = OSError("registry probe unavailable")
+    _unavailable_id, unavailable = _run_catalog_session(
+        store, package, runner, registry, "unavailable"
+    )
+    emitted.add(unavailable["nodes"]["analyze"]["attempts"][0]["error_code"])
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    recovered_id, recovered = _run_catalog_session(
+        store, package, runner, registry, "recovered"
+    )
+    assert recovered["status"] == "succeeded"
+    emitted.add(
+        next(
+            event["event_type"]
+            for event in store.tail_events(recovered_id)
+            if event["event_type"] == "persistent_session_missing_fresh_start"
+        )
+    )
+
+    class UnavailableRegistry(NodeSessionRegistry):
+        def compare_and_set_or_observe(self, *_args, **_kwargs):
+            raise OSError("registry update unavailable")
+
+    pending_home = tmp_path / "pending-home"
+    pending_store = RunStore(pending_home)
+    pending_registry = UnavailableRegistry(pending_home)
+    pending_runner = _CatalogSessionRunner()
+    pending_id = _admit_catalog_snapshot(
+        pending_store, package, key="pending-update"
+    )
+    clock = [datetime(2026, 8, 1, tzinfo=timezone.utc)]
+    scheduler = RunScheduler(
+        pending_store,
+        agent_runner=pending_runner,
+        session_registry=pending_registry,
+        utcnow=lambda: clock[0],
+    )
+    scheduler.advance(pending_id)
+    for delay in (1, 2, 4, 8):
+        clock[0] += timedelta(seconds=delay)
+        scheduler.advance(pending_id)
+    emitted.add(pending_store.load_run(pending_id)["last_error"]["code"])
+    return emitted
+
+
+def test_every_registered_phase3_code_has_an_executable_emitter(
+    tmp_path, workflow_writer
+) -> None:
+    """Pair the complete registry with real behavior, not catalog prose."""
+    observed: set[str] = set()
+    for index, (node, expected) in enumerate(_DURABLE_BEHAVIOR_CASES):
+        observed.add(
+            _emit_normalization_failure(
+                tmp_path / f"normalization-{index}", workflow_writer, node, expected
+            )
+        )
+    observed.update(_emit_resume_failure_codes(tmp_path / "resume", workflow_writer))
+    observed.update(
+        _emit_static_admission_codes(tmp_path / "admission", workflow_writer)
+    )
+    observed.update(_emit_runtime_reference_codes())
+    observed.update(_emit_condition_codes())
+    observed.update(_emit_resolution_wait_codes(tmp_path / "waits", workflow_writer))
+    observed.update(_emit_bash_catalog_codes(tmp_path / "bash"))
+    observed.update(_emit_session_catalog_codes(tmp_path / "sessions", workflow_writer))
+
+    assert observed == {item.code for item in language_schema.PHASE3_DURABLE_CODES}
+
 
 @pytest.mark.parametrize(
     ("node", "expected"),
     _DURABLE_BEHAVIOR_CASES,
 )
-def test_phase3_catalog_metadata_matches_real_normalization_failure(
+def _emit_normalization_failure(
     tmp_path, workflow_writer, node, expected
-) -> None:
+) -> str:
     path = workflow_writer(
         tmp_path,
         nodes=[node],
@@ -142,6 +332,14 @@ def test_phase3_catalog_metadata_matches_real_normalization_failure(
     assert catalog[emitted]["normalizer_versions"] == [3]
     assert catalog[emitted]["runtime_failure"] is True
     assert catalog[emitted]["evidence"] is False
+    return emitted
+
+
+@pytest.mark.parametrize(("node", "expected"), _DURABLE_BEHAVIOR_CASES)
+def test_phase3_catalog_metadata_matches_real_normalization_failure(
+    tmp_path, workflow_writer, node, expected
+) -> None:
+    assert _emit_normalization_failure(tmp_path, workflow_writer, node, expected)
 
 
 def test_every_task1_normalization_behavior_has_catalog_metadata() -> None:
@@ -180,9 +378,9 @@ def test_task3_static_reference_codes_have_additive_catalog_metadata() -> None:
         assert catalog[code]["evidence"] is False
 
 
-def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
+def _emit_static_admission_codes(
     tmp_path, workflow_writer
-) -> None:
+) -> set[str]:
     emitted: set[str] = set()
 
     unsafe = workflow_writer(
@@ -302,9 +500,16 @@ def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
         "named_script_output_reference_unsupported",
         "invalid_command_resource",
     }
+    return emitted
 
 
-def test_task4_runtime_reference_codes_have_behavior_linked_catalog_entries() -> None:
+def test_task3_catalog_codes_are_emitted_by_real_admission_paths(
+    tmp_path, workflow_writer
+) -> None:
+    assert len(_emit_static_admission_codes(tmp_path, workflow_writer)) == 6
+
+
+def _emit_runtime_reference_codes() -> set[str]:
     canonical = b'{"items":[1],"scalar":3}'
     structured = ResolvedNodeOutput(
         canonical_bytes=canonical,
@@ -349,9 +554,14 @@ def test_task4_runtime_reference_codes_have_behavior_linked_catalog_entries() ->
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False
+    return emitted
 
 
-def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
+def test_task4_runtime_reference_codes_have_behavior_linked_catalog_entries() -> None:
+    assert len(_emit_runtime_reference_codes()) == 5
+
+
+def _emit_condition_codes() -> set[str]:
     canonical = b'"2"'
     structured_string = ResolvedNodeOutput(
         canonical_bytes=canonical,
@@ -418,6 +628,11 @@ def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False
+    return emitted
+
+
+def test_task5_condition_codes_have_behavior_linked_catalog_entries() -> None:
+    assert len(_emit_condition_codes()) == 4
 
 
 def test_task11_bash_codes_have_bounded_runtime_catalog_entries() -> None:
@@ -436,9 +651,9 @@ def test_task11_bash_codes_have_bounded_runtime_catalog_entries() -> None:
         assert catalog[code]["fields"] == ["nodes[].bash"]
 
 
-def test_task6_resolution_wait_codes_have_real_state_machine_emitters(
+def _emit_resolution_wait_codes(
     tmp_path, workflow_writer
-) -> None:
+) -> set[str]:
     """Catch catalog-only transient/exhausted codes with no durable emitter."""
     path = workflow_writer(
         tmp_path / "resolution-catalog",
@@ -513,6 +728,13 @@ def test_task6_resolution_wait_codes_have_real_state_machine_emitters(
         assert catalog[code]["normalizer_versions"] == [3]
         assert catalog[code]["runtime_failure"] is True
         assert catalog[code]["evidence"] is False
+    return {transient, exhausted}
+
+
+def test_task6_resolution_wait_codes_have_real_state_machine_emitters(
+    tmp_path, workflow_writer
+) -> None:
+    assert len(_emit_resolution_wait_codes(tmp_path, workflow_writer)) == 2
 
 
 def _admit_catalog_snapshot(store: RunStore, package, *, key: str) -> str:
@@ -558,9 +780,9 @@ def _reseal_catalog_resources(
     )
 
 
-def test_task2_catalog_codes_are_emitted_by_real_resume_failures(
+def _emit_resume_failure_codes(
     tmp_path, workflow_writer
-) -> None:
+) -> set[str]:
     path = workflow_writer(
         tmp_path,
         nodes=[{"id": "agent", "prompt": "work"}],
@@ -602,10 +824,18 @@ def test_task2_catalog_codes_are_emitted_by_real_resume_failures(
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
-    assert {
+    emitted = {
         language_exc.value.code,
         execution_exc.value.code,
-    } == {
+    }
+    assert emitted == {
         "workflow_language_snapshot_mismatch",
         "workflow_execution_semantics_mismatch",
     }
+    return emitted
+
+
+def test_task2_catalog_codes_are_emitted_by_real_resume_failures(
+    tmp_path, workflow_writer
+) -> None:
+    assert len(_emit_resume_failure_codes(tmp_path, workflow_writer)) == 2

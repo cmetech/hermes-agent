@@ -1,17 +1,54 @@
 from __future__ import annotations
 
+from datetime import datetime
+from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.bash_rendering import render_v3_bash
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.language_schema import NODE_TYPES, workflow_authoring_contract
 from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.showcase import load_showcase_catalog, run_showcase
+from plugins.workflow.store import RunStore
+
+
+def _run_package(package, home, key, **scheduler_kwargs):
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=key,
+        ),
+        immutable_snapshot=prepared,
+    )
+    result = RunScheduler(store, **scheduler_kwargs).advance(admitted.run_id)
+    if result["status"] == "waiting_retry":
+        due = min(
+            datetime.fromisoformat(node["next_attempt_at"])
+            for node in result["nodes"].values()
+            if node.get("next_attempt_at")
+        )
+        result = RunScheduler(
+            store, **scheduler_kwargs, utcnow=lambda: due
+        ).advance(admitted.run_id)
+    return store, admitted.run_id, result
 
 
 def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     tmp_path, workflow_writer
 ) -> None:
     root = tmp_path / "portable"
+    # Adapted from Archon's official node/DAG authoring and `$node.output` material:
+    # https://archon.diy/guides/authoring-workflows/
+    # https://archon.diy/book/quick-reference/
     workflow = workflow_writer(
         root,
         name="portable-contract",
@@ -19,27 +56,19 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
         nodes=[
             {
                 "id": "prepare",
-                "bash": "printf ready",
+                "bash": (
+                    'marker="$ARTIFACTS_DIR/retry-marker"; '
+                    'if [ ! -f "$marker" ]; then : > "$marker"; exit 1; fi; '
+                    "printf 2"
+                ),
                 "timeout": 120_000,
-                "retry": {"max_attempts": 1},
+                "retry": {"max_attempts": 1, "delay_ms": 1_000, "on_error": "all"},
             },
             {
-                "id": "script",
-                "script": "print('ok')",
-                "runtime": "uv",
+                "id": "consume",
+                "bash": "printf consumed",
                 "depends_on": ["prepare"],
-                "when": "$prepare.output == 'ready'",
-            },
-            {
-                "id": "review",
-                "approval": {"message": "Review", "capture_response": True},
-                "depends_on": ["script"],
-            },
-            {
-                "id": "cancel",
-                "cancel": "bounded cancellation",
-                "depends_on": ["review", "script"],
-                "when": "$script.output == 'cancel'",
+                "when": "$prepare.output >= 2",
             },
         ],
     )
@@ -59,12 +88,13 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     assert prepare.options["timeout"] == 120_000
     assert prepare.options["retry"]["max_attempts"] == 1
     assert report.runnable
-    assert [node.node_type for node in package.definition.nodes] == [
-        "bash",
-        "script",
-        "approval",
-        "cancel",
-    ]
+    assert [node.node_type for node in package.definition.nodes] == ["bash", "bash"]
+    _store, _run_id, executed = _run_package(
+        package, tmp_path / "portable-home", "portable-execution"
+    )
+    assert executed["status"] == "succeeded"
+    assert len(executed["nodes"]["prepare"]["attempts"]) == 2
+    assert executed["nodes"]["consume"]["state"] == "succeeded"
     showcase_catalog = load_showcase_catalog()
     assert set(showcase_catalog) == {
         "ai-extensions",
@@ -81,8 +111,9 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     assert offline["status"] == "succeeded"
 
 
-def test_official_archon_bash_boundary_and_recovery_contract_are_discoverable(
+def test_official_archon_bash_boundary_executes_inline_and_spilled_values(
     tmp_path,
+    workflow_writer,
 ) -> None:
     """Exercise representative v3 boundary behavior from the public contract."""
     template = 'printf \'%s\' "$producer.output"'
@@ -107,12 +138,110 @@ def test_official_archon_bash_boundary_and_recovery_contract_are_discoverable(
         inline.close()
         spilled.close()
 
+    for size, expected_spills in ((32_768, 0), (32_769, 1)):
+        workflow = workflow_writer(
+            tmp_path / f"boundary-{size}",
+            name=f"official-boundary-{size}",
+            nodes=[
+                {
+                    "id": "producer",
+                    "bash": (
+                        "/usr/bin/env python3 -c \"import sys; "
+                        f"sys.stdout.write('x'*{size})\""
+                    ),
+                },
+                {
+                    "id": "consumer",
+                    "bash": 'printf \'%s\' "$producer.output"',
+                    "depends_on": ["producer"],
+                },
+            ],
+        )
+        workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+            "language_compatibility: archon-2026-07\n", encoding="utf-8"
+        )
+        package = load_workflow(workflow)
+        _store, _run_id, result = _run_package(
+            package, tmp_path / f"boundary-home-{size}", f"boundary-{size}"
+        )
+        assert result["status"] == "succeeded"
+        metadata = result["nodes"]["consumer"]["attempts"][0]["metadata"]["bash"]
+        assert metadata["spill_count"] == expected_spills
+        assert metadata["spill_total_bytes"] == (size if expected_spills else 0)
+
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
-    topics = {item["id"]: item for item in contract["documentation"]["topics"]}
-    assert topics["persistent-session-recovery"]["operator_surfaces"] == [
-        "workflow doctor",
-        "Run Inspector recovery evidence",
+    bash = contract["definition_schema"]["properties"]["nodes"]["items"][
+        "properties"
+    ]["bash"]
+    assert bash["x-hermes-semantics"]["inline_utf8_bytes"] == 32_768
+
+
+class _MissingSessionRunner:
+    def __init__(self):
+        self.requests = []
+        self.missing = False
+
+    def run(self, request, **_kwargs):
+        self.requests.append(request)
+        if self.missing and request.context_mode == "shared":
+            raise PluginAgentSessionMissingError("confirmed absent")
+        return PluginAgentRunResult(
+            final_response="ok",
+            session_id=f"session-{len(self.requests)}",
+            provider="fixture-provider",
+            model="fixture-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={"provider_attempts": 1},
+        )
+
+
+def test_official_archon_confirmed_missing_cross_run_session_executes_fresh_once(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "recovery",
+        name="official-recovery",
+        persist_sessions=True,
+        provider="fixture-provider",
+        model="fixture-model",
+        nodes=[{"id": "analyze", "prompt": "Analyze the direct input"}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    home = tmp_path / "recovery-home"
+    runner = _MissingSessionRunner()
+    registry = NodeSessionRegistry(home)
+
+    _run_package(
+        package,
+        home,
+        "seed",
+        agent_runner=runner,
+        session_registry=registry,
+    )
+    runner.missing = True
+    store, run_id, recovered = _run_package(
+        package,
+        home,
+        "recover",
+        agent_runner=runner,
+        session_registry=registry,
+    )
+
+    assert recovered["status"] == "succeeded"
+    assert [request.context_mode for request in runner.requests] == [
+        "fresh",
+        "shared",
+        "fresh",
     ]
+    assert sum(
+        event["event_type"] == "persistent_session_missing_fresh_start"
+        for event in store.tail_events(run_id)
+    ) == 1
 
 
 def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(

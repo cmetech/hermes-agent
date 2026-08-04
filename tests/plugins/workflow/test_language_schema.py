@@ -109,6 +109,65 @@ def test_archon_contract_describes_phase3_authoring_semantics_from_inventory():
         "confirmed_cross_run_missing": "one_fresh_execution"
     }
 
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    kinds = {item["id"]: item for item in contract["node_kinds"]}
+
+    for kind, field_path, schema_field in (
+        ("bash", "nodes[].timeout", "timeout"),
+        ("prompt", "nodes[].idle_timeout", "idle_timeout"),
+        ("bash", "nodes[].depends_on", "depends_on"),
+        ("prompt", "nodes[].when", "when"),
+        ("bash", "nodes[].bash", "bash"),
+        ("prompt", "nodes[].persist_session", "persist_session"),
+    ):
+        descriptor = next(
+            item
+            for item in kinds[kind]["fields"]
+            if item["field_path"] == field_path
+        )
+        schema_metadata = _node_property(schema, kind, schema_field)
+        assert language_schema.resolve_field_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            descriptor["semantics"],
+        ) == schema_metadata["x-hermes-semantics"]
+        if "x-hermes-unit" in schema_metadata:
+            assert descriptor["unit"] == schema_metadata["x-hermes-unit"]
+
+    retry_descriptor = next(
+        item
+        for item in kinds["prompt"]["fields"]
+        if item["field_path"] == "nodes[].retry.max_attempts"
+    )
+    assert language_schema.resolve_field_semantics(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        retry_descriptor["semantics"],
+    ) == retry["properties"]["max_attempts"]["x-hermes-semantics"]
+    assert retry_descriptor["unit"] == "count"
+
+
+def test_legacy_editor_descriptors_keep_units_without_v3_semantics():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    kinds = {item["id"]: item for item in contract["node_kinds"]}
+
+    timeout = next(
+        item
+        for item in kinds["bash"]["fields"]
+        if item["field_path"] == "nodes[].timeout"
+    )
+    retry = next(
+        item
+        for item in kinds["prompt"]["fields"]
+        if item["field_path"] == "nodes[].retry.max_attempts"
+    )
+    assert timeout["unit"] == "seconds"
+    assert retry["unit"] == "count"
+    assert "semantics" not in timeout
+    assert "semantics" not in retry
+    assert language_schema.resolve_field_semantics(
+        WorkflowLanguageProfile.HERMES_LEGACY,
+        "timeout",
+    ) is None
+
 
 def test_archon_contract_documentation_derives_stable_codes_and_phase_boundaries():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
@@ -116,10 +175,11 @@ def test_archon_contract_documentation_derives_stable_codes_and_phase_boundaries
 
     assert topics["stable-codes"]["code_source"] == "compatibility_codes"
     assert "codes" not in topics["stable-codes"]
-    assert topics["extension-options"]["parameters"] == {
-        "mcp_skills": "options_not_node_kinds",
-        "loops_includes_phase": 4,
-    }
+    assert topics["persistent-session-recovery"]["operator_surfaces"] == [
+        "workflow doctor",
+        "Run Inspector recovery evidence",
+    ]
+    assert "extension-options" not in topics
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))

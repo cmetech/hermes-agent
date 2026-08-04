@@ -154,6 +154,63 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
         "unsupported_context": "fail",
     }
 
+    installed_flow = tmp_path / "installed-official.yaml"
+    installed_flow.write_text(
+        """name: installed-official
+description: Installed Archon authoring flow
+nodes:
+  - id: prepare
+    bash: 'marker="$ARTIFACTS_DIR/retry-marker"; if [ ! -f "$marker" ]; then : > "$marker"; exit 1; fi; printf 2'
+    timeout: 120000
+    retry: {max_attempts: 1, delay_ms: 1000, on_error: all}
+  - id: consume
+    bash: printf consumed
+    depends_on: [prepare]
+    when: $prepare.output >= 2
+""",
+        encoding="utf-8",
+    )
+    installed_flow.with_name("installed-official.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    installed_execution = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from datetime import datetime; import json,sys; "
+                "from plugins.workflow.admission import RunAdmissionRequest; "
+                "from plugins.workflow.schema import load_workflow; "
+                "from plugins.workflow.scheduler import RunScheduler; "
+                "from plugins.workflow.store import RunStore; "
+                "p=load_workflow(sys.argv[1]); s=RunStore(sys.argv[2]); "
+                "x=s.prepare_run_snapshot(p); a=s.start_run(RunAdmissionRequest("
+                "workflow_name=p.definition.name,definition_digest=x.definition_digest,"
+                "policy_digest=x.policy_digest,input_manifest_digest=x.input_manifest_digest,"
+                "trigger_source='cli',idempotency_key='installed',concurrency_key='installed'),"
+                "immutable_snapshot=x); r=RunScheduler(s).advance(a.run_id); "
+                "due=datetime.fromisoformat(next(n['next_attempt_at'] for n in r['nodes'].values() "
+                "if n.get('next_attempt_at'))); "
+                "r=RunScheduler(s,utcnow=lambda:due).advance(a.run_id); "
+                "print(json.dumps({'status':r['status'],'attempts':len(r['nodes']['prepare']['attempts']),"
+                "'consumer':r['nodes']['consume']['state']}))"
+            ),
+            str(installed_flow),
+            str(home),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert installed_execution.returncode == 0, installed_execution.stderr
+    assert json.loads(installed_execution.stdout) == {
+        "status": "succeeded",
+        "attempts": 2,
+        "consumer": "succeeded",
+    }
+
     showcase_probe = subprocess.run(
         [
             sys.executable,

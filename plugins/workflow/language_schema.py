@@ -994,6 +994,8 @@ def _field_description(
     profile: WorkflowLanguageProfile,
 ) -> str:
     """Return stable prose; structured profile semantics are projected separately."""
+    if _field_semantics(spec, profile) is not None:
+        return "Semantics."
     return spec.description
 
 
@@ -1044,6 +1046,24 @@ def _field_semantics(
             "confirmed_cross_run_missing": "one_fresh_execution"
         },
     }.get(key)
+
+
+def _field_semantics_id(spec: WorkflowFieldSpec) -> str:
+    """Return the stable contract-local id for one authoritative semantic record."""
+    return spec.yaml_name
+
+
+def resolve_field_semantics(
+    profile: WorkflowLanguageProfile,
+    semantics_ref: str,
+) -> dict[str, object] | None:
+    """Resolve an editor semantic id through the same field-inventory authority."""
+    selected = _profile(profile)
+    spec = next(
+        (item for item in FIELD_INVENTORY if _field_semantics_id(item) == semantics_ref),
+        None,
+    )
+    return None if spec is None else _field_semantics(spec, selected)
 
 
 def _freeze_editor_value(value: object) -> object:
@@ -2278,6 +2298,14 @@ def _field_descriptor(
         "status": editor_status,
         "examples": [_thaw_editor_value(example) for example in spec.examples],
     }
+    semantics = _field_semantics(spec, profile)
+    unit = _field_unit(spec, profile)
+    if unit is not None and (
+        profile is WorkflowLanguageProfile.HERMES_LEGACY or semantics is not None
+    ):
+        descriptor["unit"] = unit
+    if semantics is not None:
+        descriptor["semantics"] = _field_semantics_id(spec)
     return descriptor
 
 
@@ -2562,24 +2590,17 @@ def contract_documentation(
         },
         separators=(",", ":"),
     )
-    phase3_topics: list[dict[str, object]] = []
-    if selected is WorkflowLanguageProfile.ARCHON_2026_07:
-        phase3_topics.extend([
-            {
-                "id": "persistent-session-recovery",
-                "operator_surfaces": [
-                    "workflow doctor",
-                    "Run Inspector recovery evidence",
-                ],
-            },
-            {
-                "id": "extension-options",
-                "parameters": {
-                    "mcp_skills": "options_not_node_kinds",
-                    "loops_includes_phase": 4,
-                },
-            },
-        ])
+    phase3_topics = (
+        [{
+            "id": "persistent-session-recovery",
+            "operator_surfaces": [
+                "workflow doctor",
+                "Run Inspector recovery evidence",
+            ],
+        }]
+        if selected is WorkflowLanguageProfile.ARCHON_2026_07
+        else []
+    )
     return {
         "topics": [
             {
