@@ -93,6 +93,58 @@ def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
     assert restarted.pending_attention(run_id="run-1") == ()
 
 
+def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_path):
+    """Provider-controlled delivery errors cannot enter durable public history."""
+    store = RunStore(tmp_path / "notification-private-errors")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    canary = "private-notification-session-provider-path-history"
+    notification_id = outbox.record(
+        run_id="private-notification-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "last_error": canary,
+            "sessionAlias": canary,
+            "nested": {
+                "node_session_id": canary,
+                "messages": [f"embedded {canary}"],
+            },
+        },
+        now=now,
+    )
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    assert leased[0]["notification_id"] == notification_id
+    assert outbox.terminal_fail(
+        notification_id,
+        owner_id="notification-owner",
+        error=canary,
+        now=now,
+    )
+
+    with store._connect() as connection:
+        durable = " ".join(
+            str(value)
+            for row in connection.execute(
+                "SELECT workflow_notification_outbox.payload_json, last_error, "
+                "workflow_notification_facts.payload_json "
+                "FROM workflow_notification_outbox LEFT JOIN "
+                "workflow_notification_facts USING(notification_id) "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+            for value in row
+        )
+    assert canary not in durable
+    assert canary not in str(outbox.history(run_id="private-notification-run"))
+
+
 def test_expired_desktop_lease_returns_to_pending_and_dismissal_is_projection_only(
     tmp_path,
 ):

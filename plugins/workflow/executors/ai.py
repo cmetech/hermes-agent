@@ -806,9 +806,43 @@ class AgentNodeExecutor:
                 "failed",
                 "cancelled",
                 "interrupted",
+                "paused",
             }:
+                allowed_metadata = {
+                    key: value
+                    for key, value in dict(failure.metadata).items()
+                    if key
+                    in {
+                        "provider_attempts",
+                        "provider_attempts_exact",
+                        "known_no_effect",
+                        "unknown_side_effect",
+                        "outcome_unknown",
+                        "archon_terminal_failure",
+                        "additional_provider_attempts",
+                    }
+                    and (
+                        value is None
+                        or isinstance(value, bool | int | float | str)
+                    )
+                }
+                fixed_message = {
+                    "authorization": "selected recovery authorization failed",
+                    "authentication": "selected recovery authentication failed",
+                    "network_error": "selected recovery network operation failed",
+                    "network_disconnect": "selected recovery network operation failed",
+                    "validation": "selected recovery validation failed",
+                    "provider_timeout": "selected recovery provider timed out",
+                    "cancelled": "selected recovery was cancelled",
+                }.get(
+                    str(failure.error_code or ""),
+                    "selected recovery execution failed",
+                )
                 return replace(
                     failure,
+                    artifacts=(),
+                    error_message=fixed_message,
+                    metadata=allowed_metadata,
                     session_recovery_outcome="fresh_execution_failed",
                 )
             return failure

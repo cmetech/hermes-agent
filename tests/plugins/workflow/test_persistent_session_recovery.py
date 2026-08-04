@@ -34,6 +34,7 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
+from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
@@ -412,6 +413,49 @@ def _rewrite_journal_event(
         "\n".join(json.dumps(item) for item in events) + "\n",
         encoding="utf-8",
     )
+
+
+def _rewrite_complete_journal_order(
+    store: RunStore,
+    run_id: str,
+    mutate: Callable[[list[dict[str, object]]], None],
+) -> None:
+    """Rewrite every mutable journal checksum after an order mutation."""
+    directory = store.run_directory(run_id)
+    journal = directory / "events.jsonl"
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    mutate(events)
+    for sequence, event in enumerate(events, 1):
+        event["sequence"] = sequence
+        projection = event.get("projection")
+        if isinstance(projection, dict):
+            projection["event_sequence"] = sequence
+            event["projection_sha256"] = hashlib.sha256(
+                json.dumps(
+                    projection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        material = dict(event)
+        material.pop("frame_sha256", None)
+        event["frame_sha256"] = hashlib.sha256(
+            json.dumps(
+                material,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    encoded = ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+    journal.write_bytes(encoded)
+    with sqlite3.connect(store.database) as connection:
+        connection.execute(
+            "UPDATE runs SET journal_sha256=? WHERE run_id=?",
+            (hashlib.sha256(encoded).hexdigest(), run_id),
+        )
+        connection.commit()
 
 
 def _resolved_running_recovery(
@@ -3481,12 +3525,20 @@ def _assert_private_values_absent(
 ) -> None:
     try:
         public = read_public()
-    except JournalRecoveryError as exc:
+    except RuntimeError as exc:
         encoded = str(exc)
     else:
         encoded = json.dumps(public, sort_keys=True)
     for private_value in private_values:
         assert private_value not in encoded
+
+
+def _private_selection_values(store: RunStore, run_id: str) -> tuple[str, str]:
+    authorities = store._read_private_session_authorities(run_id=run_id)
+    authority = next(
+        iter(authorities["session_recovery_selection_authority"].values())
+    )
+    return str(authority["missing_session_id"]), str(authority["cache_fingerprint"])
 
 
 def _rewrite_recovery_completion_chain(
@@ -3596,8 +3648,7 @@ def test_failed_fresh_recovery_selection_is_the_public_privacy_boundary(
         "fresh-failure-privacy",
     )
     assert result["status"] == "failed"
-    internal = store.load_run(run_id)
-    fingerprint = internal["nodes"]["analyze"]["cache_fingerprint"]
+    _missing_session, fingerprint = _private_selection_values(store, run_id)
     assert len(fingerprint) == 64
 
     for read_public in (
@@ -3851,9 +3902,9 @@ def test_selection_activation_event_privacy_uses_trusted_run_and_sequence(
         f"{identity_damage}-recovery",
     )
     attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
-    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
-        "cache_fingerprint"
-    ]
+    _missing_session, original_fingerprint = _private_selection_values(
+        store, run_id
+    )
     substituted_session = f"private-{identity_damage}-session"
     substituted_fingerprint = hashlib.sha256(
         f"private-{identity_damage}-fingerprint".encode()
@@ -3927,9 +3978,9 @@ def test_later_run_level_event_privacy_uses_selection_activation_boundary(
         registry,
         "later-event-recovery",
     )
-    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
-        "cache_fingerprint"
-    ]
+    _missing_session, original_fingerprint = _private_selection_values(
+        store, run_id
+    )
     substituted_session = "private-later-run-event-session"
     substituted_fingerprint = "e" * 64
 
@@ -4007,21 +4058,22 @@ def test_selection_privacy_leaves_pre_activation_event_payload_unchanged(
     _run_once(store, package, runner, registry, "pre-activation-seed")
     runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
     runner.fresh_failure = True
-    run_id, _result = _run_once(
-        store,
-        package,
-        runner,
-        registry,
-        "pre-activation-recovery",
-    )
     earlier_session = "ordinary-pre-activation-session-field"
     earlier_fingerprint = "d" * 64
+
+    admitted = _admit(store, package, "pre-activation-recovery")
+    run_id = admitted.run_id
 
     def add_earlier_payload(event) -> None:
         event["payload"]["session_id"] = earlier_session
         event["payload"]["cache_fingerprint"] = earlier_fingerprint
 
     _rewrite_journal_event(store, run_id, "run_admitted", add_earlier_payload)
+    RunScheduler(
+        store,
+        agent_runner=runner,
+        session_registry=registry,
+    ).advance(run_id)
     public = json.dumps(store.tail_events(run_id), sort_keys=True)
     assert earlier_session in public
     assert earlier_fingerprint in public
@@ -4126,3 +4178,398 @@ def test_selected_nonwinning_completion_redacts_private_session_fields(
         lambda: EvidenceReader(store).query(admitted.run_id, kind="timeline"),
     ):
         _assert_private_values_absent(read_public, (session_id, fingerprint))
+
+
+def _failed_fresh_recovery_run(tmp_path, workflow_writer, *, name: str):
+    package = _archon_package(workflow_writer, tmp_path / name, name=name)
+    home = tmp_path / f"{name}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"{name}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(store, package, runner, registry, name)
+    assert result["status"] == "failed"
+    return store, run_id
+
+
+def test_new_recovery_authorities_bind_immutable_journal_predecessor_chain(
+    tmp_path, workflow_writer
+) -> None:
+    """Selection and winner rows must authenticate their historical prefix."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "journal-prefix-authorities",
+        name="journal-prefix-authorities",
+    )
+    store = RunStore(tmp_path / "journal-prefix-authorities-home")
+    registry = NodeSessionRegistry(tmp_path / "journal-prefix-authorities-home")
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "journal-prefix-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, _result = _run_once(
+        store, package, runner, registry, "journal-prefix-recovery"
+    )
+
+    with sqlite3.connect(store.database) as connection:
+        rows = connection.execute(
+            "SELECT authority_json FROM session_recovery_selection_authority "
+            "WHERE run_id=? UNION ALL SELECT authority_json FROM "
+            "session_registry_winner_authority WHERE run_id=?",
+            (run_id, run_id),
+        ).fetchall()
+    assert len(rows) == 2
+    for row in rows:
+        authority = json.loads(row[0])
+        assert authority["schema_version"] == 3
+        assert authority["journal_order_version"] == 1
+        assert authority["activation_predecessor_sequence"] == (
+            authority["activation_event_sequence"] - 1
+        )
+        assert len(authority["activation_predecessor_chain_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        pytest.param("journal_order_version", 2, id="unsupported-version"),
+        pytest.param(
+            "activation_predecessor_sequence", -1, id="wrong-predecessor-count"
+        ),
+        pytest.param(
+            "activation_predecessor_chain_sha256",
+            "not-a-digest",
+            id="bad-hex",
+        ),
+        pytest.param(
+            "activation_predecessor_chain_sha256",
+            "0" * 64,
+            id="wrong-run-genesis",
+        ),
+        pytest.param(
+            "unexpected_private_field",
+            "private-extra-field",
+            id="extra-field",
+        ),
+    ),
+)
+def test_malformed_v3_journal_order_authority_fails_closed_value_free(
+    tmp_path, workflow_writer, field, value
+) -> None:
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name=f"malformed-order-{field}"
+    )
+    canary = "malformed-order-private-session-canary"
+    with sqlite3.connect(store.database) as connection:
+        row = connection.execute(
+            "SELECT attempt_id, authority_json FROM "
+            "session_recovery_selection_authority WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        authority = json.loads(row[1])
+        authority[field] = value
+        authority["missing_session_id"] = canary
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":"))
+        connection.execute(
+            "UPDATE session_recovery_selection_authority SET authority_json=?, "
+            "authority_sha256=? WHERE attempt_id=?",
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
+        )
+        connection.commit()
+    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
+
+
+def test_winner_prefix_detects_rewrite_between_selection_and_completion(
+    tmp_path, workflow_writer
+) -> None:
+    """The winner independently binds the selection frame in its predecessor."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "winner-prefix-order",
+        name="winner-prefix-order",
+    )
+    store = RunStore(tmp_path / "winner-prefix-order-home")
+    registry = NodeSessionRegistry(tmp_path / "winner-prefix-order-home")
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "winner-prefix-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, _result = _run_once(
+        store, package, runner, registry, "winner-prefix-recovery"
+    )
+    canary = "winner-prefix-private-canary"
+
+    def rewrite_selection(event) -> None:
+        event["payload"]["message"] = canary
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_missing_fresh_start",
+        rewrite_selection,
+    )
+    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
+
+
+def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name="recovery-pagination-privacy"
+    )
+    authorities = store._read_private_session_authorities(run_id=run_id)
+    authority = next(
+        iter(authorities["session_recovery_selection_authority"].values())
+    )
+    activation = int(authority["activation_event_sequence"])
+    missing_session = str(authority["missing_session_id"])
+    fingerprint = str(authority["cache_fingerprint"])
+    for after in (max(0, activation - 2), activation - 1, activation):
+        _assert_private_values_absent(
+            lambda after=after: store.tail_events(
+                run_id, after_sequence=after, limit=200
+            ),
+            (missing_session, fingerprint),
+        )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ("prefix-delete", "prefix-insert", "prefix-duplicate", "prefix-reorder", "move-later-before"),
+)
+def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
+    tmp_path, workflow_writer, damage
+) -> None:
+    """Recomputed self-checksums cannot rewrite the recovery history prefix."""
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name=f"journal-order-{damage}"
+    )
+    private_session = f"original-private-{damage}-session"
+    private_fingerprint = hashlib.sha256(damage.encode()).hexdigest()
+
+    def damage_events(events: list[dict[str, object]]) -> None:
+        activation = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event_type") == "persistent_session_missing_fresh_start"
+        )
+        later = min(len(events) - 1, activation + 1)
+        payload = events[later].setdefault("payload", {})
+        assert isinstance(payload, dict)
+        payload["session_id"] = private_session
+        payload["cache_fingerprint"] = private_fingerprint
+        payload["message"] = f"embedded {private_session} {private_fingerprint}"
+        if damage == "prefix-delete":
+            del events[0]
+        elif damage == "prefix-insert":
+            events.insert(0, json.loads(json.dumps(events[0])))
+        elif damage == "prefix-duplicate":
+            events.insert(1, json.loads(json.dumps(events[0])))
+        elif damage == "prefix-reorder":
+            events[0], events[1] = events[1], events[0]
+        else:
+            moved = events.pop(later)
+            events.insert(max(0, activation - 1), moved)
+
+    _rewrite_complete_journal_order(store, run_id, damage_events)
+    values = (private_session, private_fingerprint)
+    for reader in (
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+        lambda: NotificationOutbox(store)._journal_candidates(
+            run_id,
+            max_journal_bytes=store.max_journal_bytes,
+        ),
+    ):
+        _assert_private_values_absent(reader, values)
+
+
+def test_activation_or_later_whole_event_privacy_is_recursive_and_value_aware(
+    tmp_path, workflow_writer
+) -> None:
+    """Aliases, nested strings, lists, siblings, and top-level fields are private."""
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name="whole-event-recovery-privacy"
+    )
+    authority = store._read_private_session_authorities(run_id=run_id)
+    selection = next(
+        iter(authority["session_recovery_selection_authority"].values())
+    )
+    missing_session = str(selection["missing_session_id"])
+    fingerprint = str(selection["cache_fingerprint"])
+    substituted_session = "substituted-whole-event-private-session"
+    substituted_fingerprint = "f" * 64
+
+    def add_private_aliases(event) -> None:
+        event["payload"] = {
+            "sessionAlias": missing_session,
+            "fingerprintAlias": substituted_fingerprint,
+            "messages": [
+                f"history {missing_session} {fingerprint}",
+                {"sibling": f"artifact:{substituted_session}"},
+            ],
+            "audit": {"exception": f"provider path {substituted_fingerprint}"},
+            "session_registry_update_candidate": {
+                "new_session_id": substituted_session,
+            },
+        }
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_recovery_outcome",
+        add_private_aliases,
+    )
+    values = (
+        missing_session,
+        fingerprint,
+        substituted_session,
+        substituted_fingerprint,
+    )
+    for reader in (
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(reader, values)
+
+
+def test_unexpected_top_level_journal_fields_fail_closed_without_echo(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name="unexpected-journal-field"
+    )
+    canary = "unexpected-top-level-private-session"
+
+    def add_unexpected_field(event) -> None:
+        event["unexpected_private_alias"] = canary
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_recovery_outcome",
+        add_unexpected_field,
+    )
+    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
+
+
+def test_schema_v2_recovery_authority_is_privacy_only_and_semantically_inert(
+    tmp_path, workflow_writer
+) -> None:
+    """Old unchained authorities cannot be upgraded from a mutable journal."""
+    store, run_id = _failed_fresh_recovery_run(
+        tmp_path, workflow_writer, name="schema-v2-recovery-authority"
+    )
+    with sqlite3.connect(store.database) as connection:
+        row = connection.execute(
+            "SELECT attempt_id, authority_json FROM "
+            "session_recovery_selection_authority WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        authority = json.loads(row[1])
+        authority["schema_version"] = 2
+        authority.pop("journal_order_version", None)
+        authority.pop("activation_predecessor_sequence", None)
+        authority.pop("activation_predecessor_chain_sha256", None)
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":"))
+        connection.execute(
+            "UPDATE session_recovery_selection_authority SET authority_json=?, "
+            "authority_sha256=? WHERE attempt_id=?",
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
+        )
+        connection.commit()
+
+    preactivation_canary = "schema-v2-all-run-private-canary"
+
+    def inject_early(event) -> None:
+        event["payload"]["message"] = preactivation_canary
+
+    _rewrite_journal_event(store, run_id, "run_admitted", inject_early)
+    _assert_private_values_absent(
+        lambda: store.tail_events(run_id), (preactivation_canary,)
+    )
+    with pytest.raises(JournalRecoveryError):
+        store.load_run(run_id)
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    (PermissionError, OSError, ValueError, RuntimeError),
+)
+def test_selected_recovery_exception_diagnostics_are_value_free(
+    tmp_path, workflow_writer, exception_type
+) -> None:
+    """Direct fresh-launch exceptions cannot persist provider-controlled text."""
+    canary = f"private-{exception_type.__name__}-provider-path-history"
+
+    class RaisingFreshRunner(_PersistentRunner):
+        def run(self, request, **kwargs):
+            if request.context_mode == "fresh" and self.shared_failure is not None:
+                raise exception_type(canary)
+            return super().run(request, **kwargs)
+
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"selected-{exception_type.__name__}",
+        name=f"selected-{exception_type.__name__}",
+    )
+    home = tmp_path / f"selected-{exception_type.__name__}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = RaisingFreshRunner()
+    _run_once(store, package, runner, registry, f"{exception_type.__name__}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, _result = _run_once(
+        store, package, runner, registry, f"{exception_type.__name__}-recovery"
+    )
+    assert canary not in (store.run_directory(run_id) / "events.jsonl").read_text()
+    _assert_private_values_absent(lambda: store.get_run_status(run_id), (canary,))
+
+
+def test_selected_recovery_worker_audit_is_allowlisted_before_persistence(
+    tmp_path, workflow_writer
+) -> None:
+    """A failed fresh worker cannot persist arbitrary audit/provider history."""
+    canary = "private-worker-audit-provider-path-history"
+
+    class AuditFreshRunner(_PersistentRunner):
+        def run(self, request, **kwargs):
+            if request.context_mode == "fresh" and self.shared_failure is not None:
+                return PluginAgentRunResult(
+                    final_response=canary,
+                    session_id=canary,
+                    provider=canary,
+                    model=canary,
+                    status="failed",
+                    pending_interaction=None,
+                    usage={"raw": canary},
+                    audit={
+                        "provider_attempts": 1,
+                        "failure_kind": "validation",
+                        "raw_exception": canary,
+                        "history": [canary],
+                        "provider_attempts_exact": canary,
+                        "archon_terminal_failure": canary,
+                    },
+                )
+            return super().run(request, **kwargs)
+
+    package = _archon_package(
+        workflow_writer, tmp_path / "selected-audit", name="selected-audit"
+    )
+    home = tmp_path / "selected-audit-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = AuditFreshRunner()
+    _run_once(store, package, runner, registry, "selected-audit-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, _result = _run_once(
+        store, package, runner, registry, "selected-audit-recovery"
+    )
+    assert canary not in (store.run_directory(run_id) / "events.jsonl").read_text()
+    _assert_private_values_absent(lambda: store.get_run_status(run_id), (canary,))

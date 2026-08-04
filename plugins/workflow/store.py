@@ -224,10 +224,16 @@ def _session_recovery_selection_authority(
     *,
     activation_event_sequence: int,
     activation_event_type: str,
+    activation_predecessor_chain_sha256: str,
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "journal_order_version": 1,
         "activation_event_sequence": activation_event_sequence,
+        "activation_predecessor_sequence": activation_event_sequence - 1,
+        "activation_predecessor_chain_sha256": (
+            activation_predecessor_chain_sha256
+        ),
         "activation_event_type": activation_event_type,
         "run_id": selection.run_id,
         "attempt_id": selection.attempt_id,
@@ -251,10 +257,16 @@ def _session_registry_winner_authority(
     *,
     activation_event_sequence: int,
     activation_event_type: str,
+    activation_predecessor_chain_sha256: str,
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "journal_order_version": 1,
         "activation_event_sequence": activation_event_sequence,
+        "activation_predecessor_sequence": activation_event_sequence - 1,
+        "activation_predecessor_chain_sha256": (
+            activation_predecessor_chain_sha256
+        ),
         "activation_event_type": activation_event_type,
         "candidate": _session_registry_candidate_payload(candidate),
     }
@@ -279,8 +291,17 @@ def _session_recovery_selection_from_authority(
     }
     activation: int | None = None
     event_type: str | None = None
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         expected_fields.update({"activation_event_sequence", "activation_event_type"})
+        if schema_version == 3:
+            expected_fields.update(
+                {
+                    "journal_order_version",
+                    "activation_predecessor_sequence",
+                    "activation_predecessor_chain_sha256",
+                }
+            )
+            _validate_journal_order_authority_fields(value)
         activation_value = value.get("activation_event_sequence")
         if (
             isinstance(activation_value, bool)
@@ -338,13 +359,23 @@ def _session_recovery_selection_from_authority(
 def _session_registry_candidate_from_authority(
     value: object,
 ) -> tuple[SessionRegistryUpdateCandidate, int, int | None, str | None]:
-    if isinstance(value, Mapping) and value.get("schema_version") == 2:
-        if set(value) != {
+    if isinstance(value, Mapping) and value.get("schema_version") in {2, 3}:
+        expected_fields = {
             "schema_version",
             "activation_event_sequence",
             "activation_event_type",
             "candidate",
-        }:
+        }
+        if value.get("schema_version") == 3:
+            expected_fields.update(
+                {
+                    "journal_order_version",
+                    "activation_predecessor_sequence",
+                    "activation_predecessor_chain_sha256",
+                }
+            )
+            _validate_journal_order_authority_fields(value)
+        if set(value) != expected_fields:
             raise JournalRecoveryError("session registry winner authority is malformed")
         activation = value.get("activation_event_sequence")
         if (
@@ -809,6 +840,95 @@ def _journal_frame_digest(event: Mapping[str, object]) -> str:
     return _sha256(encoded)
 
 
+_JOURNAL_ORDER_GENESIS_DOMAIN = b"hermes.workflow.journal-order.v1.genesis\0"
+_JOURNAL_ORDER_STEP_DOMAIN = b"hermes.workflow.journal-order.v1.step\0"
+
+
+def _journal_order_genesis(run_id: str) -> bytes:
+    encoded = run_id.encode("utf-8")
+    return hashlib.sha256(
+        _JOURNAL_ORDER_GENESIS_DOMAIN
+        + len(encoded).to_bytes(8, "big")
+        + encoded
+    ).digest()
+
+
+def _journal_order_checkpoints(
+    run_id: str,
+    events: Iterable[Mapping[str, object]],
+) -> tuple[str, ...]:
+    """Return genesis and every domain-separated ordered frame checkpoint."""
+    chain = _journal_order_genesis(run_id)
+    checkpoints = [chain.hex()]
+    for sequence, event in enumerate(events, 1):
+        if event.get("sequence") != sequence:
+            raise JournalRecoveryError("journal sequence gap")
+        if event.get("run_id") != run_id:
+            raise JournalRecoveryError("journal run identity mismatch")
+        try:
+            frame_digest = bytes.fromhex(_journal_frame_digest(event))
+        except ValueError as exc:
+            raise JournalRecoveryError("journal order authority is invalid") from exc
+        chain = hashlib.sha256(
+            _JOURNAL_ORDER_STEP_DOMAIN
+            + chain
+            + sequence.to_bytes(8, "big")
+            + frame_digest
+        ).digest()
+        checkpoints.append(chain.hex())
+    return tuple(checkpoints)
+
+
+def _validate_journal_order_authority_fields(
+    authority: Mapping[str, object],
+) -> None:
+    activation = authority.get("activation_event_sequence")
+    predecessor = authority.get("activation_predecessor_sequence")
+    digest = authority.get("activation_predecessor_chain_sha256")
+    if (
+        authority.get("journal_order_version") != 1
+        or isinstance(activation, bool)
+        or not isinstance(activation, int)
+        or activation < 1
+        or isinstance(predecessor, bool)
+        or not isinstance(predecessor, int)
+        or predecessor != activation - 1
+        or not isinstance(digest, str)
+        or _SHA256_PATTERN.fullmatch(digest) is None
+    ):
+        raise JournalRecoveryError("private session journal order is malformed")
+
+
+def _validate_private_authority_journal_order(
+    authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
+    events: Iterable[Mapping[str, object]],
+    *,
+    run_id: str,
+) -> None:
+    """Validate every immutable prefix commitment in one bounded linear scan."""
+    ordered_authorities = tuple(
+        authority
+        for table in (
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        )
+        for authority in authorities.get(table, {}).values()
+        if authority.get("schema_version") == 3
+    )
+    if not ordered_authorities:
+        return
+    event_list = tuple(events)
+    checkpoints = _journal_order_checkpoints(run_id, event_list)
+    for authority in ordered_authorities:
+        _validate_journal_order_authority_fields(authority)
+        predecessor = int(authority["activation_predecessor_sequence"])
+        if predecessor >= len(checkpoints) or not hmac.compare_digest(
+            str(authority["activation_predecessor_chain_sha256"]),
+            checkpoints[predecessor],
+        ):
+            raise JournalRecoveryError("private session journal order is invalid")
+
+
 def _encode_journal_frame(event: Mapping[str, object]) -> tuple[dict[str, object], bytes]:
     framed = dict(event)
     framed["schema_version"] = 2
@@ -868,16 +988,81 @@ def _redact_private_session_authority(
 ) -> dict[str, object]:
     """Copy a public run/event projection without exact session authority."""
 
-    def redact_session_fields(item: object) -> None:
+    sensitive_values: set[str] = set()
+
+    def sensitive_key(key: object) -> bool:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        return (
+            normalized.endswith("sessionid")
+            or normalized.endswith("cachefingerprint")
+            or normalized in {"sessionalias", "fingerprintalias"}
+        ) and not normalized.endswith("sha256")
+
+    def collect_sensitive_values(item: object) -> None:
+        pending = [item]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, Mapping):
+                for child_key, child_value in current.items():
+                    if sensitive_key(child_key) and isinstance(child_value, str):
+                        sensitive_values.add(child_value)
+                    pending.append(child_value)
+            elif isinstance(current, list | tuple):
+                pending.extend(current)
+
+    def redact_session_fields(item: object, *, aggressive: bool = False) -> None:
         pending = [item]
         while pending:
             current = pending.pop()
             if isinstance(current, dict):
-                current.pop("session_id", None)
-                current.pop("cache_fingerprint", None)
-                pending.extend(current.values())
+                for child_key in tuple(current):
+                    normalized = re.sub(
+                        r"[^a-z0-9]", "", str(child_key).lower()
+                    )
+                    if sensitive_key(child_key) or normalized in {
+                        "sessionregistryupdatecandidate",
+                        "pendingsessionregistryupdate",
+                        "pendingsessionregistryupdates",
+                    }:
+                        current.pop(child_key, None)
+                        continue
+                    if aggressive and normalized in {
+                        "message",
+                        "warnings",
+                        "lasterror",
+                        "errormessage",
+                        "exception",
+                        "rawexception",
+                        "history",
+                        "providerpath",
+                        "providercontent",
+                        "rawproviderresponse",
+                    }:
+                        current.pop(child_key, None)
+                        continue
+                    child = current[child_key]
+                    if isinstance(child, str):
+                        for private_value in sorted(
+                            sensitive_values, key=len, reverse=True
+                        ):
+                            if private_value:
+                                child = child.replace(private_value, "[REDACTED]")
+                        current[child_key] = child
+                    else:
+                        pending.append(child)
             elif isinstance(current, list):
-                pending.extend(current)
+                for index, child in enumerate(current):
+                    if isinstance(child, str):
+                        for private_value in sorted(
+                            sensitive_values, key=len, reverse=True
+                        ):
+                            if private_value:
+                                child = child.replace(
+                                    private_value, "[REDACTED]"
+                                )
+                        current[index] = child
+                    else:
+                        pending.append(child)
 
     projected = copy.deepcopy(dict(value))
     authority_projection = (
@@ -890,6 +1075,7 @@ def _redact_private_session_authority(
     nodes = authority_projection.get("nodes")
     protected_attempts: set[tuple[str, str]] = set()
     selection_event_privacy = False
+    unchained_all_run_privacy = False
     authority_run_id = trusted_run_id or authority_projection.get("run_id")
     if private_authorities is not None:
         for authority in private_authorities.get(
@@ -904,10 +1090,19 @@ def _redact_private_session_authority(
                     "private session selection authority is malformed"
                 ) from exc
             if selection.run_id == authority_run_id:
+                sensitive_values.update(
+                    {selection.missing_session_id, selection.cache_fingerprint}
+                )
                 protected_attempts.add(
                     (selection.key.node_id, selection.attempt_id)
                 )
                 if (
+                    authority.get("schema_version") == 2
+                    and trusted_event_sequence is not None
+                ):
+                    selection_event_privacy = True
+                    unchained_all_run_privacy = True
+                elif (
                     activation is not None
                     and trusted_event_sequence is not None
                     and trusted_event_sequence >= activation
@@ -930,6 +1125,9 @@ def _redact_private_session_authority(
                 retry_count == 0
                 and candidate.winning_run_id == authority_run_id
             ):
+                sensitive_values.update(
+                    {candidate.new_session_id, candidate.cache_fingerprint}
+                )
                 protected_attempts.add(
                     (candidate.winning_node_id, candidate.winning_attempt_id)
                 )
@@ -986,7 +1184,13 @@ def _redact_private_session_authority(
             str(projected.get("attempt_id") or payload_attempt_id),
         )
         if selection_event_privacy or event_identity in protected_attempts:
+            collect_sensitive_values(payload)
             redact_session_fields(payload)
+    if selection_event_privacy:
+        collect_sensitive_values(projected)
+        redact_session_fields(projected, aggressive=True)
+        if unchained_all_run_privacy and isinstance(projected.get("payload"), dict):
+            projected["payload"] = {}
     return projected
 
 
@@ -4600,6 +4804,19 @@ class RunStore:
                 authorities[table][str(row["attempt_id"])] = authority
         return authorities
 
+    def _journal_predecessor_chain_locked(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        expected_predecessor_sequence: int,
+    ) -> str:
+        events = self._read_journal_events(directory)
+        if len(events) != expected_predecessor_sequence:
+            raise JournalRecoveryError("journal activation predecessor is invalid")
+        checkpoints = _journal_order_checkpoints(run_id, events)
+        return checkpoints[expected_predecessor_sequence]
+
     @staticmethod
     def _bind_private_session_authorities_to_events(
         authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
@@ -4607,10 +4824,16 @@ class RunStore:
         *,
         run_id: str,
     ) -> dict[str, dict[str, Mapping[str, object]]]:
-        """Keep schema-v2 precommits only when their exact frame exists."""
+        """Keep schema-v1/v3 authorities only when immutable activation binds."""
+        event_list = tuple(events)
+        _validate_private_authority_journal_order(
+            authorities,
+            event_list,
+            run_id=run_id,
+        )
         event_by_sequence = {
             int(event["sequence"]): event
-            for event in events
+            for event in event_list
             if isinstance(event.get("sequence"), int)
             and not isinstance(event.get("sequence"), bool)
         }
@@ -4624,6 +4847,10 @@ class RunStore:
             selection, activation, event_type = (
                 _session_recovery_selection_from_authority(authority)
             )
+            if authority.get("schema_version") == 2:
+                # A historical unchained precommit is privacy-only. Inferring a
+                # prefix from the mutable journal would silently upgrade trust.
+                continue
             if activation is not None:
                 event = event_by_sequence.get(activation)
                 if (
@@ -4641,6 +4868,8 @@ class RunStore:
             candidate, _retry_count, activation, event_type = (
                 _session_registry_candidate_from_authority(authority)
             )
+            if authority.get("schema_version") == 2:
+                continue
             if activation is not None:
                 event = event_by_sequence.get(activation)
                 if (
@@ -4848,10 +5077,18 @@ class RunStore:
             "source",
             "provider_attempts_before_recovery",
         }
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             expected_fields.update(
                 {"activation_event_sequence", "activation_event_type"}
             )
+            if schema_version == 3:
+                expected_fields.update(
+                    {
+                        "journal_order_version",
+                        "activation_predecessor_sequence",
+                        "activation_predecessor_chain_sha256",
+                    }
+                )
         elif schema_version != 1:
             return False
         if set(selection_authority) != expected_fields:
@@ -4895,7 +5132,7 @@ class RunStore:
             if isinstance(recovery, Mapping)
             and recovery.get("attempt_id") == attempt_id
         ] if isinstance(recoveries, list) else []
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             activation = selection_authority.get("activation_event_sequence")
             if (
                 isinstance(activation, bool)
@@ -6347,6 +6584,25 @@ class RunStore:
         if frame_version != 1 or event.get("schema_version") != 2:
             raise JournalRecoveryError(
                 f"unsupported journal frame at line {line_number}"
+            )
+        allowed_fields = {
+            "sequence",
+            "timestamp",
+            "run_id",
+            "node_id",
+            "attempt_id",
+            "event_type",
+            "payload",
+            "payload_truncated",
+            "projection",
+            "projection_sha256",
+            "schema_version",
+            "frame_version",
+            "frame_sha256",
+        }
+        if not set(event) <= allowed_fields:
+            raise JournalRecoveryError(
+                f"journal frame fields are invalid at line {line_number}"
             )
         checksum = event.get("frame_sha256")
         if not isinstance(checksum, str) or len(checksum) != 64:
@@ -8053,6 +8309,42 @@ class RunStore:
             )
         return observed, fence
 
+    def _verified_public_journal_events_locked(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes | None = None,
+        recover_torn_tail: bool = True,
+    ) -> tuple[dict[str, object], ...]:
+        """Return one chain-verified, value-free journal view under the run lock."""
+        events = self._read_journal_events(
+            directory,
+            journal_data=journal_data,
+            recover_torn_tail=recover_torn_tail,
+        )
+        positioned_events = _trusted_journal_positions(events)
+        private_authorities = self._read_private_session_authorities(run_id=run_id)
+        bound_private_authorities = self._bind_private_session_authorities_to_events(
+            private_authorities,
+            events,
+            run_id=run_id,
+        )
+        self._validate_recovery_completion_event_authority(
+            events,
+            run_id=run_id,
+            private_authorities=bound_private_authorities,
+        )
+        return tuple(
+            _redact_private_session_authority(
+                event,
+                private_authorities=private_authorities,
+                trusted_run_id=run_id,
+                trusted_event_sequence=position,
+            )
+            for position, event in positioned_events
+        )
+
     def tail_events(
         self,
         run_id: str,
@@ -8065,36 +8357,15 @@ class RunStore:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            events = self._read_journal_events(directory)
-            positioned_events = _trusted_journal_positions(events)
-            private_authorities = self._read_private_session_authorities(
+            events = self._verified_public_journal_events_locked(
+                directory,
                 run_id=run_id,
-            )
-            bound_private_authorities = (
-                self._bind_private_session_authorities_to_events(
-                    private_authorities,
-                    events,
-                    run_id=run_id,
-                )
-            )
-            self._validate_recovery_completion_event_authority(
-                events,
-                run_id=run_id,
-                private_authorities=bound_private_authorities,
             )
         selected = tuple(
-            (position, event)
-            for position, event in positioned_events
-            if int(event["sequence"]) > after_sequence
+            event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
         public_events = []
-        for position, event in selected:
-            event = _redact_private_session_authority(
-                event,
-                private_authorities=private_authorities,
-                trusted_run_id=run_id,
-                trusted_event_sequence=position,
-            )
+        for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(_sanitize(event))
@@ -8148,43 +8419,24 @@ class RunStore:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            all_events = self._read_journal_events(directory)
-            positioned_events = _trusted_journal_positions(all_events)
+            all_events = self._verified_public_journal_events_locked(
+                directory,
+                run_id=run_id,
+            )
             selected_start = max(0, len(all_events) - limit)
-            selected = positioned_events[selected_start:]
-            private_authorities = self._read_private_session_authorities(
-                run_id=run_id,
-            )
-            bound_private_authorities = (
-                self._bind_private_session_authorities_to_events(
-                    private_authorities,
-                    all_events,
-                    run_id=run_id,
-                )
-            )
-            self._validate_recovery_completion_event_authority(
-                all_events,
-                run_id=run_id,
-                private_authorities=bound_private_authorities,
-            )
+            selected = all_events[selected_start:]
         truncated = (
             len(all_events) > limit
             or projection_was_truncated(
-                tuple(event for _position, event in selected)
+                tuple(selected)
             )
             or any(
                 bool(event.get("payload_truncated"))
-                for _position, event in selected
+                for event in selected
             )
         )
         public_events = []
-        for position, event in selected:
-            event = _redact_private_session_authority(
-                event,
-                private_authorities=private_authorities,
-                trusted_run_id=run_id,
-                trusted_event_sequence=position,
-            )
+        for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(sanitize_projection(event))
@@ -9851,6 +10103,15 @@ class RunStore:
                     activation_event_sequence=int(projection["event_sequence"]) + 1,
                     activation_event_type=(
                         "persistent_session_missing_fresh_start"
+                    ),
+                    activation_predecessor_chain_sha256=(
+                        self._journal_predecessor_chain_locked(
+                            directory,
+                            run_id=claim.run_id,
+                            expected_predecessor_sequence=int(
+                                projection["event_sequence"]
+                            ),
+                        )
                     ),
                 )
                 with (
@@ -11657,6 +11918,15 @@ class RunStore:
                                 int(projection["event_sequence"]) + 1
                             ),
                             activation_event_type="node_succeeded",
+                            activation_predecessor_chain_sha256=(
+                                self._journal_predecessor_chain_locked(
+                                    directory,
+                                    run_id=claim.run_id,
+                                    expected_predecessor_sequence=int(
+                                        projection["event_sequence"]
+                                    ),
+                                )
+                            ),
                         ),
                     )
                     if fence_connection is None:

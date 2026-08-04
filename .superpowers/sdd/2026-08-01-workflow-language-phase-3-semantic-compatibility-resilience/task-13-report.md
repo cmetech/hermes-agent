@@ -1570,3 +1570,130 @@ focused and expanded gates.
 No Task 14 work or out-of-scope mutation was performed. No push, publication,
 merge, branch deletion, worktree deletion, literal-`main` mutation, shared
 `base` checkout mutation, or brand-ref mutation was performed.
+
+## Fix Round 9 — Authenticated journal order and centralized value-free recovery
+
+### Starting identity and finding disposition
+
+- HEAD: `d6ed3aeb359a920fe806719b09ca9aaac68756bf`
+- Tree: `3427ba03daab94ac9dda167b14ca1a998872c86c`
+- Worktree: clean
+
+The user explicitly authorized this ninth bounded Task 13 fix round. The round
+addresses the complete specification and quality Round 8 rereview findings in
+one architectural correction. The retained analysis is
+`task-13-round-9-analysis.md`.
+
+### Correction
+
+- Selection and winner private authorities now use schema version 3 and carry
+  a domain-separated predecessor journal-order chain commitment. The
+  commitment is computed under the run lock and validated for every schema-v3
+  authority in one bounded linear scan before semantic binding, projection
+  replay/repair, public event reads, mutable index corroboration, or
+  notification reconciliation.
+- Coherently recomputed deletion, prefix truncation, insertion, duplication,
+  reorder, renumbering, and rewrite before activation fail closed. Exact
+  activation-frame and winner-projection corroboration remain independently
+  required for semantic continuation and registry CAS.
+- Historical schema-v2 authorities are never silently upgraded from mutable
+  journal history: they are privacy-only, impose conservative all-run public
+  privacy, and cannot supply active recovery semantics. Approved schema-v1
+  behavior remains exact.
+- Current framed journals reject unexpected top-level fields. One locked
+  public journal reader now performs order/authority/completion verification
+  before recursively removing session IDs, cache fingerprints, private
+  candidate containers, provider/error/history fields, aliases, and exact
+  authority-known values, including occurrences inside nested strings and
+  list elements.
+- Selected fresh-recovery failures persist fixed messages, no artifacts, and
+  only bounded operational metadata. Raw provider/worker exceptions, audit
+  history, provider path/content, model/session data, usage, and fingerprints
+  cannot enter durable public recovery diagnostics.
+- Direct notification append uses a recursive value-free projection and fixed
+  delivery errors. Raw-journal notification reconciliation now consumes the
+  same locked, chain-verified public event boundary and never persists raw
+  `last_error`.
+- Existing journal corruption without a private schema-v3 authority retains
+  its established fixed `sequence gap` / run-identity taxonomy.
+
+No provider release boundary, cancellation linearization, retry accounting,
+command authority, workflow language surface, prompt/tool schema, Desktop
+production file, or legacy/unversioned behavior changed.
+
+### Exact TDD and adversarial evidence
+
+Every Python command used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`. No direct pytest invocation or retry was used.
+
+Initial focused RED before production edits:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_notifications.py
+```
+
+Result: **129 passed / 14 failed**. The failures proved the missing schema-v3
+selection/winner chain, coherent order-mutation detection, whole-event
+recursive privacy, conservative schema-v2 behavior, fixed exception/worker
+diagnostics, and value-free notification persistence.
+
+The complete focused rerun after correction passed **149/149**. Self-review
+then added explicit malformed-v3 rows for unsupported version, wrong
+predecessor count, bad hex, a valid-length wrong-genesis digest, and an extra
+authority field; all five pass. It also added a direct notification alias,
+nested session-ID, and embedded-list-string canary. That notification test was
+RED before the recursive direct-append correction and GREEN afterward.
+
+The order-damage matrix contiguously renumbers events and recomputes every
+mutable frame/projection/journal/index digest after prefix deletion, insertion,
+duplication, reorder, and moving a later private payload before activation.
+Store tail/latest/events-after, timeline evidence, and raw-journal notification
+reconciliation all fail closed without returning the canaries. Existing real
+authenticated API, Desktop, CLI, no-fence selection/winner, crash boundary,
+typed/schemaless, success/failure/cancel/interruption, and Showcase tests share
+the same verified store boundary.
+
+### Final Fix Round 9 verification
+
+Canonical Task 13 ten-file command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Result: **10 files, 360 passed / 0 failed**, 14 workers, 43.3 seconds.
+
+Expanded agent/scheduler/Desktop/API/CLI/notification/Showcase command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_showcase_evidence.py
+```
+
+Result: **11 files, 624 passed / 0 failed**, 14 workers, 83.9 seconds. The
+generic plugin-agent file passed **129/129**, authenticated Desktop API passed
+**157/157**, notifications passed **13/13**, and Showcase passed **4/4**.
+
+Additional security/performance command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_performance_bounds.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: **2 files, 43 passed / 0 failed**, 14 workers, 26.8 seconds.
+
+### Fix Round 9 changed files and self-review
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-analysis.md`
+- `plugins/workflow/executors/ai.py`
+- `plugins/workflow/notifications.py`
+- `plugins/workflow/store.py`
+- `tests/plugins/workflow/test_notifications.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+The correction is confined to Task 13 recovery order authority, public
+privacy, diagnostics, notifications, and their tests/evidence. No Task 14 work
+or out-of-scope mutation was performed. No push, publication, merge, branch
+deletion, worktree deletion, literal-`main` mutation, shared `base` checkout
+mutation, or brand-ref mutation was performed.
