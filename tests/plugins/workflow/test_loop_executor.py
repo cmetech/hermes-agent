@@ -769,25 +769,27 @@ def test_scheduler_preserves_terminal_frames_when_loop_reaches_journal_quota(
 def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     tmp_path: Path, workflow_writer
 ) -> None:
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="resumable-loop",
-            interactive=True,
-            nodes=[
-                {
-                    "id": "iterate",
-                    "loop": {
-                        "prompt": "Feedback: $LOOP_USER_INPUT",
-                        "until": "DONE",
-                        "max_iterations": 2,
-                        "interactive": True,
-                        "gate_message": "Review",
-                    },
-                }
-            ],
-        )
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="resumable-loop",
+        interactive=True,
+        nodes=[
+            {
+                "id": "iterate",
+                "loop": {
+                    "prompt": "Feedback: $LOOP_USER_INPUT",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                    "interactive": True,
+                    "gate_message": "Review",
+                },
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -804,6 +806,7 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     )
     RunScheduler(store, agent_runner=FakeAgentRunner("draft")).advance(admitted.run_id)
     paused = store.load_run(admitted.run_id)
+    assert paused["nodes"]["iterate"].get("retry_consumed", 0) == 0
     interaction_id = paused["nodes"]["iterate"]["pending_interaction"][
         "interaction_id"
     ]
@@ -819,6 +822,7 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
 
     assert resumed["status"] == "running"
     assert completed["status"] == "succeeded"
+    assert completed["nodes"]["iterate"]["retry_consumed"] == 1
     assert runner.requests[0].prompt == "Feedback: tighten evidence"
     assert (
         "tighten evidence"

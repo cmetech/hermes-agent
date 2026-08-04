@@ -532,29 +532,32 @@ def test_approval_rework_rechecks_wall_after_prompt_preparation(
 def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     tmp_path, workflow_writer
 ):
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="rework-gate",
-            nodes=[
-                {
-                    "id": "review",
-                    "approval": {
-                        "message": "Approve?",
-                        "on_reject": {
-                            "prompt": "Revise because: $REJECTION_REASON",
-                            "max_attempts": 1,
-                        },
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="rework-gate",
+        nodes=[
+            {
+                "id": "review",
+                "approval": {
+                    "message": "Approve?",
+                    "on_reject": {
+                        "prompt": "Revise because: $REJECTION_REASON",
+                        "max_attempts": 1,
                     },
-                }
-            ],
-        )
+                },
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     admitted = _start(store, package, key="rework")
     runner = ReworkRunner()
     scheduler = RunScheduler(store, agent_runner=runner)
     first_pause = scheduler.advance(admitted.run_id)
+    assert first_pause["nodes"]["review"].get("retry_consumed", 0) == 0
 
     rejected = store.reject_run(
         admitted.run_id,
@@ -567,6 +570,7 @@ def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     assert rejected.outcome == "applied"
     second_pause = scheduler.advance(admitted.run_id)
     assert second_pause["status"] == "paused"
+    assert second_pause["nodes"]["review"].get("retry_consumed", 0) == 0
     assert runner.requests[0].prompt == "Revise because: missing evidence"
     assert second_pause["nodes"]["review"]["approval_rework_attempts"] == 1
 
@@ -824,7 +828,7 @@ def test_approval_permission_error_stays_authorization_without_provider_charge(
 class ToolApprovalRunner:
     def __init__(self):
         self.requests = []
-        self.digests = iter(("a" * 64, "b" * 64))
+        self.digests = iter(("a" * 64, "b" * 64, "c" * 64))
 
     def run(self, request, **_kwargs):
         self.requests.append(request)
@@ -837,26 +841,35 @@ class ToolApprovalRunner:
             status="paused",
             pending_interaction={"kind": "approval", "action_digest": digest},
             usage={},
-            audit={},
+            audit={"provider_attempts": 1, "model_calls": 1},
         )
 
 
-def test_worker_action_grant_is_consumed_before_spawn_and_mismatch_repauses(
+def test_worker_action_grant_pauses_remain_resumable_until_outcome(
     tmp_path, workflow_writer
 ):
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="tool-gate",
-            nodes=[{"id": "act", "prompt": "perform action"}],
-        )
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="tool-gate",
+        nodes=[
+            {
+                "id": "act",
+                "prompt": "perform action",
+                "retry": {"max_attempts": 1},
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     admitted = _start(store, package, key="tool")
     runner = ToolApprovalRunner()
     scheduler = RunScheduler(store, agent_runner=runner)
     first = scheduler.advance(admitted.run_id)
     pending = first["nodes"]["act"]["pending_interaction"]
+    assert first["nodes"]["act"].get("retry_consumed", 0) == 0
 
     store.approve_run(
         admitted.run_id,
@@ -867,7 +880,21 @@ def test_worker_action_grant_is_consumed_before_spawn_and_mismatch_repauses(
 
     assert runner.requests[1].approved_action_digest == "a" * 64
     assert second["status"] == "paused"
+    assert second["nodes"]["act"].get("retry_consumed", 0) == 0
     assert second["nodes"]["act"]["pending_interaction"]["action_digest"] == "b" * 64
+    store.approve_run(
+        admitted.run_id,
+        expected_state_version=second["state_version"],
+        interaction_id=second["nodes"]["act"]["pending_interaction"][
+            "action_digest"
+        ],
+    )
+    third = scheduler.advance(admitted.run_id)
+
+    assert runner.requests[2].approved_action_digest == "b" * 64
+    assert third["status"] == "paused"
+    assert third["nodes"]["act"].get("retry_consumed", 0) == 0
+    assert third["nodes"]["act"]["pending_interaction"]["action_digest"] == "c" * 64
     persisted = (store.run_directory(admitted.run_id) / "events.jsonl").read_text()
     assert "approved_action_digest" not in persisted
 

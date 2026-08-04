@@ -4,7 +4,7 @@
 
 **Goal:** Resolve the one CRITICAL and seven HIGH Phase 3 review findings without weakening prompt-cache stability, provider-call accounting, execution fencing, or the user's validation restriction.
 
-**Architecture:** Keep the fixes at their existing ownership boundaries: Bash admission/rendering in `bash_rendering.py`, durable accounting/transitions in scheduler/store, session transport typing in `agent/plugin_agent.py`, AI recovery classification in the AI executor, and upstream/release protection in the customization ledger and focused merge gate. Preserve provider-call charges for AI action-grant pauses; only interaction-only approval and loop-input pauses are exempt from workflow retry charging.
+**Architecture:** Keep the fixes at their existing ownership boundaries: Bash admission/rendering in `bash_rendering.py`, durable accounting/transitions in scheduler/store, session transport typing in `agent/plugin_agent.py`, AI recovery classification in the AI executor, and upstream/release protection in the customization ledger and focused merge gate. Treat every durable interaction pause as continuation of the same logical attempt; charge the retry ledger only when that attempt reaches a non-paused outcome.
 
 **Test discipline:** For each task, add the smallest ordinary regression test, run it to observe the intended failure, implement the fix, and rerun the focused file. The two suites prohibited by the active user override (`test_phase3_bash_lexer_security.py` and `test_persistent_session_recovery.py`) remain outside automated release gates; targeted ordinary tests in the latter may be run by exact node ID only when needed for crash/accounting remediation.
 
@@ -62,9 +62,9 @@
 - Test: `tests/plugins/workflow/test_loop_executor.py`
 
 1. Add v3 scheduler tests for approval reject/rework and interactive loop input proving pause/resume does not consume their one-attempt workflow grant.
-2. Add or strengthen a v3 AI action-grant assertion proving its provider-bearing pause remains charged.
+2. Add a v3 AI action-grant assertion proving its pause remains a resumable continuation rather than exhausting a zero-retry workflow.
 3. Run the tests to reproduce approval/loop exhaustion.
-4. Add a narrow scheduler predicate for `workflow_approval` and `loop_input` interaction-only pauses; skip retry charging only for those cases.
+4. Skip retry-ledger charging for paused results; feature-specific approval/rework, loop-iteration, and agent-iteration bounds continue to govern those resumable continuations.
 5. Run the focused approval, loop, and retry-accounting tests.
 6. Commit as `fix(workflow): exclude interaction waits from retry grants`.
 

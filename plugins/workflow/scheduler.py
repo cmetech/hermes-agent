@@ -3441,6 +3441,7 @@ class RunScheduler:
         if execution_semantics is not None and result.status not in {
             "cancelled",
             "interrupted",
+            "paused",
         }:
             projection = self.store.load_run(claim.run_id)
             node_state = projection["nodes"][claim.node_id]
