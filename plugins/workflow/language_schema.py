@@ -39,6 +39,10 @@ ARCHON_V3_CONDITION_PRECEDENCE = (
 )
 ARCHON_V3_CONDITION_EVALUATION_ORDER = "left_to_right"
 ARCHON_V3_CONDITION_SHORT_CIRCUIT = True
+BASH_INLINE_MAX_BYTES = 32_768
+BASH_SPILL_MAX_FILES = 64
+BASH_SPILL_MAX_VALUE_BYTES = 500_000
+BASH_SPILL_MAX_TOTAL_BYTES = 2_000_000
 ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
     "quoted_equality": "exact_string_only",
     "unquoted_decimal_equality": "canonical_finite_number_only",
@@ -985,6 +989,63 @@ def _description_for(scope: str, yaml_name: str) -> str:
     return f"{subject} within the node's {scope.replace('_', ' ')} settings."
 
 
+def _field_description(
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+) -> str:
+    """Return stable prose; structured profile semantics are projected separately."""
+    return spec.description
+
+
+def _field_semantics(
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+) -> dict[str, object] | None:
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return None
+    key = (spec.scope, spec.yaml_name)
+    return {
+        ("node", "timeout"): {
+            "unit": "milliseconds",
+            "omitted": 120_000,
+            "scope": "attempt",
+        },
+        ("node", "idle_timeout"): {
+            "unit": "milliseconds",
+            "omitted": "sealed_ai_idle",
+            "scope": "attempt",
+        },
+        ("retry", "max_attempts"): {
+            "counts": "retries_after_initial",
+            "omitted_ai": 2,
+            "omitted_deterministic": 0,
+        },
+        ("node", "depends_on"): {"output_references": "direct_only"},
+        ("node", "when"): {
+            "operands": "typed_scalar",
+            "false": "skip",
+            "errors": "fail_pre_execution",
+        },
+        ("node", "bash"): {
+            "inline_utf8_bytes": BASH_INLINE_MAX_BYTES,
+            "spill_value_utf8_bytes": BASH_SPILL_MAX_VALUE_BYTES,
+            "spill_files": BASH_SPILL_MAX_FILES,
+            "spill_total_utf8_bytes": BASH_SPILL_MAX_TOTAL_BYTES,
+            "large_values": "contents",
+            "contexts": {
+                "unquoted_token": "substitute",
+                "double_quoted_token": "substitute",
+                "single_quoted_token": "safe_quote_boundary",
+                "escaped_or_comment": "literal",
+            },
+            "unsupported_context": "fail",
+        },
+        ("node", "persist_session"): {
+            "confirmed_cross_run_missing": "one_fresh_execution"
+        },
+    }.get(key)
+
+
 def _freeze_editor_value(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({
@@ -1897,7 +1958,7 @@ def _field_schema(
     status = _field_status(spec, profile)
     result.update({
         "title": spec.title,
-        "description": spec.description,
+        "description": _field_description(spec, profile),
         "x-hermes-section": spec.section,
         "x-hermes-order": _field_order(spec),
         "x-hermes-widget": spec.widget,
@@ -1930,6 +1991,9 @@ def _field_schema(
         result["x-hermes-unit"] = unit
     if spec.value_role is not None:
         result["x-hermes-value-role"] = spec.value_role
+    semantics = _field_semantics(spec, profile)
+    if semantics is not None:
+        result["x-hermes-semantics"] = semantics
     if status.status != "supported":
         result["x-hermes-compatibility-code"] = status.code
         result["x-hermes-enforcement-phase"] = spec.enforcement_phase
@@ -2198,10 +2262,10 @@ def _field_descriptor(
         and _editor_status(parent_status.status) == "deferred"
         else _editor_status(status.status)
     )
-    return {
+    descriptor: dict[str, object] = {
         "id": f"{node_type}.{spec.scope}.{spec.yaml_name}",
         "label": spec.title,
-        "description": spec.description,
+        "description": _field_description(spec, profile),
         "field_path": field_path,
         "applicability": {
             "profiles": [profile.value],
@@ -2214,6 +2278,7 @@ def _field_descriptor(
         "status": editor_status,
         "examples": [_thaw_editor_value(example) for example in spec.examples],
     }
+    return descriptor
 
 
 def _node_example(node_type: str) -> dict[str, object]:
@@ -2497,6 +2562,24 @@ def contract_documentation(
         },
         separators=(",", ":"),
     )
+    phase3_topics: list[dict[str, object]] = []
+    if selected is WorkflowLanguageProfile.ARCHON_2026_07:
+        phase3_topics.extend([
+            {
+                "id": "persistent-session-recovery",
+                "operator_surfaces": [
+                    "workflow doctor",
+                    "Run Inspector recovery evidence",
+                ],
+            },
+            {
+                "id": "extension-options",
+                "parameters": {
+                    "mcp_skills": "options_not_node_kinds",
+                    "loops_includes_phase": 4,
+                },
+            },
+        ])
     return {
         "topics": [
             {
@@ -2542,6 +2625,11 @@ def contract_documentation(
                 },
                 "examples": [profile_sidecar],
             },
+            {
+                "id": "stable-codes",
+                "code_source": "compatibility_codes",
+            },
+            *phase3_topics,
         ],
         "examples": [
             {

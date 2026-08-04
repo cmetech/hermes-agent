@@ -14,15 +14,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
+from plugins.workflow.language_schema import (
+    BASH_INLINE_MAX_BYTES,
+    BASH_SPILL_MAX_FILES,
+    BASH_SPILL_MAX_TOTAL_BYTES,
+    BASH_SPILL_MAX_VALUE_BYTES,
+)
+
 
 if TYPE_CHECKING:
     from tools.managed_process import InheritedDescriptorIdentity
 
 
-BASH_INLINE_MAX_BYTES = 32_768
-BASH_SPILL_MAX_FILES = 64
-BASH_SPILL_MAX_VALUE_BYTES = 500_000
-BASH_SPILL_MAX_TOTAL_BYTES = 2_000_000
 _BASH_LEXER_MAX_NESTING = 64
 _BASH_SCALAR_REFERENCE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"

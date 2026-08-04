@@ -1,0 +1,107 @@
+# Task 15 Report — Published Phase 3 Language Contract
+
+## Outcome
+
+The dynamic workflow contract now publishes compact, profile-specific Phase 3
+semantics from `language_schema.py`: Archon timeout units and omission behavior,
+retry-after-initial defaults, direct-dependency and typed-condition rules,
+bounded Bash substitution, and confirmed-missing cross-run recovery. Legacy
+keeps normalizer v2, seconds, and its existing warnings.
+
+The website and workflow-builder references now follow that authority. They
+direct readers to generated `compatibility_codes` instead of copying an
+exhaustive stable-code list, retain MCP and skills as AI-node options, and keep
+loop/include expansion in Phase 4. No generated JSON Schema was checked in.
+
+The four Bash bounds are centralized in the dependency-neutral language
+inventory and mechanically re-exported by `bash_rendering.py`, so runtime and
+generated metadata cannot drift.
+
+## TDD Evidence
+
+- Initial RED: the four-file generated-contract/docs/skill gate reported
+  **622 passed / 4 failed**. The failures were the intended generic timeout
+  description, missing generated stable-code/recovery topics, and stale Phase 2
+  skill guidance.
+- Contract-bound correction: the first GREEN attempt reported **624 passed /
+  2 failed** because the additive envelope exceeded its existing 256,000-byte
+  bound. Structured metadata was compacted without weakening the bound.
+- Generated/docs GREEN: the same four-file command reported **626 passed / 0
+  failed**.
+- Fixture RED: the representative Archon fixture first rejected the legacy
+  `variables` field, then rejected an indirect output reference. Removing the
+  legacy-only field and declaring the referenced producer directly made the
+  fixture valid without weakening v3.
+- Portable GREEN: **3 passed / 0 failed**, including real 32,768-byte inline and
+  32,769-byte spill behavior.
+- Installed GREEN: the integration-marked installed-distribution test built and
+  installed the wheel, used a clean temporary `HERMES_HOME`, and reported
+  **1 passed / 0 failed** while querying the dynamic Archon schema.
+
+All Python evidence used `scripts/run_tests.sh` with file retries disabled.
+
+## Dynamic Schema Evidence
+
+With the project `.venv` active:
+
+```text
+./hermes workflow schema --profile archon-2026-07 --json
+profile=archon-2026-07 normalizer_version=3 bytes=255992
+timeout semantics={omitted: 120000, scope: attempt, unit: milliseconds}
+
+./hermes workflow schema --profile hermes-legacy --json
+profile=hermes-legacy normalizer_version=2 timeout_unit=seconds
+v3 semantics absent
+```
+
+The first probe before activating `.venv` selected the host Python and failed
+before command dispatch. Repeating it in the documented development environment
+produced the evidence above; no product change was needed.
+
+## Verification
+
+The required seven-file matrix plus the narrow Bash authority regression:
+
+```text
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase3_code_catalog.py \
+  tests/plugins/workflow/test_language_schema.py \
+  tests/plugins/workflow/test_portable_compatibility_e2e.py \
+  tests/plugins/workflow/test_installed_distribution_e2e.py \
+  tests/plugins/workflow/test_showcase_distribution_e2e.py \
+  tests/agent/test_workflow_builder_skill.py \
+  tests/skills/test_workflow_operator_behavior.py \
+  tests/plugins/workflow/test_phase3_bash_substitution.py
+```
+
+Result: **1,755 passed / 0 failed**. The default marker selection filters the
+installed integration test in this aggregate run; its separate `-m integration`
+run passed 1/1 as recorded above.
+
+Scoped Ruff and `git diff --check` passed. Both dynamic profile probes parsed
+successfully, and the Archon envelope remains below its original bound.
+
+## Files Changed
+
+- `plugins/workflow/language_schema.py`
+- `plugins/workflow/bash_rendering.py`
+- `website/docs/user-guide/features/workflow-yaml-reference.md`
+- `skills/software-development/workflow-builder/references/portable-schema.md`
+- `skills/software-development/workflow-builder/references/authoring-checklist.md`
+- `tests/plugins/workflow/test_language_schema.py`
+- `tests/plugins/workflow/test_portable_compatibility_e2e.py`
+- `tests/plugins/workflow/test_installed_distribution_e2e.py`
+- `tests/plugins/workflow/test_phase3_bash_substitution.py`
+- `tests/agent/test_workflow_builder_skill.py`
+- `tests/skills/test_workflow_operator_behavior.py`
+- retained Task 15 progress and this report
+
+## Deviations and Concerns
+
+The parent authorized one narrow ownership exception for `bash_rendering.py`
+and its regression test so the generated contract could own the four existing
+bounds without creating a second authority. The change is import/re-export
+only and preserves existing names and behavior.
+
+No blocking concern remains. Task 16 final verification is still pending; this
+report does not claim Phase 3 completion.

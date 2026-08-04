@@ -44,7 +44,7 @@ because older strict companion parsers reject the new field. An explicit
 `hermes-legacy` declaration is suitable only when every reader recognizes
 `language_compatibility`.
 
-Phase 2 supports Archon AI `output_format` and `output_type`. `output_format`
+Phase 3 supports Archon AI `output_format` and `output_type`. `output_format`
 is normalized as bounded Draft 2020-12 JSON Schema when the package loads, and
 direct `$node.output.field` condition references are rejected only when every
 closed schema branch proves that field path impossible. `output_type` is
@@ -57,13 +57,21 @@ semantics: `output_format` emits `legacy_output_format_post_validation`, and
 `output_type` emits `legacy_output_type_not_published` because no typed artifact
 is published.
 
+Phase 3 supports node timeout and retry authoring under Archon:
+
+- Bash/script `timeout` is positive finite milliseconds; omission requests
+  120,000 ms before the sealed subprocess ceiling is applied.
+- AI `idle_timeout` is positive finite milliseconds; omission uses the sealed
+  AI idle ceiling.
+- `retry.max_attempts` counts retries after the initial attempt. AI nodes
+  default to two retries; deterministic Bash/script nodes default to none.
+- Every output reference names a direct dependency. Conditions use strict
+  typed scalar comparisons and fail on syntax, missing-value, or type errors.
+
 The following declarations remain intentionally blocked under Archon:
 
 | Field | Archon contract code | Archon enforcement phase | Current legacy meaning and warning code |
 | --- | --- | ---: | --- |
-| Node `idle_timeout` | `archon_idle_timeout_semantics_unavailable` | 3 | Positive seconds without reinterpretation; `legacy_idle_timeout_seconds`. Archon millisecond normalization is deferred to Phase 3. |
-| Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds; `legacy_timeout_seconds`. |
-| Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts and `delay_ms` is milliseconds; `legacy_retry_total_attempts`. |
 | `maxBudgetUsd` | `archon_budget_enforcement_unavailable` | 5 | Provider-capability mapping only; not a portable guarantee. |
 | Workflow/node `sandbox` | `archon_sandbox_enforcement_unavailable` | 5 | Provider/backend capability only; resource limits are not a sandbox. |
 
@@ -91,7 +99,7 @@ array. Each node has `id`, exactly one node-type payload, and optional
 `approval`, and `cancel`. Graph and `$node.output` references must be upstream.
 
 Common fields include `when`, `trigger_rule`, `context`, `idle_timeout`,
-`always_run`, `output_type`, plus the deferred `retry`. AI nodes may use
+`always_run`, `output_type`, and supported `retry`. AI nodes may use
 provider/model selection, `persist_session`, `allowed_tools`, `denied_tools`,
 `hooks`, `mcp`, `skills`, inline `agents`, reasoning controls, `systemPrompt`, and
 fallbacks when doctor confirms the Hermes mapping. Tool aliases such as
@@ -102,11 +110,10 @@ MCP and skills remain options on `command` and `prompt`. They are not node
 kinds. Script nodes with `uv` or `bun` are existing execution behavior, not a
 new structured-data node kind.
 
-Treat `idle_timeout` as profile-sensitive even though it is structurally valid
-on every node. Hermes legacy interprets the authored value as seconds and
-emits `legacy_idle_timeout_seconds`. Under `archon-2026-07`, it blocks with
-`archon_idle_timeout_semantics_unavailable`; do not convert or reinterpret the
-value until Phase 3 supplies Archon millisecond normalization.
+Treat timeout and retry as profile-sensitive. Hermes legacy timeout values are
+seconds and legacy `max_attempts` counts total attempts. Archon timeout values
+are milliseconds and Archon `max_attempts` counts retries after the initial
+attempt. Always consult the generated field metadata before converting.
 
 For a structured Archon output, declare a bounded local JSON Schema directly
 on the AI node:
@@ -188,10 +195,21 @@ only from the corroborated winning attempt. Evidence contains bounded metadata
 rather than content. Authenticated preview is bounded to 64 KiB and download
 uses the opaque ID.
 
-Do not synthesize Phase 3 behavior. Phase 2 adds no timeout units/defaults,
-retry counts/classes, strict missing-output/reference/field handling, condition
-coercion/precedence, large Bash spill/quoting, persistent-session recovery,
-`maxBudgetUsd` portability, new node kinds, `include`, or `loop_group`.
+Phase 3 Bash values through the 32,768-byte UTF-8 boundary render inline;
+larger values are consumed as bounded contents, never pathnames. Only ordinary
+authenticated token contexts are rewritten. Escaped/comment references stay
+literal, and ambiguous expansions fail before launch.
+
+Only a confirmed missing cross-run session may select one fresh execution,
+with zero provider attempts before recovery. Same-run missing context fails;
+storage errors remain operational failures; fingerprint mismatch retains its
+warning/fresh behavior. Use `workflow doctor`, generated
+`compatibility_codes`, and Run Inspector recovery evidence as the operator
+authority.
+
+MCP and skills remain options, not node kinds. Loops and includes remain Phase 4.
+Do not synthesize Phase 4 loop/include behavior or Phase 5 `maxBudgetUsd`,
+sandbox, or provider-portability guarantees.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

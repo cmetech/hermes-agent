@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import plugins.workflow.bash_rendering as bash_rendering
+import plugins.workflow.language_schema as language_schema
 import tools.managed_process as managed_process_module
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
@@ -30,6 +31,29 @@ _SHELL_CONTEXTS = {
     "double-quoted": "printf '%s' \"$USER_MESSAGE\"",
     "single-quoted": "printf '%s' '$USER_MESSAGE'",
 }
+
+
+def test_bash_runtime_bounds_are_reexported_from_the_language_contract() -> None:
+    assert (
+        bash_rendering.BASH_INLINE_MAX_BYTES
+        == language_schema.BASH_INLINE_MAX_BYTES
+        == 32_768
+    )
+    assert (
+        bash_rendering.BASH_SPILL_MAX_VALUE_BYTES
+        == language_schema.BASH_SPILL_MAX_VALUE_BYTES
+        == 500_000
+    )
+    assert (
+        bash_rendering.BASH_SPILL_MAX_FILES
+        == language_schema.BASH_SPILL_MAX_FILES
+        == 64
+    )
+    assert (
+        bash_rendering.BASH_SPILL_MAX_TOTAL_BYTES
+        == language_schema.BASH_SPILL_MAX_TOTAL_BYTES
+        == 2_000_000
+    )
 
 _JOINED_UNSUPPORTED_CONTEXTS = (
     ("(\\\n( {reference} ))", "bare-arithmetic"),

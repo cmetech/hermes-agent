@@ -111,6 +111,49 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     assert isinstance(envelope["result"], list)
     assert home.is_dir()
 
+    schema_command = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "workflow",
+            "schema",
+            "--profile",
+            "archon-2026-07",
+            "--json",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert schema_command.returncode == 0, schema_command.stderr
+    installed_contract = json.loads(schema_command.stdout)
+    bash_schema = installed_contract["definition_schema"]["properties"]["nodes"][
+        "items"
+    ]["properties"]["bash"]
+    timeout_schema = installed_contract["definition_schema"]["properties"]["nodes"][
+        "items"
+    ]["properties"]["timeout"]
+    assert installed_contract["normalizer_version"] == 3
+    assert timeout_schema["x-hermes-unit"] == "milliseconds"
+    assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
+    assert bash_schema["x-hermes-semantics"] == {
+        "inline_utf8_bytes": 32_768,
+        "spill_value_utf8_bytes": 500_000,
+        "spill_files": 64,
+        "spill_total_utf8_bytes": 2_000_000,
+        "large_values": "contents",
+        "contexts": {
+            "unquoted_token": "substitute",
+            "double_quoted_token": "substitute",
+            "single_quoted_token": "safe_quote_boundary",
+            "escaped_or_comment": "literal",
+        },
+        "unsupported_context": "fail",
+    }
+
     showcase_probe = subprocess.run(
         [
             sys.executable,

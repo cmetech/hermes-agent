@@ -11,6 +11,8 @@ import yaml
 from plugins.workflow.cli import register_cli
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.machine_contract import operator_command_contract
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.showcase import preflight_showcase
 from plugins.workflow.trust import (
@@ -150,6 +152,20 @@ def test_operator_contract_publishes_complete_exit_code_table() -> None:
         "action_failed": 8,
         "internal": 70,
     }
+
+
+def test_operator_phase3_guidance_uses_the_dynamic_catalog_authority() -> None:
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    topics = {item["id"]: item for item in contract["documentation"]["topics"]}
+
+    stable_codes = topics["stable-codes"]
+    assert stable_codes["code_source"] == "compatibility_codes"
+    assert "codes" not in stable_codes
+    recovery = topics["persistent-session-recovery"]
+    assert recovery["operator_surfaces"] == [
+        "workflow doctor",
+        "Run Inspector recovery evidence",
+    ]
 
 
 def test_operator_skills_are_structured_and_defer_syntax_to_runtime() -> None:

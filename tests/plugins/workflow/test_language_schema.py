@@ -56,6 +56,72 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
     assert len(json.dumps(contract).encode()) < 256_000
 
 
+def test_archon_contract_describes_phase3_authoring_semantics_from_inventory():
+    """Catch the generated contract falling back to obsolete Phase 2 guidance."""
+    schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+
+    assert _node_property(schema, "bash", "timeout")["x-hermes-semantics"] == {
+        "unit": "milliseconds",
+        "omitted": 120_000,
+        "scope": "attempt",
+    }
+    assert _node_property(schema, "prompt", "idle_timeout")[
+        "x-hermes-semantics"
+    ] == {
+        "unit": "milliseconds",
+        "omitted": "sealed_ai_idle",
+        "scope": "attempt",
+    }
+    retry = _node_property(schema, "prompt", "retry")
+    assert retry["properties"]["max_attempts"]["x-hermes-semantics"] == {
+        "counts": "retries_after_initial",
+        "omitted_ai": 2,
+        "omitted_deterministic": 0,
+    }
+    assert _node_property(schema, "bash", "depends_on")[
+        "x-hermes-semantics"
+    ] == {
+        "output_references": "direct_only"
+    }
+    assert _node_property(schema, "prompt", "when")["x-hermes-semantics"] == {
+        "operands": "typed_scalar",
+        "false": "skip",
+        "errors": "fail_pre_execution",
+    }
+
+    assert _node_property(schema, "bash", "bash")["x-hermes-semantics"] == {
+        "inline_utf8_bytes": 32_768,
+        "spill_value_utf8_bytes": 500_000,
+        "spill_files": 64,
+        "spill_total_utf8_bytes": 2_000_000,
+        "large_values": "contents",
+        "contexts": {
+            "unquoted_token": "substitute",
+            "double_quoted_token": "substitute",
+            "single_quoted_token": "safe_quote_boundary",
+            "escaped_or_comment": "literal",
+        },
+        "unsupported_context": "fail",
+    }
+    assert _node_property(schema, "prompt", "persist_session")[
+        "x-hermes-semantics"
+    ] == {
+        "confirmed_cross_run_missing": "one_fresh_execution"
+    }
+
+
+def test_archon_contract_documentation_derives_stable_codes_and_phase_boundaries():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    topics = {item["id"]: item for item in contract["documentation"]["topics"]}
+
+    assert topics["stable-codes"]["code_source"] == "compatibility_codes"
+    assert "codes" not in topics["stable-codes"]
+    assert topics["extension-options"]["parameters"] == {
+        "mcp_skills": "options_not_node_kinds",
+        "loops_includes_phase": 4,
+    }
+
+
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
 def test_authoring_contract_generation_is_byte_deterministic(profile):
     first = json.dumps(
@@ -1192,28 +1258,12 @@ def test_dynamic_catalog_codes_are_emitted_by_real_runtime_paths():
         }
         for profile in WorkflowLanguageProfile
     }
-    root = Path(__file__).parents[3]
-    references = (
-        root / "website/docs/user-guide/features/workflow-yaml-reference.md",
-        root
-        / "skills/software-development/workflow-builder/references/portable-schema.md",
-    )
-
     assert runtime_codes == expected_codes
     for profile, emitted_codes in runtime_codes.items():
         assert emitted_codes <= set(compatibility_code_catalog(profile))
-        for reference in references:
-            documented = reference.read_text(encoding="utf-8")
-            assert not {code for code in emitted_codes if f"`{code}`" not in documented}
 
 
-def test_generated_language_codes_are_covered_by_authoring_references():
-    generated_codes = {
-        code
-        for profile in WorkflowLanguageProfile
-        for code, metadata in compatibility_code_catalog(profile).items()
-        if metadata.get("compatibility", True)
-    }
+def test_generated_language_codes_are_derived_in_authoring_contracts():
     root = Path(__file__).parents[3]
     references = (
         root / "website/docs/user-guide/features/workflow-yaml-reference.md",
@@ -1221,9 +1271,22 @@ def test_generated_language_codes_are_covered_by_authoring_references():
         / "skills/software-development/workflow-builder/references/portable-schema.md",
     )
 
+    for profile in WorkflowLanguageProfile:
+        contract = workflow_authoring_contract(profile)
+        topic = next(
+            item
+            for item in contract["documentation"]["topics"]
+            if item["id"] == "stable-codes"
+        )
+        assert topic["code_source"] == "compatibility_codes"
+        assert "codes" not in topic
+
     for reference in references:
         documented = reference.read_text(encoding="utf-8")
-        assert not {code for code in generated_codes if f"`{code}`" not in documented}
+        assert "compatibility_codes" in documented
+        assert "second exhaustive code list" in documented or reference.name == (
+            "portable-schema.md"
+        )
 
 
 def test_authoring_contract_excludes_secret_values_and_runtime_data(
