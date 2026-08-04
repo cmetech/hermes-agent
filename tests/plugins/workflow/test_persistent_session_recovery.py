@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import multiprocessing
 import sqlite3
+from typing import Callable
 
 import pytest
 
 from agent.plugin_agent import (
     PluginAgentRunResult,
+    PluginAgentRunner,
     PluginAgentSessionMissingError,
 )
 from plugins.workflow.admission import RunAdmissionRequest
@@ -16,13 +19,23 @@ from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.language_schema import compatibility_code_catalog
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    DeadlineBudget,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    freeze_value,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    NodeSessionRegistry,
+    SessionRegistryUpdateCandidate,
+)
 from plugins.workflow.store import JournalRecoveryError, RunStore, StorageQuotaError
+from tools.managed_process import ProcessIdentity
 
 
 class _PersistentRunner:
@@ -59,6 +72,20 @@ class _PersistentRunner:
             usage={},
             audit={"provider_attempts": 1},
         )
+
+
+def _registry_cas_process(home, ready, results, session_id) -> None:
+    registry = NodeSessionRegistry(home)
+    key = NodeSessionKey("process", "node", "scope", "provider", "default")
+    ready.wait(timeout=10)
+    results.put(
+        registry.compare_and_set_or_observe(
+            key,
+            0,
+            session_id,
+            hashlib.sha256(session_id.encode()).hexdigest(),
+        )
+    )
 
 
 def _archon_package(workflow_writer, root, *, name="persistent", nodes=None):
@@ -101,6 +128,43 @@ def _run_once(store, package, runner, registry, key):
         session_registry=registry,
     ).advance(admitted.run_id)
     return admitted.run_id, result
+
+
+def _rewrite_latest_projection(
+    store: RunStore,
+    run_id: str,
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    directory = store.run_directory(run_id)
+    events = [
+        json.loads(line)
+        for line in (directory / "events.jsonl").read_text().splitlines()
+    ]
+    latest = events[-1]
+    mutate(latest["projection"])
+    latest["projection_sha256"] = hashlib.sha256(
+        json.dumps(
+            latest["projection"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    material = dict(latest)
+    material.pop("frame_sha256", None)
+    latest["frame_sha256"] = hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    (directory / "events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (directory / "run.json").write_text("{broken", encoding="utf-8")
 
 
 def test_confirmed_missing_cross_run_session_starts_fresh_once(
@@ -176,6 +240,235 @@ def test_cross_run_session_probe_failure_is_not_treated_as_confirmed_absence(
     assert len(runner.requests) == 2
 
 
+@pytest.mark.parametrize(
+    ("boundary", "expected_status", "expected_code"),
+    [
+        ("deadline", "failed", "provider_timeout"),
+        ("cancel", "cancelled", "cancelled"),
+    ],
+)
+def test_recovery_reseals_authority_before_fresh_provider_launch(
+    tmp_path, boundary, expected_status, expected_code
+) -> None:
+    registry = NodeSessionRegistry(tmp_path / "reseal-home")
+    runner = _PersistentRunner()
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    node = WorkflowNode(
+        id="analyze",
+        node_type="prompt",
+        value="Analyze",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    now = [0.0]
+    cancelled = [False]
+
+    def select_recovery(_selection) -> bool:
+        if boundary == "deadline":
+            now[0] = 2.0
+        else:
+            cancelled[0] = True
+        return True
+
+    context = NodeExecutionContext(
+        run_id="run-reseal",
+        run_directory=tmp_path,
+        node=node,
+        attempt_id="attempt-reseal",
+        workflow_name="reseal",
+        workflow_options=freeze_value(
+            {
+                "persist_sessions": True,
+                "provider": "fake-provider",
+                "model": "fake-model",
+            }
+        ),
+        operator_scope="scope-digest",
+        variable_context=VariableContext(
+            workflow_id="run-reseal",
+            normalizer_version=3,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
+        deadline_budget=DeadlineBudget.create(
+            now=0,
+            wall_seconds=1,
+            idle_seconds=1,
+            provider_seconds=1,
+        ),
+        sealed_attempt_timeout=True,
+        monotonic=lambda: now[0],
+        is_cancelled=lambda: cancelled[0],
+        record_session_recovery_selection=select_recovery,
+    )
+    executor = AgentNodeExecutor(runner, session_registry=registry)
+    fingerprint = executor._fingerprint(context)
+    key = NodeSessionKey(
+        "reseal", "analyze", "scope-digest", "fake-provider", "default"
+    )
+    registry.compare_and_set_or_observe(
+        key,
+        0,
+        "missing-session",
+        fingerprint,
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == expected_status
+    assert result.error_code == expected_code
+    assert result.metadata["provider_attempts"] == 0
+    assert result.session_recovery_outcome == "fresh_execution_failed"
+    assert [request.context_mode for request in runner.requests] == ["shared"]
+
+
+def test_real_session_database_failure_is_recovery_unavailable_before_spawn(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_state
+
+    database = tmp_path / "corrupt-state.db"
+    database.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", database)
+    registry = NodeSessionRegistry(tmp_path / "real-db-home")
+    node = WorkflowNode(
+        id="analyze",
+        node_type="prompt",
+        value="Analyze",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    context = NodeExecutionContext(
+        run_id="run-real-db",
+        run_directory=tmp_path,
+        node=node,
+        attempt_id="attempt-real-db",
+        workflow_name="real-db",
+        workflow_options=freeze_value(
+            {
+                "persist_sessions": True,
+                "provider": "fake-provider",
+                "model": "fake-model",
+            }
+        ),
+        operator_scope="scope-digest",
+        variable_context=VariableContext(
+            workflow_id="run-real-db",
+            normalizer_version=3,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
+        spawn_intent=lambda _nonce: (_ for _ in ()).throw(
+            AssertionError("worker spawn reached")
+        ),
+    )
+    executor = AgentNodeExecutor(
+        PluginAgentRunner("workflow"),
+        session_registry=registry,
+    )
+    registry.compare_and_set_or_observe(
+        NodeSessionKey(
+            "real-db",
+            "analyze",
+            "scope-digest",
+            "fake-provider",
+            "default",
+        ),
+        0,
+        "missing-session",
+        executor._fingerprint(context),
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "persistent_session_recovery_unavailable"
+    assert result.metadata["provider_attempts"] == 0
+
+
+def test_crash_after_provider_worker_spawn_is_never_replayed_as_prelaunch(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_package(workflow_writer, tmp_path / "spawn-crash")
+    store = RunStore(tmp_path / "spawn-crash-home")
+    admitted = _admit(store, package, "spawn-crash")
+    claim = store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "crashed-owner",
+        executor_id="prompt",
+        effect_classification="replay_safe",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_spawn_intent(claim, executor_nonce="provider-worker")
+    identity = ProcessIdentity(pid=999_991, start_time=12345, group_id=999_991)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(
+        RunStore,
+        "_observe_process_identity",
+        staticmethod(lambda _serialized: "known_stopped"),
+    )
+
+    assert store.interrupt_active_claims(
+        admitted.run_id,
+        reason="scheduler_crash",
+    ) == ("analyze",)
+
+    recovered = store.load_run(admitted.run_id)
+    node = recovered["nodes"]["analyze"]
+    assert recovered["status"] == "paused"
+    assert node["recovery"]["observation"] == "outcome_uncertain"
+    assert node["pending_interaction"]["type"] == "reconcile"
+    assert store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "must-not-replay",
+    ) is None
+
+
+def test_crash_after_reaped_provider_worker_still_requires_reconciliation(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(workflow_writer, tmp_path / "reaped-spawn-crash")
+    store = RunStore(tmp_path / "reaped-spawn-crash-home")
+    admitted = _admit(store, package, "reaped-spawn-crash")
+    claim = store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "crashed-owner",
+        executor_id="agent",
+        effect_classification="replay_safe",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_spawn_intent(claim, executor_nonce="provider-worker")
+    identity = ProcessIdentity(pid=999_991, start_time=12345, group_id=999_991)
+    assert store.record_process_started(claim, identity)
+    assert store.record_process_stopped(claim, identity, cleaned=True)
+
+    assert store.interrupt_active_claims(
+        admitted.run_id,
+        reason="scheduler_crash",
+    ) == ("analyze",)
+
+    recovered = store.load_run(admitted.run_id)
+    node = recovered["nodes"]["analyze"]
+    assert recovered["status"] == "paused"
+    assert node["recovery"]["observation"] == "outcome_uncertain"
+    assert node["recovery"]["termination_confirmed"] is True
+    assert node["pending_interaction"]["type"] == "reconcile"
+    assert store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "must-not-replay",
+    ) is None
+
+
 def test_registry_read_failure_is_recovery_unavailable_before_provider(
     tmp_path, workflow_writer
 ) -> None:
@@ -200,6 +493,61 @@ def test_registry_read_failure_is_recovery_unavailable_before_provider(
         "persistent_session_recovery_unavailable"
     )
     assert runner.requests == []
+
+
+def test_corrupt_registry_fingerprint_is_unavailable_not_fresh_execution(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(workflow_writer, tmp_path / "corrupt-fingerprint")
+    store = RunStore(tmp_path / "corrupt-fingerprint-home")
+    registry = NodeSessionRegistry(tmp_path / "corrupt-fingerprint-home")
+    runner = _PersistentRunner()
+    key = NodeSessionKey(
+        "persistent", "analyze", "local", "fake-provider", "default"
+    )
+    registry.compare_and_set_or_observe(
+        key,
+        0,
+        "corrupt-session",
+        "a" * 64,
+    )
+    with sqlite3.connect(registry.database) as connection:
+        connection.execute(
+            "UPDATE node_sessions SET cache_fingerprint='not-a-digest'"
+        )
+
+    _run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "corrupt-fingerprint",
+    )
+
+    assert result["status"] == "failed"
+    attempt = result["nodes"]["analyze"]["attempts"][0]
+    assert attempt["error_code"] == "persistent_session_recovery_unavailable"
+    assert attempt["metadata"]["provider_attempts"] == 0
+    assert runner.requests == []
+
+
+def test_legacy_scheduler_without_agent_never_creates_session_registry(
+    tmp_path, monkeypatch
+) -> None:
+    import plugins.workflow.scheduler as scheduler_module
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "NodeSessionRegistry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("session registry created")
+        ),
+    )
+    scheduler = RunScheduler(RunStore(tmp_path / "legacy-no-agent-home"))
+    try:
+        assert scheduler.session_registry is None
+    finally:
+        scheduler.shutdown()
 
 
 def test_recovery_selection_is_durable_before_fresh_provider_launch(
@@ -268,6 +616,40 @@ def test_recovery_selection_is_durable_before_fresh_provider_launch(
         "path",
         "response",
     }.intersection(persistent)
+
+
+def test_recovered_session_authority_is_private_across_every_public_surface(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(workflow_writer, tmp_path / "privacy")
+    store = RunStore(tmp_path / "privacy-home")
+    registry = NodeSessionRegistry(tmp_path / "privacy-home")
+    runner = _PersistentRunner()
+
+    _run_once(store, package, runner, registry, "seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(store, package, runner, registry, "privacy")
+
+    internal = store.load_run(run_id)
+    node = internal["nodes"]["analyze"]
+    new_session_id = node["session_id"]
+    cache_fingerprint = node["cache_fingerprint"]
+    assert result["status"] == "succeeded"
+    assert new_session_id == "session-3"
+    assert len(cache_fingerprint) == 64
+
+    public_surfaces = {
+        "status": store.get_run_status(run_id),
+        "public_projection": public_run_projection(store.get_run_status(run_id)),
+        "events": store.tail_events(run_id),
+        "attempts": EvidenceReader(store).query(run_id, kind="attempts"),
+        "timeline": EvidenceReader(store).query(run_id, kind="timeline"),
+        "recovery": EvidenceReader(store).query(run_id, kind="recovery"),
+    }
+    for name, surface in public_surfaces.items():
+        encoded = json.dumps(surface, sort_keys=True)
+        assert new_session_id not in encoded, name
+        assert cache_fingerprint not in encoded, name
 
 
 def test_failed_fresh_recovery_records_outcome_without_registry_obligation(
@@ -451,6 +833,7 @@ def test_fresh_execution_returns_private_registry_candidate_without_writing(
     assert candidate.winning_run_id == "run-candidate"
     assert candidate.winning_node_id == "analyze"
     assert candidate.winning_attempt_id == "attempt-candidate"
+    assert result.session_registry_authority == candidate
 
 
 def test_success_and_registry_obligation_are_atomic_before_cas(
@@ -518,6 +901,70 @@ def test_success_and_registry_obligation_are_atomic_before_cas(
     assert rebuilt_reserve is not None
 
 
+def test_parallel_persistent_nodes_keep_every_winning_registry_obligation(
+    tmp_path, workflow_writer
+) -> None:
+    class SwitchableRegistry(NodeSessionRegistry):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.available = False
+
+        def compare_and_set_or_observe(self, *args, **kwargs):
+            if not self.available:
+                raise OSError("private registry path")
+            return super().compare_and_set_or_observe(*args, **kwargs)
+
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "parallel",
+        name="parallel",
+        nodes=[
+            {"id": "first", "prompt": "First"},
+            {"id": "second", "prompt": "Second"},
+        ],
+    )
+    store = RunStore(tmp_path / "parallel-home")
+    registry = SwitchableRegistry(tmp_path / "parallel-home")
+    runner = _PersistentRunner()
+    clock = [datetime(2026, 8, 1, tzinfo=timezone.utc)]
+    admitted = _admit(store, package, "parallel")
+    scheduler = RunScheduler(
+        store,
+        agent_runner=runner,
+        session_registry=registry,
+        max_parallel_nodes=2,
+        utcnow=lambda: clock[0],
+    )
+
+    scheduler.advance(admitted.run_id)
+
+    pending = store.load_run(admitted.run_id)
+    assert {node["state"] for node in pending["nodes"].values()} == {"succeeded"}
+    assert len(pending["pending_session_registry_updates"]) == 2
+    assert len(runner.requests) == 2
+
+    registry.available = True
+    clock[0] += timedelta(seconds=2)
+    completed = scheduler.advance(admitted.run_id)
+    if completed["status"] != "succeeded":
+        completed = scheduler.advance(admitted.run_id)
+
+    assert completed["status"] == "succeeded"
+    assert "pending_session_registry_updates" not in completed
+    assert {
+        registry.get(
+            NodeSessionKey(
+                "parallel",
+                node_id,
+                "local",
+                "fake-provider",
+                "default",
+            )
+        ).session_id
+        for node_id in ("first", "second")
+    } == {"session-1", "session-2"}
+
+
 def test_registry_cas_distinguishes_replacement_replay_and_newer_winner(
     tmp_path,
 ) -> None:
@@ -538,6 +985,124 @@ def test_registry_cas_distinguishes_replacement_replay_and_newer_winner(
     assert replayed == "stale_entry_replaced_already_applied"
     assert retained == "newer_entry_retained"
     assert registry.get(key).session_id == "winner-session"
+
+
+def test_registry_generation_cas_has_one_winner_across_processes(tmp_path) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_registry_cas_process,
+            args=(tmp_path / "multiprocess-home", ready, results, session_id),
+        )
+        for session_id in ("process-session-a", "process-session-b")
+    ]
+    for process in processes:
+        process.start()
+    ready.set()
+    outcomes = [results.get(timeout=15) for _process in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+
+    assert sorted(outcomes) == ["newer_entry_retained", "stale_entry_replaced"]
+
+
+def test_live_completion_rejects_substituted_registry_authority(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(workflow_writer, tmp_path / "live-authority")
+    store = RunStore(tmp_path / "live-authority-home")
+    admitted = _admit(store, package, "live-authority")
+    claim = store.claim_node(admitted.run_id, "analyze", "owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    candidate = SessionRegistryUpdateCandidate(
+        key=NodeSessionKey(
+            "persistent", "analyze", "local", "fake-provider", "default"
+        ),
+        expected_generation=0,
+        new_session_id="winning-session",
+        cache_fingerprint="a" * 64,
+        winning_run_id=admitted.run_id,
+        winning_node_id="analyze",
+        winning_attempt_id=claim.attempt_id,
+    )
+    substituted = SessionRegistryUpdateCandidate(
+        key=candidate.key,
+        expected_generation=0,
+        new_session_id="substituted-session",
+        cache_fingerprint="a" * 64,
+        winning_run_id=admitted.run_id,
+        winning_node_id="analyze",
+        winning_attempt_id=claim.attempt_id,
+    )
+
+    with pytest.raises(ValueError, match="winning completion"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            metadata={
+                "session_id": candidate.new_session_id,
+                "cache_fingerprint": candidate.cache_fingerprint,
+            },
+            session_registry_update=candidate,
+            session_registry_authority=substituted,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("generation", -1),
+        ("session_id", "s" * 4097),
+        ("cache_fingerprint", "f" * 4097),
+        ("updated_at", "not-an-instant"),
+    ],
+)
+def test_registry_rejects_malformed_or_oversized_durable_rows(
+    tmp_path, column, value
+) -> None:
+    registry = NodeSessionRegistry(tmp_path / "malformed-row-home")
+    key = NodeSessionKey("row", "node", "scope", "provider", "default")
+    registry.compare_and_set_or_observe(key, 0, "session", "legacy-fingerprint")
+    with sqlite3.connect(registry.database) as connection:
+        connection.execute(
+            f"UPDATE node_sessions SET {column}=? WHERE workflow='row'",
+            (value,),
+        )
+
+    with pytest.raises(ValueError, match="malformed"):
+        registry.get(key)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"expected_generation": True},
+        {"new_session_id": "s" * 4097},
+        {"cache_fingerprint": "not-a-sha256"},
+        {"recovery_selected": "false"},
+    ],
+)
+def test_registry_candidate_rejects_noncanonical_authority(overrides) -> None:
+    values = {
+        "key": NodeSessionKey(
+            "candidate", "node", "scope", "provider", "default"
+        ),
+        "expected_generation": 0,
+        "new_session_id": "session",
+        "cache_fingerprint": "a" * 64,
+        "winning_run_id": "run",
+        "winning_node_id": "node",
+        "winning_attempt_id": "attempt",
+        "recovery_selected": False,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError):
+        SessionRegistryUpdateCandidate(**values)
 
 
 def test_phase3_catalog_registers_real_session_recovery_codes_and_event() -> None:
@@ -774,38 +1339,80 @@ def test_uncorroborated_registry_obligation_fails_closed_during_rebuild(
         UnavailableRegistry(tmp_path / "damaged-home"),
         "damaged",
     )
-    directory = store.run_directory(run_id)
-    events = [
-        json.loads(line)
-        for line in (directory / "events.jsonl").read_text().splitlines()
-    ]
-    latest = events[-1]
-    latest["projection"]["pending_session_registry_update"][
-        "winning_attempt_id"
-    ] = "uncorroborated-attempt"
-    latest["projection_sha256"] = hashlib.sha256(
-        json.dumps(
-            latest["projection"],
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    material = dict(latest)
-    material.pop("frame_sha256", None)
-    latest["frame_sha256"] = hashlib.sha256(
-        json.dumps(
-            material,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    (directory / "events.jsonl").write_text(
-        "\n".join(json.dumps(event) for event in events) + "\n",
-        encoding="utf-8",
+    _rewrite_latest_projection(
+        store,
+        run_id,
+        lambda projection: projection["pending_session_registry_update"].update(
+            {"winning_attempt_id": "uncorroborated-attempt"}
+        ),
     )
-    (directory / "run.json").write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(JournalRecoveryError, match="valid recovery data"):
+        store.load_run(run_id)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda pending: pending.update({"expected_generation": 1}),
+            id="generation",
+        ),
+        pytest.param(
+            lambda pending: pending.update(
+                {"new_session_id": "substituted-session"}
+            ),
+            id="new-session",
+        ),
+        pytest.param(
+            lambda pending: pending.update({"cache_fingerprint": "f" * 64}),
+            id="fingerprint",
+        ),
+        pytest.param(
+            lambda pending: pending["key"].update(
+                {"provider": "substituted-provider"}
+            ),
+            id="provider",
+        ),
+        pytest.param(
+            lambda pending: pending["key"].update(
+                {"profile": "substituted-profile"}
+            ),
+            id="profile",
+        ),
+        pytest.param(
+            lambda pending: pending.update({"recovery_selected": "false"}),
+            id="recovery-selected-type",
+        ),
+    ],
+)
+def test_substituted_registry_authority_fails_closed_during_rebuild(
+    tmp_path, workflow_writer, mutate
+) -> None:
+    class UnavailableRegistry(NodeSessionRegistry):
+        def compare_and_set_or_observe(self, *args, **kwargs):
+            raise OSError("private registry path")
+
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "substituted",
+        name="substituted",
+    )
+    store = RunStore(tmp_path / "substituted-home")
+    run_id, _result = _run_once(
+        store,
+        package,
+        _PersistentRunner(),
+        UnavailableRegistry(tmp_path / "substituted-home"),
+        "substituted",
+    )
+    _rewrite_latest_projection(
+        store,
+        run_id,
+        lambda projection: mutate(
+            projection["pending_session_registry_update"]
+        ),
+    )
 
     with pytest.raises(JournalRecoveryError, match="valid recovery data"):
         store.load_run(run_id)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import errno
 import gc
 import hashlib
@@ -229,6 +230,10 @@ def _session_registry_candidate_from_payload(
         or not 0 <= retry_count <= 5
     ):
         raise JournalRecoveryError("session registry obligation retry is malformed")
+    if type(value.get("recovery_selected")) is not bool:
+        raise JournalRecoveryError(
+            "session registry obligation recovery flag is malformed"
+        )
     bounded_text = (
         key.get("workflow"),
         key.get("node_id"),
@@ -263,7 +268,7 @@ def _session_registry_candidate_from_payload(
             winning_run_id=value["winning_run_id"],
             winning_node_id=value["winning_node_id"],
             winning_attempt_id=value["winning_attempt_id"],
-            recovery_selected=value.get("recovery_selected") is True,
+            recovery_selected=value["recovery_selected"],
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise JournalRecoveryError(
@@ -283,6 +288,141 @@ def _session_registry_candidate_from_payload(
     }:
         raise JournalRecoveryError("session registry obligation fields are malformed")
     return candidate, retry_count
+
+
+_MAX_PENDING_SESSION_REGISTRY_UPDATES = 64
+
+
+def _pending_session_registry_payloads(
+    projection: Mapping[str, object],
+) -> dict[str, object]:
+    singular = projection.get("pending_session_registry_update")
+    plural = projection.get("pending_session_registry_updates")
+    if singular is not None and plural is not None:
+        raise JournalRecoveryError(
+            "session registry obligations have conflicting representations"
+        )
+    if singular is not None:
+        candidate, _retry_count = _session_registry_candidate_from_payload(singular)
+        return {candidate.winning_attempt_id: singular}
+    if plural is None:
+        return {}
+    if (
+        not isinstance(plural, Mapping)
+        or not 1 <= len(plural) <= _MAX_PENDING_SESSION_REGISTRY_UPDATES
+    ):
+        raise JournalRecoveryError("session registry obligations are malformed")
+    pending: dict[str, object] = {}
+    for attempt_id, payload in plural.items():
+        candidate, _retry_count = _session_registry_candidate_from_payload(payload)
+        if (
+            not isinstance(attempt_id, str)
+            or attempt_id != candidate.winning_attempt_id
+            or attempt_id in pending
+        ):
+            raise JournalRecoveryError(
+                "session registry obligation attempt identity is malformed"
+            )
+        pending[attempt_id] = payload
+    return pending
+
+
+def _store_pending_session_registry_payloads(
+    projection: dict[str, object],
+    pending: Mapping[str, object],
+) -> None:
+    projection.pop("pending_session_registry_update", None)
+    projection.pop("pending_session_registry_updates", None)
+    if len(pending) == 1:
+        projection["pending_session_registry_update"] = next(iter(pending.values()))
+    elif pending:
+        projection["pending_session_registry_updates"] = {
+            attempt_id: pending[attempt_id] for attempt_id in sorted(pending)
+        }
+
+
+def _set_pending_session_registry_update(
+    projection: dict[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+    *,
+    retry_count: int = 0,
+) -> None:
+    pending = _pending_session_registry_payloads(projection)
+    if (
+        candidate.winning_attempt_id not in pending
+        and len(pending) >= _MAX_PENDING_SESSION_REGISTRY_UPDATES
+    ):
+        raise StorageQuotaError("session registry obligation capacity is exhausted")
+    pending[candidate.winning_attempt_id] = _session_registry_candidate_payload(
+        candidate,
+        retry_count=retry_count,
+    )
+    _store_pending_session_registry_payloads(projection, pending)
+
+
+def _remove_pending_session_registry_update(
+    projection: dict[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+) -> None:
+    pending = _pending_session_registry_payloads(projection)
+    payload = pending.get(candidate.winning_attempt_id)
+    if payload is None:
+        raise RuntimeError("stale session registry update outcome")
+    current, _retry_count = _session_registry_candidate_from_payload(payload)
+    if current != candidate:
+        raise RuntimeError("stale session registry update outcome")
+    pending.pop(candidate.winning_attempt_id)
+    _store_pending_session_registry_payloads(projection, pending)
+
+
+def _session_registry_candidate_is_corroborated(
+    projection: Mapping[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+) -> bool:
+    nodes = projection.get("nodes")
+    winning_node = (
+        nodes.get(candidate.winning_node_id) if isinstance(nodes, Mapping) else None
+    )
+    if not isinstance(winning_node, Mapping):
+        return False
+    winning_attempts = [
+        attempt
+        for attempt in winning_node.get("attempts", ())
+        if isinstance(attempt, Mapping)
+        and attempt.get("attempt_id") == candidate.winning_attempt_id
+        and attempt.get("state") == "succeeded"
+    ]
+    if len(winning_attempts) != 1:
+        return False
+    try:
+        authority, authority_retry_count = _session_registry_candidate_from_payload(
+            winning_attempts[0].get("session_registry_authority")
+        )
+    except JournalRecoveryError:
+        return False
+    if authority_retry_count != 0 or authority != candidate:
+        return False
+    if not candidate.recovery_selected:
+        return True
+    recoveries = winning_node.get("session_recoveries")
+    matches = [
+        recovery
+        for recovery in recoveries
+        if isinstance(recovery, Mapping)
+        and recovery.get("attempt_id") == candidate.winning_attempt_id
+    ] if isinstance(recoveries, list) else []
+    if len(matches) != 1:
+        return False
+    recovery = matches[0]
+    return (
+        recovery.get("registry_generation") == candidate.expected_generation
+        and recovery.get("cache_fingerprint_sha256")
+        == _sha256(candidate.cache_fingerprint.encode("utf-8"))
+        and recovery.get("source") == "cross_run_registry"
+        and recovery.get("provider") == candidate.key.provider
+        and recovery.get("runtime_profile") == candidate.key.profile
+        and recovery.get("provider_attempts_before_recovery") == 0
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +679,37 @@ def _sanitize_diagnostic(value: str | None) -> str | None:
     if value is None:
         return None
     return _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)[:2000]
+
+
+def _redact_private_session_authority(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """Copy a public run/event projection without exact session authority."""
+    projected = copy.deepcopy(dict(value))
+    projected.pop("pending_session_registry_update", None)
+    projected.pop("pending_session_registry_updates", None)
+    nodes = projected.get("nodes")
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            node.pop("session_id", None)
+            node.pop("cache_fingerprint", None)
+            for attempt in node.get("attempts", ()):
+                if not isinstance(attempt, dict):
+                    continue
+                attempt.pop("session_registry_authority", None)
+                metadata = attempt.get("metadata")
+                if isinstance(metadata, dict):
+                    metadata.pop("session_id", None)
+                    metadata.pop("cache_fingerprint", None)
+    payload = projected.get("payload")
+    if isinstance(payload, dict):
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("session_id", None)
+            metadata.pop("cache_fingerprint", None)
+    return projected
 
 
 def _sanitize_v3_condition_diagnostic(value: str) -> str:
@@ -3870,18 +4041,18 @@ class RunStore:
                 )
             except (OSError, json.JSONDecodeError):
                 continue
-            pending = projection.get("pending_session_registry_update")
-            if pending is not None:
+            try:
+                pending_payloads = _pending_session_registry_payloads(projection)
+            except JournalRecoveryError:
+                pending_payloads = {}
+            for pending in pending_payloads.values():
                 try:
-                    candidate, _retry_count = (
-                        _session_registry_candidate_from_payload(pending)
+                    candidate, _retry_count = _session_registry_candidate_from_payload(
+                        pending
                     )
                 except JournalRecoveryError:
-                    candidate = None
-                if (
-                    candidate is not None
-                    and candidate.winning_run_id == row["run_id"]
-                ):
+                    continue
+                if candidate.winning_run_id == row["run_id"]:
                     projection_bytes = len(
                         json.dumps(
                             projection,
@@ -5758,42 +5929,43 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
-        pending = value.get("pending_session_registry_update")
         next_registry_update_at = value.get("next_registry_update_at")
-        if pending is None:
-            return next_registry_update_at is None
         try:
-            candidate, retry_count = _session_registry_candidate_from_payload(
-                pending
-            )
+            pending = _pending_session_registry_payloads(value)
         except JournalRecoveryError:
             return False
-        winning_node = nodes.get(candidate.winning_node_id)
-        if (
-            candidate.winning_run_id != run_id
-            or candidate.key.workflow != value.get("workflow")
-            or candidate.key.node_id != candidate.winning_node_id
-            or candidate.key.scope
-            != str(value.get("operator_scope_digest") or "local")
-            or not isinstance(winning_node, dict)
-            or winning_node.get("state") != "succeeded"
-            or value.get("status")
-            in {"succeeded", "failed", "cancelled", "abandoned"}
-        ):
-            return False
-        winning_attempts = [
-            attempt
-            for attempt in winning_node.get("attempts", ())
-            if isinstance(attempt, Mapping)
-            and attempt.get("attempt_id") == candidate.winning_attempt_id
-            and attempt.get("state") == "succeeded"
-        ]
-        if len(winning_attempts) != 1:
-            return False
-        if retry_count == 0:
+        if not pending:
+            return next_registry_update_at is None
+        retry_counts = []
+        for payload in pending.values():
+            try:
+                candidate, retry_count = _session_registry_candidate_from_payload(
+                    payload
+                )
+            except JournalRecoveryError:
+                return False
+            winning_node = nodes.get(candidate.winning_node_id)
+            if (
+                candidate.winning_run_id != run_id
+                or candidate.key.workflow != value.get("workflow")
+                or candidate.key.node_id != candidate.winning_node_id
+                or candidate.key.scope
+                != str(value.get("operator_scope_digest") or "local")
+                or not isinstance(winning_node, dict)
+                or winning_node.get("state") != "succeeded"
+                or value.get("status")
+                in {"succeeded", "failed", "cancelled", "abandoned"}
+                or not _session_registry_candidate_is_corroborated(value, candidate)
+            ):
+                return False
+            retry_counts.append(retry_count)
+        retrying = [count for count in retry_counts if count > 0]
+        if not retrying:
             if next_registry_update_at is not None:
                 return False
         else:
+            if len(retrying) != 1:
+                return False
             if not isinstance(next_registry_update_at, str):
                 return False
             try:
@@ -5802,19 +5974,8 @@ class RunStore:
                 return False
             if wake.tzinfo is None or wake.utcoffset() is None:
                 return False
-        if value.get("status") == "recovery_pending" and retry_count != 5:
+        if value.get("status") == "recovery_pending" and retrying != [5]:
             return False
-        if candidate.recovery_selected:
-            recoveries = winning_node.get("session_recoveries")
-            matches = [
-                recovery
-                for recovery in recoveries
-                if isinstance(recoveries, list)
-                and isinstance(recovery, Mapping)
-                and recovery.get("attempt_id") == candidate.winning_attempt_id
-            ] if isinstance(recoveries, list) else []
-            if len(matches) != 1:
-                return False
         return True
 
     def _rebuild_projection(
@@ -6938,7 +7099,9 @@ class RunStore:
             event = dict(event)
             event.pop("projection", None)
             event.pop("projection_sha256", None)
-            public_events.append(_sanitize(event))
+            public_events.append(
+                _sanitize(_redact_private_session_authority(event))
+            )
         return tuple(public_events)
 
     def events_after(
@@ -7908,8 +8071,7 @@ class RunStore:
             if _metadata_only
             else self.load_run(run_id, operator_scope=operator_scope)
         )
-        run = dict(run)
-        run.pop("pending_session_registry_update", None)
+        run = _redact_private_session_authority(run)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
@@ -10050,6 +10212,7 @@ class RunStore:
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
         session_registry_update: SessionRegistryUpdateCandidate | None = None,
+        session_registry_authority: SessionRegistryUpdateCandidate | None = None,
         now: LeaseClockSample | None = None,
     ) -> None:
         if status not in {
@@ -10106,9 +10269,21 @@ class RunStore:
                 status == "succeeded" and session_registry_update is not None
             ):
                 raise RuntimeError("stale completion for terminal run")
+            if (session_registry_update is None) != (
+                session_registry_authority is None
+            ):
+                raise ValueError(
+                    "session registry update authority is incomplete"
+                )
             if session_registry_update is not None:
+                completion_metadata = metadata or {}
                 if (
                     status != "succeeded"
+                    or session_registry_authority != session_registry_update
+                    or completion_metadata.get("session_id")
+                    != session_registry_update.new_session_id
+                    or completion_metadata.get("cache_fingerprint")
+                    != session_registry_update.cache_fingerprint
                     or session_registry_update.winning_run_id != claim.run_id
                     or session_registry_update.winning_node_id != claim.node_id
                     or session_registry_update.winning_attempt_id
@@ -10121,9 +10296,12 @@ class RunStore:
                     raise ValueError(
                         "session registry update does not match winning completion"
                     )
-                if projection.get("pending_session_registry_update") is not None:
+                if (
+                    session_registry_update.winning_attempt_id
+                    in _pending_session_registry_payloads(projection)
+                ):
                     raise JournalRecoveryError(
-                        "run already has a pending session registry update"
+                        "attempt already has a pending session registry update"
                     )
             if status == "paused":
                 with (
@@ -10190,6 +10368,12 @@ class RunStore:
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
             node["attempts"][-1]["metadata"] = safe_metadata
+            if session_registry_update is not None:
+                node["attempts"][-1]["session_registry_authority"] = (
+                    _session_registry_candidate_payload(
+                        session_registry_authority
+                    )
+                )
             if status == "cancelled":
                 for other_id, other in projection["nodes"].items():
                     if other_id == claim.node_id or other["state"] in {
@@ -10254,8 +10438,16 @@ class RunStore:
                 elif not existing_indices:
                     projection["artifacts"].append(entry)
             if session_registry_update is not None:
-                projection["pending_session_registry_update"] = (
-                    _session_registry_candidate_payload(session_registry_update)
+                if not _session_registry_candidate_is_corroborated(
+                    projection,
+                    session_registry_update,
+                ):
+                    raise JournalRecoveryError(
+                        "session registry update authority is uncorroborated"
+                    )
+                _set_pending_session_registry_update(
+                    projection,
+                    session_registry_update,
                 )
             self._append_locked(
                 directory,
@@ -10264,7 +10456,11 @@ class RunStore:
                 {
                     "artifacts": refs,
                     "error_code": error_code,
-                    "metadata": safe_metadata,
+                    "metadata": {
+                        key: value
+                        for key, value in safe_metadata.items()
+                        if key not in {"session_id", "cache_fingerprint"}
+                    },
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
@@ -10300,7 +10496,7 @@ class RunStore:
                 "interrupted",
             }:
                 terminal = "failed" if "failed" in states else "succeeded"
-            if projection.get("pending_session_registry_update") is not None:
+            if _pending_session_registry_payloads(projection):
                 terminal = None
             if terminal:
                 projection["status"] = terminal
@@ -10435,10 +10631,19 @@ class RunStore:
         run_id: str,
     ) -> tuple[SessionRegistryUpdateCandidate, int, str | None] | None:
         projection = self.load_run(run_id)
-        value = projection.get("pending_session_registry_update")
-        if value is None:
+        pending = _pending_session_registry_payloads(projection)
+        if not pending:
             return None
-        candidate, retry_count = _session_registry_candidate_from_payload(value)
+        decoded = [
+            _session_registry_candidate_from_payload(payload)
+            for payload in pending.values()
+        ]
+        retrying = [item for item in decoded if item[1] > 0]
+        candidate, retry_count = (
+            retrying[0]
+            if retrying
+            else min(decoded, key=lambda item: item[0].winning_attempt_id)
+        )
         if candidate.winning_run_id != run_id:
             raise JournalRecoveryError("session registry obligation run is invalid")
         next_at = projection.get("next_registry_update_at")
@@ -10458,18 +10663,19 @@ class RunStore:
         directory = self.run_directory(run_id)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
-            current, retry_count = _session_registry_candidate_from_payload(
-                projection.get("pending_session_registry_update")
-            )
+            pending = _pending_session_registry_payloads(projection)
+            payload = pending.get(candidate.winning_attempt_id)
+            if payload is None:
+                raise RuntimeError("stale session registry obligation deferral")
+            current, retry_count = _session_registry_candidate_from_payload(payload)
             if current != candidate or retry_count >= 5:
                 raise RuntimeError("stale session registry obligation deferral")
             attempt = retry_count + 1
             delay_seconds = (1, 2, 4, 8, 16)[retry_count]
-            projection["pending_session_registry_update"] = (
-                _session_registry_candidate_payload(
-                    candidate,
-                    retry_count=attempt,
-                )
+            _set_pending_session_registry_update(
+                projection,
+                candidate,
+                retry_count=attempt,
             )
             projection["next_registry_update_at"] = (
                 now.astimezone(timezone.utc) + timedelta(seconds=delay_seconds)
@@ -10534,14 +10740,10 @@ class RunStore:
         directory = self.run_directory(run_id)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
-            current, _retry_count = _session_registry_candidate_from_payload(
-                projection.get("pending_session_registry_update")
-            )
-            if current != candidate:
-                raise RuntimeError("stale session registry update outcome")
             self._set_session_recovery_outcome(projection, candidate, outcome)
-            projection.pop("pending_session_registry_update", None)
+            _remove_pending_session_registry_update(projection, candidate)
             projection.pop("next_registry_update_at", None)
+            has_pending = bool(_pending_session_registry_payloads(projection))
             if (
                 isinstance(projection.get("last_error"), Mapping)
                 and projection["last_error"].get("code")
@@ -10553,7 +10755,9 @@ class RunStore:
                 if warning not in projection["warnings"]:
                     projection["warnings"].append(warning)
             terminal = None
-            if projection.get("desired_status") == "cancelled":
+            if has_pending:
+                terminal = None
+            elif projection.get("desired_status") == "cancelled":
                 projection["desired_status"] = None
                 for node in projection["nodes"].values():
                     if node["state"] not in {"succeeded", "failed", "skipped"}:
@@ -11320,7 +11524,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] != "running":
                 return False
-            if projection.get("pending_session_registry_update") is not None:
+            if _pending_session_registry_payloads(projection):
                 return False
             states = {node["state"] for node in projection["nodes"].values()}
             if states - {
@@ -11933,7 +12137,30 @@ class RunStore:
     def _observe_attempt(cls, attempt: Mapping[str, object]) -> str:
         serialized = attempt.get("process_identity")
         if isinstance(serialized, Mapping):
-            return cls._observe_process_identity(serialized)
+            # Reaping an AI worker proves only that its process stopped. The
+            # provider may already have accepted work whose result was never
+            # journaled, so that cut must remain outcome-uncertain.
+            provider_worker_started = attempt.get("executor_id") in {
+                "agent",
+                "command",
+                "prompt",
+                "loop",
+                "approval",
+            }
+            process_stop = attempt.get("process_stop")
+            if (
+                not provider_worker_started
+                and isinstance(process_stop, Mapping)
+                and process_stop.get("identity_matched") is True
+                and process_stop.get("cleaned") is True
+            ):
+                return "known_stopped"
+            observation = cls._observe_process_identity(serialized)
+            return (
+                "still_running"
+                if observation == "still_running"
+                else "outcome_uncertain"
+            )
         spawn = attempt.get("spawn")
         if not isinstance(spawn, Mapping):
             return "not_started"
@@ -12004,6 +12231,12 @@ class RunStore:
                 effect_classification = str(
                     attempt.get("effect_classification", "replay_safe")
                 )
+                process_stop = attempt.get("process_stop")
+                termination_confirmed = observation == "not_started" or bool(
+                    isinstance(process_stop, Mapping)
+                    and process_stop.get("identity_matched") is True
+                    and process_stop.get("cleaned") is True
+                )
                 node["recovery"] = {
                     "attempt_id": claim["attempt_id"],
                     "owner_id": attempt.get("owner_id", claim.get("owner_id")),
@@ -12015,8 +12248,7 @@ class RunStore:
                     "process_identity": attempt.get("process_identity"),
                     "observation": observation,
                     "interrupted_at": _utc_now(),
-                    "termination_confirmed": observation
-                    in {"known_stopped", "not_started"},
+                    "termination_confirmed": termination_confirmed,
                 }
                 requires_reconcile = effect_classification == "outward" or (
                     observation == "outcome_uncertain"
@@ -12158,6 +12390,12 @@ class RunStore:
             effect_classification = str(
                 attempt.get("effect_classification", "replay_safe")
             )
+            process_stop = attempt.get("process_stop")
+            termination_confirmed = observation == "not_started" or bool(
+                isinstance(process_stop, Mapping)
+                and process_stop.get("identity_matched") is True
+                and process_stop.get("cleaned") is True
+            )
             node.pop("claim", None)
             node["recovery"] = {
                 "attempt_id": claim.attempt_id,
@@ -12170,8 +12408,7 @@ class RunStore:
                 "process_identity": attempt.get("process_identity"),
                 "observation": observation,
                 "interrupted_at": _utc_now(),
-                "termination_confirmed": observation
-                in {"known_stopped", "not_started"},
+                "termination_confirmed": termination_confirmed,
             }
             requires_reconcile = effect_classification == "outward" or (
                 observation == "outcome_uncertain"
@@ -12540,18 +12777,25 @@ class RunStore:
             if failed_cleanup:
                 return {**projection, "cancellation_outcome": "cleanup_failed"}
 
-            if projection.get("pending_session_registry_update") is not None:
+            pending_registry_payloads = _pending_session_registry_payloads(projection)
+            if pending_registry_payloads:
                 if projection.get("status") == "recovery_pending":
-                    candidate, _retry_count = (
-                        _session_registry_candidate_from_payload(
-                            projection["pending_session_registry_update"]
+                    reset_payloads = {}
+                    for pending_payload in pending_registry_payloads.values():
+                        candidate, _retry_count = (
+                            _session_registry_candidate_from_payload(
+                                pending_payload
+                            )
                         )
-                    )
-                    projection["pending_session_registry_update"] = (
-                        _session_registry_candidate_payload(
-                            candidate,
-                            retry_count=0,
+                        reset_payloads[candidate.winning_attempt_id] = (
+                            _session_registry_candidate_payload(
+                                candidate,
+                                retry_count=0,
+                            )
                         )
+                    _store_pending_session_registry_payloads(
+                        projection,
+                        reset_payloads,
                     )
                     projection.pop("next_registry_update_at", None)
                     projection["status"] = "running"
@@ -12636,11 +12880,23 @@ class RunStore:
             ):
                 raise WorkflowConflict("stale resume decision")
             if projection["status"] == "recovery_pending":
-                candidate, _retry_count = _session_registry_candidate_from_payload(
-                    projection.get("pending_session_registry_update")
+                pending_registry_payloads = _pending_session_registry_payloads(
+                    projection
                 )
-                projection["pending_session_registry_update"] = (
-                    _session_registry_candidate_payload(candidate, retry_count=0)
+                reset_payloads = {}
+                for pending_payload in pending_registry_payloads.values():
+                    candidate, _retry_count = (
+                        _session_registry_candidate_from_payload(pending_payload)
+                    )
+                    reset_payloads[candidate.winning_attempt_id] = (
+                        _session_registry_candidate_payload(
+                            candidate,
+                            retry_count=0,
+                        )
+                    )
+                _store_pending_session_registry_payloads(
+                    projection,
+                    reset_payloads,
                 )
                 projection.pop("next_registry_update_at", None)
                 projection["last_error"] = None

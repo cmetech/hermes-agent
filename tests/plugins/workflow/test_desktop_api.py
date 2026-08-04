@@ -64,6 +64,7 @@ from plugins.workflow.scheduled_revalidation import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ArtifactRef,
     RunStore,
@@ -1398,6 +1399,85 @@ def test_scheduled_mutation_success_uses_public_run_projection(
     assert cleanup.status_code == 200
     assert run_id in cleanup.json()["run_ids"]
     assert run_directory.is_dir()
+
+
+def test_recovery_pending_detail_and_resume_use_explicit_operator_actions(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.cli as workflow_cli
+
+    class UnavailableRegistry(NodeSessionRegistry):
+        def compare_and_set_or_observe(self, *args, **kwargs):
+            raise OSError("private registry path")
+
+    class Runner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="ok",
+                session_id="private-session",
+                provider=request.provider or "fake-provider",
+                model=request.model or "fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={"provider_attempts": 1},
+            )
+
+    home = tmp_path / "recovery-pending-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(
+        tmp_path / "recovery-pending-package",
+        name="desktop-recovery-pending",
+        persist_sessions=True,
+        provider="fake-provider",
+        model="fake-model",
+        nodes=[{"id": "analyze", "prompt": "Analyze"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    admitted = _start(store, package, "desktop-recovery-pending")
+    clock = [datetime(2026, 8, 1, tzinfo=timezone.utc)]
+    scheduler = RunScheduler(
+        store,
+        agent_runner=Runner(),
+        session_registry=UnavailableRegistry(home),
+        utcnow=lambda: clock[0],
+    )
+    scheduler.advance(admitted.run_id)
+    for delay in (1, 2, 4, 8):
+        clock[0] += timedelta(seconds=delay)
+        scheduler.advance(admitted.run_id)
+    assert store.load_run(admitted.run_id)["status"] == "recovery_pending"
+
+    monkeypatch.setattr(
+        workflow_cli,
+        "_scheduler",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            verified_always_run_nodes=lambda _run_id: frozenset()
+        ),
+    )
+    client = TestClient(_app(_router()))
+    detail = client.get(
+        f"/api/plugins/workflow/runs/{admitted.run_id}"
+    ).json()
+
+    assert detail["next_actions"] == ["status", "events", "resume", "cancel"]
+    archived = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/archive",
+        json={"expected_version": detail["state_version"]},
+    )
+    assert archived.status_code == 409
+    assert archived.json()["detail"]["code"] == "invalid_transition"
+    resumed = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/resume",
+        json={"expected_version": detail["state_version"]},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
 
 
 @pytest.mark.parametrize(

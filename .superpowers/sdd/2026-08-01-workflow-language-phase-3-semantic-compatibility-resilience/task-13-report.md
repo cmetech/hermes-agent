@@ -383,3 +383,134 @@ Task 14, Phase 4, or unrelated file changed.
   pytest invocation, push, publication, merge, branch deletion, worktree
   deletion, literal-`main` mutation, or shared `base` checkout mutation was
   performed.
+
+## Fix Round 1
+
+### Authenticated review base and disposition
+
+Fix Round 1 started from clean reviewed base
+`3406b1fe087797eb46dd88c74938db83326c2220`. It addresses every concrete
+finding in `task-13-spec-review-1.md` and `task-13-quality-review-1.md`:
+
+- Public status, attempt, event/timeline, recovery evidence, and authenticated
+  Desktop/API projections now omit the exact recovered session ID and exact
+  cache fingerprint. The exact values remain available only to private
+  same-run execution authority and registry reconciliation.
+- Live completion and rebuild require an exact private candidate corroborator,
+  exact boolean recovery selection, exact winner/run/workflow/scope/provider/
+  profile/generation/session/fingerprint authority, and exact selected-recovery
+  digest/source/zero-provider evidence. Field-by-field substitution fails
+  closed.
+- Real profile-local `SessionDB` corruption maps to
+  `persistent_session_recovery_unavailable` before worker spawn or provider
+  use.
+- `recovery_pending` advertises and accepts `resume` and `cancel`; it does not
+  advertise `archive`.
+- Independent persistent nodes can complete concurrently into a bounded
+  collection of per-attempt registry obligations. Reconciliation is
+  deterministic and idempotent, and finalization waits until every obligation
+  is resolved.
+- Registry construction remains lazy for schedulers without an agent runner and
+  occurs on demand only for a validated pending obligation.
+- The isolated `PluginAgentRunner` now journals spawn intent before allocation,
+  records allocation failure, binds the real managed-process identity, and
+  records cleanup at the actual process boundary. A crash after AI-worker
+  allocation is outcome-uncertain even if that worker was cleanly reaped: reap
+  proves termination, not that the provider had zero effect, so silent replay
+  remains forbidden.
+- The replacement fresh request is resealed against the immutable deadline and
+  cancellation immediately before both typed-exception and child-result-race
+  launches.
+- Registry keys, rows, recovery selections, candidates, and CAS inputs now have
+  explicit type and size bounds. Strict v3 rejects malformed/noncanonical
+  fingerprints before provider use. The registry schema initialization is also
+  protected by the cross-process lock.
+- The test matrix now uses a real corrupt `SessionDB`, real isolated worker
+  lifecycle callbacks, crash-cut store recovery, concurrent persistent nodes,
+  and separate spawned registry processes racing the generation CAS.
+
+The parent explicitly extended the fix scope to the generic agent lifecycle and
+Desktop/action surfaces. No workflow sanitizer, evidence schema, language
+schema, model tool, prompt, history, toolset, user configuration, or unrelated
+file was changed in this round.
+
+### Fix-round TDD evidence
+
+All Python tests below were invoked through `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`; no direct pytest invocation or retry was used.
+
+- Privacy and corruption tests first failed **7 tests / 16 passed**, then the
+  focused recovery suite passed **23/23**.
+- Generic isolated-worker lifecycle tests first failed **2 tests / 121
+  passed**, then the combined agent/recovery gate passed **149/149**.
+- The two-node concurrent-obligation test failed with the prior singular-slot
+  error, then the recovery suite passed **27/27**.
+- The lazy-scheduler regression failed because construction opened the registry,
+  then the recovery suite passed **28/28**.
+- Operator action/API discovery failed **1 test / 14 passed**, then the
+  action/Desktop gate passed **170/170**.
+- Malformed row/candidate cases failed **8 tests / 28 passed**, then the
+  relevant gate passed **42/42**.
+- The post-spawn crash case failed by producing `interrupted` rather than
+  `paused`, then recovery/crash tests passed **66/66**.
+- The separate-process CAS test exposed `sqlite3.OperationalError: database is
+  locked`; locking schema initialization made the recovery suite pass **39/39**.
+- Final self-review added the previously uncovered crash after clean AI-worker
+  reap but before durable node completion. RED was **40 passed / 1 failed**;
+  after separating termination proof from provider-outcome proof, recovery and
+  crash suites passed **70/70**.
+
+No test was weakened, deleted, skipped, mocked away, or marked flaky.
+
+### Final Fix Round 1 verification
+
+The exact required ten-file command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Final result: **10 files, 263 passed / 0 failed**.
+
+The expanded changed-seam/scheduler/Desktop command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Final result: **9 files, 502 passed / 0 failed**.
+
+Ruff passed on every changed Python source/test file, and `git diff --check`
+reported no whitespace errors.
+
+### Fix Round 1 changed files
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `agent/plugin_agent.py`
+- `plugins/workflow/actions.py`
+- `plugins/workflow/executors/ai.py`
+- `plugins/workflow/executors/base.py`
+- `plugins/workflow/scheduler.py`
+- `plugins/workflow/sessions.py`
+- `plugins/workflow/store.py`
+- `tests/agent/test_plugin_agent.py`
+- `tests/plugins/workflow/test_desktop_api.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+- `tests/plugins/workflow/test_run_queries.py`
+
+### Fix Round 1 self-review
+
+- Strict v3 behavior remains gated to the admitted execution semantics; legacy,
+  v1, and v2 paths retain their existing registry/CAS behavior.
+- The system prompt, tool schemas, prior messages, and per-conversation toolset
+  remain byte-stable. No core model tool or workflow-specific prompt surface was
+  added.
+- The bounded obligation collection preserves the singular on-disk form for one
+  candidate and promotes to a maximum-64 mapping only when concurrency requires
+  it. One persisted retry wake applies to one deterministic obligation at a
+  time; provider execution is never repeated by reconciliation.
+- Exact private session authority is removed only at public store/API/event
+  boundaries. Existing typed-publication session metadata remains governed by
+  its separate established contract.
+- No blocking concerns remain.

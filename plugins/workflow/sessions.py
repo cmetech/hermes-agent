@@ -25,6 +25,9 @@ except ImportError:  # pragma: no cover
 
 
 _SHA256_LENGTH = 64
+_SESSION_ID_MAX_CHARS = 4096
+_REGISTRY_VALUE_MAX_CHARS = 4096
+_REGISTRY_IDENTITY_MAX_CHARS = 256
 _MIRROR_MAX_CONTENT_BYTES = 500_000
 _MIRROR_MAX_DOCUMENT_BYTES = 65_536
 _MIRROR_MEDIA = {
@@ -1053,6 +1056,21 @@ class NodeSessionKey:
     provider: str
     profile: str
 
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > _REGISTRY_IDENTITY_MAX_CHARS
+            for value in (
+                self.workflow,
+                self.node_id,
+                self.scope,
+                self.provider,
+                self.profile,
+            )
+        ):
+            raise ValueError("node session key is malformed")
+
 
 @dataclass(frozen=True)
 class NodeSessionRecord:
@@ -1061,6 +1079,27 @@ class NodeSessionRecord:
     cache_fingerprint: str
     generation: int
     updated_at: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.session_id, str)
+            or not self.session_id
+            or len(self.session_id) > _SESSION_ID_MAX_CHARS
+            or not isinstance(self.cache_fingerprint, str)
+            or not self.cache_fingerprint
+            or len(self.cache_fingerprint) > _REGISTRY_VALUE_MAX_CHARS
+            or isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 0
+            or not isinstance(self.updated_at, str)
+        ):
+            raise ValueError("node session record is malformed")
+        try:
+            updated_at = datetime.fromisoformat(self.updated_at)
+        except ValueError as exc:
+            raise ValueError("node session record is malformed") from exc
+        if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+            raise ValueError("node session record is malformed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1085,11 +1124,27 @@ class PersistentSessionRecoverySelection:
             self.run_id,
             self.attempt_id,
         )
-        if any(not value or len(value) > 256 for value in bounded):
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > _REGISTRY_IDENTITY_MAX_CHARS
+            for value in bounded
+        ):
             raise ValueError("persistent session recovery identity is invalid")
-        if self.expected_generation < 0:
+        if (
+            isinstance(self.expected_generation, bool)
+            or not isinstance(self.expected_generation, int)
+            or self.expected_generation < 0
+        ):
             raise ValueError("expected_generation must be non-negative")
-        if not self.missing_session_id or not self.cache_fingerprint:
+        if (
+            not isinstance(self.missing_session_id, str)
+            or not self.missing_session_id
+            or len(self.missing_session_id) > _SESSION_ID_MAX_CHARS
+            or not isinstance(self.cache_fingerprint, str)
+            or len(self.cache_fingerprint) != _SHA256_LENGTH
+            or any(character not in "0123456789abcdef" for character in self.cache_fingerprint)
+        ):
             raise ValueError("persistent session recovery values must be non-empty")
         if self.source != "cross_run_registry":
             raise ValueError("persistent session recovery source is invalid")
@@ -1119,14 +1174,32 @@ class SessionRegistryUpdateCandidate:
             self.winning_node_id,
             self.winning_attempt_id,
         )
-        if any(not value or len(value) > 256 for value in bounded):
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > _REGISTRY_IDENTITY_MAX_CHARS
+            for value in bounded
+        ):
             raise ValueError("session registry update identity is invalid")
         if self.key.node_id != self.winning_node_id:
             raise ValueError("session registry update node identity is inconsistent")
-        if self.expected_generation < 0:
+        if (
+            isinstance(self.expected_generation, bool)
+            or not isinstance(self.expected_generation, int)
+            or self.expected_generation < 0
+        ):
             raise ValueError("expected_generation must be non-negative")
-        if not self.new_session_id or not self.cache_fingerprint:
+        if (
+            not isinstance(self.new_session_id, str)
+            or not self.new_session_id
+            or len(self.new_session_id) > _SESSION_ID_MAX_CHARS
+            or not isinstance(self.cache_fingerprint, str)
+            or len(self.cache_fingerprint) != _SHA256_LENGTH
+            or any(character not in "0123456789abcdef" for character in self.cache_fingerprint)
+        ):
             raise ValueError("session registry update values must be non-empty")
+        if type(self.recovery_selected) is not bool:
+            raise ValueError("session registry update recovery flag is invalid")
 
 
 class NodeSessionRegistry:
@@ -1137,23 +1210,24 @@ class NodeSessionRegistry:
         self.root.mkdir(parents=True, exist_ok=True)
         self.database = self.root / "node-sessions.sqlite3"
         self.lock_path = self.root / ".node-sessions.lock"
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS node_sessions (
-                    workflow TEXT NOT NULL,
-                    node_id TEXT NOT NULL,
-                    scope TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    profile TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    cache_fingerprint TEXT NOT NULL,
-                    generation INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (workflow, node_id, scope, provider, profile)
+        with workflow_lock(self.lock_path):
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS node_sessions (
+                        workflow TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        scope TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        profile TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        cache_fingerprint TEXT NOT NULL,
+                        generation INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (workflow, node_id, scope, provider, profile)
+                    )
+                    """
                 )
-                """
-            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=5, isolation_level=None)
@@ -1208,9 +1282,20 @@ class NodeSessionRegistry:
         session_id: str,
         cache_fingerprint: str,
     ) -> str:
-        if expected_generation < 0:
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 0
+        ):
             raise ValueError("expected_generation must be non-negative")
-        if not session_id or not cache_fingerprint:
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > _SESSION_ID_MAX_CHARS
+            or not isinstance(cache_fingerprint, str)
+            or not cache_fingerprint
+            or len(cache_fingerprint) > _REGISTRY_VALUE_MAX_CHARS
+        ):
             raise ValueError("session_id and cache_fingerprint must be non-empty")
         now = datetime.now(timezone.utc).isoformat()
         with workflow_lock(self.lock_path):

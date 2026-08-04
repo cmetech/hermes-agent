@@ -802,7 +802,11 @@ class AgentNodeExecutor:
         def with_recovery_failure(
             failure: NodeExecutionResult,
         ) -> NodeExecutionResult:
-            if recovery_selected and failure.status == "failed":
+            if recovery_selected and failure.status in {
+                "failed",
+                "cancelled",
+                "interrupted",
+            }:
                 return replace(
                     failure,
                     session_recovery_outcome="fresh_execution_failed",
@@ -866,6 +870,15 @@ class AgentNodeExecutor:
                         return self._recovery_unavailable()
                     raise
                 if record is not None:
+                    if strict_v3 and (
+                        not isinstance(record.cache_fingerprint, str)
+                        or len(record.cache_fingerprint) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in record.cache_fingerprint
+                        )
+                    ):
+                        return self._recovery_unavailable()
                     expected_generation = record.generation
                     if record.cache_fingerprint == fingerprint:
                         context_mode = "shared"
@@ -1076,6 +1089,51 @@ class AgentNodeExecutor:
                     metadata={"provider_attempts": 0},
                 )
 
+            def launch_agent(launch_request):
+                launch_kwargs = {"is_cancelled": context.is_cancelled}
+                lifecycle_callbacks = {
+                    "spawn_intent": context.spawn_intent,
+                    "spawn_failed": context.spawn_failed,
+                    "process_started": context.process_started,
+                    "process_stopped": context.process_stopped,
+                }
+                if getattr(agent_runner, "starts_request_mcp", False):
+                    launch_kwargs.update({
+                        name: callback
+                        for name, callback in lifecycle_callbacks.items()
+                        if callback is not None
+                    })
+                return agent_runner.run(launch_request, **launch_kwargs)
+
+            def fresh_recovery_request():
+                fresh_request = replace(
+                    request,
+                    context_mode="fresh",
+                    session_id=None,
+                )
+                fresh_request = sealed_provider_request_for_launch(
+                    context,
+                    fresh_request,
+                )
+                if fresh_request is None:
+                    return with_recovery_failure(
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="provider_timeout",
+                            error_message="workflow attempt deadline expired",
+                            metadata={"provider_attempts": 0},
+                        )
+                    )
+                if context.is_cancelled is not None and context.is_cancelled():
+                    return with_recovery_failure(
+                        NodeExecutionResult(
+                            "cancelled",
+                            error_code="cancelled",
+                            metadata={"provider_attempts": 0},
+                        )
+                    )
+                return launch_agent(fresh_request)
+
             def select_fresh_recovery() -> bool:
                 nonlocal recovery_selected
                 callback = context.record_session_recovery_selection
@@ -1100,10 +1158,7 @@ class AgentNodeExecutor:
                 return selected
 
             try:
-                result = agent_runner.run(
-                    request,
-                    is_cancelled=context.is_cancelled,
-                )
+                result = launch_agent(request)
             except PluginAgentSessionMissingError:
                 if not strict_v3:
                     raise
@@ -1123,12 +1178,15 @@ class AgentNodeExecutor:
                     raise
                 if not select_fresh_recovery():
                     return self._recovery_unavailable()
-                request = replace(request, context_mode="fresh", session_id=None)
-                result = agent_runner.run(
-                    request,
-                    is_cancelled=context.is_cancelled,
-                )
-            except (OSError, PermissionError, ValueError) as exc:
+                result = fresh_recovery_request()
+                if isinstance(result, NodeExecutionResult):
+                    return result
+            except (
+                OSError,
+                PermissionError,
+                ValueError,
+                sqlite3.DatabaseError,
+            ) as exc:
                 if strict_v3 and session_source == "cross_run_registry":
                     return self._recovery_unavailable()
                 raise
@@ -1154,15 +1212,9 @@ class AgentNodeExecutor:
                 if session_source == "cross_run_registry":
                     if not select_fresh_recovery():
                         return self._recovery_unavailable()
-                    request = replace(
-                        request,
-                        context_mode="fresh",
-                        session_id=None,
-                    )
-                    result = agent_runner.run(
-                        request,
-                        is_cancelled=context.is_cancelled,
-                    )
+                    result = fresh_recovery_request()
+                    if isinstance(result, NodeExecutionResult):
+                        return result
         except PermissionError as exc:
             return with_recovery_failure(
                 self._failure("authorization", str(exc))
@@ -1443,18 +1495,20 @@ class AgentNodeExecutor:
                 if strict_v3:
                     if not result.session_id:
                         return self._recovery_unavailable()
+                    registry_update = SessionRegistryUpdateCandidate(
+                        key=registry_key,
+                        expected_generation=expected_generation,
+                        new_session_id=result.session_id,
+                        cache_fingerprint=fingerprint,
+                        winning_run_id=context.run_id,
+                        winning_node_id=node.id,
+                        winning_attempt_id=context.attempt_id,
+                        recovery_selected=recovery_selected,
+                    )
                     return replace(
                         archon_result,
-                        session_registry_update=SessionRegistryUpdateCandidate(
-                            key=registry_key,
-                            expected_generation=expected_generation,
-                            new_session_id=result.session_id,
-                            cache_fingerprint=fingerprint,
-                            winning_run_id=context.run_id,
-                            winning_node_id=node.id,
-                            winning_attempt_id=context.attempt_id,
-                            recovery_selected=recovery_selected,
-                        ),
+                        session_registry_update=registry_update,
+                        session_registry_authority=registry_update,
                     )
                 updated = self.session_registry.compare_and_set(
                     registry_key,

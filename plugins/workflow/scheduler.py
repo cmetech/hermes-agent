@@ -563,9 +563,9 @@ class RunScheduler:
             else None
         )
         self.store = store
-        self.session_registry = session_registry or NodeSessionRegistry(
-            store.hermes_home
-        )
+        self.session_registry = session_registry
+        if self.session_registry is None and agent_runner is not None:
+            self.session_registry = NodeSessionRegistry(store.hermes_home)
         self.owner_id = owner_id or f"scheduler-{os.getpid()}-{uuid.uuid4().hex}"
         if (execution_owner_id is None) != (execution_owner_epoch is None):
             raise ValueError(
@@ -660,6 +660,8 @@ class RunScheduler:
         pending = self.store.pending_session_registry_update(run_id)
         if pending is None:
             return False
+        if self.session_registry is None:
+            self.session_registry = NodeSessionRegistry(self.store.hermes_home)
         candidate, retry_count, next_at = pending
         projection = self.store.load_run(run_id)
         if projection.get("status") == "recovery_pending":
@@ -3545,6 +3547,9 @@ class RunScheduler:
                             session_registry_update=(
                                 result.session_registry_update
                             ),
+                            session_registry_authority=(
+                                result.session_registry_authority
+                            ),
                         )
                     except BaseException:
                         self._purge_attempt_output_cache(claim)
@@ -3558,6 +3563,9 @@ class RunScheduler:
                     error_message=result.error_message,
                     metadata=completion_metadata,
                     session_registry_update=result.session_registry_update,
+                    session_registry_authority=(
+                        result.session_registry_authority
+                    ),
                 )
             return
         if execution_semantics is not None:

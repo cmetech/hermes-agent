@@ -2699,6 +2699,65 @@ def test_cancelled_worker_launches_no_provider_call(monkeypatch) -> None:
     assert result["audit"]["provider_attempts"] == 0
 
 
+@pytest.mark.live_system_guard_bypass
+def test_worker_exchange_reports_spawn_lifecycle_in_order() -> None:
+    lifecycle = []
+    code = (
+        "import json,sys;sys.stdin.readline();"
+        "print(json.dumps({'protocol_version':1,'type':'result','result':{}}),"
+        "flush=True)"
+    )
+
+    frame = _exchange_worker(
+        {"protocol_version": 1, "type": "run"},
+        workdir=None,
+        idle_timeout_seconds=5,
+        wall_timeout_seconds=10,
+        worker_argv=[sys.executable, "-c", code],
+        spawn_intent=lambda nonce: lifecycle.append(("intent", nonce)) or True,
+        spawn_failed=lambda nonce, error: lifecycle.append(
+            ("failed", nonce, error)
+        )
+        or True,
+        process_started=lambda identity: lifecycle.append(
+            ("started", identity)
+        )
+        or True,
+        process_stopped=lambda identity, cleaned: lifecycle.append(
+            ("stopped", identity, cleaned)
+        ),
+    )
+
+    assert frame["type"] == "result"
+    assert [item[0] for item in lifecycle] == ["intent", "started", "stopped"]
+    assert lifecycle[0][1]
+    assert lifecycle[1][1] == lifecycle[2][1]
+    assert lifecycle[2][2] is True
+
+
+def test_worker_exchange_rejected_spawn_intent_creates_no_process(monkeypatch) -> None:
+    import agent.plugin_agent as plugin_agent
+
+    monkeypatch.setattr(
+        plugin_agent.ManagedProcessTree,
+        "spawn",
+        staticmethod(
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("process created")
+            )
+        ),
+    )
+
+    with pytest.raises(_PluginAgentCancelled):
+        _exchange_worker(
+            {"protocol_version": 1, "type": "run"},
+            workdir=None,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            spawn_intent=lambda _nonce: False,
+        )
+
+
 def test_approval_digest_is_validated_before_worker_start(monkeypatch) -> None:
     monkeypatch.setattr(
         "agent.plugin_agent._exchange_worker",

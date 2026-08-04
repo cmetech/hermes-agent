@@ -39,6 +39,7 @@ from agent.structured_output import (
 )
 from tools.managed_process import (
     ManagedProcessTree,
+    ProcessIdentity,
     ProcessResourceLimits,
     TerminationPolicy,
 )
@@ -1173,6 +1174,10 @@ def _exchange_worker_once(
     is_cancelled: Callable[[], bool] | None = None,
     resource_limits: ProcessResourceLimits | None = None,
     termination_policy: TerminationPolicy | None = None,
+    spawn_intent: Callable[[str], bool] | None = None,
+    spawn_failed: Callable[[str, str], bool] | None = None,
+    process_started: Callable[[ProcessIdentity], bool] | None = None,
+    process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
@@ -1188,24 +1193,47 @@ def _exchange_worker_once(
         ),
         str(package_root),
     ]
-    tree = ManagedProcessTree.spawn(
-        worker_argv or default_worker_argv,
-        policy=termination_policy
-        or TerminationPolicy(
-            cooperative_grace_seconds=5.0,
-            term_grace_seconds=5.0,
-            kill_grace_seconds=2.0,
-            wait_timeout_seconds=2.0,
-        ),
-        cwd=str(workdir) if workdir else None,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    executor_nonce = secrets.token_hex(16)
+    if spawn_intent is not None and not spawn_intent(executor_nonce):
+        raise _PluginAgentCancelled("plugin-agent spawn intent was rejected")
+    try:
+        tree = ManagedProcessTree.spawn(
+            worker_argv or default_worker_argv,
+            policy=termination_policy
+            or TerminationPolicy(
+                cooperative_grace_seconds=5.0,
+                term_grace_seconds=5.0,
+                kill_grace_seconds=2.0,
+                wait_timeout_seconds=2.0,
+            ),
+            cwd=str(workdir) if workdir else None,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except BaseException as exc:
+        if spawn_failed is not None:
+            try:
+                spawn_failed(executor_nonce, type(exc).__name__)
+            except BaseException:
+                pass
+        raise
+    process_registered = False
+    if process_started is not None:
+        try:
+            process_registered = bool(process_started(tree.identity))
+        except BaseException:
+            tree.close()
+            raise
+        if not process_registered:
+            tree.close()
+            raise _PluginAgentCancelled(
+                "plugin-agent process registration was rejected"
+            )
     assert tree.process.stdin is not None
     assert tree.process.stdout is not None
     assert tree.process.stderr is not None
@@ -1281,7 +1309,16 @@ def _exchange_worker_once(
             tree.process.stdin.close()
         except Exception:
             pass
-        tree.close()
+        cleaned = False
+        try:
+            tree.close()
+            cleaned = tree.reaped
+        finally:
+            if process_registered and process_stopped is not None:
+                try:
+                    process_stopped(tree.identity, cleaned)
+                except BaseException:
+                    pass
         stdout_reader.join(timeout=1.0)
         stderr_reader.join(timeout=1.0)
 
@@ -1296,6 +1333,10 @@ def _exchange_worker(
     is_cancelled: Callable[[], bool] | None = None,
     resource_limits: ProcessResourceLimits | None = None,
     termination_policy: TerminationPolicy | None = None,
+    spawn_intent: Callable[[str], bool] | None = None,
+    spawn_failed: Callable[[str, str], bool] | None = None,
+    process_started: Callable[[ProcessIdentity], bool] | None = None,
+    process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
     """Exchange one frame while owning any top-level sealed grant broker."""
 
@@ -1326,6 +1367,10 @@ def _exchange_worker(
             is_cancelled=is_cancelled,
             resource_limits=resource_limits,
             termination_policy=termination_policy,
+            spawn_intent=spawn_intent,
+            spawn_failed=spawn_failed,
+            process_started=process_started,
+            process_stopped=process_stopped,
         )
     finally:
         if owned_authority is not None:
@@ -1347,6 +1392,10 @@ class PluginAgentRunner:
         request: PluginAgentRunRequest,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        spawn_intent: Callable[[str], bool] | None = None,
+        spawn_failed: Callable[[str, str], bool] | None = None,
+        process_started: Callable[[ProcessIdentity], bool] | None = None,
+        process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
     ) -> PluginAgentRunResult:
         _validate_request(request)
         if not _agent_override_allowed(self.plugin_id, "provider", request.provider):
@@ -1386,6 +1435,10 @@ class PluginAgentRunner:
                     kill_grace_seconds=request.kill_reap_grace_seconds,
                     wait_timeout_seconds=request.kill_reap_grace_seconds,
                 ),
+                spawn_intent=spawn_intent,
+                spawn_failed=spawn_failed,
+                process_started=process_started,
+                process_stopped=process_stopped,
             )
             result = frame.get("result")
             if not isinstance(result, dict):

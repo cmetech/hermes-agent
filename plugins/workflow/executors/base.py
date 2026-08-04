@@ -101,6 +101,7 @@ class NodeExecutionResult:
     metadata: Mapping[str, object] = field(default_factory=dict)
     primary_output: PrimaryOutputCandidate | None = None
     session_registry_update: SessionRegistryUpdateCandidate | None = None
+    session_registry_authority: SessionRegistryUpdateCandidate | None = None
     session_recovery_outcome: str | None = None
 
 
