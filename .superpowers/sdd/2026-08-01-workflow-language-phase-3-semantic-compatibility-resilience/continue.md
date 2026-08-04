@@ -1,34 +1,34 @@
-# Continue — Phase 3 complete / integration handoff
+# Continue — Phase 3 adversarial remediation complete / integration handoff
 
 ## Last action
 
-Closed Task 16 and Phase 3 at reviewed production implementation
-`8a1fe704484bf63e0e84f536f7fb690a2f024ccf` (tree
-`94f4fd4572b63ba6dd496213b603e67748b41b46`). Independent final specification
-and quality reviews both passed with 0 Critical, 0 Important, and 0 Minor
-findings. The explicit ordinary functional, Desktop, schema, customization,
-merge, and manual integration-only upstream/OTTO/LOOP24 gates passed. Broad
-discovery and the generic ledger-validation stage were superseded because they
-could select security/threat-focused tests prohibited by the user. No such
-evidence is used for completion.
+Confirmed and resolved all one CRITICAL and seven HIGH findings from the
+post-completion adversarial review of immutable candidate `8a1fe704`. The
+repaired production candidate is `060f60f5429c5250d018e4efe61f1a22edc05102`.
+The clean allowed base gate passed 3,857 Python tests, the installed-wheel test,
+and 159 Desktop tests. The upstream-customization checker and diff checks also
+passed. The prohibited threat-model/security suites remained excluded.
 
 ## Next action
 
 Wait for explicit user authorization before integration. If authorized, use
 the project branch rule that developer shorthand `main` means `base`; do not
-target literal `main`. Reverify the reviewed production identity, the
-report-only closure identity, clean worktree, and current `base` state before
-any merge, push, PR, release, branch deletion, or worktree removal.
+target literal `main`. Reverify repaired production candidate `060f60f54`, the
+report-only closure commit above it, the clean worktree, and current `base`
+state before any merge, push, PR, release, branch deletion, or worktree removal.
 
 ## Why
 
-Tasks 1–16 implement, publish, and verify the bounded Phase 3 contract through
-the runtime, API, Desktop, generated schema, documentation, skill, installed
-distribution, customization gates, and disposable brand integration rehearsal.
+Tasks 1–16 implement, publish, and verify the bounded Phase 3 contract. The
+post-completion remediation additionally closes Bash arithmetic admission and
+aggregate-size gaps, pause/retry and reference-wait accounting defects, the
+session journal crash window, post-provider outcome misclassification, loop
+double rendering, and upstream ownership of provider-attempt transport seams.
 
 ## Open threads
 
-- Tasks 1–16 are complete; no implementation or review finding remains open.
+- Tasks 1–16 and all adversarial remediation findings are complete; no known
+  CRITICAL or HIGH finding remains open.
 - Integration, push, publication, release propagation, and cleanup remain
   unauthorized until the user requests them separately.
 - The shared `base` checkout remains at `5b974a53593fc880d18417ee2fc0e5eaff5599f4`
