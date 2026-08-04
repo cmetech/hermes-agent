@@ -634,6 +634,69 @@ def test_sealed_snapshot_allows_regular_publication_runtime_root(
     assert observed == expected
 
 
+def test_root_mutable_file_names_include_only_store_owned_recovery_artifacts() -> None:
+    artifact_id = "a" * 32
+    accepted = {
+        ".lock",
+        ".snapshot-owner.json",
+        "events.jsonl",
+        "run.json",
+        f"run.json.corrupt-{artifact_id}",
+        f"events.jsonl.torn-{artifact_id}",
+    }
+    rejected = {
+        f"nested/run.json.corrupt-{artifact_id}",
+        f"nested/events.jsonl.torn-{artifact_id}",
+        f"run.json.corrupt-{artifact_id[:-1]}",
+        f"events.jsonl.torn-{artifact_id}0",
+        "run.json.corrupt-not-an-artifact-id",
+        "events.jsonl.torn-not-an-artifact-id",
+    }
+
+    assert all(
+        scheduled_revalidation_module._is_mutable_run_file(path)
+        for path in accepted
+    )
+    assert not any(
+        scheduled_revalidation_module._is_mutable_run_file(path)
+        for path in rejected
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    (
+        f"run.json.corrupt-{'a' * 32}",
+        f"events.jsonl.torn-{'b' * 32}",
+    ),
+)
+def test_sealed_snapshot_ignores_store_owned_root_recovery_artifact(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    sealed_paths = ("definition.yaml", "inputs.json", "resources.json")
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    expected_explicit = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+    expected_legacy = scheduled_revalidation_module.sealed_snapshot_digest(root)
+    (root / artifact_name).write_text("preserved recovery bytes\n", encoding="utf-8")
+
+    assert scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    ) == expected_explicit
+    assert (
+        scheduled_revalidation_module.sealed_snapshot_digest(root)
+        == expected_legacy
+    )
+
+
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo"])
 def test_sealed_snapshot_rejects_unsafe_publication_runtime_entries(
     tmp_path: Path,

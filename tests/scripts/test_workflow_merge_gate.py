@@ -76,6 +76,15 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_topology.py",
     )
 }
+PROHIBITED_WORKFLOW_GATE_SUITES = {
+    "tests/plugins/workflow/test_phase3_bash_lexer_security.py": (
+        "excluded from automated validation by the active user override"
+    ),
+    "tests/plugins/workflow/test_persistent_session_recovery.py": (
+        "mixed persistent-session suite excluded by the active user override"
+    ),
+}
+WORKFLOW_GATE_OPTOUTS.update(PROHIBITED_WORKFLOW_GATE_SUITES)
 
 PARSER_VERSIONS = {
     "typescript": "6.0.3",
@@ -254,7 +263,6 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_phase3_resolution_waits.py",
         "tests/plugins/workflow/test_phase3_bash_substitution.py",
         "tests/plugins/workflow/test_phase3_bash_descriptor_faults.py",
-        "tests/plugins/workflow/test_phase3_bash_lexer_security.py",
         "tests/plugins/workflow/test_phase3_bash_reference_ordering.py",
         *PHASE_1_LANGUAGE_BACKEND_SUITES,
     ):
@@ -278,6 +286,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert not any("*" in path for path in opted_out)
     assert not (opted_out - workflow_inventory)
     assert not (opted_out & selected_workflow)
+    assert not (set(PROHIBITED_WORKFLOW_GATE_SUITES) & selected_workflow)
     assert not (workflow_inventory - selected_workflow - opted_out)
 
 
