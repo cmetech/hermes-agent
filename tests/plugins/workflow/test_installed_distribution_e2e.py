@@ -177,24 +177,54 @@ nodes:
         [
             sys.executable,
             "-c",
-            (
-                "from datetime import datetime; import json,sys; "
-                "from plugins.workflow.admission import RunAdmissionRequest; "
-                "from plugins.workflow.schema import load_workflow; "
-                "from plugins.workflow.scheduler import RunScheduler; "
-                "from plugins.workflow.store import RunStore; "
-                "p=load_workflow(sys.argv[1]); s=RunStore(sys.argv[2]); "
-                "x=s.prepare_run_snapshot(p); a=s.start_run(RunAdmissionRequest("
-                "workflow_name=p.definition.name,definition_digest=x.definition_digest,"
-                "policy_digest=x.policy_digest,input_manifest_digest=x.input_manifest_digest,"
-                "trigger_source='cli',idempotency_key='installed',concurrency_key='installed'),"
-                "immutable_snapshot=x); r=RunScheduler(s).advance(a.run_id); "
-                "due=datetime.fromisoformat(next(n['next_attempt_at'] for n in r['nodes'].values() "
-                "if n.get('next_attempt_at'))); "
-                "r=RunScheduler(s,utcnow=lambda:due).advance(a.run_id); "
-                "print(json.dumps({'status':r['status'],'attempts':len(r['nodes']['prepare']['attempts']),"
-                "'consumer':r['nodes']['consume']['state']}))"
-            ),
+            """
+from datetime import datetime, timezone
+import json
+import sys
+
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.store import RunStore
+
+package = load_workflow(sys.argv[1])
+store = RunStore(sys.argv[2])
+snapshot = store.prepare_run_snapshot(package)
+admitted = store.start_run(
+    RunAdmissionRequest(
+        workflow_name=package.definition.name,
+        definition_digest=snapshot.definition_digest,
+        policy_digest=snapshot.policy_digest,
+        input_manifest_digest=snapshot.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key="installed",
+        concurrency_key="installed",
+    ),
+    immutable_snapshot=snapshot,
+)
+clock = [datetime.now(timezone.utc)]
+scheduler = RunScheduler(store, utcnow=lambda: clock[0])
+shutdown = False
+try:
+    result = scheduler.advance(admitted.run_id)
+    clock[0] = datetime.fromisoformat(
+        next(
+            node["next_attempt_at"]
+            for node in result["nodes"].values()
+            if node.get("next_attempt_at")
+        )
+    )
+    result = scheduler.advance(admitted.run_id)
+finally:
+    scheduler.shutdown(deadline_seconds=2)
+    shutdown = True
+print(json.dumps({
+    "status": result["status"],
+    "attempts": len(result["nodes"]["prepare"]["attempts"]),
+    "consumer": result["nodes"]["consume"]["state"],
+    "shutdown": shutdown,
+}))
+""",
             str(installed_flow),
             str(home),
         ],
@@ -209,6 +239,7 @@ nodes:
         "status": "succeeded",
         "attempts": 2,
         "consumer": "succeeded",
+        "shutdown": True,
     }
 
     showcase_probe = subprocess.run(

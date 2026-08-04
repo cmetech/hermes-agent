@@ -8,6 +8,7 @@ import os
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
+import plugins.workflow.bash_rendering as bash_rendering
 import plugins.workflow.language_schema as language_schema
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.bash_rendering import BashRenderingError, render_v3_bash
@@ -120,7 +121,10 @@ _DURABLE_BEHAVIOR_CASES = (
         ),
 )
 
-def _emit_bash_catalog_codes(tmp_path) -> set[str]:
+def _emit_bash_catalog_codes(
+    tmp_path, *, platform_name: str | None = None
+) -> set[str]:
+    platform_name = os.name if platform_name is None else platform_name
     template = "$producer.output"
     span = (0, len(template))
     emitted: set[str] = set()
@@ -143,7 +147,7 @@ def _emit_bash_catalog_codes(tmp_path) -> set[str]:
         )
     emitted.add(context_exc.value.code)
 
-    if os.name != "nt":
+    if platform_name != "nt":
         escape = tmp_path / "spill-escape"
         (escape / "attempt").mkdir(parents=True)
         alias = tmp_path / "spill-alias"
@@ -155,8 +159,19 @@ def _emit_bash_catalog_codes(tmp_path) -> set[str]:
                 spill_directory=alias / "attempt" / "variables-v3",
             )
         emitted.add(spill_exc.value.code)
-    else:  # pragma: no cover - POSIX CI owns the descriptor implementation.
-        pytest.skip("real spill-descriptor emitter requires POSIX")
+    else:
+        original_native_windows = bash_rendering._NATIVE_WINDOWS
+        bash_rendering._NATIVE_WINDOWS = True
+        try:
+            with pytest.raises(BashRenderingError) as spill_exc:
+                render_v3_bash(
+                    template,
+                    [(span[0], span[1], "x" * 32_769)],
+                    spill_directory=tmp_path / "windows-spill",
+                )
+        finally:
+            bash_rendering._NATIVE_WINDOWS = original_native_windows
+        emitted.add(spill_exc.value.code)
     return emitted
 
 
@@ -196,11 +211,9 @@ def _catalog_session_package(workflow_writer, root, *, name, nodes=None):
     return load_workflow(path)
 
 
-def _run_catalog_session(store, package, runner, registry, key):
+def _run_catalog_session(store, package, scheduler, key):
     run_id = _admit_catalog_snapshot(store, package, key=key)
-    return run_id, RunScheduler(
-        store, agent_runner=runner, session_registry=registry
-    ).advance(run_id)
+    return run_id, scheduler.advance(run_id)
 
 
 def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
@@ -220,15 +233,20 @@ def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
         ],
     )
     same_home = tmp_path / "same-home"
+    same_store = RunStore(same_home)
     same_runner = _CatalogSessionRunner()
     same_runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
-    _same_id, same = _run_catalog_session(
-        RunStore(same_home),
-        same_package,
-        same_runner,
-        NodeSessionRegistry(same_home),
-        "same-run",
+    same_scheduler = RunScheduler(
+        same_store,
+        agent_runner=same_runner,
+        session_registry=NodeSessionRegistry(same_home),
     )
+    try:
+        _same_id, same = _run_catalog_session(
+            same_store, same_package, same_scheduler, "same-run"
+        )
+    finally:
+        same_scheduler.shutdown(deadline_seconds=2)
     emitted.add(same["nodes"]["second"]["attempts"][0]["error_code"])
 
     package = _catalog_session_package(
@@ -238,16 +256,22 @@ def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
     store = RunStore(home)
     registry = NodeSessionRegistry(home)
     runner = _CatalogSessionRunner()
-    _run_catalog_session(store, package, runner, registry, "seed")
-    runner.shared_failure = OSError("registry probe unavailable")
-    _unavailable_id, unavailable = _run_catalog_session(
-        store, package, runner, registry, "unavailable"
+    scheduler = RunScheduler(
+        store, agent_runner=runner, session_registry=registry
     )
-    emitted.add(unavailable["nodes"]["analyze"]["attempts"][0]["error_code"])
-    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
-    recovered_id, recovered = _run_catalog_session(
-        store, package, runner, registry, "recovered"
-    )
+    try:
+        _run_catalog_session(store, package, scheduler, "seed")
+        runner.shared_failure = OSError("registry probe unavailable")
+        _unavailable_id, unavailable = _run_catalog_session(
+            store, package, scheduler, "unavailable"
+        )
+        emitted.add(unavailable["nodes"]["analyze"]["attempts"][0]["error_code"])
+        runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+        recovered_id, recovered = _run_catalog_session(
+            store, package, scheduler, "recovered"
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
     assert recovered["status"] == "succeeded"
     emitted.add(
         next(
@@ -275,18 +299,29 @@ def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
         session_registry=pending_registry,
         utcnow=lambda: clock[0],
     )
-    scheduler.advance(pending_id)
-    for delay in (1, 2, 4, 8):
-        clock[0] += timedelta(seconds=delay)
+    try:
         scheduler.advance(pending_id)
+        for delay in (1, 2, 4, 8):
+            clock[0] += timedelta(seconds=delay)
+            scheduler.advance(pending_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
     emitted.add(pending_store.load_run(pending_id)["last_error"]["code"])
     return emitted
 
 
 def test_every_registered_phase3_code_has_an_executable_emitter(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, monkeypatch
 ) -> None:
     """Pair the complete registry with real behavior, not catalog prose."""
+    shutdown_deadlines: list[float] = []
+    original_shutdown = RunScheduler.shutdown
+
+    def tracking_shutdown(self, deadline_seconds=10):
+        shutdown_deadlines.append(deadline_seconds)
+        return original_shutdown(self, deadline_seconds=deadline_seconds)
+
+    monkeypatch.setattr(RunScheduler, "shutdown", tracking_shutdown)
     observed: set[str] = set()
     for index, (node, expected) in enumerate(_DURABLE_BEHAVIOR_CASES):
         observed.add(
@@ -305,6 +340,18 @@ def test_every_registered_phase3_code_has_an_executable_emitter(
     observed.update(_emit_session_catalog_codes(tmp_path / "sessions", workflow_writer))
 
     assert observed == {item.code for item in language_schema.PHASE3_DURABLE_CODES}
+    assert shutdown_deadlines == [2] * 4
+
+
+def test_bash_catalog_windows_path_emits_integrity_without_skipping(
+    tmp_path,
+) -> None:
+    try:
+        emitted = _emit_bash_catalog_codes(tmp_path, platform_name="nt")
+    except pytest.skip.Exception:
+        pytest.fail("the native-Windows Bash catalog path must not be skipped")
+
+    assert "bash_spill_integrity" in emitted
 
 
 @pytest.mark.parametrize(

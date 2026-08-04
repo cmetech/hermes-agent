@@ -53,7 +53,15 @@ ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
     "ordered_rhs": ("unquoted_decimal", "quoted_decimal"),
     "structured_strings_coerce_to_number": False,
 })
-CONTRACT_READER_VERSION = 1
+CONTRACT_READER_VERSION = 2
+EDITOR_PROJECTION_VERSION = 2
+CONTRACT_MAX_BYTES = 256_000
+CONTRACT_RESERVED_GROWTH_BYTES = 4_000
+CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
+    "definition_schema": 150_000,
+    "node_kinds": 72_000,
+    "compatibility_codes": 15_000,
+})
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
 ARCHON_V3_NODE_ID_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
@@ -994,8 +1002,6 @@ def _field_description(
     profile: WorkflowLanguageProfile,
 ) -> str:
     """Return stable prose; structured profile semantics are projected separately."""
-    if _field_semantics(spec, profile) is not None:
-        return "v3."
     return spec.description
 
 
@@ -1050,7 +1056,7 @@ def _field_semantics(
 
 def _field_semantics_id(spec: WorkflowFieldSpec) -> str:
     """Return the stable contract-local id for one authoritative semantic record."""
-    return spec.yaml_name
+    return f"{spec.scope}.{spec.yaml_name}"
 
 
 def resolve_field_semantics(
@@ -1064,6 +1070,42 @@ def resolve_field_semantics(
         None,
     )
     return None if spec is None else _field_semantics(spec, selected)
+
+
+def field_definition_catalog(
+    profile: WorkflowLanguageProfile,
+    *,
+    definition_ids: frozenset[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Project self-contained editor metadata keyed by unique inventory scope."""
+    selected = _profile(profile)
+    catalog: dict[str, dict[str, object]] = {}
+    inventory_ids: set[str] = set()
+    for spec in FIELD_INVENTORY:
+        definition_id = _field_semantics_id(spec)
+        if definition_id in inventory_ids:
+            raise RuntimeError(f"duplicate workflow field definition id: {definition_id}")
+        inventory_ids.add(definition_id)
+        if definition_ids is not None and definition_id not in definition_ids:
+            continue
+        definition: dict[str, object] = {
+            "label": spec.title,
+            "description": _field_description(spec, selected),
+            "examples": [_thaw_editor_value(example) for example in spec.examples],
+            "widget": spec.widget,
+            "section": spec.section,
+        }
+        unit = _field_unit(spec, selected)
+        if unit is not None and (
+            selected is WorkflowLanguageProfile.HERMES_LEGACY
+            or _field_semantics(spec, selected) is not None
+        ):
+            definition["unit"] = unit
+        semantics = _field_semantics(spec, selected)
+        if semantics is not None:
+            definition["semantics"] = semantics
+        catalog[definition_id] = definition
+    return catalog
 
 
 def _freeze_editor_value(value: object) -> object:
@@ -2284,28 +2326,16 @@ def _field_descriptor(
     )
     descriptor: dict[str, object] = {
         "id": f"{node_type}.{spec.scope}.{spec.yaml_name}",
-        "label": spec.title,
-        "description": _field_description(spec, profile),
+        "definition_ref": _field_semantics_id(spec),
         "field_path": field_path,
         "applicability": {
             "profiles": [profile.value],
             "documents": ["definition"],
             "node_kinds": [node_type],
         },
-        "widget": spec.widget,
-        "section": spec.section,
         "order": _field_order(spec),
         "status": editor_status,
-        "examples": [_thaw_editor_value(example) for example in spec.examples],
     }
-    semantics = _field_semantics(spec, profile)
-    unit = _field_unit(spec, profile)
-    if unit is not None and (
-        profile is WorkflowLanguageProfile.HERMES_LEGACY or semantics is not None
-    ):
-        descriptor["unit"] = unit
-    if semantics is not None:
-        descriptor["semantics"] = _field_semantics_id(spec)
     return descriptor
 
 
@@ -2755,18 +2785,33 @@ def workflow_authoring_contract(
 ) -> dict[str, object]:
     """Return one bounded, side-effect-free workflow authoring contract."""
     selected = _profile(profile)
+    node_kinds = node_kind_descriptors(selected)
+    referenced_definitions = frozenset(
+        str(field["definition_ref"])
+        for node_kind in node_kinds
+        for field in node_kind["fields"]
+    )
     envelope: dict[str, object] = {
         "schema_version": 1,
         "contract_reader_version": CONTRACT_READER_VERSION,
+        "editor_projection_version": EDITOR_PROJECTION_VERSION,
         "profile": selected.value,
         "normalizer_version": CURRENT_NORMALIZER_BY_PROFILE[selected],
+        "field_definitions": field_definition_catalog(
+            selected, definition_ids=referenced_definitions
+        ),
         "definition_schema": definition_json_schema(selected),
         "sidecar_schema": sidecar_json_schema(selected),
-        "node_kinds": node_kind_descriptors(selected),
+        "node_kinds": node_kinds,
         "semantic_rules": semantic_rule_descriptors(selected),
         "compatibility_codes": compatibility_code_catalog(selected),
         "documentation": contract_documentation(selected),
-        "limits": {"max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES},
+        "limits": {
+            "max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES,
+            "max_contract_bytes": CONTRACT_MAX_BYTES,
+            "reserved_growth_bytes": CONTRACT_RESERVED_GROWTH_BYTES,
+            "section_max_bytes": dict(CONTRACT_SECTION_MAX_BYTES),
+        },
         "x-hermes-provenance": {
             "producer": "hermes-agent",
             "command": "hermes workflow schema",

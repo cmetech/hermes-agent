@@ -17,11 +17,22 @@ The four Bash bounds are centralized in the dependency-neutral language
 inventory and mechanically re-exported by `bash_rendering.py`, so runtime and
 generated metadata cannot drift.
 
-The specification-review correction also projects units and compact semantic
-IDs into editor field descriptors. `resolve_field_semantics()` resolves those
-IDs through the same inventory authority as the inline JSON Schema annotation;
-legacy descriptors retain seconds and expose no v3 semantic ID. The stricter
-default-`json.dumps` envelope remains bounded at 255,795 bytes.
+The quality-review correction makes the editor projection self-contained on
+the wire. Contract-reader/editor-projection v2 descriptors carry
+scope-qualified `definition_ref` values, and the bounded top-level
+`field_definitions` table carries useful labels, descriptions, examples,
+widgets, sections, units, and profile semantics. All 96 serialized references
+resolve after a JSON round trip without importing a Python helper. The same
+compaction restores human field descriptions and reduces the Archon envelope
+to 249,509 bytes, preserving 6,491 bytes below the unchanged 256,000-byte
+external ceiling.
+
+The portable Bash fixtures now follow the host contract: descriptor-capable
+POSIX hosts prove inline and spilled success, while native Windows proves the
+stable large-value failure without skipping the complete durable-code
+assertion. Every scheduler introduced by these fixtures is retained for its
+full sequence and shut down in a bounded `finally` block, including the
+installed-wheel subprocess.
 
 ## TDD Evidence
 
@@ -59,20 +70,31 @@ default-`json.dumps` envelope remains bounded at 255,795 bytes.
   passed / 0 failed** after restoring an Archon-only `extension-options` topic
   derived from the AI extension-option inventory and Phase 4 constant. The
   focused schema/operator/builder gate passed **608 / 608**.
+- Quality-review I1/I2 RED/GREEN: the serialized contract gate reported **599
+  passed / 4 failed** for the missing definition table, reader/projection v2,
+  reserved headroom, and useful semantic-field descriptions, then **604 / 604**
+  after the wire-table compaction, collision guard, and consumer updates.
+- Quality-review I3/M1 RED/GREEN: the portable helper reported **3 passed / 1
+  failed** for its missing shutdown; the durable-code catalog reported **19
+  passed / 2 failed** for the skipped Windows emitter and missing bounded
+  shutdowns. The combined focused gate then passed **25 / 25**.
+- The corrected installed-wheel subprocess retained one scheduler across retry
+  time advancement and shut it down in `finally`; its explicit integration run
+  passed **1 / 1**.
 
-All Python evidence used `scripts/run_tests.sh` with file retries disabled.
+Non-integration Python evidence used `scripts/run_tests.sh` with file retries
+disabled; the installed-wheel test used an explicit integration-marker run.
 
 ## Dynamic Schema Evidence
 
 With the project `.venv` active:
 
 ```text
-./hermes workflow schema --profile archon-2026-07 --json
-profile=archon-2026-07 normalizer_version=3 bytes=255795 compatibility_codes=39 semantic_refs=25 extension_options=true
-timeout semantics={omitted: 120000, scope: attempt, unit: milliseconds}
+.venv/bin/python ./hermes workflow schema --profile archon-2026-07 --json
+profile=archon-2026-07 normalizer=3 reader=2 projection=2 bytes=249509 definitions=96 refs=96 unresolved=0 compatibility_codes=39
 
-./hermes workflow schema --profile hermes-legacy --json
-profile=hermes-legacy normalizer_version=2 bytes=249839 compatibility_codes=9 semantic_refs=0 extension_options=false
+.venv/bin/python ./hermes workflow schema --profile hermes-legacy --json
+profile=hermes-legacy normalizer=2 reader=2 projection=2 bytes=240669 definitions=96 refs=96 unresolved=0 compatibility_codes=9
 ```
 
 The first probe before activating `.venv` selected the host Python and failed
@@ -95,13 +117,14 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_phase3_bash_substitution.py
 ```
 
-Result after the specification-review correction: **1,758 passed / 0 failed**.
+Result after the quality-review correction: **1,764 passed / 0 failed**.
 The default marker selection filters the
 installed integration test in this aggregate run; its separate `-m integration`
 run passed 1/1 as recorded above.
 
 Scoped Ruff and `git diff --check` passed. Both dynamic profile probes parsed
-successfully, and the Archon envelope remains below its original bound.
+successfully with every definition reference resolved. The Archon envelope is
+within its 252,000-byte growth target and all three published section budgets.
 
 ## Files Changed
 
@@ -126,5 +149,6 @@ and its regression test so the generated contract could own the four existing
 bounds without creating a second authority. The change is import/re-export
 only and preserves existing names and behavior.
 
-No blocking concern remains. Task 16 final verification is still pending; this
-report does not claim Phase 3 completion.
+No blocking concern remains. Per user instruction, threat-model/security
+testing and validation were excluded. Task 16 final verification is still
+pending; this report does not claim Phase 3 completion.

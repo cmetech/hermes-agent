@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+import os
+import shlex
+import sys
+
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.bash_rendering import render_v3_bash
+from plugins.workflow.bash_rendering import BashRenderingError, render_v3_bash
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.language_schema import NODE_TYPES, workflow_authoring_contract
 from plugins.workflow.models import WorkflowLanguageProfile
@@ -29,22 +35,33 @@ def _run_package(package, home, key, **scheduler_kwargs):
         ),
         immutable_snapshot=prepared,
     )
-    result = RunScheduler(store, **scheduler_kwargs).advance(admitted.run_id)
-    if result["status"] == "waiting_retry":
-        due = min(
-            datetime.fromisoformat(node["next_attempt_at"])
-            for node in result["nodes"].values()
-            if node.get("next_attempt_at")
-        )
-        result = RunScheduler(
-            store, **scheduler_kwargs, utcnow=lambda: due
-        ).advance(admitted.run_id)
+    clock = [datetime.now(timezone.utc)]
+    scheduler = RunScheduler(store, **scheduler_kwargs, utcnow=lambda: clock[0])
+    try:
+        result = scheduler.advance(admitted.run_id)
+        if result["status"] == "waiting_retry":
+            clock[0] = min(
+                datetime.fromisoformat(node["next_attempt_at"])
+                for node in result["nodes"].values()
+                if node.get("next_attempt_at")
+            )
+            result = scheduler.advance(admitted.run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
     return store, admitted.run_id, result
 
 
 def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, monkeypatch
 ) -> None:
+    shutdown_deadlines: list[float] = []
+    original_shutdown = RunScheduler.shutdown
+
+    def tracking_shutdown(self, deadline_seconds=10):
+        shutdown_deadlines.append(deadline_seconds)
+        return original_shutdown(self, deadline_seconds=deadline_seconds)
+
+    monkeypatch.setattr(RunScheduler, "shutdown", tracking_shutdown)
     root = tmp_path / "portable"
     # Adapted from Archon's official node/DAG authoring and `$node.output` material:
     # https://archon.diy/guides/authoring-workflows/
@@ -92,6 +109,7 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     _store, _run_id, executed = _run_package(
         package, tmp_path / "portable-home", "portable-execution"
     )
+    assert shutdown_deadlines == [2]
     assert executed["status"] == "succeeded"
     assert len(executed["nodes"]["prepare"]["attempts"]) == 2
     assert executed["nodes"]["consume"]["state"] == "succeeded"
@@ -125,20 +143,33 @@ def test_official_archon_bash_boundary_executes_inline_and_spilled_values(
         [(start, end, "x" * 32_768)],
         spill_directory=tmp_path / "inline",
     )
-    spilled = render_v3_bash(
-        template,
-        [(start, end, "x" * 32_769)],
-        spill_directory=tmp_path / "spilled",
-    )
+    spilled = None
     try:
         assert inline.spill_count == 0
-        assert spilled.spill_count == 1
-        assert spilled.spill_total_bytes == 32_769
+        if os.name == "nt":
+            with pytest.raises(BashRenderingError) as exc:
+                render_v3_bash(
+                    template,
+                    [(start, end, "x" * 32_769)],
+                    spill_directory=tmp_path / "spilled",
+                )
+            assert exc.value.code == "bash_spill_integrity"
+        else:
+            spilled = render_v3_bash(
+                template,
+                [(start, end, "x" * 32_769)],
+                spill_directory=tmp_path / "spilled",
+            )
+            assert spilled.spill_count == 1
+            assert spilled.spill_total_bytes == 32_769
     finally:
         inline.close()
-        spilled.close()
+        if spilled is not None:
+            spilled.close()
 
-    for size, expected_spills in ((32_768, 0), (32_769, 1)):
+    executable = shlex.quote(sys.executable)
+    boundary_cases = ((32_768, 0), (32_769, 1)) if os.name != "nt" else ()
+    for size, expected_spills in boundary_cases:
         workflow = workflow_writer(
             tmp_path / f"boundary-{size}",
             name=f"official-boundary-{size}",
@@ -146,7 +177,7 @@ def test_official_archon_bash_boundary_executes_inline_and_spilled_values(
                 {
                     "id": "producer",
                     "bash": (
-                        "/usr/bin/env python3 -c \"import sys; "
+                        f"{executable} -c \"import sys; "
                         f"sys.stdout.write('x'*{size})\""
                     ),
                 },
