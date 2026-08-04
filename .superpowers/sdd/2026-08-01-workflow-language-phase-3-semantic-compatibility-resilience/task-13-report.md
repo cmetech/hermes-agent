@@ -1136,3 +1136,63 @@ Result: `All checks passed!`. `git diff --check` is clean.
 - No push, publication, merge, branch deletion, worktree deletion,
   literal-`main` mutation, or shared `base` checkout mutation was performed.
 - No blocking concerns remain. Task 14 was not entered.
+
+## Fix Round 5 — Exact authority-frame binding and fail-closed event reads
+
+### Starting identity
+
+- HEAD: `5412139af989bb4217ae5f60adcac20dc84390cc`
+- Tree: `4c555efaf65883522946779350198eb211b11611`
+- Worktree: clean
+
+### Review corrections
+
+- Schema-v2 recovery selections and winners now carry an exact activation event
+  type in addition to their sequence and run/node/attempt identity. A private
+  precommit is authoritative only when the corresponding journal frame exists
+  at that exact identity; unrelated later events cannot activate it.
+- Private recovery authorities are parsed and semantically validated before
+  use. A malformed candidate, event type, identity, or bounded field fails
+  closed instead of being accepted because its outer JSON and checksum happen
+  to be valid.
+- Recovery-bearing `node_succeeded` events are validated against the immutable
+  private winner authority before tail, latest-page, rebuild, and public
+  projection use. Missing, corrupted, or wrong-shaped authorities now produce
+  the bounded journal-recovery failure rather than exposing the original event.
+- Strict schema-v3 projection validation reverse-requires a valid winner for
+  each succeeded selected recovery attempt. Schema-v1 compatibility remains
+  unchanged.
+
+### TDD evidence
+
+- RED, before production edits:
+  `HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'no_fence_selection_precommit or no_fence_winner_precommit or session_bearing_completion_event'`
+  — `0 passed, 4 failed`. The failures demonstrated selection activation by a
+  heartbeat, winner activation by a sibling event, and event API/CLI disclosure
+  after deletion or checksum-preserving semantic corruption of the winner.
+- GREEN for the same command: `4 passed, 0 failed`.
+- Complete modified test file: `88 passed, 0 failed`.
+- Canonical ten-file Task 13 gate: `310 passed, 0 failed`.
+- Expanded nine-file compatibility gate: `557 passed, 0 failed`.
+- Focused crash/privacy matrix, including ten real coordinator-death cuts:
+  `18 passed, 0 failed`.
+- Ruff on both modified Python files: all checks passed.
+- `git diff --check`: clean.
+
+### Fix Round 5 changed files
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `plugins/workflow/store.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+### Fix Round 5 self-review
+
+- The correction binds each no-fence SQLite precommit to its intended journal
+  frame without weakening the existing insert-only private authority model.
+- Event privacy now fails closed at every public event-reading boundary, before
+  a recovery-bearing payload can be projected or returned.
+- The wrong-shaped-authority regression preserves a valid canonical outer row
+  and checksum, proving semantic validation rather than checksum-only rejection.
+- Existing opposite-order journal-before-SQLite failure behavior and schema-v1
+  compatibility remain covered and green.
+- No Task 14 work or out-of-scope mutation was performed.

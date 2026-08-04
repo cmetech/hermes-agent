@@ -223,10 +223,12 @@ def _session_recovery_selection_authority(
     selection: PersistentSessionRecoverySelection,
     *,
     activation_event_sequence: int,
+    activation_event_type: str,
 ) -> dict[str, object]:
     return {
         "schema_version": 2,
         "activation_event_sequence": activation_event_sequence,
+        "activation_event_type": activation_event_type,
         "run_id": selection.run_id,
         "attempt_id": selection.attempt_id,
         "key": {
@@ -248,21 +250,99 @@ def _session_registry_winner_authority(
     candidate: SessionRegistryUpdateCandidate,
     *,
     activation_event_sequence: int,
+    activation_event_type: str,
 ) -> dict[str, object]:
     return {
         "schema_version": 2,
         "activation_event_sequence": activation_event_sequence,
+        "activation_event_type": activation_event_type,
         "candidate": _session_registry_candidate_payload(candidate),
     }
 
 
+def _session_recovery_selection_from_authority(
+    value: object,
+) -> tuple[PersistentSessionRecoverySelection, int | None, str | None]:
+    if not isinstance(value, Mapping):
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    schema_version = value.get("schema_version")
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "attempt_id",
+        "key",
+        "expected_generation",
+        "missing_session_id",
+        "cache_fingerprint",
+        "source",
+        "provider_attempts_before_recovery",
+    }
+    activation: int | None = None
+    event_type: str | None = None
+    if schema_version == 2:
+        expected_fields.update({"activation_event_sequence", "activation_event_type"})
+        activation_value = value.get("activation_event_sequence")
+        if (
+            isinstance(activation_value, bool)
+            or not isinstance(activation_value, int)
+            or activation_value < 1
+        ):
+            raise JournalRecoveryError(
+                "session recovery selection activation is malformed"
+            )
+        activation = activation_value
+        event_type_value = value.get("activation_event_type")
+        if event_type_value != "persistent_session_missing_fresh_start":
+            raise JournalRecoveryError(
+                "session recovery selection activation event is malformed"
+            )
+        event_type = event_type_value
+    elif schema_version != 1:
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    if set(value) != expected_fields:
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    key = value.get("key")
+    if not isinstance(key, Mapping) or set(key) != {
+        "workflow",
+        "node_id",
+        "scope",
+        "provider",
+        "profile",
+    }:
+        raise JournalRecoveryError("session recovery selection key is malformed")
+    if value.get("provider_attempts_before_recovery") != 0:
+        raise JournalRecoveryError("session recovery selection attempts are malformed")
+    try:
+        selection = PersistentSessionRecoverySelection(
+            key=NodeSessionKey(
+                workflow=key["workflow"],
+                node_id=key["node_id"],
+                scope=key["scope"],
+                provider=key["provider"],
+                profile=key["profile"],
+            ),
+            expected_generation=value["expected_generation"],
+            missing_session_id=value["missing_session_id"],
+            cache_fingerprint=value["cache_fingerprint"],
+            run_id=value["run_id"],
+            attempt_id=value["attempt_id"],
+            source=value["source"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalRecoveryError(
+            "session recovery selection identity is malformed"
+        ) from exc
+    return selection, activation, event_type
+
+
 def _session_registry_candidate_from_authority(
     value: object,
-) -> tuple[SessionRegistryUpdateCandidate, int, int | None]:
+) -> tuple[SessionRegistryUpdateCandidate, int, int | None, str | None]:
     if isinstance(value, Mapping) and value.get("schema_version") == 2:
         if set(value) != {
             "schema_version",
             "activation_event_sequence",
+            "activation_event_type",
             "candidate",
         }:
             raise JournalRecoveryError("session registry winner authority is malformed")
@@ -273,12 +353,17 @@ def _session_registry_candidate_from_authority(
             or activation < 1
         ):
             raise JournalRecoveryError("session registry winner activation is malformed")
+        event_type = value.get("activation_event_type")
+        if event_type != "node_succeeded":
+            raise JournalRecoveryError(
+                "session registry winner activation event is malformed"
+            )
         candidate, retry_count = _session_registry_candidate_from_payload(
             value.get("candidate")
         )
-        return candidate, retry_count, activation
+        return candidate, retry_count, activation, event_type
     candidate, retry_count = _session_registry_candidate_from_payload(value)
-    return candidate, retry_count, None
+    return candidate, retry_count, None, None
 
 
 def _session_registry_candidate_from_payload(
@@ -795,13 +880,15 @@ def _redact_private_session_authority(
             "session_registry_winner_authority", {}
         ).values():
             try:
-                candidate, retry_count, _activation = (
+                candidate, retry_count, _activation, _event_type = (
                     _session_registry_candidate_from_authority(
                         authority
                     )
                 )
-            except JournalRecoveryError:
-                continue
+            except JournalRecoveryError as exc:
+                raise JournalRecoveryError(
+                    "private session winner authority is malformed"
+                ) from exc
             if (
                 retry_count == 0
                 and candidate.winning_run_id == authority_projection.get("run_id")
@@ -4461,8 +4548,127 @@ class RunStore:
                     raise JournalRecoveryError(
                         "private session authority is noncanonical"
                     )
+                if table == "session_recovery_selection_authority":
+                    _session_recovery_selection_from_authority(authority)
+                else:
+                    _session_registry_candidate_from_authority(authority)
                 authorities[table][str(row["attempt_id"])] = authority
         return authorities
+
+    @staticmethod
+    def _bind_private_session_authorities_to_events(
+        authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
+        events: Iterable[Mapping[str, object]],
+        *,
+        run_id: str,
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        """Keep schema-v2 precommits only when their exact frame exists."""
+        event_by_sequence = {
+            int(event["sequence"]): event
+            for event in events
+            if isinstance(event.get("sequence"), int)
+            and not isinstance(event.get("sequence"), bool)
+        }
+        bound: dict[str, dict[str, Mapping[str, object]]] = {
+            "session_recovery_selection_authority": {},
+            "session_registry_winner_authority": {},
+        }
+        for attempt_id, authority in authorities.get(
+            "session_recovery_selection_authority", {}
+        ).items():
+            selection, activation, event_type = (
+                _session_recovery_selection_from_authority(authority)
+            )
+            if activation is not None:
+                event = event_by_sequence.get(activation)
+                if (
+                    event is None
+                    or event.get("run_id") != run_id
+                    or event.get("event_type") != event_type
+                    or event.get("node_id") != selection.key.node_id
+                    or event.get("attempt_id") != selection.attempt_id
+                ):
+                    continue
+            bound["session_recovery_selection_authority"][attempt_id] = authority
+        for attempt_id, authority in authorities.get(
+            "session_registry_winner_authority", {}
+        ).items():
+            candidate, _retry_count, activation, event_type = (
+                _session_registry_candidate_from_authority(authority)
+            )
+            if activation is not None:
+                event = event_by_sequence.get(activation)
+                if (
+                    event is None
+                    or event.get("run_id") != run_id
+                    or event.get("event_type") != event_type
+                    or event.get("node_id") != candidate.winning_node_id
+                    or event.get("attempt_id") != candidate.winning_attempt_id
+                ):
+                    continue
+            bound["session_registry_winner_authority"][attempt_id] = authority
+        return bound
+
+    def _read_bound_private_session_authorities(
+        self,
+        *,
+        run_id: str,
+        events: Iterable[Mapping[str, object]],
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        return self._bind_private_session_authorities_to_events(
+            self._read_private_session_authorities(run_id=run_id),
+            events,
+            run_id=run_id,
+        )
+
+    def _validate_recovery_completion_event_authority(
+        self,
+        events: Iterable[Mapping[str, object]],
+        *,
+        run_id: str,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ],
+    ) -> None:
+        """Fail closed before projecting a v3 recovery completion payload."""
+        for event in events:
+            if event.get("event_type") != "node_succeeded":
+                continue
+            projection = event.get("projection")
+            if not isinstance(projection, Mapping):
+                continue
+            language = projection.get("language")
+            if not isinstance(language, Mapping) or language.get(
+                "normalizer_version"
+            ) != 3:
+                continue
+            nodes = projection.get("nodes")
+            node = (
+                nodes.get(event.get("node_id"))
+                if isinstance(nodes, Mapping)
+                else None
+            )
+            recoveries = (
+                node.get("session_recoveries")
+                if isinstance(node, Mapping)
+                else None
+            )
+            if not isinstance(recoveries, list) or not any(
+                isinstance(recovery, Mapping)
+                and recovery.get("attempt_id") == event.get("attempt_id")
+                for recovery in recoveries
+            ):
+                continue
+            if (
+                event.get("projection_sha256") != _projection_digest(projection)
+                or not self._private_session_authorities_match_projection(
+                    projection,
+                    private_authorities=private_authorities,
+                )
+            ):
+                raise JournalRecoveryError(
+                    "persistent session completion authority is invalid"
+                )
 
     def _private_session_registry_authority_matches(
         self,
@@ -4480,7 +4686,7 @@ class RunStore:
             "session_registry_winner_authority", {}
         ).get(candidate.winning_attempt_id)
         try:
-            anchored_candidate, retry_count, activation = (
+            anchored_candidate, retry_count, activation, _event_type = (
                 _session_registry_candidate_from_authority(winner_authority)
             )
         except JournalRecoveryError:
@@ -4527,7 +4733,9 @@ class RunStore:
             "provider_attempts_before_recovery",
         }
         if schema_version == 2:
-            expected_fields.add("activation_event_sequence")
+            expected_fields.update(
+                {"activation_event_sequence", "activation_event_type"}
+            )
         elif schema_version != 1:
             return False
         if set(selection_authority) != expected_fields:
@@ -4577,6 +4785,8 @@ class RunStore:
                 isinstance(activation, bool)
                 or not isinstance(activation, int)
                 or activation < 1
+                or selection_authority.get("activation_event_type")
+                != "persistent_session_missing_fresh_start"
             ):
                 return False
             active = int(projection.get("event_sequence", 0)) >= activation
@@ -4643,7 +4853,7 @@ class RunStore:
         anchored_winners: dict[str, SessionRegistryUpdateCandidate] = {}
         for attempt_id, authority in winners.items():
             try:
-                candidate, retry_count, activation = (
+                candidate, retry_count, activation, _event_type = (
                     _session_registry_candidate_from_authority(authority)
                 )
             except JournalRecoveryError:
@@ -4735,6 +4945,33 @@ class RunStore:
                         )
                     ):
                         return False
+                    attempts = node.get("attempts")
+                    matching_attempt = next(
+                        (
+                            attempt
+                            for attempt in attempts
+                            if isinstance(attempt, Mapping)
+                            and attempt.get("attempt_id") == attempt_id
+                        ),
+                        None,
+                    ) if isinstance(attempts, list) else None
+                    if (
+                        isinstance(matching_attempt, Mapping)
+                        and matching_attempt.get("state") == "succeeded"
+                    ):
+                        candidate = anchored_winners.get(attempt_id)
+                        if (
+                            candidate is None
+                            or not _session_registry_candidate_is_corroborated(
+                                projection, candidate
+                            )
+                            or not self._private_session_registry_authority_matches(
+                                projection,
+                                candidate,
+                                private_authorities=private_authorities,
+                            )
+                        ):
+                            return False
         return True
 
     @staticmethod
@@ -6492,7 +6729,17 @@ class RunStore:
         except JournalRecoveryError:
             return False
         if private_authorities is None:
-            private_authorities = self._read_private_session_authorities(run_id=run_id)
+            try:
+                directory = self.run_directory(run_id)
+            except KeyError:
+                private_authorities = self._read_private_session_authorities(
+                    run_id=run_id
+                )
+            else:
+                private_authorities = self._read_bound_private_session_authorities(
+                    run_id=run_id,
+                    events=self._read_journal_events(directory),
+                )
         if not self._private_session_authorities_match_projection(
             value,
             private_authorities=private_authorities,
@@ -6558,10 +6805,13 @@ class RunStore:
         latest = None
         latest_migration_count = 0
         expected_sequence = 1
-        private_authorities = self._read_private_session_authorities(run_id=run_id)
         events = self._read_journal_events(
             directory,
             journal_data=journal_data,
+        )
+        private_authorities = self._read_bound_private_session_authorities(
+            run_id=run_id,
+            events=events,
         )
         for event in events:
             if event.get("sequence") != expected_sequence:
@@ -7665,7 +7915,15 @@ class RunStore:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             events = self._read_journal_events(directory)
-            private_authorities = self._read_private_session_authorities(run_id=run_id)
+            private_authorities = self._read_bound_private_session_authorities(
+                run_id=run_id,
+                events=events,
+            )
+            self._validate_recovery_completion_event_authority(
+                events,
+                run_id=run_id,
+                private_authorities=private_authorities,
+            )
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
@@ -7730,7 +7988,15 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             all_events = self._read_journal_events(directory)
             selected = all_events[-limit:]
-            private_authorities = self._read_private_session_authorities(run_id=run_id)
+            private_authorities = self._read_bound_private_session_authorities(
+                run_id=run_id,
+                events=all_events,
+            )
+            self._validate_recovery_completion_event_authority(
+                all_events,
+                run_id=run_id,
+                private_authorities=private_authorities,
+            )
         truncated = (
             len(all_events) > limit
             or projection_was_truncated(selected)
@@ -9405,6 +9671,9 @@ class RunStore:
                 selection_authority = _session_recovery_selection_authority(
                     selection,
                     activation_event_sequence=int(projection["event_sequence"]) + 1,
+                    activation_event_type=(
+                        "persistent_session_missing_fresh_start"
+                    ),
                 )
                 with (
                     nullcontext(fence_connection)
@@ -11209,6 +11478,7 @@ class RunStore:
                             activation_event_sequence=(
                                 int(projection["event_sequence"]) + 1
                             ),
+                            activation_event_type="node_succeeded",
                         ),
                     )
                     if fence_connection is None:

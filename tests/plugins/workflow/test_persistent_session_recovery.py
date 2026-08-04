@@ -373,6 +373,47 @@ def _rewrite_latest_projection(
     (directory / "run.json").write_text("{broken", encoding="utf-8")
 
 
+def _rewrite_journal_event(
+    store: RunStore,
+    run_id: str,
+    event_type: str,
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    directory = store.run_directory(run_id)
+    events = [
+        json.loads(line)
+        for line in (directory / "events.jsonl").read_text().splitlines()
+    ]
+    matches = [event for event in events if event.get("event_type") == event_type]
+    assert len(matches) == 1
+    event = matches[0]
+    mutate(event)
+    projection = event.get("projection")
+    if isinstance(projection, dict):
+        event["projection_sha256"] = hashlib.sha256(
+            json.dumps(
+                projection,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    material = dict(event)
+    material.pop("frame_sha256", None)
+    event["frame_sha256"] = hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    (directory / "events.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in events) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _resolved_running_recovery(
     store: RunStore,
     package,
@@ -3054,3 +3095,263 @@ def test_fresh_failed_recovery_requires_its_private_selection_evidence(
 
     with pytest.raises(JournalRecoveryError, match="valid recovery data"):
         store.load_run(run_id)
+
+
+def test_no_fence_selection_precommit_is_not_activated_by_heartbeat(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    """A missing selection frame must keep its private precommit inert."""
+    home = tmp_path / "selection-precommit-home"
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "selection-precommit",
+        name="selection-precommit",
+    )
+    store = RunStore(home)
+    admitted = _admit(store, package, "selection-precommit")
+    claim = store.claim_node(admitted.run_id, "analyze", "selection-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    original_append = store._append_locked
+
+    def crash_before_selection_frame(*_args, **_kwargs):
+        raise RuntimeError("selection frame was not appended")
+
+    monkeypatch.setattr(store, "_append_locked", crash_before_selection_frame)
+    with pytest.raises(RuntimeError, match="selection frame"):
+        store.record_persistent_session_recovery_selection(
+            claim,
+            PersistentSessionRecoverySelection(
+                key=NodeSessionKey(
+                    package.definition.name,
+                    "analyze",
+                    "local",
+                    "fake-provider",
+                    "default",
+                ),
+                expected_generation=0,
+                missing_session_id="orphaned-selection-session",
+                cache_fingerprint="a" * 64,
+                run_id=admitted.run_id,
+                attempt_id=claim.attempt_id,
+            ),
+        )
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    with sqlite3.connect(store.database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM session_recovery_selection_authority "
+            "WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone() is not None
+
+    current = json.loads(
+        (store.run_directory(admitted.run_id) / "run.json").read_text()
+    )
+    active = current["nodes"]["analyze"]["claim"]
+    assert store.renew_claim(
+        claim,
+        now=datetime.fromisoformat(active["heartbeat_at"]) + timedelta(seconds=6),
+        monotonic_now=float(active["heartbeat_monotonic"]) + 6,
+    )
+    restarted = RunStore(home)
+    recovered = restarted.load_run(admitted.run_id)
+    assert recovered["nodes"]["analyze"].get("session_recoveries", []) == []
+    assert restarted.interrupt_active_claims(
+        admitted.run_id,
+        reason="coordinator_shutdown",
+    ) == ("analyze",)
+    assert restarted.load_run(admitted.run_id)["status"] == "interrupted"
+
+
+def test_no_fence_winner_precommit_is_not_activated_by_sibling_event(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    """A missing success frame must keep its private winner precommit inert."""
+    home = tmp_path / "winner-precommit-home"
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "winner-precommit",
+        name="winner-precommit",
+        nodes=[
+            {"id": "first", "prompt": "First"},
+            {"id": "sibling", "prompt": "Sibling"},
+        ],
+    )
+    store = RunStore(home)
+    admitted = _admit(store, package, "winner-precommit")
+    claim = store.claim_node(admitted.run_id, "first", "winner-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    key = NodeSessionKey(
+        package.definition.name,
+        "first",
+        "local",
+        "fake-provider",
+        "default",
+    )
+    assert store.record_persistent_session_recovery_selection(
+        claim,
+        PersistentSessionRecoverySelection(
+            key=key,
+            expected_generation=0,
+            missing_session_id="missing-winner-session",
+            cache_fingerprint="a" * 64,
+            run_id=admitted.run_id,
+            attempt_id=claim.attempt_id,
+        ),
+    )
+    candidate = SessionRegistryUpdateCandidate(
+        key=key,
+        expected_generation=0,
+        new_session_id="orphaned-winner-session",
+        cache_fingerprint="a" * 64,
+        winning_run_id=admitted.run_id,
+        winning_node_id="first",
+        winning_attempt_id=claim.attempt_id,
+        recovery_selected=True,
+    )
+    original_append = store._append_locked
+
+    def crash_before_winner_frame(*_args, **_kwargs):
+        raise RuntimeError("winner frame was not appended")
+
+    monkeypatch.setattr(store, "_append_locked", crash_before_winner_frame)
+    with pytest.raises(RuntimeError, match="winner frame"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            metadata={
+                "session_id": candidate.new_session_id,
+                "cache_fingerprint": candidate.cache_fingerprint,
+            },
+            session_registry_update=candidate,
+            session_registry_authority=candidate,
+        )
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    with sqlite3.connect(store.database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM session_registry_winner_authority WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone() is not None
+
+    sibling = store.claim_node(admitted.run_id, "sibling", "sibling-owner")
+    assert sibling is not None
+    restarted = RunStore(home)
+    recovered = restarted.load_run(admitted.run_id)
+    assert recovered["nodes"]["first"]["state"] == "running"
+    assert "pending_session_registry_update" not in recovered
+    assert NodeSessionRegistry(home).get(key) is None
+    assert restarted.interrupt_active_claims(
+        admitted.run_id,
+        reason="coordinator_shutdown",
+    ) == ("first", "sibling")
+    assert restarted.load_run(admitted.run_id)["status"] == "interrupted"
+    assert NodeSessionRegistry(home).get(key) is None
+
+
+@pytest.mark.parametrize("authority_damage", ("deleted", "wrong-shaped"))
+def test_session_bearing_completion_event_fails_closed_without_winner_authority(
+    tmp_path, workflow_writer, capsys, authority_damage
+) -> None:
+    """Event/CLI reads must validate the payload-bearing recovery winner."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"event-winner-{authority_damage}",
+        name=f"event-winner-{authority_damage}",
+        nodes=[
+            {
+                "id": "analyze",
+                "prompt": "Analyze",
+                "output_type": "RecoveredReport",
+            }
+        ],
+    )
+    home = tmp_path / f"event-winner-{authority_damage}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"event-{authority_damage}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"event-{authority_damage}",
+    )
+    original_session = result["nodes"]["analyze"]["session_id"]
+    substituted_session = "substituted-event-session"
+    attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+
+    def damage_completion(event) -> None:
+        projection = event["projection"]
+        node = projection["nodes"]["analyze"]
+        attempt = node["attempts"][-1]
+        attempt.pop("session_registry_authority", None)
+        attempt["metadata"]["session_id"] = substituted_session
+        attempt["metadata"]["cache_fingerprint"] = "f" * 64
+        node["session_id"] = substituted_session
+        node["cache_fingerprint"] = "f" * 64
+        for artifact in projection["artifacts"]:
+            if artifact.get("attempt_id") == attempt_id:
+                artifact["session_id"] = substituted_session
+        for artifact in event["payload"].get("artifacts", []):
+            artifact["session_id"] = substituted_session
+
+    _rewrite_journal_event(store, run_id, "node_succeeded", damage_completion)
+    with sqlite3.connect(store.database) as connection:
+        if authority_damage == "deleted":
+            connection.execute(
+                "DELETE FROM session_registry_winner_authority "
+                "WHERE attempt_id=?",
+                (attempt_id,),
+            )
+        else:
+            original_authority = connection.execute(
+                "SELECT authority_json FROM session_registry_winner_authority "
+                "WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            assert original_authority is not None
+            wrong_shaped_authority = json.loads(original_authority[0])
+            wrong_shaped_authority["candidate"] = {"wrong": "shape"}
+            malformed = json.dumps(
+                wrong_shaped_authority,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "UPDATE session_registry_winner_authority "
+                "SET authority_json=?, authority_sha256=? WHERE attempt_id=?",
+                (
+                    malformed,
+                    hashlib.sha256(malformed.encode()).hexdigest(),
+                    attempt_id,
+                ),
+            )
+        connection.commit()
+
+    for read_events in (store.tail_events, store.latest_event_page):
+        with pytest.raises(JournalRecoveryError) as exc_info:
+            read_events(run_id)
+        diagnostic = str(exc_info.value)
+        assert original_session not in diagnostic
+        assert substituted_session not in diagnostic
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(home),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) == 70
+    cli_output = capsys.readouterr().out
+    assert original_session not in cli_output
+    assert substituted_session not in cli_output
