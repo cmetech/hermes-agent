@@ -1,0 +1,1007 @@
+# Review package: 18b0c8d8697a49ea3beb8c006a110c2994ad0e5f..HEAD
+
+## Commits
+2e7f1f227 fix(workflow): close task 13 round 9 regressions
+
+## Files changed
+ .../task-13-round-9-closure-report.md              | 175 +++++++++++++++++++++
+ plugins/workflow/executors/ai.py                   |  73 ++++++---
+ plugins/workflow/notifications.py                  |  31 +++-
+ tests/plugins/workflow/test_notifications.py       | 114 ++++++++++++++
+ .../workflow/test_persistent_session_recovery.py   | 156 ++++++++++++++++--
+ 5 files changed, 509 insertions(+), 40 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md
+new file mode 100644
+index 000000000..dadb01641
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md
+@@ -0,0 +1,175 @@
++# Task 13 Round 9 Closure Report
++
++Date: 2026-08-04
++
++## Outcome
++
++Closed all three functional findings from `task-13-quality-rereview-9.md` in one
++test-driven correction:
++
++1. Notification retry and terminal/dead-letter paths now retain only exact,
++   allowlisted, value-free delivery reasons. Unknown or free-form input is
++   normalized to `notification delivery failed` in both the outbox row and any
++   durable decision fact.
++2. A confirmed-missing cross-run recovery whose fresh worker pauses now returns
++   an explicit bounded recovery projection. It retains only exact scalar
++   provider-attempt accounting and the validated approval kind/action digest
++   needed to resume, records `fresh_execution_failed`, and drops session,
++   provider, model, usage, audit, fingerprint, warning, output, and other
++   provider-controlled fields. The ordinary non-recovery paused path is
++   unchanged.
++3. Recovery-order tests no longer treat arbitrary `RuntimeError` instances as
++   acceptable. Malformed/order-damaged store readers assert exact
++   `JournalRecoveryError` messages, while the notification reader asserts its
++   exact `NotificationReconciliationError` projection. Existing successfully
++   sanitized reader cases remain supported.
++
++No threat-model analysis, threat/security test, or adversarial/exploit
++validation was performed.
++
++## Root cause
++
++### Notification delivery compatibility
++
++Round 9 ignored the `error` argument in both `NotificationOutbox.fail()` and
++`NotificationOutbox.terminal_fail()` and hardcoded the generic diagnostic.
++That erased the coordinator's already-bounded `delivery_store_unavailable`
++receipt and made retryable and terminal projections lose useful stable state.
++
++The correction centralizes exact allowlist normalization and uses the resulting
++stable reason consistently for `last_error` and terminal/dead-letter facts.
++Prefix-shaped or free-form details such as adapter exception type/history text
++do not match the allowlist and become the fixed generic reason.
++
++### Selected-recovery paused execution
++
++The ordinary `result.status == "paused"` branch returned directly after copying
++the full worker-derived metadata. It never reached `with_recovery_failure()`, so
++the newly added paused member in that helper was dead for the normal path.
++
++The correction adds a dedicated `recovery_selected` paused branch. It uses the
++same bounded accounting projection as selected-recovery failures and separately
++validates the resumable approval descriptor. The failure helper no longer
++claims to handle paused results.
++
++### Test precision
++
++`_assert_private_values_absent()` had been widened from the workflow journal
++domain error to all `RuntimeError` instances. An unrelated runtime failure could
++therefore satisfy an order test merely by omitting its canary.
++
++The helper is narrowed back to `JournalRecoveryError`. Tests that require
++fail-closed behavior now assert the exact domain type and stable message at the
++call site; notification reconciliation asserts its separate domain wrapper.
++
++## TDD evidence
++
++### Required existing coordinator RED
++
++Command:
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_coordinator.py
++```
++
++Result: **38 passed / 1 failed**. The sole failure was
++`test_gateway_retryable_delivery_receipt_requeues_outbox_row`, with expected
++`delivery_store_unavailable` but actual `notification delivery failed`.
++
++### Test-first correction RED
++
++The direct notification compatibility/normalization tests, confirmed-missing
++paused executor test, and precise order-domain assertions were added before any
++production edit.
++
++First command:
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_persistent_session_recovery.py
++```
++
++Initial result: **151 passed / 3 failed**. Two failures were the intended
++missing production behaviors (stable delivery reason erased; selected recovery
++pause lacked `fresh_execution_failed`). The third established the precise
++existing journal message as `journal sequence gap: expected 1, received 2`;
++the test assertion was corrected to that unchanged production taxonomy.
++
++The same command was rerun before production edits.
++
++Result: **152 passed / 2 failed**. The only failures were the two intended
++behavioral REDs:
++
++- allowlisted `delivery_store_unavailable` still persisted as the generic
++  reason;
++- confirmed-missing fresh paused execution returned unbounded metadata and no
++  recovery outcome.
++
++All narrowed malformed/order assertions passed against the existing production
++taxonomy during this RED run.
++
++## GREEN evidence
++
++### Gate A
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_coordinator.py tests/plugins/workflow/test_persistent_session_recovery.py
++```
++
++Result: **3 files / 193 passed / 0 failed**.
++
++### Gate B
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_coordinator.py
++```
++
++Result: **12 files / 415 passed / 0 failed**.
++
++### Gate C
++
++```text
++../../.venv/bin/ruff check plugins/workflow/notifications.py plugins/workflow/executors/ai.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_persistent_session_recovery.py
++git diff --check
++```
++
++Result: **all checks passed / clean diff check**.
++
++Retries were disabled for every test command. Only ordinary functional tests
++were run.
++
++## Changed files
++
++- `plugins/workflow/notifications.py`
++- `plugins/workflow/executors/ai.py`
++- `tests/plugins/workflow/test_notifications.py`
++- `tests/plugins/workflow/test_persistent_session_recovery.py`
++- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md`
++
++The owned coordinator test file required no edit; its existing compatibility
++assertion now passes.
++
++## Self-review
++
++- The delivery allowlist contains exact codes emitted by the authenticated
++  gateway delivery path and receipt status fallbacks. It does not accept
++  prefixes, arbitrary bounded text, exception type suffixes, paths, sessions,
++  or provider response content.
++- Retryable and terminal/dead-letter persistence use the same normalized
++  reason. Direct tests cover an accepted stable code and rejected free-form
++  input for both paths.
++- The recovery-paused result retains only a validated lower-case SHA-256 action
++  digest and the stable `approval` kind, which are the fields the resume path
++  uses for interaction identity/action grant. Worker payload fields such as
++  command, description, history, or provider detail are not copied.
++- Accounting projection accepts non-negative integer attempt counts and boolean
++  state flags only; arbitrary scalar strings are not admitted.
++- The selected-recovery paused behavioral test exercises the real
++  `AgentNodeExecutor` shared-to-fresh transition and verifies request order,
++  resumability data, exact bounded metadata, recovery outcome, and absence of
++  private canaries/fingerprint.
++- Ordinary non-recovery paused handling remains on its original return path.
++- Test taxonomy was not changed in production. Exact stable messages are
++  asserted for malformed authority, sequence damage, prefix commitment damage,
++  and the notification reconciliation wrapper.
++- The two pre-existing ignored rereview artifacts and all unrelated files were
++  preserved.
+diff --git a/plugins/workflow/executors/ai.py b/plugins/workflow/executors/ai.py
+index 55c18e632..d74dd2d60 100644
+--- a/plugins/workflow/executors/ai.py
++++ b/plugins/workflow/executors/ai.py
+@@ -792,64 +792,87 @@ class AgentNodeExecutor:
+         context_mode = "fresh"
+         session_id = None
+         warnings: list[str] = []
+         registry_key = None
+         expected_generation = 0
+         session_source: str | None = None
+         stale_session_id: str | None = None
+         stale_cache_fingerprint: str | None = None
+         recovery_selected = False
+
++        def recovery_accounting_metadata(
++            metadata: Mapping[str, object],
++        ) -> dict[str, object]:
++            counts = {"provider_attempts", "additional_provider_attempts"}
++            flags = {
++                "provider_attempts_exact",
++                "known_no_effect",
++                "unknown_side_effect",
++                "outcome_unknown",
++                "archon_terminal_failure",
++            }
++            return {
++                key: value
++                for key, value in dict(metadata).items()
++                if (
++                    key in counts
++                    and isinstance(value, int)
++                    and not isinstance(value, bool)
++                    and value >= 0
++                )
++                or (key in flags and isinstance(value, bool))
++            }
++
++        def paused_recovery_interaction(
++            pending: Mapping[str, object] | None,
++        ) -> dict[str, str]:
++            if not isinstance(pending, Mapping):
++                return {}
++            kind = pending.get("kind")
++            action_digest = pending.get("action_digest")
++            if (
++                kind != "approval"
++                or not isinstance(action_digest, str)
++                or len(action_digest) != 64
++                or any(
++                    character not in "0123456789abcdef"
++                    for character in action_digest
++                )
++            ):
++                return {}
++            return {"kind": "approval", "action_digest": action_digest}
++
+         def with_recovery_failure(
+             failure: NodeExecutionResult,
+         ) -> NodeExecutionResult:
+             if recovery_selected and failure.status in {
+                 "failed",
+                 "cancelled",
+                 "interrupted",
+-                "paused",
+             }:
+-                allowed_metadata = {
+-                    key: value
+-                    for key, value in dict(failure.metadata).items()
+-                    if key
+-                    in {
+-                        "provider_attempts",
+-                        "provider_attempts_exact",
+-                        "known_no_effect",
+-                        "unknown_side_effect",
+-                        "outcome_unknown",
+-                        "archon_terminal_failure",
+-                        "additional_provider_attempts",
+-                    }
+-                    and (
+-                        value is None
+-                        or isinstance(value, bool | int | float | str)
+-                    )
+-                }
+                 fixed_message = {
+                     "authorization": "selected recovery authorization failed",
+                     "authentication": "selected recovery authentication failed",
+                     "network_error": "selected recovery network operation failed",
+                     "network_disconnect": "selected recovery network operation failed",
+                     "validation": "selected recovery validation failed",
+                     "provider_timeout": "selected recovery provider timed out",
+                     "cancelled": "selected recovery was cancelled",
+                 }.get(
+                     str(failure.error_code or ""),
+                     "selected recovery execution failed",
+                 )
+                 return replace(
+                     failure,
+                     artifacts=(),
+                     error_message=fixed_message,
+-                    metadata=allowed_metadata,
++                    metadata=recovery_accounting_metadata(failure.metadata),
+                     session_recovery_outcome="fresh_execution_failed",
+                 )
+             return failure
+
+         if explicit_context == "shared":
+             predecessors = [
+                 context.predecessor_results.get(dependency)
+                 for dependency in node.depends_on
+                 if context.predecessor_results.get(dependency) is not None
+             ]
+@@ -1408,20 +1431,30 @@ class AgentNodeExecutor:
+                 )
+             )
+             if provider_attempts is not None:
+                 metadata["provider_attempts"] = provider_attempts
+                 if strict_v3:
+                     metadata["provider_attempts_exact"] = True
+             elif strict_v3:
+                 metadata["provider_attempts_exact"] = False
+         if result.status == "paused":
+             metadata["pending_interaction"] = dict(result.pending_interaction or {})
++            if recovery_selected:
++                recovery_metadata = recovery_accounting_metadata(metadata)
++                recovery_metadata["pending_interaction"] = (
++                    paused_recovery_interaction(result.pending_interaction)
++                )
++                return NodeExecutionResult(
++                    "paused",
++                    metadata=recovery_metadata,
++                    session_recovery_outcome="fresh_execution_failed",
++                )
+             return NodeExecutionResult("paused", metadata=metadata)
+         if result.status == "cancelled":
+             reason = (
+                 context.cancellation_reason()
+                 if context.cancellation_reason is not None
+                 else "cancelled"
+             )
+             return NodeExecutionResult(
+                 "interrupted" if reason == "shutdown" else "cancelled",
+                 error_code=reason or "cancelled",
+diff --git a/plugins/workflow/notifications.py b/plugins/workflow/notifications.py
+index a65d0d162..2909588be 100644
+--- a/plugins/workflow/notifications.py
++++ b/plugins/workflow/notifications.py
+@@ -25,30 +25,51 @@ logger = logging.getLogger(__name__)
+ COALESCED_KINDS = frozenset({"failure", "stalled", "retry"})
+ ATTENTION_KINDS = frozenset(
+     {
+         "approval_required",
+         "input_required",
+         "failure",
+         "stalled",
+         "reconciliation_required",
+     }
+ )
++_GENERIC_DELIVERY_FAILURE_REASON = "notification delivery failed"
++_STABLE_DELIVERY_FAILURE_REASONS = frozenset(
++    {
++        "adapter_send_failed",
++        "adapter_send_timeout",
++        "adapter_unavailable",
++        "delivery_store_unavailable",
++        "gateway_loop_unavailable",
++        "invalid_text",
++        "outcome_uncertain",
++        "permanent_failure",
++        "retryable_failure",
++        "unauthorized",
++    }
++)
+
+
+ class NotificationReconciliationError(RuntimeError):
+     """A run journal could not be safely corroborated for notifications."""
+
+
+ class _NotificationRepairPageFull(Exception):
+     """The next safe journal would exceed this scanner iteration's budget."""
+
+
++def _stable_delivery_failure_reason(error: object) -> str:
++    if isinstance(error, str) and error in _STABLE_DELIVERY_FAILURE_REASONS:
++        return error
++    return _GENERIC_DELIVERY_FAILURE_REASON
++
++
+ def install_notification_schema(connection: sqlite3.Connection) -> None:
+     connection.executescript(
+         """
+         CREATE TABLE IF NOT EXISTS workflow_notification_outbox (
+             notification_id TEXT PRIMARY KEY,
+             transition_key TEXT NOT NULL UNIQUE,
+             run_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             destination TEXT NOT NULL,
+             transition_version INTEGER NOT NULL,
+@@ -823,48 +844,49 @@ class NotificationOutbox:
+         self,
+         notification_id: str,
+         *,
+         owner_id: str,
+         error: str,
+         outcome_uncertain: bool = False,
+         now: datetime | None = None,
+     ) -> bool:
+         """Durably stop a delivery that is unsafe or pointless to replay."""
+         observed = self._aware(now or datetime.now(timezone.utc))
++        failure_reason = _stable_delivery_failure_reason(error)
+         with self.store._connect() as connection:
+             connection.execute("BEGIN IMMEDIATE")
+             row = connection.execute(
+                 "SELECT * FROM workflow_notification_outbox WHERE "
+                 "notification_id=? AND state='leased' AND lease_owner=?",
+                 (notification_id, owner_id),
+             ).fetchone()
+             if row is None:
+                 connection.rollback()
+                 return False
+             decision = (
+                 "delivery_outcome_uncertain"
+                 if outcome_uncertain
+                 else "terminal_dead_letter"
+             )
+             connection.execute(
+                 "UPDATE workflow_notification_outbox SET state='dead', "
+                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, "
+                 "last_error=? WHERE notification_id=?",
+-                (observed.isoformat(), "notification delivery failed", notification_id),
++                (observed.isoformat(), failure_reason, notification_id),
+             )
+             self._record_decision_fact(
+                 connection,
+                 row,
+                 decision=decision,
+                 occurrence_key=f"{decision}:{uuid.uuid4().hex}",
+                 payload={
+-                    "error": "notification delivery failed",
++                    "error": failure_reason,
+                     "attempts": row["attempts"],
+                 },
+                 occurred_at=observed.isoformat(),
+             )
+             connection.commit()
+         return True
+
+     def ack(self, notification_id: str, *, owner_id: str, now: datetime | None = None) -> bool:
+         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
+         with self.store._connect() as connection:
+@@ -878,53 +900,54 @@ class NotificationOutbox:
+
+     def fail(
+         self,
+         notification_id: str,
+         *,
+         owner_id: str,
+         error: str,
+         now: datetime | None = None,
+     ) -> bool:
+         observed = self._aware(now or datetime.now(timezone.utc))
++        failure_reason = _stable_delivery_failure_reason(error)
+         with self.store._connect() as connection:
+             connection.execute("BEGIN IMMEDIATE")
+             row = connection.execute(
+                 "SELECT * FROM workflow_notification_outbox WHERE "
+                 "notification_id=? AND state='leased' AND lease_owner=?",
+                 (notification_id, owner_id),
+             ).fetchone()
+             if row is None:
+                 return False
+             attempts = int(row["attempts"])
+             dead = attempts >= 8
+             available = observed + timedelta(seconds=min(300, 2 ** min(attempts, 8)))
+             connection.execute(
+                 "UPDATE workflow_notification_outbox SET state=?, available_at=?, "
+                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, last_error=? "
+                 "WHERE notification_id=?",
+                 (
+                     "dead" if dead else "pending",
+                     available.isoformat(),
+                     observed.isoformat(),
+-                    "notification delivery failed",
++                    failure_reason,
+                     notification_id,
+                 ),
+             )
+             if dead:
+                 self._record_decision_fact(
+                     connection,
+                     row,
+                     decision="terminal_dead_letter",
+                     occurrence_key=f"terminal-dead:{attempts}:{uuid.uuid4().hex}",
+                     payload={
+                         "attempts": attempts,
+-                        "error": "notification delivery failed",
++                        "error": failure_reason,
+                     },
+                     occurred_at=observed.isoformat(),
+                 )
+             connection.commit()
+         return True
+
+     def retry_dead(
+         self,
+         notification_id: str,
+         authority_scope: str,
+diff --git a/tests/plugins/workflow/test_notifications.py b/tests/plugins/workflow/test_notifications.py
+index e3718af8a..e7bd524e9 100644
+--- a/tests/plugins/workflow/test_notifications.py
++++ b/tests/plugins/workflow/test_notifications.py
+@@ -1,13 +1,14 @@
+ from __future__ import annotations
+
+ from datetime import datetime, timedelta, timezone
++import json
+ import logging
+ import threading
+ from types import SimpleNamespace
+
+ from hermes_cli.plugin_services import BackgroundServiceContext
+ from plugins.workflow.notifications import NotificationOutbox
+ from plugins.workflow.admission import RunAdmissionRequest
+ from plugins.workflow.coordinator import WorkflowCoordinatorService
+ from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+ from plugins.workflow.locks import workflow_lock
+@@ -138,20 +139,133 @@ def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_pat
+                 "workflow_notification_facts USING(notification_id) "
+                 "WHERE notification_id=?",
+                 (notification_id,),
+             ).fetchall()
+             for value in row
+         )
+     assert canary not in durable
+     assert canary not in str(outbox.history(run_id="private-notification-run"))
+
+
++def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
++    store = RunStore(tmp_path / "stable-delivery-reason")
++    outbox = NotificationOutbox(store)
++    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
++    notification_ids = []
++    for version in (1, 2):
++        notification_ids.append(
++            outbox.record(
++                run_id="stable-delivery-reason-run",
++                kind="completion",
++                destination="desktop",
++                transition_version=version,
++                payload={"status": "succeeded"},
++                now=now,
++            )
++        )
++    leased = outbox.lease(
++        destination="desktop",
++        owner_id="stable-delivery-owner",
++        now=now,
++        lease_seconds=30,
++        limit=2,
++    )
++    assert {item["notification_id"] for item in leased} == set(notification_ids)
++
++    assert outbox.fail(
++        notification_ids[0],
++        owner_id="stable-delivery-owner",
++        error="delivery_store_unavailable",
++        now=now,
++    )
++    assert outbox.terminal_fail(
++        notification_ids[1],
++        owner_id="stable-delivery-owner",
++        error="delivery_store_unavailable",
++        now=now,
++    )
++
++    history = outbox.history(run_id="stable-delivery-reason-run")
++    deliveries = {
++        item["notification_id"]: item for item in history if item["last_error"]
++    }
++    assert deliveries[notification_ids[0]]["last_error"] == (
++        "delivery_store_unavailable"
++    )
++    assert deliveries[notification_ids[1]]["last_error"] == (
++        "delivery_store_unavailable"
++    )
++    dead_letter = next(
++        item
++        for item in history
++        if item["notification_id"] == notification_ids[1]
++        and item["payload"].get("decision") == "terminal_dead_letter"
++    )
++    assert dead_letter["payload"]["error"] == "delivery_store_unavailable"
++
++
++def test_notification_failures_normalize_free_form_delivery_detail(tmp_path):
++    store = RunStore(tmp_path / "free-form-delivery-detail")
++    outbox = NotificationOutbox(store)
++    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
++    canary = "private adapter session /path history"
++    notification_ids = []
++    for version in (1, 2):
++        notification_ids.append(
++            outbox.record(
++                run_id="free-form-delivery-detail-run",
++                kind="completion",
++                destination="desktop",
++                transition_version=version,
++                payload={"status": "succeeded"},
++                now=now,
++            )
++        )
++    outbox.lease(
++        destination="desktop",
++        owner_id="free-form-delivery-owner",
++        now=now,
++        lease_seconds=30,
++        limit=2,
++    )
++
++    assert outbox.fail(
++        notification_ids[0],
++        owner_id="free-form-delivery-owner",
++        error=canary,
++        now=now,
++    )
++    assert outbox.terminal_fail(
++        notification_ids[1],
++        owner_id="free-form-delivery-owner",
++        error=canary,
++        now=now,
++    )
++
++    history = outbox.history(run_id="free-form-delivery-detail-run")
++    assert canary not in json.dumps(history, sort_keys=True)
++    deliveries = {
++        item["notification_id"]: item for item in history if item["last_error"]
++    }
++    assert {
++        deliveries[notification_id]["last_error"]
++        for notification_id in notification_ids
++    } == {"notification delivery failed"}
++    dead_letter = next(
++        item
++        for item in history
++        if item["notification_id"] == notification_ids[1]
++        and item["payload"].get("decision") == "terminal_dead_letter"
++    )
++    assert dead_letter["payload"]["error"] == "notification delivery failed"
++
++
+ def test_expired_desktop_lease_returns_to_pending_and_dismissal_is_projection_only(
+     tmp_path,
+ ):
+     store = RunStore(tmp_path / "home")
+     outbox = NotificationOutbox(store)
+     now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+     notification_id = outbox.record(
+         run_id="run-2",
+         kind="failure",
+         destination="desktop",
+diff --git a/tests/plugins/workflow/test_persistent_session_recovery.py b/tests/plugins/workflow/test_persistent_session_recovery.py
+index 8e1e8c28f..9315f84cc 100644
+--- a/tests/plugins/workflow/test_persistent_session_recovery.py
++++ b/tests/plugins/workflow/test_persistent_session_recovery.py
+@@ -27,21 +27,24 @@ from plugins.workflow.executors.ai import AgentNodeExecutor
+ from plugins.workflow.executors.base import NodeExecutionContext
+ from plugins.workflow.evidence import EvidenceReader
+ from plugins.workflow.language_schema import compatibility_code_catalog
+ from plugins.workflow.models import (
+     DeadlineBudget,
+     ExecutionFence,
+     WorkflowLanguageProfile,
+     WorkflowNode,
+     freeze_value,
+ )
+-from plugins.workflow.notifications import NotificationOutbox
++from plugins.workflow.notifications import (
++    NotificationOutbox,
++    NotificationReconciliationError,
++)
+ from plugins.workflow.resources import VariableContext
+ from plugins.workflow.sanitize import public_run_projection
+ from plugins.workflow.scheduler import RunScheduler
+ from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+ from plugins.workflow.sessions import (
+     NodeSessionKey,
+     NodeSessionRegistry,
+     PersistentSessionRecoverySelection,
+     SessionRegistryUpdateCandidate,
+ )
+@@ -530,20 +533,117 @@ def test_confirmed_missing_cross_run_session_starts_fresh_once(
+     _run_id, recovered = _run_once(store, package, runner, registry, "recover")
+
+     assert recovered["status"] == "succeeded"
+     assert [request.context_mode for request in runner.requests] == [
+         "fresh",
+         "shared",
+         "fresh",
+     ]
+
+
++def test_confirmed_missing_cross_run_session_pause_preserves_only_resume_state(
++    tmp_path,
++) -> None:
++    canary = "private-paused-session-provider-model-usage-audit-history"
++    action_digest = "a" * 64
++
++    class PausedFreshRunner(_PersistentRunner):
++        def run(self, request, **kwargs):
++            self.requests.append(request)
++            if request.context_mode == "shared":
++                raise PluginAgentSessionMissingError("confirmed absent")
++            return PluginAgentRunResult(
++                final_response=canary,
++                session_id=canary,
++                provider=canary,
++                model=canary,
++                status="paused",
++                pending_interaction={
++                    "kind": "approval",
++                    "action_digest": action_digest,
++                    "provider_history": canary,
++                },
++                usage={"prompt_tokens": 99},
++                audit={
++                    "provider_attempts": 1,
++                    "provider_history": canary,
++                },
++            )
++
++    registry = NodeSessionRegistry(tmp_path / "paused-recovery-home")
++    runner = PausedFreshRunner()
++    node = WorkflowNode(
++        id="analyze",
++        node_type="prompt",
++        value="Analyze",
++        depends_on=(),
++        source_index=0,
++        source_line=1,
++        options=freeze_value({}),
++    )
++    context = NodeExecutionContext(
++        run_id="paused-recovery-run",
++        run_directory=tmp_path,
++        node=node,
++        attempt_id="paused-recovery-attempt",
++        workflow_name="paused-recovery",
++        workflow_options=freeze_value(
++            {
++                "persist_sessions": True,
++                "provider": "fake-provider",
++                "model": "fake-model",
++            }
++        ),
++        operator_scope="scope-digest",
++        variable_context=VariableContext(
++            workflow_id="paused-recovery-run",
++            normalizer_version=3,
++        ),
++        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
++        normalizer_version=3,
++        record_session_recovery_selection=lambda _selection: True,
++    )
++    executor = AgentNodeExecutor(runner, session_registry=registry)
++    fingerprint = executor._fingerprint(context)
++    registry.compare_and_set_or_observe(
++        NodeSessionKey(
++            "paused-recovery",
++            "analyze",
++            "scope-digest",
++            "fake-provider",
++            "default",
++        ),
++        0,
++        "missing-paused-session",
++        fingerprint,
++    )
++
++    result = executor.execute(context)
++
++    assert result.status == "paused"
++    assert result.session_recovery_outcome == "fresh_execution_failed"
++    assert result.metadata == {
++        "provider_attempts": 0,
++        "provider_attempts_exact": True,
++        "pending_interaction": {
++            "kind": "approval",
++            "action_digest": action_digest,
++        },
++    }
++    assert [request.context_mode for request in runner.requests] == [
++        "shared",
++        "fresh",
++    ]
++    assert canary not in json.dumps(result.metadata, sort_keys=True)
++    assert fingerprint not in json.dumps(result.metadata, sort_keys=True)
++
++
+ def test_same_run_shared_session_missing_fails_without_fresh_request(
+     tmp_path, workflow_writer
+ ) -> None:
+     package = _archon_package(
+         workflow_writer,
+         tmp_path / "same-run",
+         name="same-run",
+         nodes=[
+             {"id": "first", "prompt": "First"},
+             {
+@@ -3518,21 +3618,21 @@ def test_selected_recovery_event_privacy_does_not_trust_mutable_completion_field
+     ):
+         assert private_value not in cli_output
+
+
+ def _assert_private_values_absent(
+     read_public: Callable[[], object],
+     private_values: tuple[str, ...],
+ ) -> None:
+     try:
+         public = read_public()
+-    except RuntimeError as exc:
++    except JournalRecoveryError as exc:
+         encoded = str(exc)
+     else:
+         encoded = json.dumps(public, sort_keys=True)
+     for private_value in private_values:
+         assert private_value not in encoded
+
+
+ def _private_selection_values(store: RunStore, run_id: str) -> tuple[str, str]:
+     authorities = store._read_private_session_authorities(run_id=run_id)
+     authority = next(
+@@ -4114,24 +4214,25 @@ def test_selection_event_privacy_fails_closed_when_journal_order_is_damaged(
+         store,
+         run_id,
+         "persistent_session_missing_fresh_start",
+         damage_activation,
+     )
+     journal = store.run_directory(run_id) / "events.jsonl"
+     events = journal.read_text().splitlines()
+     assert json.loads(events[0])["event_type"] == "run_admitted"
+     journal.write_text("\n".join(events[1:]) + "\n", encoding="utf-8")
+
+-    _assert_private_values_absent(
+-        lambda: store.tail_events(run_id),
+-        (substituted_session, substituted_fingerprint),
+-    )
++    with pytest.raises(JournalRecoveryError) as exc_info:
++        store.tail_events(run_id)
++    assert str(exc_info.value) == "journal sequence gap: expected 1, received 2"
++    assert substituted_session not in str(exc_info.value)
++    assert substituted_fingerprint not in str(exc_info.value)
+
+
+ @pytest.mark.parametrize("completion_status", ("cancelled", "interrupted"))
+ def test_selected_nonwinning_completion_redacts_private_session_fields(
+     tmp_path, workflow_writer, completion_status
+ ) -> None:
+     package = _archon_package(
+         workflow_writer,
+         tmp_path / f"selection-{completion_status}-privacy",
+         name=f"selection-{completion_status}-privacy",
+@@ -4224,45 +4325,56 @@ def test_new_recovery_authorities_bind_immutable_journal_predecessor_chain(
+         authority = json.loads(row[0])
+         assert authority["schema_version"] == 3
+         assert authority["journal_order_version"] == 1
+         assert authority["activation_predecessor_sequence"] == (
+             authority["activation_event_sequence"] - 1
+         )
+         assert len(authority["activation_predecessor_chain_sha256"]) == 64
+
+
+ @pytest.mark.parametrize(
+-    ("field", "value"),
++    ("field", "value", "expected_message"),
+     (
+-        pytest.param("journal_order_version", 2, id="unsupported-version"),
+         pytest.param(
+-            "activation_predecessor_sequence", -1, id="wrong-predecessor-count"
++            "journal_order_version",
++            2,
++            "private session journal order is malformed",
++            id="unsupported-version",
++        ),
++        pytest.param(
++            "activation_predecessor_sequence",
++            -1,
++            "private session journal order is malformed",
++            id="wrong-predecessor-count",
+         ),
+         pytest.param(
+             "activation_predecessor_chain_sha256",
+             "not-a-digest",
++            "private session journal order is malformed",
+             id="bad-hex",
+         ),
+         pytest.param(
+             "activation_predecessor_chain_sha256",
+             "0" * 64,
++            "private session journal order is invalid",
+             id="wrong-run-genesis",
+         ),
+         pytest.param(
+             "unexpected_private_field",
+             "private-extra-field",
++            "session recovery selection authority is malformed",
+             id="extra-field",
+         ),
+     ),
+ )
+ def test_malformed_v3_journal_order_authority_fails_closed_value_free(
+-    tmp_path, workflow_writer, field, value
++    tmp_path, workflow_writer, field, value, expected_message
+ ) -> None:
+     store, run_id = _failed_fresh_recovery_run(
+         tmp_path, workflow_writer, name=f"malformed-order-{field}"
+     )
+     canary = "malformed-order-private-session-canary"
+     with sqlite3.connect(store.database) as connection:
+         row = connection.execute(
+             "SELECT attempt_id, authority_json FROM "
+             "session_recovery_selection_authority WHERE run_id=?",
+             (run_id,),
+@@ -4270,21 +4382,24 @@ def test_malformed_v3_journal_order_authority_fails_closed_value_free(
+         authority = json.loads(row[1])
+         authority[field] = value
+         authority["missing_session_id"] = canary
+         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":"))
+         connection.execute(
+             "UPDATE session_recovery_selection_authority SET authority_json=?, "
+             "authority_sha256=? WHERE attempt_id=?",
+             (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
+         )
+         connection.commit()
+-    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
++    with pytest.raises(JournalRecoveryError) as exc_info:
++        store.tail_events(run_id)
++    assert str(exc_info.value) == expected_message
++    assert canary not in str(exc_info.value)
+
+
+ def test_winner_prefix_detects_rewrite_between_selection_and_completion(
+     tmp_path, workflow_writer
+ ) -> None:
+     """The winner independently binds the selection frame in its predecessor."""
+     package = _archon_package(
+         workflow_writer,
+         tmp_path / "winner-prefix-order",
+         name="winner-prefix-order",
+@@ -4301,21 +4416,24 @@ def test_winner_prefix_detects_rewrite_between_selection_and_completion(
+
+     def rewrite_selection(event) -> None:
+         event["payload"]["message"] = canary
+
+     _rewrite_journal_event(
+         store,
+         run_id,
+         "persistent_session_missing_fresh_start",
+         rewrite_selection,
+     )
+-    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
++    with pytest.raises(JournalRecoveryError) as exc_info:
++        store.tail_events(run_id)
++    assert str(exc_info.value) == "private session journal order is invalid"
++    assert canary not in str(exc_info.value)
+
+
+ def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
+     tmp_path, workflow_writer
+ ) -> None:
+     store, run_id = _failed_fresh_recovery_run(
+         tmp_path, workflow_writer, name="recovery-pagination-privacy"
+     )
+     authorities = store._read_private_session_authorities(run_id=run_id)
+     authority = next(
+@@ -4371,26 +4489,32 @@ def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
+             moved = events.pop(later)
+             events.insert(max(0, activation - 1), moved)
+
+     _rewrite_complete_journal_order(store, run_id, damage_events)
+     values = (private_session, private_fingerprint)
+     for reader in (
+         lambda: store.tail_events(run_id),
+         lambda: store.latest_event_page(run_id),
+         lambda: store.events_after(run_id),
+         lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+-        lambda: NotificationOutbox(store)._journal_candidates(
++    ):
++        with pytest.raises(JournalRecoveryError) as exc_info:
++            reader()
++        assert str(exc_info.value) == "private session journal order is invalid"
++        assert all(value not in str(exc_info.value) for value in values)
++    with pytest.raises(NotificationReconciliationError) as exc_info:
++        NotificationOutbox(store)._journal_candidates(
+             run_id,
+             max_journal_bytes=store.max_journal_bytes,
+-        ),
+-    ):
+-        _assert_private_values_absent(reader, values)
++        )
++    assert str(exc_info.value) == "journal could not be safely corroborated"
++    assert all(value not in str(exc_info.value) for value in values)
+
+
+ def test_activation_or_later_whole_event_privacy_is_recursive_and_value_aware(
+     tmp_path, workflow_writer
+ ) -> None:
+     """Aliases, nested strings, lists, siblings, and top-level fields are private."""
+     store, run_id = _failed_fresh_recovery_run(
+         tmp_path, workflow_writer, name="whole-event-recovery-privacy"
+     )
+     authority = store._read_private_session_authorities(run_id=run_id)
