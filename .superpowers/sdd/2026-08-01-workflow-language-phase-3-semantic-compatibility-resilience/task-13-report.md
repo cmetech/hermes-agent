@@ -1447,3 +1447,126 @@ by the complete and expanded gates.
 No Task 14 work or out-of-scope mutation was performed. No push, publication,
 merge, branch deletion, worktree deletion, literal-`main` mutation, shared
 `base` checkout mutation, or brand-ref mutation was performed.
+
+## Fix Round 8 — Trusted run and immutable activation event privacy
+
+### Starting identity and finding disposition
+
+- HEAD: `9a78bb7b283fbc00f09b4233f55490df807e7254`
+- Tree: `98350745bdc95eb8f2ad861bdcc0417bbf42c96f`
+- Worktree: clean
+
+The user explicitly authorized this eighth bounded Task 13 fix round. The
+round addresses the sole Important finding shared by
+`task-13-spec-rereview-7.md` and `task-13-quality-rereview-7.md`: public event
+privacy still asked mutable embedded projection, outer event, and fallback
+payload identity whether an exact raw recovery selection protected a payload.
+
+### Correction
+
+- Store event readers now pass the requested run ID as trusted method context
+  rather than deriving recovery privacy from an event's embedded projection.
+- Schema-v2 raw selection authority contributes its immutable activation
+  sequence. Every payload at that journal position or later is conservatively
+  stripped of exact `session_id` and `cache_fingerprint` fields regardless of
+  event type, outer node/attempt identity, fallback payload identity, embedded
+  projection run, recovery list, marker, winner, or public projection state.
+- The boundary uses validated journal order, not mutable event identity. Events
+  before activation remain unchanged. Schema-v1 authority keeps its prior
+  identity behavior.
+- Raw authorities remain privacy-only. Completion validation still receives
+  only the separately event-bound selection/winner set, so a rewritten or
+  missing activation frame cannot gain continuation authority. An unbound
+  schema-v2 precommit still makes activation-or-later payloads value-safe.
+- Status redaction also receives the trusted requested run ID. Ordinary runs
+  without a private selection receive no new privacy boundary.
+
+No provider lifecycle, registry CAS, recovery reconciliation, workflow
+language surface, API route, Desktop production file, prompt, history,
+toolset, model-tool schema, user configuration, Phase 4/5 behavior, or
+unrelated product area changed.
+
+### Exact TDD evidence
+
+Every Python command used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`. No direct pytest invocation or retry was used.
+
+Focused RED before production edits:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'selection_activation_event_privacy_uses_trusted_run_and_sequence or later_run_level_event_privacy_uses_selection_activation_boundary or selection_privacy_leaves_pre_activation_event_payload_unchanged'
+```
+
+Result: **1 passed / 7 failed**. The passing row proved pre-activation payloads
+were unaffected. The seven expected failures exposed substituted recovery
+values after rewriting outer node ID, outer attempt ID, both outer IDs,
+falsey outer IDs plus payload fallback IDs, embedded projection run ID, every
+identity jointly with public recovery state, and a later run-level/sibling
+event.
+
+The same command after the correction passed **8/8**.
+
+Self-review then tested whether deleting a pre-activation journal frame could
+shift file position below the private activation sequence. Exact RED/GREEN
+command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'selection_event_privacy_fails_closed_when_journal_order_is_damaged'
+```
+
+RED: **0 passed / 1 failed** because the shifted activation payload returned
+both substituted values. GREEN after public event readers required contiguous
+journal sequences: **1 passed / 0 failed**. The complete new focused matrix,
+including the original eight rows, passed **9/9**.
+
+Expanded privacy, no-fence, outcome, and legacy matrix:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'selection_activation_event_privacy_uses_trusted_run_and_sequence or later_run_level_event_privacy_uses_selection_activation_boundary or selection_privacy_leaves_pre_activation_event_payload_unchanged or failed_fresh_recovery_selection_is_the_public_privacy_boundary or selected_recovery_privacy_does_not_depend_on_mutable_projection_state or selection_precommit_identity_redacts_events_when_activation_is_rewritten or selected_nonwinning_completion_redacts_private_session_fields or selected_recovery_event_privacy_does_not_trust_mutable_completion_fields or no_fence_selection_precommit or no_fence_winner_precommit or legacy_public_session_projection_remains_exact'
+```
+
+Result: **32 passed / 0 failed**. This combines the new individual/joint event
+identity matrix with successful/failed/cancelled/interrupted recovery,
+original/substituted values, missing or rewritten public recovery authority,
+real no-fence precommits, legacy parity, status, tail/latest/events-after,
+timeline evidence, authenticated API, and real CLI consumers.
+
+The complete recovery file passed **117/117**.
+
+### Final Fix Round 8 verification
+
+Canonical Task 13 ten-file command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Result: **10 files, 339 passed / 0 failed**, 14 workers, 35.4 seconds.
+
+Expanded agent/scheduler/Desktop/API/CLI command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Result: **9 files, 586 passed / 0 failed**, 14 workers, 85.2 seconds. The
+generic plugin-agent file passed **129/129** and authenticated Desktop API file
+passed **157/157**.
+
+### Fix Round 8 changed files and self-review
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `plugins/workflow/store.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+The correction is confined to public store redaction. Private selection and
+winner codecs, exact event binding, completion authority, provider release,
+cancellation linearization, CAS reconciliation, and bounded public evidence
+remain unchanged. Existing schema-v1, unversioned, Hermes legacy,
+normalizer-v1/v2, ordinary v3, and no-fence semantics remain covered by the
+focused and expanded gates.
+
+No Task 14 work or out-of-scope mutation was performed. No push, publication,
+merge, branch deletion, worktree deletion, literal-`main` mutation, shared
+`base` checkout mutation, or brand-ref mutation was performed.

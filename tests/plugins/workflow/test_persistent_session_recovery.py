@@ -3816,6 +3816,265 @@ def test_selection_precommit_identity_redacts_events_when_activation_is_rewritte
         )
 
 
+@pytest.mark.parametrize(
+    "identity_damage",
+    (
+        "outer-node",
+        "outer-attempt",
+        "outer-both",
+        "payload-fallback",
+        "embedded-run",
+        "all-identities",
+    ),
+)
+def test_selection_activation_event_privacy_uses_trusted_run_and_sequence(
+    tmp_path, workflow_writer, identity_damage
+) -> None:
+    """Mutable event identity cannot opt a selected payload out of privacy."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"selection-event-identity-{identity_damage}",
+        name=f"selection-event-identity-{identity_damage}",
+    )
+    home = tmp_path / f"selection-event-identity-{identity_damage}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"{identity_damage}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"{identity_damage}-recovery",
+    )
+    attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
+        "cache_fingerprint"
+    ]
+    substituted_session = f"private-{identity_damage}-session"
+    substituted_fingerprint = hashlib.sha256(
+        f"private-{identity_damage}-fingerprint".encode()
+    ).hexdigest()
+
+    def damage_activation(event) -> None:
+        payload = event["payload"]
+        payload["session_id"] = substituted_session
+        payload["cache_fingerprint"] = substituted_fingerprint
+        if identity_damage in {"outer-node", "outer-both", "all-identities"}:
+            event["node_id"] = "sibling"
+        if identity_damage in {"outer-attempt", "outer-both", "all-identities"}:
+            event["attempt_id"] = "substituted-attempt"
+        if identity_damage == "payload-fallback":
+            event.pop("node_id", None)
+            event["attempt_id"] = ""
+            payload["node_id"] = "sibling"
+            payload["attempt_id"] = "substituted-attempt"
+        if identity_damage in {"embedded-run", "all-identities"}:
+            event["projection"]["run_id"] = "substituted-run"
+        if identity_damage == "all-identities":
+            event["event_type"] = "selection_activation_rewritten"
+            payload["node_id"] = "sibling"
+            payload["attempt_id"] = "substituted-attempt"
+            node = event["projection"]["nodes"]["analyze"]
+            node["session_recoveries"] = []
+            node["attempts"][-1].pop("session_registry_authority", None)
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_missing_fresh_start",
+        damage_activation,
+    )
+
+    private_values = (
+        original_fingerprint,
+        substituted_session,
+        substituted_fingerprint,
+    )
+    for read_public in (
+        lambda: store.get_run_status(run_id),
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(read_public, private_values)
+
+
+def test_later_run_level_event_privacy_uses_selection_activation_boundary(
+    tmp_path, workflow_writer, monkeypatch, capsys
+) -> None:
+    """Later sibling/run-level payloads inherit selection privacy by sequence."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "later-selection-event-privacy",
+        name="later-selection-event-privacy",
+    )
+    home = tmp_path / "later-selection-event-privacy-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "later-event-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "later-event-recovery",
+    )
+    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
+        "cache_fingerprint"
+    ]
+    substituted_session = "private-later-run-event-session"
+    substituted_fingerprint = "e" * 64
+
+    def damage_later_event(event) -> None:
+        event["event_type"] = "rewritten_run_level_event"
+        event["node_id"] = "sibling"
+        event["attempt_id"] = "sibling-attempt"
+        event["projection"]["run_id"] = "substituted-run"
+        payload = event["payload"]
+        payload.update(
+            {
+                "node_id": "payload-sibling",
+                "attempt_id": "payload-attempt",
+                "session_id": substituted_session,
+                "cache_fingerprint": substituted_fingerprint,
+            }
+        )
+
+    _rewrite_journal_event(store, run_id, "node_failed", damage_later_event)
+    private_values = (
+        original_fingerprint,
+        substituted_session,
+        substituted_fingerprint,
+    )
+    for read_public in (
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(read_public, private_values)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    api = _authenticated_workflow_api_client(home)
+    for response in (
+        api.get(f"/api/plugins/workflow/runs/{run_id}/events"),
+        api.get(
+            f"/api/plugins/workflow/runs/{run_id}/evidence",
+            params={"kind": "timeline"},
+        ),
+    ):
+        assert response.status_code in {200, 409}
+        for private_value in private_values:
+            assert private_value not in response.text
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(home),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) in {0, 70}
+    cli_output = capsys.readouterr().out
+    for private_value in private_values:
+        assert private_value not in cli_output
+
+
+def test_selection_privacy_leaves_pre_activation_event_payload_unchanged(
+    tmp_path, workflow_writer
+) -> None:
+    """A selection must not retroactively redact an earlier journal payload."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "pre-activation-event-privacy",
+        name="pre-activation-event-privacy",
+    )
+    store = RunStore(tmp_path / "pre-activation-event-privacy-home")
+    registry = NodeSessionRegistry(tmp_path / "pre-activation-event-privacy-home")
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "pre-activation-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, _result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "pre-activation-recovery",
+    )
+    earlier_session = "ordinary-pre-activation-session-field"
+    earlier_fingerprint = "d" * 64
+
+    def add_earlier_payload(event) -> None:
+        event["payload"]["session_id"] = earlier_session
+        event["payload"]["cache_fingerprint"] = earlier_fingerprint
+
+    _rewrite_journal_event(store, run_id, "run_admitted", add_earlier_payload)
+    public = json.dumps(store.tail_events(run_id), sort_keys=True)
+    assert earlier_session in public
+    assert earlier_fingerprint in public
+
+
+def test_selection_event_privacy_fails_closed_when_journal_order_is_damaged(
+    tmp_path, workflow_writer
+) -> None:
+    """Removing an earlier frame cannot shift activation below its private fence."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "selection-event-order-privacy",
+        name="selection-event-order-privacy",
+    )
+    store = RunStore(tmp_path / "selection-event-order-privacy-home")
+    registry = NodeSessionRegistry(tmp_path / "selection-event-order-privacy-home")
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "event-order-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, _result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "event-order-recovery",
+    )
+    substituted_session = "private-shifted-activation-session"
+    substituted_fingerprint = "c" * 64
+
+    def damage_activation(event) -> None:
+        event["node_id"] = "sibling"
+        event["attempt_id"] = "sibling-attempt"
+        event["payload"]["session_id"] = substituted_session
+        event["payload"]["cache_fingerprint"] = substituted_fingerprint
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_missing_fresh_start",
+        damage_activation,
+    )
+    journal = store.run_directory(run_id) / "events.jsonl"
+    events = journal.read_text().splitlines()
+    assert json.loads(events[0])["event_type"] == "run_admitted"
+    journal.write_text("\n".join(events[1:]) + "\n", encoding="utf-8")
+
+    _assert_private_values_absent(
+        lambda: store.tail_events(run_id),
+        (substituted_session, substituted_fingerprint),
+    )
+
+
 @pytest.mark.parametrize("completion_status", ("cancelled", "interrupted"))
 def test_selected_nonwinning_completion_redacts_private_session_fields(
     tmp_path, workflow_writer, completion_status

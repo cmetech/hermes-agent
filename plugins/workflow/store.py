@@ -863,6 +863,8 @@ def _redact_private_session_authority(
     private_authorities: Mapping[
         str, Mapping[str, Mapping[str, object]]
     ] | None = None,
+    trusted_run_id: str | None = None,
+    trusted_event_sequence: int | None = None,
 ) -> dict[str, object]:
     """Copy a public run/event projection without exact session authority."""
 
@@ -887,22 +889,30 @@ def _redact_private_session_authority(
     authority_projection.pop("pending_session_registry_updates", None)
     nodes = authority_projection.get("nodes")
     protected_attempts: set[tuple[str, str]] = set()
+    selection_event_privacy = False
+    authority_run_id = trusted_run_id or authority_projection.get("run_id")
     if private_authorities is not None:
         for authority in private_authorities.get(
             "session_recovery_selection_authority", {}
         ).values():
             try:
-                selection, _activation, _event_type = (
+                selection, activation, _event_type = (
                     _session_recovery_selection_from_authority(authority)
                 )
             except JournalRecoveryError as exc:
                 raise JournalRecoveryError(
                     "private session selection authority is malformed"
                 ) from exc
-            if selection.run_id == authority_projection.get("run_id"):
+            if selection.run_id == authority_run_id:
                 protected_attempts.add(
                     (selection.key.node_id, selection.attempt_id)
                 )
+                if (
+                    activation is not None
+                    and trusted_event_sequence is not None
+                    and trusted_event_sequence >= activation
+                ):
+                    selection_event_privacy = True
         for authority in private_authorities.get(
             "session_registry_winner_authority", {}
         ).values():
@@ -918,7 +928,7 @@ def _redact_private_session_authority(
                 ) from exc
             if (
                 retry_count == 0
-                and candidate.winning_run_id == authority_projection.get("run_id")
+                and candidate.winning_run_id == authority_run_id
             ):
                 protected_attempts.add(
                     (candidate.winning_node_id, candidate.winning_attempt_id)
@@ -975,9 +985,23 @@ def _redact_private_session_authority(
             str(projected.get("node_id") or payload.get("node_id")),
             str(projected.get("attempt_id") or payload_attempt_id),
         )
-        if event_identity in protected_attempts:
+        if selection_event_privacy or event_identity in protected_attempts:
             redact_session_fields(payload)
     return projected
+
+
+def _trusted_journal_positions(
+    events: Iterable[Mapping[str, object]],
+) -> tuple[tuple[int, Mapping[str, object]], ...]:
+    """Bind event privacy to contiguous journal order, not mutable identity."""
+    positioned = tuple(enumerate(events, 1))
+    for position, event in positioned:
+        if event.get("sequence") != position:
+            raise JournalRecoveryError(
+                f"journal sequence gap: expected {position}, "
+                f"received {event.get('sequence')}"
+            )
+    return positioned
 
 
 def _sanitize_v3_condition_diagnostic(value: str) -> str:
@@ -8042,6 +8066,7 @@ class RunStore:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             events = self._read_journal_events(directory)
+            positioned_events = _trusted_journal_positions(events)
             private_authorities = self._read_private_session_authorities(
                 run_id=run_id,
             )
@@ -8058,13 +8083,17 @@ class RunStore:
                 private_authorities=bound_private_authorities,
             )
         selected = tuple(
-            event for event in events if int(event["sequence"]) > after_sequence
+            (position, event)
+            for position, event in positioned_events
+            if int(event["sequence"]) > after_sequence
         )[:limit]
         public_events = []
-        for event in selected:
+        for position, event in selected:
             event = _redact_private_session_authority(
                 event,
                 private_authorities=private_authorities,
+                trusted_run_id=run_id,
+                trusted_event_sequence=position,
             )
             event.pop("projection", None)
             event.pop("projection_sha256", None)
@@ -8120,7 +8149,9 @@ class RunStore:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             all_events = self._read_journal_events(directory)
-            selected = all_events[-limit:]
+            positioned_events = _trusted_journal_positions(all_events)
+            selected_start = max(0, len(all_events) - limit)
+            selected = positioned_events[selected_start:]
             private_authorities = self._read_private_session_authorities(
                 run_id=run_id,
             )
@@ -8138,14 +8169,21 @@ class RunStore:
             )
         truncated = (
             len(all_events) > limit
-            or projection_was_truncated(selected)
-            or any(bool(event.get("payload_truncated")) for event in selected)
+            or projection_was_truncated(
+                tuple(event for _position, event in selected)
+            )
+            or any(
+                bool(event.get("payload_truncated"))
+                for _position, event in selected
+            )
         )
         public_events = []
-        for event in selected:
+        for position, event in selected:
             event = _redact_private_session_authority(
                 event,
                 private_authorities=private_authorities,
+                trusted_run_id=run_id,
+                trusted_event_sequence=position,
             )
             event.pop("projection", None)
             event.pop("projection_sha256", None)
@@ -9059,6 +9097,7 @@ class RunStore:
         run = _redact_private_session_authority(
             run,
             private_authorities=self._read_private_session_authorities(run_id=run_id),
+            trusted_run_id=run_id,
         )
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
