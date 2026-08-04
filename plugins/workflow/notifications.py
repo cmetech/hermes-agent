@@ -32,6 +32,21 @@ ATTENTION_KINDS = frozenset(
         "reconciliation_required",
     }
 )
+_GENERIC_DELIVERY_FAILURE_REASON = "notification delivery failed"
+_STABLE_DELIVERY_FAILURE_REASONS = frozenset(
+    {
+        "adapter_send_failed",
+        "adapter_send_timeout",
+        "adapter_unavailable",
+        "delivery_store_unavailable",
+        "gateway_loop_unavailable",
+        "invalid_text",
+        "outcome_uncertain",
+        "permanent_failure",
+        "retryable_failure",
+        "unauthorized",
+    }
+)
 
 
 class NotificationReconciliationError(RuntimeError):
@@ -40,6 +55,12 @@ class NotificationReconciliationError(RuntimeError):
 
 class _NotificationRepairPageFull(Exception):
     """The next safe journal would exceed this scanner iteration's budget."""
+
+
+def _stable_delivery_failure_reason(error: object) -> str:
+    if isinstance(error, str) and error in _STABLE_DELIVERY_FAILURE_REASONS:
+        return error
+    return _GENERIC_DELIVERY_FAILURE_REASON
 
 
 def install_notification_schema(connection: sqlite3.Connection) -> None:
@@ -830,6 +851,7 @@ class NotificationOutbox:
     ) -> bool:
         """Durably stop a delivery that is unsafe or pointless to replay."""
         observed = self._aware(now or datetime.now(timezone.utc))
+        failure_reason = _stable_delivery_failure_reason(error)
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -849,7 +871,7 @@ class NotificationOutbox:
                 "UPDATE workflow_notification_outbox SET state='dead', "
                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, "
                 "last_error=? WHERE notification_id=?",
-                (observed.isoformat(), "notification delivery failed", notification_id),
+                (observed.isoformat(), failure_reason, notification_id),
             )
             self._record_decision_fact(
                 connection,
@@ -857,7 +879,7 @@ class NotificationOutbox:
                 decision=decision,
                 occurrence_key=f"{decision}:{uuid.uuid4().hex}",
                 payload={
-                    "error": "notification delivery failed",
+                    "error": failure_reason,
                     "attempts": row["attempts"],
                 },
                 occurred_at=observed.isoformat(),
@@ -885,6 +907,7 @@ class NotificationOutbox:
         now: datetime | None = None,
     ) -> bool:
         observed = self._aware(now or datetime.now(timezone.utc))
+        failure_reason = _stable_delivery_failure_reason(error)
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -905,7 +928,7 @@ class NotificationOutbox:
                     "dead" if dead else "pending",
                     available.isoformat(),
                     observed.isoformat(),
-                    "notification delivery failed",
+                    failure_reason,
                     notification_id,
                 ),
             )
@@ -917,7 +940,7 @@ class NotificationOutbox:
                     occurrence_key=f"terminal-dead:{attempts}:{uuid.uuid4().hex}",
                     payload={
                         "attempts": attempts,
-                        "error": "notification delivery failed",
+                        "error": failure_reason,
                     },
                     occurred_at=observed.isoformat(),
                 )

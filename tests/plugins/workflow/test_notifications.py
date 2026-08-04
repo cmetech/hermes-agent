@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import threading
 from types import SimpleNamespace
@@ -143,6 +144,119 @@ def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_pat
         )
     assert canary not in durable
     assert canary not in str(outbox.history(run_id="private-notification-run"))
+
+
+def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
+    store = RunStore(tmp_path / "stable-delivery-reason")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    notification_ids = []
+    for version in (1, 2):
+        notification_ids.append(
+            outbox.record(
+                run_id="stable-delivery-reason-run",
+                kind="completion",
+                destination="desktop",
+                transition_version=version,
+                payload={"status": "succeeded"},
+                now=now,
+            )
+        )
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="stable-delivery-owner",
+        now=now,
+        lease_seconds=30,
+        limit=2,
+    )
+    assert {item["notification_id"] for item in leased} == set(notification_ids)
+
+    assert outbox.fail(
+        notification_ids[0],
+        owner_id="stable-delivery-owner",
+        error="delivery_store_unavailable",
+        now=now,
+    )
+    assert outbox.terminal_fail(
+        notification_ids[1],
+        owner_id="stable-delivery-owner",
+        error="delivery_store_unavailable",
+        now=now,
+    )
+
+    history = outbox.history(run_id="stable-delivery-reason-run")
+    deliveries = {
+        item["notification_id"]: item for item in history if item["last_error"]
+    }
+    assert deliveries[notification_ids[0]]["last_error"] == (
+        "delivery_store_unavailable"
+    )
+    assert deliveries[notification_ids[1]]["last_error"] == (
+        "delivery_store_unavailable"
+    )
+    dead_letter = next(
+        item
+        for item in history
+        if item["notification_id"] == notification_ids[1]
+        and item["payload"].get("decision") == "terminal_dead_letter"
+    )
+    assert dead_letter["payload"]["error"] == "delivery_store_unavailable"
+
+
+def test_notification_failures_normalize_free_form_delivery_detail(tmp_path):
+    store = RunStore(tmp_path / "free-form-delivery-detail")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    canary = "private adapter session /path history"
+    notification_ids = []
+    for version in (1, 2):
+        notification_ids.append(
+            outbox.record(
+                run_id="free-form-delivery-detail-run",
+                kind="completion",
+                destination="desktop",
+                transition_version=version,
+                payload={"status": "succeeded"},
+                now=now,
+            )
+        )
+    outbox.lease(
+        destination="desktop",
+        owner_id="free-form-delivery-owner",
+        now=now,
+        lease_seconds=30,
+        limit=2,
+    )
+
+    assert outbox.fail(
+        notification_ids[0],
+        owner_id="free-form-delivery-owner",
+        error=canary,
+        now=now,
+    )
+    assert outbox.terminal_fail(
+        notification_ids[1],
+        owner_id="free-form-delivery-owner",
+        error=canary,
+        now=now,
+    )
+
+    history = outbox.history(run_id="free-form-delivery-detail-run")
+    assert canary not in json.dumps(history, sort_keys=True)
+    deliveries = {
+        item["notification_id"]: item for item in history if item["last_error"]
+    }
+    assert {
+        deliveries[notification_id]["last_error"]
+        for notification_id in notification_ids
+    } == {"notification delivery failed"}
+    dead_letter = next(
+        item
+        for item in history
+        if item["notification_id"] == notification_ids[1]
+        and item["payload"].get("decision") == "terminal_dead_letter"
+    )
+    assert dead_letter["payload"]["error"] == "notification delivery failed"
 
 
 def test_expired_desktop_lease_returns_to_pending_and_dismissal_is_projection_only(

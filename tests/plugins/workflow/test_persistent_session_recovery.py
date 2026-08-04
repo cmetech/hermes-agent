@@ -34,7 +34,10 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
-from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.notifications import (
+    NotificationOutbox,
+    NotificationReconciliationError,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
@@ -535,6 +538,103 @@ def test_confirmed_missing_cross_run_session_starts_fresh_once(
         "shared",
         "fresh",
     ]
+
+
+def test_confirmed_missing_cross_run_session_pause_preserves_only_resume_state(
+    tmp_path,
+) -> None:
+    canary = "private-paused-session-provider-model-usage-audit-history"
+    action_digest = "a" * 64
+
+    class PausedFreshRunner(_PersistentRunner):
+        def run(self, request, **kwargs):
+            self.requests.append(request)
+            if request.context_mode == "shared":
+                raise PluginAgentSessionMissingError("confirmed absent")
+            return PluginAgentRunResult(
+                final_response=canary,
+                session_id=canary,
+                provider=canary,
+                model=canary,
+                status="paused",
+                pending_interaction={
+                    "kind": "approval",
+                    "action_digest": action_digest,
+                    "provider_history": canary,
+                },
+                usage={"prompt_tokens": 99},
+                audit={
+                    "provider_attempts": 1,
+                    "provider_history": canary,
+                },
+            )
+
+    registry = NodeSessionRegistry(tmp_path / "paused-recovery-home")
+    runner = PausedFreshRunner()
+    node = WorkflowNode(
+        id="analyze",
+        node_type="prompt",
+        value="Analyze",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    context = NodeExecutionContext(
+        run_id="paused-recovery-run",
+        run_directory=tmp_path,
+        node=node,
+        attempt_id="paused-recovery-attempt",
+        workflow_name="paused-recovery",
+        workflow_options=freeze_value(
+            {
+                "persist_sessions": True,
+                "provider": "fake-provider",
+                "model": "fake-model",
+            }
+        ),
+        operator_scope="scope-digest",
+        variable_context=VariableContext(
+            workflow_id="paused-recovery-run",
+            normalizer_version=3,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
+        record_session_recovery_selection=lambda _selection: True,
+    )
+    executor = AgentNodeExecutor(runner, session_registry=registry)
+    fingerprint = executor._fingerprint(context)
+    registry.compare_and_set_or_observe(
+        NodeSessionKey(
+            "paused-recovery",
+            "analyze",
+            "scope-digest",
+            "fake-provider",
+            "default",
+        ),
+        0,
+        "missing-paused-session",
+        fingerprint,
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "paused"
+    assert result.session_recovery_outcome == "fresh_execution_failed"
+    assert result.metadata == {
+        "provider_attempts": 0,
+        "provider_attempts_exact": True,
+        "pending_interaction": {
+            "kind": "approval",
+            "action_digest": action_digest,
+        },
+    }
+    assert [request.context_mode for request in runner.requests] == [
+        "shared",
+        "fresh",
+    ]
+    assert canary not in json.dumps(result.metadata, sort_keys=True)
+    assert fingerprint not in json.dumps(result.metadata, sort_keys=True)
 
 
 def test_same_run_shared_session_missing_fails_without_fresh_request(
@@ -3525,7 +3625,7 @@ def _assert_private_values_absent(
 ) -> None:
     try:
         public = read_public()
-    except RuntimeError as exc:
+    except JournalRecoveryError as exc:
         encoded = str(exc)
     else:
         encoded = json.dumps(public, sort_keys=True)
@@ -4121,10 +4221,11 @@ def test_selection_event_privacy_fails_closed_when_journal_order_is_damaged(
     assert json.loads(events[0])["event_type"] == "run_admitted"
     journal.write_text("\n".join(events[1:]) + "\n", encoding="utf-8")
 
-    _assert_private_values_absent(
-        lambda: store.tail_events(run_id),
-        (substituted_session, substituted_fingerprint),
-    )
+    with pytest.raises(JournalRecoveryError) as exc_info:
+        store.tail_events(run_id)
+    assert str(exc_info.value) == "journal sequence gap: expected 1, received 2"
+    assert substituted_session not in str(exc_info.value)
+    assert substituted_fingerprint not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("completion_status", ("cancelled", "interrupted"))
@@ -4231,31 +4332,42 @@ def test_new_recovery_authorities_bind_immutable_journal_predecessor_chain(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "expected_message"),
     (
-        pytest.param("journal_order_version", 2, id="unsupported-version"),
         pytest.param(
-            "activation_predecessor_sequence", -1, id="wrong-predecessor-count"
+            "journal_order_version",
+            2,
+            "private session journal order is malformed",
+            id="unsupported-version",
+        ),
+        pytest.param(
+            "activation_predecessor_sequence",
+            -1,
+            "private session journal order is malformed",
+            id="wrong-predecessor-count",
         ),
         pytest.param(
             "activation_predecessor_chain_sha256",
             "not-a-digest",
+            "private session journal order is malformed",
             id="bad-hex",
         ),
         pytest.param(
             "activation_predecessor_chain_sha256",
             "0" * 64,
+            "private session journal order is invalid",
             id="wrong-run-genesis",
         ),
         pytest.param(
             "unexpected_private_field",
             "private-extra-field",
+            "session recovery selection authority is malformed",
             id="extra-field",
         ),
     ),
 )
 def test_malformed_v3_journal_order_authority_fails_closed_value_free(
-    tmp_path, workflow_writer, field, value
+    tmp_path, workflow_writer, field, value, expected_message
 ) -> None:
     store, run_id = _failed_fresh_recovery_run(
         tmp_path, workflow_writer, name=f"malformed-order-{field}"
@@ -4277,7 +4389,10 @@ def test_malformed_v3_journal_order_authority_fails_closed_value_free(
             (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
         )
         connection.commit()
-    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
+    with pytest.raises(JournalRecoveryError) as exc_info:
+        store.tail_events(run_id)
+    assert str(exc_info.value) == expected_message
+    assert canary not in str(exc_info.value)
 
 
 def test_winner_prefix_detects_rewrite_between_selection_and_completion(
@@ -4308,7 +4423,10 @@ def test_winner_prefix_detects_rewrite_between_selection_and_completion(
         "persistent_session_missing_fresh_start",
         rewrite_selection,
     )
-    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
+    with pytest.raises(JournalRecoveryError) as exc_info:
+        store.tail_events(run_id)
+    assert str(exc_info.value) == "private session journal order is invalid"
+    assert canary not in str(exc_info.value)
 
 
 def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
@@ -4378,12 +4496,18 @@ def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
         lambda: store.latest_event_page(run_id),
         lambda: store.events_after(run_id),
         lambda: EvidenceReader(store).query(run_id, kind="timeline"),
-        lambda: NotificationOutbox(store)._journal_candidates(
+    ):
+        with pytest.raises(JournalRecoveryError) as exc_info:
+            reader()
+        assert str(exc_info.value) == "private session journal order is invalid"
+        assert all(value not in str(exc_info.value) for value in values)
+    with pytest.raises(NotificationReconciliationError) as exc_info:
+        NotificationOutbox(store)._journal_candidates(
             run_id,
             max_journal_bytes=store.max_journal_bytes,
-        ),
-    ):
-        _assert_private_values_absent(reader, values)
+        )
+    assert str(exc_info.value) == "journal could not be safely corroborated"
+    assert all(value not in str(exc_info.value) for value in values)
 
 
 def test_activation_or_later_whole_event_privacy_is_recursive_and_value_aware(

@@ -799,6 +799,48 @@ class AgentNodeExecutor:
         stale_cache_fingerprint: str | None = None
         recovery_selected = False
 
+        def recovery_accounting_metadata(
+            metadata: Mapping[str, object],
+        ) -> dict[str, object]:
+            counts = {"provider_attempts", "additional_provider_attempts"}
+            flags = {
+                "provider_attempts_exact",
+                "known_no_effect",
+                "unknown_side_effect",
+                "outcome_unknown",
+                "archon_terminal_failure",
+            }
+            return {
+                key: value
+                for key, value in dict(metadata).items()
+                if (
+                    key in counts
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+                or (key in flags and isinstance(value, bool))
+            }
+
+        def paused_recovery_interaction(
+            pending: Mapping[str, object] | None,
+        ) -> dict[str, str]:
+            if not isinstance(pending, Mapping):
+                return {}
+            kind = pending.get("kind")
+            action_digest = pending.get("action_digest")
+            if (
+                kind != "approval"
+                or not isinstance(action_digest, str)
+                or len(action_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in action_digest
+                )
+            ):
+                return {}
+            return {"kind": "approval", "action_digest": action_digest}
+
         def with_recovery_failure(
             failure: NodeExecutionResult,
         ) -> NodeExecutionResult:
@@ -806,26 +848,7 @@ class AgentNodeExecutor:
                 "failed",
                 "cancelled",
                 "interrupted",
-                "paused",
             }:
-                allowed_metadata = {
-                    key: value
-                    for key, value in dict(failure.metadata).items()
-                    if key
-                    in {
-                        "provider_attempts",
-                        "provider_attempts_exact",
-                        "known_no_effect",
-                        "unknown_side_effect",
-                        "outcome_unknown",
-                        "archon_terminal_failure",
-                        "additional_provider_attempts",
-                    }
-                    and (
-                        value is None
-                        or isinstance(value, bool | int | float | str)
-                    )
-                }
                 fixed_message = {
                     "authorization": "selected recovery authorization failed",
                     "authentication": "selected recovery authentication failed",
@@ -842,7 +865,7 @@ class AgentNodeExecutor:
                     failure,
                     artifacts=(),
                     error_message=fixed_message,
-                    metadata=allowed_metadata,
+                    metadata=recovery_accounting_metadata(failure.metadata),
                     session_recovery_outcome="fresh_execution_failed",
                 )
             return failure
@@ -1415,6 +1438,16 @@ class AgentNodeExecutor:
                 metadata["provider_attempts_exact"] = False
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
+            if recovery_selected:
+                recovery_metadata = recovery_accounting_metadata(metadata)
+                recovery_metadata["pending_interaction"] = (
+                    paused_recovery_interaction(result.pending_interaction)
+                )
+                return NodeExecutionResult(
+                    "paused",
+                    metadata=recovery_metadata,
+                    session_recovery_outcome="fresh_execution_failed",
+                )
             return NodeExecutionResult("paused", metadata=metadata)
         if result.status == "cancelled":
             reason = (
