@@ -2755,6 +2755,17 @@ assert control == {
     "type": "provider_start",
     "executor_nonce": nonce,
 }
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_start_received",
+    "executor_nonce": nonce,
+}), flush=True)
+execute = json.loads(sys.stdin.readline())
+assert execute == {
+    "protocol_version": 1,
+    "type": "provider_execute",
+    "executor_nonce": nonce,
+}
 print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
       flush=True)
 """
@@ -2787,6 +2798,124 @@ print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
         "stopped",
     ]
     assert lifecycle[0][1] == lifecycle[2][1]
+
+
+@pytest.mark.live_system_guard_bypass
+def test_worker_exchange_records_delivery_only_after_child_acknowledges_start() -> None:
+    lifecycle = []
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+nonce = request["provider_start_handshake"]["executor_nonce"]
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_ready",
+    "executor_nonce": nonce,
+}), flush=True)
+start = json.loads(sys.stdin.readline())
+assert start == {
+    "protocol_version": 1,
+    "type": "provider_start",
+    "executor_nonce": nonce,
+}
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_start_received",
+    "executor_nonce": nonce,
+}), flush=True)
+execute = json.loads(sys.stdin.readline())
+assert execute == {
+    "protocol_version": 1,
+    "type": "provider_execute",
+    "executor_nonce": nonce,
+}
+print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
+      flush=True)
+"""
+
+    frame = _exchange_worker(
+        {
+            "protocol_version": 1,
+            "type": "run",
+            "provider_start_handshake": {"required": True},
+        },
+        workdir=None,
+        idle_timeout_seconds=5,
+        wall_timeout_seconds=10,
+        worker_argv=[sys.executable, "-c", code],
+        spawn_intent=lambda nonce: lifecycle.append(("intent", nonce)) or True,
+        process_started=lambda identity: lifecycle.append(("started", identity))
+        or True,
+        provider_dispatch=lambda nonce: lifecycle.append(("authorize", nonce))
+        or True,
+        provider_start_delivered=lambda nonce: lifecycle.append(
+            ("delivered", nonce)
+        )
+        or True,
+        process_stopped=lambda identity, cleaned: lifecycle.append(
+            ("stopped", identity, cleaned)
+        ),
+    )
+
+    assert frame["type"] == "result"
+    assert [item[0] for item in lifecycle] == [
+        "intent",
+        "started",
+        "authorize",
+        "delivered",
+        "stopped",
+    ]
+    assert lifecycle[0][1] == lifecycle[2][1] == lifecycle[3][1]
+
+
+@pytest.mark.live_system_guard_bypass
+def test_worker_exchange_rechecks_cancellation_at_provider_ready() -> None:
+    dispatched = []
+    cancellation_checks = [0]
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+nonce = request["provider_start_handshake"]["executor_nonce"]
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_ready",
+    "executor_nonce": nonce,
+}), flush=True)
+start = json.loads(sys.stdin.readline())
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_start_received",
+    "executor_nonce": nonce,
+}), flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
+      flush=True)
+"""
+
+    def is_cancelled() -> bool:
+        cancellation_checks[0] += 1
+        return cancellation_checks[0] >= 2
+
+    with pytest.raises(_PluginAgentCancelled, match="cancelled"):
+        _exchange_worker(
+            {
+                "protocol_version": 1,
+                "type": "run",
+                "provider_start_handshake": {"required": True},
+            },
+            workdir=None,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            worker_argv=[sys.executable, "-c", code],
+            is_cancelled=is_cancelled,
+            provider_dispatch=lambda nonce: dispatched.append(nonce) or True,
+        )
+
+    assert dispatched == []
 
 
 def test_worker_exchange_rejected_spawn_intent_creates_no_process(monkeypatch) -> None:

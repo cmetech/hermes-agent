@@ -3241,6 +3241,12 @@ class RunScheduler:
                                     executor_nonce=executor_nonce,
                                 )
                             ),
+                            provider_start_delivered=lambda executor_nonce: (
+                                self.store.record_provider_start_delivered(
+                                    claim,
+                                    executor_nonce=executor_nonce,
+                                )
+                            ),
                             process_stopped=lambda identity, cleaned: (
                                 self.store.record_process_stopped(
                                     claim, identity, cleaned=cleaned

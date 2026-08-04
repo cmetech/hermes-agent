@@ -1179,6 +1179,7 @@ def _exchange_worker_once(
     spawn_failed: Callable[[str, str], bool] | None = None,
     process_started: Callable[[ProcessIdentity], bool] | None = None,
     provider_dispatch: Callable[[str], bool] | None = None,
+    provider_start_delivered: Callable[[str], bool] | None = None,
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
     executor_nonce = secrets.token_hex(16)
@@ -1272,7 +1273,8 @@ def _exchange_worker_once(
 
     started = last_activity = time.monotonic()
     stderr_tail = ""
-    provider_dispatched = False
+    provider_authorized = False
+    provider_delivered = False
     limits = resource_limits or ProcessResourceLimits()
     try:
         while True:
@@ -1316,12 +1318,14 @@ def _exchange_worker_once(
             if frame.get("type") == "provider_ready":
                 if (
                     not handshake_required
-                    or provider_dispatched
+                    or provider_authorized
                     or frame.get("executor_nonce") != executor_nonce
                 ):
                     raise RuntimeError(
                         "plugin-agent provider handshake is invalid"
                     )
+                if is_cancelled is not None and is_cancelled():
+                    raise _PluginAgentCancelled("plugin-agent run cancelled")
                 if provider_dispatch is not None and not provider_dispatch(
                     executor_nonce
                 ):
@@ -1338,10 +1342,50 @@ def _exchange_worker_once(
                 )
                 tree.process.stdin.write(control + "\n")
                 tree.process.stdin.flush()
-                provider_dispatched = True
+                provider_authorized = True
+                last_activity = time.monotonic()
+                continue
+            if frame.get("type") == "provider_start_received":
+                if (
+                    not handshake_required
+                    or not provider_authorized
+                    or provider_delivered
+                    or frame.get("executor_nonce") != executor_nonce
+                ):
+                    raise RuntimeError(
+                        "plugin-agent provider delivery handshake is invalid"
+                    )
+                if is_cancelled is not None and is_cancelled():
+                    raise _PluginAgentCancelled("plugin-agent run cancelled")
+                if (
+                    provider_start_delivered is not None
+                    and not provider_start_delivered(executor_nonce)
+                ):
+                    raise _PluginAgentCancelled(
+                        "plugin-agent provider delivery was rejected"
+                    )
+                execute = json.dumps(
+                    {
+                        "protocol_version": _PROTOCOL_VERSION,
+                        "type": "provider_execute",
+                        "executor_nonce": executor_nonce,
+                    },
+                    separators=(",", ":"),
+                )
+                tree.process.stdin.write(execute + "\n")
+                tree.process.stdin.flush()
+                provider_delivered = True
                 last_activity = time.monotonic()
                 continue
             if frame.get("type") == "result":
+                if (
+                    handshake_required
+                    and provider_authorized
+                    and not provider_delivered
+                ):
+                    raise RuntimeError(
+                        "plugin-agent provider handshake ended before delivery"
+                    )
                 return frame
             if frame.get("type") not in {"progress", "interaction"}:
                 raise RuntimeError("plugin-agent emitted an unknown frame type")
@@ -1380,6 +1424,7 @@ def _exchange_worker(
     spawn_failed: Callable[[str, str], bool] | None = None,
     process_started: Callable[[ProcessIdentity], bool] | None = None,
     provider_dispatch: Callable[[str], bool] | None = None,
+    provider_start_delivered: Callable[[str], bool] | None = None,
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
     """Exchange one frame while owning any top-level sealed grant broker."""
@@ -1415,6 +1460,7 @@ def _exchange_worker(
             spawn_failed=spawn_failed,
             process_started=process_started,
             provider_dispatch=provider_dispatch,
+            provider_start_delivered=provider_start_delivered,
             process_stopped=process_stopped,
         )
     finally:
@@ -1441,6 +1487,7 @@ class PluginAgentRunner:
         spawn_failed: Callable[[str, str], bool] | None = None,
         process_started: Callable[[ProcessIdentity], bool] | None = None,
         provider_dispatch: Callable[[str], bool] | None = None,
+        provider_start_delivered: Callable[[str], bool] | None = None,
         process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
     ) -> PluginAgentRunResult:
         _validate_request(request)
@@ -1485,6 +1532,7 @@ class PluginAgentRunner:
                 spawn_failed=spawn_failed,
                 process_started=process_started,
                 provider_dispatch=provider_dispatch,
+                provider_start_delivered=provider_start_delivered,
                 process_stopped=process_stopped,
             )
             result = frame.get("result")

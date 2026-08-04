@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -168,6 +170,11 @@ def _crash_cut_coordinator(
         time.sleep(60)
         return
     assert store.record_provider_dispatch(claim, executor_nonce=nonce)
+    if stage == "after_dispatch_before_delivery":
+        ready.set()
+        time.sleep(60)
+        return
+    assert store.record_provider_start_delivered(claim, executor_nonce=nonce)
     start_marker.write_text("authorized", encoding="utf-8")
     deadline = time.monotonic() + 10
     while not provider_marker.exists() and time.monotonic() < deadline:
@@ -300,6 +307,65 @@ def _rewrite_latest_projection(
         encoding="utf-8",
     )
     (directory / "run.json").write_text("{broken", encoding="utf-8")
+
+
+def _resolved_running_recovery(
+    store: RunStore,
+    package,
+) -> tuple[str, SessionRegistryUpdateCandidate]:
+    admitted = _admit(store, package, "resolved-running")
+    claim = store.claim_node(
+        admitted.run_id,
+        "first",
+        "resolved-running-owner",
+        journal_reserve_bytes=2 * 1024 * 1024,
+        terminal_journal_reserve_bytes=2 * 1024 * 1024,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    key = NodeSessionKey(
+        package.definition.name,
+        "first",
+        "local",
+        "fake-provider",
+        "default",
+    )
+    selection = PersistentSessionRecoverySelection(
+        key=key,
+        expected_generation=0,
+        missing_session_id="missing-running-session",
+        cache_fingerprint="a" * 64,
+        run_id=admitted.run_id,
+        attempt_id=claim.attempt_id,
+    )
+    assert store.record_persistent_session_recovery_selection(claim, selection)
+    candidate = SessionRegistryUpdateCandidate(
+        key=key,
+        expected_generation=0,
+        new_session_id="fresh-running-session",
+        cache_fingerprint="a" * 64,
+        winning_run_id=admitted.run_id,
+        winning_node_id="first",
+        winning_attempt_id=claim.attempt_id,
+        recovery_selected=True,
+    )
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": candidate.new_session_id,
+            "cache_fingerprint": candidate.cache_fingerprint,
+        },
+        session_registry_update=candidate,
+        session_registry_authority=candidate,
+    )
+    store.resolve_session_registry_update(
+        admitted.run_id,
+        candidate,
+        outcome="stale_entry_replaced",
+    )
+    assert store.load_run(admitted.run_id)["status"] == "running"
+    return admitted.run_id, candidate
 
 
 def test_confirmed_missing_cross_run_session_starts_fresh_once(
@@ -601,6 +667,10 @@ def test_crash_after_provider_worker_spawn_is_never_replayed_as_prelaunch(
         claim,
         executor_nonce="provider-worker",
     )
+    assert store.record_provider_start_delivered(
+        claim,
+        executor_nonce="provider-worker",
+    )
     monkeypatch.setattr(
         RunStore,
         "_observe_process_identity",
@@ -643,6 +713,10 @@ def test_crash_after_reaped_provider_worker_still_requires_reconciliation(
     identity = ProcessIdentity(pid=999_991, start_time=12345, group_id=999_991)
     assert store.record_process_started(claim, identity)
     assert store.record_provider_dispatch(
+        claim,
+        executor_nonce="provider-worker",
+    )
+    assert store.record_provider_start_delivered(
         claim,
         executor_nonce="provider-worker",
     )
@@ -713,6 +787,89 @@ def test_reaped_real_worker_before_provider_dispatch_is_known_zero(
     assert node.get("pending_interaction") is None
 
 
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("cancel_order", ("before-authorization", "after-authorization"))
+def test_provider_dispatch_cannot_cross_durable_cancellation(
+    tmp_path, workflow_writer, cancel_order, monkeypatch
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"dispatch-cancel-{cancel_order}",
+        name=f"dispatch-cancel-{cancel_order}",
+    )
+    store = RunStore(tmp_path / f"dispatch-cancel-{cancel_order}-home")
+    admitted = _admit(store, package, f"dispatch-cancel-{cancel_order}")
+    claim = store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "dispatch-cancel-owner",
+        executor_id="prompt",
+        effect_classification="replay_safe",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    nonce = "dispatch-cancel-provider"
+    assert store.record_spawn_intent(claim, executor_nonce=nonce)
+    tree = ManagedProcessTree.spawn(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        policy=TerminationPolicy(
+            cooperative_grace_seconds=0.05,
+            term_grace_seconds=0.1,
+            kill_grace_seconds=0.2,
+            wait_timeout_seconds=0.2,
+        ),
+    )
+    cancel_errors: list[BaseException] = []
+    cancellation_recorded = threading.Event()
+    release_termination = threading.Event()
+    original_terminate_existing = ManagedProcessTree.terminate_existing
+
+    def blocked_terminate_existing(identity, **kwargs):
+        cancellation_recorded.set()
+        if not release_termination.wait(timeout=10):
+            raise AssertionError("cancellation test did not release termination")
+        return original_terminate_existing(identity, **kwargs)
+
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "terminate_existing",
+        staticmethod(blocked_terminate_existing),
+    )
+
+    def cancel() -> None:
+        try:
+            store.cancel_run(admitted.run_id)
+        except BaseException as exc:
+            cancel_errors.append(exc)
+
+    cancel_thread = threading.Thread(target=cancel, daemon=True)
+    try:
+        assert store.record_process_started(claim, tree.identity)
+        if cancel_order == "after-authorization":
+            assert store.record_provider_dispatch(claim, executor_nonce=nonce)
+        cancel_thread.start()
+        assert cancellation_recorded.wait(timeout=10)
+        assert store.load_run(admitted.run_id)["desired_status"] == "cancelled"
+        if cancel_order == "before-authorization":
+            crossed_cancellation = store.record_provider_dispatch(
+                claim,
+                executor_nonce=nonce,
+            )
+        else:
+            crossed_cancellation = store.record_provider_start_delivered(
+                claim,
+                executor_nonce=nonce,
+            )
+    finally:
+        release_termination.set()
+        cancel_thread.join(timeout=10)
+        tree.close()
+
+    assert not cancel_thread.is_alive()
+    assert cancel_errors == []
+    assert not crossed_cancellation
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX coordinator kill")
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize(
@@ -722,6 +879,7 @@ def test_reaped_real_worker_before_provider_dispatch_is_known_zero(
         "after_selection_before_launch",
         "after_spawn_intent_before_process",
         "after_process_registration_before_dispatch",
+        "after_dispatch_before_delivery",
         "after_launch_before_completion",
         "after_completion_before_cas",
         "after_cas_before_outcome",
@@ -778,6 +936,7 @@ def test_killed_coordinator_restart_preserves_each_recovery_boundary(
 
     if stage in {
         "after_process_registration_before_dispatch",
+        "after_dispatch_before_delivery",
         "after_launch_before_completion",
         "after_completion_before_cas",
         "after_cas_before_outcome",
@@ -802,6 +961,7 @@ def test_killed_coordinator_restart_preserves_each_recovery_boundary(
         "after_selection_before_launch",
         "after_spawn_intent_before_process",
         "after_process_registration_before_dispatch",
+        "after_dispatch_before_delivery",
     }:
         assert restarted.interrupt_active_claims(
             admitted.run_id,
@@ -811,7 +971,11 @@ def test_killed_coordinator_restart_preserves_each_recovery_boundary(
         assert recovered["status"] == "interrupted"
         expected_observation = (
             "known_stopped"
-            if stage == "after_process_registration_before_dispatch"
+            if stage
+            in {
+                "after_process_registration_before_dispatch",
+                "after_dispatch_before_delivery",
+            }
             else "not_started"
         )
         assert (
@@ -1088,7 +1252,7 @@ def test_recovered_session_authority_is_private_across_every_public_surface(
 
 
 def test_recovered_typed_output_session_is_private_across_artifact_surfaces(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, capsys
 ) -> None:
     package = _archon_package(
         workflow_writer,
@@ -1128,11 +1292,68 @@ def test_recovered_typed_output_session_is_private_across_artifact_surfaces(
     public_surfaces = {
         "status": store.get_run_status(run_id),
         "events": store.tail_events(run_id),
+        "latest_event_page": store.latest_event_page(run_id),
         "artifacts": EvidenceReader(store).query(run_id, kind="artifacts"),
         "timeline": EvidenceReader(store).query(run_id, kind="timeline"),
     }
     for name, surface in public_surfaces.items():
         assert new_session_id not in json.dumps(surface, sort_keys=True), name
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(tmp_path / "typed-privacy-home"),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) == 0
+    cli_events = json.loads(capsys.readouterr().out)
+    assert new_session_id not in json.dumps(cli_events, sort_keys=True)
+
+
+def test_postresolution_event_privacy_uses_private_anchor_without_public_marker(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "markerless-event-privacy",
+        nodes=[
+            {
+                "id": "analyze",
+                "prompt": "Analyze",
+                "output_type": "RecoveredReport",
+            }
+        ],
+    )
+    home = tmp_path / "markerless-event-privacy-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "markerless-event-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "markerless-event-privacy",
+    )
+    protected_session_id = result["nodes"]["analyze"]["session_id"]
+
+    _rewrite_latest_projection(
+        store,
+        run_id,
+        lambda projection: projection["nodes"]["analyze"]["attempts"][-1].pop(
+            "session_registry_authority"
+        ),
+    )
+
+    page = store.latest_event_page(run_id)
+    assert protected_session_id not in json.dumps(page, sort_keys=True)
 
 
 @pytest.mark.parametrize("normalizer_version", [1, 2])
@@ -2131,6 +2352,204 @@ def test_selected_recovery_missing_session_digest_has_private_anchor(
         recovery["missing_session_sha256"] = "b" * 64
 
     _rewrite_latest_projection(store, run_id, substitute_missing_digest)
+
+    with pytest.raises(JournalRecoveryError, match="valid recovery data"):
+        store.load_run(run_id)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("authority-marker", "exact-session-authority", "missing-session-digest"),
+)
+def test_resolved_terminal_recovery_keeps_private_anchor_authoritative(
+    tmp_path, workflow_writer, corruption
+) -> None:
+    home = tmp_path / f"resolved-terminal-{corruption}-home"
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"resolved-terminal-{corruption}",
+        name=f"resolved-terminal-{corruption}",
+    )
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"{corruption}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"{corruption}-resolved",
+    )
+    assert result["status"] == "succeeded"
+    assert store.pending_session_registry_update(run_id) is None
+
+    def corrupt(projection) -> None:
+        node = projection["nodes"]["analyze"]
+        attempt = node["attempts"][-1]
+        recovery = node["session_recoveries"][-1]
+        if corruption == "authority-marker":
+            attempt.pop("session_registry_authority")
+        elif corruption == "exact-session-authority":
+            attempt["session_registry_authority"]["new_session_id"] = (
+                "substituted-terminal-session"
+            )
+            attempt["session_registry_authority"]["cache_fingerprint"] = "f" * 64
+            attempt["metadata"]["session_id"] = "substituted-terminal-session"
+            attempt["metadata"]["cache_fingerprint"] = "f" * 64
+            node["session_id"] = "substituted-terminal-session"
+            node["cache_fingerprint"] = "f" * 64
+            recovery["cache_fingerprint_sha256"] = hashlib.sha256(
+                ("f" * 64).encode()
+            ).hexdigest()
+        else:
+            recovery["missing_session_sha256"] = "b" * 64
+
+    _rewrite_latest_projection(store, run_id, corrupt)
+
+    with pytest.raises(JournalRecoveryError, match="valid recovery data"):
+        store.load_run(run_id)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("authority-marker", "exact-session-authority", "missing-session-digest"),
+)
+def test_resolved_running_recovery_keeps_private_anchor_authoritative(
+    tmp_path, workflow_writer, corruption
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"resolved-running-{corruption}",
+        name=f"resolved-running-{corruption}",
+        nodes=[
+            {"id": "first", "prompt": "First"},
+            {
+                "id": "second",
+                "prompt": "Continue",
+                "depends_on": ["first"],
+                "context": "shared",
+            },
+        ],
+    )
+    store = RunStore(tmp_path / f"resolved-running-{corruption}-home")
+    run_id, _candidate = _resolved_running_recovery(store, package)
+
+    def corrupt(projection) -> None:
+        node = projection["nodes"]["first"]
+        attempt = node["attempts"][-1]
+        recovery = node["session_recoveries"][-1]
+        if corruption == "authority-marker":
+            attempt.pop("session_registry_authority")
+        elif corruption == "exact-session-authority":
+            attempt["session_registry_authority"]["new_session_id"] = (
+                "substituted-running-session"
+            )
+            attempt["session_registry_authority"]["cache_fingerprint"] = "f" * 64
+            attempt["metadata"]["session_id"] = "substituted-running-session"
+            attempt["metadata"]["cache_fingerprint"] = "f" * 64
+            node["session_id"] = "substituted-running-session"
+            node["cache_fingerprint"] = "f" * 64
+            recovery["cache_fingerprint_sha256"] = hashlib.sha256(
+                ("f" * 64).encode()
+            ).hexdigest()
+        else:
+            recovery["missing_session_sha256"] = "b" * 64
+
+    _rewrite_latest_projection(store, run_id, corrupt)
+
+    runner = _PersistentRunner()
+    scheduler = RunScheduler(
+        store,
+        agent_runner=runner,
+        session_registry=NodeSessionRegistry(
+            tmp_path / f"resolved-running-{corruption}-home"
+        ),
+    )
+    try:
+        with pytest.raises(JournalRecoveryError, match="valid recovery data"):
+            scheduler.advance(run_id)
+    finally:
+        scheduler.shutdown()
+    assert runner.requests == []
+
+
+def test_selected_preobligation_recovery_requires_its_private_evidence(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "selected-preobligation-anchor",
+        name="selected-preobligation-anchor",
+    )
+    store = RunStore(tmp_path / "selected-preobligation-anchor-home")
+    admitted = _admit(store, package, "selected-preobligation-anchor")
+    claim = store.claim_node(admitted.run_id, "analyze", "selection-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_persistent_session_recovery_selection(
+        claim,
+        PersistentSessionRecoverySelection(
+            key=NodeSessionKey(
+                package.definition.name,
+                "analyze",
+                "local",
+                "fake-provider",
+                "default",
+            ),
+            expected_generation=0,
+            missing_session_id="selected-missing-session",
+            cache_fingerprint="a" * 64,
+            run_id=admitted.run_id,
+            attempt_id=claim.attempt_id,
+        ),
+    )
+
+    _rewrite_latest_projection(
+        store,
+        admitted.run_id,
+        lambda projection: projection["nodes"]["analyze"][
+            "session_recoveries"
+        ][-1].update({"missing_session_sha256": "b" * 64}),
+    )
+
+    with pytest.raises(JournalRecoveryError, match="valid recovery data"):
+        store.load_run(admitted.run_id)
+
+
+def test_fresh_failed_recovery_requires_its_private_selection_evidence(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "fresh-failed-anchor-home"
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "fresh-failed-anchor",
+        name="fresh-failed-anchor",
+    )
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "fresh-failed-anchor-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "fresh-failed-anchor",
+    )
+    assert result["status"] == "failed"
+    assert store.pending_session_registry_update(run_id) is None
+
+    _rewrite_latest_projection(
+        store,
+        run_id,
+        lambda projection: projection["nodes"]["analyze"].update(
+            {"session_recoveries": []}
+        ),
+    )
 
     with pytest.raises(JournalRecoveryError, match="valid recovery data"):
         store.load_run(run_id)

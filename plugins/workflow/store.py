@@ -221,9 +221,12 @@ def _private_authority_json(authority: Mapping[str, object]) -> str:
 
 def _session_recovery_selection_authority(
     selection: PersistentSessionRecoverySelection,
+    *,
+    activation_event_sequence: int,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "activation_event_sequence": activation_event_sequence,
         "run_id": selection.run_id,
         "attempt_id": selection.attempt_id,
         "key": {
@@ -434,6 +437,25 @@ def _session_registry_candidate_is_corroborated(
         return False
     if authority_retry_count != 0 or authority != candidate:
         return False
+    winning_metadata = winning_attempts[0].get("metadata")
+    if (
+        not isinstance(winning_metadata, Mapping)
+        or winning_metadata.get("session_id") != candidate.new_session_id
+        or winning_metadata.get("cache_fingerprint")
+        != candidate.cache_fingerprint
+        or winning_node.get("session_id") != candidate.new_session_id
+        or winning_node.get("cache_fingerprint") != candidate.cache_fingerprint
+    ):
+        return False
+    for artifact in projection.get("artifacts", ()):
+        if (
+            isinstance(artifact, Mapping)
+            and artifact.get("node_id") == candidate.winning_node_id
+            and artifact.get("attempt_id") == candidate.winning_attempt_id
+            and "session_id" in artifact
+            and artifact.get("session_id") != candidate.new_session_id
+        ):
+            return False
     if not candidate.recovery_selected:
         return True
     recoveries = winning_node.get("session_recoveries")
@@ -715,6 +737,10 @@ def _sanitize_diagnostic(value: str | None) -> str | None:
 
 def _redact_private_session_authority(
     value: Mapping[str, object],
+    *,
+    private_authorities: Mapping[
+        str, Mapping[str, Mapping[str, object]]
+    ] | None = None,
 ) -> dict[str, object]:
     """Copy a public run/event projection without exact session authority."""
     projected = copy.deepcopy(dict(value))
@@ -727,18 +753,55 @@ def _redact_private_session_authority(
     authority_projection.pop("pending_session_registry_updates", None)
     nodes = authority_projection.get("nodes")
     protected_attempts: set[tuple[str, str]] = set()
+    if isinstance(nodes, dict) and private_authorities is not None:
+        for authority in private_authorities.get(
+            "session_registry_winner_authority", {}
+        ).values():
+            try:
+                candidate, retry_count = _session_registry_candidate_from_payload(
+                    authority
+                )
+            except JournalRecoveryError:
+                continue
+            node = nodes.get(candidate.winning_node_id)
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            if (
+                retry_count == 0
+                and candidate.winning_run_id == authority_projection.get("run_id")
+                and isinstance(attempts, list)
+                and any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("attempt_id") == candidate.winning_attempt_id
+                    and attempt.get("state") == "succeeded"
+                    for attempt in attempts
+                )
+            ):
+                protected_attempts.add(
+                    (candidate.winning_node_id, candidate.winning_attempt_id)
+                )
     if isinstance(nodes, dict):
         for node_id, node in nodes.items():
             if not isinstance(node, dict):
                 continue
-            node_is_protected = False
+            node_is_protected = any(
+                protected_node_id == str(node_id)
+                for protected_node_id, _attempt_id in protected_attempts
+            )
             for attempt in node.get("attempts", ()):
                 if not isinstance(attempt, dict):
                     continue
                 attempt_id = attempt.get("attempt_id")
-                if not isinstance(
+                marker_is_protected = isinstance(
                     attempt.get("session_registry_authority"), Mapping
-                ) or not isinstance(attempt_id, str):
+                )
+                anchored_is_protected = (
+                    str(node_id), str(attempt_id)
+                ) in protected_attempts
+                if (
+                    not isinstance(attempt_id, str)
+                    or not marker_is_protected
+                    and not anchored_is_protected
+                ):
                     continue
                 node_is_protected = True
                 protected_attempts.add((str(node_id), attempt_id))
@@ -4385,49 +4448,210 @@ class RunStore:
         selection_authority = authorities.get(
             "session_recovery_selection_authority", {}
         ).get(candidate.winning_attempt_id)
+        return self._private_selection_authority_matches(
+            projection,
+            candidate.winning_attempt_id,
+            selection_authority,
+            require_active=True,
+        )
+
+    @staticmethod
+    def _private_selection_authority_matches(
+        projection: Mapping[str, object],
+        attempt_id: str,
+        selection_authority: object,
+        *,
+        require_active: bool,
+    ) -> bool:
         if not isinstance(selection_authority, Mapping):
             return False
-        key = selection_authority.get("key")
-        if not isinstance(key, Mapping):
+        schema_version = selection_authority.get("schema_version")
+        expected_fields = {
+            "schema_version",
+            "run_id",
+            "attempt_id",
+            "key",
+            "expected_generation",
+            "missing_session_id",
+            "cache_fingerprint",
+            "source",
+            "provider_attempts_before_recovery",
+        }
+        if schema_version == 2:
+            expected_fields.add("activation_event_sequence")
+        elif schema_version != 1:
             return False
-        node = projection.get("nodes", {}).get(candidate.winning_node_id)
-        recoveries = node.get("session_recoveries") if isinstance(node, dict) else None
+        if set(selection_authority) != expected_fields:
+            return False
+        key = selection_authority.get("key")
+        if not isinstance(key, Mapping) or set(key) != {
+            "workflow",
+            "node_id",
+            "scope",
+            "provider",
+            "profile",
+        }:
+            return False
+        if (
+            selection_authority.get("run_id") != projection.get("run_id")
+            or selection_authority.get("attempt_id") != attempt_id
+            or key.get("workflow") != projection.get("workflow")
+            or key.get("scope")
+            != str(projection.get("operator_scope_digest") or "local")
+            or any(
+                not isinstance(key.get(field), str) or not key.get(field)
+                for field in ("node_id", "provider", "profile")
+            )
+        ):
+            return False
+        node_id = key.get("node_id")
+        nodes = projection.get("nodes")
+        node = nodes.get(node_id) if isinstance(nodes, Mapping) else None
+        attempts = node.get("attempts") if isinstance(node, Mapping) else None
+        matching_attempts = [
+            attempt
+            for attempt in attempts
+            if isinstance(attempt, Mapping)
+            and attempt.get("attempt_id") == attempt_id
+        ] if isinstance(attempts, list) else []
+        attempt = matching_attempts[0] if len(matching_attempts) == 1 else None
+        recoveries = node.get("session_recoveries") if isinstance(node, Mapping) else None
         matches = [
             recovery
             for recovery in recoveries
             if isinstance(recovery, Mapping)
-            and recovery.get("attempt_id") == candidate.winning_attempt_id
+            and recovery.get("attempt_id") == attempt_id
         ] if isinstance(recoveries, list) else []
-        if len(matches) != 1:
+        if schema_version == 2:
+            activation = selection_authority.get("activation_event_sequence")
+            if (
+                isinstance(activation, bool)
+                or not isinstance(activation, int)
+                or activation < 1
+            ):
+                return False
+            active = int(projection.get("event_sequence", 0)) >= activation
+        else:
+            active = bool(matches) or (
+                isinstance(attempt, Mapping)
+                and attempt.get("state")
+                in {"succeeded", "failed", "cancelled", "interrupted"}
+            )
+        if not active:
+            return not require_active
+        if attempt is None or len(matches) != 1:
             return False
         recovery = matches[0]
         missing_session_id = selection_authority.get("missing_session_id")
         cache_fingerprint = selection_authority.get("cache_fingerprint")
         return (
-            selection_authority.get("schema_version") == 1
-            and selection_authority.get("run_id") == candidate.winning_run_id
-            and selection_authority.get("attempt_id")
-            == candidate.winning_attempt_id
+            selection_authority.get("run_id") == projection.get("run_id")
+            and selection_authority.get("attempt_id") == attempt_id
             and key
             == {
-                "workflow": candidate.key.workflow,
-                "node_id": candidate.key.node_id,
-                "scope": candidate.key.scope,
-                "provider": candidate.key.provider,
-                "profile": candidate.key.profile,
+                "workflow": projection.get("workflow"),
+                "node_id": node_id,
+                "scope": str(projection.get("operator_scope_digest") or "local"),
+                "provider": recovery.get("provider"),
+                "profile": recovery.get("runtime_profile"),
             }
             and selection_authority.get("expected_generation")
-            == candidate.expected_generation
+            == recovery.get("registry_generation")
             and isinstance(missing_session_id, str)
             and recovery.get("missing_session_sha256")
             == _sha256(missing_session_id.encode("utf-8"))
-            and cache_fingerprint == candidate.cache_fingerprint
+            and isinstance(cache_fingerprint, str)
             and recovery.get("cache_fingerprint_sha256")
-            == _sha256(candidate.cache_fingerprint.encode("utf-8"))
+            == _sha256(cache_fingerprint.encode("utf-8"))
             and selection_authority.get("source") == recovery.get("source")
             and selection_authority.get("provider_attempts_before_recovery") == 0
             and recovery.get("provider_attempts_before_recovery") == 0
         )
+
+    def _private_session_authorities_match_projection(
+        self,
+        projection: Mapping[str, object],
+        *,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ],
+    ) -> bool:
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return False
+        selections = private_authorities.get(
+            "session_recovery_selection_authority", {}
+        )
+        winners = private_authorities.get("session_registry_winner_authority", {})
+        for attempt_id, selection_authority in selections.items():
+            if not self._private_selection_authority_matches(
+                projection,
+                attempt_id,
+                selection_authority,
+                require_active=False,
+            ):
+                return False
+        anchored_winners: dict[str, SessionRegistryUpdateCandidate] = {}
+        for attempt_id, authority in winners.items():
+            try:
+                candidate, retry_count = _session_registry_candidate_from_payload(
+                    authority
+                )
+            except JournalRecoveryError:
+                return False
+            if (
+                retry_count != 0
+                or candidate.winning_attempt_id != attempt_id
+                or candidate.winning_run_id != projection.get("run_id")
+            ):
+                return False
+            anchored_winners[attempt_id] = candidate
+            node = nodes.get(candidate.winning_node_id)
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            matching_attempts = [
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == attempt_id
+            ] if isinstance(attempts, list) else []
+            if not matching_attempts or matching_attempts[0].get("state") != "succeeded":
+                continue
+            if (
+                len(matching_attempts) != 1
+                or not _session_registry_candidate_is_corroborated(
+                    projection, candidate
+                )
+                or not self._private_session_registry_authority_matches(
+                    projection,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
+            ):
+                return False
+        for node in nodes.values():
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            if not isinstance(attempts, list):
+                continue
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping) or not isinstance(
+                    attempt.get("session_registry_authority"), Mapping
+                ):
+                    continue
+                attempt_id = attempt.get("attempt_id")
+                candidate = anchored_winners.get(str(attempt_id))
+                if (
+                    candidate is None
+                    or not _session_registry_candidate_is_corroborated(
+                        projection, candidate
+                    )
+                    or not self._private_session_registry_authority_matches(
+                        projection,
+                        candidate,
+                        private_authorities=private_authorities,
+                    )
+                ):
+                    return False
+        return True
 
     @staticmethod
     def _record_coordinator_wake(
@@ -6183,10 +6407,15 @@ class RunStore:
             pending = _pending_session_registry_payloads(value)
         except JournalRecoveryError:
             return False
-        if not pending:
-            return next_registry_update_at is None
         if private_authorities is None:
             private_authorities = self._read_private_session_authorities(run_id=run_id)
+        if not self._private_session_authorities_match_projection(
+            value,
+            private_authorities=private_authorities,
+        ):
+            return False
+        if not pending:
+            return next_registry_update_at is None
         retry_counts = []
         for payload in pending.values():
             try:
@@ -7352,12 +7581,16 @@ class RunStore:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             events = self._read_journal_events(directory)
+            private_authorities = self._read_private_session_authorities(run_id=run_id)
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
         public_events = []
         for event in selected:
-            event = _redact_private_session_authority(event)
+            event = _redact_private_session_authority(
+                event,
+                private_authorities=private_authorities,
+            )
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(_sanitize(event))
@@ -7413,6 +7646,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             all_events = self._read_journal_events(directory)
             selected = all_events[-limit:]
+            private_authorities = self._read_private_session_authorities(run_id=run_id)
         truncated = (
             len(all_events) > limit
             or projection_was_truncated(selected)
@@ -7420,7 +7654,10 @@ class RunStore:
         )
         public_events = []
         for event in selected:
-            event = dict(event)
+            event = _redact_private_session_authority(
+                event,
+                private_authorities=private_authorities,
+            )
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(sanitize_projection(event))
@@ -8330,7 +8567,10 @@ class RunStore:
             if _metadata_only
             else self.load_run(run_id, operator_scope=operator_scope)
         )
-        run = _redact_private_session_authority(run)
+        run = _redact_private_session_authority(
+            run,
+            private_authorities=self._read_private_session_authorities(run_id=run_id),
+        )
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
@@ -9078,7 +9318,10 @@ class RunStore:
                     raise StorageQuotaError(
                         "persistent session recovery evidence is full"
                     )
-                selection_authority = _session_recovery_selection_authority(selection)
+                selection_authority = _session_recovery_selection_authority(
+                    selection,
+                    activation_event_sequence=int(projection["event_sequence"]) + 1,
+                )
                 with (
                     nullcontext(fence_connection)
                     if fence_connection is not None
@@ -9491,6 +9734,11 @@ class RunStore:
                 claim.execution_fence, now
             ) as fence_connection:
                 projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
                 if active.get("attempt_id") != claim.attempt_id:
@@ -9509,7 +9757,7 @@ class RunStore:
                 if isinstance(existing, Mapping):
                     return (
                         existing.get("executor_nonce") == nonce
-                        and existing.get("state") == "authorized"
+                        and existing.get("state") in {"authorized", "delivered"}
                     )
                 spawn = attempt.get("spawn")
                 if (
@@ -9530,6 +9778,74 @@ class RunStore:
                     directory,
                     projection,
                     "provider_dispatch_authorized",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_provider_start_delivered(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Record the child's provider-start receipt before execution release."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                dispatch = attempt.get("provider_dispatch")
+                if not isinstance(dispatch, Mapping) or dispatch.get(
+                    "executor_nonce"
+                ) != nonce:
+                    return False
+                if dispatch.get("state") == "delivered":
+                    return True
+                if dispatch.get("state") != "authorized":
+                    return False
+                delivered = {
+                    "state": "delivered",
+                    "executor_nonce": nonce,
+                    "authorized_at": dispatch.get("recorded_at"),
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = delivered
+                active["provider_dispatch"] = dict(delivered)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_start_delivered",
                     {"executor_nonce": nonce},
                     node_id=claim.node_id,
                     attempt_id=claim.attempt_id,
@@ -12514,7 +12830,7 @@ class RunStore:
             provider_work_possible = bool(
                 provider_worker_started
                 and isinstance(provider_dispatch, Mapping)
-                and provider_dispatch.get("state") == "authorized"
+                and provider_dispatch.get("state") == "delivered"
             )
             if (
                 not provider_work_possible

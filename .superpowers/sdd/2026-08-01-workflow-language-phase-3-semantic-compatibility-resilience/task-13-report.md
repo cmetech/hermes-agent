@@ -515,6 +515,210 @@ reported no whitespace errors.
   its separate established contract.
 - No blocking concerns remain.
 
+## Fix Round 3 — Post-resolution authority, event privacy, delivery, and cancellation
+
+Fix Round 3 was applied from authenticated base
+`81bc8c316af7d6c283dcbf9427795955001c0fdf`. It addresses every Critical and
+Important item in the fresh specification and quality rereviews without
+entering Task 14.
+
+### Corrections
+
+- Private recovery authority is now validated independently of whether a
+  registry obligation remains pending. Selection anchors use schema v2 with
+  an activation event sequence, so historical pre-selection frames remain
+  reconstructible while every active selected, fresh-failed, still-running,
+  and terminal recovery-bearing projection must match its insert-only private
+  anchor. Successful winner anchors must retain the exact marker, attempt/node
+  session and fingerprint, typed-artifact session, recovery digests, and
+  canonical CAS candidate.
+- Public protection is derived from the private winner anchor as well as the
+  mutable journal marker. Marker removal therefore cannot expose a recovered
+  typed-artifact session through status, tail events, latest event pages,
+  evidence, or the real `workflow events --json` CLI path. Ordinary
+  legacy/v1/v2 projections remain unchanged.
+- Provider authorization and provider-start receipt are now separate durable
+  states. The child acknowledges the exact nonce-bound start frame, the parent
+  durably records `provider_start_delivered`, and only then sends the exact
+  nonce-bound execute release. Recovery treats authorization without delivery
+  as known zero-effect and treats only delivered provider work as potentially
+  effectful. Pre-provider validation failures may still return before the
+  handshake without being misclassified.
+- Provider-ready handling rechecks cancellation immediately before
+  authorization and again before delivery. Both store transitions also
+  atomically require a running projection with no desired terminal state while
+  holding the run lock, so cancellation wins both possible orderings.
+- The real coordinator-death matrix now contains nine cuts, including the
+  exact durable-authorization/before-delivery interval. The cancellation proof
+  uses a real managed worker and pauses only the real termination call after
+  `desired_status=cancelled` is durable, then exercises both transition races
+  under the actual run lock.
+
+No model tool, system prompt, prior message, toolset, workflow language
+surface, user configuration, or unrelated product area changed.
+
+### Exact Fix Round 3 RED/GREEN evidence
+
+Every Python test command below used the repository harness with retries
+disabled. No direct pytest invocation, fallback, test weakening, skipped test,
+or retry was used.
+
+#### Post-resolution and pre-obligation private anchors
+
+Exact RED and GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'resolved_terminal_recovery or resolved_running_recovery or selected_preobligation_recovery or fresh_failed_recovery_requires'
+```
+
+RED: **0 passed / 8 failed**; all eight damaged recomputed heads were accepted.
+GREEN: **8 passed / 0 failed**. The still-running cases enter the actual
+scheduler and also prove zero downstream shared-context provider requests.
+The complete recovery file passed **67/67** at this checkpoint.
+
+#### Latest event page and real CLI event privacy
+
+Exact RED and GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'recovered_typed_output_session_is_private or postresolution_event_privacy'
+```
+
+RED: **0 passed / 2 failed** because the recovered session remained visible in
+`latest_event_page()` and the CLI path. GREEN after private-anchor-aware event
+redaction: **2 passed / 0 failed**, including a markerless recomputed terminal
+event with a typed publication.
+
+#### Durable provider-start delivery
+
+Exact child-ack RED command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py -k 'records_delivery_only_after_child_acknowledges_start'
+```
+
+RED: **0 passed / 1 failed** because no durable delivery callback/protocol
+state existed.
+
+Exact authorization-to-delivery crash RED command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'killed_coordinator_restart'
+```
+
+RED: **8 passed / 1 failed**; the new real kill cut recovered as paused and
+uncertain instead of interrupted with known-zero effect.
+
+Exact combined GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py -k 'records_delivery_only_after_child_acknowledges_start or authorizes_provider_after_child_is_ready or killed_coordinator_restart'
+```
+
+GREEN: **11 passed / 0 failed** across two real worker handshakes and all nine
+real coordinator-death cuts.
+
+#### Cancellation ordering at provider readiness
+
+Exact parent readiness RED/GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py -k 'rechecks_cancellation_at_provider_ready'
+```
+
+RED: **0 passed / 1 failed** because dispatch occurred after cancellation was
+observable. GREEN: **1 passed / 0 failed** with no dispatch callback.
+
+Exact durable store race RED/GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'provider_dispatch_cannot_cross_durable_cancellation'
+```
+
+RED: **0 passed / 2 failed**; both cancel-before-authorization and
+cancel-after-authorization/before-delivery crossed the durable cancellation
+state. GREEN: **2 passed / 0 failed**.
+
+#### Full-file regression discovered during validation
+
+The first complete modified-files run reported **193 passed / 4 failed**:
+two legitimate pre-provider validation results were rejected before readiness,
+and two established-effect recovery tests still modeled authorization alone as
+provider launch. The parent now accepts only the safe no-authorization early
+result, continues to reject authorization-without-delivery protocol results,
+and the two established-effect fixtures explicitly cross delivery.
+
+Exact focused GREEN commands:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py -k 'real_worker_classifies_session_deleted_after_parent_preflight_without_side_effects or real_workers_are_process_isolated_and_unknown_tools_fail_before_billing'
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'crash_after_provider_worker_spawn_is_never_replayed_as_prelaunch or crash_after_reaped_provider_worker_still_requires_reconciliation'
+```
+
+Result: **4 passed / 0 failed**. The complete modified-files rerun passed
+**197/197**: `test_plugin_agent.py` **126/126** and persistent recovery
+**71/71**.
+
+### Final Fix Round 3 verification
+
+The exact required ten-file command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Final result: **10 files, 293 passed / 0 failed**, 14 workers, 16.6 seconds.
+
+The exact expanded changed-seam/scheduler/Desktop command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Final result: **9 files, 537 passed / 0 failed**, 14 workers, 66.8 seconds.
+The authenticated Desktop API file passed **157/157**.
+
+Exact static lint command:
+
+```bash
+../../.venv/bin/ruff check agent/plugin_agent.py agent/plugin_agent_worker.py plugins/workflow/executors/ai.py plugins/workflow/executors/base.py plugins/workflow/scheduler.py plugins/workflow/store.py tests/agent/test_plugin_agent.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persistent_session_recovery.py
+```
+
+Result: `All checks passed!`. `git diff --check` is clean.
+
+### Fix Round 3 changed files
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `agent/plugin_agent.py`
+- `agent/plugin_agent_worker.py`
+- `plugins/workflow/executors/ai.py`
+- `plugins/workflow/executors/base.py`
+- `plugins/workflow/scheduler.py`
+- `plugins/workflow/store.py`
+- `tests/agent/test_plugin_agent.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+### Fix Round 3 self-review
+
+- Historical journal frames remain valid because v2 selection anchors activate
+  at the exact event sequence that first publishes recovery evidence; v1
+  private anchors retain conservative compatibility behavior.
+- Winner anchors activate only when the bound attempt is succeeded. From that
+  point forward, journal marker removal and exact session/fingerprint/recovery
+  substitution fail closed even after the pending obligation is cleared.
+- Public redaction consults the independent winner anchor, while private
+  scheduler/CAS paths retain exact continuation authority.
+- The provider protocol preserves nonce binding and no replay. Authorization
+  without child receipt is known zero; delivery is recorded before the child
+  receives its execute release; only delivered attempts become uncertain after
+  coordinator loss.
+- Cancellation rejection is enforced both before callbacks in the parent and
+  under the same run lock that orders `desired_status`, including idempotent
+  transition calls.
+- No push, publication, merge, branch deletion, worktree deletion,
+  literal-`main` mutation, or shared `base` checkout mutation was performed.
+- No blocking concerns remain.
+
 ## Fix Round 2
 
 ### Authenticated review base and disposition
@@ -767,3 +971,13 @@ format rewrite was made. `git diff --check` is clean.
 - No push, publication, merge, branch deletion, worktree deletion,
   literal-`main` mutation, or shared `base` checkout mutation was performed.
 - No blocking concerns remain.
+
+## Current disposition after Fix Round 3
+
+The complete Fix Round 3 correction, RED/GREEN history, exact no-retry
+commands, 293-test required gate, 537-test expanded gate, changed-file list,
+and self-review are recorded in the dedicated Fix Round 3 section above. This
+closing disposition supersedes the preserved Fix Round 2 implementation
+record: all findings in `task-13-spec-rereview-2.md` and
+`task-13-quality-rereview-2.md` are addressed, static checks are clean, and
+Task 14 was not entered.

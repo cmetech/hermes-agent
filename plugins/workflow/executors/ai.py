@@ -1096,6 +1096,7 @@ class AgentNodeExecutor:
                     "spawn_failed": context.spawn_failed,
                     "process_started": context.process_started,
                     "provider_dispatch": context.provider_dispatch,
+                    "provider_start_delivered": context.provider_start_delivered,
                     "process_stopped": context.process_stopped,
                 }
                 if getattr(agent_runner, "starts_request_mcp", False):

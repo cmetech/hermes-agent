@@ -1932,6 +1932,18 @@ def main() -> int:
                 "executor_nonce": executor_nonce,
             }:
                 raise ValueError("provider start authorization is malformed")
+            _emit("provider_start_received", executor_nonce=executor_nonce)
+            execute_raw = sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1)
+            if not execute_raw or len(execute_raw) > _MAX_REQUEST_BYTES:
+                _cancel_event.set()
+                raise InterruptedError("provider execute coordinator disappeared")
+            execute = json.loads(execute_raw)
+            if execute != {
+                "protocol_version": _PROTOCOL_VERSION,
+                "type": "provider_execute",
+                "executor_nonce": executor_nonce,
+            }:
+                raise ValueError("provider execute authorization is malformed")
             start_lifeline()
 
         if not handshake_required:
