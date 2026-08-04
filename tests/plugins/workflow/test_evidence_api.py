@@ -852,3 +852,99 @@ def test_regular_log_evidence_is_sanitized_and_aggregate_bounded(
     assert item["bytes_returned"] == 256 * 1024
     assert item["truncated"] is True
     assert "warnings" not in page
+
+
+class _Phase3ProjectionStore:
+    def __init__(self, run: dict[str, object]) -> None:
+        self.run = run
+
+    def get_run_status(self, _run_id: str, *, operator_scope=None):
+        return self.run
+
+
+def test_phase3_attempt_evidence_names_requested_effective_retry_and_error_fields() -> None:
+    store = _Phase3ProjectionStore({
+        "nodes": {
+            "agent": {
+                "attempts": [
+                    {
+                        "attempt_id": "attempt-1",
+                        "state": "failed",
+                        "error_code": "provider_timeout",
+                        "error_message": "bounded failure",
+                        "metadata": {
+                            "requested_retries": 5,
+                            "requested_total_attempts": 6,
+                            "effective_total_attempts": 5,
+                            "retry_consumed": 2,
+                            "remaining_attempts": 3,
+                            "capped": True,
+                            "provider_response": "not projected",
+                        },
+                    }
+                ]
+            }
+        }
+    })
+
+    page = EvidenceReader(store).query("run-1", kind="attempts")
+
+    assert page["items"] == [
+        {
+            "node_id": "agent",
+            "attempt_id": "attempt-1",
+            "state": "failed",
+            "retry": {
+                "requested_retries": 5,
+                "requested_total_attempts": 6,
+                "effective_total_attempts": 5,
+                "retry_consumed": 2,
+                "remaining_attempts": 3,
+                "capped": True,
+            },
+            "error": {"code": "provider_timeout", "message": "bounded failure"},
+        }
+    ]
+
+
+def test_persistent_session_recovery_evidence_is_a_closed_bounded_projection() -> None:
+    store = _Phase3ProjectionStore({
+        "nodes": {
+            "agent": {
+                "session_recoveries": [
+                    {
+                        "attempt_id": "attempt-1",
+                        "registry_generation": 7,
+                        "source": "cross_run_registry",
+                        "provider": "test-provider",
+                        "runtime_profile": "default",
+                        "provider_attempts_before_recovery": 0,
+                        "outcome": "stale_entry_replaced",
+                        "missing_session_sha256": "a" * 64,
+                        "cache_fingerprint_sha256": "b" * 64,
+                        "pending_session_registry_update": {"key": "not projected"},
+                        "provider_history": ["not projected"],
+                    }
+                ]
+            }
+        }
+    })
+
+    page = EvidenceReader(store).query("run-1", kind="recovery")
+
+    assert page["items"] == [
+        {
+            "node_id": "agent",
+            "attempt_id": "attempt-1",
+            "recovery_kind": "persistent_session",
+            "registry_generation": 7,
+            "missing_session_sha256": "a" * 64,
+            "cache_fingerprint_sha256": "b" * 64,
+            "source": "cross_run_registry",
+            "provider": "test-provider",
+            "runtime_profile": "default",
+            "provider_attempts_before_recovery": 0,
+            "outcome": "stale_entry_replaced",
+        }
+    ]
+    assert len(page["items"]) <= 200

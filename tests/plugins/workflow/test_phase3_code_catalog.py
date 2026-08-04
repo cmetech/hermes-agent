@@ -54,6 +54,16 @@ def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
     )
 
 
+def test_api_finding_migrations_use_the_versioned_editor_code_authority() -> None:
+    from plugins.workflow.dashboard.plugin_api import _finding_migration
+
+    catalog = compatibility_code_catalog(WorkflowLanguageProfile.HERMES_LEGACY)
+
+    assert _finding_migration(
+        "legacy_language_profile", WorkflowLanguageProfile.HERMES_LEGACY.value
+    ) == catalog["legacy_language_profile"]["migration"]
+
+
 def test_runtime_only_codes_omit_editor_only_compatibility_projection_fields() -> None:
     """Catch bounded runtime metadata acquiring irrelevant migration/editor prose."""
     catalog = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)

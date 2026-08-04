@@ -42,6 +42,15 @@ function asDisplay(value: unknown, fallback: string): string {
   return Array.isArray(value) ? value.join(', ') || fallback : String(value)
 }
 
+function formatEvidenceItem(item: Record<string, unknown>): string {
+  return Object.entries(item)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(
+      ([key, value]) => `${key}=${typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)}`
+    )
+    .join('\n')
+}
+
 function EvidenceItems({
   emptyLabel,
   items,
@@ -58,7 +67,7 @@ function EvidenceItems({
   return (
     <div className="space-y-2" role="list">
       {items.map((item, index) => {
-        const content = logs && typeof item.text === 'string' ? item.text : JSON.stringify(item, null, 2)
+        const content = logs && typeof item.text === 'string' ? item.text : formatEvidenceItem(item)
 
         return (
           <LogView className="max-h-72" key={`${String(item.sequence ?? item.attempt_id ?? index)}`} role="listitem">

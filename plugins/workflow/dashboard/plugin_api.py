@@ -418,6 +418,25 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         return self
 
 
+class WorkflowDetailCompatibilityFinding(WorkflowCompatibilityFinding):
+    model_config = ConfigDict(extra="forbid")
+
+    migration: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_WORKFLOW_RESPONSE_TEXT_MAX,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class WorkflowDetailCompatibilityFull(WorkflowCompatibilityFull):
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[WorkflowDetailCompatibilityFinding] = Field(
+        ..., max_length=WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
+
+
 def _sanitize_compatibility_finding_projection(
     finding: Mapping[str, object],
 ) -> dict[str, object]:
@@ -443,8 +462,29 @@ def _sanitize_compatibility_finding_projection(
     return projected
 
 
+def _finding_migration(code: object, effective_profile: object) -> str | None:
+    """Resolve bounded guidance from the shared versioned code authority."""
+    if not isinstance(code, str) or not isinstance(effective_profile, str):
+        return None
+    from plugins.workflow.language_schema import compatibility_code_catalog
+    from plugins.workflow.models import WorkflowLanguageProfile as LanguageProfile
+
+    try:
+        profile = LanguageProfile(effective_profile)
+    except ValueError:
+        return None
+    metadata = compatibility_code_catalog(profile).get(code)
+    migration = metadata.get("migration") if isinstance(metadata, Mapping) else None
+    if not isinstance(migration, str) or not migration:
+        return None
+    projected = sanitize_projection(migration, key="migration")
+    return projected if isinstance(projected, str) and projected else None
+
+
 def _sanitize_full_compatibility_projection(
     compatibility: Mapping[str, object],
+    *,
+    effective_profile: object = None,
 ) -> dict[str, object]:
     """Preserve one complete producer-bounded report across generic clipping."""
     findings = compatibility.get("findings")
@@ -454,7 +494,11 @@ def _sanitize_full_compatibility_projection(
     for finding in findings:
         if not isinstance(finding, Mapping):
             raise TypeError("full compatibility findings must contain mappings")
-        projected_findings.append(_sanitize_compatibility_finding_projection(finding))
+        projected = _sanitize_compatibility_finding_projection(finding)
+        migration = _finding_migration(finding.get("code"), effective_profile)
+        if migration is not None:
+            projected["migration"] = migration
+        projected_findings.append(projected)
     return {
         "level": compatibility["level"],
         "runnable": compatibility["runnable"],
@@ -558,7 +602,7 @@ class WorkflowDetailResponse(BaseModel):
     run_support: WorkflowCatalogRunSupport
     language: WorkflowDetailLanguageStatus
     risk_summary: dict[str, object]
-    compatibility: WorkflowCompatibilityFull
+    compatibility: WorkflowDetailCompatibilityFull
     coordinator: WorkflowCoordinatorResponse
     topology: WorkflowTopologyResponse
     definition: dict[str, object]
@@ -607,7 +651,10 @@ def list_workflows(
     }
 
 
-@router.get("/workflows/{name}", response_model=WorkflowDetailResponse)
+@router.get(
+    "/workflows/{name}",
+    response_model=WorkflowDetailResponse,
+)
 def workflow_detail(
     name: str,
     request: Request,
@@ -670,7 +717,14 @@ def workflow_detail(
         ) from exc
     compatibility = detail["compatibility"]
     assert isinstance(compatibility, Mapping)
-    full_compatibility = _sanitize_full_compatibility_projection(compatibility)
+    language = detail.get("language")
+    effective_profile = (
+        language.get("effective_profile") if isinstance(language, Mapping) else None
+    )
+    full_compatibility = _sanitize_full_compatibility_projection(
+        compatibility,
+        effective_profile=effective_profile,
+    )
     sanitized = sanitize_projection(detail)
     assert isinstance(sanitized, dict)
     # build_workflow_detail already supplies the shared semantically redacted,

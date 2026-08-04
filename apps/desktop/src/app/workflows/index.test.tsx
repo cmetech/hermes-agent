@@ -1001,6 +1001,34 @@ describe('WorkflowsView', () => {
     )
   })
 
+  it('requests and renders generic persistent-session recovery evidence', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowEvidence.mockResolvedValue({
+      items: [
+        {
+          attempt_id: 'attempt-1',
+          outcome: 'stale_entry_replaced',
+          recovery_kind: 'persistent_session'
+        }
+      ],
+      kind: 'recovery',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector run={run()} />
+      </QueryClientProvider>
+    )
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Recovery' }), { button: 0, ctrlKey: false })
+
+    await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'recovery'))
+    expect(await screen.findByText(/recovery_kind=persistent_session/)).toBeTruthy()
+    expect(screen.getByText(/outcome=stale_entry_replaced/)).toBeTruthy()
+  })
+
   it('uses typed artifacts only for backend-confirmed publication identities and preserves legacy evidence fallback', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     getWorkflowEvidence.mockResolvedValueOnce({

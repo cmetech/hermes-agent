@@ -30,6 +30,25 @@ EVIDENCE_KINDS = frozenset({
 
 _LOG_READ_LIMIT = 256 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_PHASE3_RETRY_FIELDS = (
+    "requested_retries",
+    "requested_total_attempts",
+    "effective_total_attempts",
+    "retry_consumed",
+    "remaining_attempts",
+    "capped",
+)
+_PERSISTENT_SESSION_RECOVERY_FIELDS = (
+    "attempt_id",
+    "registry_generation",
+    "missing_session_sha256",
+    "cache_fingerprint_sha256",
+    "source",
+    "provider",
+    "runtime_profile",
+    "provider_attempts_before_recovery",
+    "outcome",
+)
 
 
 class _UnsafeEvidencePath(Exception):
@@ -309,7 +328,7 @@ class EvidenceReader:
             return [*historical, *pending_items]
         if kind == "attempts":
             return [
-                {"node_id": node_id, **attempt}
+                self._attempt_evidence_item(node_id, attempt)
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 for attempt in node.get("attempts", [])
@@ -335,11 +354,7 @@ class EvidenceReader:
                 and isinstance(node.get("recovery"), Mapping)
             ]
             persistent_session_recovery = [
-                {
-                    "node_id": node_id,
-                    "recovery_kind": "persistent_session",
-                    **recovery,
-                }
+                self._persistent_session_recovery_item(node_id, recovery)
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 for recovery in node.get("session_recoveries", ())
@@ -365,6 +380,44 @@ class EvidenceReader:
 
             return list(NotificationOutbox(self.store).history(run_id=run_id))
         return []
+
+    @staticmethod
+    def _attempt_evidence_item(
+        node_id: object,
+        attempt: Mapping[str, object],
+    ) -> dict[str, object]:
+        metadata = attempt.get("metadata")
+        if not isinstance(metadata, Mapping) or not all(
+            field in metadata for field in _PHASE3_RETRY_FIELDS
+        ):
+            return {"node_id": node_id, **attempt}
+        projected: dict[str, object] = {
+            "node_id": node_id,
+            "attempt_id": attempt.get("attempt_id"),
+            "state": attempt.get("state"),
+            "retry": {field: metadata[field] for field in _PHASE3_RETRY_FIELDS},
+        }
+        if attempt.get("error_code") is not None:
+            projected["error"] = {
+                "code": attempt.get("error_code"),
+                "message": attempt.get("error_message"),
+            }
+        return projected
+
+    @staticmethod
+    def _persistent_session_recovery_item(
+        node_id: object,
+        recovery: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {
+            "node_id": node_id,
+            "recovery_kind": "persistent_session",
+            **{
+                field: recovery[field]
+                for field in _PERSISTENT_SESSION_RECOVERY_FIELDS
+                if field in recovery
+            },
+        }
 
     @staticmethod
     def _artifact_evidence_item(

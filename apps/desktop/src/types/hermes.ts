@@ -182,6 +182,7 @@ export interface WorkflowCompatibilityFinding {
   code: string
   level: string
   message: string
+  migration?: string
   path: string
 }
 
@@ -330,12 +331,46 @@ export interface WorkflowArtifactPreview {
 }
 
 export interface WorkflowEvidencePage {
-  items: Array<Record<string, unknown>>
+  items: WorkflowEvidenceItem[]
   kind: WorkflowEvidenceKind
   next_cursor: number
   schema_version: number
   truncated: boolean
 }
+
+export interface WorkflowAttemptEvidence extends Record<string, unknown> {
+  attempt_id?: string
+  error?: { code: string; message?: null | string }
+  node_id: string
+  retry?: {
+    capped: boolean
+    effective_total_attempts: number
+    remaining_attempts: number
+    requested_retries: number
+    requested_total_attempts: number
+    retry_consumed: number
+  }
+  state?: string
+}
+
+export interface WorkflowPersistentSessionRecoveryEvidence extends Record<string, unknown> {
+  attempt_id: string
+  cache_fingerprint_sha256: string
+  missing_session_sha256: string
+  node_id: string
+  outcome: string
+  provider: string
+  provider_attempts_before_recovery: number
+  recovery_kind: 'persistent_session'
+  registry_generation: number
+  runtime_profile: string
+  source: string
+}
+
+export type WorkflowEvidenceItem =
+  | Record<string, unknown>
+  | WorkflowAttemptEvidence
+  | WorkflowPersistentSessionRecoveryEvidence
 
 export interface WorkflowRunPage {
   next_cursor: null | string
