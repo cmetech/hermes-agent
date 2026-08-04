@@ -7,7 +7,11 @@ import os
 
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
+from agent.plugin_agent import (
+    PluginAgentRunResult,
+    PluginAgentSessionMissingError,
+    PluginAgentSessionUnavailableError,
+)
 import plugins.workflow.bash_rendering as bash_rendering
 import plugins.workflow.language_schema as language_schema
 from plugins.workflow.admission import RunAdmissionRequest
@@ -261,7 +265,9 @@ def _emit_session_catalog_codes(tmp_path, workflow_writer) -> set[str]:
     )
     try:
         _run_catalog_session(store, package, scheduler, "seed")
-        runner.shared_failure = OSError("registry probe unavailable")
+        runner.shared_failure = PluginAgentSessionUnavailableError(
+            "registry probe unavailable"
+        )
         _unavailable_id, unavailable = _run_catalog_session(
             store, package, scheduler, "unavailable"
         )
