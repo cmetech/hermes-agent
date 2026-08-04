@@ -981,3 +981,158 @@ closing disposition supersedes the preserved Fix Round 2 implementation
 record: all findings in `task-13-spec-rereview-2.md` and
 `task-13-quality-rereview-2.md` are addressed, static checks are clean, and
 Task 14 was not entered.
+
+## Fix Round 4 — Immutable winner authority and true provider-release boundary
+
+Fix Round 4 was applied from authenticated base
+`c8ec1f8a8ad3dc325ae427e06fa69b77947872f0`, tree
+`0a7d6490cf3d9458c656fcb10126a20a759fc1ea`. It addresses the Critical and
+three Important findings in the independent Fix Round 3 specification and
+quality rereviews without entering Task 14.
+
+### Corrections
+
+- New private winner authorities use schema v2 with an immutable activation
+  event sequence and a nested exact candidate. Before activation, historical
+  journal frames remain valid. At and after activation, the exact succeeded
+  attempt, public marker/corroboration, session, cache fingerprint, typed
+  artifact, recovery digests, and selection authority remain mandatory even
+  if mutable attempt state or public marker data is damaged. Existing schema
+  v1 rows retain their prior compatibility behavior.
+- Public redaction protects every valid privately anchored winner independently
+  of mutable attempt state or marker presence. Attempt-state downgrade,
+  marker removal, and session substitution therefore cannot expose either the
+  original or substituted private continuation identity through event pages.
+- The provider protocol now has a separate nonce-bound execute receipt and
+  release. The child acknowledges the preparatory execute frame while it is
+  still blocked. The parent durably records that known-zero receipt, rechecks
+  cancellation, atomically records the execution-release decision, and only
+  then sends the final release frame. Recovery treats only the durable
+  `released` state as potentially effectful; `authorized`, `delivered`, and
+  `execute_received` remain known zero.
+- The durable execution-release transition uses the existing run lock and
+  execution fence and requires `status == running` with no desired terminal
+  state. Cancellation before release wins and no final permission is sent;
+  release committed before cancellation is the opposite valid ordering.
+- Private authority reads now fail closed on SQLite access errors, checksum
+  mismatch, malformed JSON, and noncanonical JSON. Normalizer-v3 projections
+  also enforce the reverse invariant: every public recovery selection must
+  have its exact readable private anchor. A journal-fsync/SQLite-rollback cut
+  consequently fails closed instead of accepting journal-only selection
+  authority.
+
+No system prompt, prior message, toolset, model-tool schema, workflow language
+surface, unversioned compatibility behavior, or unrelated product area
+changed.
+
+### Exact Fix Round 4 RED/GREEN evidence
+
+All Python tests used `scripts/run_tests.sh` with the requested interpreter and
+`HERMES_TEST_FILE_RETRIES=0`. No direct pytest invocation, retry, skipped test,
+or test weakening was used.
+
+The initial combined RED command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py -k 'durably_orders_execute_receipt or orders_cancellation_at_true_execute_boundary or immutable_winner_anchor or active_selection_fails_closed or journal_selection_without_committed or recovery_effect_boundary or real_coordinator_death_before_execute_receipt'
+```
+
+RED: **0 passed / 13 failed** before production edits. GREEN after the bounded
+implementation: **13 passed / 0 failed**.
+
+The complete modified behavioral files initially exposed three legitimate
+fixture/compatibility regressions: a schema-v2 winner was enforced against the
+historical frame immediately before its activation event, bounded synthetic
+recovery history omitted the newly required private selection anchors, and
+legacy schema-v1 winner fixtures needed their prior activation rule. The
+correction introduced the explicit event boundary, retained schema-v1
+compatibility, and made the synthetic history carry valid private anchors.
+
+The final complete modified-files command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py
+```
+
+Final result: **2 files, 213 passed / 0 failed** (`129 + 84`).
+
+The focused release/cancellation command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py -k 'orders_cancellation_at_true_execute_boundary or provider_dispatch_cannot_cross_durable_cancellation'
+```
+
+Result: **5 passed / 0 failed**, including cancellation before durable release,
+cancellation after release linearization, and the store-side desired-status
+race after execute receipt.
+
+The focused real coordinator-death/restart matrix was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'killed_coordinator_restart or real_coordinator_death_before_execute_receipt'
+```
+
+Result: **10 passed / 0 failed**, including the real parent/child cut after
+durable start receipt while the child remained blocked before execute receipt.
+
+### Final Fix Round 4 verification
+
+The exact required ten-file command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Final result: **10 files, 306 passed / 0 failed**, 14 workers, 18.3 seconds.
+
+The exact expanded changed-seam/scheduler/Desktop command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Final result: **9 files, 553 passed / 0 failed**, 14 workers, 67.0 seconds.
+The authenticated Desktop API file passed **157/157**.
+
+Exact static command:
+
+```bash
+../../.venv/bin/ruff check agent/plugin_agent.py agent/plugin_agent_worker.py plugins/workflow/executors/ai.py plugins/workflow/executors/base.py plugins/workflow/scheduler.py plugins/workflow/store.py tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py
+```
+
+Result: `All checks passed!`. `git diff --check` is clean.
+
+### Fix Round 4 changed files
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `agent/plugin_agent.py`
+- `agent/plugin_agent_worker.py`
+- `plugins/workflow/executors/ai.py`
+- `plugins/workflow/executors/base.py`
+- `plugins/workflow/scheduler.py`
+- `plugins/workflow/store.py`
+- `tests/agent/test_plugin_agent.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+### Fix Round 4 self-review
+
+- The execute protocol remains nonce-bound, process-isolated, bounded by the
+  existing time/resource limits, and cleanup-safe. The final release is never
+  sent unless its durable transition succeeded.
+- A coordinator loss before the durable release is known zero; after the
+  release decision it is conservatively uncertain and never replayed. This
+  closes the reviewed start-delivery-to-execute-receipt cut without creating a
+  replay window.
+- The release transition is the cancellation linearization point. The store
+  rejects a release after desired cancellation is durable; cancellation after
+  a committed release does not retroactively convert the authorized effect
+  into a replay-safe attempt.
+- Private winner and selection rows remain insert-only, canonical, bounded by
+  admitted attempts, and deleted by the existing run foreign-key cascade.
+  Journal-only selection after a cross-store crash is intentionally rejected
+  rather than silently trusted.
+- Existing unversioned, Hermes legacy, normalizer-v1/v2, and schema-v1 private
+  authority behavior passed the complete focused and expanded gates.
+- No push, publication, merge, branch deletion, worktree deletion,
+  literal-`main` mutation, or shared `base` checkout mutation was performed.
+- No blocking concerns remain. Task 14 was not entered.

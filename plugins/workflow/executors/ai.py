@@ -1097,6 +1097,8 @@ class AgentNodeExecutor:
                     "process_started": context.process_started,
                     "provider_dispatch": context.provider_dispatch,
                     "provider_start_delivered": context.provider_start_delivered,
+                    "provider_execute_received": context.provider_execute_received,
+                    "provider_execute_release": context.provider_execute_release,
                     "process_stopped": context.process_stopped,
                 }
                 if getattr(agent_runner, "starts_request_mcp", False):

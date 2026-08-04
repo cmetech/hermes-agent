@@ -2766,6 +2766,16 @@ assert execute == {
     "type": "provider_execute",
     "executor_nonce": nonce,
 }
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_execute_received",
+    "executor_nonce": nonce,
+}), flush=True)
+assert json.loads(sys.stdin.readline()) == {
+    "protocol_version": 1,
+    "type": "provider_execute_release",
+    "executor_nonce": nonce,
+}
 print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
       flush=True)
 """
@@ -2831,6 +2841,16 @@ assert execute == {
     "type": "provider_execute",
     "executor_nonce": nonce,
 }
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_execute_received",
+    "executor_nonce": nonce,
+}), flush=True)
+assert json.loads(sys.stdin.readline()) == {
+    "protocol_version": 1,
+    "type": "provider_execute_release",
+    "executor_nonce": nonce,
+}
 print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
       flush=True)
 """
@@ -2868,6 +2888,151 @@ print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
         "stopped",
     ]
     assert lifecycle[0][1] == lifecycle[2][1] == lifecycle[3][1]
+
+
+@pytest.mark.live_system_guard_bypass
+def test_worker_exchange_durably_orders_execute_receipt_before_release() -> None:
+    """Removing the receipt/release split must let a crash replay provider work."""
+    lifecycle = []
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+nonce = request["provider_start_handshake"]["executor_nonce"]
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_ready",
+    "executor_nonce": nonce,
+}), flush=True)
+assert json.loads(sys.stdin.readline())["type"] == "provider_start"
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_start_received",
+    "executor_nonce": nonce,
+}), flush=True)
+assert json.loads(sys.stdin.readline())["type"] == "provider_execute"
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_execute_received",
+    "executor_nonce": nonce,
+}), flush=True)
+release = json.loads(sys.stdin.readline())
+assert release == {
+    "protocol_version": 1,
+    "type": "provider_execute_release",
+    "executor_nonce": nonce,
+}
+print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
+      flush=True)
+"""
+
+    frame = _exchange_worker(
+        {
+            "protocol_version": 1,
+            "type": "run",
+            "provider_start_handshake": {"required": True},
+        },
+        workdir=None,
+        idle_timeout_seconds=5,
+        wall_timeout_seconds=10,
+        worker_argv=[sys.executable, "-c", code],
+        provider_dispatch=lambda nonce: lifecycle.append(("authorize", nonce))
+        or True,
+        provider_start_delivered=lambda nonce: lifecycle.append(
+            ("start-received", nonce)
+        )
+        or True,
+        provider_execute_received=lambda nonce: lifecycle.append(
+            ("execute-received", nonce)
+        )
+        or True,
+        provider_execute_release=lambda nonce: lifecycle.append(
+            ("execute-release", nonce)
+        )
+        or True,
+    )
+
+    assert frame["type"] == "result"
+    assert [item[0] for item in lifecycle] == [
+        "authorize",
+        "start-received",
+        "execute-received",
+        "execute-release",
+    ]
+    assert len({item[1] for item in lifecycle}) == 1
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    ("cancel_at", "release_expected"),
+    (("execute-received", False), ("after-release-linearization", True)),
+)
+def test_worker_exchange_orders_cancellation_at_true_execute_boundary(
+    cancel_at, release_expected
+) -> None:
+    """Moving the cancellation check away from release must cross one ordering."""
+    cancelled = threading.Event()
+    release_seen = []
+    child_release = []
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+nonce = request["provider_start_handshake"]["executor_nonce"]
+print(json.dumps({"protocol_version":1,"type":"provider_ready",
+                  "executor_nonce":nonce}), flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"protocol_version":1,"type":"provider_start_received",
+                  "executor_nonce":nonce}), flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"protocol_version":1,"type":"provider_execute_received",
+                  "executor_nonce":nonce}), flush=True)
+release_raw = sys.stdin.readline()
+if release_raw:
+    release = json.loads(release_raw)
+    if release.get("type") == "provider_execute_release":
+        print(json.dumps({"protocol_version":1,"type":"progress",
+                          "message":"release-observed"}), flush=True)
+        print(json.dumps({"protocol_version":1,"type":"result","result":{}}),
+              flush=True)
+"""
+
+    def execute_received(nonce: str) -> bool:
+        if cancel_at == "execute-received":
+            cancelled.set()
+        return True
+
+    def execute_release(nonce: str) -> bool:
+        release_seen.append(nonce)
+        if cancel_at == "after-release-linearization":
+            threading.Timer(0.05, cancelled.set).start()
+        return True
+
+    try:
+        frame = _exchange_worker(
+            {
+                "protocol_version": 1,
+                "type": "run",
+                "provider_start_handshake": {"required": True},
+            },
+            workdir=None,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            worker_argv=[sys.executable, "-c", code],
+            is_cancelled=cancelled.is_set,
+            provider_dispatch=lambda _nonce: True,
+            provider_start_delivered=lambda _nonce: True,
+            provider_execute_received=execute_received,
+            provider_execute_release=execute_release,
+        )
+        child_release.append(frame["type"] == "result")
+    except _PluginAgentCancelled:
+        child_release.append(False)
+
+    assert bool(release_seen) is release_expected
+    assert child_release == [release_expected]
 
 
 @pytest.mark.live_system_guard_bypass
