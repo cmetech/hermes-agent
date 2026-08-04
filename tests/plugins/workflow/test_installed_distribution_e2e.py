@@ -141,6 +141,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
     assert bash_schema["x-hermes-semantics"] == {
         "inline_utf8_bytes": 32_768,
+        "rendered_command_utf8_bytes": 98_304,
         "spill_value_utf8_bytes": 500_000,
         "spill_files": 64,
         "spill_total_utf8_bytes": 2_000_000,
