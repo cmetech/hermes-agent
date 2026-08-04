@@ -3473,3 +3473,397 @@ def test_selected_recovery_event_privacy_does_not_trust_mutable_completion_field
         substituted_fingerprint,
     ):
         assert private_value not in cli_output
+
+
+def _assert_private_values_absent(
+    read_public: Callable[[], object],
+    private_values: tuple[str, ...],
+) -> None:
+    try:
+        public = read_public()
+    except JournalRecoveryError as exc:
+        encoded = str(exc)
+    else:
+        encoded = json.dumps(public, sort_keys=True)
+    for private_value in private_values:
+        assert private_value not in encoded
+
+
+def _rewrite_recovery_completion_chain(
+    store: RunStore,
+    run_id: str,
+    mutate: Callable[[dict[str, object], str], None],
+) -> None:
+    directory = store.run_directory(run_id)
+    events = [
+        json.loads(line)
+        for line in (directory / "events.jsonl").read_text().splitlines()
+    ]
+    start = next(
+        index
+        for index, event in enumerate(events)
+        if event.get("event_type") == "node_succeeded"
+    )
+    for event in events[start:]:
+        projection = event["projection"]
+        mutate(projection, str(event.get("event_type")))
+        event["projection_sha256"] = hashlib.sha256(
+            json.dumps(
+                projection,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        material = dict(event)
+        material.pop("frame_sha256", None)
+        event["frame_sha256"] = hashlib.sha256(
+            json.dumps(
+                material,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    completion = events[start]
+    completion_payload = completion.setdefault("payload", {})
+    assert isinstance(completion_payload, dict)
+    completion_metadata = completion_payload.setdefault("metadata", {})
+    assert isinstance(completion_metadata, dict)
+    completion_metadata["session_id"] = "substituted-selection-session"
+    completion_metadata["cache_fingerprint"] = "f" * 64
+    completion["frame_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in completion.items() if key != "frame_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    (directory / "events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (directory / "run.json").write_text("{broken", encoding="utf-8")
+
+
+def _authenticated_workflow_api_client(home):
+    import importlib.util
+    from pathlib import Path
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    path = Path(__file__).parents[3] / "plugins/workflow/dashboard/plugin_api.py"
+    name = f"workflow_dashboard_api_privacy_{time.time_ns()}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def authenticated(request, call_next):
+        request.state.local_admin_authenticated = True
+        return await call_next(request)
+
+    app.include_router(module.router, prefix="/api/plugins/workflow")
+    return TestClient(app)
+
+
+def test_failed_fresh_recovery_selection_is_the_public_privacy_boundary(
+    tmp_path, workflow_writer, capsys, monkeypatch
+) -> None:
+    """A normal failed fresh request must not publish its exact fingerprint."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "fresh-failure-public-privacy",
+        name="fresh-failure-public-privacy",
+    )
+    home = tmp_path / "fresh-failure-public-privacy-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "fresh-failure-privacy-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "fresh-failure-privacy",
+    )
+    assert result["status"] == "failed"
+    internal = store.load_run(run_id)
+    fingerprint = internal["nodes"]["analyze"]["cache_fingerprint"]
+    assert len(fingerprint) == 64
+
+    for read_public in (
+        lambda: store.get_run_status(run_id),
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(read_public, (fingerprint,))
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    api = _authenticated_workflow_api_client(home)
+    api_responses = (
+        api.get(f"/api/plugins/workflow/runs/{run_id}"),
+        api.get(f"/api/plugins/workflow/runs/{run_id}/events"),
+        api.get(
+            f"/api/plugins/workflow/runs/{run_id}/evidence",
+            params={"kind": "timeline"},
+        ),
+    )
+    assert all(response.status_code == 200 for response in api_responses)
+    assert all(fingerprint not in response.text for response in api_responses)
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(home),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) == 0
+    assert fingerprint not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "projection_damage",
+    ("attempt-state", "node-state", "run-state", "all-states", "attempt-removed", "node-removed"),
+)
+@pytest.mark.parametrize("typed_output", (False, True), ids=("schemaless", "typed"))
+def test_selected_recovery_privacy_does_not_depend_on_mutable_projection_state(
+    tmp_path, workflow_writer, capsys, projection_damage, typed_output
+) -> None:
+    """A selected attempt stays private even when recomputed state removes success."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"selection-state-privacy-{projection_damage}-{typed_output}",
+        name=f"selection-state-privacy-{projection_damage}-{typed_output}",
+        nodes=[
+            {
+                "id": "analyze",
+                "prompt": "Analyze",
+                **({"output_type": "RecoveredReport"} if typed_output else {}),
+            }
+        ],
+    )
+    home = tmp_path / f"selection-state-privacy-{projection_damage}-{typed_output}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"{projection_damage}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"{projection_damage}-recovery",
+    )
+    internal = store.load_run(run_id)
+    node = internal["nodes"]["analyze"]
+    original_session = node["session_id"]
+    original_fingerprint = node["cache_fingerprint"]
+    attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+    substituted_session = "substituted-selection-session"
+    substituted_fingerprint = "f" * 64
+
+    def damage(projection, _event_type) -> None:
+        projected_nodes = projection["nodes"]
+        projected_node = projected_nodes.get("analyze")
+        if isinstance(projected_node, dict):
+            attempts = projected_node.get("attempts", [])
+            selected_attempt = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.get("attempt_id") == attempt_id
+                ),
+                None,
+            )
+            if isinstance(selected_attempt, dict):
+                selected_attempt.pop("session_registry_authority", None)
+                selected_attempt["metadata"]["session_id"] = substituted_session
+                selected_attempt["metadata"][
+                    "cache_fingerprint"
+                ] = substituted_fingerprint
+                if projection_damage in {"attempt-state", "all-states"}:
+                    selected_attempt["state"] = "failed"
+            projected_node["session_id"] = substituted_session
+            projected_node["cache_fingerprint"] = substituted_fingerprint
+            if projection_damage in {"node-state", "all-states"}:
+                projected_node["state"] = "failed"
+            if projection_damage == "attempt-removed":
+                projected_node["attempts"] = [
+                    attempt
+                    for attempt in attempts
+                    if attempt.get("attempt_id") != attempt_id
+                ]
+        if projection_damage == "node-removed":
+            projected_nodes.pop("analyze", None)
+        if projection_damage in {"run-state", "all-states"}:
+            projection["status"] = "failed"
+        for artifact in projection.get("artifacts", []):
+            if artifact.get("attempt_id") == attempt_id:
+                artifact["session_id"] = substituted_session
+
+    _rewrite_recovery_completion_chain(store, run_id, damage)
+    with sqlite3.connect(store.database) as connection:
+        connection.execute(
+            "DELETE FROM session_registry_winner_authority WHERE attempt_id=?",
+            (attempt_id,),
+        )
+        connection.commit()
+
+    private_values = (
+        original_session,
+        original_fingerprint,
+        substituted_session,
+        substituted_fingerprint,
+    )
+    for read_public in (
+        lambda: store.get_run_status(run_id),
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(read_public, private_values)
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(home),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) in {0, 70}
+    output = capsys.readouterr().out
+    for private_value in private_values:
+        assert private_value not in output
+
+
+def test_selection_precommit_identity_redacts_events_when_activation_is_rewritten(
+    tmp_path, workflow_writer
+) -> None:
+    """A damaged activation frame remains inert authority but cannot leak identity."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "selection-activation-privacy",
+        name="selection-activation-privacy",
+    )
+    home = tmp_path / "selection-activation-privacy-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, "activation-privacy-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    runner.fresh_failure = True
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "activation-privacy",
+    )
+    attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+    substituted_session = "rewritten-activation-session"
+    substituted_fingerprint = "f" * 64
+
+    def rewrite_activation(event) -> None:
+        event["event_type"] = "selection_activation_rewritten"
+        event["payload"]["session_id"] = substituted_session
+        event["payload"]["cache_fingerprint"] = substituted_fingerprint
+        projection = event["projection"]
+        node = projection["nodes"]["analyze"]
+        attempt = next(
+            item
+            for item in node["attempts"]
+            if item["attempt_id"] == attempt_id
+        )
+        metadata = attempt.setdefault("metadata", {})
+        metadata["session_id"] = substituted_session
+        metadata["cache_fingerprint"] = substituted_fingerprint
+        node["session_id"] = substituted_session
+        node["cache_fingerprint"] = substituted_fingerprint
+
+    _rewrite_journal_event(
+        store,
+        run_id,
+        "persistent_session_missing_fresh_start",
+        rewrite_activation,
+    )
+
+    for read_public in (store.tail_events, store.latest_event_page):
+        _assert_private_values_absent(
+            lambda read_public=read_public: read_public(run_id),
+            (substituted_session, substituted_fingerprint),
+        )
+
+
+@pytest.mark.parametrize("completion_status", ("cancelled", "interrupted"))
+def test_selected_nonwinning_completion_redacts_private_session_fields(
+    tmp_path, workflow_writer, completion_status
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"selection-{completion_status}-privacy",
+        name=f"selection-{completion_status}-privacy",
+    )
+    store = RunStore(tmp_path / f"selection-{completion_status}-privacy-home")
+    admitted = _admit(store, package, f"selection-{completion_status}-privacy")
+    claim = store.claim_node(admitted.run_id, "analyze", "selection-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    session_id = f"private-{completion_status}-session"
+    fingerprint = "a" * 64
+    assert store.record_persistent_session_recovery_selection(
+        claim,
+        PersistentSessionRecoverySelection(
+            key=NodeSessionKey(
+                package.definition.name,
+                "analyze",
+                "local",
+                "fake-provider",
+                "default",
+            ),
+            expected_generation=0,
+            missing_session_id="missing-session",
+            cache_fingerprint=fingerprint,
+            run_id=admitted.run_id,
+            attempt_id=claim.attempt_id,
+        ),
+    )
+    store.complete_node(
+        claim,
+        status=completion_status,
+        error_code=completion_status,
+        metadata={
+            "session_id": session_id,
+            "cache_fingerprint": fingerprint,
+        },
+    )
+
+    for read_public in (
+        lambda: store.get_run_status(admitted.run_id),
+        lambda: store.tail_events(admitted.run_id),
+        lambda: store.latest_event_page(admitted.run_id),
+        lambda: store.events_after(admitted.run_id),
+        lambda: EvidenceReader(store).query(admitted.run_id, kind="timeline"),
+    ):
+        _assert_private_values_absent(read_public, (session_id, fingerprint))

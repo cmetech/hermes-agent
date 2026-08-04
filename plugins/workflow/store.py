@@ -865,6 +865,18 @@ def _redact_private_session_authority(
     ] | None = None,
 ) -> dict[str, object]:
     """Copy a public run/event projection without exact session authority."""
+
+    def redact_session_fields(item: object) -> None:
+        pending = [item]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                current.pop("session_id", None)
+                current.pop("cache_fingerprint", None)
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+
     projected = copy.deepcopy(dict(value))
     authority_projection = (
         projected["projection"]
@@ -875,7 +887,22 @@ def _redact_private_session_authority(
     authority_projection.pop("pending_session_registry_updates", None)
     nodes = authority_projection.get("nodes")
     protected_attempts: set[tuple[str, str]] = set()
-    if isinstance(nodes, dict) and private_authorities is not None:
+    if private_authorities is not None:
+        for authority in private_authorities.get(
+            "session_recovery_selection_authority", {}
+        ).values():
+            try:
+                selection, _activation, _event_type = (
+                    _session_recovery_selection_from_authority(authority)
+                )
+            except JournalRecoveryError as exc:
+                raise JournalRecoveryError(
+                    "private session selection authority is malformed"
+                ) from exc
+            if selection.run_id == authority_projection.get("run_id"):
+                protected_attempts.add(
+                    (selection.key.node_id, selection.attempt_id)
+                )
         for authority in private_authorities.get(
             "session_registry_winner_authority", {}
         ).values():
@@ -940,22 +967,16 @@ def _redact_private_session_authority(
                 str(artifact.get("attempt_id")),
             ) in protected_attempts:
                 artifact.pop("session_id", None)
+                artifact.pop("cache_fingerprint", None)
     payload = projected.get("payload")
     if isinstance(payload, dict):
+        payload_attempt_id = payload.get("attempt_id")
         event_identity = (
-            str(projected.get("node_id")),
-            str(projected.get("attempt_id")),
+            str(projected.get("node_id") or payload.get("node_id")),
+            str(projected.get("attempt_id") or payload_attempt_id),
         )
         if event_identity in protected_attempts:
-            metadata = payload.get("metadata")
-            if isinstance(metadata, dict):
-                metadata.pop("session_id", None)
-                metadata.pop("cache_fingerprint", None)
-            payload_artifacts = payload.get("artifacts")
-            if isinstance(payload_artifacts, list):
-                for artifact in payload_artifacts:
-                    if isinstance(artifact, dict):
-                        artifact.pop("session_id", None)
+            redact_session_fields(payload)
     return projected
 
 
@@ -8021,14 +8042,20 @@ class RunStore:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             events = self._read_journal_events(directory)
-            private_authorities = self._read_bound_private_session_authorities(
+            private_authorities = self._read_private_session_authorities(
                 run_id=run_id,
-                events=events,
+            )
+            bound_private_authorities = (
+                self._bind_private_session_authorities_to_events(
+                    private_authorities,
+                    events,
+                    run_id=run_id,
+                )
             )
             self._validate_recovery_completion_event_authority(
                 events,
                 run_id=run_id,
-                private_authorities=private_authorities,
+                private_authorities=bound_private_authorities,
             )
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
@@ -8094,14 +8121,20 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             all_events = self._read_journal_events(directory)
             selected = all_events[-limit:]
-            private_authorities = self._read_bound_private_session_authorities(
+            private_authorities = self._read_private_session_authorities(
                 run_id=run_id,
-                events=all_events,
+            )
+            bound_private_authorities = (
+                self._bind_private_session_authorities_to_events(
+                    private_authorities,
+                    all_events,
+                    run_id=run_id,
+                )
             )
             self._validate_recovery_completion_event_authority(
                 all_events,
                 run_id=run_id,
-                private_authorities=private_authorities,
+                private_authorities=bound_private_authorities,
             )
         truncated = (
             len(all_events) > limit
