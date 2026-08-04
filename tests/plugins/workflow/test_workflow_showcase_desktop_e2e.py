@@ -127,7 +127,30 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         )
         assert detail_response.status_code == 200
         detail = detail_response.json()
-        assert detail["compatibility"] == compatibility
+        detail_compatibility = detail["compatibility"]
+        for field in (
+            "level",
+            "runnable",
+            "findings_truncated",
+            "finding_count",
+        ):
+            assert detail_compatibility[field] == compatibility[field]
+        catalog_findings = compatibility["findings"]
+        detail_findings = detail_compatibility["findings"]
+        assert len(catalog_findings) == len(detail_findings) == 512
+        assert all("migration" not in finding for finding in catalog_findings)
+        assert [
+            {key: value for key, value in finding.items() if key != "migration"}
+            for finding in detail_findings
+        ] == catalog_findings
+        assert detail_findings[0]["code"] == "legacy_language_profile"
+        assert detail_findings[0]["migration"] == (
+            'Run "hermes workflow doctor" and resolve compatibility code '
+            '"legacy_language_profile" before relying on this field in the '
+            "selected profile."
+        )
+        assert detail_findings[-1]["code"] == "compatibility_findings_truncated"
+        assert "migration" not in detail_findings[-1]
         assert len(detail_response.content) < 1024 * 1024
         assert detail["topology"]["mermaid"]
         assert detail["definition"]["nodes"][0]["value"] == "[REDACTED]"

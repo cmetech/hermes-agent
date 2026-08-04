@@ -66,10 +66,6 @@ class NodeExecutionContext:
     spawn_intent: Callable[[str], bool] | None = None
     spawn_failed: Callable[[str, str], bool] | None = None
     process_started: Callable[[ProcessIdentity], bool] | None = None
-    provider_dispatch: Callable[[str], bool] | None = None
-    provider_start_delivered: Callable[[str], bool] | None = None
-    provider_execute_received: Callable[[str], bool] | None = None
-    provider_execute_release: Callable[[str], bool] | None = None
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     termination_policy: TerminationPolicy = field(
@@ -94,6 +90,10 @@ class NodeExecutionContext:
     record_session_recovery_selection: (
         Callable[[PersistentSessionRecoverySelection], bool] | None
     ) = None
+    provider_dispatch: Callable[[str], bool] | None = None
+    provider_start_delivered: Callable[[str], bool] | None = None
+    provider_execute_received: Callable[[str], bool] | None = None
+    provider_execute_release: Callable[[str], bool] | None = None
 
 
 @dataclass(frozen=True)

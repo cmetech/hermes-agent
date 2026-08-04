@@ -81,8 +81,13 @@ def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
 
     assert context.monotonic is monotonic
     assert context.termination_policy is termination_policy
+    assert context.process_stopped is None
     assert context.sealed_resource_paths is None
     assert context.sealed_resource_bytes is None
+    assert context.provider_dispatch is None
+    assert context.provider_start_delivered is None
+    assert context.provider_execute_received is None
+    assert context.provider_execute_release is None
 
 
 def test_named_script_prefers_exact_package_resource_before_runtime_suffix(

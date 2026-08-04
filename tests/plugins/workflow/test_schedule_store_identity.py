@@ -98,6 +98,7 @@ def _downgrade_to_v13_legacy_namespace(
             definitions.append(definition)
         names = ", ".join(f'"{row[1]}"' for row in retained)
         connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
         connection.execute("ALTER TABLE runs RENAME TO runs_v14_source")
         connection.execute(f"CREATE TABLE runs ({', '.join(definitions)})")
         connection.execute(
