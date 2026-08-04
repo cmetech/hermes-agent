@@ -3085,10 +3085,10 @@ def test_completed_recovery_state_reverse_requires_selection_anchor(
         store.load_run(run_id)
 
 
-def test_journal_selection_without_committed_private_anchor_fails_closed(
+def test_fenced_selection_commits_private_anchor_before_journal_activation(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
-    """A crash after journal fsync but before SQLite commit must not select fresh."""
+    """A journaled selection remains loadable after its fenced caller crashes."""
     home = tmp_path / "selection-journal-commit-gap-home"
     package = _archon_package(
         workflow_writer,
@@ -3153,12 +3153,108 @@ def test_journal_selection_without_committed_private_anchor_fails_closed(
             "WHERE attempt_id=?",
             (claim.attempt_id,),
         ).fetchone()
-    assert row is None
-    with pytest.raises(
-        JournalRecoveryError,
-        match="private session authority|valid recovery data",
-    ):
-        RunStore(home).load_run(admitted.run_id)
+    assert row is not None
+    recovered = RunStore(home).load_run(admitted.run_id)
+    assert recovered["nodes"]["analyze"]["session_recoveries"][-1]["outcome"] == (
+        "fresh_start_selected"
+    )
+
+
+def test_fenced_winner_commits_private_anchor_before_journal_activation(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    """A journaled winning completion keeps its private recovery authority."""
+    home = tmp_path / "winner-journal-commit-gap-home"
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "winner-journal-commit-gap",
+        name="winner-journal-commit-gap",
+    )
+    store = RunStore(home)
+    admitted = _admit(store, package, "winner-journal-commit-gap")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="winner-owner",
+        host_kind="gateway",
+        host_instance_id="winner-owner-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "analyze",
+        "winner-owner",
+        execution_fence=fence,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    key = NodeSessionKey(
+        package.definition.name,
+        "analyze",
+        "local",
+        "fake-provider",
+        "default",
+    )
+    assert store.record_persistent_session_recovery_selection(
+        claim,
+        PersistentSessionRecoverySelection(
+            key=key,
+            expected_generation=0,
+            missing_session_id="missing-winner-session",
+            cache_fingerprint="a" * 64,
+            run_id=admitted.run_id,
+            attempt_id=claim.attempt_id,
+        ),
+    )
+    candidate = SessionRegistryUpdateCandidate(
+        key=key,
+        expected_generation=0,
+        new_session_id="winning-session",
+        cache_fingerprint="a" * 64,
+        winning_run_id=admitted.run_id,
+        winning_node_id="analyze",
+        winning_attempt_id=claim.attempt_id,
+        recovery_selected=True,
+    )
+    original_append = store._append_locked
+
+    def crash_after_fsync(*args, **kwargs):
+        original_append(*args, **kwargs)
+        raise RuntimeError("crash after winner journal fsync before caller return")
+
+    monkeypatch.setattr(store, "_append_locked", crash_after_fsync)
+    with pytest.raises(RuntimeError, match="winner journal fsync"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            metadata={
+                "session_id": candidate.new_session_id,
+                "cache_fingerprint": candidate.cache_fingerprint,
+            },
+            session_registry_update=candidate,
+            session_registry_authority=candidate,
+        )
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    with sqlite3.connect(store.database) as connection:
+        row = connection.execute(
+            "SELECT 1 FROM session_registry_winner_authority WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()
+    assert row is not None
+    restarted = RunStore(home)
+    recovered = restarted.load_run(admitted.run_id)
+    assert recovered["nodes"]["analyze"]["state"] == "succeeded"
+    pending = restarted.pending_session_registry_update(admitted.run_id)
+    assert pending is not None
+    assert pending[0] == candidate
 
 
 def test_selected_preobligation_recovery_requires_its_private_evidence(

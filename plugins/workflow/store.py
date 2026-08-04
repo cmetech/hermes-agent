@@ -2778,6 +2778,21 @@ class RunStore:
         finally:
             connection.close()
 
+    def _commit_fenced_private_authority(
+        self,
+        connection: sqlite3.Connection | None,
+        fence: ExecutionFence | None,
+        now: LeaseClockSample | None = None,
+    ) -> None:
+        """Durably anchor private evidence before its activating journal frame."""
+        if connection is None:
+            return
+        if fence is None:
+            raise RuntimeError("private authority checkpoint requires a fence")
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        self.assert_execution_fence(connection, fence, now)
+
     def _migrate_runs_idempotency_namespace(
         self,
         connection: sqlite3.Connection,
@@ -10120,6 +10135,11 @@ class RunStore:
                     )
                     if fence_connection is None:
                         authority_connection.commit()
+                self._commit_fenced_private_authority(
+                    fence_connection,
+                    claim.execution_fence,
+                    now,
+                )
                 if existing is not None:
                     return existing.get("outcome") == "fresh_start_selected"
                 public_selection = {
@@ -11921,6 +11941,11 @@ class RunStore:
                     )
                     if fence_connection is None:
                         authority_connection.commit()
+                self._commit_fenced_private_authority(
+                    fence_connection,
+                    claim.execution_fence,
+                    now,
+                )
             if status == "paused":
                 with (
                     nullcontext(fence_connection)
