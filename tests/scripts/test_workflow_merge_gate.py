@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -75,6 +76,15 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_topology.py",
     )
 }
+PROHIBITED_WORKFLOW_GATE_SUITES = {
+    "tests/plugins/workflow/test_phase3_bash_lexer_security.py": (
+        "excluded from automated validation by the active user override"
+    ),
+    "tests/plugins/workflow/test_persistent_session_recovery.py": (
+        "mixed persistent-session suite excluded by the active user override"
+    ),
+}
+WORKFLOW_GATE_OPTOUTS.update(PROHIBITED_WORKFLOW_GATE_SUITES)
 
 PARSER_VERSIONS = {
     "typescript": "6.0.3",
@@ -82,6 +92,21 @@ PARSER_VERSIONS = {
     "remark-parse": "11.0.0",
     "micromark": "4.0.2",
 }
+
+
+def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
+    packages: dict[str, object] = {"": {"name": name}}
+    packages.update(
+        {
+            f"node_modules/{package}": {"version": version}
+            for package, version in PARSER_VERSIONS.items()
+        }
+    )
+    return {
+        "name": name,
+        "lockfileVersion": 3,
+        "packages": packages,
+    }
 
 
 def _write_parser_dependencies(root: Path) -> None:
@@ -207,9 +232,12 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert len(selected_python) == len(set(selected_python))
     assert len(selected_desktop) == len(set(selected_desktop))
     for path in (
+        "tests/tools/test_managed_process.py",
+        "tests/tools/test_process_registry.py",
         "tests/gateway/test_plugin_background_services.py",
         "tests/gateway/test_plugin_delivery.py",
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
+        "tests/agent/test_provider_attempt_transport.py",
         "tests/scripts/test_workflow_merge_gate.py",
         "tests/plugins/workflow/test_catalog_api.py",
         "tests/plugins/workflow/test_workflow_detail_api.py",
@@ -218,6 +246,9 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_node_mcp.py",
         "tests/hermes_cli/test_execution_runtime_capabilities.py",
         "tests/plugins/workflow/test_runner_binding.py",
+        "tests/plugins/workflow/test_typed_publication.py",
+        "tests/plugins/workflow/test_typed_publication_recovery.py",
+        "tests/plugins/workflow/test_structured_output_language.py",
         "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py",
         "tests/plugins/workflow/test_ai_extensions_middleware_e2e.py",
         "tests/plugins/workflow/test_showcase_ai_e2e.py",
@@ -225,6 +256,15 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_showcase_schedule_e2e.py",
         "tests/plugins/workflow/test_scheduled_runs.py",
         "tests/plugins/workflow/test_schedule_revalidation.py",
+        "tests/plugins/workflow/test_phase3_language.py",
+        "tests/plugins/workflow/test_phase3_execution_semantics.py",
+        "tests/plugins/workflow/test_phase3_code_catalog.py",
+        "tests/plugins/workflow/test_strict_output_references.py",
+        "tests/plugins/workflow/test_phase3_conditions.py",
+        "tests/plugins/workflow/test_phase3_resolution_waits.py",
+        "tests/plugins/workflow/test_phase3_bash_substitution.py",
+        "tests/plugins/workflow/test_phase3_bash_descriptor_faults.py",
+        "tests/plugins/workflow/test_phase3_bash_reference_ordering.py",
         *PHASE_1_LANGUAGE_BACKEND_SUITES,
     ):
         assert selected_python.count(path) == 1
@@ -247,6 +287,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert not any("*" in path for path in opted_out)
     assert not (opted_out - workflow_inventory)
     assert not (opted_out & selected_workflow)
+    assert not (set(PROHIBITED_WORKFLOW_GATE_SUITES) & selected_workflow)
     assert not (workflow_inventory - selected_workflow - opted_out)
 
 
@@ -314,6 +355,7 @@ def test_phase_1_language_customizations_and_regression_gate_are_tracked() -> No
 
     assert PHASE_1_LANGUAGE_CUSTOMIZATION_IDS <= customization_ids
     assert "workflow-language-regression-gates" in customization_ids
+    assert "workflow-provider-attempt-transport-authority" in customization_ids
 
 
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
@@ -384,6 +426,7 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     (repo / "docs/upstream-customizations").mkdir(parents=True)
     (repo / "brands").mkdir()
     (repo / "plugins/workflow").mkdir(parents=True)
+    (repo / "apps/desktop").mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "base"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Gate Test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
@@ -395,6 +438,13 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     (repo / "docs/upstream-customizations/merge-evidence.schema.json").write_text("{}\n")
     (repo / "brands/otto.json").write_text('{"slug":"otto"}\n')
     (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'base'\n")
+    (repo / "package.json").write_text('{"name":"gate-fixture"}\n')
+    (repo / "package-lock.json").write_text(
+        f"{json.dumps(_parser_package_lock())}\n"
+    )
+    (repo / "apps/desktop/package.json").write_text(
+        '{"name":"gate-desktop-fixture"}\n'
+    )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
     base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
@@ -416,6 +466,46 @@ def _linked_brand_checkout(tmp_path: Path) -> tuple[Path, Path, str]:
         capture_output=True,
     )
     return shared_root, linked, base
+
+
+def _sibling_invocation_checkouts(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    shared_root, base = _brand_repo(tmp_path)
+    invocation = tmp_path / "invocation-worktree"
+    detached = tmp_path / "detached-rehearsal"
+    for worktree in (invocation, detached):
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), base],
+            cwd=shared_root,
+            check=True,
+            capture_output=True,
+        )
+    shutil.rmtree(shared_root / "node_modules")
+    return shared_root, invocation, detached, base
+
+
+def _brand_parser_checkouts(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    shared_root, invocation, brand, base = _sibling_invocation_checkouts(tmp_path)
+    _write_parser_dependencies(invocation)
+    (brand / "package.json").write_text('{"name":"otto-gate-fixture"}\n')
+    (brand / "package-lock.json").write_text(
+        f"{json.dumps(_parser_package_lock('otto-gate-fixture'))}\n"
+    )
+    subprocess.run(
+        ["git", "add", "package.json", "package-lock.json"],
+        cwd=brand,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "generate brand metadata"],
+        cwd=brand,
+        check=True,
+        capture_output=True,
+    )
+    return shared_root, invocation, brand, base
 
 
 def _run_gate_with_marker(
@@ -476,6 +566,545 @@ def test_brand_gate_provisions_root_parser_dependencies_before_checker(
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "checked\n"
     assert (linked / "node_modules").resolve() == (shared_root / "node_modules").resolve()
+
+
+def test_gate_provisions_parser_dependencies_from_sibling_invocation_worktree(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    marker = tmp_path / "sibling-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "checked\n"
+    assert (detached / "node_modules").resolve() == (
+        invocation / "node_modules"
+    ).resolve()
+
+
+def _run_brand_parser_gate(
+    brand: Path,
+    invocation: Path,
+    base: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            GATE,
+            "--repo",
+            brand,
+            "--phase",
+            "brand",
+            "--brand",
+            "otto",
+            "--tested-base-sha",
+            base,
+        ],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "WORKFLOW_MERGE_GATE_FAST": "1"},
+    )
+
+
+def test_brand_gate_reuses_parser_dependencies_across_brand_metadata(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 0, result.stderr
+    assert (brand / "node_modules").is_symlink()
+    assert (brand / "node_modules").resolve() == (invocation / "node_modules").resolve()
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "version-mismatch",
+        "missing-entry",
+        "duplicate-entry",
+        "malformed-entry",
+        "dirty-brand-lock",
+        "dirty-source-lock",
+    ],
+)
+def test_brand_gate_rejects_unsealed_or_mismatched_parser_lock_entries(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+    target = brand / "package-lock.json"
+    payload = _parser_package_lock("otto-gate-fixture")
+    packages = payload["packages"]
+    assert isinstance(packages, dict)
+    if malformation == "version-mismatch":
+        packages["node_modules/typescript"] = {"version": "0.0.0"}
+    elif malformation == "missing-entry":
+        packages.pop("node_modules/typescript")
+    elif malformation == "malformed-entry":
+        packages["node_modules/typescript"] = {"version": 603}
+    elif malformation == "duplicate-entry":
+        entry = '"node_modules/typescript":{"version":"6.0.3"}'
+        serialized = json.dumps(payload, separators=(",", ":"))
+        serialized = serialized.replace(entry, f"{entry},{entry}", 1)
+        target.write_text(f"{serialized}\n")
+    elif malformation == "dirty-brand-lock":
+        payload["name"] = "dirty-brand-lock"
+    elif malformation == "dirty-source-lock":
+        target = invocation / "package-lock.json"
+        target.write_text(f"{json.dumps(_parser_package_lock('dirty-source'))}\n")
+    if malformation not in {"duplicate-entry", "dirty-source-lock"}:
+        target.write_text(f"{json.dumps(payload)}\n")
+    if not malformation.startswith("dirty-"):
+        subprocess.run(
+            ["git", "add", "package-lock.json"],
+            cwd=brand,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"malform lock: {malformation}"],
+            cwd=brand,
+            check=True,
+            capture_output=True,
+        )
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+
+
+def test_brand_gate_rejects_parser_dependencies_from_different_repository(
+    tmp_path: Path,
+) -> None:
+    _shared_root, _invocation, brand, base = _brand_parser_checkouts(
+        tmp_path / "target"
+    )
+    unrelated, _unrelated_base = _brand_repo(tmp_path / "unrelated")
+
+    result = _run_brand_parser_gate(brand, unrelated, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+
+
+def test_brand_gate_rejects_escaping_parser_dependency_symlink(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, brand, base = _brand_parser_checkouts(tmp_path)
+    outside = tmp_path / "outside-brand-parser-dependencies"
+    _write_parser_dependencies(outside)
+    shutil.rmtree(invocation / "node_modules")
+    (invocation / "node_modules").symlink_to(
+        outside / "node_modules", target_is_directory=True
+    )
+
+    result = _run_brand_parser_gate(brand, invocation, base)
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+
+
+def test_gate_rejects_invocation_dependencies_from_different_repository(
+    tmp_path: Path,
+) -> None:
+    _shared_root, _invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    unrelated = tmp_path / "unrelated-repository"
+    unrelated.mkdir()
+    subprocess.run(["git", "init"], cwd=unrelated, check=True, capture_output=True)
+    _write_parser_dependencies(unrelated)
+    marker = tmp_path / "unrelated-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=unrelated,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_escaping_sibling_invocation_dependency_view(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    outside = tmp_path / "outside-sibling-dependencies"
+    _write_parser_dependencies(outside)
+    (invocation / "node_modules").symlink_to(
+        outside / "node_modules", target_is_directory=True
+    )
+    marker = tmp_path / "escaping-sibling-invocation-checker.marker"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CHECKER_MARKER": str(marker),
+            "WORKFLOW_MERGE_GATE_FAST": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def _install_full_gate_fixtures(repo: Path, tmp_path: Path) -> dict[str, str]:
+    run_tests = repo / "scripts/run_tests.sh"
+    run_tests.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    run_tests.chmod(0o755)
+    (repo / "apps/desktop").mkdir(parents=True, exist_ok=True)
+    fixture_bin = tmp_path / f"{repo.name}-fixture-bin"
+    fixture_bin.mkdir()
+    npx = fixture_bin / "npx"
+    npx.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ -n \"${GATE_DESKTOP_OBSERVATION:-}\" ]]; then\n"
+        "  [[ -d node_modules && ! -L node_modules ]]\n"
+        "  [[ -L node_modules/fixture-package ]]\n"
+        "  [[ -d node_modules/.vite && ! -L node_modules/.vite ]]\n"
+        "  [[ ! -e node_modules/.vite/source-cache ]]\n"
+        "  printf '%s\\n' \"$1\" >>\"$GATE_DESKTOP_OBSERVATION\"\n"
+        "fi\n"
+        "case \"${GATE_NPX_MODE:-pass}:$1\" in\n"
+        "  test-fail:vitest) exit 41 ;;\n"
+        "  typecheck-fail:tsc) exit 42 ;;\n"
+        "  signal:vitest) kill -TERM \"$PPID\"; exit 143 ;;\n"
+        "  handoff-source-missing:tsc) "
+        "mv \"$GATE_DESKTOP_SOURCE\" \"$GATE_DESKTOP_SOURCE.moved\" ;;\n"
+        "  handoff-target-replaced:tsc) rm -rf node_modules; "
+        "ln -s \"$GATE_REPLACEMENT_SOURCE\" node_modules ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    npx.chmod(0o755)
+    env = os.environ.copy()
+    env.pop("WORKFLOW_MERGE_GATE_FAST", None)
+    env["PATH"] = f"{fixture_bin}{os.pathsep}{env['PATH']}"
+    env["PYTHON_BIN"] = sys.executable
+    return env
+
+
+def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    (desktop_modules / ".vite/source-cache").write_text("source-only\n")
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    observation = tmp_path / "desktop-gate-observation.log"
+    env["GATE_DESKTOP_OBSERVATION"] = str(observation)
+
+    env["GATE_NPX_MODE"] = "test-fail"
+    failed = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert failed.returncode != 0
+    assert not (detached / "apps/desktop/node_modules").exists()
+
+    env.pop("GATE_NPX_MODE")
+    retried = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert retried.returncode == 0, retried.stderr
+    detached_modules = detached / "apps/desktop/node_modules"
+    assert detached_modules.is_symlink()
+    assert detached_modules.resolve() == desktop_modules.resolve()
+
+    assert observation.read_text(encoding="utf-8").splitlines() == [
+        "vitest",
+        "vitest",
+        "tsc",
+    ]
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+
+
+@pytest.mark.parametrize("failure_mode", ["test-fail", "typecheck-fail", "signal"])
+def test_gate_cleans_provisioned_desktop_view_on_early_exit(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    (desktop_modules / ".vite/source-cache").write_text("source-only\n")
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_NPX_MODE"] = failure_mode
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert not (detached / "apps/desktop/node_modules").exists()
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+
+
+def test_gate_fails_closed_when_successful_desktop_handoff_source_disappears(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_DESKTOP_SOURCE"] = str(desktop_modules)
+    env["GATE_NPX_MODE"] = "handoff-source-missing"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "desktop dependency cleanup refused" in result.stderr
+    assert not (detached / "apps/desktop/node_modules").exists()
+    assert Path(f"{desktop_modules}.moved/fixture-package/package.json").is_file()
+
+
+def test_gate_refuses_to_replace_an_unowned_desktop_handoff_target(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    (desktop_modules / "fixture-package").mkdir(parents=True)
+    (desktop_modules / "fixture-package/package.json").write_text(
+        '{"name":"fixture-package"}\n'
+    )
+    (desktop_modules / ".vite").mkdir()
+    replacement = tmp_path / "unowned-desktop-dependencies"
+    replacement.mkdir()
+    env = _install_full_gate_fixtures(detached, tmp_path)
+    env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
+    env["GATE_REPLACEMENT_SOURCE"] = str(replacement)
+    env["GATE_NPX_MODE"] = "handoff-target-replaced"
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    detached_modules = detached / "apps/desktop/node_modules"
+    assert result.returncode != 0
+    assert "desktop dependency cleanup refused" in result.stderr
+    assert detached_modules.is_symlink()
+    assert detached_modules.resolve() == replacement.resolve()
+    assert (desktop_modules / "fixture-package/package.json").is_file()
+
+
+def test_gate_preserves_preexisting_external_desktop_dependency_symlink(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(invocation)
+    desktop_modules = invocation / "apps/desktop/node_modules"
+    desktop_modules.mkdir(parents=True)
+    detached_link = detached / "apps/desktop/node_modules"
+    detached_link.symlink_to(desktop_modules, target_is_directory=True)
+    env = _install_full_gate_fixtures(detached, tmp_path)
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert detached_link.is_symlink()
+    assert os.readlink(detached_link) == str(desktop_modules)
+    assert detached_link.resolve() == desktop_modules.resolve()
+
+
+def test_gate_rejects_desktop_dependencies_from_different_repository(
+    tmp_path: Path,
+) -> None:
+    _shared_root, _invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(detached)
+    unrelated = tmp_path / "unrelated-desktop-repository"
+    (unrelated / "apps/desktop/node_modules").mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=unrelated, check=True, capture_output=True)
+    env = _install_full_gate_fixtures(detached, tmp_path)
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=unrelated,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "desktop dependencies are required" in result.stderr
+
+
+def test_gate_rejects_escaping_sibling_desktop_dependency_view(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(detached)
+    outside = tmp_path / "outside-desktop-dependencies"
+    (outside / "node_modules").mkdir(parents=True)
+    (invocation / "apps/desktop").mkdir(parents=True, exist_ok=True)
+    (invocation / "apps/desktop/node_modules").symlink_to(
+        outside / "node_modules", target_is_directory=True
+    )
+    env = _install_full_gate_fixtures(detached, tmp_path)
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "desktop dependencies are required" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    ["package-lock.json", "apps/desktop/package.json"],
+)
+def test_gate_rejects_sibling_desktop_view_with_missing_dependency_identity(
+    tmp_path: Path,
+    missing_path: str,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(detached)
+    (invocation / "apps/desktop/node_modules").mkdir(parents=True)
+    (invocation / missing_path).unlink()
+    env = _install_full_gate_fixtures(detached, tmp_path)
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "desktop dependencies are required" in result.stderr
+
+
+def test_gate_rejects_sibling_desktop_view_with_mismatched_dependency_identity(
+    tmp_path: Path,
+) -> None:
+    _shared_root, invocation, detached, _base = _sibling_invocation_checkouts(
+        tmp_path
+    )
+    _write_parser_dependencies(detached)
+    (invocation / "apps/desktop/node_modules").mkdir(parents=True)
+    (invocation / "package-lock.json").write_text(
+        '{"name":"different","lockfileVersion":3,"packages":{}}\n'
+    )
+    subprocess.run(
+        ["git", "commit", "-am", "change dependency identity"],
+        cwd=invocation,
+        check=True,
+        capture_output=True,
+    )
+    env = _install_full_gate_fixtures(detached, tmp_path)
+
+    result = subprocess.run(
+        [GATE, "--repo", detached, "--phase", "base"],
+        cwd=invocation,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "desktop dependencies are required" in result.stderr
 
 
 def test_gate_fails_before_checker_when_root_parser_dependencies_are_missing(

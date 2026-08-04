@@ -146,6 +146,7 @@ def test_conversation_scope_filters_lists_and_explicit_run_ids(
         ("running", None, "stalled", {"cancel", "resume"}),
         ("queued", None, "waiting", {"cancel"}),
         ("waiting_retry", None, "retry_wait", {"cancel"}),
+        ("recovery_pending", None, "operator_wait", {"resume", "cancel"}),
         (
             "paused",
             {"type": "approval"},

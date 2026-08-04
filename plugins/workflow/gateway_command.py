@@ -16,6 +16,7 @@ from plugins.workflow.compat import (
     assess_compatibility,
     require_runnable,
 )
+from plugins.workflow.models import RunExecutionLimits
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.trust import (
     WorkflowTrustStore,
@@ -118,7 +119,9 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
     if coordinator.status != "healthy":
         raise RuntimeError("background execution requires a healthy coordinator")
     prepared = store.prepare_run_snapshot(
-        package, values={"arguments": args.arguments} if args.arguments else None
+        package,
+        values={"arguments": args.arguments} if args.arguments else None,
+        execution_limits=RunExecutionLimits.resolve(runtime),
     )
     provenance = gateway_trigger_provenance(
         invocation, intent_key=args.idempotency_key

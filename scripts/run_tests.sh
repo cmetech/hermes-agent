@@ -43,14 +43,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # pytest, pytest-asyncio, pytest-timeout, ruff, ty).
 PYTHON=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -x "$candidate/bin/python" ]; then
+  if [ -x "$candidate/bin/python" ] \
+    && "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
     PYTHON="$candidate/bin/python"
     break
   fi
   # uv creates the standard ``Scripts`` layout on native Windows.  The
   # portability matrix invokes this script through Git Bash, so probe the
   # interpreter itself instead of assuming a POSIX ``bin/activate`` file.
-  if [ -x "$candidate/Scripts/python.exe" ]; then
+  if [ -x "$candidate/Scripts/python.exe" ] \
+    && "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
     PYTHON="$candidate/Scripts/python.exe"
     break
   fi
@@ -132,6 +134,101 @@ fi
 echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
+# Ledger invariants are already isolated, supervised, captured, and retried by
+# run_workflow_ledger_invariants.py.  Keep this wrapper authoritative for
+# interpreter selection and the clean environment, but preserve pytest's native
+# exit/signal status so the ledger can distinguish test failures from
+# infrastructure failures.  The controller-only option is accepted solely to
+# enforce that its retry layer is disabled.
+if [ "${WORKFLOW_LEDGER_EXECUTION_ACTIVE:-}" = "1" ]; then
+  invalid_ledger_command() {
+    echo "error: invalid ledger wrapper command" >&2
+    exit 2
+  }
+  [ "$#" -eq 9 ] || [ "$#" -eq 11 ] || invalid_ledger_command
+  [ "$1" = "--workflow-ledger-single-file" ] || invalid_ledger_command
+  LEDGER_TEST_PATH="$2"
+  case "$LEDGER_TEST_PATH" in
+    tests/*.py) ;;
+    *) invalid_ledger_command ;;
+  esac
+  case "/$LEDGER_TEST_PATH/" in
+    *"//"*|*"/./"*|*"/../"*) invalid_ledger_command ;;
+  esac
+  [ ! -L "$REPO_ROOT/$LEDGER_TEST_PATH" ] \
+    && [ -f "$REPO_ROOT/$LEDGER_TEST_PATH" ] \
+    && git -C "$REPO_ROOT" ls-files --error-unmatch -- "$LEDGER_TEST_PATH" \
+      >/dev/null 2>&1 \
+    || invalid_ledger_command
+  [ "$3" = "--workflow-ledger-pytest-basetemp" ] \
+    && [ "$5" = "--workflow-ledger-pytest-capability" ] \
+    || invalid_ledger_command
+  LEDGER_PYTEST_BASETEMP="$4"
+  LEDGER_PYTEST_CAPABILITY="$6"
+  "$PYTHON" - "$REPO_ROOT" "$LEDGER_PYTEST_BASETEMP" \
+      "$LEDGER_PYTEST_CAPABILITY" <<'PY' || invalid_ledger_command
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+repo = Path(sys.argv[1]).resolve(strict=True)
+basetemp = Path(sys.argv[2])
+capability = sys.argv[3]
+if not re.fullmatch(r"[0-9a-f]{64}", capability):
+    raise SystemExit(1)
+if not basetemp.is_absolute() or basetemp.name != "basetemp":
+    raise SystemExit(1)
+root = basetemp.parent.resolve(strict=True)
+if basetemp.resolve(strict=False) != root / "basetemp":
+    raise SystemExit(1)
+if not root.name.startswith("workflow-ledger-pytest-"):
+    raise SystemExit(1)
+if root == repo or root.is_relative_to(repo):
+    raise SystemExit(1)
+if not stat.S_ISDIR(root.lstat().st_mode) or root.is_symlink():
+    raise SystemExit(1)
+marker = root / ".workflow-ledger-pytest-owner"
+if not stat.S_ISREG(marker.lstat().st_mode) or marker.is_symlink():
+    raise SystemExit(1)
+if marker.read_text(encoding="ascii") != capability:
+    raise SystemExit(1)
+if os.path.lexists(basetemp):
+    raise SystemExit(1)
+PY
+  [ "$7" = "--file-retries" ] && [ "$8" = "0" ] && [ "$9" = "-q" ] \
+    || invalid_ledger_command
+  LEDGER_PYTEST_ARGS=("$LEDGER_TEST_PATH" "-q" \
+    "--basetemp=$LEDGER_PYTEST_BASETEMP")
+  if [ "$#" -eq 11 ]; then
+    [ "$LEDGER_TEST_PATH" = \
+        "tests/plugins/workflow/test_installed_distribution_e2e.py" ] \
+      && [ "${10}" = "-m" ] && [ "${11}" = "integration" ] \
+      || invalid_ledger_command
+    LEDGER_PYTEST_ARGS+=("-m" "integration")
+  elif [ "$LEDGER_TEST_PATH" = \
+      "tests/plugins/workflow/test_installed_distribution_e2e.py" ]; then
+    invalid_ledger_command
+  fi
+  echo "▶ launching isolated ledger invariant"
+  exec env -i \
+    PATH="$PATH" \
+    HOME="$HOME" \
+    TZ=UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUTF8="${PYTHONUTF8:-1}" \
+    PYTHONHASHSEED=0 \
+    PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX" \
+    HERMES_TEST_FILE_RETRIES=0 \
+    HERMES_OFFLINE="${HERMES_OFFLINE:-1}" \
+    ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
+    ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+    WORKFLOW_LEDGER_EXECUTION_ACTIVE=1 \
+    "$PYTHON" -m pytest "${LEDGER_PYTEST_ARGS[@]}"
+fi
+
 echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
@@ -143,6 +240,7 @@ exec env -i \
   PYTHONHASHSEED=0 \
   PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX" \
   ${HERMES_TEST_WORKERS:+HERMES_TEST_WORKERS="$HERMES_TEST_WORKERS"} \
+  ${HERMES_TEST_FILE_RETRIES:+HERMES_TEST_FILE_RETRIES="$HERMES_TEST_FILE_RETRIES"} \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

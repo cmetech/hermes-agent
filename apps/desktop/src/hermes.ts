@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import type { WorkflowArtifactDownloadResult } from '@/global'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -61,6 +62,7 @@ import type {
   ToolsetConfig,
   ToolsetInfo,
   ToolsetModelsResponse,
+  WorkflowArtifactPreview,
   WorkflowAttentionPage,
   WorkflowCleanupPreview,
   WorkflowCleanupResult,
@@ -378,7 +380,9 @@ export async function listSessions(
 export function listWorkflowRuns(cursor?: string, view: WorkflowRunListView = 'board'): Promise<WorkflowRunPage> {
   const query = new URLSearchParams({ view })
 
-  if (cursor) {query.set('cursor', cursor)}
+  if (cursor) {
+    query.set('cursor', cursor)
+  }
 
   return window.hermesDesktop.api<WorkflowRunPage>({
     path: `/api/plugins/workflow/runs?${query.toString()}`,
@@ -459,6 +463,37 @@ export function getWorkflowEvidence(
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/evidence?${query}`,
     ...profileScoped()
   })
+}
+
+function workflowArtifactUrl(runId: string, publicationId: string, action: 'download' | 'preview'): string {
+  return (
+    `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/artifacts/` +
+    `${encodeURIComponent(publicationId)}/${action}`
+  )
+}
+
+export function getWorkflowArtifactPreview(runId: string, publicationId: string): Promise<WorkflowArtifactPreview> {
+  return window.hermesDesktop.api<WorkflowArtifactPreview>({
+    path: workflowArtifactUrl(runId, publicationId, 'preview'),
+    ...profileScoped()
+  })
+}
+
+export function downloadWorkflowArtifact(
+  runId: string,
+  publicationId: string,
+  profile: null | string,
+  requestId: string
+): Promise<WorkflowArtifactDownloadResult> {
+  return window.hermesDesktop.downloadWorkflowArtifact({
+    path: workflowArtifactUrl(runId, publicationId, 'download'),
+    ...(profile === null ? {} : { profile }),
+    requestId
+  })
+}
+
+export function cancelWorkflowArtifactDownload(requestId: string): Promise<{ cancelled: boolean }> {
+  return window.hermesDesktop.cancelWorkflowArtifactDownload(requestId)
 }
 
 export function mutateWorkflowRun(

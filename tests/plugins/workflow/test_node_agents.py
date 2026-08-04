@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult
+from agent.plugin_agent import PluginAgentRunRequest, PluginAgentRunResult
 from agent.plugin_agent_worker import _build_inline_agent_handler
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
-from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tests.plugins.workflow.test_ai_executor import (
+    FakeAgentRunner,
+    _archon_context,
+    _context,
+    _node,
+)
 
 
 def test_ordinary_node_denies_raw_delegation_and_has_no_inline_agents(tmp_path):
@@ -49,6 +54,34 @@ def test_declared_agents_are_scoped_and_aliases_resolve_without_delegate(tmp_pat
     assert child["denied_tools"] == ["terminal", "delegate_task"]
     assert child["max_iterations"] == 3
     assert "delegate_task" in runner.requests[0].denied_tools
+
+
+def test_structured_repair_has_no_inline_agents_or_delegation_surface(tmp_path):
+    runner = FakeAgentRunner("not json", '{"answer":"fixed"}')
+    node = _node(
+        "agent-repair",
+        "coordinate",
+        agents={
+            "reviewer": {
+                "description": "Review evidence",
+                "prompt": "Review it",
+            }
+        },
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].inline_agents
+    assert runner.requests[1].inline_agents == {}
+    assert runner.requests[1].allowed_tools == ()
+    assert runner.requests[1].enabled_toolsets == ()
+    assert "delegate_task" in runner.requests[1].denied_tools
 
 
 @pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
@@ -153,6 +186,102 @@ def test_inline_agent_handler_is_synchronous_bounded_and_returns_sanitized_resul
         "inline_agent_started",
         "inline_agent_completed",
     ]
+
+
+def test_strict_inline_agent_inherits_one_private_provider_authority(tmp_path):
+    runner = ChildRunner(
+        PluginAgentRunResult(
+            final_response="child result",
+            session_id="child-session",
+            provider="fake",
+            model="fake",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+    )
+    descriptor = {
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": 43210,
+        "authkey": "YXV0aG9yaXR5",
+    }
+    parent = PluginAgentRunRequest(
+        prompt="parent",
+        sealed_provider_attempt_grant=True,
+        max_api_attempts=5,
+        _provider_attempt_authority=descriptor,
+    )
+    handler = _build_inline_agent_handler(
+        plugin_id="workflow",
+        definitions={
+            "reviewer": {
+                "description": "review",
+                "prompt": "Base",
+                "model": None,
+                "allowed_tools": [],
+                "denied_tools": ["delegate_task", "workflow_agent"],
+                "instructions": "",
+                "max_iterations": 2,
+            }
+        },
+        workdir=tmp_path,
+        parent_request=parent,
+        runner_factory=lambda _plugin_id: runner,
+        emit_progress=lambda **_payload: None,
+        pause=lambda _descriptor: None,
+    )
+
+    assert handler({"agent_id": "reviewer", "task": "Inspect"})["status"] == (
+        "completed"
+    )
+    child = runner.requests[0]
+    assert child.sealed_provider_attempt_grant is True
+    assert child.max_api_attempts == 5
+    assert child._provider_attempt_authority == descriptor
+
+
+def test_legacy_inline_agent_does_not_gain_provider_authority(tmp_path):
+    runner = ChildRunner(
+        PluginAgentRunResult(
+            final_response="child result",
+            session_id="child-session",
+            provider="fake",
+            model="fake",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+    )
+    parent = PluginAgentRunRequest(prompt="parent", max_api_attempts=2)
+    handler = _build_inline_agent_handler(
+        plugin_id="workflow",
+        definitions={
+            "reviewer": {
+                "description": "review",
+                "prompt": "Base",
+                "model": None,
+                "allowed_tools": [],
+                "denied_tools": ["delegate_task", "workflow_agent"],
+                "instructions": "",
+                "max_iterations": 2,
+            }
+        },
+        workdir=tmp_path,
+        parent_request=parent,
+        runner_factory=lambda _plugin_id: runner,
+        emit_progress=lambda **_payload: None,
+        pause=lambda _descriptor: None,
+    )
+
+    assert handler({"agent_id": "reviewer", "task": "Inspect"})["status"] == (
+        "completed"
+    )
+    child = runner.requests[0]
+    assert child.sealed_provider_attempt_grant is False
+    assert child._provider_attempt_authority is None
 
 
 def test_inline_agent_pending_approval_bubbles_to_parent_pause(tmp_path):

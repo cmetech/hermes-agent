@@ -14,6 +14,7 @@ from plugins.workflow.models import (
 )
 
 if TYPE_CHECKING:
+    from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
     from plugins.workflow.trust import WorkflowRiskSummary
 
 
@@ -465,6 +466,9 @@ def assess_compatibility(
     provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
     isolated_workdir: bool = False,
     mcp_available: bool = False,
+    structured_output_decisions: Mapping[
+        str, "StructuredOutputCapabilityDecision"
+    ] | None = None,
 ) -> CompatibilityReport:
     """Classify every declared field that requires a Hermes mapping."""
     tools = available_tools
@@ -555,6 +559,37 @@ def assess_compatibility(
     for index, node in enumerate(package.definition.nodes):
         prefix = f"nodes[{index}]"
         node_options = node.options
+        structured_output = package.language.structured_outputs.get(node.id)
+        if structured_output is not None and structured_output_decisions is not None:
+            decision = structured_output_decisions.get(node.id)
+            if decision is None:
+                decision = structured_output_decisions.get(
+                    structured_output.schema_fingerprint
+                )
+            unsupported = decision is None or decision.strategy.value == "unsupported"
+            _finding(
+                findings,
+                f"{prefix}.output_format",
+                (
+                    CompatibilityLevel.UNSUPPORTED
+                    if unsupported
+                    else CompatibilityLevel.MAPPED
+                ),
+                (
+                    "configured runtime cannot honor the structured-output contract"
+                    if unsupported
+                    else (
+                        "structured output uses sealed strategy "
+                        f"{decision.strategy.value}"
+                    )
+                ),
+                code=(
+                    "structured_output_strategy_unsupported"
+                    if unsupported
+                    else "structured_output_strategy_resolved"
+                ),
+                blocking=unsupported,
+            )
         if node_options.get("context") == "shared":
             _finding(
                 findings,

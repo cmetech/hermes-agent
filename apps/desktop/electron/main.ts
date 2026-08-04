@@ -211,6 +211,12 @@ import {
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
+import {
+  fetchWorkflowArtifactWithOauthCookie,
+  fetchWorkflowArtifactWithToken,
+  registerWorkflowArtifactDownloadIpc,
+  type WorkflowArtifactDownloadAuth
+} from './workflow-artifact-download'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
@@ -6070,6 +6076,20 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
   })
 }
 
+function fetchWorkflowArtifactResource(
+  url: string,
+  auth: WorkflowArtifactDownloadAuth,
+  maxBytes: number,
+  signal?: AbortSignal
+) {
+  return auth.kind === 'cookie'
+    ? fetchWorkflowArtifactWithOauthCookie(url, maxBytes, DEFAULT_FETCH_TIMEOUT_MS, {
+        getSession: getOauthSession,
+        request: options => electronNet.request(options as any) as any
+      }, signal)
+    : fetchWorkflowArtifactWithToken(url, auth, maxBytes, DEFAULT_FETCH_TIMEOUT_MS, signal)
+}
+
 // ---------------------------------------------------------------------------
 // RFC 8252 native-app tokens (system-browser + loopback + PKCE).
 //
@@ -9674,6 +9694,26 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
+
+registerWorkflowArtifactDownloadIpc({
+  browserWindow: { fromWebContents: sender => BrowserWindow.fromWebContents(sender as any) },
+  dialog: { showSaveDialog: (...args) => (dialog.showSaveDialog as any)(...args) },
+  download: {
+    ensureBackend,
+    fetchResource: fetchWorkflowArtifactResource,
+    resolveOauthAuth: async baseUrl => {
+      const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+
+      return resolveOauthRestAuth(nativeAt)
+    },
+    routePath: (requestPath, profile) =>
+      pathWithGlobalRemoteProfile(requestPath, profile, {
+        globalRemote: globalRemoteActive(),
+        profileRemoteOverride: profileHasRemoteOverride(profile)
+      })
+  },
+  ipcMain
+})
 
 ipcMain.handle('hermes:api:structured', async (_event, request) => {
   const profile = request?.profile

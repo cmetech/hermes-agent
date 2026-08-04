@@ -1,31 +1,65 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    execution_capability_context,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
 class RecordingRunner:
-    def __init__(self):
+    def __init__(
+        self,
+        response="investigated",
+        *,
+        declaration_source="default_prompt_adapter",
+        api_mode="chat_completions",
+    ):
         self.requests = []
+        self.response = response
+        self.declaration_source = declaration_source
+        self.api_mode = api_mode
 
     def run(self, request, **_kwargs):
         self.requests.append(request)
+        evidence = None
+        audit = {}
+        if request.structured_output is not None:
+            evidence = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": self.declaration_source,
+            }
+            audit.update(evidence)
+            audit["api_calls"] = 1
+            audit["api_mode"] = self.api_mode
         return PluginAgentRunResult(
-            final_response="investigated",
+            final_response=self.response,
             session_id="ai-session",
-            provider="fake",
-            model="fake",
+            provider=request.provider or "fake",
+            model=request.model or "fake",
             status="completed",
             pending_interaction=None,
             usage={"input_tokens": 1, "output_tokens": 1},
-            audit={},
+            audit=audit,
+            structured_output=evidence,
         )
 
 
@@ -198,3 +232,184 @@ def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
     assert request.term_grace_seconds == 2
     assert request.kill_reap_grace_seconds == 1
     assert request.max_iterations == 90
+
+
+def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
+    tmp_path, workflow_writer
+):
+    output_type = "MixedCase/rapport-分析-" + ("Ω" * 300)
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="archon-structured-e2e",
+        provider="fake-provider",
+        model="fake-model",
+        nodes=[
+            {
+                "id": "work",
+                "prompt": "produce",
+                "output_type": output_type,
+                "output_format": {
+                    "type": "object",
+                    "required": ["a", "b"],
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "b": {"type": "boolean"},
+                    },
+                },
+            }
+        ],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="fake-provider",
+            model="fake-model",
+        ),
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="archon-structured",
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    decision = execution_context.structured_output_decisions(package)["work"]
+    runner = RecordingRunner(
+        ' { "b": true, "a": 1 }\n',
+        declaration_source=decision.declaration_source,
+        api_mode=decision.api_mode,
+    )
+
+    scheduler = RunScheduler(store, agent_runner=runner)
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["last_error"] is None, result["last_error"]
+    assert result["status"] == "succeeded", result
+    assert runner.requests[0].structured_output is not None
+    assert runner.requests[0].structured_output.schema.schema_fingerprint == (
+        package.language.structured_outputs["work"].schema_fingerprint
+    )
+    output = store.run_directory(admitted.run_id) / result["artifacts"][0][
+        "relative_path"
+    ]
+    assert output.read_bytes() == b'{"a":1,"b":true}'
+    candidate = result["nodes"]["work"]["attempts"][-1]["metadata"][
+        "primary_output_candidate"
+    ]
+    assert candidate == {
+        "attempt_relative_path": result["artifacts"][0]["relative_path"],
+        "media_type": "application/json",
+        "size_bytes": len(b'{"a":1,"b":true}'),
+        "sha256": hashlib.sha256(b'{"a":1,"b":true}').hexdigest(),
+        "schema_fingerprint": (
+            package.language.structured_outputs["work"].schema_fingerprint
+        ),
+        "canonicalization_version": 1,
+        "output_type": output_type,
+    }
+    assert scheduler._primary_output_candidates == {}
+    assert scheduler._resolved_output_cache == {}
+    assert scheduler._output_resolution_cache_bytes == 0
+    resolved = scheduler._output_values(
+        result, store.run_directory(admitted.run_id)
+    )["work"]
+    assert resolved.value == {"a": 1, "b": True}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "malformed", "extra", "contradictory"],
+)
+def test_archon_malformed_sealed_decision_is_terminal_under_on_error_all(
+    tmp_path, workflow_writer, mutation
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name=f"archon-sealed-{mutation}",
+        provider="fake-provider",
+        model="fake-model",
+        nodes=[{
+            "id": "work",
+            "prompt": "produce",
+            "output_format": {"type": "object"},
+            "retry": {"max_attempts": 3, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="fake-provider",
+            model="fake-model",
+        ),
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"sealed-{mutation}",
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    projection = store.load_run(admitted.run_id)
+    metadata = dict(projection["run_metadata"])
+    decision_key = next(
+        key for key in metadata if key.startswith("structured_output_decision.")
+    )
+    if mutation == "missing":
+        metadata.pop(decision_key)
+    elif mutation == "malformed":
+        metadata[decision_key] = "{"
+    else:
+        decision = json.loads(metadata[decision_key])
+        if mutation == "extra":
+            decision["unexpected"] = True
+        else:
+            decision["schema_fingerprint"] = "0" * 64
+        metadata[decision_key] = json.dumps(
+            decision, sort_keys=True, separators=(",", ":")
+        )
+    store.append_event(
+        admitted.run_id,
+        "test_corrupt_sealed_decision",
+        projection_updates={"run_metadata": metadata},
+    )
+    runner = RecordingRunner("{}")
+
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "structured_output_capability_drift"
+    assert result["nodes"]["work"]["state"] == "failed"
+    assert len(result["nodes"]["work"]["attempts"]) == 1
+    assert runner.requests == []

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 import os
 import re
-from urllib.parse import urlparse
+from types import MappingProxyType
+from urllib.parse import parse_qsl, quote, urlparse, urlunsplit
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
+from agent.structured_output import StructuredOutputStrategy
 from agent.credential_pool import (
     CredentialPool,
     PooledCredential,
@@ -63,6 +66,102 @@ def _getenv(name: str, default: str = "") -> str:
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+_NON_SECRET_ROUTE_QUERY_KEYS = frozenset({
+    "api-version",
+    "api_version",
+    "apiversion",
+    "deployment",
+    "deployment-id",
+    "deployment-name",
+    "deployment_id",
+    "deployment_name",
+    "deploymentid",
+    "deploymentname",
+    "location",
+    "region",
+    "tenant",
+    "tenant-id",
+    "tenant_id",
+    "tenantid",
+})
+_CREDENTIAL_ROUTE_QUERY_KEYS = frozenset({
+    "access-key",
+    "access-token",
+    "access_key",
+    "access_token",
+    "apikey",
+    "api-key",
+    "api_key",
+    "auth",
+    "auth-token",
+    "auth_token",
+    "authorization",
+    "client-secret",
+    "client_secret",
+    "code",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "sig",
+    "signature",
+    "subscription-key",
+    "subscription_key",
+    "token",
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-amz-signedheaders",
+})
+_UNCLASSIFIED_ROUTE_QUERY = "unclassified_query_parameter"
+
+
+class _UnclassifiedRouteQuery(ValueError):
+    """A route query value cannot safely enter credential-free evidence."""
+
+
+def _credential_free_route_url(value: object) -> str:
+    """Return stable route evidence without credential-bearing URL material."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    parsed = urlparse(value.strip())
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        normalized_host = f"{normalized_host}:{port}"
+    query_evidence: list[tuple[str, str | None]] = []
+    for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = key.strip().casefold()
+        if normalized_key in _NON_SECRET_ROUTE_QUERY_KEYS:
+            query_evidence.append((normalized_key, query_value))
+        elif normalized_key in _CREDENTIAL_ROUTE_QUERY_KEYS:
+            query_evidence.append((normalized_key, None))
+        else:
+            raise _UnclassifiedRouteQuery(_UNCLASSIFIED_ROUTE_QUERY)
+    structural_query = "&".join(
+        quote(key, safe="")
+        if query_value is None
+        else f"{quote(key, safe='')}={quote(query_value, safe='')}"
+        for key, query_value in sorted(query_evidence)
+    )
+    return urlunsplit(
+        (scheme, normalized_host, parsed.path or "", structural_query, "")
+    ).rstrip("/")
 
 
 def _loopback_hostname(host: str) -> bool:
@@ -373,16 +472,193 @@ _HERMES_MANAGED_TOOL_LOOP_API_MODES = frozenset({
 class ExecutionRuntimeCapabilities:
     api_mode: str
     hermes_managed_tool_loop: bool
+    effective_provider: str = ""
+    model: str = ""
+    base_url_trust_class: str = "unknown"
+    declared_structured_output_strategy: str | None = None
+    structured_output_declaration_source: str | None = None
 
 
-def _classify_execution_api_mode(api_mode: object) -> ExecutionRuntimeCapabilities:
+@dataclass(frozen=True, slots=True)
+class StructuredOutputCapabilityDecision:
+    strategy: StructuredOutputStrategy
+    effective_provider: str
+    model: str
+    api_mode: str
+    declaration_source: str
+    adapter_version: int
+    schema_fingerprint: str
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfiguredExecutionRoute:
+    """Credential-free immutable provider record used by admission."""
+
+    requested_provider: str
+    effective_provider: str
+    model_config: Mapping[str, object]
+    provider_config: Mapping[str, object]
+    route_evidence_error: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "model_config", MappingProxyType(dict(self.model_config))
+        )
+        object.__setattr__(
+            self, "provider_config", MappingProxyType(dict(self.provider_config))
+        )
+
+
+_STRUCTURED_OUTPUT_ADAPTER_VERSION = 1
+_STRUCTURED_OUTPUT_RATIONALE_MAX_CHARS = 256
+_STRUCTURED_OUTPUT_TRUST_CLASSES = frozenset(
+    {"trusted_direct", "aggregator", "custom", "unknown"}
+)
+
+
+def _structured_output_rationale(value: str) -> str:
+    return value[:_STRUCTURED_OUTPUT_RATIONALE_MAX_CHARS]
+
+
+def _execution_model(
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None,
+    target_model: object,
+) -> str:
+    if isinstance(target_model, str) and target_model.strip():
+        return target_model.strip()
+    for config in (model_config, provider_config):
+        if not isinstance(config, Mapping):
+            continue
+        for key in ("default", "model", "default_model"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _execution_base_url(
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None,
+) -> str:
+    for config in (provider_config, model_config):
+        if not isinstance(config, Mapping):
+            continue
+        for key in ("base_url", "api", "url"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().rstrip("/")
+    return ""
+
+
+def _structured_output_runtime_declaration(
+    *,
+    provider: str,
+    api_mode: str,
+    base_url: str,
+) -> tuple[str, str, str | None, str | None]:
+    """Return effective provider, URL trust, declaration, and its authority."""
+    normalized_provider = provider.strip().lower()
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized_provider)
+    except Exception:
+        profile = None
+    effective_provider = normalized_provider
+    if profile is not None and normalized_provider != "custom":
+        profile_name = str(getattr(profile, "name", "") or "").strip().lower()
+        if profile_name:
+            effective_provider = profile_name
+    effective_base_url = base_url or (
+        str(profile.base_url) if profile is not None else ""
+    )
+    hostname = (base_url_hostname(effective_base_url) or "").lower()
+
+    declared_strategy = None
+    declaration_source = None
+    if profile is not None and profile.structured_output_strategy is not None:
+        candidate = str(profile.structured_output_strategy).strip().lower()
+        if candidate in {strategy.value for strategy in StructuredOutputStrategy}:
+            declared_strategy = candidate
+            declaration_source = "provider_profile"
+
+    # Explicit provider declarations are authoritative. In particular, a
+    # provider that forbids adaptation cannot be promoted merely because its
+    # configured URL happens to use an official-looking hostname.
+    if declared_strategy == StructuredOutputStrategy.UNSUPPORTED.value:
+        return (
+            effective_provider,
+            "unknown",
+            declared_strategy,
+            declaration_source,
+        )
+
+    # Native OpenAI support belongs only to Hermes' built-in API-key identity.
+    # Hostname alone is not provider authority: OAuth Codex, custom profiles,
+    # and arbitrary provider names can all be configured with the same URL.
+    if effective_provider == "openai-api" and (
+        hostname == "api.openai.com" or not effective_base_url
+    ):
+        strategy = (
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value
+            if api_mode in {"chat_completions", "codex_responses"}
+            else None
+        )
+        return "openai", "trusted_direct", strategy, (
+            "trusted_runtime_classifier" if strategy is not None else None
+        )
+
+    if hostname == "api.anthropic.com" and effective_provider == "anthropic":
+        trust_class = "trusted_direct"
+    elif hostname == "openrouter.ai" or effective_provider == "openrouter":
+        trust_class = "aggregator"
+    elif effective_provider == "custom":
+        trust_class = "custom"
+    else:
+        trust_class = "unknown"
+
+    return (
+        effective_provider,
+        trust_class if trust_class in _STRUCTURED_OUTPUT_TRUST_CLASSES else "unknown",
+        declared_strategy,
+        declaration_source,
+    )
+
+
+def _classify_execution_api_mode(
+    api_mode: object,
+    *,
+    provider: object = "",
+    model: object = "",
+    base_url: object = "",
+) -> ExecutionRuntimeCapabilities:
     """Classify one already-derived API mode."""
     normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
+    normalized_provider = provider.strip().lower() if isinstance(provider, str) else ""
+    normalized_model = model.strip() if isinstance(model, str) else ""
+    normalized_base_url = base_url.strip() if isinstance(base_url, str) else ""
+    (
+        effective_provider,
+        trust_class,
+        declared_strategy,
+        declaration_source,
+    ) = _structured_output_runtime_declaration(
+        provider=normalized_provider,
+        api_mode=normalized,
+        base_url=normalized_base_url,
+    )
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
         hermes_managed_tool_loop=(
             normalized in _HERMES_MANAGED_TOOL_LOOP_API_MODES
         ),
+        effective_provider=effective_provider,
+        model=normalized_model,
+        base_url_trust_class=trust_class,
+        declared_structured_output_strategy=declared_strategy,
+        structured_output_declaration_source=declaration_source,
     )
 
 
@@ -406,15 +682,226 @@ def classify_execution_runtime(
         provider_config=provider_config,
         target_model=target_model,
     )
-    return _classify_execution_api_mode(api_mode)
+    return _classify_execution_api_mode(
+        api_mode,
+        provider=provider,
+        model=_execution_model(model_config, provider_config, target_model),
+        base_url=_execution_base_url(model_config, provider_config),
+    )
+
+
+def snapshot_configured_execution_routes(
+    config: Mapping[str, object] | object,
+) -> Mapping[str, ConfiguredExecutionRoute]:
+    """Freeze credential-free route records using runtime resolver precedence."""
+    if not isinstance(config, Mapping):
+        return MappingProxyType({})
+
+    routes: dict[str, ConfiguredExecutionRoute] = {}
+    for entry in get_compatible_custom_providers(copy.deepcopy(dict(config))):
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "").strip()
+        provider_key = str(entry.get("provider_key") or "").strip()
+        route_evidence_error = None
+        try:
+            base_url = _credential_free_route_url(entry.get("base_url"))
+        except _UnclassifiedRouteQuery:
+            base_url = ""
+            route_evidence_error = _UNCLASSIFIED_ROUTE_QUERY
+        if (not base_url and route_evidence_error is None) or not (
+            name or provider_key
+        ):
+            continue
+        model = str(entry.get("model") or "").strip()
+        api_mode = str(entry.get("api_mode") or "").strip().lower()
+        route = ConfiguredExecutionRoute(
+            requested_provider=provider_key or name,
+            effective_provider="custom",
+            model_config={"provider": "custom", "default": model},
+            provider_config={
+                **({"base_url": base_url} if base_url else {}),
+                **({"api_mode": api_mode} if api_mode else {}),
+                **({"model": model} if model else {}),
+            },
+            route_evidence_error=route_evidence_error,
+        )
+        aliases: set[str] = set()
+        for candidate in (name, provider_key):
+            normalized = _normalize_custom_provider_name(candidate)
+            if not normalized:
+                continue
+            if normalized.startswith("custom:"):
+                aliases.add(normalized)
+                continue
+            aliases.add(f"custom:{normalized}")
+            try:
+                canonical = auth_mod.resolve_provider(normalized)
+            except AuthError:
+                canonical = ""
+            # Named custom records cannot shadow a canonical built-in. This
+            # mirrors _get_named_custom_provider(); an explicit custom:<name>
+            # request remains routable.
+            if normalized == "custom" or canonical != normalized:
+                aliases.add(normalized)
+        for alias in aliases:
+            routes.setdefault(alias, route)
+
+    model_config = config.get("model")
+    if isinstance(model_config, Mapping):
+        requested = str(model_config.get("provider") or "").strip().lower()
+        if requested and requested not in routes:
+            try:
+                effective_provider = auth_mod.resolve_provider(requested)
+            except AuthError:
+                effective_provider = ""
+            safe_keys = (
+                "provider", "default", "model", "default_model", "base_url",
+                "api", "url", "api_mode", "transport", "openai_runtime",
+            )
+            safe_model_config = {
+                key: model_config[key]
+                for key in safe_keys
+                if key in model_config
+            }
+            route_evidence_error = None
+            for key in ("base_url", "api", "url"):
+                if key not in safe_model_config:
+                    continue
+                try:
+                    safe_url = _credential_free_route_url(safe_model_config[key])
+                except _UnclassifiedRouteQuery:
+                    route_evidence_error = _UNCLASSIFIED_ROUTE_QUERY
+                    for url_key in ("base_url", "api", "url"):
+                        safe_model_config.pop(url_key, None)
+                    break
+                if safe_url:
+                    safe_model_config[key] = safe_url
+                else:
+                    safe_model_config.pop(key, None)
+            if effective_provider == "anthropic":
+                configured_base_url = _execution_base_url(
+                    safe_model_config, safe_model_config
+                )
+                if configured_base_url and not _anthropic_base_url_override_ok(
+                    configured_base_url
+                ):
+                    for key in ("base_url", "api", "url"):
+                        safe_model_config.pop(key, None)
+            route_keys = (
+                "base_url", "api", "url", "api_mode", "transport",
+                "openai_runtime",
+            )
+            has_route_evidence = any(
+                isinstance(safe_model_config.get(key), str)
+                and bool(str(safe_model_config.get(key)).strip())
+                for key in route_keys
+            ) or route_evidence_error is not None
+            if effective_provider and has_route_evidence:
+                routes[requested] = ConfiguredExecutionRoute(
+                    requested_provider=requested,
+                    effective_provider=effective_provider,
+                    model_config=safe_model_config,
+                    provider_config=safe_model_config,
+                    route_evidence_error=route_evidence_error,
+                )
+
+    return MappingProxyType(routes)
+
+
+def classify_configured_execution_route(
+    route: ConfiguredExecutionRoute,
+    *,
+    target_model: str | None = None,
+) -> ExecutionRuntimeCapabilities:
+    """Classify one frozen configured record without credentials or live config."""
+    classified = classify_execution_runtime(
+        provider=route.effective_provider,
+        model_config=route.model_config,
+        provider_config=route.provider_config,
+        target_model=target_model,
+    )
+    if route.route_evidence_error is None:
+        return classified
+    return ExecutionRuntimeCapabilities(
+        api_mode=classified.api_mode,
+        hermes_managed_tool_loop=False,
+        effective_provider=classified.effective_provider,
+        model=classified.model,
+        base_url_trust_class="unknown",
+        declared_structured_output_strategy=(
+            StructuredOutputStrategy.UNSUPPORTED.value
+        ),
+        structured_output_declaration_source="route_query_unclassified",
+    )
 
 
 def classify_resolved_execution_runtime(
     runtime: Mapping[str, Any] | object,
+    *,
+    target_model: object = None,
 ) -> ExecutionRuntimeCapabilities:
     """Classify the API mode on an already-resolved runtime mapping."""
-    api_mode = runtime.get("api_mode") if isinstance(runtime, Mapping) else None
-    return _classify_execution_api_mode(api_mode)
+    if not isinstance(runtime, Mapping):
+        return _classify_execution_api_mode(None)
+    return _classify_execution_api_mode(
+        runtime.get("api_mode"),
+        provider=runtime.get("provider"),
+        model=_execution_model({}, runtime, target_model),
+        base_url=runtime.get("base_url"),
+    )
+
+
+def resolve_structured_output_capability(
+    runtime: ExecutionRuntimeCapabilities,
+    *,
+    schema_fingerprint: str,
+    model: str | None = None,
+) -> StructuredOutputCapabilityDecision:
+    """Seal one structured-output strategy from explicit runtime authority."""
+    declared = runtime.declared_structured_output_strategy
+    if declared == StructuredOutputStrategy.UNSUPPORTED.value:
+        strategy = StructuredOutputStrategy.UNSUPPORTED
+        if runtime.structured_output_declaration_source == (
+            "route_query_unclassified"
+        ):
+            source = "route_query_unclassified"
+            rationale = "provider route query cannot be classified without secrets"
+        else:
+            source = "explicit_unsupported"
+            rationale = "provider explicitly forbids structured-output adaptation"
+    elif not runtime.hermes_managed_tool_loop:
+        strategy = StructuredOutputStrategy.UNSUPPORTED
+        source = "delegated_runtime"
+        rationale = "delegated runtime has no Hermes structured-output contract"
+    elif (
+        runtime.base_url_trust_class == "trusted_direct"
+        and declared
+        in {
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
+            StructuredOutputStrategy.NATIVE_JSON_MODE.value,
+        }
+    ):
+        strategy = StructuredOutputStrategy(declared)
+        source = runtime.structured_output_declaration_source or "provider_profile"
+        rationale = "trusted direct provider explicitly declares native support"
+    else:
+        strategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+        source = "managed_loop_default"
+        rationale = (
+            "Hermes-managed loop uses prompt schema adaptation without a trusted "
+            "direct native declaration"
+        )
+    return StructuredOutputCapabilityDecision(
+        strategy=strategy,
+        effective_provider=runtime.effective_provider,
+        model=(model.strip() if isinstance(model, str) else runtime.model),
+        api_mode=runtime.api_mode,
+        declaration_source=source,
+        adapter_version=_STRUCTURED_OUTPUT_ADAPTER_VERSION,
+        schema_fingerprint=schema_fingerprint,
+        rationale=_structured_output_rationale(rationale),
+    )
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:

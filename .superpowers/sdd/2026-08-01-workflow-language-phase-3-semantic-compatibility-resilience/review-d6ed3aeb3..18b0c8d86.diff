@@ -1,0 +1,2252 @@
+# Review package: d6ed3aeb359a920fe806719b09ca9aaac68756bf..HEAD
+
+## Commits
+18b0c8d86 fix(workflow): authenticate recovery journal order
+
+## Files changed
+ .../task-13-report.md                              | 127 ++++++
+ .../task-13-round-9-analysis.md                    | 191 ++++++++
+ plugins/workflow/executors/ai.py                   |  34 ++
+ plugins/workflow/notifications.py                  |  96 ++++-
+ plugins/workflow/store.py                          | 404 ++++++++++++++---
+ tests/plugins/workflow/test_notifications.py       |  52 +++
+ .../workflow/test_persistent_session_recovery.py   | 479 ++++++++++++++++++++-
+ 7 files changed, 1293 insertions(+), 90 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md
+index f6e03a9e4..2652129c9 100644
+--- a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md
++++ b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md
+@@ -1563,10 +1563,137 @@ passed **157/157**.
+ The correction is confined to public store redaction. Private selection and
+ winner codecs, exact event binding, completion authority, provider release,
+ cancellation linearization, CAS reconciliation, and bounded public evidence
+ remain unchanged. Existing schema-v1, unversioned, Hermes legacy,
+ normalizer-v1/v2, ordinary v3, and no-fence semantics remain covered by the
+ focused and expanded gates.
+
+ No Task 14 work or out-of-scope mutation was performed. No push, publication,
+ merge, branch deletion, worktree deletion, literal-`main` mutation, shared
+ `base` checkout mutation, or brand-ref mutation was performed.
++
++## Fix Round 9 — Authenticated journal order and centralized value-free recovery
++
++### Starting identity and finding disposition
++
++- HEAD: `d6ed3aeb359a920fe806719b09ca9aaac68756bf`
++- Tree: `3427ba03daab94ac9dda167b14ca1a998872c86c`
++- Worktree: clean
++
++The user explicitly authorized this ninth bounded Task 13 fix round. The round
++addresses the complete specification and quality Round 8 rereview findings in
++one architectural correction. The retained analysis is
++`task-13-round-9-analysis.md`.
++
++### Correction
++
++- Selection and winner private authorities now use schema version 3 and carry
++  a domain-separated predecessor journal-order chain commitment. The
++  commitment is computed under the run lock and validated for every schema-v3
++  authority in one bounded linear scan before semantic binding, projection
++  replay/repair, public event reads, mutable index corroboration, or
++  notification reconciliation.
++- Coherently recomputed deletion, prefix truncation, insertion, duplication,
++  reorder, renumbering, and rewrite before activation fail closed. Exact
++  activation-frame and winner-projection corroboration remain independently
++  required for semantic continuation and registry CAS.
++- Historical schema-v2 authorities are never silently upgraded from mutable
++  journal history: they are privacy-only, impose conservative all-run public
++  privacy, and cannot supply active recovery semantics. Approved schema-v1
++  behavior remains exact.
++- Current framed journals reject unexpected top-level fields. One locked
++  public journal reader now performs order/authority/completion verification
++  before recursively removing session IDs, cache fingerprints, private
++  candidate containers, provider/error/history fields, aliases, and exact
++  authority-known values, including occurrences inside nested strings and
++  list elements.
++- Selected fresh-recovery failures persist fixed messages, no artifacts, and
++  only bounded operational metadata. Raw provider/worker exceptions, audit
++  history, provider path/content, model/session data, usage, and fingerprints
++  cannot enter durable public recovery diagnostics.
++- Direct notification append uses a recursive value-free projection and fixed
++  delivery errors. Raw-journal notification reconciliation now consumes the
++  same locked, chain-verified public event boundary and never persists raw
++  `last_error`.
++- Existing journal corruption without a private schema-v3 authority retains
++  its established fixed `sequence gap` / run-identity taxonomy.
++
++No provider release boundary, cancellation linearization, retry accounting,
++command authority, workflow language surface, prompt/tool schema, Desktop
++production file, or legacy/unversioned behavior changed.
++
++### Exact TDD and adversarial evidence
++
++Every Python command used `scripts/run_tests.sh` with
++`HERMES_PYTHON=../../.venv/bin/python` and
++`HERMES_TEST_FILE_RETRIES=0`. No direct pytest invocation or retry was used.
++
++Initial focused RED before production edits:
++
++```bash
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_notifications.py
++```
++
++Result: **129 passed / 14 failed**. The failures proved the missing schema-v3
++selection/winner chain, coherent order-mutation detection, whole-event
++recursive privacy, conservative schema-v2 behavior, fixed exception/worker
++diagnostics, and value-free notification persistence.
++
++The complete focused rerun after correction passed **149/149**. Self-review
++then added explicit malformed-v3 rows for unsupported version, wrong
++predecessor count, bad hex, a valid-length wrong-genesis digest, and an extra
++authority field; all five pass. It also added a direct notification alias,
++nested session-ID, and embedded-list-string canary. That notification test was
++RED before the recursive direct-append correction and GREEN afterward.
++
++The order-damage matrix contiguously renumbers events and recomputes every
++mutable frame/projection/journal/index digest after prefix deletion, insertion,
++duplication, reorder, and moving a later private payload before activation.
++Store tail/latest/events-after, timeline evidence, and raw-journal notification
++reconciliation all fail closed without returning the canaries. Existing real
++authenticated API, Desktop, CLI, no-fence selection/winner, crash boundary,
++typed/schemaless, success/failure/cancel/interruption, and Showcase tests share
++the same verified store boundary.
++
++### Final Fix Round 9 verification
++
++Canonical Task 13 ten-file command:
++
++```bash
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
++```
++
++Result: **10 files, 360 passed / 0 failed**, 14 workers, 43.3 seconds.
++
++Expanded agent/scheduler/Desktop/API/CLI/notification/Showcase command:
++
++```bash
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_showcase_evidence.py
++```
++
++Result: **11 files, 624 passed / 0 failed**, 14 workers, 83.9 seconds. The
++generic plugin-agent file passed **129/129**, authenticated Desktop API passed
++**157/157**, notifications passed **13/13**, and Showcase passed **4/4**.
++
++Additional security/performance command:
++
++```bash
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_performance_bounds.py tests/plugins/workflow/test_security_boundaries.py
++```
++
++Result: **2 files, 43 passed / 0 failed**, 14 workers, 26.8 seconds.
++
++### Fix Round 9 changed files and self-review
++
++- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
++- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-analysis.md`
++- `plugins/workflow/executors/ai.py`
++- `plugins/workflow/notifications.py`
++- `plugins/workflow/store.py`
++- `tests/plugins/workflow/test_notifications.py`
++- `tests/plugins/workflow/test_persistent_session_recovery.py`
++
++The correction is confined to Task 13 recovery order authority, public
++privacy, diagnostics, notifications, and their tests/evidence. No Task 14 work
++or out-of-scope mutation was performed. No push, publication, merge, branch
++deletion, worktree deletion, literal-`main` mutation, shared `base` checkout
++mutation, or brand-ref mutation was performed.
+diff --git a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-analysis.md b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-analysis.md
+new file mode 100644
+index 000000000..1a6dd4061
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-analysis.md
+@@ -0,0 +1,191 @@
++# Task 13 Round 9 Pre-Implementation Analysis
++
++## Why prior rounds did not close
++
++Prior fixes followed one concrete review reproduction at a time. The underlying
++boundary has five independent dimensions: private authority source, public
++state, event identity, event position, and historical order. Green tests proved
++the named mutation but did not cover the complete cross-product. Round 9 must
++implement invariants for the whole class before closing individual examples.
++
++## Trusted and untrusted state
++
++Trusted within the approved threat model:
++
++- canonical insert-only private authority rows in SQLite;
++- the per-run lock while observing the journal and writing a precommit;
++- SQLite FULL synchronous commit semantics;
++- SHA-256 collision resistance.
++
++Untrusted/recomputable:
++
++- `events.jsonl`, `run.json`, event sequence numbers and identities;
++- event projections, frame/projection self-digests;
++- the mutable runs-table projection and whole-journal digest index;
++- public state, markers, diagnostics, event payloads, and aliases.
++
++Direct coordinated modification of both the private authority JSON and its
++stored digest is outside this bounded damage model.
++
++## Binding invariant
++
++Emit schema-v3 selection and winner authority rows. Retain the schema-v2 fields
++and add:
++
++- `journal_order_version: 1`
++- `activation_predecessor_sequence: activation_event_sequence - 1`
++- `activation_predecessor_chain_sha256: <64 lowercase hex>`
++
++Use a domain-separated ordered chain over recomputed canonical frame digests:
++
++```text
++H0 = SHA256(domain-genesis || length(run_id) || run_id)
++Hi = SHA256(domain-step || H[i-1] || u64be(i) || frame_digest(event_i))
++```
++
++Compute the predecessor checkpoint once under the run lock before inserting a
++selection or winner precommit. Require the current journal length and projection
++event sequence to equal activation minus one. Validate all schema-v3 prefix
++commitments in one O(events + authorities) scan before semantic binding,
++projection rebuild, public reads, repair adoption, mutable index resync, or
++notification reconciliation.
++
++Any deletion, prefix truncation, insertion, duplication, reorder, renumbering,
++or rewrite before activation must cause a fixed value-free fail-closed result.
++Suffix damage after activation may remain readable only when every returned
++event is value-free. Raw precommits remain privacy-only; semantic continuation
++still requires the exact activation frame and exact winner projection.
++
++Apply the prefix commitment to both selection and winner rows. Anchoring only
++selection would move unauthenticated order into winner/CAS semantics.
++
++Schema policy:
++
++- schema-v3: exact prefix validation and authentic pre-activation behavior;
++- schema-v2: never infer/backfill a prefix from the mutable journal; use
++  conservative all-run privacy and fail closed for active semantic authority;
++- schema-v1: preserve the approved exact compatibility behavior.
++
++## Crash invariants
++
++- Before private commit: no authority or activation.
++- No-fence private commit before append: prefix-bound privacy-only precommit;
++  exact activation absent, so no semantic authority or CAS.
++- Torn activation append: truncate/preserve the torn tail; precommit remains
++  inert and the predecessor checkpoint remains valid.
++- Journal fsync before run.json: journal transition authority rebuilds only
++  after prefix validation.
++- Fenced journal fsync before SQLite commit: transaction rollback leaves public
++  recovery without private authority and must fail closed; never backfill.
++- Winner precommit before completion: unrelated events cannot activate winner
++  semantics.
++- Winner completion with rolled-back private row: reverse invariant fails and
++  no CAS occurs.
++
++## Privacy invariant
++
++Every public projection either fails with a fixed value-free error or contains
++none of the exact private values. This includes missing/new session IDs, cache
++fingerprints, provider paths/content/history canaries, and exact candidate
++containers.
++
++Defense in depth:
++
++1. Strictly reject unexpected top-level journal-frame fields.
++2. Recursively remove structural `session_id` and `cache_fingerprint` keys from
++   the entire activation-or-later event, not only the projection/payload.
++3. Recursively redact authority-known exact values and occurrences inside
++   strings throughout the whole public object.
++4. Persist only an allowlisted failed-recovery audit/diagnostic shape. Never
++   persist raw provider/worker exception text or audit history for a selected
++   recovery.
++5. Use fixed failure codes/messages for public errors.
++6. Keep private candidate/key containers out of every public location.
++
++Normal failed-fresh, cancelled, interrupted, and paused selections are privacy
++protected even without a winner. Successful continuation still requires an
++exact bound winner.
++
++## Consumers that must share verification/redaction
++
++- status, run list/board/history, attention;
++- tail/latest/events-after and every pagination boundary;
++- timeline, interactions, attempts, notifications, and recovery evidence;
++- authenticated detail/events/evidence/notification APIs and Desktop;
++- CLI status/events and Showcase status/report collection;
++- NotificationOutbox direct append and raw-journal reconciliation.
++
++`NotificationOutbox._journal_candidates` currently reads raw journal data and
++must use the same verified/redacted path or an equivalent centralized helper.
++Direct append notifications must not persist raw `last_error`.
++
++## Required RED matrix
++
++Order/persistence:
++
++- delete, prefix-truncate, insert, duplicate, swap, or rewrite pre-activation
++  frames, then contiguously renumber and recompute all mutable digests/indexes;
++- move a post-activation private payload before activation;
++- delete/replace activation; reorder/rewrite suffix; torn activation/suffix;
++- no-fence selection and winner precommit with unrelated event at reserved
++  sequence;
++- fenced journal-first rollback for selection and winner;
++- malformed schema-v3 chain fields, wrong predecessor count, wrong run genesis,
++  unsupported version, extra fields, bad hex;
++- schema-v2 conservative behavior and exact schema-v1 compatibility.
++
++Privacy/diagnostics:
++
++- exact private values in canonical keys, aliases, top-level fields, nested
++  maps/lists, messages, warnings, last_error, sibling metadata, artifacts, and
++  audit/error text;
++- worker audit failure plus direct PermissionError/OSError/ValueError/
++  RuntimeError paths;
++- success, failed result, thrown exception, timeout, cancellation,
++  interruption, pause; typed and schemaless outputs;
++- original and substituted canaries;
++- pages beginning before, at, and after activation.
++
++Consumers:
++
++- status/list/attention, tail/latest/events-after, all evidence kinds,
++  notifications, authenticated API, Desktop inheritance, CLI, and Showcase.
++
++Each case may fail closed or return sanitized output, but no surface may contain
++any private canary merely because another surface rejects it.
++
++## Round 9 file ownership
++
++Production:
++
++- `plugins/workflow/store.py`
++- `plugins/workflow/executors/ai.py`
++- `plugins/workflow/notifications.py`
++
++Tests:
++
++- `tests/plugins/workflow/test_persistent_session_recovery.py`
++- `tests/plugins/workflow/test_notifications.py`
++- `tests/plugins/workflow/test_desktop_api.py`
++- `tests/plugins/workflow/test_cli.py`
++- `tests/plugins/workflow/test_showcase_evidence.py`
++
++Evidence:
++
++- tracked `task-13-report.md`
++
++Do not modify the generic worker unless a proven invariant cannot be enforced
++at the workflow executor boundary. Stop for any other file.
++
++## Closure conditions
++
++- All Round 8 findings and every matrix sibling have behavioral RED then GREEN.
++- Both private authority types authenticate prefix order.
++- No public consumer bypasses the centralized verified/redacted path.
++- Diagnostics are allowlisted and value-free before durable persistence.
++- Ordinary v3 non-recovery and exact unversioned/Hermes-legacy/v1/v2/schema-v1
++  behavior remain unchanged.
++- Provider replay, cancellation, CAS, finalization, bounded retry, prompt cache,
++  and narrow-waist guarantees remain unchanged.
++- Complete focused, canonical, expanded, notification, Desktop/API/CLI,
++  Showcase, Ruff, and diff gates pass with retries disabled.
+diff --git a/plugins/workflow/executors/ai.py b/plugins/workflow/executors/ai.py
+index 584c6182c..55c18e632 100644
+--- a/plugins/workflow/executors/ai.py
++++ b/plugins/workflow/executors/ai.py
+@@ -799,23 +799,57 @@ class AgentNodeExecutor:
+         stale_cache_fingerprint: str | None = None
+         recovery_selected = False
+
+         def with_recovery_failure(
+             failure: NodeExecutionResult,
+         ) -> NodeExecutionResult:
+             if recovery_selected and failure.status in {
+                 "failed",
+                 "cancelled",
+                 "interrupted",
++                "paused",
+             }:
++                allowed_metadata = {
++                    key: value
++                    for key, value in dict(failure.metadata).items()
++                    if key
++                    in {
++                        "provider_attempts",
++                        "provider_attempts_exact",
++                        "known_no_effect",
++                        "unknown_side_effect",
++                        "outcome_unknown",
++                        "archon_terminal_failure",
++                        "additional_provider_attempts",
++                    }
++                    and (
++                        value is None
++                        or isinstance(value, bool | int | float | str)
++                    )
++                }
++                fixed_message = {
++                    "authorization": "selected recovery authorization failed",
++                    "authentication": "selected recovery authentication failed",
++                    "network_error": "selected recovery network operation failed",
++                    "network_disconnect": "selected recovery network operation failed",
++                    "validation": "selected recovery validation failed",
++                    "provider_timeout": "selected recovery provider timed out",
++                    "cancelled": "selected recovery was cancelled",
++                }.get(
++                    str(failure.error_code or ""),
++                    "selected recovery execution failed",
++                )
+                 return replace(
+                     failure,
++                    artifacts=(),
++                    error_message=fixed_message,
++                    metadata=allowed_metadata,
+                     session_recovery_outcome="fresh_execution_failed",
+                 )
+             return failure
+
+         if explicit_context == "shared":
+             predecessors = [
+                 context.predecessor_results.get(dependency)
+                 for dependency in node.depends_on
+                 if context.predecessor_results.get(dependency) is not None
+             ]
+diff --git a/plugins/workflow/notifications.py b/plugins/workflow/notifications.py
+index d55fb4de2..a65d0d162 100644
+--- a/plugins/workflow/notifications.py
++++ b/plugins/workflow/notifications.py
+@@ -138,20 +138,91 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str
+         pending_type = pending.get("type") if isinstance(pending, Mapping) else None
+         if pending_type in {"approval", "workflow_approval"}:
+             return "approval_required"
+         if pending_type == "loop_input":
+             return "input_required"
+         if pending_type == "reconcile":
+             return "reconciliation_required"
+     return None
+
+
++def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str, object]:
++    """Project notification data without durable raw recovery/error authority."""
++    projected = sanitize_projection(dict(payload))
++    if not isinstance(projected, dict):
++        return {}
++    sensitive_values: set[str] = set()
++
++    def normalized_key(key: object) -> str:
++        return "".join(
++            character for character in str(key).lower() if character.isalnum()
++        )
++
++    def is_sensitive_key(key: object) -> bool:
++        normalized = normalized_key(key)
++        return (
++            normalized.endswith("sessionid")
++            or normalized.endswith("cachefingerprint")
++            or normalized in {"sessionalias", "fingerprintalias"}
++        ) and not normalized.endswith("sha256")
++
++    to_collect: list[object] = [projected]
++    while to_collect:
++        current = to_collect.pop()
++        if isinstance(current, dict):
++            for key, value in current.items():
++                if is_sensitive_key(key) and isinstance(value, str):
++                    sensitive_values.add(value)
++                to_collect.append(value)
++        elif isinstance(current, list):
++            to_collect.extend(current)
++
++    pending: list[object] = [projected]
++    while pending:
++        current = pending.pop()
++        if isinstance(current, dict):
++            for key in tuple(current):
++                normalized = normalized_key(key)
++                if is_sensitive_key(key) or normalized in {
++                    "sessionregistryupdatecandidate",
++                    "pendingsessionregistryupdate",
++                    "pendingsessionregistryupdates",
++                }:
++                    current.pop(key, None)
++                    continue
++                if normalized == "lasterror":
++                    current[key] = "workflow operation failed"
++                    continue
++                child = current[key]
++                if isinstance(child, str):
++                    for private_value in sorted(
++                        sensitive_values, key=len, reverse=True
++                    ):
++                        if private_value:
++                            child = child.replace(private_value, "[REDACTED]")
++                    current[key] = child
++                else:
++                    pending.append(child)
++        elif isinstance(current, list):
++            for index, child in enumerate(current):
++                if isinstance(child, str):
++                    for private_value in sorted(
++                        sensitive_values, key=len, reverse=True
++                    ):
++                        if private_value:
++                            child = child.replace(private_value, "[REDACTED]")
++                    current[index] = child
++                else:
++                    pending.append(child)
++    return projected
++
++
+ class NotificationOutbox:
+     """Lease-based delivery authority backed by the RunStore SQLite index."""
+
+     def __init__(self, store) -> None:
+         self.store = store
+         with self.store._connect() as connection:
+             install_notification_schema(connection)
+
+     @staticmethod
+     def _aware(now: datetime) -> datetime:
+@@ -172,21 +243,23 @@ class NotificationOutbox:
+     def _record_decision_fact(
+         connection: sqlite3.Connection,
+         row: Mapping[str, object],
+         *,
+         decision: str,
+         occurrence_key: str,
+         payload: Mapping[str, object],
+         occurred_at: str,
+     ) -> None:
+         safe_payload = json.dumps(
+-            sanitize_projection({"decision": decision, **dict(payload)}),
++            _value_free_notification_payload(
++                {"decision": decision, **dict(payload)}
++            ),
+             sort_keys=True,
+             separators=(",", ":"),
+         )
+         connection.execute(
+             "INSERT OR IGNORE INTO workflow_notification_facts ("
+             "transition_key, notification_id, run_id, kind, destination, "
+             "transition_version, payload_json, occurred_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (
+                 f"notification:{row['notification_id']}:{occurrence_key}",
+@@ -218,21 +291,23 @@ class NotificationOutbox:
+         transition_destination = destination
+         if destination.startswith("gateway:"):
+             capability = destination.removeprefix("gateway:")
+             transition_destination = (
+                 "gateway:sha256:" + hashlib.sha256(capability.encode()).hexdigest()
+             )
+         transition_key = (
+             f"{run_id}:{kind}:{transition_version}:{transition_destination}"
+         )
+         safe_payload = json.dumps(
+-            sanitize_projection(dict(payload)), sort_keys=True, separators=(",", ":")
++            _value_free_notification_payload(payload),
++            sort_keys=True,
++            separators=(",", ":"),
+         )
+         gateway_destination = self._gateway_destination(
+             run_id,
+             source_destination=destination,
+             delivery_state=delivery_state,
+         )
+         with self.store._connect() as connection:
+             connection.execute("BEGIN IMMEDIATE")
+             duplicate = connection.execute(
+                 "SELECT notification_id FROM workflow_notification_facts "
+@@ -428,22 +503,23 @@ class NotificationOutbox:
+                     and not allow_page_overrun
+                 ):
+                     raise _NotificationRepairPageFull
+                 data, reported_size = _read_contained_regular_file(
+                     directory, journal_path, max_journal_bytes + 1
+                 )
+                 if reported_size > max_journal_bytes:
+                     raise NotificationReconciliationError(
+                         "journal exceeds its enforced quota"
+                     )
+-                events = self.store._read_journal_events(
++                events = self.store._verified_public_journal_events_locked(
+                     directory,
++                    run_id=run_id,
+                     recover_torn_tail=False,
+                     journal_data=data,
+                 )
+         except NotificationReconciliationError:
+             raise
+         except _NotificationRepairPageFull:
+             raise
+         except WorkflowLockTimeout:
+             raise
+         except (
+@@ -766,28 +842,31 @@ class NotificationOutbox:
+                 return False
+             decision = (
+                 "delivery_outcome_uncertain"
+                 if outcome_uncertain
+                 else "terminal_dead_letter"
+             )
+             connection.execute(
+                 "UPDATE workflow_notification_outbox SET state='dead', "
+                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, "
+                 "last_error=? WHERE notification_id=?",
+-                (observed.isoformat(), error[:512], notification_id),
++                (observed.isoformat(), "notification delivery failed", notification_id),
+             )
+             self._record_decision_fact(
+                 connection,
+                 row,
+                 decision=decision,
+                 occurrence_key=f"{decision}:{uuid.uuid4().hex}",
+-                payload={"error": error[:512], "attempts": row["attempts"]},
++                payload={
++                    "error": "notification delivery failed",
++                    "attempts": row["attempts"],
++                },
+                 occurred_at=observed.isoformat(),
+             )
+             connection.commit()
+         return True
+
+     def ack(self, notification_id: str, *, owner_id: str, now: datetime | None = None) -> bool:
+         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
+         with self.store._connect() as connection:
+             changed = connection.execute(
+                 "UPDATE workflow_notification_outbox SET state='delivered', "
+@@ -819,31 +898,34 @@ class NotificationOutbox:
+             dead = attempts >= 8
+             available = observed + timedelta(seconds=min(300, 2 ** min(attempts, 8)))
+             connection.execute(
+                 "UPDATE workflow_notification_outbox SET state=?, available_at=?, "
+                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, last_error=? "
+                 "WHERE notification_id=?",
+                 (
+                     "dead" if dead else "pending",
+                     available.isoformat(),
+                     observed.isoformat(),
+-                    error[:512],
++                    "notification delivery failed",
+                     notification_id,
+                 ),
+             )
+             if dead:
+                 self._record_decision_fact(
+                     connection,
+                     row,
+                     decision="terminal_dead_letter",
+                     occurrence_key=f"terminal-dead:{attempts}:{uuid.uuid4().hex}",
+-                    payload={"attempts": attempts, "error": error[:512]},
++                    payload={
++                        "attempts": attempts,
++                        "error": "notification delivery failed",
++                    },
+                     occurred_at=observed.isoformat(),
+                 )
+             connection.commit()
+         return True
+
+     def retry_dead(
+         self,
+         notification_id: str,
+         authority_scope: str,
+         *,
+diff --git a/plugins/workflow/store.py b/plugins/workflow/store.py
+index f6a7f778b..a0217f5da 100644
+--- a/plugins/workflow/store.py
++++ b/plugins/workflow/store.py
+@@ -217,24 +217,30 @@ def _private_authority_json(authority: Mapping[str, object]) -> str:
+         separators=(",", ":"),
+         ensure_ascii=False,
+     )
+
+
+ def _session_recovery_selection_authority(
+     selection: PersistentSessionRecoverySelection,
+     *,
+     activation_event_sequence: int,
+     activation_event_type: str,
++    activation_predecessor_chain_sha256: str,
+ ) -> dict[str, object]:
+     return {
+-        "schema_version": 2,
++        "schema_version": 3,
++        "journal_order_version": 1,
+         "activation_event_sequence": activation_event_sequence,
++        "activation_predecessor_sequence": activation_event_sequence - 1,
++        "activation_predecessor_chain_sha256": (
++            activation_predecessor_chain_sha256
++        ),
+         "activation_event_type": activation_event_type,
+         "run_id": selection.run_id,
+         "attempt_id": selection.attempt_id,
+         "key": {
+             "workflow": selection.key.workflow,
+             "node_id": selection.key.node_id,
+             "scope": selection.key.scope,
+             "provider": selection.key.provider,
+             "profile": selection.key.profile,
+         },
+@@ -244,24 +250,30 @@ def _session_recovery_selection_authority(
+         "source": selection.source,
+         "provider_attempts_before_recovery": 0,
+     }
+
+
+ def _session_registry_winner_authority(
+     candidate: SessionRegistryUpdateCandidate,
+     *,
+     activation_event_sequence: int,
+     activation_event_type: str,
++    activation_predecessor_chain_sha256: str,
+ ) -> dict[str, object]:
+     return {
+-        "schema_version": 2,
++        "schema_version": 3,
++        "journal_order_version": 1,
+         "activation_event_sequence": activation_event_sequence,
++        "activation_predecessor_sequence": activation_event_sequence - 1,
++        "activation_predecessor_chain_sha256": (
++            activation_predecessor_chain_sha256
++        ),
+         "activation_event_type": activation_event_type,
+         "candidate": _session_registry_candidate_payload(candidate),
+     }
+
+
+ def _session_recovery_selection_from_authority(
+     value: object,
+ ) -> tuple[PersistentSessionRecoverySelection, int | None, str | None]:
+     if not isinstance(value, Mapping):
+         raise JournalRecoveryError("session recovery selection authority is malformed")
+@@ -272,22 +284,31 @@ def _session_recovery_selection_from_authority(
+         "attempt_id",
+         "key",
+         "expected_generation",
+         "missing_session_id",
+         "cache_fingerprint",
+         "source",
+         "provider_attempts_before_recovery",
+     }
+     activation: int | None = None
+     event_type: str | None = None
+-    if schema_version == 2:
++    if schema_version in {2, 3}:
+         expected_fields.update({"activation_event_sequence", "activation_event_type"})
++        if schema_version == 3:
++            expected_fields.update(
++                {
++                    "journal_order_version",
++                    "activation_predecessor_sequence",
++                    "activation_predecessor_chain_sha256",
++                }
++            )
++            _validate_journal_order_authority_fields(value)
+         activation_value = value.get("activation_event_sequence")
+         if (
+             isinstance(activation_value, bool)
+             or not isinstance(activation_value, int)
+             or activation_value < 1
+         ):
+             raise JournalRecoveryError(
+                 "session recovery selection activation is malformed"
+             )
+         activation = activation_value
+@@ -331,27 +352,37 @@ def _session_recovery_selection_from_authority(
+     except (KeyError, TypeError, ValueError) as exc:
+         raise JournalRecoveryError(
+             "session recovery selection identity is malformed"
+         ) from exc
+     return selection, activation, event_type
+
+
+ def _session_registry_candidate_from_authority(
+     value: object,
+ ) -> tuple[SessionRegistryUpdateCandidate, int, int | None, str | None]:
+-    if isinstance(value, Mapping) and value.get("schema_version") == 2:
+-        if set(value) != {
++    if isinstance(value, Mapping) and value.get("schema_version") in {2, 3}:
++        expected_fields = {
+             "schema_version",
+             "activation_event_sequence",
+             "activation_event_type",
+             "candidate",
+-        }:
++        }
++        if value.get("schema_version") == 3:
++            expected_fields.update(
++                {
++                    "journal_order_version",
++                    "activation_predecessor_sequence",
++                    "activation_predecessor_chain_sha256",
++                }
++            )
++            _validate_journal_order_authority_fields(value)
++        if set(value) != expected_fields:
+             raise JournalRecoveryError("session registry winner authority is malformed")
+         activation = value.get("activation_event_sequence")
+         if (
+             isinstance(activation, bool)
+             or not isinstance(activation, int)
+             or activation < 1
+         ):
+             raise JournalRecoveryError("session registry winner activation is malformed")
+         event_type = value.get("activation_event_type")
+         if event_type != "node_succeeded":
+@@ -802,20 +833,109 @@ def _projection_digest(projection: Mapping[str, object]) -> str:
+
+ def _journal_frame_digest(event: Mapping[str, object]) -> str:
+     material = dict(event)
+     material.pop("frame_sha256", None)
+     encoded = json.dumps(
+         material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+     ).encode("utf-8")
+     return _sha256(encoded)
+
+
++_JOURNAL_ORDER_GENESIS_DOMAIN = b"hermes.workflow.journal-order.v1.genesis\0"
++_JOURNAL_ORDER_STEP_DOMAIN = b"hermes.workflow.journal-order.v1.step\0"
++
++
++def _journal_order_genesis(run_id: str) -> bytes:
++    encoded = run_id.encode("utf-8")
++    return hashlib.sha256(
++        _JOURNAL_ORDER_GENESIS_DOMAIN
++        + len(encoded).to_bytes(8, "big")
++        + encoded
++    ).digest()
++
++
++def _journal_order_checkpoints(
++    run_id: str,
++    events: Iterable[Mapping[str, object]],
++) -> tuple[str, ...]:
++    """Return genesis and every domain-separated ordered frame checkpoint."""
++    chain = _journal_order_genesis(run_id)
++    checkpoints = [chain.hex()]
++    for sequence, event in enumerate(events, 1):
++        if event.get("sequence") != sequence:
++            raise JournalRecoveryError("journal sequence gap")
++        if event.get("run_id") != run_id:
++            raise JournalRecoveryError("journal run identity mismatch")
++        try:
++            frame_digest = bytes.fromhex(_journal_frame_digest(event))
++        except ValueError as exc:
++            raise JournalRecoveryError("journal order authority is invalid") from exc
++        chain = hashlib.sha256(
++            _JOURNAL_ORDER_STEP_DOMAIN
++            + chain
++            + sequence.to_bytes(8, "big")
++            + frame_digest
++        ).digest()
++        checkpoints.append(chain.hex())
++    return tuple(checkpoints)
++
++
++def _validate_journal_order_authority_fields(
++    authority: Mapping[str, object],
++) -> None:
++    activation = authority.get("activation_event_sequence")
++    predecessor = authority.get("activation_predecessor_sequence")
++    digest = authority.get("activation_predecessor_chain_sha256")
++    if (
++        authority.get("journal_order_version") != 1
++        or isinstance(activation, bool)
++        or not isinstance(activation, int)
++        or activation < 1
++        or isinstance(predecessor, bool)
++        or not isinstance(predecessor, int)
++        or predecessor != activation - 1
++        or not isinstance(digest, str)
++        or _SHA256_PATTERN.fullmatch(digest) is None
++    ):
++        raise JournalRecoveryError("private session journal order is malformed")
++
++
++def _validate_private_authority_journal_order(
++    authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
++    events: Iterable[Mapping[str, object]],
++    *,
++    run_id: str,
++) -> None:
++    """Validate every immutable prefix commitment in one bounded linear scan."""
++    ordered_authorities = tuple(
++        authority
++        for table in (
++            "session_recovery_selection_authority",
++            "session_registry_winner_authority",
++        )
++        for authority in authorities.get(table, {}).values()
++        if authority.get("schema_version") == 3
++    )
++    if not ordered_authorities:
++        return
++    event_list = tuple(events)
++    checkpoints = _journal_order_checkpoints(run_id, event_list)
++    for authority in ordered_authorities:
++        _validate_journal_order_authority_fields(authority)
++        predecessor = int(authority["activation_predecessor_sequence"])
++        if predecessor >= len(checkpoints) or not hmac.compare_digest(
++            str(authority["activation_predecessor_chain_sha256"]),
++            checkpoints[predecessor],
++        ):
++            raise JournalRecoveryError("private session journal order is invalid")
++
++
+ def _encode_journal_frame(event: Mapping[str, object]) -> tuple[dict[str, object], bytes]:
+     framed = dict(event)
+     framed["schema_version"] = 2
+     framed["frame_version"] = 1
+     framed["frame_sha256"] = _journal_frame_digest(framed)
+     encoded = json.dumps(
+         framed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+     ).encode("utf-8") + b"\n"
+     return framed, encoded
+
+@@ -861,60 +981,135 @@ def _redact_private_session_authority(
+     value: Mapping[str, object],
+     *,
+     private_authorities: Mapping[
+         str, Mapping[str, Mapping[str, object]]
+     ] | None = None,
+     trusted_run_id: str | None = None,
+     trusted_event_sequence: int | None = None,
+ ) -> dict[str, object]:
+     """Copy a public run/event projection without exact session authority."""
+
+-    def redact_session_fields(item: object) -> None:
++    sensitive_values: set[str] = set()
++
++    def sensitive_key(key: object) -> bool:
++        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
++        return (
++            normalized.endswith("sessionid")
++            or normalized.endswith("cachefingerprint")
++            or normalized in {"sessionalias", "fingerprintalias"}
++        ) and not normalized.endswith("sha256")
++
++    def collect_sensitive_values(item: object) -> None:
++        pending = [item]
++        while pending:
++            current = pending.pop()
++            if isinstance(current, Mapping):
++                for child_key, child_value in current.items():
++                    if sensitive_key(child_key) and isinstance(child_value, str):
++                        sensitive_values.add(child_value)
++                    pending.append(child_value)
++            elif isinstance(current, list | tuple):
++                pending.extend(current)
++
++    def redact_session_fields(item: object, *, aggressive: bool = False) -> None:
+         pending = [item]
+         while pending:
+             current = pending.pop()
+             if isinstance(current, dict):
+-                current.pop("session_id", None)
+-                current.pop("cache_fingerprint", None)
+-                pending.extend(current.values())
++                for child_key in tuple(current):
++                    normalized = re.sub(
++                        r"[^a-z0-9]", "", str(child_key).lower()
++                    )
++                    if sensitive_key(child_key) or normalized in {
++                        "sessionregistryupdatecandidate",
++                        "pendingsessionregistryupdate",
++                        "pendingsessionregistryupdates",
++                    }:
++                        current.pop(child_key, None)
++                        continue
++                    if aggressive and normalized in {
++                        "message",
++                        "warnings",
++                        "lasterror",
++                        "errormessage",
++                        "exception",
++                        "rawexception",
++                        "history",
++                        "providerpath",
++                        "providercontent",
++                        "rawproviderresponse",
++                    }:
++                        current.pop(child_key, None)
++                        continue
++                    child = current[child_key]
++                    if isinstance(child, str):
++                        for private_value in sorted(
++                            sensitive_values, key=len, reverse=True
++                        ):
++                            if private_value:
++                                child = child.replace(private_value, "[REDACTED]")
++                        current[child_key] = child
++                    else:
++                        pending.append(child)
+             elif isinstance(current, list):
+-                pending.extend(current)
++                for index, child in enumerate(current):
++                    if isinstance(child, str):
++                        for private_value in sorted(
++                            sensitive_values, key=len, reverse=True
++                        ):
++                            if private_value:
++                                child = child.replace(
++                                    private_value, "[REDACTED]"
++                                )
++                        current[index] = child
++                    else:
++                        pending.append(child)
+
+     projected = copy.deepcopy(dict(value))
+     authority_projection = (
+         projected["projection"]
+         if isinstance(projected.get("projection"), dict)
+         else projected
+     )
+     authority_projection.pop("pending_session_registry_update", None)
+     authority_projection.pop("pending_session_registry_updates", None)
+     nodes = authority_projection.get("nodes")
+     protected_attempts: set[tuple[str, str]] = set()
+     selection_event_privacy = False
++    unchained_all_run_privacy = False
+     authority_run_id = trusted_run_id or authority_projection.get("run_id")
+     if private_authorities is not None:
+         for authority in private_authorities.get(
+             "session_recovery_selection_authority", {}
+         ).values():
+             try:
+                 selection, activation, _event_type = (
+                     _session_recovery_selection_from_authority(authority)
+                 )
+             except JournalRecoveryError as exc:
+                 raise JournalRecoveryError(
+                     "private session selection authority is malformed"
+                 ) from exc
+             if selection.run_id == authority_run_id:
++                sensitive_values.update(
++                    {selection.missing_session_id, selection.cache_fingerprint}
++                )
+                 protected_attempts.add(
+                     (selection.key.node_id, selection.attempt_id)
+                 )
+                 if (
++                    authority.get("schema_version") == 2
++                    and trusted_event_sequence is not None
++                ):
++                    selection_event_privacy = True
++                    unchained_all_run_privacy = True
++                elif (
+                     activation is not None
+                     and trusted_event_sequence is not None
+                     and trusted_event_sequence >= activation
+                 ):
+                     selection_event_privacy = True
+         for authority in private_authorities.get(
+             "session_registry_winner_authority", {}
+         ).values():
+             try:
+                 candidate, retry_count, _activation, _event_type = (
+@@ -923,20 +1118,23 @@ def _redact_private_session_authority(
+                     )
+                 )
+             except JournalRecoveryError as exc:
+                 raise JournalRecoveryError(
+                     "private session winner authority is malformed"
+                 ) from exc
+             if (
+                 retry_count == 0
+                 and candidate.winning_run_id == authority_run_id
+             ):
++                sensitive_values.update(
++                    {candidate.new_session_id, candidate.cache_fingerprint}
++                )
+                 protected_attempts.add(
+                     (candidate.winning_node_id, candidate.winning_attempt_id)
+                 )
+     if isinstance(nodes, dict):
+         for node_id, node in nodes.items():
+             if not isinstance(node, dict):
+                 continue
+             node_is_protected = any(
+                 protected_node_id == str(node_id)
+                 for protected_node_id, _attempt_id in protected_attempts
+@@ -979,21 +1177,27 @@ def _redact_private_session_authority(
+                 artifact.pop("session_id", None)
+                 artifact.pop("cache_fingerprint", None)
+     payload = projected.get("payload")
+     if isinstance(payload, dict):
+         payload_attempt_id = payload.get("attempt_id")
+         event_identity = (
+             str(projected.get("node_id") or payload.get("node_id")),
+             str(projected.get("attempt_id") or payload_attempt_id),
+         )
+         if selection_event_privacy or event_identity in protected_attempts:
++            collect_sensitive_values(payload)
+             redact_session_fields(payload)
++    if selection_event_privacy:
++        collect_sensitive_values(projected)
++        redact_session_fields(projected, aggressive=True)
++        if unchained_all_run_privacy and isinstance(projected.get("payload"), dict):
++            projected["payload"] = {}
+     return projected
+
+
+ def _trusted_journal_positions(
+     events: Iterable[Mapping[str, object]],
+ ) -> tuple[tuple[int, Mapping[str, object]], ...]:
+     """Bind event privacy to contiguous journal order, not mutable identity."""
+     positioned = tuple(enumerate(events, 1))
+     for position, event in positioned:
+         if event.get("sequence") != position:
+@@ -4593,61 +4797,86 @@ class RunStore:
+                     raise JournalRecoveryError(
+                         "private session authority is noncanonical"
+                     )
+                 if table == "session_recovery_selection_authority":
+                     _session_recovery_selection_from_authority(authority)
+                 else:
+                     _session_registry_candidate_from_authority(authority)
+                 authorities[table][str(row["attempt_id"])] = authority
+         return authorities
+
++    def _journal_predecessor_chain_locked(
++        self,
++        directory: Path,
++        *,
++        run_id: str,
++        expected_predecessor_sequence: int,
++    ) -> str:
++        events = self._read_journal_events(directory)
++        if len(events) != expected_predecessor_sequence:
++            raise JournalRecoveryError("journal activation predecessor is invalid")
++        checkpoints = _journal_order_checkpoints(run_id, events)
++        return checkpoints[expected_predecessor_sequence]
++
+     @staticmethod
+     def _bind_private_session_authorities_to_events(
+         authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
+         events: Iterable[Mapping[str, object]],
+         *,
+         run_id: str,
+     ) -> dict[str, dict[str, Mapping[str, object]]]:
+-        """Keep schema-v2 precommits only when their exact frame exists."""
++        """Keep schema-v1/v3 authorities only when immutable activation binds."""
++        event_list = tuple(events)
++        _validate_private_authority_journal_order(
++            authorities,
++            event_list,
++            run_id=run_id,
++        )
+         event_by_sequence = {
+             int(event["sequence"]): event
+-            for event in events
++            for event in event_list
+             if isinstance(event.get("sequence"), int)
+             and not isinstance(event.get("sequence"), bool)
+         }
+         bound: dict[str, dict[str, Mapping[str, object]]] = {
+             "session_recovery_selection_authority": {},
+             "session_registry_winner_authority": {},
+         }
+         for attempt_id, authority in authorities.get(
+             "session_recovery_selection_authority", {}
+         ).items():
+             selection, activation, event_type = (
+                 _session_recovery_selection_from_authority(authority)
+             )
++            if authority.get("schema_version") == 2:
++                # A historical unchained precommit is privacy-only. Inferring a
++                # prefix from the mutable journal would silently upgrade trust.
++                continue
+             if activation is not None:
+                 event = event_by_sequence.get(activation)
+                 if (
+                     event is None
+                     or event.get("run_id") != run_id
+                     or event.get("event_type") != event_type
+                     or event.get("node_id") != selection.key.node_id
+                     or event.get("attempt_id") != selection.attempt_id
+                 ):
+                     continue
+             bound["session_recovery_selection_authority"][attempt_id] = authority
+         for attempt_id, authority in authorities.get(
+             "session_registry_winner_authority", {}
+         ).items():
+             candidate, _retry_count, activation, event_type = (
+                 _session_registry_candidate_from_authority(authority)
+             )
++            if authority.get("schema_version") == 2:
++                continue
+             if activation is not None:
+                 event = event_by_sequence.get(activation)
+                 if (
+                     event is None
+                     or event.get("run_id") != run_id
+                     or event.get("event_type") != event_type
+                     or event.get("node_id") != candidate.winning_node_id
+                     or event.get("attempt_id") != candidate.winning_attempt_id
+                 ):
+                     continue
+@@ -4841,24 +5070,32 @@ class RunStore:
+             "schema_version",
+             "run_id",
+             "attempt_id",
+             "key",
+             "expected_generation",
+             "missing_session_id",
+             "cache_fingerprint",
+             "source",
+             "provider_attempts_before_recovery",
+         }
+-        if schema_version == 2:
++        if schema_version in {2, 3}:
+             expected_fields.update(
+                 {"activation_event_sequence", "activation_event_type"}
+             )
++            if schema_version == 3:
++                expected_fields.update(
++                    {
++                        "journal_order_version",
++                        "activation_predecessor_sequence",
++                        "activation_predecessor_chain_sha256",
++                    }
++                )
+         elif schema_version != 1:
+             return False
+         if set(selection_authority) != expected_fields:
+             return False
+         key = selection_authority.get("key")
+         if not isinstance(key, Mapping) or set(key) != {
+             "workflow",
+             "node_id",
+             "scope",
+             "provider",
+@@ -4888,21 +5125,21 @@ class RunStore:
+             and attempt.get("attempt_id") == attempt_id
+         ] if isinstance(attempts, list) else []
+         attempt = matching_attempts[0] if len(matching_attempts) == 1 else None
+         recoveries = node.get("session_recoveries") if isinstance(node, Mapping) else None
+         matches = [
+             recovery
+             for recovery in recoveries
+             if isinstance(recovery, Mapping)
+             and recovery.get("attempt_id") == attempt_id
+         ] if isinstance(recoveries, list) else []
+-        if schema_version == 2:
++        if schema_version in {2, 3}:
+             activation = selection_authority.get("activation_event_sequence")
+             if (
+                 isinstance(activation, bool)
+                 or not isinstance(activation, int)
+                 or activation < 1
+                 or selection_authority.get("activation_event_type")
+                 != "persistent_session_missing_fresh_start"
+             ):
+                 return False
+             active = int(projection.get("event_sequence", 0)) >= activation
+@@ -6341,20 +6578,39 @@ class RunStore:
+         if frame_version is None:
+             if event.get("schema_version") != 1:
+                 raise JournalRecoveryError(
+                     f"unsupported journal schema at line {line_number}"
+                 )
+             return
+         if frame_version != 1 or event.get("schema_version") != 2:
+             raise JournalRecoveryError(
+                 f"unsupported journal frame at line {line_number}"
+             )
++        allowed_fields = {
++            "sequence",
++            "timestamp",
++            "run_id",
++            "node_id",
++            "attempt_id",
++            "event_type",
++            "payload",
++            "payload_truncated",
++            "projection",
++            "projection_sha256",
++            "schema_version",
++            "frame_version",
++            "frame_sha256",
++        }
++        if not set(event) <= allowed_fields:
++            raise JournalRecoveryError(
++                f"journal frame fields are invalid at line {line_number}"
++            )
+         checksum = event.get("frame_sha256")
+         if not isinstance(checksum, str) or len(checksum) != 64:
+             raise JournalRecoveryError(
+                 f"journal frame checksum missing at line {line_number}"
+             )
+         if not hmac.compare_digest(checksum, _journal_frame_digest(event)):
+             raise JournalRecoveryError(
+                 f"journal frame checksum mismatch at line {line_number}"
+             )
+
+@@ -8046,62 +8302,77 @@ class RunStore:
+         except (TypeError, ValueError) as exc:
+             raise JournalRecoveryError(
+                 "scheduled coordinator queue sequence is invalid"
+             ) from exc
+         if fence < 0:
+             raise JournalRecoveryError(
+                 "scheduled coordinator queue sequence is invalid"
+             )
+         return observed, fence
+
++    def _verified_public_journal_events_locked(
++        self,
++        directory: Path,
++        *,
++        run_id: str,
++        journal_data: bytes | None = None,
++        recover_torn_tail: bool = True,
++    ) -> tuple[dict[str, object], ...]:
++        """Return one chain-verified, value-free journal view under the run lock."""
++        events = self._read_journal_events(
++            directory,
++            journal_data=journal_data,
++            recover_torn_tail=recover_torn_tail,
++        )
++        positioned_events = _trusted_journal_positions(events)
++        private_authorities = self._read_private_session_authorities(run_id=run_id)
++        bound_private_authorities = self._bind_private_session_authorities_to_events(
++            private_authorities,
++            events,
++            run_id=run_id,
++        )
++        self._validate_recovery_completion_event_authority(
++            events,
++            run_id=run_id,
++            private_authorities=bound_private_authorities,
++        )
++        return tuple(
++            _redact_private_session_authority(
++                event,
++                private_authorities=private_authorities,
++                trusted_run_id=run_id,
++                trusted_event_sequence=position,
++            )
++            for position, event in positioned_events
++        )
++
+     def tail_events(
+         self,
+         run_id: str,
+         *,
+         after_sequence: int = 0,
+         limit: int = 100,
+         operator_scope: str | None = None,
+     ) -> tuple[dict[str, object], ...]:
+         if not 1 <= limit <= 200:
+             raise ValueError("limit must be between 1 and 200")
+         directory = self.run_directory(run_id, operator_scope=operator_scope)
+         with workflow_lock(self._run_lock_path(run_id)):
+-            events = self._read_journal_events(directory)
+-            positioned_events = _trusted_journal_positions(events)
+-            private_authorities = self._read_private_session_authorities(
++            events = self._verified_public_journal_events_locked(
++                directory,
+                 run_id=run_id,
+             )
+-            bound_private_authorities = (
+-                self._bind_private_session_authorities_to_events(
+-                    private_authorities,
+-                    events,
+-                    run_id=run_id,
+-                )
+-            )
+-            self._validate_recovery_completion_event_authority(
+-                events,
+-                run_id=run_id,
+-                private_authorities=bound_private_authorities,
+-            )
+         selected = tuple(
+-            (position, event)
+-            for position, event in positioned_events
+-            if int(event["sequence"]) > after_sequence
++            event for event in events if int(event["sequence"]) > after_sequence
+         )[:limit]
+         public_events = []
+-        for position, event in selected:
+-            event = _redact_private_session_authority(
+-                event,
+-                private_authorities=private_authorities,
+-                trusted_run_id=run_id,
+-                trusted_event_sequence=position,
+-            )
++        for event in selected:
+             event.pop("projection", None)
+             event.pop("projection_sha256", None)
+             public_events.append(_sanitize(event))
+         return tuple(public_events)
+
+     def events_after(
+         self,
+         run_id: str,
+         *,
+         after: int = 0,
+@@ -8141,57 +8412,38 @@ class RunStore:
+         run_id: str,
+         *,
+         limit: int = 100,
+         operator_scope: str | None = None,
+     ) -> dict[str, object]:
+         """Return one sanitized newest-event page with explicit truncation."""
+         if not 1 <= limit <= 200:
+             raise ValueError("limit must be between 1 and 200")
+         directory = self.run_directory(run_id, operator_scope=operator_scope)
+         with workflow_lock(self._run_lock_path(run_id)):
+-            all_events = self._read_journal_events(directory)
+-            positioned_events = _trusted_journal_positions(all_events)
++            all_events = self._verified_public_journal_events_locked(
++                directory,
++                run_id=run_id,
++            )
+             selected_start = max(0, len(all_events) - limit)
+-            selected = positioned_events[selected_start:]
+-            private_authorities = self._read_private_session_authorities(
+-                run_id=run_id,
+-            )
+-            bound_private_authorities = (
+-                self._bind_private_session_authorities_to_events(
+-                    private_authorities,
+-                    all_events,
+-                    run_id=run_id,
+-                )
+-            )
+-            self._validate_recovery_completion_event_authority(
+-                all_events,
+-                run_id=run_id,
+-                private_authorities=bound_private_authorities,
+-            )
++            selected = all_events[selected_start:]
+         truncated = (
+             len(all_events) > limit
+             or projection_was_truncated(
+-                tuple(event for _position, event in selected)
++                tuple(selected)
+             )
+             or any(
+                 bool(event.get("payload_truncated"))
+-                for _position, event in selected
++                for event in selected
+             )
+         )
+         public_events = []
+-        for position, event in selected:
+-            event = _redact_private_session_authority(
+-                event,
+-                private_authorities=private_authorities,
+-                trusted_run_id=run_id,
+-                trusted_event_sequence=position,
+-            )
++        for event in selected:
+             event.pop("projection", None)
+             event.pop("projection_sha256", None)
+             public_events.append(sanitize_projection(event))
+         return {
+             "events": tuple(public_events),
+             "truncated": truncated,
+             "next_cursor": (
+                 int(public_events[-1]["sequence"]) if public_events else 0
+             ),
+         }
+@@ -9845,20 +10097,29 @@ class RunStore:
+                 if existing is None and len(recoveries) == 6:
+                     raise StorageQuotaError(
+                         "persistent session recovery evidence is full"
+                     )
+                 selection_authority = _session_recovery_selection_authority(
+                     selection,
+                     activation_event_sequence=int(projection["event_sequence"]) + 1,
+                     activation_event_type=(
+                         "persistent_session_missing_fresh_start"
+                     ),
++                    activation_predecessor_chain_sha256=(
++                        self._journal_predecessor_chain_locked(
++                            directory,
++                            run_id=claim.run_id,
++                            expected_predecessor_sequence=int(
++                                projection["event_sequence"]
++                            ),
++                        )
++                    ),
+                 )
+                 with (
+                     nullcontext(fence_connection)
+                     if fence_connection is not None
+                     else self._connect()
+                 ) as authority_connection:
+                     if fence_connection is None:
+                         authority_connection.execute("BEGIN IMMEDIATE")
+                     self._write_private_authority(
+                         authority_connection,
+@@ -11650,20 +11911,29 @@ class RunStore:
+                         authority_connection,
+                         table="session_registry_winner_authority",
+                         run_id=claim.run_id,
+                         attempt_id=claim.attempt_id,
+                         authority=_session_registry_winner_authority(
+                             session_registry_update,
+                             activation_event_sequence=(
+                                 int(projection["event_sequence"]) + 1
+                             ),
+                             activation_event_type="node_succeeded",
++                            activation_predecessor_chain_sha256=(
++                                self._journal_predecessor_chain_locked(
++                                    directory,
++                                    run_id=claim.run_id,
++                                    expected_predecessor_sequence=int(
++                                        projection["event_sequence"]
++                                    ),
++                                )
++                            ),
+                         ),
+                     )
+                     if fence_connection is None:
+                         authority_connection.commit()
+             if status == "paused":
+                 with (
+                     nullcontext(fence_connection)
+                     if fence_connection is not None
+                     else self._connect()
+                 ) as connection:
+diff --git a/tests/plugins/workflow/test_notifications.py b/tests/plugins/workflow/test_notifications.py
+index 987f55592..e3718af8a 100644
+--- a/tests/plugins/workflow/test_notifications.py
++++ b/tests/plugins/workflow/test_notifications.py
+@@ -86,20 +86,72 @@ def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
+         destination="desktop",
+         owner_id="electron-b",
+         now=now + timedelta(seconds=1),
+         lease_seconds=30,
+     ) == ()
+     assert restarted.ack(notification_id, owner_id="electron-b", now=now) is False
+     assert restarted.ack(notification_id, owner_id="electron-a", now=now) is True
+     assert restarted.pending_attention(run_id="run-1") == ()
+
+
++def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_path):
++    """Provider-controlled delivery errors cannot enter durable public history."""
++    store = RunStore(tmp_path / "notification-private-errors")
++    outbox = NotificationOutbox(store)
++    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
++    canary = "private-notification-session-provider-path-history"
++    notification_id = outbox.record(
++        run_id="private-notification-run",
++        kind="failure",
++        destination="desktop",
++        transition_version=1,
++        payload={
++            "last_error": canary,
++            "sessionAlias": canary,
++            "nested": {
++                "node_session_id": canary,
++                "messages": [f"embedded {canary}"],
++            },
++        },
++        now=now,
++    )
++    leased = outbox.lease(
++        destination="desktop",
++        owner_id="notification-owner",
++        now=now,
++        lease_seconds=30,
++    )
++    assert leased[0]["notification_id"] == notification_id
++    assert outbox.terminal_fail(
++        notification_id,
++        owner_id="notification-owner",
++        error=canary,
++        now=now,
++    )
++
++    with store._connect() as connection:
++        durable = " ".join(
++            str(value)
++            for row in connection.execute(
++                "SELECT workflow_notification_outbox.payload_json, last_error, "
++                "workflow_notification_facts.payload_json "
++                "FROM workflow_notification_outbox LEFT JOIN "
++                "workflow_notification_facts USING(notification_id) "
++                "WHERE notification_id=?",
++                (notification_id,),
++            ).fetchall()
++            for value in row
++        )
++    assert canary not in durable
++    assert canary not in str(outbox.history(run_id="private-notification-run"))
++
++
+ def test_expired_desktop_lease_returns_to_pending_and_dismissal_is_projection_only(
+     tmp_path,
+ ):
+     store = RunStore(tmp_path / "home")
+     outbox = NotificationOutbox(store)
+     now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+     notification_id = outbox.record(
+         run_id="run-2",
+         kind="failure",
+         destination="desktop",
+diff --git a/tests/plugins/workflow/test_persistent_session_recovery.py b/tests/plugins/workflow/test_persistent_session_recovery.py
+index b080dab20..8e1e8c28f 100644
+--- a/tests/plugins/workflow/test_persistent_session_recovery.py
++++ b/tests/plugins/workflow/test_persistent_session_recovery.py
+@@ -27,20 +27,21 @@ from plugins.workflow.executors.ai import AgentNodeExecutor
+ from plugins.workflow.executors.base import NodeExecutionContext
+ from plugins.workflow.evidence import EvidenceReader
+ from plugins.workflow.language_schema import compatibility_code_catalog
+ from plugins.workflow.models import (
+     DeadlineBudget,
+     ExecutionFence,
+     WorkflowLanguageProfile,
+     WorkflowNode,
+     freeze_value,
+ )
++from plugins.workflow.notifications import NotificationOutbox
+ from plugins.workflow.resources import VariableContext
+ from plugins.workflow.sanitize import public_run_projection
+ from plugins.workflow.scheduler import RunScheduler
+ from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+ from plugins.workflow.sessions import (
+     NodeSessionKey,
+     NodeSessionRegistry,
+     PersistentSessionRecoverySelection,
+     SessionRegistryUpdateCandidate,
+ )
+@@ -407,20 +408,63 @@ def _rewrite_journal_event(
+             separators=(",", ":"),
+             ensure_ascii=False,
+         ).encode("utf-8")
+     ).hexdigest()
+     (directory / "events.jsonl").write_text(
+         "\n".join(json.dumps(item) for item in events) + "\n",
+         encoding="utf-8",
+     )
+
+
++def _rewrite_complete_journal_order(
++    store: RunStore,
++    run_id: str,
++    mutate: Callable[[list[dict[str, object]]], None],
++) -> None:
++    """Rewrite every mutable journal checksum after an order mutation."""
++    directory = store.run_directory(run_id)
++    journal = directory / "events.jsonl"
++    events = [json.loads(line) for line in journal.read_text().splitlines()]
++    mutate(events)
++    for sequence, event in enumerate(events, 1):
++        event["sequence"] = sequence
++        projection = event.get("projection")
++        if isinstance(projection, dict):
++            projection["event_sequence"] = sequence
++            event["projection_sha256"] = hashlib.sha256(
++                json.dumps(
++                    projection,
++                    sort_keys=True,
++                    separators=(",", ":"),
++                    ensure_ascii=False,
++                ).encode("utf-8")
++            ).hexdigest()
++        material = dict(event)
++        material.pop("frame_sha256", None)
++        event["frame_sha256"] = hashlib.sha256(
++            json.dumps(
++                material,
++                sort_keys=True,
++                separators=(",", ":"),
++                ensure_ascii=False,
++            ).encode("utf-8")
++        ).hexdigest()
++    encoded = ("\n".join(json.dumps(event) for event in events) + "\n").encode()
++    journal.write_bytes(encoded)
++    with sqlite3.connect(store.database) as connection:
++        connection.execute(
++            "UPDATE runs SET journal_sha256=? WHERE run_id=?",
++            (hashlib.sha256(encoded).hexdigest(), run_id),
++        )
++        connection.commit()
++
++
+ def _resolved_running_recovery(
+     store: RunStore,
+     package,
+ ) -> tuple[str, SessionRegistryUpdateCandidate]:
+     admitted = _admit(store, package, "resolved-running")
+     claim = store.claim_node(
+         admitted.run_id,
+         "first",
+         "resolved-running-owner",
+         journal_reserve_bytes=2 * 1024 * 1024,
+@@ -3474,28 +3518,36 @@ def test_selected_recovery_event_privacy_does_not_trust_mutable_completion_field
+     ):
+         assert private_value not in cli_output
+
+
+ def _assert_private_values_absent(
+     read_public: Callable[[], object],
+     private_values: tuple[str, ...],
+ ) -> None:
+     try:
+         public = read_public()
+-    except JournalRecoveryError as exc:
++    except RuntimeError as exc:
+         encoded = str(exc)
+     else:
+         encoded = json.dumps(public, sort_keys=True)
+     for private_value in private_values:
+         assert private_value not in encoded
+
+
++def _private_selection_values(store: RunStore, run_id: str) -> tuple[str, str]:
++    authorities = store._read_private_session_authorities(run_id=run_id)
++    authority = next(
++        iter(authorities["session_recovery_selection_authority"].values())
++    )
++    return str(authority["missing_session_id"]), str(authority["cache_fingerprint"])
++
++
+ def _rewrite_recovery_completion_chain(
+     store: RunStore,
+     run_id: str,
+     mutate: Callable[[dict[str, object], str], None],
+ ) -> None:
+     directory = store.run_directory(run_id)
+     events = [
+         json.loads(line)
+         for line in (directory / "events.jsonl").read_text().splitlines()
+     ]
+@@ -3589,22 +3641,21 @@ def test_failed_fresh_recovery_selection_is_the_public_privacy_boundary(
+     runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+     runner.fresh_failure = True
+     run_id, result = _run_once(
+         store,
+         package,
+         runner,
+         registry,
+         "fresh-failure-privacy",
+     )
+     assert result["status"] == "failed"
+-    internal = store.load_run(run_id)
+-    fingerprint = internal["nodes"]["analyze"]["cache_fingerprint"]
++    _missing_session, fingerprint = _private_selection_values(store, run_id)
+     assert len(fingerprint) == 64
+
+     for read_public in (
+         lambda: store.get_run_status(run_id),
+         lambda: store.tail_events(run_id),
+         lambda: store.latest_event_page(run_id),
+         lambda: store.events_after(run_id),
+         lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+     ):
+         _assert_private_values_absent(read_public, (fingerprint,))
+@@ -3844,23 +3895,23 @@ def test_selection_activation_event_privacy_uses_trusted_run_and_sequence(
+     runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+     runner.fresh_failure = True
+     run_id, result = _run_once(
+         store,
+         package,
+         runner,
+         registry,
+         f"{identity_damage}-recovery",
+     )
+     attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+-    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
+-        "cache_fingerprint"
+-    ]
++    _missing_session, original_fingerprint = _private_selection_values(
++        store, run_id
++    )
+     substituted_session = f"private-{identity_damage}-session"
+     substituted_fingerprint = hashlib.sha256(
+         f"private-{identity_damage}-fingerprint".encode()
+     ).hexdigest()
+
+     def damage_activation(event) -> None:
+         payload = event["payload"]
+         payload["session_id"] = substituted_session
+         payload["cache_fingerprint"] = substituted_fingerprint
+         if identity_damage in {"outer-node", "outer-both", "all-identities"}:
+@@ -3920,23 +3971,23 @@ def test_later_run_level_event_privacy_uses_selection_activation_boundary(
+     _run_once(store, package, runner, registry, "later-event-seed")
+     runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+     runner.fresh_failure = True
+     run_id, result = _run_once(
+         store,
+         package,
+         runner,
+         registry,
+         "later-event-recovery",
+     )
+-    original_fingerprint = store.load_run(run_id)["nodes"]["analyze"][
+-        "cache_fingerprint"
+-    ]
++    _missing_session, original_fingerprint = _private_selection_values(
++        store, run_id
++    )
+     substituted_session = "private-later-run-event-session"
+     substituted_fingerprint = "e" * 64
+
+     def damage_later_event(event) -> None:
+         event["event_type"] = "rewritten_run_level_event"
+         event["node_id"] = "sibling"
+         event["attempt_id"] = "sibling-attempt"
+         event["projection"]["run_id"] = "substituted-run"
+         payload = event["payload"]
+         payload.update(
+@@ -4000,35 +4051,36 @@ def test_selection_privacy_leaves_pre_activation_event_payload_unchanged(
+         workflow_writer,
+         tmp_path / "pre-activation-event-privacy",
+         name="pre-activation-event-privacy",
+     )
+     store = RunStore(tmp_path / "pre-activation-event-privacy-home")
+     registry = NodeSessionRegistry(tmp_path / "pre-activation-event-privacy-home")
+     runner = _PersistentRunner()
+     _run_once(store, package, runner, registry, "pre-activation-seed")
+     runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+     runner.fresh_failure = True
+-    run_id, _result = _run_once(
+-        store,
+-        package,
+-        runner,
+-        registry,
+-        "pre-activation-recovery",
+-    )
+     earlier_session = "ordinary-pre-activation-session-field"
+     earlier_fingerprint = "d" * 64
+
++    admitted = _admit(store, package, "pre-activation-recovery")
++    run_id = admitted.run_id
++
+     def add_earlier_payload(event) -> None:
+         event["payload"]["session_id"] = earlier_session
+         event["payload"]["cache_fingerprint"] = earlier_fingerprint
+
+     _rewrite_journal_event(store, run_id, "run_admitted", add_earlier_payload)
++    RunScheduler(
++        store,
++        agent_runner=runner,
++        session_registry=registry,
++    ).advance(run_id)
+     public = json.dumps(store.tail_events(run_id), sort_keys=True)
+     assert earlier_session in public
+     assert earlier_fingerprint in public
+
+
+ def test_selection_event_privacy_fails_closed_when_journal_order_is_damaged(
+     tmp_path, workflow_writer
+ ) -> None:
+     """Removing an earlier frame cannot shift activation below its private fence."""
+     package = _archon_package(
+@@ -4119,10 +4171,405 @@ def test_selected_nonwinning_completion_redacts_private_session_fields(
+     )
+
+     for read_public in (
+         lambda: store.get_run_status(admitted.run_id),
+         lambda: store.tail_events(admitted.run_id),
+         lambda: store.latest_event_page(admitted.run_id),
+         lambda: store.events_after(admitted.run_id),
+         lambda: EvidenceReader(store).query(admitted.run_id, kind="timeline"),
+     ):
+         _assert_private_values_absent(read_public, (session_id, fingerprint))
++
++
++def _failed_fresh_recovery_run(tmp_path, workflow_writer, *, name: str):
++    package = _archon_package(workflow_writer, tmp_path / name, name=name)
++    home = tmp_path / f"{name}-home"
++    store = RunStore(home)
++    registry = NodeSessionRegistry(home)
++    runner = _PersistentRunner()
++    _run_once(store, package, runner, registry, f"{name}-seed")
++    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
++    runner.fresh_failure = True
++    run_id, result = _run_once(store, package, runner, registry, name)
++    assert result["status"] == "failed"
++    return store, run_id
++
++
++def test_new_recovery_authorities_bind_immutable_journal_predecessor_chain(
++    tmp_path, workflow_writer
++) -> None:
++    """Selection and winner rows must authenticate their historical prefix."""
++    package = _archon_package(
++        workflow_writer,
++        tmp_path / "journal-prefix-authorities",
++        name="journal-prefix-authorities",
++    )
++    store = RunStore(tmp_path / "journal-prefix-authorities-home")
++    registry = NodeSessionRegistry(tmp_path / "journal-prefix-authorities-home")
++    runner = _PersistentRunner()
++    _run_once(store, package, runner, registry, "journal-prefix-seed")
++    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
++    run_id, _result = _run_once(
++        store, package, runner, registry, "journal-prefix-recovery"
++    )
++
++    with sqlite3.connect(store.database) as connection:
++        rows = connection.execute(
++            "SELECT authority_json FROM session_recovery_selection_authority "
++            "WHERE run_id=? UNION ALL SELECT authority_json FROM "
++            "session_registry_winner_authority WHERE run_id=?",
++            (run_id, run_id),
++        ).fetchall()
++    assert len(rows) == 2
++    for row in rows:
++        authority = json.loads(row[0])
++        assert authority["schema_version"] == 3
++        assert authority["journal_order_version"] == 1
++        assert authority["activation_predecessor_sequence"] == (
++            authority["activation_event_sequence"] - 1
++        )
++        assert len(authority["activation_predecessor_chain_sha256"]) == 64
++
++
++@pytest.mark.parametrize(
++    ("field", "value"),
++    (
++        pytest.param("journal_order_version", 2, id="unsupported-version"),
++        pytest.param(
++            "activation_predecessor_sequence", -1, id="wrong-predecessor-count"
++        ),
++        pytest.param(
++            "activation_predecessor_chain_sha256",
++            "not-a-digest",
++            id="bad-hex",
++        ),
++        pytest.param(
++            "activation_predecessor_chain_sha256",
++            "0" * 64,
++            id="wrong-run-genesis",
++        ),
++        pytest.param(
++            "unexpected_private_field",
++            "private-extra-field",
++            id="extra-field",
++        ),
++    ),
++)
++def test_malformed_v3_journal_order_authority_fails_closed_value_free(
++    tmp_path, workflow_writer, field, value
++) -> None:
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name=f"malformed-order-{field}"
++    )
++    canary = "malformed-order-private-session-canary"
++    with sqlite3.connect(store.database) as connection:
++        row = connection.execute(
++            "SELECT attempt_id, authority_json FROM "
++            "session_recovery_selection_authority WHERE run_id=?",
++            (run_id,),
++        ).fetchone()
++        authority = json.loads(row[1])
++        authority[field] = value
++        authority["missing_session_id"] = canary
++        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":"))
++        connection.execute(
++            "UPDATE session_recovery_selection_authority SET authority_json=?, "
++            "authority_sha256=? WHERE attempt_id=?",
++            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
++        )
++        connection.commit()
++    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
++
++
++def test_winner_prefix_detects_rewrite_between_selection_and_completion(
++    tmp_path, workflow_writer
++) -> None:
++    """The winner independently binds the selection frame in its predecessor."""
++    package = _archon_package(
++        workflow_writer,
++        tmp_path / "winner-prefix-order",
++        name="winner-prefix-order",
++    )
++    store = RunStore(tmp_path / "winner-prefix-order-home")
++    registry = NodeSessionRegistry(tmp_path / "winner-prefix-order-home")
++    runner = _PersistentRunner()
++    _run_once(store, package, runner, registry, "winner-prefix-seed")
++    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
++    run_id, _result = _run_once(
++        store, package, runner, registry, "winner-prefix-recovery"
++    )
++    canary = "winner-prefix-private-canary"
++
++    def rewrite_selection(event) -> None:
++        event["payload"]["message"] = canary
++
++    _rewrite_journal_event(
++        store,
++        run_id,
++        "persistent_session_missing_fresh_start",
++        rewrite_selection,
++    )
++    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
++
++
++def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
++    tmp_path, workflow_writer
++) -> None:
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name="recovery-pagination-privacy"
++    )
++    authorities = store._read_private_session_authorities(run_id=run_id)
++    authority = next(
++        iter(authorities["session_recovery_selection_authority"].values())
++    )
++    activation = int(authority["activation_event_sequence"])
++    missing_session = str(authority["missing_session_id"])
++    fingerprint = str(authority["cache_fingerprint"])
++    for after in (max(0, activation - 2), activation - 1, activation):
++        _assert_private_values_absent(
++            lambda after=after: store.tail_events(
++                run_id, after_sequence=after, limit=200
++            ),
++            (missing_session, fingerprint),
++        )
++
++
++@pytest.mark.parametrize(
++    "damage",
++    ("prefix-delete", "prefix-insert", "prefix-duplicate", "prefix-reorder", "move-later-before"),
++)
++def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
++    tmp_path, workflow_writer, damage
++) -> None:
++    """Recomputed self-checksums cannot rewrite the recovery history prefix."""
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name=f"journal-order-{damage}"
++    )
++    private_session = f"original-private-{damage}-session"
++    private_fingerprint = hashlib.sha256(damage.encode()).hexdigest()
++
++    def damage_events(events: list[dict[str, object]]) -> None:
++        activation = next(
++            index
++            for index, event in enumerate(events)
++            if event.get("event_type") == "persistent_session_missing_fresh_start"
++        )
++        later = min(len(events) - 1, activation + 1)
++        payload = events[later].setdefault("payload", {})
++        assert isinstance(payload, dict)
++        payload["session_id"] = private_session
++        payload["cache_fingerprint"] = private_fingerprint
++        payload["message"] = f"embedded {private_session} {private_fingerprint}"
++        if damage == "prefix-delete":
++            del events[0]
++        elif damage == "prefix-insert":
++            events.insert(0, json.loads(json.dumps(events[0])))
++        elif damage == "prefix-duplicate":
++            events.insert(1, json.loads(json.dumps(events[0])))
++        elif damage == "prefix-reorder":
++            events[0], events[1] = events[1], events[0]
++        else:
++            moved = events.pop(later)
++            events.insert(max(0, activation - 1), moved)
++
++    _rewrite_complete_journal_order(store, run_id, damage_events)
++    values = (private_session, private_fingerprint)
++    for reader in (
++        lambda: store.tail_events(run_id),
++        lambda: store.latest_event_page(run_id),
++        lambda: store.events_after(run_id),
++        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
++        lambda: NotificationOutbox(store)._journal_candidates(
++            run_id,
++            max_journal_bytes=store.max_journal_bytes,
++        ),
++    ):
++        _assert_private_values_absent(reader, values)
++
++
++def test_activation_or_later_whole_event_privacy_is_recursive_and_value_aware(
++    tmp_path, workflow_writer
++) -> None:
++    """Aliases, nested strings, lists, siblings, and top-level fields are private."""
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name="whole-event-recovery-privacy"
++    )
++    authority = store._read_private_session_authorities(run_id=run_id)
++    selection = next(
++        iter(authority["session_recovery_selection_authority"].values())
++    )
++    missing_session = str(selection["missing_session_id"])
++    fingerprint = str(selection["cache_fingerprint"])
++    substituted_session = "substituted-whole-event-private-session"
++    substituted_fingerprint = "f" * 64
++
++    def add_private_aliases(event) -> None:
++        event["payload"] = {
++            "sessionAlias": missing_session,
++            "fingerprintAlias": substituted_fingerprint,
++            "messages": [
++                f"history {missing_session} {fingerprint}",
++                {"sibling": f"artifact:{substituted_session}"},
++            ],
++            "audit": {"exception": f"provider path {substituted_fingerprint}"},
++            "session_registry_update_candidate": {
++                "new_session_id": substituted_session,
++            },
++        }
++
++    _rewrite_journal_event(
++        store,
++        run_id,
++        "persistent_session_recovery_outcome",
++        add_private_aliases,
++    )
++    values = (
++        missing_session,
++        fingerprint,
++        substituted_session,
++        substituted_fingerprint,
++    )
++    for reader in (
++        lambda: store.tail_events(run_id),
++        lambda: store.latest_event_page(run_id),
++        lambda: store.events_after(run_id),
++        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
++    ):
++        _assert_private_values_absent(reader, values)
++
++
++def test_unexpected_top_level_journal_fields_fail_closed_without_echo(
++    tmp_path, workflow_writer
++) -> None:
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name="unexpected-journal-field"
++    )
++    canary = "unexpected-top-level-private-session"
++
++    def add_unexpected_field(event) -> None:
++        event["unexpected_private_alias"] = canary
++
++    _rewrite_journal_event(
++        store,
++        run_id,
++        "persistent_session_recovery_outcome",
++        add_unexpected_field,
++    )
++    _assert_private_values_absent(lambda: store.tail_events(run_id), (canary,))
++
++
++def test_schema_v2_recovery_authority_is_privacy_only_and_semantically_inert(
++    tmp_path, workflow_writer
++) -> None:
++    """Old unchained authorities cannot be upgraded from a mutable journal."""
++    store, run_id = _failed_fresh_recovery_run(
++        tmp_path, workflow_writer, name="schema-v2-recovery-authority"
++    )
++    with sqlite3.connect(store.database) as connection:
++        row = connection.execute(
++            "SELECT attempt_id, authority_json FROM "
++            "session_recovery_selection_authority WHERE run_id=?",
++            (run_id,),
++        ).fetchone()
++        assert row is not None
++        authority = json.loads(row[1])
++        authority["schema_version"] = 2
++        authority.pop("journal_order_version", None)
++        authority.pop("activation_predecessor_sequence", None)
++        authority.pop("activation_predecessor_chain_sha256", None)
++        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":"))
++        connection.execute(
++            "UPDATE session_recovery_selection_authority SET authority_json=?, "
++            "authority_sha256=? WHERE attempt_id=?",
++            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row[0]),
++        )
++        connection.commit()
++
++    preactivation_canary = "schema-v2-all-run-private-canary"
++
++    def inject_early(event) -> None:
++        event["payload"]["message"] = preactivation_canary
++
++    _rewrite_journal_event(store, run_id, "run_admitted", inject_early)
++    _assert_private_values_absent(
++        lambda: store.tail_events(run_id), (preactivation_canary,)
++    )
++    with pytest.raises(JournalRecoveryError):
++        store.load_run(run_id)
++
++
++@pytest.mark.parametrize(
++    "exception_type",
++    (PermissionError, OSError, ValueError, RuntimeError),
++)
++def test_selected_recovery_exception_diagnostics_are_value_free(
++    tmp_path, workflow_writer, exception_type
++) -> None:
++    """Direct fresh-launch exceptions cannot persist provider-controlled text."""
++    canary = f"private-{exception_type.__name__}-provider-path-history"
++
++    class RaisingFreshRunner(_PersistentRunner):
++        def run(self, request, **kwargs):
++            if request.context_mode == "fresh" and self.shared_failure is not None:
++                raise exception_type(canary)
++            return super().run(request, **kwargs)
++
++    package = _archon_package(
++        workflow_writer,
++        tmp_path / f"selected-{exception_type.__name__}",
++        name=f"selected-{exception_type.__name__}",
++    )
++    home = tmp_path / f"selected-{exception_type.__name__}-home"
++    store = RunStore(home)
++    registry = NodeSessionRegistry(home)
++    runner = RaisingFreshRunner()
++    _run_once(store, package, runner, registry, f"{exception_type.__name__}-seed")
++    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
++    run_id, _result = _run_once(
++        store, package, runner, registry, f"{exception_type.__name__}-recovery"
++    )
++    assert canary not in (store.run_directory(run_id) / "events.jsonl").read_text()
++    _assert_private_values_absent(lambda: store.get_run_status(run_id), (canary,))
++
++
++def test_selected_recovery_worker_audit_is_allowlisted_before_persistence(
++    tmp_path, workflow_writer
++) -> None:
++    """A failed fresh worker cannot persist arbitrary audit/provider history."""
++    canary = "private-worker-audit-provider-path-history"
++
++    class AuditFreshRunner(_PersistentRunner):
++        def run(self, request, **kwargs):
++            if request.context_mode == "fresh" and self.shared_failure is not None:
++                return PluginAgentRunResult(
++                    final_response=canary,
++                    session_id=canary,
++                    provider=canary,
++                    model=canary,
++                    status="failed",
++                    pending_interaction=None,
++                    usage={"raw": canary},
++                    audit={
++                        "provider_attempts": 1,
++                        "failure_kind": "validation",
++                        "raw_exception": canary,
++                        "history": [canary],
++                        "provider_attempts_exact": canary,
++                        "archon_terminal_failure": canary,
++                    },
++                )
++            return super().run(request, **kwargs)
++
++    package = _archon_package(
++        workflow_writer, tmp_path / "selected-audit", name="selected-audit"
++    )
++    home = tmp_path / "selected-audit-home"
++    store = RunStore(home)
++    registry = NodeSessionRegistry(home)
++    runner = AuditFreshRunner()
++    _run_once(store, package, runner, registry, "selected-audit-seed")
++    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
++    run_id, _result = _run_once(
++        store, package, runner, registry, "selected-audit-recovery"
++    )
++    assert canary not in (store.run_directory(run_id) / "events.jsonl").read_text()
++    _assert_private_values_absent(lambda: store.get_run_status(run_id), (canary,))

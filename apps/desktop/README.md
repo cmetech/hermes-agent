@@ -13,6 +13,7 @@
 <tr><td><b>Chat with the full agent</b></td><td>Streaming responses, live tool activity, structured tool summaries, and the same conversation history as every other Hermes surface.</td></tr>
 <tr><td><b>Side-by-side previews</b></td><td>Render web pages, files, and tool outputs in a right-hand pane while you keep chatting.</td></tr>
 <tr><td><b>File browser</b></td><td>Explore and preview the working directory without leaving the app.</td></tr>
+<tr><td><b>Workflow artifacts</b></td><td>Inspect backend-confirmed typed output, request a bounded preview, or save the verified original through the native download dialog.</td></tr>
 <tr><td><b>Voice</b></td><td>Talk to Hermes and hear it back.</td></tr>
 <tr><td><b>Settings & onboarding</b></td><td>Manage providers, models, tools, and credentials from a real UI. First-run setup gets you to your first message in seconds.</td></tr>
 <tr><td><b>Stays current</b></td><td>Built-in updates pull the latest agent and rebuild the app in place.</td></tr>
@@ -144,6 +145,26 @@ cold boot. The shell and current management overlay remain mounted while
 gateway-bound nanostores are wiped, query-backed data is invalidated, and the
 new connection repopulates skeletons. This prevents rows or transcripts from
 the previous gateway bleeding into the next one.
+
+### Workflow typed artifacts
+
+The run inspector's **Artifacts** tab treats the backend as the authority. A
+typed artifact appears only when evidence contains a valid opaque publication
+ID; older backends and older evidence retain the generic evidence view. The
+renderer does not interpret workflow YAML or infer publication from an
+`output_type` declaration.
+
+Preview is an explicit user action and is bounded by the backend to 64 KiB.
+Desktop formats JSON only when the complete canonical value is available,
+shows other supported text as bounded plain text, and keeps unknown media
+download-only. Preview and metadata errors stay in the tab and do not impair
+chat or terminal surfaces.
+
+Downloads pass the run and opaque publication identities through the
+authenticated Electron bridge. The user chooses the destination in the native
+save dialog; credentials are not exposed to the renderer. See the
+[workflow user guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/workflows#inspect-typed-output)
+for publication, recovery, and authoring behavior.
 
 ### Verification
 

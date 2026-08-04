@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from dataclasses import replace
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
-from agent.plugin_agent import PluginAgentRunRequest
+from agent.plugin_agent import (
+    PluginAgentRunRequest,
+    PluginAgentSessionMissingError,
+    PluginAgentSessionUnavailableError,
+)
+from agent.structured_output import (
+    MAX_OUTPUT_BYTES,
+    StructuredOutputError,
+    StructuredOutputRequest,
+    StructuredOutputSchemaInvalid,
+    StructuredOutputStrategy,
+    StructuredOutputValidatorUnavailable,
+    normalize_schema,
+    parse_validate_canonicalize,
+    require_structured_output_validator,
+)
 from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
@@ -17,15 +34,35 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     conservative_provider_retry_count,
+    sealed_provider_request_for_launch,
     validated_provider_retry_count,
+    validated_provider_total_call_count,
+)
+from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    PrimaryOutputCandidate,
+    WorkflowOutputReferenceError,
+    write_archon_output_exclusive,
 )
 from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
     ResourceResolver,
     VariableContext,
+    substitution_renderer,
 )
-from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    NodeSessionRegistry,
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
+)
 from plugins.workflow.store import ArtifactRef
+
+
+_MAX_REPAIR_RESPONSE_BYTES = 256_000
+_MAX_REPAIR_PROMPT_CHARS = 500_000
+_MAX_REPAIR_REQUEST_WIRE_BYTES = 900_000
 
 
 def _thaw(value: object) -> object:
@@ -46,6 +83,37 @@ def _artifact(path: Path, run_directory: Path) -> ArtifactRef:
     )
 
 
+def _artifact_for_bytes(
+    path: Path,
+    run_directory: Path,
+    data: bytes,
+    *,
+    media_type: str,
+) -> ArtifactRef:
+    return ArtifactRef(
+        relative_path=path.relative_to(run_directory).as_posix(),
+        media_type=media_type,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _aggregate_usage(
+    first: Mapping[str, int | float | None],
+    second: Mapping[str, int | float | None],
+) -> dict[str, int | float | None]:
+    aggregate: dict[str, int | float | None] = {}
+    for key in sorted(set(first) | set(second)):
+        values = [
+            value for value in (first.get(key), second.get(key)) if value is not None
+        ]
+        if values and all(isinstance(value, int | float) for value in values):
+            aggregate[key] = sum(values)
+        else:
+            aggregate[key] = second.get(key, first.get(key))
+    return aggregate
+
+
 class AgentNodeExecutor:
     def __init__(
         self,
@@ -63,6 +131,25 @@ class AgentNodeExecutor:
     def _fingerprint(self, context: NodeExecutionContext) -> str:
         node = context.node
         workflow = context.workflow_options
+        structured_identity = None
+        if (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and context.structured_output is not None
+            and context.structured_output_decision is not None
+        ):
+            structured_identity = {
+                "schema_fingerprint": context.structured_output.schema_fingerprint,
+                "strategy": context.structured_output_decision.strategy.value,
+                "adapter_version": context.structured_output_decision.adapter_version,
+                "effective_provider": (
+                    context.structured_output_decision.effective_provider
+                ),
+                "model": context.structured_output_decision.model,
+                "api_mode": context.structured_output_decision.api_mode,
+                "declaration_source": (
+                    context.structured_output_decision.declaration_source
+                ),
+            }
         material = {
             "provider": node.options.get("provider") or workflow.get("provider"),
             "model": node.options.get("model") or workflow.get("model"),
@@ -82,6 +169,8 @@ class AgentNodeExecutor:
                 )
             },
         }
+        if structured_identity is not None:
+            material["structured_output"] = structured_identity
         encoded = json.dumps(
             material, sort_keys=True, separators=(",", ":"), default=str
         )
@@ -91,6 +180,471 @@ class AgentNodeExecutor:
     def _failure(code: str, message: str) -> NodeExecutionResult:
         return NodeExecutionResult("failed", (), code, message)
 
+    @staticmethod
+    def _recovery_unavailable() -> NodeExecutionResult:
+        return NodeExecutionResult(
+            "failed",
+            error_code="persistent_session_recovery_unavailable",
+            error_message="persistent session could not be verified",
+            metadata={
+                "provider_attempts": 0,
+                "provider_attempts_exact": True,
+                "known_no_effect": True,
+                "archon_terminal_failure": True,
+            },
+        )
+
+    @staticmethod
+    def _requested_provider(context: NodeExecutionContext) -> str | None:
+        """Return the routable selector from the immutable package snapshot."""
+        provider = context.node.options.get("provider") or context.workflow_options.get(
+            "provider"
+        )
+        return provider if isinstance(provider, str) and provider else None
+
+    @staticmethod
+    def _structured_request(
+        context: NodeExecutionContext,
+    ) -> StructuredOutputRequest | None:
+        if context.language_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+            return None
+        declared = context.structured_output
+        decision = context.structured_output_decision
+        if declared is None:
+            if context.node.options.get("output_format") is not None:
+                raise ValueError("admitted structured-output schema is missing")
+            return None
+        if decision is None:
+            raise ValueError("admitted structured-output decision is missing")
+        normalized = normalize_schema(_thaw(declared.canonical_schema))
+        if (
+            normalized.schema_fingerprint != declared.schema_fingerprint
+            or decision.schema_fingerprint != declared.schema_fingerprint
+            or declared.canonicalization_version != 1
+        ):
+            raise ValueError("admitted structured-output identity is contradictory")
+        return StructuredOutputRequest(
+            schema=normalized,
+            strategy=decision.strategy,
+            adapter_version=decision.adapter_version,
+            output_bytes_limit=MAX_OUTPUT_BYTES,
+            canonicalization_version=declared.canonicalization_version,
+        )
+
+    @staticmethod
+    def _structured_counts(
+        result,
+        request: StructuredOutputRequest,
+        decision,
+        *,
+        declaration_source: str,
+        provider_limit: int,
+        model_limit: int,
+        require_positive: bool,
+    ) -> tuple[int, int]:
+        evidence = result.structured_output
+        if not isinstance(evidence, Mapping):
+            raise ValueError("structured output evidence is missing")
+        if (
+            result.provider != decision.effective_provider
+            or result.model != decision.model
+            or result.audit.get("api_mode") != decision.api_mode
+            or evidence.get("strategy") != request.strategy.value
+            or evidence.get("adapter_version") != request.adapter_version
+            or evidence.get("schema_fingerprint") != request.schema.schema_fingerprint
+            or evidence.get("declaration_source") != declaration_source
+        ):
+            raise ValueError("structured output evidence does not match admission")
+        provider_attempts = evidence.get("provider_attempts")
+        model_calls = evidence.get("model_calls")
+        if (
+            isinstance(provider_attempts, bool)
+            or not isinstance(provider_attempts, int)
+            or not (1 if require_positive else 0) <= provider_attempts <= provider_limit
+            or isinstance(model_calls, bool)
+            or not isinstance(model_calls, int)
+            or not (1 if require_positive else 0) <= model_calls <= model_limit
+        ):
+            raise ValueError("structured output accounting is invalid")
+        return provider_attempts, model_calls
+
+    @staticmethod
+    def _uncertain_effects(audit: Mapping[str, object]) -> bool:
+        failure_kind = str(audit.get("failure_kind", "")).lower()
+        return bool(
+            audit.get("unknown_side_effect") is True
+            or audit.get("outcome_unknown") is True
+            or audit.get("reconciliation_required") is True
+            or "unknown_side_effect" in failure_kind
+            or "outcome_unknown" in failure_kind
+        )
+
+    @staticmethod
+    def _repair_prompt(
+        request: StructuredOutputRequest,
+        invalid_response: str,
+        diagnostics: str,
+    ) -> str:
+        return json.dumps(
+            {
+                "canonical_schema": json.loads(
+                    request.schema.canonical_schema_bytes.decode("utf-8")
+                ),
+                "invalid_response": invalid_response,
+                "validation_diagnostics": diagnostics,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _bounded_repair_request(
+        cls,
+        template: PluginAgentRunRequest,
+        structured_request: StructuredOutputRequest,
+        invalid_response: str,
+        diagnostics: str,
+    ) -> PluginAgentRunRequest | None:
+        def candidate(excerpt_length: int) -> PluginAgentRunRequest | None:
+            prompt = cls._repair_prompt(
+                structured_request,
+                invalid_response[:excerpt_length],
+                diagnostics,
+            )
+            if len(prompt) > _MAX_REPAIR_PROMPT_CHARS:
+                return None
+            request = replace(template, prompt=prompt)
+            encoded_wire = json.dumps(
+                request.to_wire(), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if len(encoded_wire) > _MAX_REPAIR_REQUEST_WIRE_BYTES:
+                return None
+            return request
+
+        complete = candidate(len(invalid_response))
+        if complete is not None:
+            return complete
+        empty = candidate(0)
+        if empty is None:
+            return None
+        low = 0
+        high = len(invalid_response)
+        best = empty
+        while low + 1 < high:
+            middle = (low + high) // 2
+            bounded = candidate(middle)
+            if bounded is None:
+                high = middle
+            else:
+                low = middle
+                best = bounded
+        return best
+
+    @staticmethod
+    def _write_archon_output(
+        context: NodeExecutionContext,
+        data: bytes,
+        metadata: dict[str, object],
+        *,
+        is_structured: bool,
+        structured_value: object | None,
+        schema_fingerprint: str | None,
+        canonicalization_version: int,
+    ) -> NodeExecutionResult:
+        node = context.node
+        extension = ".json" if is_structured else ".md"
+        media_type = "application/json" if is_structured else "text/plain"
+        try:
+            output_path = write_archon_output_exclusive(
+                context.run_directory,
+                node_id=node.id,
+                attempt_id=context.attempt_id,
+                filename=f"output{extension}",
+                data=data,
+            )
+        except ArchonOutputIntegrityError:
+            metadata["archon_terminal_failure"] = True
+            metadata.pop("output", None)
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_integrity",
+                error_message="Archon output could not be sealed",
+                metadata=metadata,
+            )
+        artifact = _artifact_for_bytes(
+            output_path,
+            context.run_directory,
+            data,
+            media_type=media_type,
+        )
+        relative_path = output_path.relative_to(context.run_directory).as_posix()
+        candidate = PrimaryOutputCandidate(
+            attempt_relative_path=relative_path,
+            media_type=media_type,
+            size_bytes=len(data),
+            sha256=artifact.sha256,
+            structured_value=structured_value,
+            schema_fingerprint=schema_fingerprint,
+            canonicalization_version=canonicalization_version,
+            output_type=(
+                str(node.options["output_type"])
+                if node.options.get("output_type") is not None
+                else None
+            ),
+        )
+        metadata["output"] = data.decode("utf-8")
+        return NodeExecutionResult(
+            "succeeded",
+            (artifact,),
+            metadata=metadata,
+            primary_output=candidate,
+        )
+
+    @staticmethod
+    def _bounded_diagnostics(value: str, limit: int = 16_384) -> str:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= limit:
+            return value
+        encoded = encoded[: max(0, limit - 3)]
+        while encoded:
+            try:
+                return encoded.decode("utf-8") + "..."
+            except UnicodeDecodeError:
+                encoded = encoded[:-1]
+        return "..."[:limit]
+
+    def _repair_or_fail(
+        self,
+        context: NodeExecutionContext,
+        agent_runner,
+        initial_request: PluginAgentRunRequest,
+        initial_result,
+        metadata: dict[str, object],
+        structured_request: StructuredOutputRequest,
+        structured_validator: Any,
+        *,
+        diagnostics: str,
+        first_provider_attempts: int,
+        first_model_calls: int,
+        granted_provider_attempts: int,
+        wall_deadline: float,
+    ) -> NodeExecutionResult:
+        response = initial_result.final_response
+        strict_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and isinstance(context.variable_context, VariableContext)
+            and context.variable_context.normalizer_version == 3
+        )
+        response_bytes = response.encode("utf-8")
+        diagnostics = self._bounded_diagnostics(diagnostics)
+        metadata.update({
+            "archon_terminal_failure": True,
+            "invalid_output_sha256": hashlib.sha256(response_bytes).hexdigest(),
+            "invalid_output_size_bytes": len(response_bytes),
+            "validation_diagnostics": diagnostics,
+        })
+        metadata.pop("output", None)
+
+        def failed(disposition: str) -> NodeExecutionResult:
+            metadata["repair_disposition"] = disposition
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=diagnostics,
+                metadata=metadata,
+            )
+
+        def conservatively_account(repair_result=None) -> None:
+            if repair_result is not None:
+                metadata["usage"] = _aggregate_usage(
+                    initial_result.usage, repair_result.usage
+                )
+            total_model_calls = first_model_calls + 1
+            aggregate_audit = dict(initial_result.audit)
+            aggregate_audit.update({
+                "provider_attempts": granted_provider_attempts,
+                "model_calls": total_model_calls,
+                "api_calls": total_model_calls,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "repair_accounting": "conservative",
+                "provider_attempts_exact": False,
+                "model_calls_exact": False,
+                "api_calls_exact": False,
+            })
+            metadata["audit"] = aggregate_audit
+            metadata["provider_attempts"] = max(0, granted_provider_attempts - 1)
+            if strict_v3:
+                metadata["provider_attempts_exact"] = False
+
+        if (
+            structured_request.strategy
+            is not StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+        ):
+            return failed("ineligible_native_strategy")
+        if context.outward_action:
+            return failed("ineligible_outward_action")
+        if self._uncertain_effects(initial_result.audit):
+            return failed("ineligible_uncertain_effects")
+        if context.is_cancelled is not None and context.is_cancelled():
+            return failed("ineligible_cancelled")
+        remaining_provider_attempts = (
+            granted_provider_attempts - first_provider_attempts
+        )
+        if remaining_provider_attempts <= 0:
+            return failed("ineligible_provider_attempts")
+        if initial_request.max_iterations - first_model_calls <= 0:
+            return failed("ineligible_model_iterations")
+        remaining_wall = max(0.0, wall_deadline - context.monotonic())
+        if remaining_wall <= 0:
+            return failed("ineligible_wall_time")
+        if len(response_bytes) > _MAX_REPAIR_RESPONSE_BYTES:
+            return failed("ineligible_response_too_large")
+
+        decision = context.structured_output_decision
+        assert decision is not None
+        repair_template = PluginAgentRunRequest(
+            prompt="",
+            provider=initial_request.provider,
+            model=decision.model,
+            context_mode="fresh",
+            session_id=None,
+            enabled_toolsets=(),
+            allowed_tools=(),
+            denied_tools=("delegate_task", "workflow_agent"),
+            skills=(),
+            hooks=(),
+            mcp_servers=None,
+            inline_agents={},
+            reasoning_config=None,
+            fallback_model=None,
+            ephemeral_system_prompt=None,
+            request_overrides={},
+            structured_output=structured_request,
+            max_budget_usd=None,
+            sandbox_policy=None,
+            approved_action_digest=None,
+            workdir=context.run_directory,
+            max_iterations=1,
+            max_api_attempts=remaining_provider_attempts,
+            sealed_provider_attempt_grant=(
+                initial_request.sealed_provider_attempt_grant
+            ),
+            idle_timeout_seconds=min(
+                initial_request.idle_timeout_seconds, remaining_wall
+            ),
+            wall_timeout_seconds=remaining_wall,
+            provider_request_timeout_seconds=min(
+                initial_request.provider_request_timeout_seconds,
+                remaining_wall,
+            ),
+            max_process_tree_rss_bytes=initial_request.max_process_tree_rss_bytes,
+            max_process_tree_cpu_seconds=(initial_request.max_process_tree_cpu_seconds),
+            max_descendants=initial_request.max_descendants,
+            cooperative_shutdown_seconds=(initial_request.cooperative_shutdown_seconds),
+            term_grace_seconds=initial_request.term_grace_seconds,
+            kill_reap_grace_seconds=initial_request.kill_reap_grace_seconds,
+        )
+        repair_request = self._bounded_repair_request(
+            repair_template,
+            structured_request,
+            response,
+            diagnostics,
+        )
+        if repair_request is None:
+            return failed("ineligible_repair_prompt_too_large")
+        repair_request = sealed_provider_request_for_launch(context, repair_request)
+        if repair_request is None:
+            return failed("ineligible_wall_time")
+        try:
+            repair_result = agent_runner.run(
+                repair_request,
+                is_cancelled=context.is_cancelled,
+            )
+        except (OSError, RuntimeError, ValueError):
+            conservatively_account()
+            return failed("repair_failed")
+
+        metadata["usage"] = _aggregate_usage(initial_result.usage, repair_result.usage)
+        repair_counts: tuple[int, int] | None = None
+        if repair_result.structured_output is not None:
+            try:
+                assert context.structured_output_decision is not None
+                repair_counts = self._structured_counts(
+                    repair_result,
+                    structured_request,
+                    decision,
+                    declaration_source=(decision.declaration_source),
+                    provider_limit=remaining_provider_attempts,
+                    model_limit=1,
+                    require_positive=repair_result.status == "completed",
+                )
+            except ValueError:
+                conservatively_account(repair_result)
+                return failed("repair_evidence_invalid")
+        if repair_counts is None:
+            conservatively_account(repair_result)
+            return failed(
+                "repair_cancelled"
+                if repair_result.status == "cancelled"
+                else "repair_failed"
+            )
+
+        total_provider_attempts = first_provider_attempts + repair_counts[0]
+        total_model_calls = first_model_calls + repair_counts[1]
+        aggregate_audit = dict(initial_result.audit)
+        aggregate_audit.update({
+            "provider_attempts": total_provider_attempts,
+            "model_calls": total_model_calls,
+            "api_calls": total_model_calls,
+            "effective_provider": decision.effective_provider,
+            "model": decision.model,
+            "api_mode": decision.api_mode,
+            "repair_accounting": "exact",
+            "provider_attempts_exact": True,
+            "model_calls_exact": True,
+            "api_calls_exact": True,
+        })
+        metadata["audit"] = aggregate_audit
+        metadata["provider_attempts"] = max(0, total_provider_attempts - 1)
+        if strict_v3:
+            metadata["provider_attempts_exact"] = True
+        if repair_result.status != "completed":
+            return failed(
+                "repair_cancelled"
+                if repair_result.status == "cancelled"
+                else "repair_failed"
+            )
+        try:
+            repaired = parse_validate_canonicalize(
+                repair_result.final_response,
+                structured_request,
+                validator=structured_validator,
+            )
+        except StructuredOutputValidatorUnavailable as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_unavailable",
+                error_message=str(exc),
+                metadata=metadata,
+            )
+        except StructuredOutputError:
+            return failed("repair_invalid")
+
+        metadata["repair_disposition"] = "succeeded"
+        metadata.pop("archon_terminal_failure", None)
+        return self._write_archon_output(
+            context,
+            repaired.canonical_bytes,
+            metadata,
+            is_structured=True,
+            structured_value=repaired.value,
+            schema_fingerprint=structured_request.schema.schema_fingerprint,
+            canonicalization_version=repaired.canonicalization_version,
+        )
+
     def _prompt(self, context: NodeExecutionContext) -> str:
         node = context.node
         if node.node_type == "command":
@@ -99,14 +653,21 @@ class AgentNodeExecutor:
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
-                ).command(str(node.value)).body
+                )
+                .command(str(node.value))
+                .body
             )
         else:
             template = str(node.value)
         variables = context.variable_context
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
-        prompt = variables.render_prompt(template)
+        renderer = substitution_renderer(
+            variables,
+            direct_dependencies=node.depends_on,
+            output_resolver=context.output_resolver,
+        )
+        prompt = renderer.render_prompt(template)
         if node.options.get("skills"):
             skill_text = ResourceResolver(
                 context.run_directory,
@@ -137,9 +698,7 @@ class AgentNodeExecutor:
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
-                ).text(
-                    f"node-agent-skills/{context.node.id}/{agent_id}.md"
-                )
+                ).text(f"node-agent-skills/{context.node.id}/{agent_id}.md")
             definitions[str(agent_id)] = {
                 "description": str(raw["description"]),
                 "prompt": str(raw["prompt"]),
@@ -155,6 +714,12 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        strict_v3 = (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and isinstance(context.variable_context, VariableContext)
+            and context.variable_context.normalizer_version == 3
+        )
+        prompt = self._prompt(context) if strict_v3 else None
         materializer: AuthenticatedExecutionMaterializer | None = None
         try:
             agent_runner = entitled_agent_runner(
@@ -163,11 +728,66 @@ class AgentNodeExecutor:
                 self.deterministic_runner,
             )
         except AIExecutionIntegrityError as exc:
+            if strict_v3:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="execution_integrity",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "provider_attempts_exact": True,
+                    },
+                )
             return self._failure("execution_integrity", str(exc))
         if agent_runner is None:
             return self._failure(
                 "agent_runner_unavailable", "real agent execution is unavailable"
             )
+        try:
+            structured_request = self._structured_request(context)
+        except StructuredOutputSchemaInvalid as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": 0,
+                    "archon_terminal_failure": True,
+                },
+            )
+        except ValueError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_capability_drift",
+                error_message=str(exc),
+                metadata={"archon_terminal_failure": True},
+            )
+        structured_validator = None
+        if structured_request is not None:
+            try:
+                structured_validator = require_structured_output_validator(
+                    structured_request.schema.canonical_schema
+                )
+            except StructuredOutputSchemaInvalid as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_invalid",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "archon_terminal_failure": True,
+                    },
+                )
+            except StructuredOutputValidatorUnavailable as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_unavailable",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": 0,
+                        "archon_terminal_failure": True,
+                    },
+                )
         fingerprint = self._fingerprint(context)
         explicit_context = node.options.get("context")
         context_mode = "fresh"
@@ -175,6 +795,81 @@ class AgentNodeExecutor:
         warnings: list[str] = []
         registry_key = None
         expected_generation = 0
+        session_source: str | None = None
+        stale_session_id: str | None = None
+        stale_cache_fingerprint: str | None = None
+        recovery_selected = False
+
+        def recovery_accounting_metadata(
+            metadata: Mapping[str, object],
+        ) -> dict[str, object]:
+            counts = {"provider_attempts", "additional_provider_attempts"}
+            flags = {
+                "provider_attempts_exact",
+                "known_no_effect",
+                "unknown_side_effect",
+                "outcome_unknown",
+                "archon_terminal_failure",
+            }
+            return {
+                key: value
+                for key, value in dict(metadata).items()
+                if (
+                    key in counts
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+                or (key in flags and isinstance(value, bool))
+            }
+
+        def paused_recovery_interaction(
+            pending: Mapping[str, object] | None,
+        ) -> dict[str, str]:
+            if not isinstance(pending, Mapping):
+                return {}
+            kind = pending.get("kind")
+            action_digest = pending.get("action_digest")
+            if (
+                kind != "approval"
+                or not isinstance(action_digest, str)
+                or len(action_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in action_digest
+                )
+            ):
+                return {}
+            return {"kind": "approval", "action_digest": action_digest}
+
+        def with_recovery_failure(
+            failure: NodeExecutionResult,
+        ) -> NodeExecutionResult:
+            if recovery_selected and failure.status in {
+                "failed",
+                "cancelled",
+                "interrupted",
+            }:
+                fixed_message = {
+                    "authorization": "selected recovery authorization failed",
+                    "authentication": "selected recovery authentication failed",
+                    "network_error": "selected recovery network operation failed",
+                    "network_disconnect": "selected recovery network operation failed",
+                    "validation": "selected recovery validation failed",
+                    "provider_timeout": "selected recovery provider timed out",
+                    "cancelled": "selected recovery was cancelled",
+                }.get(
+                    str(failure.error_code or ""),
+                    "selected recovery execution failed",
+                )
+                return replace(
+                    failure,
+                    artifacts=(),
+                    error_message=fixed_message,
+                    metadata=recovery_accounting_metadata(failure.metadata),
+                    session_recovery_outcome="fresh_execution_failed",
+                )
+            return failure
 
         if explicit_context == "shared":
             predecessors = [
@@ -200,6 +895,7 @@ class AgentNodeExecutor:
                     "shared predecessor has no resumable session; use fresh context",
                 )
             context_mode = "shared"
+            session_source = "same_run_predecessor"
         else:
             persist = bool(
                 node.options.get(
@@ -225,12 +921,29 @@ class AgentNodeExecutor:
                     provider,
                     self.profile_name,
                 )
-                record = self.session_registry.get(registry_key)
+                try:
+                    record = self.session_registry.get(registry_key)
+                except (OSError, PermissionError, ValueError, sqlite3.DatabaseError):
+                    if strict_v3:
+                        return self._recovery_unavailable()
+                    raise
                 if record is not None:
+                    if strict_v3 and (
+                        not isinstance(record.cache_fingerprint, str)
+                        or len(record.cache_fingerprint) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in record.cache_fingerprint
+                        )
+                    ):
+                        return self._recovery_unavailable()
                     expected_generation = record.generation
                     if record.cache_fingerprint == fingerprint:
                         context_mode = "shared"
                         session_id = record.session_id
+                        session_source = "cross_run_registry"
+                        stale_session_id = record.session_id
+                        stale_cache_fingerprint = record.cache_fingerprint
                     else:
                         warnings.append(
                             "stale persistent session replaced after cache change"
@@ -246,10 +959,26 @@ class AgentNodeExecutor:
                     else context.max_provider_attempts
                 ),
             )
+            request_started_at = context.monotonic()
             wall_timeout = (
-                context.deadline_budget.remaining_wall(context.monotonic())
+                context.deadline_budget.remaining_wall(request_started_at)
                 if context.deadline_budget is not None
                 else float(context.timeout_seconds)
+            )
+            if context.sealed_attempt_timeout and wall_timeout <= 0:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_timeout",
+                    error_message="workflow attempt deadline expired",
+                    metadata={
+                        "provider_attempts": 0,
+                        **({"provider_attempts_exact": True} if strict_v3 else {}),
+                    },
+                )
+            wall_deadline = (
+                context.deadline_budget.wall_deadline
+                if context.deadline_budget is not None
+                else request_started_at + wall_timeout
             )
             idle_timeout = min(
                 context.deadline_budget.idle_seconds
@@ -328,11 +1057,19 @@ class AgentNodeExecutor:
             if web_mode is not None:
                 request_overrides["web_search_mode"] = web_mode
             request = PluginAgentRunRequest(
-                prompt=self._prompt(context),
-                provider=node.options.get("provider")
-                or context.workflow_options.get("provider"),
-                model=node.options.get("model")
-                or context.workflow_options.get("model"),
+                prompt=prompt if prompt is not None else self._prompt(context),
+                provider=(
+                    self._requested_provider(context)
+                    if structured_request is not None
+                    else node.options.get("provider")
+                    or context.workflow_options.get("provider")
+                ),
+                model=(
+                    context.structured_output_decision.model
+                    if structured_request is not None
+                    else node.options.get("model")
+                    or context.workflow_options.get("model")
+                ),
                 context_mode=context_mode,
                 session_id=session_id,
                 allowed_tools=allowed_tools,
@@ -345,6 +1082,7 @@ class AgentNodeExecutor:
                 fallback_model=str(fallback_model) if fallback_model else None,
                 ephemeral_system_prompt=node.options.get("systemPrompt"),
                 request_overrides=request_overrides,
+                structured_output=structured_request,
                 max_budget_usd=node.options.get(
                     "maxBudgetUsd", context.workflow_options.get("maxBudgetUsd")
                 ),
@@ -359,6 +1097,7 @@ class AgentNodeExecutor:
                 workdir=context.run_directory,
                 max_iterations=90,
                 max_api_attempts=granted_provider_attempts,
+                sealed_provider_attempt_grant=strict_v3,
                 idle_timeout_seconds=idle_timeout,
                 wall_timeout_seconds=wall_timeout,
                 provider_request_timeout_seconds=provider_timeout,
@@ -393,37 +1132,202 @@ class AgentNodeExecutor:
                     else context.termination_policy.kill_grace_seconds
                 ),
             )
-            result = agent_runner.run(
-                request,
-                is_cancelled=context.is_cancelled,
-            )
-        except PermissionError as exc:
-            return self._failure("authorization", str(exc))
-        except OSError as exc:
-            return NodeExecutionResult(
-                "failed",
-                error_code="network_error",
-                error_message=str(exc),
-                metadata={
-                    "provider_attempts": conservative_provider_retry_count(
-                        None,
-                        granted_attempts=granted_provider_attempts,
+            request = sealed_provider_request_for_launch(context, request)
+            if request is None:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_timeout",
+                    error_message="workflow attempt deadline expired",
+                    metadata={"provider_attempts": 0},
+                )
+            if context.is_cancelled is not None and context.is_cancelled():
+                return NodeExecutionResult(
+                    "cancelled",
+                    error_code="cancelled",
+                    metadata={"provider_attempts": 0},
+                )
+
+            def launch_agent(launch_request):
+                launch_kwargs = {"is_cancelled": context.is_cancelled}
+                lifecycle_callbacks = {
+                    "spawn_intent": context.spawn_intent,
+                    "spawn_failed": context.spawn_failed,
+                    "process_started": context.process_started,
+                    "provider_dispatch": context.provider_dispatch,
+                    "provider_start_delivered": context.provider_start_delivered,
+                    "provider_execute_received": context.provider_execute_received,
+                    "provider_execute_release": context.provider_execute_release,
+                    "process_stopped": context.process_stopped,
+                }
+                if getattr(agent_runner, "starts_request_mcp", False):
+                    launch_kwargs.update({
+                        name: callback
+                        for name, callback in lifecycle_callbacks.items()
+                        if callback is not None
+                    })
+                return agent_runner.run(launch_request, **launch_kwargs)
+
+            def fresh_recovery_request():
+                fresh_request = replace(
+                    request,
+                    context_mode="fresh",
+                    session_id=None,
+                )
+                fresh_request = sealed_provider_request_for_launch(
+                    context,
+                    fresh_request,
+                )
+                if fresh_request is None:
+                    return with_recovery_failure(
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="provider_timeout",
+                            error_message="workflow attempt deadline expired",
+                            metadata={"provider_attempts": 0},
+                        )
                     )
-                },
+                if context.is_cancelled is not None and context.is_cancelled():
+                    return with_recovery_failure(
+                        NodeExecutionResult(
+                            "cancelled",
+                            error_code="cancelled",
+                            metadata={"provider_attempts": 0},
+                        )
+                    )
+                return launch_agent(fresh_request)
+
+            def select_fresh_recovery() -> bool:
+                nonlocal recovery_selected
+                callback = context.record_session_recovery_selection
+                if (
+                    callback is None
+                    or registry_key is None
+                    or stale_session_id is None
+                    or stale_cache_fingerprint is None
+                ):
+                    return False
+                selected = callback(
+                    PersistentSessionRecoverySelection(
+                        key=registry_key,
+                        expected_generation=expected_generation,
+                        missing_session_id=stale_session_id,
+                        cache_fingerprint=stale_cache_fingerprint,
+                        run_id=context.run_id,
+                        attempt_id=context.attempt_id,
+                    )
+                )
+                recovery_selected = selected
+                return selected
+
+            try:
+                result = launch_agent(request)
+            except PluginAgentSessionMissingError:
+                if not strict_v3:
+                    raise
+                if session_source == "same_run_predecessor":
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="context_missing_session",
+                        error_message="shared predecessor session is missing",
+                        metadata={
+                            "provider_attempts": 0,
+                            "provider_attempts_exact": True,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                if session_source != "cross_run_registry":
+                    raise
+                if not select_fresh_recovery():
+                    return self._recovery_unavailable()
+                result = fresh_recovery_request()
+                if isinstance(result, NodeExecutionResult):
+                    return result
+            except PluginAgentSessionUnavailableError:
+                if strict_v3 and (
+                    session_source == "cross_run_registry"
+                    or session_source == "same_run_predecessor"
+                ):
+                    return self._recovery_unavailable()
+                raise
+            missing_after_worker_load = (
+                result.status == "failed"
+                and result.audit.get("failure_kind") == "persistent_session_missing"
+                and result.audit.get("provider_attempts") == 0
+                and result.audit.get("model_calls") == 0
+            )
+            if missing_after_worker_load and strict_v3:
+                if session_source == "same_run_predecessor":
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="context_missing_session",
+                        error_message="shared predecessor session is missing",
+                        metadata={
+                            "provider_attempts": 0,
+                            "provider_attempts_exact": True,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                if session_source == "cross_run_registry":
+                    if not select_fresh_recovery():
+                        return self._recovery_unavailable()
+                    result = fresh_recovery_request()
+                    if isinstance(result, NodeExecutionResult):
+                        return result
+        except PermissionError as exc:
+            return with_recovery_failure(
+                self._failure("authorization", str(exc))
+            )
+        except OSError as exc:
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="network_error",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": conservative_provider_retry_count(
+                            None,
+                            granted_attempts=granted_provider_attempts,
+                        ),
+                        **({"provider_attempts_exact": False} if strict_v3 else {}),
+                    },
+                )
             )
         except ValueError as exc:
-            return self._failure("validation", str(exc))
-        except RuntimeError as exc:
-            return NodeExecutionResult(
-                "failed",
-                error_code="agent_execution_failed",
-                error_message=str(exc),
-                metadata={
-                    "provider_attempts": conservative_provider_retry_count(
-                        None,
-                        granted_attempts=granted_provider_attempts,
+            if strict_v3:
+                return with_recovery_failure(
+                    NodeExecutionResult(
+                        "failed",
+                        error_code="outcome_unknown",
+                        error_message=str(exc),
+                        metadata={
+                            "provider_attempts": conservative_provider_retry_count(
+                                None,
+                                granted_attempts=granted_provider_attempts,
+                            ),
+                            "provider_attempts_exact": False,
+                            "outcome_unknown": True,
+                        },
                     )
-                },
+                )
+            return with_recovery_failure(self._failure("validation", str(exc)))
+        except WorkflowOutputReferenceError:
+            raise
+        except RuntimeError as exc:
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="agent_execution_failed",
+                    error_message=str(exc),
+                    metadata={
+                        "provider_attempts": conservative_provider_retry_count(
+                            None,
+                            granted_attempts=granted_provider_attempts,
+                        ),
+                        **({"provider_attempts_exact": False} if strict_v3 else {}),
+                    },
+                )
             )
         finally:
             if materializer is not None:
@@ -438,14 +1342,121 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
-        provider_attempts = validated_provider_retry_count(
-            result.audit.get("provider_attempts"),
-            granted_attempts=granted_provider_attempts,
-        )
-        if provider_attempts is not None:
-            metadata["provider_attempts"] = provider_attempts
+        structured_counts: tuple[int, int] | None = None
+        negotiation_failure = str(result.audit.get("failure_kind", ""))
+        if structured_request is not None and negotiation_failure in {
+            "structured_output_capability_drift",
+            "structured_output_unsupported",
+        }:
+            try:
+                if result.status != "failed":
+                    raise ValueError("structured output negotiation status is invalid")
+                assert context.structured_output_decision is not None
+                negotiation_counts = self._structured_counts(
+                    result,
+                    structured_request,
+                    context.structured_output_decision,
+                    declaration_source=(
+                        context.structured_output_decision.declaration_source
+                    ),
+                    provider_limit=granted_provider_attempts,
+                    model_limit=request.max_iterations,
+                    require_positive=False,
+                )
+                if negotiation_counts != (0, 0):
+                    raise ValueError(
+                        "structured output negotiation accounting is invalid"
+                    )
+            except ValueError as exc:
+                metadata["negotiation_evidence"] = "invalid"
+                error_message = str(exc)
+                metadata["provider_attempts"] = conservative_provider_retry_count(
+                    None,
+                    granted_attempts=granted_provider_attempts,
+                )
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = False
+            else:
+                metadata["negotiation_evidence"] = "corroborated"
+                error_message = "structured output negotiation failed"
+                metadata["provider_attempts"] = 0
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = True
+            metadata["archon_terminal_failure"] = True
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code=negotiation_failure,
+                    error_message=error_message,
+                    metadata=metadata,
+                )
+            )
+        if structured_request is not None and result.structured_output is not None:
+            try:
+                structured_counts = self._structured_counts(
+                    result,
+                    structured_request,
+                    context.structured_output_decision,
+                    declaration_source=(
+                        context.structured_output_decision.declaration_source
+                    ),
+                    provider_limit=granted_provider_attempts,
+                    model_limit=request.max_iterations,
+                    require_positive=result.status == "completed",
+                )
+            except ValueError as exc:
+                metadata["archon_terminal_failure"] = True
+                return with_recovery_failure(
+                    NodeExecutionResult(
+                        "failed",
+                        error_code="structured_output_capability_drift",
+                        error_message=str(exc),
+                        metadata=metadata,
+                    )
+                )
+            metadata["provider_attempts"] = max(0, structured_counts[0] - 1)
+            if strict_v3:
+                metadata["provider_attempts_exact"] = True
+        elif structured_request is not None and result.status == "completed":
+            metadata["archon_terminal_failure"] = True
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="structured_output_capability_drift",
+                    error_message="structured output evidence is missing",
+                    metadata=metadata,
+                )
+            )
+        else:
+            provider_attempts = (
+                validated_provider_total_call_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
+                )
+                if strict_v3
+                else validated_provider_retry_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
+                )
+            )
+            if provider_attempts is not None:
+                metadata["provider_attempts"] = provider_attempts
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = True
+            elif strict_v3:
+                metadata["provider_attempts_exact"] = False
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
+            if recovery_selected:
+                recovery_metadata = recovery_accounting_metadata(metadata)
+                recovery_metadata["pending_interaction"] = (
+                    paused_recovery_interaction(result.pending_interaction)
+                )
+                return NodeExecutionResult(
+                    "paused",
+                    metadata=recovery_metadata,
+                    session_recovery_outcome="fresh_execution_failed",
+                )
             return NodeExecutionResult("paused", metadata=metadata)
         if result.status == "cancelled":
             reason = (
@@ -462,6 +1473,9 @@ class AgentNodeExecutor:
             failure_kind = str(result.audit.get("failure_kind", "")).lower()
             if failure_kind == "package_mcp_unavailable":
                 error_code = "package_mcp_unavailable"
+            elif failure_kind == "provider_attempt_grant_exhausted":
+                error_code = "provider_attempt_grant_exhausted"
+                metadata["known_no_effect"] = True
             elif (
                 "unknown_side_effect" in failure_kind
                 or "outcome_unknown" in failure_kind
@@ -485,7 +1499,7 @@ class AgentNodeExecutor:
                 error_code = "network_disconnect"
             else:
                 error_code = "agent_failed"
-            if provider_attempts is None:
+            if "provider_attempts" not in metadata:
                 # The host loop does not currently expose its exact retry
                 # counter. Charge the full granted retry allowance so the
                 # workflow and provider layers can never multiply attempts.
@@ -493,15 +1507,119 @@ class AgentNodeExecutor:
                     result.audit.get("provider_attempts"),
                     granted_attempts=granted_provider_attempts,
                 )
-            return NodeExecutionResult(
-                "failed",
-                (),
-                error_code,
-                "isolated agent execution failed",
-                metadata,
+                if strict_v3:
+                    metadata["provider_attempts_exact"] = False
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    (),
+                    error_code,
+                    "isolated agent execution failed",
+                    metadata,
+                )
             )
 
         output = result.final_response
+        if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07:
+            if structured_request is None:
+                archon_result = self._write_archon_output(
+                    context,
+                    output.encode("utf-8"),
+                    metadata,
+                    is_structured=False,
+                    structured_value=None,
+                    schema_fingerprint=None,
+                    canonicalization_version=1,
+                )
+            else:
+                assert structured_counts is not None
+                try:
+                    structured_value = parse_validate_canonicalize(
+                        output,
+                        structured_request,
+                        validator=structured_validator,
+                    )
+                except StructuredOutputValidatorUnavailable as exc:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="structured_output_unavailable",
+                        error_message=str(exc),
+                        metadata=metadata,
+                    )
+                except StructuredOutputError as exc:
+                    archon_result = self._repair_or_fail(
+                        context,
+                        agent_runner,
+                        request,
+                        result,
+                        metadata,
+                        structured_request,
+                        structured_validator,
+                        diagnostics=str(exc),
+                        first_provider_attempts=structured_counts[0],
+                        first_model_calls=structured_counts[1],
+                        granted_provider_attempts=granted_provider_attempts,
+                        wall_deadline=wall_deadline,
+                    )
+                else:
+                    archon_result = self._write_archon_output(
+                        context,
+                        structured_value.canonical_bytes,
+                        metadata,
+                        is_structured=True,
+                        structured_value=structured_value.value,
+                        schema_fingerprint=(
+                            structured_request.schema.schema_fingerprint
+                        ),
+                        canonicalization_version=(
+                            structured_value.canonicalization_version
+                        ),
+                )
+                if archon_result.status != "succeeded":
+                    return with_recovery_failure(archon_result)
+            if registry_key is not None and self.session_registry is not None:
+                if strict_v3:
+                    if not result.session_id:
+                        return with_recovery_failure(
+                            NodeExecutionResult(
+                                "failed",
+                                artifacts=archon_result.artifacts,
+                                error_code="outcome_unknown",
+                                error_message=(
+                                    "completed persistent-session execution omitted "
+                                    "its session identifier"
+                                ),
+                                metadata={
+                                    **metadata,
+                                    "outcome_unknown": True,
+                                },
+                            )
+                        )
+                    registry_update = SessionRegistryUpdateCandidate(
+                        key=registry_key,
+                        expected_generation=expected_generation,
+                        new_session_id=result.session_id,
+                        cache_fingerprint=fingerprint,
+                        winning_run_id=context.run_id,
+                        winning_node_id=node.id,
+                        winning_attempt_id=context.attempt_id,
+                        recovery_selected=recovery_selected,
+                    )
+                    return replace(
+                        archon_result,
+                        session_registry_update=registry_update,
+                        session_registry_authority=registry_update,
+                    )
+                updated = self.session_registry.compare_and_set(
+                    registry_key,
+                    expected_generation,
+                    result.session_id,
+                    fingerprint,
+                )
+                if not updated:
+                    warnings.append("newer persistent session retained")
+            return archon_result
+
         schema = node.options.get("output_format")
         extension = ".txt"
         if schema is not None:
@@ -510,11 +1628,11 @@ class AgentNodeExecutor:
             except json.JSONDecodeError as exc:
                 return self._failure("structured_output_invalid", str(exc))
             try:
-                import jsonschema
-            except ImportError:
+                jsonschema = require_structured_output_validator(legacy=True)
+            except StructuredOutputValidatorUnavailable as exc:
                 return self._failure(
                     "structured_output_unavailable",
-                    "jsonschema is required; install the Hermes mcp or all extra",
+                    str(exc),
                 )
             try:
                 jsonschema.validate(value, _thaw(schema))

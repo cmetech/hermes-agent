@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 import math
 from pathlib import Path
@@ -18,7 +18,11 @@ class ExecutionFence:
     owner_epoch: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.owner_id, str) or not self.owner_id or len(self.owner_id) > 256:
+        if (
+            not isinstance(self.owner_id, str)
+            or not self.owner_id
+            or len(self.owner_id) > 256
+        ):
             raise ValueError("owner_id must be bounded non-empty text")
         if (
             isinstance(self.owner_epoch, bool)
@@ -130,6 +134,41 @@ class WorkflowLanguageMetadata:
     effective_profile: WorkflowLanguageProfile
     normalizer_version: int
     normalized_definition_digest: str
+    structured_outputs: Mapping[str, "WorkflowStructuredOutput"] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    node_semantics: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "structured_outputs",
+            MappingProxyType(dict(self.structured_outputs)),
+        )
+        object.__setattr__(
+            self,
+            "node_semantics",
+            MappingProxyType({
+                node_id: freeze_value(value)
+                for node_id, value in self.node_semantics.items()
+            }),
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowStructuredOutput:
+    """One sealed normalized output contract for a workflow node."""
+
+    canonical_schema: Mapping[str, object]
+    schema_fingerprint: str
+    canonicalization_version: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "canonical_schema", freeze_value(self.canonical_schema)
+        )
 
 
 class CompatibilityLevel(StrEnum):
@@ -219,6 +258,153 @@ class RetryPolicy:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RetryLedgerGrant:
+    """One admitted v3 attempt grant derived from durable prior charge."""
+
+    explicit: bool
+    requested_retries: int
+    requested_total_attempts: int
+    effective_total_attempts: int
+    delay_ms: int
+    on_error: str
+    capped: bool
+    retry_consumed: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.explicit, bool) or not isinstance(self.capped, bool):
+            raise ValueError("retry ledger flags must be booleans")
+        if (
+            isinstance(self.requested_retries, bool)
+            or not isinstance(self.requested_retries, int)
+            or not 0 <= self.requested_retries <= 5
+        ):
+            raise ValueError("requested_retries must be between 0 and 5")
+        if (
+            isinstance(self.requested_total_attempts, bool)
+            or not isinstance(self.requested_total_attempts, int)
+            or self.requested_total_attempts != self.requested_retries + 1
+        ):
+            raise ValueError("requested_total_attempts must include the initial attempt")
+        if (
+            isinstance(self.effective_total_attempts, bool)
+            or not isinstance(self.effective_total_attempts, int)
+            or not 1 <= self.effective_total_attempts <= 5
+        ):
+            raise ValueError("effective_total_attempts must be between 1 and 5")
+        if (
+            isinstance(self.retry_consumed, bool)
+            or not isinstance(self.retry_consumed, int)
+            or not 0 <= self.retry_consumed <= self.effective_total_attempts
+        ):
+            raise ValueError("retry_consumed exceeds the sealed total")
+        if (
+            isinstance(self.delay_ms, bool)
+            or not isinstance(self.delay_ms, int)
+            or not 1000 <= self.delay_ms <= 60_000
+        ):
+            raise ValueError("retry delay must be between 1000 and 60000 ms")
+        if self.on_error not in {"transient", "all"}:
+            raise ValueError("retry on_error must be transient or all")
+        if self.capped is not (
+            self.effective_total_attempts < self.requested_total_attempts
+        ):
+            raise ValueError("retry capped evidence is inconsistent")
+
+    @classmethod
+    def from_projection(
+        cls,
+        value: Mapping[str, object],
+        *,
+        retry_consumed: int,
+    ) -> "RetryLedgerGrant":
+        return cls(
+            explicit=value["explicit"],
+            requested_retries=value["requested_retries"],
+            requested_total_attempts=value["requested_total_attempts"],
+            effective_total_attempts=value["effective_total_attempts"],
+            delay_ms=value["delay_ms"],
+            on_error=value["on_error"],
+            capped=value["capped"],
+            retry_consumed=retry_consumed,
+        )
+
+    @property
+    def remaining_attempts(self) -> int:
+        return self.effective_total_attempts - self.retry_consumed
+
+    @property
+    def policy(self) -> RetryPolicy:
+        return RetryPolicy(
+            max_attempts=self.effective_total_attempts,
+            delay_ms=self.delay_ms,
+            on_error=self.on_error,
+        )
+
+    def charge(
+        self,
+        provider_evidence: object,
+        *,
+        provider_attempts_exact: bool | None = None,
+    ) -> "RetryAttemptCharge":
+        """Charge one workflow attempt and validated provider retries once."""
+        granted = self.remaining_attempts
+        if granted <= 0:
+            raise ValueError("retry grant is exhausted")
+        if (
+            provider_attempts_exact is not False
+            and isinstance(provider_evidence, int)
+            and not isinstance(provider_evidence, bool)
+            and 0 <= provider_evidence < granted
+        ):
+            additional = provider_evidence
+            exact = (
+                provider_attempts_exact
+                if isinstance(provider_attempts_exact, bool)
+                else True
+            )
+        else:
+            additional = granted - 1
+            exact = False
+        charged = 1 + additional
+        consumed = min(
+            self.effective_total_attempts,
+            self.retry_consumed + charged,
+        )
+        return RetryAttemptCharge(
+            additional_provider_attempts=additional,
+            charged_attempts=charged,
+            retry_consumed=consumed,
+            remaining_attempts=self.effective_total_attempts - consumed,
+            provider_attempts_exact=exact,
+        )
+
+    def evidence(self, charge: "RetryAttemptCharge") -> dict[str, object]:
+        return {
+            "requested_retries": self.requested_retries,
+            "requested_total_attempts": self.requested_total_attempts,
+            "effective_total_attempts": self.effective_total_attempts,
+            "retry_consumed": charge.retry_consumed,
+            "remaining_attempts": charge.remaining_attempts,
+            "additional_provider_attempts": (
+                charge.additional_provider_attempts
+            ),
+            "provider_attempts_exact": charge.provider_attempts_exact,
+            "capped": self.capped,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RetryAttemptCharge:
+    """One validated durable update to a sealed combined retry ledger."""
+
+    additional_provider_attempts: int
+    charged_attempts: int
+    retry_consumed: int
+    remaining_attempts: int
+    provider_attempts_exact: bool
+
+
 @dataclass
 class DeadlineBudget:
     """Absolute monotonic deadlines shared by a node and its descendants."""
@@ -244,6 +430,24 @@ class DeadlineBudget:
         if not math.isfinite(float(now)):
             raise ValueError("now must be finite")
         return cls(float(now) + wall, idle, provider, float(now), float(now))
+
+    @classmethod
+    def from_attempt_semantics(
+        cls,
+        *,
+        now: float,
+        attempt_wall_seconds: float,
+        idle_seconds: float,
+        provider_seconds: float,
+    ) -> "DeadlineBudget":
+        """Create one attempt budget from already-normalized effective values."""
+        wall = _bounded_seconds(attempt_wall_seconds, "attempt_wall_seconds")
+        return cls.create(
+            now=now,
+            wall_seconds=wall,
+            idle_seconds=idle_seconds,
+            provider_seconds=provider_seconds,
+        )
 
     def child(
         self,
@@ -457,9 +661,7 @@ class WorkflowRuntimeConfig:
             "ai_wall_timeout_seconds", resolved.ai_wall_timeout_seconds
         )
         tightened["ai_idle_timeout_seconds"] = min(
-            tightened.get(
-                "ai_idle_timeout_seconds", resolved.ai_idle_timeout_seconds
-            ),
+            tightened.get("ai_idle_timeout_seconds", resolved.ai_idle_timeout_seconds),
             wall,
         )
         tightened["provider_request_timeout_seconds"] = min(

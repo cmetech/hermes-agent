@@ -274,7 +274,6 @@ def test_workflow_detail_model_accepts_real_maximum_node_compatibility_report(
                 "bash": "true",
                 "timeout": 1,
                 "retry": {"max_attempts": 1},
-                "output_format": {"type": "object"},
                 "output_type": "text",
                 "maxBudgetUsd": 1,
                 "sandbox": {"enabled": True},
@@ -324,11 +323,11 @@ def test_workflow_compatibility_models_accept_real_producer_state_variants(
         ),
         ("mapped", None, {}, CompatibilityLevel.MAPPED, True),
         (
-            "blocking",
+            "timeout",
             {"language_compatibility": "archon-2026-07"},
             {"nodes": [{"id": "start", "bash": "true", "timeout": 1}]},
-            CompatibilityLevel.UNSUPPORTED,
-            False,
+            CompatibilityLevel.PORTABLE,
+            True,
         ),
         (
             "nonblocking-unsupported",
@@ -421,6 +420,9 @@ def test_workflow_detail_normalizes_sanitizer_empty_compatibility_paths(
         ),
         "blocking": False,
         "code": "unknown_top_level_field",
+        "migration": module._finding_migration(
+            "unknown_top_level_field", "hermes-legacy"
+        ),
     }
     if unsafe_key:
         assert unsafe_key not in finding["path"]
@@ -905,11 +907,20 @@ def test_workflow_detail_is_full_read_only_preflight_with_coordinator_down(
     assert payload["risk_summary"]["risk_digest"]
     assert payload["compatibility"]["level"]
     assert isinstance(payload["compatibility"]["findings"], list)
+    legacy_finding = next(
+        finding
+        for finding in payload["compatibility"]["findings"]
+        if finding["code"] == "legacy_language_profile"
+    )
+    assert legacy_finding["migration"] == _module()._finding_migration(
+        "legacy_language_profile", "hermes-legacy"
+    )
+    assert len(legacy_finding["migration"]) <= _module()._WORKFLOW_RESPONSE_TEXT_MAX
     assert payload["language"] == {
         "declared_profile": None,
         "effective_profile": "hermes-legacy",
         "legacy": True,
-        "normalizer_version": 1,
+        "normalizer_version": 2,
         "normalized_definition_digest": load_workflow(path).language.normalized_definition_digest,
     }
     assert "semantic_fingerprint" not in payload["language"]

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from agent.structured_output import canonical_json_bytes
+import plugins.workflow.language as language_module
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     bind_semantic_fingerprint,
@@ -18,6 +22,8 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
+from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.scheduler import ConditionEvaluationError, evaluate_condition
 from plugins.workflow.schema import load_workflow
 
 
@@ -72,6 +78,147 @@ def test_archon_profile_normalization_is_deterministic(definition):
         == second.metadata.normalized_definition_digest
     )
     assert len(first.metadata.normalized_definition_digest) == 64
+    ordinary_document = language_module._json_safe({
+        "profile": selection.effective_profile.value,
+        "normalizer_version": 1,
+        "definition": {
+            "name": first.definition.name,
+            "description": first.definition.description,
+            "nodes": [
+                {
+                    "id": node.id,
+                    "node_type": node.node_type,
+                    "value": node.value,
+                    "depends_on": list(node.depends_on),
+                    "options": node.options,
+                }
+                for node in first.definition.nodes
+            ],
+            "options": first.definition.options,
+        },
+    })
+    shared_encoding = canonical_json_bytes(
+        ordinary_document,
+        max_bytes=1_000_000,
+    )
+    stdlib_encoding = json.dumps(
+        ordinary_document,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert shared_encoding == stdlib_encoding
+    assert first.metadata.normalized_definition_digest == hashlib.sha256(
+        shared_encoding
+    ).hexdigest()
+
+
+def test_normalized_digest_preserves_exact_integer_beyond_runtime_digit_limit(
+    definition,
+):
+    maximum = 10**4_999
+    definition = replace(
+        definition,
+        nodes=(
+            replace(
+                definition.nodes[0],
+                node_type="prompt",
+                value="Return an exact integer",
+                options=freeze_value({
+                    "output_format": {
+                        "type": "number",
+                        "maximum": maximum,
+                    }
+                }),
+            ),
+        ),
+    )
+    selection = WorkflowLanguageSelection(
+        declared_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+
+    first = normalize_workflow(definition, selection=selection, normalizer_version=2)
+    second = normalize_workflow(definition, selection=selection, normalizer_version=2)
+
+    assert first.metadata.normalized_definition_digest == (
+        second.metadata.normalized_definition_digest
+    )
+    assert first.metadata.structured_outputs["start"].canonical_schema[
+        "maximum"
+    ] == maximum
+
+
+def test_version_one_keeps_archon_structured_output_identity(definition):
+    definition = replace(
+        definition,
+        nodes=(
+            replace(
+                definition.nodes[0],
+                node_type="prompt",
+                value="Return JSON",
+                options=freeze_value({"output_format": {"type": "object"}}),
+            ),
+        ),
+    )
+    selection = WorkflowLanguageSelection(
+        declared_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+
+    normalized = normalize_workflow(
+        definition, selection=selection, normalizer_version=1
+    )
+
+    assert normalized.definition is definition
+    assert normalized.metadata.structured_outputs == {}
+
+
+def test_legacy_structured_output_findings_remain_unchanged(workflow_writer, tmp_path):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path,
+            nodes=[
+                {
+                    "id": "prompt",
+                    "prompt": "Return JSON",
+                    "output_format": {"type": "object"},
+                    "output_type": "report",
+                }
+            ],
+        )
+    )
+
+    assert {finding.code for finding in package.compatibility_findings} >= {
+        "legacy_output_format_post_validation",
+        "legacy_output_type_not_published",
+    }
+
+
+def test_phase2_resolved_output_keeps_condition_compatibility_adapters():
+    canonical = b'{"count":"2","flag":"yes"}'
+    output = ResolvedNodeOutput(
+        canonical_bytes=canonical,
+        value={"count": "2", "flag": "yes"},
+        text=canonical.decode("utf-8"),
+        media_type="application/json",
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        node_id="collect",
+        attempt_id="attempt-winner",
+        publication_id=None,
+    )
+    outputs = {"collect": output}
+
+    assert not evaluate_condition("$collect.output.count == 2", outputs)
+    assert evaluate_condition(
+        "$collect.output.flag == 'yes' || "
+        "$collect.output.count == 1 && $collect.output.count == 0",
+        outputs,
+    )
+    with pytest.raises(ConditionEvaluationError, match="missing output path"):
+        evaluate_condition("$collect.output.missing == 'x'", outputs)
 
 
 def test_unknown_normalizer_version_fails_closed(definition):

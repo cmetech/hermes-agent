@@ -41,7 +41,7 @@ from plugins.workflow.input_contract import (
 )
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
-from plugins.workflow.models import WorkflowPackage
+from plugins.workflow.models import RunExecutionLimits, WorkflowPackage
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.sanitize import (
@@ -1094,7 +1094,12 @@ def run_showcase(
         if showcase_id == "laptop-diagnostic":
             fixture_dir, fixture = _stage_fixture(home)
             inputs = {"evidence": fixture}
-        prepared = store.prepare_run_snapshot(package, inputs=inputs, values={"arguments": symptom or ""})
+        prepared = store.prepare_run_snapshot(
+            package,
+            inputs=inputs,
+            values={"arguments": symptom or ""},
+            execution_limits=RunExecutionLimits.resolve(config),
+        )
     finally:
         if fixture_dir is not None:
             shutil.rmtree(fixture_dir, ignore_errors=True)

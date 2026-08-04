@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 import threading
 
@@ -13,7 +14,12 @@ from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    ArtifactRef,
+    JournalRecoveryError,
+    RunStore,
+    TypedPublicationCandidate,
+)
 from plugins.workflow.notifications import NotificationOutbox
 
 
@@ -96,6 +102,112 @@ def test_archive_is_reversible_visibility_metadata_not_execution_state(
     assert restored["restored_to_history"] is True
     assert restored["archive_version"] == 2
     assert restored["next_actions"] == ["status", "events", "archive"]
+
+
+def test_typed_publication_bundle_is_one_archive_restore_and_cleanup_unit(
+    tmp_path, workflow_writer
+) -> None:
+    root = tmp_path / "typed-retention"
+    workflow = workflow_writer(
+        root,
+        name="typed-retention",
+        nodes=[{"id": "report", "bash": "true", "output_type": "Report"}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="typed-retention",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "report", "owner")
+    assert claim is not None
+    data = b"retained together"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / "output.md"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    relative = source.relative_to(store.run_directory(admitted.run_id)).as_posix()
+    digest = hashlib.sha256(data).hexdigest()
+    artifact = ArtifactRef(
+        relative,
+        "text/markdown; charset=utf-8",
+        len(data),
+        digest,
+    )
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(artifact,),
+        typed_publication=TypedPublicationCandidate(
+            attempt_relative_path=relative,
+            output_type="Report",
+            media_type="text/markdown; charset=utf-8",
+            size_bytes=len(data),
+            sha256=digest,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            session_id=None,
+        ),
+    )
+    current = store.load_run(admitted.run_id)
+    publication = next(
+        entry for entry in current["artifacts"] if "publication_id" in entry
+    )
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / publication["publication_id"]
+    )
+
+    archived = store.archive_run(
+        admitted.run_id,
+        expected_state_version=current["state_version"],
+    )
+    assert sorted(path.name for path in bundle.iterdir()) == [
+        "content.md",
+        "metadata.json",
+    ]
+    store.restore_run(
+        admitted.run_id,
+        expected_state_version=archived["state_version"],
+    )
+    assert sorted(path.name for path in bundle.iterdir()) == [
+        "content.md",
+        "metadata.json",
+    ]
+
+    preview = store.cleanup_runs(older_than=timedelta(0))
+    executed = store.cleanup_runs(
+        execute=True,
+        confirmation_token=preview["confirmation_token"],
+    )
+    quarantined_bundle = (
+        Path(executed["quarantine_paths"][0])
+        / "publications"
+        / publication["publication_id"]
+    )
+    assert sorted(path.name for path in quarantined_bundle.iterdir()) == [
+        "content.md",
+        "metadata.json",
+    ]
 
 
 def test_board_history_archive_views_use_utc_injectable_clock_and_exact_boundary(

@@ -21,6 +21,12 @@ from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
+from agent.structured_output import (
+    STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE,
+    StructuredOutputSchemaInvalid,
+    StructuredOutputValidatorUnavailable,
+    require_structured_output_validator,
+)
 from hermes_constants import get_hermes_home
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
@@ -40,10 +46,12 @@ from plugins.workflow.compat import (
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
+    RunExecutionLimits,
     ValidationIssue,
     WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
+    WorkflowStructuredOutput,
     WorkflowValidationError,
 )
 from plugins.workflow.machine_contract import (
@@ -349,9 +357,7 @@ def _hook_projection(hooks: object) -> object:
             entry: dict[str, object] = {}
             for field in ("matcher", "timeout"):
                 if field in raw_entry:
-                    entry[field] = _complete_projection(
-                        raw_entry[field], key=field
-                    )
+                    entry[field] = _complete_projection(raw_entry[field], key=field)
             raw_response = raw_entry.get("response")
             if isinstance(raw_response, Mapping):
                 response: dict[str, object] = {}
@@ -450,9 +456,7 @@ def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
     }
     projection = {
         "name": definition.name,
-        "description": _complete_projection(
-            definition.description, key="description"
-        ),
+        "description": _complete_projection(definition.description, key="description"),
         "nodes": [
             {
                 "id": node.id,
@@ -737,7 +741,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     reconcile_parser.add_argument("--interaction-id", required=True)
     reconcile_parser.add_argument("--expected-version", type=int)
-    reconcile_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    reconcile_parser.add_argument(
+        "--continue", dest="continue_run", action="store_true"
+    )
     _json_flag(reconcile_parser)
 
     for action, help_text in (
@@ -833,7 +839,11 @@ def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
         if package.definition.name == name:
             return package
     candidates = [
-        {"id": package.definition.name, "kind": "workflow", "label": package.definition.name}
+        {
+            "id": package.definition.name,
+            "kind": "workflow",
+            "label": package.definition.name,
+        }
         for package in sorted(packages, key=lambda item: item.definition.name)[:10]
     ]
     raise WorkflowNotFound(
@@ -947,31 +957,27 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         if identity in seen_issues:
             continue
         seen_issues.add(identity)
-        issue_entries.append(
-            {
-                "path": issue.path,
-                "code": issue.code,
-                "message": issue.message,
-                "severity": issue.severity,
-                "blocking": issue.blocking,
-                "source_line": issue.source_line,
-            }
-        )
+        issue_entries.append({
+            "path": issue.path,
+            "code": issue.code,
+            "message": issue.message,
+            "severity": issue.severity,
+            "blocking": issue.blocking,
+            "source_line": issue.source_line,
+        })
     for finding in compatibility.findings:
         identity = (finding.code, finding.path)
         if identity in seen_issues:
             continue
         seen_issues.add(identity)
-        issue_entries.append(
-            {
-                "path": finding.path,
-                "code": finding.code,
-                "message": finding.message,
-                "severity": finding.severity,
-                "blocking": finding.blocking,
-                "source_line": None,
-            }
-        )
+        issue_entries.append({
+            "path": finding.path,
+            "code": finding.code,
+            "message": finding.message,
+            "severity": finding.severity,
+            "blocking": finding.blocking,
+            "source_line": None,
+        })
     payload = {
         "name": package.definition.name,
         "valid": compatibility.runnable,
@@ -1135,9 +1141,7 @@ def _doctor_compatibility_level(
     findings: Iterable[CompatibilityFinding],
 ) -> CompatibilityLevel:
     materialized = tuple(findings)
-    if any(
-        finding.level is CompatibilityLevel.UNSUPPORTED for finding in materialized
-    ):
+    if any(finding.level is CompatibilityLevel.UNSUPPORTED for finding in materialized):
         return CompatibilityLevel.UNSUPPORTED
     if materialized:
         return CompatibilityLevel.MAPPED
@@ -1177,17 +1181,25 @@ def _provider_override_findings(
         _doctor_finding(
             code=f"{kind}_override_not_authorized",
             path=path,
-            message=(
-                f"workflow agent {kind} override is disabled in profile config"
-            ),
+            message=(f"workflow agent {kind} override is disabled in profile config"),
             blocking=True,
             level=CompatibilityLevel.UNSUPPORTED,
         )
         for kind, path, value in requested
-        if not _agent_override_allowed(
-            "workflow", kind, value, config=config
-        )
+        if not _agent_override_allowed("workflow", kind, value, config=config)
     )
+
+
+def _structured_output_validator_available(
+    structured_outputs: Iterable[WorkflowStructuredOutput],
+) -> bool:
+    """Probe the exact optional Draft 2020-12 API execution requires."""
+    try:
+        for structured_output in structured_outputs:
+            require_structured_output_validator(structured_output.canonical_schema)
+    except StructuredOutputValidatorUnavailable:
+        return False
+    return True
 
 
 def doctor_package(
@@ -1214,9 +1226,33 @@ def doctor_package(
         mcp_available=mcp_available,
     )
     findings = list(compatibility.findings)
-    findings.extend(
-        _provider_override_findings(package, hermes_home=hermes_home)
-    )
+    if package.language.structured_outputs:
+        try:
+            validator_available = _structured_output_validator_available(
+                package.language.structured_outputs.values()
+            )
+        except StructuredOutputSchemaInvalid as exc:
+            findings.append(
+                _doctor_finding(
+                    code="structured_output_invalid",
+                    path="language.structured_outputs",
+                    message=str(exc),
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+        else:
+            if not validator_available:
+                findings.append(
+                    _doctor_finding(
+                        code="structured_output_unavailable",
+                        path="language.structured_outputs",
+                        message=STRUCTURED_OUTPUT_VALIDATOR_INSTALL_GUIDANCE,
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
+    findings.extend(_provider_override_findings(package, hermes_home=hermes_home))
     risk = build_risk_summary(package, compatibility)
     package_digest = compute_package_digest(package)
     covered = package_digest.covered_relative_paths
@@ -1285,10 +1321,14 @@ def doctor_package(
         )
     else:
         for service in required_services:
-            missing = available_services is not None and service not in available_services
+            missing = (
+                available_services is not None and service not in available_services
+            )
             findings.append(
                 _doctor_finding(
-                    code="missing_service" if missing else "configured_service_preflight",
+                    code="missing_service"
+                    if missing
+                    else "configured_service_preflight",
                     path=f"sidecar.required_services.{service}",
                     message=(
                         f"required configured service is unavailable: {service}"
@@ -1395,8 +1435,7 @@ def doctor_package(
         _doctor_finding(
             code="executable_resources_digest_bound",
             path="package.digest",
-            message="package digest covers executable resources: "
-            + ", ".join(covered),
+            message="package digest covers executable resources: " + ", ".join(covered),
         )
     )
     findings.append(
@@ -1525,7 +1564,7 @@ def _doctor_text_value(value: object, *, path: bool = False) -> object:
     if isinstance(sanitized, str) and path:
         match = _DOCTOR_ABSOLUTE_PATH_START.search(sanitized)
         if match is not None:
-            return sanitized[:match.start()] + "[REDACTED_PATH]"
+            return sanitized[: match.start()] + "[REDACTED_PATH]"
     return sanitized
 
 
@@ -1556,8 +1595,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"Compatibility: {payload['compatibility']}")
         print(f"Language: {payload['language']['effective_profile']}")
         print(
-            "Execution environment: "
-            f"{payload['risk_summary']['execution_environment']}"
+            f"Execution environment: {payload['risk_summary']['execution_environment']}"
         )
         print(f"Remediation: {payload['remediation']}")
         findings = payload.get("findings", ())
@@ -1786,7 +1824,9 @@ def _cmd_run(
         else None
     )
     prepared = store.prepare_run_snapshot(
-        package, values={"arguments": args.arguments} if args.arguments else None
+        package,
+        values={"arguments": args.arguments} if args.arguments else None,
+        execution_limits=RunExecutionLimits.resolve(runtime),
     )
     intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
@@ -1813,9 +1853,7 @@ def _cmd_run(
     if admitted.run_id is None:
         reason = admitted.reason_code or "admission_rejected"
         if reason == "coordinator_unavailable":
-            raise CoordinatorUnavailable(
-                f"workflow admission was rejected: {reason}"
-            )
+            raise CoordinatorUnavailable(f"workflow admission was rejected: {reason}")
         if reason in {"idempotency_conflict", "coordinator_active"}:
             raise WorkflowConflict(
                 f"workflow admission was rejected: {reason}",
@@ -1895,9 +1933,7 @@ def _run_page(
     limit: int = 100,
     view: str = "all",
 ) -> dict[str, object]:
-    runs = store.list_runs(
-        workflow=workflow, status=status, limit=limit, view=view
-    )
+    runs = store.list_runs(workflow=workflow, status=status, limit=limit, view=view)
     next_cursor = None
     if len(runs) == limit and runs:
         keyset = (str(runs[-1]["updated_at"]), str(runs[-1]["run_id"]))
@@ -1920,7 +1956,10 @@ def _run_page(
 def _cmd_runs(args: argparse.Namespace) -> int:
     payload = _run_page(
         _store(args),
-        workflow=args.workflow, status=args.status, limit=args.limit, view=args.view
+        workflow=args.workflow,
+        status=args.status,
+        limit=args.limit,
+        view=args.view,
     )
     _emit(payload, as_json=args.json)
     return 0
@@ -2251,7 +2290,10 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
 
     action = getattr(args, "showcase_action", None)
     catalog = load_showcase_catalog()
-    if action in {"describe", "preflight", "run", "reset"} and args.showcase_id not in catalog:
+    if (
+        action in {"describe", "preflight", "run", "reset"}
+        and args.showcase_id not in catalog
+    ):
         raise WorkflowNotFound(
             f"showcase not found: {args.showcase_id}",
             details={

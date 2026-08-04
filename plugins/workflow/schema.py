@@ -4,21 +4,33 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import math
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
+from agent.structured_output import parse_exact_decimal_integer
+from plugins.workflow.bash_rendering import (
+    BashRenderingError,
+    bash_output_references,
+)
+from plugins.workflow.conditions import (
+    WorkflowConditionError,
+    validate_v3_condition_syntax,
+)
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
-    WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
+    WorkflowSemanticNormalizationError,
+    WorkflowStructuredOutputNormalizationError,
     language_compatibility_findings,
     normalize_workflow,
+    prove_output_path_impossible,
     resolve_language_profile,
+    select_normalizer_version,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
@@ -30,14 +42,20 @@ from plugins.workflow.language_schema import (
     approval_reject_field_names,
     common_node_field_names,
     definition_field_names,
+    field_max_length,
     hook_entry_field_names,
     hook_event_names,
     hook_response_field_names,
     hook_specific_field_names,
+    contains_output_reference,
+    is_reference_safe_node_id,
+    iter_output_references,
+    iter_when_output_references,
     loop_field_names,
     retry_field_names,
     sidecar_field_names,
     structural_node_field_names,
+    WorkflowReferenceSyntaxError,
 )
 from plugins.workflow.models import (
     ValidationIssue,
@@ -49,12 +67,56 @@ from plugins.workflow.models import (
     WorkflowValidationError,
     freeze_value,
 )
+from plugins.workflow.resources import iter_output_field_references
 
 TRIGGER_RULES = (
     "all_success",
     "one_success",
     "none_failed_min_one_success",
     "all_done",
+)
+
+
+class _WorkflowSafeLoader(yaml.SafeLoader):
+    """SafeLoader with local exact decimal integer construction."""
+
+
+def _construct_workflow_yaml_int(loader, node):
+    value = loader.construct_scalar(node).replace("_", "")
+    sign = -1 if value[0] == "-" else 1
+    if value[0] in "+-":
+        value = value[1:]
+    if value == "0":
+        return 0
+    if value.startswith("0b"):
+        return sign * int(value[2:], 2)
+    if value.startswith("0x"):
+        return sign * int(value[2:], 16)
+    if value[0] == "0":
+        return sign * int(value, 8)
+    if ":" in value:
+        digits = [
+            parse_exact_decimal_integer(
+                part,
+                max_digits=MAX_WORKFLOW_DOCUMENT_BYTES,
+            )
+            for part in value.split(":")
+        ]
+        total = 0
+        base = 1
+        for digit in reversed(digits):
+            total += digit * base
+            base *= 60
+        return sign * total
+    return sign * parse_exact_decimal_integer(
+        value,
+        max_digits=MAX_WORKFLOW_DOCUMENT_BYTES,
+    )
+
+
+_WorkflowSafeLoader.add_constructor(
+    "tag:yaml.org,2002:int",
+    _construct_workflow_yaml_int,
 )
 CONTEXT_VALUES = ("fresh", "shared")
 SCRIPT_RUNTIMES = ("bun", "uv")
@@ -93,9 +155,21 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
     return value
 
 
-def _string(value: Any, path: str, *, allow_empty: bool = False) -> str:
+def _string(
+    value: Any,
+    path: str,
+    *,
+    allow_empty: bool = False,
+    max_length: int | None = None,
+) -> str:
     if not isinstance(value, str) or (not allow_empty and not value.strip()):
         _fail(path, "expected_string", f"{path} must be a non-empty string")
+    if max_length is not None and len(value) > max_length:
+        _fail(
+            path,
+            "string_too_long",
+            f"{path} exceeds the {max_length}-character limit",
+        )
     return value
 
 
@@ -345,9 +419,7 @@ def _validate_agents(value: Any, path: str) -> None:
                 f"{agent_path} must use a kebab-case agent id",
             )
         agent = _mapping(raw_agent, agent_path)
-        unknown = sorted(
-            set(agent) - AGENT_FIELDS
-        )
+        unknown = sorted(set(agent) - AGENT_FIELDS)
         if unknown:
             _fail(
                 agent_path,
@@ -376,7 +448,11 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         if field in node:
             _boolean(node[field], f"{path}.{field}")
     if "output_type" in node:
-        _string(node["output_type"], f"{path}.output_type")
+        _string(
+            node["output_type"],
+            f"{path}.output_type",
+            max_length=field_max_length("node", "output_type"),
+        )
     for field in ("provider", "model", "systemPrompt", "fallbackModel"):
         if field in node:
             _string(node[field], f"{path}.{field}")
@@ -427,9 +503,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
-        unknown = sorted(
-            set(loop) - LOOP_FIELDS
-        )
+        unknown = sorted(set(loop) - LOOP_FIELDS)
         if unknown:
             _fail(
                 f"{path}.loop",
@@ -487,7 +561,14 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
                 )
 
 
-def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode:
+def _normalize_node(
+    raw: Any,
+    index: int,
+    lines: dict[str, int],
+    *,
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> WorkflowNode:
     path = f"nodes[{index}]"
     node = _mapping(raw, path)
     if "kind" in node:
@@ -516,7 +597,21 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
-    structurally_invalid = sorted(set(node) - structural_node_field_names(node_type))
+    structural_fields = set(structural_node_field_names(node_type))
+    archon_v3 = (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version == 3
+    )
+    if archon_v3 and not is_reference_safe_node_id(node_id):
+        _fail(
+            f"{path}.id",
+            "archon_node_id_not_reference_safe",
+            f"{path}.id cannot be addressed by the Archon v3 reference grammar",
+            line=lines.get("id"),
+        )
+    if archon_v3:
+        structural_fields.update({"timeout", "idle_timeout", "retry"})
+    structurally_invalid = sorted(set(node) - structural_fields)
     if structurally_invalid:
         field = structurally_invalid[0]
         _fail(
@@ -551,16 +646,28 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
             "invalid_context",
             f"{path}.context must be fresh or shared",
         )
-    for timeout_name in ("idle_timeout", "timeout"):
-        if timeout_name in node:
-            _positive_number(node[timeout_name], f"{path}.{timeout_name}")
-    if "retry" in node:
-        _validate_retry(node["retry"], f"{path}.retry")
+    if not archon_v3:
+        for timeout_name in ("idle_timeout", "timeout"):
+            if timeout_name in node:
+                _positive_number(node[timeout_name], f"{path}.{timeout_name}")
+        if "retry" in node:
+            _validate_retry(node["retry"], f"{path}.retry")
     if "hooks" in node:
         _validate_hook_fields(node["hooks"], f"{path}.hooks")
     if "when" in node:
         when = _string(node["when"], f"{path}.when")
-        if not _WHEN_EXPRESSION.fullmatch(when):
+        if archon_v3:
+            try:
+                validate_v3_condition_syntax(when)
+            except WorkflowConditionError as exc:
+                if isinstance(exc.__cause__, WorkflowReferenceSyntaxError):
+                    _fail(f"{path}.when", exc.__cause__.code, str(exc.__cause__))
+                _fail(
+                    f"{path}.when",
+                    "malformed_condition",
+                    f"{path}.when is a statically malformed condition",
+                )
+        elif not _WHEN_EXPRESSION.fullmatch(when):
             _fail(
                 f"{path}.when",
                 "malformed_condition",
@@ -582,7 +689,9 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
     )
 
 
-def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
+def _validate_graph(
+    nodes: tuple[WorkflowNode, ...], *, strict_output_references: bool = False
+) -> None:
     issues: list[ValidationIssue] = []
     by_id: dict[str, WorkflowNode] = {}
     for node in nodes:
@@ -608,7 +717,7 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
                     )
                 )
         when = node.options.get("when")
-        if isinstance(when, str):
+        if isinstance(when, str) and not strict_output_references:
             for reference in _WHEN_REFERENCE.findall(when):
                 if reference not in by_id:
                     issues.append(
@@ -652,7 +761,7 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
     upstream_issues: list[ValidationIssue] = []
     for node in nodes:
         when = node.options.get("when")
-        if not isinstance(when, str):
+        if strict_output_references or not isinstance(when, str):
             continue
         upstream = collect_ancestors(node.id)
         for reference in _WHEN_REFERENCE.findall(when):
@@ -669,13 +778,488 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
         raise WorkflowValidationError(upstream_issues)
 
 
+def _validate_structured_output_field_references(
+    nodes: tuple[WorkflowNode, ...],
+    structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
+) -> None:
+    """Reject only field paths every normalized producer branch excludes."""
+    issues: list[ValidationIssue] = []
+    for node in nodes:
+        for surface_path, template in _interpolated_node_templates(
+            node, command_bodies=command_bodies
+        ):
+            for producer_id, path_parts in iter_output_field_references(template):
+                output = structured_outputs.get(producer_id)
+                if output is None:
+                    continue
+                schema = getattr(output, "canonical_schema", None)
+                if isinstance(schema, Mapping) and prove_output_path_impossible(
+                    schema, path_parts
+                ):
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "structured_output_field_impossible",
+                            f"structured output field {'.'.join(path_parts)} is impossible for node {producer_id}",
+                            line=node.source_line,
+                        )
+                    )
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+
+
+def _schema_has_unaddressable_dotted_key(
+    schema: Mapping[str, object], path_parts: tuple[str, ...]
+) -> bool:
+    """Detect an impossible traversal that instead names one dotted key."""
+    seen: set[tuple[int, int]] = set()
+
+    def resolve_local_ref(reference: object) -> object:
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            return None
+        current: object = schema
+        for raw_part in reference[2:].split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(current, Mapping) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    def visit(current: object, index: int) -> bool:
+        if not isinstance(current, Mapping) or index >= len(path_parts):
+            return False
+        marker = (id(current), index)
+        if marker in seen:
+            return False
+        seen.add(marker)
+        referenced = resolve_local_ref(current.get("$ref"))
+        if referenced is not None and visit(referenced, index):
+            return True
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            branches = current.get(keyword)
+            if isinstance(branches, tuple | list) and any(
+                visit(branch, index) for branch in branches
+            ):
+                return True
+        segment = path_parts[index]
+        schema_type = current.get("type")
+        object_capable = not (
+            isinstance(schema_type, str) and schema_type != "object"
+        ) and not (
+            isinstance(schema_type, tuple | list) and "object" not in schema_type
+        )
+        array_capable = not (
+            isinstance(schema_type, str) and schema_type != "array"
+        ) and not (
+            isinstance(schema_type, tuple | list) and "array" not in schema_type
+        )
+        if object_capable:
+            properties = current.get("properties")
+            if isinstance(properties, Mapping):
+                remaining = ".".join(path_parts[index:])
+                if "." in remaining and remaining in properties:
+                    return True
+                if segment in properties and visit(properties[segment], index + 1):
+                    return True
+        if array_capable and segment.isascii() and segment.isdigit():
+            sequence_index = int(segment)
+            prefix = current.get("prefixItems")
+            if isinstance(prefix, tuple | list) and sequence_index < len(prefix):
+                child: object = prefix[sequence_index]
+            else:
+                items = current.get("items", True)
+                if isinstance(items, tuple | list):
+                    child = (
+                        items[sequence_index]
+                        if sequence_index < len(items)
+                        else current.get("additionalItems", True)
+                    )
+                else:
+                    child = items
+            return visit(child, index + 1)
+        return False
+
+    return visit(schema, 0)
+
+
+def _v3_output_path_impossible(
+    schema: Mapping[str, object], path_parts: tuple[str, ...]
+) -> bool:
+    """Prove a v3 mapping-key/sequence-index path impossible conservatively."""
+    if not path_parts:
+        return False
+    return _v3_schema_path_impossible(
+        schema,
+        path_parts,
+        schema,
+        frozenset(),
+    )
+
+
+def _v3_schema_path_impossible(
+    schema: object,
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    if schema is False:
+        return True
+    if schema is True or not isinstance(schema, Mapping):
+        return False
+
+    segment = path_parts[0]
+    index = int(segment) if segment.isascii() and segment.isdigit() else None
+    interpretations = ("object", "array") if index is not None else ("object",)
+    return all(
+        _v3_schema_path_interpretation_impossible(
+            schema,
+            path_parts,
+            root,
+            resolving,
+            expected_type=expected_type,
+            sequence_index=index,
+        )
+        for expected_type in interpretations
+    )
+
+
+def _v3_schema_path_interpretation_impossible(
+    schema: Mapping[str, object],
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+    *,
+    expected_type: str,
+    sequence_index: int | None,
+) -> bool:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str) and schema_type != expected_type:
+        return True
+    if isinstance(schema_type, tuple | list) and expected_type not in schema_type:
+        return True
+
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference not in resolving:
+        target = _resolve_v3_local_ref(root, reference)
+        if isinstance(target, Mapping) and _v3_schema_path_interpretation_impossible(
+            target,
+            path_parts,
+            root,
+            resolving | frozenset({reference}),
+            expected_type=expected_type,
+            sequence_index=sequence_index,
+        ):
+            return True
+        if target is False:
+            return True
+
+    if expected_type == "object":
+        if _v3_object_path_impossible(schema, path_parts, root, resolving):
+            return True
+    elif sequence_index is not None and _v3_array_path_impossible(
+        schema, sequence_index, path_parts[1:], root, resolving
+    ):
+        return True
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, tuple | list) and any(
+        isinstance(branch, Mapping)
+        and _v3_schema_path_interpretation_impossible(
+            branch,
+            path_parts,
+            root,
+            resolving,
+            expected_type=expected_type,
+            sequence_index=sequence_index,
+        )
+        or branch is False
+        for branch in all_of
+    ):
+        return True
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if (
+            isinstance(branches, tuple | list)
+            and branches
+            and all(
+                branch is False
+                or (
+                    isinstance(branch, Mapping)
+                    and _v3_schema_path_interpretation_impossible(
+                        branch,
+                        path_parts,
+                        root,
+                        resolving,
+                        expected_type=expected_type,
+                        sequence_index=sequence_index,
+                    )
+                )
+                for branch in branches
+            )
+        ):
+            return True
+    return False
+
+
+def _v3_object_path_impossible(
+    schema: Mapping[str, object],
+    path_parts: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    property_name, *remaining = path_parts
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping) and property_name in properties:
+        child = properties[property_name]
+        if not remaining:
+            return child is False
+        return _v3_schema_path_impossible(
+            child, tuple(remaining), root, resolving
+        )
+    patterns = schema.get("patternProperties")
+    if isinstance(patterns, Mapping) and patterns:
+        return False
+    additional = schema.get("additionalProperties", True)
+    if additional is False:
+        return True
+    if isinstance(additional, Mapping) and remaining:
+        return _v3_schema_path_impossible(
+            additional, tuple(remaining), root, resolving
+        )
+    return False
+
+
+def _v3_array_path_impossible(
+    schema: Mapping[str, object],
+    index: int,
+    remaining: tuple[str, ...],
+    root: Mapping[str, object],
+    resolving: frozenset[str],
+) -> bool:
+    maximum = schema.get("maxItems")
+    if isinstance(maximum, int) and not isinstance(maximum, bool) and index >= maximum:
+        return True
+
+    prefix = schema.get("prefixItems")
+    if isinstance(prefix, tuple | list) and index < len(prefix):
+        child: object = prefix[index]
+    else:
+        items = schema.get("items", True)
+        if isinstance(items, tuple | list):
+            if index < len(items):
+                child = items[index]
+            else:
+                child = schema.get("additionalItems", True)
+        else:
+            child = items
+    if not remaining:
+        return child is False
+    return _v3_schema_path_impossible(child, remaining, root, resolving)
+
+
+def _resolve_v3_local_ref(
+    root: Mapping[str, object], reference: str
+) -> object | None:
+    if not reference.startswith("#/"):
+        return None
+    current: object = root
+    for raw_part in reference[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif (
+            isinstance(current, tuple | list)
+            and part.isascii()
+            and part.isdigit()
+            and int(part) < len(current)
+        ):
+            current = current[int(part)]
+        else:
+            return None
+    return current
+
+
+def _validate_v3_static_output_references(
+    nodes: tuple[WorkflowNode, ...],
+    structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
+) -> None:
+    """Enforce the closed v3 grammar and direct-dependency reference rule."""
+    issues: list[ValidationIssue] = []
+    for node in nodes:
+        for surface_path, template in _interpolated_node_templates(
+            node, command_bodies=command_bodies
+        ):
+            try:
+                if surface_path.endswith(".when"):
+                    references = tuple(
+                        iter_when_output_references(
+                            template,
+                            normalizer_version=3,
+                        )
+                    )
+                elif surface_path.endswith(".bash"):
+                    references = bash_output_references(template)
+                else:
+                    references = tuple(
+                        iter_output_references(
+                            template,
+                            normalizer_version=3,
+                        )
+                    )
+            except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
+                issues.append(
+                    _issue(surface_path, exc.code, str(exc), line=node.source_line)
+                )
+                continue
+            for reference in references:
+                if reference.node_id not in node.depends_on:
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "output_reference_not_declared_dependency",
+                            f"output reference {reference.node_id} must be listed directly in depends_on for node {node.id}",
+                            line=node.source_line,
+                        )
+                    )
+                    continue
+                if not reference.path:
+                    continue
+                output = structured_outputs.get(reference.node_id)
+                schema = getattr(output, "canonical_schema", None)
+                if not isinstance(schema, Mapping):
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            "output_reference_path_unsupported",
+                            f"output field reference requires a structured output contract on node {reference.node_id}",
+                            line=node.source_line,
+                        )
+                    )
+                    continue
+                if _v3_output_path_impossible(schema, reference.path):
+                    if _schema_has_unaddressable_dotted_key(schema, reference.path):
+                        code = "output_reference_path_unsupported"
+                        message = (
+                            "output reference cannot address a mapping key containing a dot"
+                        )
+                    else:
+                        code = "structured_output_field_impossible"
+                        message = (
+                            f"structured output field {'.'.join(reference.path)} "
+                            f"is impossible for node {reference.node_id}"
+                        )
+                    issues.append(
+                        _issue(
+                            surface_path,
+                            code,
+                            message,
+                            line=node.source_line,
+                        )
+                    )
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+
+
+def _interpolated_node_templates(
+    node: WorkflowNode,
+    *,
+    command_bodies: Mapping[str, str] | None,
+) -> Iterable[tuple[str, str]]:
+    """Yield only fields rendered by the Phase 2 runtime variable adapter."""
+    prefix = f"nodes[{node.source_index}]"
+    when = node.options.get("when")
+    if isinstance(when, str):
+        yield f"{prefix}.when", when
+    if node.node_type in {"bash", "prompt"} and isinstance(node.value, str):
+        yield f"{prefix}.{node.node_type}", node.value
+    elif (
+        node.node_type == "script"
+        and isinstance(node.value, str)
+        and is_inline_script(node.value)
+    ):
+        yield f"{prefix}.script", node.value
+    elif node.node_type == "loop" and isinstance(node.value, Mapping):
+        for field in ("prompt", "until_bash"):
+            value = node.value.get(field)
+            if isinstance(value, str):
+                yield f"{prefix}.loop.{field}", value
+    elif node.node_type == "approval" and isinstance(node.value, Mapping):
+        message = node.value.get("message")
+        if isinstance(message, str):
+            yield f"{prefix}.approval.message", message
+        on_reject = node.value.get("on_reject")
+        if isinstance(on_reject, Mapping):
+            prompt = on_reject.get("prompt")
+            if isinstance(prompt, str):
+                yield f"{prefix}.approval.on_reject.prompt", prompt
+    elif node.node_type == "command" and command_bodies is not None:
+        body = command_bodies.get(node.id)
+        if isinstance(body, str):
+            yield f"{prefix}.command", body
+
+
+def validate_authenticated_command_references(
+    package: WorkflowPackage,
+    command_bodies: Mapping[str, str],
+) -> None:
+    """Validate command bodies already read from authenticated snapshot bytes."""
+    validate_authenticated_resource_references(
+        package,
+        command_bodies=command_bodies,
+        named_script_bodies={},
+    )
+
+
+def validate_authenticated_resource_references(
+    package: WorkflowPackage,
+    *,
+    command_bodies: Mapping[str, str],
+    named_script_bodies: Mapping[str, str],
+) -> None:
+    """Scan authenticated command and named-script bytes before promotion."""
+    if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return
+    if package.language.normalizer_version == 3:
+        _validate_v3_static_output_references(
+            package.definition.nodes,
+            package.language.structured_outputs,
+            command_bodies=command_bodies,
+        )
+        issues: list[ValidationIssue] = []
+        for node in package.definition.nodes:
+            body = named_script_bodies.get(node.id)
+            if body is None:
+                continue
+            if contains_output_reference(body, normalizer_version=3):
+                issues.append(
+                    _issue(
+                        f"nodes[{node.source_index}].script",
+                        "named_script_output_reference_unsupported",
+                        "named scripts receive workflow values through their environment and cannot interpolate output references",
+                        line=node.source_line,
+                    )
+                )
+        if issues:
+            raise WorkflowValidationError(tuple(issues))
+        return
+    _validate_structured_output_field_references(
+        package.definition.nodes,
+        package.language.structured_outputs,
+        command_bodies=command_bodies,
+    )
+
+
 def _parse_sidecar(
     sidecar_path: Path,
     data: bytes,
 ) -> tuple[Path, Mapping[str, Any]]:
     try:
-        raw = yaml.safe_load(data.decode("utf-8")) or {}
-    except (UnicodeError, yaml.YAMLError) as exc:
+        raw = yaml.load(data.decode("utf-8"), Loader=_WorkflowSafeLoader) or {}
+    except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
     sidecar = _mapping(raw, "sidecar")
     forbidden = {
@@ -748,9 +1332,10 @@ def _parse_sidecar(
             "invalid_sidecar",
             "pause_lane_policy must be hold or release",
         )
-    if "pause_lane_policy" in sidecar and sidecar.get(
-        "overlap_policy", "queue"
-    ) != "queue":
+    if (
+        "pause_lane_policy" in sidecar
+        and sidecar.get("overlap_policy", "queue") != "queue"
+    ):
         _fail(
             "sidecar.pause_lane_policy",
             "invalid_sidecar",
@@ -834,7 +1419,7 @@ def _load_workflow_bytes(
     sidecar_bytes: bytes | None | object,
     source: str,
     precedence: int,
-    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
+    normalizer_version: int | None = None,
 ) -> WorkflowPackage:
     if len(data) > MAX_WORKFLOW_DOCUMENT_BYTES:
         _fail(
@@ -844,8 +1429,8 @@ def _load_workflow_bytes(
         )
     try:
         text = data.decode("utf-8")
-        raw = yaml.safe_load(text)
-    except (UnicodeError, yaml.YAMLError) as exc:
+        raw = yaml.load(text, Loader=_WorkflowSafeLoader)
+    except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("document", "invalid_yaml", f"invalid workflow YAML: {exc}")
     document = _mapping(raw, "document")
     top_lines, node_lines = _source_lines(text)
@@ -877,6 +1462,9 @@ def _load_workflow_bytes(
         selection = resolve_language_profile(sidecar)
     except WorkflowLanguageCompatibilityError as exc:
         _fail("sidecar.language_compatibility", exc.code, str(exc))
+    selected_normalizer_version = select_normalizer_version(
+        selection, normalizer_version
+    )
     unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
     if (
         unknown_top
@@ -918,11 +1506,19 @@ def _load_workflow_bytes(
         _fail("nodes", "invalid_nodes", "nodes must be a non-empty list")
     nodes = tuple(
         _normalize_node(
-            node, index, node_lines[index] if index < len(node_lines) else {}
+            node,
+            index,
+            node_lines[index] if index < len(node_lines) else {},
+            profile=selection.effective_profile,
+            normalizer_version=selected_normalizer_version,
         )
         for index, node in enumerate(raw_nodes)
     )
-    _validate_graph(nodes)
+    archon_v3 = (
+        selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and selected_normalizer_version == 3
+    )
+    _validate_graph(nodes, strict_output_references=archon_v3)
     options = {
         key: value
         for key, value in document.items()
@@ -937,11 +1533,32 @@ def _load_workflow_bytes(
     )
     node_ids = frozenset(node.id for node in nodes)
     _validate_sidecar_node_references(sidecar, node_ids)
-    normalized = normalize_workflow(
-        definition,
-        selection=selection,
-        normalizer_version=normalizer_version,
-    )
+    try:
+        normalized = normalize_workflow(
+            definition,
+            selection=selection,
+            normalizer_version=selected_normalizer_version,
+        )
+    except WorkflowStructuredOutputNormalizationError as exc:
+        _fail(
+            f"nodes[{exc.source_index}].output_format",
+            "invalid_output_format",
+            "output_format is not a valid bounded structured-output schema",
+        )
+    except WorkflowSemanticNormalizationError as exc:
+        _fail(
+            f"nodes[{exc.source_index}].{exc.field}",
+            exc.code,
+            str(exc),
+        )
+    if archon_v3:
+        _validate_v3_static_output_references(
+            normalized.definition.nodes, normalized.metadata.structured_outputs
+        )
+    else:
+        _validate_structured_output_field_references(
+            normalized.definition.nodes, normalized.metadata.structured_outputs
+        )
     return WorkflowPackage(
         source_definition=definition,
         definition=normalized.definition,
@@ -985,7 +1602,7 @@ def load_workflow_snapshot(
     sidecar_bytes: bytes | None,
     source: str = "explicit",
     precedence: int = 0,
-    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
+    normalizer_version: int | None = None,
 ) -> WorkflowPackage:
     """Parse caller-authenticated bytes without reopening definition files."""
     workflow_path = Path(path).expanduser().absolute()

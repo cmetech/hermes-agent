@@ -33,7 +33,12 @@ from plugins.workflow.resources import (
 )
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from tools.registry import registry
-from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tests.plugins.workflow.test_ai_executor import (
+    FakeAgentRunner,
+    _archon_context,
+    _context,
+    _node,
+)
 from tools.mcp_tool import _interpolate_env_vars
 
 
@@ -958,6 +963,54 @@ def test_real_worker_rejects_interpolated_undeclared_paths_before_mcp_spawn(
     assert not pid_file.exists()
 
 
+def test_missing_shared_session_precedes_request_mcp_start_and_closes_db(
+    tmp_path, monkeypatch
+):
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.timeouts as timeout_mod
+    import hermes_state
+    from agent.plugin_agent import _request_payload
+    from tools import mcp_tool
+
+    pid_file = tmp_path / "missing-shared.pid"
+    original_loader = mcp_tool._load_mcp_config
+    original_timeout = timeout_mod.get_provider_request_timeout
+    session_dbs = []
+
+    class FakeSessionDB:
+        def __init__(self):
+            self.closed = False
+            session_dbs.append(self)
+
+        def get_existing_session_conversation(self, session_id):
+            assert session_id == "missing-session"
+            return None
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+    result = worker._run(
+        _request_payload(
+            "workflow/test",
+            PluginAgentRunRequest(
+                prompt="must classify before MCP",
+                context_mode="shared",
+                session_id="missing-session",
+                allowed_tools=("mcp__node_echo__echo",),
+                mcp_servers=_request_mcp(pid_file),
+            ),
+        )
+    )
+
+    assert result == worker._persistent_session_missing_failure("workflow/test")
+    assert len(session_dbs) == 1
+    assert session_dbs[0].closed is True
+    assert not pid_file.exists()
+    assert mcp_tool._load_mcp_config is original_loader
+    assert timeout_mod.get_provider_request_timeout is original_timeout
+
+
 @pytest.mark.parametrize(
     ("uri_field", "value"),
     [
@@ -1460,6 +1513,35 @@ def test_node_executor_passes_only_its_snapshotted_mcp_mapping(tmp_path):
     assert set(runner.requests[0].mcp_servers) == {"node_echo"}
 
 
+def test_structured_repair_does_not_restart_original_mcp_servers(tmp_path):
+    runner = FakeAgentRunner("not json", '{"answer":"fixed"}')
+    node = _node(
+        "mcp-repair",
+        "work",
+        mcp="echo",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+    relative = "mcp/echo.yaml"
+    context = _archon_context(
+        tmp_path,
+        node,
+        sealed_resource_paths=frozenset({relative}),
+        sealed_resource_bytes={
+            relative: b"node_echo:\n  command: echo\n  args: [ok]\n"
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert set(runner.requests[0].mcp_servers) == {"node_echo"}
+    assert runner.requests[1].mcp_servers is None
+
+
 def test_real_plugin_agent_runs_request_mcp_and_reaps_it(tmp_path):
     import model_tools
     from tools import mcp_tool
@@ -1635,7 +1717,6 @@ def test_incapable_runtime_fails_before_agent_construction_and_mcp_start(
     [
         ("tool_policy", ValueError),
         ("session_construction", RuntimeError),
-        ("shared_session", ValueError),
         ("skill_validation", ValueError),
         ("agent_construction", RuntimeError),
         ("cancellation", KeyboardInterrupt),
@@ -1681,10 +1762,7 @@ def test_request_mcp_cleanup_covers_every_post_start_failure(
             self.closed = False
             session_dbs.append(self)
 
-        def get_session(self, _session_id):
-            return None if failure_stage == "shared_session" else object()
-
-        def get_messages_as_conversation(self, _session_id):
+        def get_existing_session_conversation(self, _session_id):
             return []
 
         def close(self):
@@ -1738,8 +1816,8 @@ def test_request_mcp_cleanup_covers_every_post_start_failure(
         worker._cancel_event.set()
     request = PluginAgentRunRequest(
         prompt="exercise cleanup",
-        context_mode="shared" if failure_stage == "shared_session" else "fresh",
-        session_id="session-1" if failure_stage == "shared_session" else None,
+        context_mode="fresh",
+        session_id=None,
         allowed_tools=(
             "mcp__node_echo__echo",
             *(("unknown_tool",) if failure_stage == "tool_policy" else ()),

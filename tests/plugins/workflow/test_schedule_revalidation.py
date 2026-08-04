@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import time
@@ -23,7 +24,11 @@ from plugins.workflow.runner_binding import (
     assess_package_execution,
     background_execution_context,
 )
-from plugins.workflow.models import ExecutionFence
+from plugins.workflow.models import (
+    ExecutionFence,
+    ValidationIssue,
+    WorkflowValidationError,
+)
 from plugins.workflow.scheduler import RunScheduler
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.schema import load_workflow
@@ -284,7 +289,8 @@ def test_scheduled_admission_persists_exact_fire_time_identity(
     assert metadata["package_digest"] == run["definition_digest"]
     assert metadata["risk_digest"]
     assert metadata["execution_identity"]
-    assert metadata["execution_identity"] == context.identity_digest
+    assert metadata["execution_identity"] == context.identity_digest_for(package)
+    assert metadata["execution_runtime_identity"] == context.identity_digest
     assert metadata["sealed_snapshot_digest"] == (
         scheduled_revalidation_module.sealed_snapshot_digest(
             store.run_directory(str(result["run_id"]))
@@ -357,9 +363,19 @@ def test_same_binding_refreshes_runtime_before_scheduled_admission(
     assert context.runtime_capabilities == ExecutionRuntimeCapabilities(
         api_mode="anthropic_messages",
         hermes_managed_tool_loop=True,
+        effective_provider="anthropic",
+        model="claude-sonnet-4-5",
+        base_url_trust_class="trusted_direct",
+        declared_structured_output_strategy="native_json_schema",
+        structured_output_declaration_source="provider_profile",
     )
     admitted = store.load_run(run_id)
-    assert admitted["run_metadata"]["execution_identity"] == context.identity_digest
+    assert admitted["run_metadata"]["execution_identity"] == (
+        context.identity_digest_for(_package)
+    )
+    assert admitted["run_metadata"]["execution_runtime_identity"] == (
+        context.identity_digest
+    )
 
     succeeded = _advance_with_binding(
         store,
@@ -373,7 +389,7 @@ def test_same_binding_refreshes_runtime_before_scheduled_admission(
     assert succeeded["status"] == "succeeded"
     assert succeeded["last_error"] is None
     assert succeeded["schedule_revalidation"]["execution_identity"] == (
-        context.identity_digest
+        context.identity_digest_for(_package)
     )
 
 
@@ -589,6 +605,123 @@ def test_sealed_snapshot_revalidation_includes_language_identity(
         scheduled_revalidation_module.verify_sealed_snapshot(
             changed,
             run_directory=store.run_directory(run_id),
+        )
+
+
+def test_sealed_snapshot_allows_regular_publication_runtime_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    sealed_paths = ("definition.yaml", "inputs.json", "resources.json")
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    expected = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+    bundle = root / "publications" / "opaque-publication"
+    bundle.mkdir(parents=True)
+    (bundle / "content.md").write_text("result", encoding="utf-8")
+    (bundle / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    observed = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+
+    assert observed == expected
+
+
+def test_root_mutable_file_names_include_only_store_owned_recovery_artifacts() -> None:
+    artifact_id = "a" * 32
+    accepted = {
+        ".lock",
+        ".snapshot-owner.json",
+        "events.jsonl",
+        "run.json",
+        f"run.json.corrupt-{artifact_id}",
+        f"events.jsonl.torn-{artifact_id}",
+    }
+    rejected = {
+        f"nested/run.json.corrupt-{artifact_id}",
+        f"nested/events.jsonl.torn-{artifact_id}",
+        f"run.json.corrupt-{artifact_id[:-1]}",
+        f"events.jsonl.torn-{artifact_id}0",
+        "run.json.corrupt-not-an-artifact-id",
+        "events.jsonl.torn-not-an-artifact-id",
+    }
+
+    assert all(
+        scheduled_revalidation_module._is_mutable_run_file(path)
+        for path in accepted
+    )
+    assert not any(
+        scheduled_revalidation_module._is_mutable_run_file(path)
+        for path in rejected
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    (
+        f"run.json.corrupt-{'a' * 32}",
+        f"events.jsonl.torn-{'b' * 32}",
+    ),
+)
+def test_sealed_snapshot_ignores_store_owned_root_recovery_artifact(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    sealed_paths = ("definition.yaml", "inputs.json", "resources.json")
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    expected_explicit = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+    expected_legacy = scheduled_revalidation_module.sealed_snapshot_digest(root)
+    (root / artifact_name).write_text("preserved recovery bytes\n", encoding="utf-8")
+
+    assert scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    ) == expected_explicit
+    assert (
+        scheduled_revalidation_module.sealed_snapshot_digest(root)
+        == expected_legacy
+    )
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo"])
+def test_sealed_snapshot_rejects_unsafe_publication_runtime_entries(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    root = tmp_path / unsafe_kind
+    root.mkdir()
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    publications = root / "publications"
+    publications.mkdir()
+    unsafe = publications / "unsafe"
+    if unsafe_kind == "symlink":
+        unsafe.symlink_to(root / "definition.yaml")
+    else:
+        os.mkfifo(unsafe)
+
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="symlink|special file",
+    ):
+        scheduled_revalidation_module.sealed_snapshot_digest(
+            root,
+            relative_paths=("definition.yaml", "inputs.json", "resources.json"),
         )
 
 
@@ -1685,6 +1818,346 @@ def test_invalid_scheduled_package_does_not_abort_valid_advance_all_peer(
             ).fetchone()[0]
             == 0
         )
+
+
+def _admit_scheduled_authenticated_command(
+    home: Path,
+    workflow_writer,
+    *,
+    name: str,
+    binding: WorkflowRunnerBinding,
+):
+    (home / "commands").mkdir(parents=True, exist_ok=True)
+    (home / "commands/consume.md").write_text(
+        "Use $producer.output.present\n", encoding="utf-8"
+    )
+    workflow = workflow_writer(
+        home / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"present": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    workflow.with_name(f"{name}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits:\n  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    context = background_execution_context(binding, requires_ai=None)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=home.parent,
+        user_home=home.parent,
+        workflow_name=name,
+        values={},
+        idempotency_key=name,
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    return store, str(admitted["run_id"]), due, identity, epoch
+
+
+@pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
+def test_scheduled_package_validation_matches_immediate_durable_failure(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    entrypoint: str,
+) -> None:
+    home = tmp_path / f"home-{entrypoint}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = _RecordingAIRunner()
+    binding = _binding(real_runner=runner)
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_authenticated_command(
+            home,
+            workflow_writer,
+            name=f"scheduled-package-validation-{entrypoint}",
+            binding=binding,
+        )
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    executor_calls = []
+    authorization = None
+    original_authorize = scheduler._authorize_scheduled_promotion
+
+    def reject_authenticated_command(_package, _command_bodies):
+        raise WorkflowValidationError(
+            ValidationIssue(
+                path="nodes[1].command",
+                code="structured_output_field_impossible",
+                message=(
+                    "structured output field missing is impossible for node producer"
+                ),
+            )
+        )
+
+    def record_authorization(loaded_run_id, projection):
+        nonlocal authorization
+        result = original_authorize(loaded_run_id, projection)
+        authorization = result[1]
+        return result
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("scheduled executor ran before package validation")
+
+    monkeypatch.setattr(
+        scheduler, "_authorize_scheduled_promotion", record_authorization
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.scheduler.validate_authenticated_command_references",
+        reject_authenticated_command,
+    )
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    try:
+        if entrypoint == "advance":
+            failed = scheduler.advance(run_id)
+            replay = scheduler.advance(run_id)
+        else:
+            failed = scheduler.advance_all([run_id])[run_id]
+            replay = scheduler.advance_all([run_id])[run_id]
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert failed["status"] == replay["status"] == "failed"
+    assert failed["last_error"] == replay["last_error"] == {
+        "code": "structured_output_field_impossible",
+        "path": "nodes[1].command",
+        "message": "structured output field missing is impossible for node producer",
+    }
+    assert failed["event_sequence"] == replay["event_sequence"]
+    assert runner.requests == []
+    assert executor_calls == []
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    failures = [
+        event
+        for event in store.tail_events(run_id, limit=20)
+        if event["event_type"] == "run_failed"
+    ]
+    assert [event["payload"] for event in failures] == [{
+        "reason_code": "package_validation_failed",
+        "validation_code": "structured_output_field_impossible",
+        "validation_path": "nodes[1].command",
+    }]
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_scheduled_package_validation_revalidates_before_terminal_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = _RecordingAIRunner()
+    binding = _binding(real_runner=runner)
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_authenticated_command(
+            home,
+            workflow_writer,
+            name="scheduled-package-validation-revalidation",
+            binding=binding,
+        )
+    )
+    initial = store.load_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    observed_projections: list[tuple[object, object, object]] = []
+    executor_calls = []
+    authorization = None
+
+    def reject_revalidation(projection):
+        observed_projections.append(
+            (
+                projection.get("status"),
+                projection.get("state_version"),
+                projection.get("desired_status"),
+            )
+        )
+        raise scheduled_revalidation_module.ScheduledRunRevalidationError(
+            "scheduled authority changed"
+        )
+
+    def authorize(loaded_run_id, _projection):
+        nonlocal authorization
+        authorization = store._scheduled_promotion_authorization(
+            loaded_run_id,
+            reject_revalidation,
+        )
+        return True, authorization
+
+    def reject_execution(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("scheduled executor ran after rejected revalidation")
+
+    with store._connect() as connection:
+        wakes_before = connection.execute(
+            "SELECT COUNT(*) FROM coordinator_wakes WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
+    monkeypatch.setattr(scheduler, "_execute_claim", reject_execution)
+    try:
+        failed = scheduler.advance(run_id, max_nodes=1)
+        replay = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert observed_projections == [
+        ("queued", initial["state_version"], None)
+    ]
+    assert failed["status"] == replay["status"] == "failed"
+    assert failed["last_error"] == replay["last_error"] == {
+        "code": "schedule_revalidation_failed",
+        "message": "scheduled run authorization changed before execution",
+    }
+    assert failed["event_sequence"] == replay["event_sequence"]
+    assert runner.requests == []
+    assert executor_calls == []
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    failures = [
+        event
+        for event in store.tail_events(run_id, limit=20)
+        if event["event_type"] == "run_failed"
+    ]
+    assert [event["payload"] for event in failures] == [{
+        "reason_code": "schedule_revalidation_failed",
+    }]
+    with store._connect() as connection:
+        indexed = connection.execute(
+            "SELECT status, projection_state_version FROM runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert (indexed["status"], indexed["projection_state_version"]) == (
+            "failed",
+            failed["state_version"],
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coordinator_wakes WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == wakes_before + 1
+
+
+def test_scheduled_package_validation_propagates_unexpected_verifier_fault(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding(real_runner=_RecordingAIRunner())
+    store, run_id, due, identity, epoch = (
+        _admit_scheduled_authenticated_command(
+            home,
+            workflow_writer,
+            name="scheduled-package-validation-verifier-fault",
+            binding=binding,
+        )
+    )
+    before = store.load_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    verifier_calls = 0
+    authorization = None
+
+    def fail_unexpectedly(_projection):
+        nonlocal verifier_calls
+        verifier_calls += 1
+        raise RuntimeError("unexpected verifier fault")
+
+    def authorize(loaded_run_id, _projection):
+        nonlocal authorization
+        authorization = store._scheduled_promotion_authorization(
+            loaded_run_id,
+            fail_unexpectedly,
+        )
+        return True, authorization
+
+    monkeypatch.setattr(scheduler, "_authorize_scheduled_promotion", authorize)
+    try:
+        with pytest.raises(RuntimeError, match="unexpected verifier fault"):
+            scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert verifier_calls == 1
+    assert store.load_run(run_id) == before
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    assert not any(
+        event["event_type"] == "run_failed"
+        for event in store.tail_events(run_id, limit=20)
+    )
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
 
 
 def test_package_preparation_error_without_server_authorization_propagates(

@@ -20,10 +20,17 @@ Before writing files:
   blocking contract evidence are shown.
 - Describe contract phase numbers only as enforcement-phase metadata, never as
   delivery dates, availability promises, or schedules.
-- Treat node `idle_timeout` as a blocking Archon field in Phase 1. Its current
-  `hermes-legacy` value is seconds (`legacy_idle_timeout_seconds`); Archon
-  millisecond normalization remains deferred to Phase 3, so never reinterpret
-  the authored value during profile conversion.
+- Archon timeout and retry fields are supported in normalizer v3: author
+  timeout values in milliseconds, remember the omitted Bash/script 120,000 ms
+  default, and count `retry.max_attempts` as retries after the initial attempt.
+  Legacy timeout values remain seconds and legacy attempts remain totals.
+- Make every output producer a direct dependency. Use strict typed scalar
+  conditions and structured output before field traversal.
+- Review Bash values at the 32,768-byte UTF-8 boundary and author only bounded
+  safe token contexts. Larger values are contents, never pathnames.
+- Only a confirmed missing cross-run session may start fresh. Same-run missing
+  context and session-store errors must remain failures.
+- MCP and skills remain node options. Loops and includes remain Phase 4.
 - For shared package bytes, establish the oldest backend. Keep the companion
   unversioned while any consumer predates `language_compatibility` support.
 - Translate any legacy `create-workflow` request into `nodes`; do not adopt
@@ -48,8 +55,8 @@ Before offering execution or scheduling:
   diagnostics, logs, or trust state.
 - Resource ceilings cover workers, parallel nodes, lifecycle seconds, total
   attempts, descendants, CPU, memory, and admission capacity.
-- Hermes `limits` and `resource_limits` are described as execution policy, not
-  deferred Archon idle-timeout, timeout, budget, retry, or sandbox semantics.
+- Hermes `limits` and `resource_limits` are execution policy. They intersect
+  Archon v3 timeout/retry requests and do not imply budget or sandbox support.
 - Run `PRODUCT_CLI workflow validate PACKAGE --json`, then
   `PRODUCT_CLI workflow doctor PACKAGE --compat-report --json`. Doctor remains
   model-free, network-free, and MCP-connection-free.

@@ -13,7 +13,12 @@ from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    ArtifactRef,
+    JournalRecoveryError,
+    RunStore,
+    TypedPublicationCandidate,
+)
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -77,6 +82,62 @@ def test_expired_lease_interrupts_and_stale_completion_cannot_win(
     assert store.load_run(admitted.run_id)["status"] == "succeeded"
 
 
+def test_resolution_wait_restart_rebuilds_without_claim_or_immediate_poll(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch restart recovery treating a durable read wait as runnable work."""
+    path = workflow_writer(
+        tmp_path / "resolution-restart-package",
+        name="resolution-restart",
+        nodes=[
+            {"id": "producer", "bash": "true"},
+            {"id": "consumer", "bash": "true", "depends_on": ["producer"]},
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    home = tmp_path / "resolution-restart-home"
+    store = RunStore(home)
+    admitted = _run(store, load_workflow(path), idempotency_key="resolution-restart")
+    observed = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    identity = {
+        "node_id": "producer",
+        "attempt_id": "attempt-winner",
+        "publication_id": "a" * 32,
+        "sha256": "b" * 64,
+        "size_bytes": 5,
+        "media_type": "text/markdown; charset=utf-8",
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "text",
+    }
+    assert store.defer_output_resolution(
+        admitted.run_id,
+        "consumer",
+        producer_identity=identity,
+        now=observed,
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+
+    restarted = RunStore(home)
+    projection = restarted.load_run(admitted.run_id)
+    assert projection["nodes"]["consumer"]["state"] == "waiting_resolution"
+    assert projection["nodes"]["consumer"]["resolution_read_count"] == 1
+    assert restarted.claim_node(
+        admitted.run_id, "consumer", "restart-must-not-claim"
+    ) is None
+    assert restarted.wake_due_output_resolutions(
+        admitted.run_id,
+        now=observed + timedelta(milliseconds=249),
+    ) == ()
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
+
+
 def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
@@ -120,6 +181,117 @@ def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     stopped = store.load_run(admitted.run_id)["nodes"]["start"]["attempts"][-1]
     assert stopped["process_identity"]["pid"] == identity.pid
     assert stopped["process_stop"]["cleaned"] is True
+
+
+def test_v3_restart_classifies_zero_effect_claim_before_fresh_attempt_budget(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "restart-zero-effect",
+        nodes=[{"id": "start", "bash": "true", "timeout": 2_000}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(tmp_path / "restart-zero-effect-home")
+    admitted = _run(
+        store,
+        load_workflow(workflow),
+        idempotency_key="restart-zero-effect",
+    )
+    old = store.claim_node(
+        admitted.run_id,
+        "start",
+        "dead-owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="replay_safe",
+    )
+    assert old is not None
+    observed = []
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: old.lease_expires_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_claim",
+        lambda *_args: observed.append((_args[1], _args[-1])),
+    )
+    try:
+        interrupted = scheduler.advance(admitted.run_id, max_nodes=1)
+        assert interrupted["status"] == "interrupted"
+        assert observed == []
+        scheduler.store.resume_run(
+            admitted.run_id,
+            always_run_nodes=scheduler.verified_always_run_nodes(admitted.run_id),
+        )
+        scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert len(observed) == 1
+    replacement, budget = observed[0]
+    assert replacement.attempt_id != old.attempt_id
+    assert budget.remaining_wall(budget.last_semantic_progress) == 2.0
+    event_types = [event["event_type"] for event in store.tail_events(admitted.run_id)]
+    assert event_types.index("node_interrupted") < event_types.index(
+        "node_claimed", event_types.index("node_claimed") + 1
+    )
+
+
+def test_v3_restart_classifies_active_process_before_any_duplicate_launch(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "restart-active-process",
+        nodes=[{"id": "start", "bash": "true", "timeout": 2_000}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(tmp_path / "restart-active-process-home")
+    admitted = _run(
+        store,
+        load_workflow(workflow),
+        idempotency_key="restart-active-process",
+    )
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "dead-owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_992, start_time=12346, group_id=999_992)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    launches = []
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: claim.lease_expires_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    monkeypatch.setattr(
+        scheduler, "_execute_claim", lambda *_args: launches.append(_args)
+    )
+    try:
+        recovered = scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert recovered["status"] == "paused"
+    assert recovered["nodes"]["start"]["recovery"]["observation"] == "still_running"
+    assert recovered["nodes"]["start"]["attempts"][-1]["attempt_id"] == (
+        claim.attempt_id
+    )
+    assert [
+        event["event_type"] for event in store.tail_events(admitted.run_id)
+    ].count("node_claimed") == 1
+    assert launches == []
 
 
 def test_spawn_intent_without_process_identity_is_outcome_uncertain(
@@ -704,6 +876,77 @@ def test_structurally_invalid_projection_rebuilds_from_journal(
     (run_dir / "run.json").write_text(json.dumps(invalid))
 
     assert store.load_run(admitted.run_id)["status"] == "running"
+
+
+def test_projection_rebuild_restores_journaled_publication_descriptor_and_bundle(
+    tmp_path, workflow_writer
+) -> None:
+    root = tmp_path / "typed-projection-rebuild"
+    workflow = workflow_writer(
+        root,
+        name="typed-projection-rebuild",
+        nodes=[{"id": "start", "bash": "true", "output_type": "Report"}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _run(store, load_workflow(workflow))
+    claim = store.claim_node(admitted.run_id, "start", "owner")
+    assert claim is not None
+    data = b"journal authority"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / "output.md"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    relative = source.relative_to(store.run_directory(admitted.run_id)).as_posix()
+    digest = hashlib.sha256(data).hexdigest()
+    artifact = ArtifactRef(
+        relative,
+        "text/markdown; charset=utf-8",
+        len(data),
+        digest,
+    )
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(artifact,),
+        typed_publication=TypedPublicationCandidate(
+            attempt_relative_path=relative,
+            output_type="Report",
+            media_type="text/markdown; charset=utf-8",
+            size_bytes=len(data),
+            sha256=digest,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            session_id=None,
+        ),
+    )
+    expected = store.load_run(admitted.run_id)
+    publication = next(
+        entry for entry in expected["artifacts"] if "publication_id" in entry
+    )
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / publication["publication_id"]
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+    for path in tuple(bundle.iterdir()):
+        path.unlink()
+    bundle.rmdir()
+
+    rebuilt = store.load_run(admitted.run_id)
+
+    assert rebuilt == expected
+    assert (bundle / "content.md").read_bytes() == data
+    assert (bundle / "metadata.json").is_file()
 
 
 def test_monotonic_gap_expires_claim_after_wall_clock_moves_backward(

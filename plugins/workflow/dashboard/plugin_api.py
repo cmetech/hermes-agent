@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -38,25 +39,53 @@ from plugins.workflow.compat import (
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.output_resolution import ArchonOutputUnavailableError
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
     WorkflowApiLimits,
     WorkflowApiRuntime,
     WorkflowRetentionPolicy,
 )
-from plugins.workflow.sanitize import public_run_projection, sanitize_projection
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.sanitize import (
+    public_run_projection,
+    sanitize_evidence_bytes,
+    sanitize_projection,
+)
+from plugins.workflow.store import (
+    JournalRecoveryError,
+    PublicationIntegrityError,
+    PublicationNotFoundError,
+    PublicationUnavailableError,
+    RunStore,
+    VerifiedPublication,
+)
 
 
 _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
+_ARTIFACT_PREVIEW_BYTES_MAX = 64 * 1024
 WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
 _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
     r"^Compatibility findings truncated: ([1-9][0-9]{0,8}) omitted; "
     r"aggregate level (portable|mapped|unsupported)$"
 )
+
+
+def _reject_nonfinite_json(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -273,7 +302,7 @@ class WorkflowDetailLanguageStatus(BaseModel):
     declared_profile: WorkflowLanguageProfile | None
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
-    normalizer_version: StrictInt = Field(..., ge=1, le=1)
+    normalizer_version: StrictInt = Field(..., ge=1, le=3)
     normalized_definition_digest: str = Field(
         ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
@@ -389,6 +418,25 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         return self
 
 
+class WorkflowDetailCompatibilityFinding(WorkflowCompatibilityFinding):
+    model_config = ConfigDict(extra="forbid")
+
+    migration: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_WORKFLOW_RESPONSE_TEXT_MAX,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class WorkflowDetailCompatibilityFull(WorkflowCompatibilityFull):
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[WorkflowDetailCompatibilityFinding] = Field(
+        ..., max_length=WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
+
+
 def _sanitize_compatibility_finding_projection(
     finding: Mapping[str, object],
 ) -> dict[str, object]:
@@ -414,8 +462,29 @@ def _sanitize_compatibility_finding_projection(
     return projected
 
 
+def _finding_migration(code: object, effective_profile: object) -> str | None:
+    """Resolve bounded guidance from the shared versioned code authority."""
+    if not isinstance(code, str) or not isinstance(effective_profile, str):
+        return None
+    from plugins.workflow.language_schema import compatibility_code_catalog
+    from plugins.workflow.models import WorkflowLanguageProfile as LanguageProfile
+
+    try:
+        profile = LanguageProfile(effective_profile)
+    except ValueError:
+        return None
+    metadata = compatibility_code_catalog(profile).get(code)
+    migration = metadata.get("migration") if isinstance(metadata, Mapping) else None
+    if not isinstance(migration, str) or not migration:
+        return None
+    projected = sanitize_projection(migration, key="migration")
+    return projected if isinstance(projected, str) and projected else None
+
+
 def _sanitize_full_compatibility_projection(
     compatibility: Mapping[str, object],
+    *,
+    effective_profile: object = None,
 ) -> dict[str, object]:
     """Preserve one complete producer-bounded report across generic clipping."""
     findings = compatibility.get("findings")
@@ -425,7 +494,11 @@ def _sanitize_full_compatibility_projection(
     for finding in findings:
         if not isinstance(finding, Mapping):
             raise TypeError("full compatibility findings must contain mappings")
-        projected_findings.append(_sanitize_compatibility_finding_projection(finding))
+        projected = _sanitize_compatibility_finding_projection(finding)
+        migration = _finding_migration(finding.get("code"), effective_profile)
+        if migration is not None:
+            projected["migration"] = migration
+        projected_findings.append(projected)
     return {
         "level": compatibility["level"],
         "runnable": compatibility["runnable"],
@@ -529,7 +602,7 @@ class WorkflowDetailResponse(BaseModel):
     run_support: WorkflowCatalogRunSupport
     language: WorkflowDetailLanguageStatus
     risk_summary: dict[str, object]
-    compatibility: WorkflowCompatibilityFull
+    compatibility: WorkflowDetailCompatibilityFull
     coordinator: WorkflowCoordinatorResponse
     topology: WorkflowTopologyResponse
     definition: dict[str, object]
@@ -578,7 +651,10 @@ def list_workflows(
     }
 
 
-@router.get("/workflows/{name}", response_model=WorkflowDetailResponse)
+@router.get(
+    "/workflows/{name}",
+    response_model=WorkflowDetailResponse,
+)
 def workflow_detail(
     name: str,
     request: Request,
@@ -641,7 +717,14 @@ def workflow_detail(
         ) from exc
     compatibility = detail["compatibility"]
     assert isinstance(compatibility, Mapping)
-    full_compatibility = _sanitize_full_compatibility_projection(compatibility)
+    language = detail.get("language")
+    effective_profile = (
+        language.get("effective_profile") if isinstance(language, Mapping) else None
+    )
+    full_compatibility = _sanitize_full_compatibility_projection(
+        compatibility,
+        effective_profile=effective_profile,
+    )
     sanitized = sanitize_projection(detail)
     assert isinstance(sanitized, dict)
     # build_workflow_detail already supplies the shared semantically redacted,
@@ -1628,6 +1711,164 @@ def evidence(
             limit=limit,
             operator_scope=None if operator.unrestricted else operator.scope,
         )
+
+
+def _verified_publication(
+    store: RunStore,
+    run_id: str,
+    publication_id: str,
+    operator: WorkflowAuthority,
+) -> VerifiedPublication:
+    try:
+        return store.lookup_publication(
+            run_id,
+            publication_id,
+            operator_scope=None if operator.unrestricted else operator.scope,
+        )
+    except PublicationNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "artifact_not_found"},
+        ) from exc
+    except PublicationUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
+    except (PublicationIntegrityError, JournalRecoveryError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "typed_publication_integrity"},
+        ) from exc
+    except (KeyError, OSError) as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "run_not_found"},
+        ) from exc
+
+
+def _artifact_temporarily_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        },
+    )
+
+
+def _artifact_preview_payload(
+    publication: VerifiedPublication,
+) -> dict[str, object]:
+    if publication.media_type == "application/json":
+        if publication.size_bytes > _ARTIFACT_PREVIEW_BYTES_MAX:
+            content: object = None
+            bytes_returned = 0
+            truncated = True
+        else:
+            try:
+                content = json.loads(
+                    publication.content.decode("utf-8"),
+                    parse_constant=_reject_nonfinite_json,
+                    object_pairs_hook=_reject_duplicate_json_keys,
+                )
+                canonical = json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                if canonical != publication.content:
+                    raise ValueError(
+                        "JSON publication bytes are not canonical"
+                    )
+            except (
+                OverflowError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+            ) as exc:
+                raise PublicationIntegrityError(
+                    "canonical JSON publication is invalid"
+                ) from exc
+            bytes_returned = publication.size_bytes
+            truncated = False
+    else:
+        preview_bytes = publication.content[:_ARTIFACT_PREVIEW_BYTES_MAX]
+        content, sanitized_truncated = sanitize_evidence_bytes(
+            preview_bytes,
+            max_chars=_ARTIFACT_PREVIEW_BYTES_MAX,
+        )
+        bytes_returned = len(preview_bytes)
+        truncated = (
+            sanitized_truncated
+            or publication.size_bytes > bytes_returned
+        )
+    return {
+        "publication_id": publication.publication_id,
+        "media_type": publication.media_type,
+        "content": content,
+        "bytes_returned": bytes_returned,
+        "size_bytes": publication.size_bytes,
+        "truncated": truncated,
+    }
+
+
+@router.get("/runs/{run_id}/artifacts/{publication_id}/preview")
+def artifact_preview(
+    request: Request,
+    run_id: str,
+    publication_id: str,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    try:
+        with _store_lease() as store:
+            publication = _verified_publication(
+                store,
+                run_id,
+                publication_id,
+                operator,
+            )
+    except ArchonOutputUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
+    try:
+        return _artifact_preview_payload(publication)
+    except PublicationIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "typed_publication_integrity"},
+        ) from exc
+
+
+@router.get("/runs/{run_id}/artifacts/{publication_id}/download")
+def artifact_download(
+    request: Request,
+    run_id: str,
+    publication_id: str,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    try:
+        with _store_lease() as store:
+            publication = _verified_publication(
+                store,
+                run_id,
+                publication_id,
+                operator,
+            )
+    except ArchonOutputUnavailableError as exc:
+        raise _artifact_temporarily_unavailable() from exc
+    filename = f"{publication.publication_id}-{publication.content_name}"
+    return StreamingResponse(
+        iter((publication.content,)),
+        media_type=publication.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(publication.size_bytes),
+        },
+    )
 
 
 class ActionRequest(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import threading
 from types import SimpleNamespace
@@ -91,6 +92,171 @@ def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
     assert restarted.ack(notification_id, owner_id="electron-b", now=now) is False
     assert restarted.ack(notification_id, owner_id="electron-a", now=now) is True
     assert restarted.pending_attention(run_id="run-1") == ()
+
+
+def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_path):
+    """Provider-controlled delivery errors cannot enter durable public history."""
+    store = RunStore(tmp_path / "notification-private-errors")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    canary = "private-notification-session-provider-path-history"
+    notification_id = outbox.record(
+        run_id="private-notification-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "last_error": canary,
+            "sessionAlias": canary,
+            "nested": {
+                "node_session_id": canary,
+                "messages": [f"embedded {canary}"],
+            },
+        },
+        now=now,
+    )
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    assert leased[0]["notification_id"] == notification_id
+    assert outbox.terminal_fail(
+        notification_id,
+        owner_id="notification-owner",
+        error=canary,
+        now=now,
+    )
+
+    with store._connect() as connection:
+        durable = " ".join(
+            str(value)
+            for row in connection.execute(
+                "SELECT workflow_notification_outbox.payload_json, last_error, "
+                "workflow_notification_facts.payload_json "
+                "FROM workflow_notification_outbox LEFT JOIN "
+                "workflow_notification_facts USING(notification_id) "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+            for value in row
+        )
+    assert canary not in durable
+    assert canary not in str(outbox.history(run_id="private-notification-run"))
+
+
+def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
+    store = RunStore(tmp_path / "stable-delivery-reason")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    notification_ids = []
+    for version in (1, 2):
+        notification_ids.append(
+            outbox.record(
+                run_id="stable-delivery-reason-run",
+                kind="completion",
+                destination="desktop",
+                transition_version=version,
+                payload={"status": "succeeded"},
+                now=now,
+            )
+        )
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="stable-delivery-owner",
+        now=now,
+        lease_seconds=30,
+        limit=2,
+    )
+    assert {item["notification_id"] for item in leased} == set(notification_ids)
+
+    assert outbox.fail(
+        notification_ids[0],
+        owner_id="stable-delivery-owner",
+        error="delivery_store_unavailable",
+        now=now,
+    )
+    assert outbox.terminal_fail(
+        notification_ids[1],
+        owner_id="stable-delivery-owner",
+        error="delivery_store_unavailable",
+        now=now,
+    )
+
+    history = outbox.history(run_id="stable-delivery-reason-run")
+    deliveries = {
+        item["notification_id"]: item for item in history if item["last_error"]
+    }
+    assert deliveries[notification_ids[0]]["last_error"] == (
+        "delivery_store_unavailable"
+    )
+    assert deliveries[notification_ids[1]]["last_error"] == (
+        "delivery_store_unavailable"
+    )
+    dead_letter = next(
+        item
+        for item in history
+        if item["notification_id"] == notification_ids[1]
+        and item["payload"].get("decision") == "terminal_dead_letter"
+    )
+    assert dead_letter["payload"]["error"] == "delivery_store_unavailable"
+
+
+def test_notification_failures_normalize_free_form_delivery_detail(tmp_path):
+    store = RunStore(tmp_path / "free-form-delivery-detail")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    canary = "private adapter session /path history"
+    notification_ids = []
+    for version in (1, 2):
+        notification_ids.append(
+            outbox.record(
+                run_id="free-form-delivery-detail-run",
+                kind="completion",
+                destination="desktop",
+                transition_version=version,
+                payload={"status": "succeeded"},
+                now=now,
+            )
+        )
+    outbox.lease(
+        destination="desktop",
+        owner_id="free-form-delivery-owner",
+        now=now,
+        lease_seconds=30,
+        limit=2,
+    )
+
+    assert outbox.fail(
+        notification_ids[0],
+        owner_id="free-form-delivery-owner",
+        error=canary,
+        now=now,
+    )
+    assert outbox.terminal_fail(
+        notification_ids[1],
+        owner_id="free-form-delivery-owner",
+        error=canary,
+        now=now,
+    )
+
+    history = outbox.history(run_id="free-form-delivery-detail-run")
+    assert canary not in json.dumps(history, sort_keys=True)
+    deliveries = {
+        item["notification_id"]: item for item in history if item["last_error"]
+    }
+    assert {
+        deliveries[notification_id]["last_error"]
+        for notification_id in notification_ids
+    } == {"notification delivery failed"}
+    dead_letter = next(
+        item
+        for item in history
+        if item["notification_id"] == notification_ids[1]
+        and item["payload"].get("decision") == "terminal_dead_letter"
+    )
+    assert dead_letter["payload"]["error"] == "notification delivery failed"
 
 
 def test_expired_desktop_lease_returns_to_pending_and_dismissal_is_projection_only(

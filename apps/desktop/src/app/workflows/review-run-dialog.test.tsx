@@ -308,6 +308,42 @@ describe('Review & Run workflow dialog', () => {
     expect(within(dialog).getByText('p'.repeat(64))).toBeTruthy()
   })
 
+  it('reviews additive v3 language and backend-authored findings', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        compatibility: {
+          findings: [
+            {
+              blocking: true,
+              code: 'legacy_language_profile',
+              level: 'mapped',
+              message: 'Backend-authored compatibility guidance',
+              migration: 'Backend-authored migration guidance',
+              path: 'sidecar.language_compatibility'
+            }
+          ],
+          level: 'unsupported',
+          runnable: false
+        },
+        language: {
+          declared_profile: 'archon-2026-07',
+          effective_profile: 'archon-2026-07',
+          legacy: false,
+          normalized_definition_digest: '3'.repeat(64),
+          normalizer_version: 3
+        }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('Normalizer 3')).toBeTruthy()
+    const message = within(dialog).getByText('Backend-authored compatibility guidance')
+    expect(message).toBeTruthy()
+    expect(within(message.closest('li')!).getByText('Backend-authored migration guidance')).toBeTruthy()
+  })
+
   it('reviews a future server-authored workflow language profile without Archon relabeling', async () => {
     catalogDefinition = definition({
       language: { effective_profile: 'future-workflow-language' as never, legacy: false }

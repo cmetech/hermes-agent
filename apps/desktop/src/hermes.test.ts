@@ -7,6 +7,8 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  cancelWorkflowArtifactDownload,
+  downloadWorkflowArtifact,
   executeWorkflowCleanup,
   getApiRequestProfile,
   getCronJobs,
@@ -17,6 +19,7 @@ import {
   getProfiles,
   getSessionMessages,
   getStatus,
+  getWorkflowArtifactPreview,
   getWorkflowEvidence,
   getWorkflowRun,
   listAllProfileSessions,
@@ -34,7 +37,12 @@ import {
   transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
-import type { WorkflowRunListView } from './types/hermes'
+import type {
+  WorkflowArtifactPreview,
+  WorkflowEvidencePage,
+  WorkflowRunListView,
+  WorkflowTypedArtifact
+} from './types/hermes'
 
 const serverWorkflowRunViews = ['board', 'history', 'archive'] satisfies WorkflowRunListView[]
 
@@ -47,13 +55,26 @@ const emptySessionsResponse = {
 
 describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
+  let nativeCancelDownload: ReturnType<typeof vi.fn>
+  let nativeDownload: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
     resetSidebarBatchCapability()
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
+    nativeCancelDownload = vi.fn().mockResolvedValue({ cancelled: true })
+    nativeDownload = vi.fn().mockResolvedValue({
+      filename: 'diagnostic.json',
+      mediaType: 'application/json',
+      sizeBytes: 13,
+      status: 'saved'
+    })
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { api }
+      value: {
+        api,
+        cancelWorkflowArtifactDownload: nativeCancelDownload,
+        downloadWorkflowArtifact: nativeDownload
+      }
     })
   })
 
@@ -331,6 +352,63 @@ describe('Hermes REST helpers', () => {
         path: '/api/plugins/workflow/runs/run%201/cancel'
       })
     )
+  })
+
+  it('types typed-artifact evidence and routes encoded preview and download identities through desktop transport', async () => {
+    const artifact: WorkflowTypedArtifact = {
+      attempt_id: 'attempt-1',
+      integrity_status: 'verified',
+      media_type: 'application/json',
+      node_id: 'produce',
+      output_type: 'Report',
+      publication_id: 'publication / opaque',
+      recovery_status: 'verified',
+      sha256: 'a'.repeat(64),
+      size_bytes: 13
+    }
+
+    const page: WorkflowEvidencePage = {
+      items: [{ relative_path: 'legacy.txt' }, artifact],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    }
+
+    const preview: WorkflowArtifactPreview = {
+      bytes_returned: 13,
+      content: { answer: 42 },
+      media_type: 'application/json',
+      publication_id: artifact.publication_id,
+      size_bytes: 13,
+      truncated: false
+    }
+
+    api.mockResolvedValue(preview)
+    setApiRequestProfile('remote-profile')
+
+    await expect(getWorkflowArtifactPreview('run / one', artifact.publication_id)).resolves.toEqual(preview)
+
+    expect(page.items).toHaveLength(2)
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/preview',
+      profile: 'remote-profile'
+    })
+    await expect(
+      downloadWorkflowArtifact('run / one', artifact.publication_id, 'remote-profile', 'request-1')
+    ).resolves.toEqual({
+      filename: 'diagnostic.json',
+      mediaType: 'application/json',
+      sizeBytes: 13,
+      status: 'saved'
+    })
+    expect(nativeDownload).toHaveBeenCalledWith({
+      path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/download',
+      profile: 'remote-profile',
+      requestId: 'request-1'
+    })
+    await expect(cancelWorkflowArtifactDownload('request-1')).resolves.toEqual({ cancelled: true })
+    expect(nativeCancelDownload).toHaveBeenCalledWith('request-1')
   })
 
   it.each(serverWorkflowRunViews)('sends the supported %s run-list view without changing its meaning', async view => {

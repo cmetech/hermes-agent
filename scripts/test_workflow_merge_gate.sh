@@ -6,6 +6,9 @@ ROOT="$(git rev-parse --show-toplevel)"
 PHASE="base"
 BRAND=""
 TESTED_BASE_SHA=""
+PROVISIONED_DESKTOP_VIEW=""
+PROVISIONED_DESKTOP_MARKER=""
+PROVISIONED_DESKTOP_SOURCE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,15 +56,121 @@ case "$PYTHON_BIN" in
 esac
 [[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
+_matches_invocation_dependency_identity() {
+  local relative target_blob invocation_blob
+  for relative in "$@"; do
+    git -C "$ROOT" diff --quiet HEAD -- "$relative" || return 1
+    git -C "$INVOCATION_ROOT" diff --quiet HEAD -- "$relative" || return 1
+    target_blob="$(git -C "$ROOT" rev-parse "HEAD:$relative" 2>/dev/null)" || return 1
+    invocation_blob="$(git -C "$INVOCATION_ROOT" rev-parse \
+      "HEAD:$relative" 2>/dev/null)" || return 1
+    [[ "$target_blob" == "$invocation_blob" ]] || return 1
+  done
+}
+
+_matches_brand_parser_lock_identity() {
+  "$PYTHON_BIN" - "$ROOT" "$INVOCATION_ROOT" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+expected = {
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0",
+    "micromark": "4.0.2",
+}
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate lock key: {key}")
+        result[key] = value
+    return result
+
+
+def parser_versions(repo):
+    subprocess.run(
+        ["git", "-C", repo, "diff", "--quiet", "HEAD", "--", "package-lock.json"],
+        check=True,
+    )
+    raw = subprocess.check_output(
+        ["git", "-C", repo, "show", "HEAD:package-lock.json"]
+    )
+    lock = json.loads(raw, object_pairs_hook=unique_object)
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        raise ValueError("lock packages must be an object")
+    versions = {}
+    for name in expected:
+        entry = packages.get(f"node_modules/{name}")
+        if not isinstance(entry, dict):
+            raise ValueError(f"missing or malformed parser lock entry: {name}")
+        version = entry.get("version")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"missing or malformed parser lock version: {name}")
+        versions[name] = version
+    return versions
+
+
+try:
+    target = parser_versions(Path(sys.argv[1]))
+    invocation = parser_versions(Path(sys.argv[2]))
+except (json.JSONDecodeError, OSError, subprocess.SubprocessError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if target == invocation == expected else 1)
+PY
+}
+
+_validated_invocation_desktop_source() {
+  local target_git_dir invocation_git_dir source
+  target_git_dir="$(git -C "$ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [[ "$invocation_git_dir" == "$target_git_dir" &&
+     "$INVOCATION_ROOT" != "$ROOT" &&
+     -d "$INVOCATION_ROOT/apps/desktop/node_modules" &&
+     ! -L "$INVOCATION_ROOT/apps/desktop/node_modules" ]] || return 1
+  _matches_invocation_dependency_identity \
+    package-lock.json apps/desktop/package.json || return 1
+  source="$(cd "$INVOCATION_ROOT/apps/desktop/node_modules" && pwd -P)" || return 1
+  [[ "$source" != "$ROOT" && "$source" != "$ROOT/"* ]] || return 1
+  printf '%s\n' "$source"
+}
+
 _require_root_dependencies() {
-  local shared_git_dir shared_root resolved_modules node_bin actual_versions
+  local shared_git_dir shared_root invocation_git_dir invocation_modules
+  local resolved_modules node_bin actual_versions
   shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
+  invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
+    --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  invocation_modules=""
+  if [[ "$invocation_git_dir" == "$shared_git_dir" &&
+        "$INVOCATION_ROOT" != "$ROOT" &&
+        -d "$INVOCATION_ROOT/node_modules" &&
+        ! -L "$INVOCATION_ROOT/node_modules" ]]; then
+    if [[ "$PHASE" == "base" ]] &&
+        _matches_invocation_dependency_identity package.json package-lock.json; then
+      invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+    elif [[ "$PHASE" == "brand" ]] && _matches_brand_parser_lock_identity; then
+      invocation_modules="$(cd "$INVOCATION_ROOT/node_modules" && pwd -P)"
+    fi
+  fi
   if [[ -L "$ROOT/node_modules" && ! -e "$ROOT/node_modules" ]]; then
     echo "root parser dependencies contain a dangling local dependency link" >&2
     return 1
   fi
-  if [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
+  if [[ ! -e "$ROOT/node_modules" && -n "$invocation_modules" ]]; then
+    ln -s "$invocation_modules" "$ROOT/node_modules" 2>/dev/null || {
+      echo "root parser dependencies could not create the bounded dependency view" >&2
+      return 1
+    }
+  elif [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
     ln -s "$shared_root/node_modules" "$ROOT/node_modules" 2>/dev/null || {
       echo "root parser dependencies could not create the bounded dependency view" >&2
       return 1
@@ -73,7 +182,8 @@ _require_root_dependencies() {
   }
   resolved_modules="$(cd "$ROOT/node_modules" && pwd -P)"
   [[ "$resolved_modules" == "$ROOT/node_modules" ||
-     "$resolved_modules" == "$shared_root/node_modules" ]] || {
+     "$resolved_modules" == "$shared_root/node_modules" ||
+     (-n "$invocation_modules" && "$resolved_modules" == "$invocation_modules") ]] || {
     echo "root parser dependencies escape the allowed dependency roots" >&2
     return 1
   }
@@ -160,7 +270,8 @@ _require_root_dependencies() {
       return manifest.version;
     });
     process.stdout.write(versions.join(" "));
-  ' "$resolved_modules" "$ROOT/node_modules" "$shared_root/node_modules" 2>/dev/null)" || {
+  ' "$resolved_modules" "$ROOT/node_modules" "$shared_root/node_modules" \
+    "$invocation_modules" 2>/dev/null)" || {
     echo "root parser dependencies are unreadable or escape the allowed roots" >&2
     return 1
   }
@@ -169,6 +280,100 @@ _require_root_dependencies() {
     return 1
   }
 }
+
+_provision_desktop_dependency_view() {
+  local source="$1" target="$ROOT/apps/desktop/node_modules" entry name
+  mkdir "$target" || return 1
+  PROVISIONED_DESKTOP_VIEW="$target"
+  PROVISIONED_DESKTOP_SOURCE="$source"
+  PROVISIONED_DESKTOP_MARKER="$(mktemp \
+    "$target/.workflow-merge-gate-owner.XXXXXX")" || return 1
+  while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    case "$name" in
+      .vite|.vite-temp|.cache)
+        mkdir "$target/$name" || return 1
+        ;;
+      *)
+        ln -s "$entry" "$target/$name" || return 1
+        ;;
+    esac
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+}
+
+_cleanup_desktop_dependency_view() {
+  local restore_external="${1:-0}"
+  local target="$PROVISIONED_DESKTOP_VIEW" marker="$PROVISIONED_DESKTOP_MARKER"
+  local source="$PROVISIONED_DESKTOP_SOURCE"
+  local expected="$ROOT/apps/desktop/node_modules" resolved_parent handoff=""
+  local current_source="" handoff_ready=0
+  [[ "$restore_external" == "0" || "$restore_external" == "1" ]] || return 1
+  [[ -n "$target" ]] || return 0
+  [[ "$target" == "$expected" ]] || return 1
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    PROVISIONED_DESKTOP_VIEW=""
+    PROVISIONED_DESKTOP_MARKER=""
+    PROVISIONED_DESKTOP_SOURCE=""
+    [[ "$restore_external" == "0" ]]
+    return
+  fi
+  [[ -d "$target" && ! -L "$target" ]] || return 1
+  resolved_parent="$(cd "$(dirname "$target")" && pwd -P)" || return 1
+  [[ "$resolved_parent" == "$ROOT/apps/desktop" ]] || return 1
+  if [[ -z "$marker" ]]; then
+    rmdir "$target" 2>/dev/null || return 1
+  else
+    [[ "${marker%/*}" == "$target" && -f "$marker" && ! -L "$marker" ]] || return 1
+    if [[ "$restore_external" == "1" ]]; then
+      current_source="$(_validated_invocation_desktop_source 2>/dev/null || true)"
+      handoff="$ROOT/apps/desktop/.workflow-merge-gate-handoff.${marker##*.}"
+      if [[ -n "$source" && "$current_source" == "$source" &&
+            ! -e "$handoff" && ! -L "$handoff" ]] &&
+          ln -s "$source" "$handoff"; then
+        handoff_ready=1
+      fi
+    fi
+    if ! rm -rf -- "$target"; then
+      [[ -n "$handoff" && -L "$handoff" ]] && unlink "$handoff"
+      return 1
+    fi
+    if [[ "$restore_external" == "1" ]]; then
+      if [[ "$handoff_ready" != "1" || -e "$target" || -L "$target" ]] ||
+          ! mv "$handoff" "$target"; then
+        [[ -n "$handoff" && -L "$handoff" ]] && unlink "$handoff"
+        PROVISIONED_DESKTOP_VIEW=""
+        PROVISIONED_DESKTOP_MARKER=""
+        PROVISIONED_DESKTOP_SOURCE=""
+        return 1
+      fi
+    fi
+  fi
+  PROVISIONED_DESKTOP_VIEW=""
+  PROVISIONED_DESKTOP_MARKER=""
+  PROVISIONED_DESKTOP_SOURCE=""
+}
+
+_finish_gate() {
+  local status="$1" restore_external=0
+  trap - EXIT HUP INT TERM
+  [[ "$status" == "0" ]] && restore_external=1
+  if ! _cleanup_desktop_dependency_view "$restore_external"; then
+    echo "desktop dependency cleanup refused an unowned or escaping path" >&2
+    status=1
+  fi
+  exit "$status"
+}
+
+_handle_gate_signal() {
+  local status="$1"
+  _cleanup_desktop_dependency_view 0 || true
+  exit "$status"
+}
+
+trap '_finish_gate $?' EXIT
+trap '_handle_gate_signal 129' HUP
+trap '_handle_gate_signal 130' INT
+trap '_handle_gate_signal 143' TERM
 
 cd "$ROOT"
 if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
@@ -188,7 +393,8 @@ if [[ "$PHASE" == "base" ]]; then
     fi
     HERMES_PYTHON="$PYTHON_BIN" "$ROOT/scripts/run_tests.sh" \
       tests/tools/test_managed_process.py tests/tools/test_process_registry.py \
-      tests/agent/test_plugin_agent.py tests/tools/test_registry.py \
+      tests/agent/test_plugin_agent.py \
+      tests/agent/test_provider_attempt_transport.py tests/tools/test_registry.py \
       tests/hermes_cli/test_execution_runtime_capabilities.py \
       tests/hermes_cli/test_kanban_mutation_preconditions.py \
       tests/hermes_cli/test_kanban_db.py \
@@ -202,6 +408,16 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
+      tests/plugins/workflow/test_phase3_language.py \
+      tests/plugins/workflow/test_phase3_execution_semantics.py \
+      tests/plugins/workflow/test_phase3_code_catalog.py \
+      tests/plugins/workflow/test_strict_output_references.py \
+      tests/plugins/workflow/test_phase3_conditions.py \
+      tests/plugins/workflow/test_phase3_resolution_waits.py \
+      tests/plugins/workflow/test_phase3_bash_substitution.py \
+      tests/plugins/workflow/test_phase3_bash_descriptor_faults.py \
+      tests/plugins/workflow/test_phase3_bash_reference_ordering.py \
+      tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
       tests/plugins/workflow/test_scheduled_runs.py \
@@ -210,6 +426,8 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_node_mcp.py \
       tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_runner_binding.py \
+      tests/plugins/workflow/test_typed_publication.py \
+      tests/plugins/workflow/test_typed_publication_recovery.py \
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
@@ -236,7 +454,19 @@ if [[ "$PHASE" == "base" ]]; then
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then
       ln -s "$SHARED_ROOT/node_modules" node_modules
     fi
-    if [[ ! -d apps/desktop/node_modules && -d "$SHARED_ROOT/apps/desktop/node_modules" ]]; then
+    INVOCATION_DESKTOP_MODULES="$(
+      _validated_invocation_desktop_source 2>/dev/null || true
+    )"
+    if [[ -L apps/desktop/node_modules && ! -e apps/desktop/node_modules ]]; then
+      echo "desktop dependencies contain a dangling local dependency link" >&2
+      exit 1
+    fi
+    if [[ ! -e apps/desktop/node_modules && -n "$INVOCATION_DESKTOP_MODULES" ]]; then
+      _provision_desktop_dependency_view "$INVOCATION_DESKTOP_MODULES" || {
+        echo "desktop dependencies could not create the bounded dependency view" >&2
+        exit 1
+      }
+    elif [[ ! -e apps/desktop/node_modules && -d "$SHARED_ROOT/apps/desktop/node_modules" ]]; then
       ln -s "$SHARED_ROOT/apps/desktop/node_modules" apps/desktop/node_modules
     fi
     [[ -d node_modules ]] || {

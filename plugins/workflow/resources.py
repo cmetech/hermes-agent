@@ -14,9 +14,26 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Mapping
+from types import MappingProxyType
+from typing import Callable, Iterable, Mapping
 
 import yaml
+
+from plugins.workflow.language_schema import (
+    WorkflowReferenceSyntaxError,
+    iter_output_references,
+)
+from plugins.workflow.bash_rendering import (
+    RenderedBashCommand,
+    bash_output_references,
+    render_v3_bash,
+)
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    ResolvedOutputReference,
+    WorkflowOutputReferenceError,
+    resolve_output_reference,
+)
 
 
 _COMMAND_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -35,6 +52,30 @@ _VARIABLE = re.compile(
     r"(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output(?:\.(?P<dot>[A-Za-z0-9_.-]+))?|"
     r"(?P<name>[A-Z][A-Z0-9_]*))"
 )
+_SCALAR_VARIABLE = re.compile(
+    r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"
+)
+_REFERENCE_NODE_CANDIDATE = re.compile(
+    r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
+)
+
+
+def iter_output_field_references(
+    template: str,
+    *,
+    normalizer_version: int = 2,
+) -> Iterable[tuple[str, tuple[str, ...]]]:
+    """Yield field references recognized by runtime variable substitution."""
+    if normalizer_version == 3:
+        for reference in iter_output_references(template, normalizer_version=3):
+            if reference.path:
+                yield reference.node_id, reference.path
+        return
+    for match in _VARIABLE.finditer(template):
+        node = match.group("node")
+        dot = match.group("dot")
+        if node is not None and dot is not None:
+            yield node, tuple(dot.split("."))
 
 
 def _shell_quote_context(template: str, end: int) -> str | None:
@@ -55,6 +96,33 @@ def _shell_quote_context(template: str, end: int) -> str | None:
     return quote
 
 
+def _iter_shell_quote_contexts(
+    template: str,
+    ends: Iterable[int],
+) -> Iterable[str | None]:
+    """Yield quote contexts for ordered offsets with one template scan."""
+    quote: str | None = None
+    escaped = False
+    position = 0
+    for end in ends:
+        if end < position:
+            raise ValueError("shell quote offsets must be ordered")
+        while position < end:
+            character = template[position]
+            position += 1
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
+            if character == "'" and quote != '"':
+                quote = None if quote == "'" else "'"
+            elif character == '"' and quote != "'":
+                quote = None if quote == '"' else '"'
+        yield quote
+
+
 def _quote_shell_value(value: str, quote: str | None) -> str:
     if quote == "'":
         return value.replace("'", "'\\''")
@@ -67,6 +135,17 @@ def _quote_shell_value(value: str, quote: str | None) -> str:
             .replace("`", "\\`")
         )
     return shlex.quote(value)
+
+
+def _render_json_value(value: object) -> str:
+    def thaw(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): thaw(child) for key, child in item.items()}
+        if isinstance(item, tuple | list):
+            return [thaw(child) for child in item]
+        return item
+
+    return json.dumps(thaw(value), sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -82,6 +161,29 @@ class ScriptResource:
     path: Path
     runtime: str
     authenticated_bytes: bytes | None = None
+
+
+def parse_command_resource(path: Path, text: str) -> CommandResource:
+    """Parse one already-authenticated UTF-8 command resource."""
+    metadata: dict[str, object] = {}
+    body = text
+    if text.startswith("---\n"):
+        header, separator, remainder = text[4:].partition("\n---\n")
+        if not separator:
+            raise ValueError(f"command frontmatter is not terminated: {path}")
+        parsed = yaml.safe_load(header) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError(f"command frontmatter must be a mapping: {path}")
+        metadata = parsed
+        body = remainder
+    description = metadata.get("description")
+    argument_hint = metadata.get("argument-hint")
+    return CommandResource(
+        path=path,
+        body=body,
+        description=str(description) if description is not None else None,
+        argument_hint=str(argument_hint) if argument_hint is not None else None,
+    )
 
 
 class AuthenticatedExecutionMaterializer:
@@ -526,25 +628,7 @@ class ResourceResolver:
     def _parse_command(path: Path, *, text: str | None = None) -> CommandResource:
         if text is None:
             text = path.read_text(encoding="utf-8")
-        metadata: dict[str, object] = {}
-        body = text
-        if text.startswith("---\n"):
-            header, separator, remainder = text[4:].partition("\n---\n")
-            if not separator:
-                raise ValueError(f"command frontmatter is not terminated: {path}")
-            parsed = yaml.safe_load(header) or {}
-            if not isinstance(parsed, dict):
-                raise ValueError(f"command frontmatter must be a mapping: {path}")
-            metadata = parsed
-            body = remainder
-        description = metadata.get("description")
-        argument_hint = metadata.get("argument-hint")
-        return CommandResource(
-            path=path,
-            body=body,
-            description=str(description) if description is not None else None,
-            argument_hint=str(argument_hint) if argument_hint is not None else None,
-        )
+        return parse_command_resource(path, text)
 
 
 @dataclass(frozen=True)
@@ -561,7 +645,23 @@ class VariableContext:
     loop_user_input: str = ""
     loop_prev_output: str = ""
     rejection_reason: str = ""
-    node_outputs: Mapping[str, str] = field(default_factory=dict)
+    node_outputs: Mapping[
+        str, str | ResolvedNodeOutput | WorkflowOutputReferenceError
+    ] = field(default_factory=dict)
+    normalizer_version: int = 2
+
+    def output_reference(
+        self, node_id: str, path: tuple[str, ...] = ()
+    ) -> ResolvedOutputReference:
+        """Resolve one Archon v3 output through the canonical strict resolver."""
+        raw = self.node_outputs.get(node_id)
+        if isinstance(raw, WorkflowOutputReferenceError):
+            raise WorkflowOutputReferenceError(raw.code, node_id, tuple(path))
+        return resolve_output_reference(
+            raw if isinstance(raw, ResolvedNodeOutput) else None,
+            node_id=node_id,
+            path=path,
+        )
 
     def _value(self, match: re.Match[str]) -> str | None:
         position = match.group("position")
@@ -574,18 +674,30 @@ class VariableContext:
             return values[index] if index < len(values) else ""
         node = match.group("node")
         if node is not None:
+            dot = match.group("dot")
+            if self.normalizer_version == 3:
+                return self.output_reference(
+                    node,
+                    tuple(dot.split(".")) if dot else (),
+                ).rendered_text
             raw = self.node_outputs.get(node)
             if raw is None:
                 return ""
-            dot = match.group("dot")
             if not dot:
-                return raw
+                return raw.text if isinstance(raw, ResolvedNodeOutput) else raw
             try:
-                value: object = json.loads(raw)
+                # Phase 2 keeps the legacy string adapter below. Archon values
+                # arrive already parsed so prompt and shell consumers never
+                # independently reinterpret provider text.
+                value: object = (
+                    raw.value
+                    if isinstance(raw, ResolvedNodeOutput)
+                    else json.loads(raw)
+                )
                 for part in dot.split("."):
-                    if isinstance(value, dict):
+                    if isinstance(value, Mapping):
                         value = value[part]
-                    elif isinstance(value, list) and part.isdigit():
+                    elif isinstance(value, tuple | list) and part.isdigit():
                         value = value[int(part)]
                     else:
                         return ""
@@ -597,7 +709,7 @@ class VariableContext:
                 return "null"
             if isinstance(value, bool):
                 return "true" if value else "false"
-            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+            return _render_json_value(value)
         values = {
             "ARGUMENTS": self.arguments,
             "USER_MESSAGE": self.user_message,
@@ -662,9 +774,247 @@ class VariableContext:
         return _VARIABLE.sub(replace, template)
 
 
+@dataclass(frozen=True)
+class StrictSubstitutionRenderer:
+    """Dependency-scoped Archon v3 rendering over immutable output facets."""
+
+    variables: VariableContext
+    direct_dependencies: frozenset[str]
+    output_resolver: Callable[
+        [str, tuple[str, ...]], ResolvedOutputReference
+    ] | None = None
+
+    def _output(self, node_id: str, path: tuple[str, ...]) -> str:
+        if node_id not in self.direct_dependencies:
+            raise WorkflowOutputReferenceError(
+                "output_reference_not_declared_dependency",
+                node_id,
+                path,
+            )
+        resolver = self.output_resolver or self.variables.output_reference
+        return resolver(node_id, path).rendered_text
+
+    @staticmethod
+    def _references(template: str, *, bash_contexts: bool = False):
+        try:
+            if bash_contexts:
+                return bash_output_references(template)
+            return tuple(iter_output_references(template, normalizer_version=3))
+        except WorkflowReferenceSyntaxError as exc:
+            candidate = (
+                _REFERENCE_NODE_CANDIDATE.match(template, exc.start)
+                if exc.start is not None
+                else None
+            )
+            raise WorkflowOutputReferenceError(
+                exc.code,
+                candidate.group("node") if candidate is not None else "invalid",
+            ) from exc
+
+    def resolve_outputs(
+        self, *templates: str
+    ) -> Mapping[tuple[str, tuple[str, ...]], ResolvedOutputReference]:
+        """Resolve each canonical output facet once without rendering text."""
+        resolved: dict[
+            tuple[str, tuple[str, ...]], ResolvedOutputReference
+        ] = {}
+        resolver = self.output_resolver or self.variables.output_reference
+        for template in templates:
+            for reference in self._references(template):
+                key = (reference.node_id, reference.path)
+                if key in resolved:
+                    continue
+                if reference.node_id not in self.direct_dependencies:
+                    raise WorkflowOutputReferenceError(
+                        "output_reference_not_declared_dependency",
+                        reference.node_id,
+                        reference.path,
+                    )
+                resolved[key] = resolver(reference.node_id, reference.path)
+        return MappingProxyType(resolved)
+
+    def _scalar(
+        self,
+        match: re.Match[str],
+        *,
+        positional_values: list[str] | None,
+    ) -> str | None:
+        position = match.group("position")
+        if position is not None:
+            index = int(position) - 1
+            if positional_values is None:
+                raise ValueError("positional values must be parsed before rendering")
+            return (
+                positional_values[index]
+                if index < len(positional_values)
+                else ""
+            )
+        values = {
+            "ARGUMENTS": self.variables.arguments,
+            "USER_MESSAGE": self.variables.user_message,
+            "ARTIFACTS_DIR": (
+                str(self.variables.artifacts_dir)
+                if self.variables.artifacts_dir
+                else ""
+            ),
+            "WORKFLOW_ID": self.variables.workflow_id,
+            "BASE_BRANCH": self.variables.base_branch,
+            "DOCS_DIR": str(self.variables.docs_dir) if self.variables.docs_dir else "",
+            "CONTEXT": self.variables.context,
+            "LOOP_USER_INPUT": self.variables.loop_user_input,
+            "LOOP_PREV_OUTPUT": self.variables.loop_prev_output,
+            "REJECTION_REASON": self.variables.rejection_reason,
+        }
+        return values.get(match.group("name"))
+
+    def _substitutions(
+        self,
+        template: str,
+        *,
+        include_scalar_variables: bool,
+        classify_bash_contexts: bool = False,
+    ) -> tuple[tuple[int, int, str], ...]:
+        references = self._references(
+            template,
+            bash_contexts=classify_bash_contexts,
+        )
+        substitutions = [
+            (
+                reference.start,
+                reference.end,
+                self._output(reference.node_id, reference.path),
+            )
+            for reference in references
+        ]
+        if include_scalar_variables:
+            reference_cursor = 0
+            positional_values: list[str] | None = None
+            for match in _SCALAR_VARIABLE.finditer(template):
+                while (
+                    reference_cursor < len(references)
+                    and references[reference_cursor].end <= match.start()
+                ):
+                    reference_cursor += 1
+                if reference_cursor < len(references) and (
+                    match.start() < references[reference_cursor].end
+                    and match.end() > references[reference_cursor].start
+                ):
+                    continue
+                if match.group("position") is not None and positional_values is None:
+                    try:
+                        positional_values = shlex.split(self.variables.arguments)
+                    except ValueError:
+                        positional_values = self.variables.arguments.split()
+                value = self._scalar(
+                    match,
+                    positional_values=positional_values,
+                )
+                if value is not None:
+                    substitutions.append((match.start(), match.end(), value))
+        substitutions.sort(key=lambda item: item[0])
+        return tuple(substitutions)
+
+    @staticmethod
+    def _replace(
+        template: str,
+        substitutions: Iterable[tuple[int, int, str]],
+    ) -> str:
+        rendered: list[str] = []
+        position = 0
+        for start, end, value in substitutions:
+            rendered.extend((template[position:start], value))
+            position = end
+        rendered.append(template[position:])
+        return "".join(rendered)
+
+    def render_outputs(self, template: str) -> str:
+        """Resolve only canonical output tokens, leaving dynamic variables intact."""
+        return self._replace(
+            template,
+            self._substitutions(template, include_scalar_variables=False),
+        )
+
+    def render_prompt(self, template: str) -> str:
+        """Render only the requested initial body; replacements are not rescanned."""
+        return self._replace(
+            template,
+            self._substitutions(template, include_scalar_variables=True),
+        )
+
+    def render_bash(
+        self,
+        template: str,
+        *,
+        spill_directory: str | Path,
+        max_inline_chars: int = 8192,
+        secure_v3: bool = False,
+    ) -> str | RenderedBashCommand:
+        """Keep the existing loop Bash materialization with strict references."""
+        if max_inline_chars <= 0:
+            raise ValueError("max_inline_chars must be positive")
+        substitutions = self._substitutions(
+            template,
+            include_scalar_variables=True,
+            classify_bash_contexts=secure_v3,
+        )
+        if secure_v3:
+            return render_v3_bash(
+                template,
+                substitutions,
+                spill_directory=spill_directory,
+            )
+        root = Path(spill_directory).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        rendered: list[str] = []
+        position = 0
+        quote_contexts = _iter_shell_quote_contexts(
+            template,
+            (start for start, _, _ in substitutions),
+        )
+        for (start, end, raw_value), quote_context in zip(
+            substitutions,
+            quote_contexts,
+            strict=True,
+        ):
+            rendered.append(template[position:start])
+            value = raw_value
+            if len(value) > max_inline_chars:
+                digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+                path = root / f"variable-{digest}.txt"
+                path.write_text(value, encoding="utf-8")
+                value = str(path)
+            rendered.append(
+                _quote_shell_value(value, quote_context)
+            )
+            position = end
+        rendered.append(template[position:])
+        return "".join(rendered)
+
+
+def substitution_renderer(
+    variables: VariableContext,
+    *,
+    direct_dependencies: Iterable[str],
+    output_resolver: Callable[
+        [str, tuple[str, ...]], ResolvedOutputReference
+    ] | None = None,
+) -> VariableContext | StrictSubstitutionRenderer:
+    """Select strict v3 rendering without changing legacy substitution."""
+    if variables.normalizer_version != 3:
+        return variables
+    return StrictSubstitutionRenderer(
+        variables=variables,
+        direct_dependencies=frozenset(direct_dependencies),
+        output_resolver=output_resolver,
+    )
+
+
 __all__ = [
     "CommandResource",
     "ResourceResolver",
     "ScriptResource",
+    "StrictSubstitutionRenderer",
     "VariableContext",
+    "iter_output_field_references",
+    "substitution_renderer",
 ]

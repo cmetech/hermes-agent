@@ -8,7 +8,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getApiRequestProfile, getWorkflowEvidence } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { WorkflowEvidenceKind, WorkflowRunSnapshot } from '@/types/hermes'
+import type {
+  WorkflowAttemptEvidence,
+  WorkflowEvidenceKind,
+  WorkflowPersistentSessionRecoveryEvidence,
+  WorkflowRunSnapshot
+} from '@/types/hermes'
+
+import { isWorkflowTypedArtifact, TypedArtifactView } from './typed-artifact-view'
 
 interface RunInspectorProps {
   actionsDisabled?: boolean
@@ -40,6 +47,71 @@ function asDisplay(value: unknown, fallback: string): string {
   return Array.isArray(value) ? value.join(', ') || fallback : String(value)
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+export function isWorkflowAttemptEvidence(item: unknown): item is WorkflowAttemptEvidence {
+  if (!isRecord(item) || !isRecord(item.retry)) {
+    return false
+  }
+
+  const retry = item.retry
+  const error = item.error
+
+  return (
+    typeof item.attempt_id === 'string' &&
+    typeof item.node_id === 'string' &&
+    (item.state === undefined || typeof item.state === 'string') &&
+    isNumber(retry.additional_provider_attempts) &&
+    typeof retry.capped === 'boolean' &&
+    isNumber(retry.effective_total_attempts) &&
+    isNumber(retry.remaining_attempts) &&
+    isNumber(retry.requested_retries) &&
+    isNumber(retry.requested_total_attempts) &&
+    isNumber(retry.retry_consumed) &&
+    (error === undefined ||
+      (isRecord(error) &&
+        typeof error.code === 'string' &&
+        (error.message === undefined || error.message === null || typeof error.message === 'string')))
+  )
+}
+
+export function isWorkflowPersistentSessionRecoveryEvidence(
+  item: unknown
+): item is WorkflowPersistentSessionRecoveryEvidence {
+  return (
+    isRecord(item) &&
+    typeof item.attempt_id === 'string' &&
+    typeof item.cache_fingerprint_sha256 === 'string' &&
+    typeof item.missing_session_sha256 === 'string' &&
+    typeof item.node_id === 'string' &&
+    typeof item.outcome === 'string' &&
+    typeof item.provider === 'string' &&
+    isNumber(item.provider_attempts_before_recovery) &&
+    item.recovery_kind === 'persistent_session' &&
+    isNumber(item.registry_generation) &&
+    typeof item.runtime_profile === 'string' &&
+    typeof item.source === 'string'
+  )
+}
+
+function evidenceItemKey(item: Record<string, unknown>, index: number): string {
+  if (isWorkflowAttemptEvidence(item)) {
+    return `${item.node_id}:${item.attempt_id}`
+  }
+
+  if (isWorkflowPersistentSessionRecoveryEvidence(item)) {
+    return `${item.node_id}:${item.attempt_id}:${item.recovery_kind}`
+  }
+
+  return String(item.sequence ?? item.attempt_id ?? index)
+}
+
 function EvidenceItems({
   emptyLabel,
   items,
@@ -59,7 +131,7 @@ function EvidenceItems({
         const content = logs && typeof item.text === 'string' ? item.text : JSON.stringify(item, null, 2)
 
         return (
-          <LogView className="max-h-72" key={`${String(item.sequence ?? item.attempt_id ?? index)}`} role="listitem">
+          <LogView className="max-h-72" key={evidenceItemKey(item, index)} role="listitem">
             {content}
           </LogView>
         )
@@ -84,6 +156,9 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
     staleTime: 5_000
   })
 
+  const evidenceItems = evidence.data?.items ?? []
+  const typedArtifacts = tab === 'artifacts' ? evidenceItems.filter(isWorkflowTypedArtifact) : []
+
   const tabs: Array<{ id: InspectorTab; label: string }> = [
     { id: 'overview', label: copy.overview },
     { id: 'timeline', label: copy.timeline },
@@ -97,8 +172,10 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   const currentNode = run.current_nodes?.[0]
   const provenance = run.provenance
   const coordinator = run.coordinator
+
   const scheduledAt =
     run.presentation_state === 'scheduled_wait' && typeof run.schedule_at === 'string' ? run.schedule_at : null
+
   const scheduled = scheduledAt !== null
 
   return (
@@ -174,8 +251,10 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
           </dl>
         ) : tab === 'timeline' ? (
           <EvidenceItems emptyLabel={copy.noEvidence} items={events} />
+        ) : tab === 'artifacts' && typedArtifacts.length > 0 ? (
+          <TypedArtifactView artifacts={typedArtifacts} runId={run.run_id} />
         ) : (
-          <EvidenceItems emptyLabel={copy.noEvidence} items={evidence.data?.items ?? []} logs={tab === 'logs'} />
+          <EvidenceItems emptyLabel={copy.noEvidence} items={evidenceItems} logs={tab === 'logs'} />
         )}
       </section>
 

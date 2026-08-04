@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Mapping
 
 from plugins.workflow.sanitize import sanitize_evidence_bytes, sanitize_projection
+from plugins.workflow.store import (
+    PublicationIntegrityError,
+    PublicationNotFoundError,
+    VerifiedPublication,
+)
 
 
 EVIDENCE_KINDS = frozenset({
@@ -25,6 +30,26 @@ EVIDENCE_KINDS = frozenset({
 
 _LOG_READ_LIMIT = 256 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_PHASE3_RETRY_FIELDS = (
+    "requested_retries",
+    "requested_total_attempts",
+    "effective_total_attempts",
+    "retry_consumed",
+    "remaining_attempts",
+    "additional_provider_attempts",
+    "capped",
+)
+_PERSISTENT_SESSION_RECOVERY_FIELDS = (
+    "attempt_id",
+    "registry_generation",
+    "missing_session_sha256",
+    "cache_fingerprint_sha256",
+    "source",
+    "provider",
+    "runtime_profile",
+    "provider_attempts_before_recovery",
+    "outcome",
+)
 
 
 class _UnsafeEvidencePath(Exception):
@@ -270,6 +295,19 @@ class EvidenceReader:
             response["warnings"] = warnings
         return response
 
+    def lookup_publication(
+        self,
+        run_id: str,
+        publication_id: str,
+        *,
+        operator_scope: str | None = None,
+    ) -> VerifiedPublication:
+        return self.store.lookup_publication(
+            run_id,
+            publication_id,
+            operator_scope=operator_scope,
+        )
+
     def _items(self, run_id, run, *, kind, operator_scope):
         nodes = run.get("nodes", {})
         node_items = nodes.items() if isinstance(nodes, Mapping) else ()
@@ -291,7 +329,7 @@ class EvidenceReader:
             return [*historical, *pending_items]
         if kind == "attempts":
             return [
-                {"node_id": node_id, **attempt}
+                self._attempt_evidence_item(node_id, attempt)
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 for attempt in node.get("attempts", [])
@@ -304,14 +342,26 @@ class EvidenceReader:
                 if isinstance(node, Mapping) and node.get("output") is not None
             ]
         if kind == "artifacts":
-            return list(run.get("artifacts", []))
-        if kind == "recovery":
             return [
+                self._artifact_evidence_item(artifact)
+                for artifact in run.get("artifacts", [])
+                if isinstance(artifact, Mapping)
+            ]
+        if kind == "recovery":
+            process_recovery = [
                 {"node_id": node_id, "recovery": node["recovery"]}
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance(node.get("recovery"), Mapping)
             ]
+            persistent_session_recovery = [
+                self._persistent_session_recovery_item(node_id, recovery)
+                for node_id, node in node_items
+                if isinstance(node, Mapping)
+                for recovery in node.get("session_recoveries", ())
+                if isinstance(recovery, Mapping)
+            ]
+            return [*process_recovery, *persistent_session_recovery]
         if kind == "coordinator":
             return [
                 {
@@ -331,6 +381,68 @@ class EvidenceReader:
 
             return list(NotificationOutbox(self.store).history(run_id=run_id))
         return []
+
+    @staticmethod
+    def _attempt_evidence_item(
+        node_id: object,
+        attempt: Mapping[str, object],
+    ) -> dict[str, object]:
+        metadata = attempt.get("metadata")
+        if not isinstance(metadata, Mapping) or not all(
+            field in metadata for field in _PHASE3_RETRY_FIELDS
+        ):
+            return {"node_id": node_id, **attempt}
+        projected: dict[str, object] = {
+            "node_id": node_id,
+            "attempt_id": attempt.get("attempt_id"),
+            "state": attempt.get("state"),
+            "retry": {field: metadata[field] for field in _PHASE3_RETRY_FIELDS},
+        }
+        if attempt.get("error_code") is not None:
+            projected["error"] = {
+                "code": attempt.get("error_code"),
+                "message": attempt.get("error_message"),
+            }
+        return projected
+
+    @staticmethod
+    def _persistent_session_recovery_item(
+        node_id: object,
+        recovery: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {
+            "node_id": node_id,
+            "recovery_kind": "persistent_session",
+            **{
+                field: recovery[field]
+                for field in _PERSISTENT_SESSION_RECOVERY_FIELDS
+                if field in recovery
+            },
+        }
+
+    @staticmethod
+    def _artifact_evidence_item(
+        artifact: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(artifact.get("publication_id"), str):
+            return dict(artifact)
+        return {
+            "publication_id": artifact.get("publication_id"),
+            "output_type": artifact.get("output_type"),
+            "media_type": artifact.get("media_type"),
+            "size_bytes": artifact.get("size_bytes"),
+            "sha256": artifact.get("sha256"),
+            "node_id": artifact.get("node_id"),
+            "attempt_id": artifact.get("attempt_id"),
+            "schema_fingerprint": artifact.get("schema_fingerprint"),
+            "produced_at": artifact.get("produced_at"),
+            "session_id": artifact.get("session_id"),
+            # load_run() revalidates the checked journal, projection descriptor,
+            # bundle containment, canonical filename, size, and digest before
+            # EvidenceReader can observe this projection.
+            "integrity_status": "verified",
+            "recovery_status": "verified",
+        }
 
     @staticmethod
     def _logs(directory: Path) -> tuple[list[dict[str, object]], list[str]]:
@@ -359,4 +471,11 @@ class EvidenceReader:
         return items, warnings
 
 
-__all__ = ["EVIDENCE_KINDS", "EvidenceReader", "_read_contained_regular_file"]
+__all__ = [
+    "EVIDENCE_KINDS",
+    "EvidenceReader",
+    "PublicationIntegrityError",
+    "PublicationNotFoundError",
+    "VerifiedPublication",
+    "_read_contained_regular_file",
+]

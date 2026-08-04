@@ -5,6 +5,28 @@ from types import SimpleNamespace
 
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
+
+
+_STRUCTURED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _structured_request(strategy: StructuredOutputStrategy) -> StructuredOutputRequest:
+    return StructuredOutputRequest(
+        schema=normalize_schema(_STRUCTURED_SCHEMA),
+        strategy=strategy,
+        adapter_version=1,
+    )
 
 
 @pytest.fixture
@@ -290,6 +312,280 @@ class TestChatCompletionsBuildKwargs:
         assert kw["model"] == "gpt-4o"
         assert kw["messages"][0]["content"] == "Hello"
         assert kw["timeout"] == 30.0
+
+    def test_direct_openai_native_schema_uses_exact_response_format(self, transport):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_non_schema_strategies_never_emit_response_format(
+        self, transport, strategy
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        ("provider_name", "base_url"),
+        [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("custom", "https://gateway.example/v1"),
+            ("openai-api", "https://gateway.example/v1"),
+        ],
+    )
+    def test_non_direct_routes_never_emit_response_format(
+        self, transport, provider_name, base_url
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        ("strategy", "provider_name", "base_url", "profile_name"),
+        [
+            (
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_MODE,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.UNSUPPORTED,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "custom",
+                "https://gateway.example/v1",
+                "custom",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openrouter",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openai-codex",
+                "https://chatgpt.com/backend-api/codex",
+                None,
+            ),
+        ],
+    )
+    def test_structured_requests_reserve_response_format_from_overrides(
+        self, transport, strategy, provider_name, base_url, profile_name
+    ):
+        profile = None
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            provider_profile=profile,
+            request_overrides={
+                "response_format": {"type": "json_object"},
+                "service_tier": "priority",
+            },
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "response_format" not in kwargs
+        assert kwargs["service_tier"] == "priority"
+
+    @pytest.mark.parametrize("profile_name", [None, "openrouter"])
+    def test_legacy_calls_preserve_response_format_override(
+        self, transport, profile_name
+    ):
+        profile = None
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_profile=profile,
+            request_overrides={"response_format": {"type": "json_object"}},
+        )
+
+        assert kwargs["response_format"] == {"type": "json_object"}
+
+    def test_native_schema_cannot_be_shadowed_by_response_format_override(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={"response_format": "malformed"},
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+    @pytest.mark.parametrize("profile_name", [None, "openrouter"])
+    def test_structured_non_native_final_kwargs_strip_nested_response_format(
+        self, transport, profile_name
+    ):
+        profile = None
+        provider_name = "openai-api"
+        base_url = "https://api.openai.com/v1"
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+            provider_name = "openrouter"
+            base_url = "https://openrouter.ai/api/v1"
+        extra_body = {
+            "response_format": {"type": "json_object"},
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            provider_profile=profile,
+            request_overrides={"extra_body": extra_body},
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "response_format" not in kwargs
+        assert kwargs["extra_body"]["trace_id"] == "keep-me"
+        assert "response_format" not in kwargs["extra_body"]
+        assert extra_body == {
+            "response_format": {"type": "json_object"},
+            "trace_id": "keep-me",
+        }
+
+    def test_native_schema_final_kwargs_cannot_be_shadowed_by_extra_body(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "extra_body": {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "smuggled",
+                            "schema": {"type": "string"},
+                            "strict": False,
+                        },
+                    },
+                    "trace_id": "keep-me",
+                }
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+
+    def test_structured_request_removes_empty_extra_body_after_reservation(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "extra_body": {"response_format": {"type": "json_object"}}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "extra_body" not in kwargs
+
+    def test_legacy_call_preserves_nested_response_format_override(self, transport):
+        extra_body = {
+            "response_format": {"type": "json_object"},
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
 
     def test_developer_role_swap(self, transport):
         msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]

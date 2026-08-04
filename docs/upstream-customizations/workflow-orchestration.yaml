@@ -376,6 +376,53 @@ upstream_changes:
     including native Windows Job Object ownership and query-proven descendant
     quiescence across direct-child exit and recovery.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: managed-process-inherited-descriptors
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tools/managed_process.py
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - InheritedDescriptorIdentity
+  - ManagedProcessTree.spawn
+  owned_invariants:
+  - explicit bounded inherited_descriptors spawn contract
+  - nominated POSIX descriptors are proven read-only before child creation
+  - pinned open-file identity is remapped to the exact nominated child number
+    with unrelated descriptors closed
+  - optional path-free expected identities are checked on race-safe pinned
+    duplicates before child creation
+  - internal pins and bootstrap status descriptors close on every launch outcome
+  - caller ownership of inherited descriptors across spawn success and failure
+  - native Windows nonempty inheritance requests fail closed before child creation
+  tests:
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(process): inherit bounded child descriptors'
+  upstream_candidate: true
+  merge_guidance: >-
+    Reconcile this narrow generic spawn seam with upstream process ownership.
+    Preserve validation of at most 64 unique open integer descriptors above
+    stdin/stdout/stderr, read-only access-mode enforcement, and pinned open-file
+    identity remapped to the exact nominated POSIX child descriptor number while
+    every unrelated descriptor is closed. When a caller supplies path-free
+    expected identities, preserve verification against the newly pinned
+    duplicates before child creation so descriptor-number reuse fails closed.
+    Preserve caller ownership of nominated handles, internal-pin cleanup on every
+    outcome, and native Windows fail-closed behavior for every nonempty request.
+    Keep workflow values, spill files, shell rendering, and evidence out of the
+    managed-process primitive, while retaining the historical Job Object, process
+    identity, termination, escalation, resource, and wait/reap contracts in the
+    adjacent entry.
+  removal_condition: >-
+    Remove when upstream's generic managed-process primitive exposes equivalent
+    bounded exact child-descriptor inheritance on POSIX and fail-closed native
+    Windows behavior without weakening process-tree ownership or caller handle
+    ownership.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: plugin-agent-runner
   change_class: agent-core-generic
   owner: workflow-orchestration
@@ -407,6 +454,43 @@ upstream_changes:
     exposing process-global resources.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-persistent-session-missing-classification
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - hermes_state.py
+  - tests/agent/test_plugin_agent.py
+  - tests/test_hermes_state.py
+  - tests/plugins/workflow/test_node_mcp.py
+  owned_symbols:
+  - PluginAgentSessionMissingError
+  - _correlate_persistent_session_result
+  - _persistent_session_missing_failure
+  - SessionDB.get_existing_session_conversation
+  owned_invariants:
+  - exact profile-local shared-session parent preflight
+  - atomic single-snapshot shared-session existence and conversation load
+  - persistent_session_missing exact-origin worker framing and correlation
+  tests:
+  - tests/agent/test_plugin_agent.py
+  - tests/test_hermes_state.py
+  - tests/plugins/workflow/test_node_mcp.py
+  expected_commit_subject: 'feat(agent): classify missing plugin sessions'
+  upstream_candidate: true
+  merge_guidance: Preserve confirmed exact profile-local SessionDB absence as
+    a typed zero-provider parent outcome, while leaving database open, read,
+    corruption, ambiguity, and access failures operationally distinct. Preserve
+    the child-load race as one atomic existence-plus-history snapshot taken
+    before MCP/runtime/structured-output side effects, returning a sanitized
+    failed result with exact zero-provider evidence, no session, history,
+    exception, or provider content, and strict parent correlation. Keep
+    workflow recovery and fresh-session policy outside the generic agent core.
+  removal_condition: Remove when upstream provides equivalent typed exact-session
+    preflight and strictly correlated zero-provider child-race classification
+    without choosing caller recovery policy.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-agent-override-inspection
   change_class: agent-core-generic
@@ -2405,6 +2489,48 @@ upstream_changes:
     canonical time handling, scheduled-wait presentation, and four-locale
     coverage while retaining the separate legacy CLI Cron showcase.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-provider-attempt-transport-authority
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - run_agent.py
+  - agent/anthropic_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/codex_runtime.py
+  - agent/provider_attempts.py
+  - tests/agent/test_provider_attempt_transport.py
+  owned_symbols:
+  - reserve_provider_transport_attempt
+  - AIAgent._anthropic_messages_create before_transport bridge
+  - chat-completions, Bedrock, MoA, and summary transport reservations
+  - create_anthropic_message per-transport before_transport callback
+  - Codex Responses and app-server transport reservations
+  owned_invariants:
+  - every actual provider transport is reserved before launch
+  - each retry or stream-to-create fallback receives a distinct reservation
+  - an absent request-local callback preserves ordinary Hermes behavior
+  - reservation refusal propagates before provider I/O
+  tests:
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_plugin_agent.py
+  - tests/plugins/workflow/test_ai_executor.py
+  expected_commit_subject: 'test(workflow): gate provider attempt transport seams'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the optional request-local reservation callback at every concrete
+    provider transport launch, including OpenAI-compatible chat completions,
+    Bedrock Converse, MoA, Anthropic stream and create fallback, Codex
+    Responses retries, Codex app-server turns, and iteration-limit summaries.
+    The reservation must execute immediately before each transport and its
+    refusal must propagate without provider I/O. Keep the hook optional so
+    ordinary non-workflow conversations retain their existing behavior. Any
+    upstream refactor that moves or adds provider launches must update the
+    focused transport contract and retain equivalent pre-launch accounting.
+  removal_condition: >-
+    Remove when upstream provides equivalent request-scoped, pre-transport
+    provider-attempt authority across every supported provider path with a
+    release-gated regression contract.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-run-execution-limits
   change_class: workflow-runtime
   owner: workflow-orchestration
@@ -3913,6 +4039,8 @@ upstream_changes:
   owned_invariants:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
+  - Phase 3 ordinary language and Bash regression suite selection
+  - provider-attempt transport contract base merge-gate selection
   - relative PYTHON_BIN canonicalization before repository switching
   - canonical per-file test isolation in the base merge gate
   - tests/plugins/workflow/test_language.py gate membership
@@ -3926,6 +4054,10 @@ upstream_changes:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_language_schema.py
   - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase3_bash_substitution.py
+  - tests/plugins/workflow/test_phase3_bash_descriptor_faults.py
+  - tests/plugins/workflow/test_phase3_bash_reference_ordering.py
+  - tests/agent/test_provider_attempt_transport.py
   - apps/desktop/src/app/workflows/index.test.tsx
   - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
   - tests/scripts/test_workflow_merge_gate.py
