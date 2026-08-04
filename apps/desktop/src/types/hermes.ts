@@ -331,7 +331,7 @@ export interface WorkflowArtifactPreview {
 }
 
 export interface WorkflowEvidencePage {
-  items: WorkflowEvidenceItem[]
+  items: Array<Record<string, unknown>>
   kind: WorkflowEvidenceKind
   next_cursor: number
   schema_version: number
@@ -339,10 +339,10 @@ export interface WorkflowEvidencePage {
 }
 
 export interface WorkflowAttemptEvidence extends Record<string, unknown> {
-  attempt_id?: string
+  attempt_id: string
   error?: { code: string; message?: null | string }
   node_id: string
-  retry?: {
+  retry: {
     additional_provider_attempts: number
     capped: boolean
     effective_total_attempts: number
@@ -367,11 +367,6 @@ export interface WorkflowPersistentSessionRecoveryEvidence extends Record<string
   runtime_profile: string
   source: string
 }
-
-export type WorkflowEvidenceItem =
-  | Record<string, unknown>
-  | WorkflowAttemptEvidence
-  | WorkflowPersistentSessionRecoveryEvidence
 
 export interface WorkflowRunPage {
   next_cursor: null | string

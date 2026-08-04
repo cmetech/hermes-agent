@@ -8,7 +8,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getApiRequestProfile, getWorkflowEvidence } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { WorkflowEvidenceKind, WorkflowRunSnapshot } from '@/types/hermes'
+import type {
+  WorkflowAttemptEvidence,
+  WorkflowEvidenceKind,
+  WorkflowPersistentSessionRecoveryEvidence,
+  WorkflowRunSnapshot
+} from '@/types/hermes'
 
 import { isWorkflowTypedArtifact, TypedArtifactView } from './typed-artifact-view'
 
@@ -42,13 +47,69 @@ function asDisplay(value: unknown, fallback: string): string {
   return Array.isArray(value) ? value.join(', ') || fallback : String(value)
 }
 
-function formatEvidenceItem(item: Record<string, unknown>): string {
-  return Object.entries(item)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(
-      ([key, value]) => `${key}=${typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)}`
-    )
-    .join('\n')
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+export function isWorkflowAttemptEvidence(item: unknown): item is WorkflowAttemptEvidence {
+  if (!isRecord(item) || !isRecord(item.retry)) {
+    return false
+  }
+
+  const retry = item.retry
+  const error = item.error
+
+  return (
+    typeof item.attempt_id === 'string' &&
+    typeof item.node_id === 'string' &&
+    (item.state === undefined || typeof item.state === 'string') &&
+    isNumber(retry.additional_provider_attempts) &&
+    typeof retry.capped === 'boolean' &&
+    isNumber(retry.effective_total_attempts) &&
+    isNumber(retry.remaining_attempts) &&
+    isNumber(retry.requested_retries) &&
+    isNumber(retry.requested_total_attempts) &&
+    isNumber(retry.retry_consumed) &&
+    (error === undefined ||
+      (isRecord(error) &&
+        typeof error.code === 'string' &&
+        (error.message === undefined || error.message === null || typeof error.message === 'string')))
+  )
+}
+
+export function isWorkflowPersistentSessionRecoveryEvidence(
+  item: unknown
+): item is WorkflowPersistentSessionRecoveryEvidence {
+  return (
+    isRecord(item) &&
+    typeof item.attempt_id === 'string' &&
+    typeof item.cache_fingerprint_sha256 === 'string' &&
+    typeof item.missing_session_sha256 === 'string' &&
+    typeof item.node_id === 'string' &&
+    typeof item.outcome === 'string' &&
+    typeof item.provider === 'string' &&
+    isNumber(item.provider_attempts_before_recovery) &&
+    item.recovery_kind === 'persistent_session' &&
+    isNumber(item.registry_generation) &&
+    typeof item.runtime_profile === 'string' &&
+    typeof item.source === 'string'
+  )
+}
+
+function evidenceItemKey(item: Record<string, unknown>, index: number): string {
+  if (isWorkflowAttemptEvidence(item)) {
+    return `${item.node_id}:${item.attempt_id}`
+  }
+
+  if (isWorkflowPersistentSessionRecoveryEvidence(item)) {
+    return `${item.node_id}:${item.attempt_id}:${item.recovery_kind}`
+  }
+
+  return String(item.sequence ?? item.attempt_id ?? index)
 }
 
 function EvidenceItems({
@@ -67,10 +128,10 @@ function EvidenceItems({
   return (
     <div className="space-y-2" role="list">
       {items.map((item, index) => {
-        const content = logs && typeof item.text === 'string' ? item.text : formatEvidenceItem(item)
+        const content = logs && typeof item.text === 'string' ? item.text : JSON.stringify(item, null, 2)
 
         return (
-          <LogView className="max-h-72" key={`${String(item.sequence ?? item.attempt_id ?? index)}`} role="listitem">
+          <LogView className="max-h-72" key={evidenceItemKey(item, index)} role="listitem">
             {content}
           </LogView>
         )

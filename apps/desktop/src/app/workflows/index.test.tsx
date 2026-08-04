@@ -7,7 +7,7 @@ import { I18nProvider } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
-import { RunInspector } from './run-inspector'
+import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
@@ -974,8 +974,16 @@ describe('WorkflowsView', () => {
   it('loads selected evidence on demand and sends bounded input through one mutation', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
     getWorkflowRun.mockResolvedValue(run({ next_actions: ['provide-input'] }))
+
+    const attemptEvidence = {
+      attempt_id: 'attempt-1',
+      error: { code: 'provider_timeout', message: 'first line\nsecond line' },
+      retry: { requested_retries: 2 },
+      state: 'failed'
+    }
+
     getWorkflowEvidence.mockResolvedValue({
-      items: [{ attempt_id: 'attempt-1', state: 'failed' }],
+      items: [attemptEvidence],
       kind: 'attempts',
       next_cursor: 1,
       schema_version: 1,
@@ -987,7 +995,17 @@ describe('WorkflowsView', () => {
     fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Attempts' }), { button: 0, ctrlKey: false })
     await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'attempts'))
     const attempt = await screen.findByRole('listitem')
-    expect(attempt.textContent).toContain('attempt-1')
+    expect(attempt.textContent).toBe(`{
+  "attempt_id": "attempt-1",
+  "error": {
+    "code": "provider_timeout",
+    "message": "first line\\nsecond line"
+  },
+  "retry": {
+    "requested_retries": 2
+  },
+  "state": "failed"
+}`)
 
     fireEvent.change(screen.getByLabelText('Input value'), { target: { value: 'bounded answer' } })
     fireEvent.click(screen.getByRole('button', { name: 'Provide input' }))
@@ -1025,8 +1043,57 @@ describe('WorkflowsView', () => {
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Recovery' }), { button: 0, ctrlKey: false })
 
     await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'recovery'))
-    expect(await screen.findByText(/recovery_kind=persistent_session/)).toBeTruthy()
-    expect(screen.getByText(/outcome=stale_entry_replaced/)).toBeTruthy()
+    expect(await screen.findByText(/"recovery_kind": "persistent_session"/)).toBeTruthy()
+    expect(screen.getByText(/"outcome": "stale_entry_replaced"/)).toBeTruthy()
+  })
+
+  it('narrows only complete Phase 3 attempt and persistent-session recovery evidence', () => {
+    const attempt: Record<string, unknown> = {
+      attempt_id: 'attempt-1',
+      node_id: 'producer',
+      retry: {
+        additional_provider_attempts: 2,
+        capped: false,
+        effective_total_attempts: 3,
+        remaining_attempts: 0,
+        requested_retries: 2,
+        requested_total_attempts: 3,
+        retry_consumed: 3
+      },
+      state: 'succeeded'
+    }
+
+    const recovery: Record<string, unknown> = {
+      attempt_id: 'attempt-2',
+      cache_fingerprint_sha256: 'b'.repeat(64),
+      missing_session_sha256: 'a'.repeat(64),
+      node_id: 'producer',
+      outcome: 'stale_entry_replaced',
+      provider: 'test-provider',
+      provider_attempts_before_recovery: 0,
+      recovery_kind: 'persistent_session',
+      registry_generation: 7,
+      runtime_profile: 'default',
+      source: 'cross_run_registry'
+    }
+
+    expect(isWorkflowAttemptEvidence(attempt)).toBe(true)
+
+    if (!isWorkflowAttemptEvidence(attempt)) {
+      throw new Error('attempt evidence did not narrow')
+    }
+
+    expect(attempt.retry.additional_provider_attempts).toBe(2)
+    expect(isWorkflowAttemptEvidence({ attempt_id: 'legacy-attempt', state: 'failed' })).toBe(false)
+
+    expect(isWorkflowPersistentSessionRecoveryEvidence(recovery)).toBe(true)
+
+    if (!isWorkflowPersistentSessionRecoveryEvidence(recovery)) {
+      throw new Error('recovery evidence did not narrow')
+    }
+
+    expect(recovery.recovery_kind).toBe('persistent_session')
+    expect(isWorkflowPersistentSessionRecoveryEvidence({ recovery_kind: 'persistent_session' })).toBe(false)
   })
 
   it('uses typed artifacts only for backend-confirmed publication identities and preserves legacy evidence fallback', async () => {

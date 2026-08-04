@@ -103,3 +103,39 @@ RED: **30 passed / 2 failed**. The exact synthetic projection and a real Archon
 v3 scheduler-to-authenticated-evidence-route assertion both failed because the
 field was absent. After the allowlist fix, the same command was GREEN:
 **32 passed / 0 failed**.
+
+## Quality Review Closure
+
+Desktop now renders each optional backend-authored migration directly beside
+its blocking compatibility message. Older findings that contain only a message
+retain the established presentation, and no local label or migration authority
+was added.
+
+All non-log Run Inspector evidence again uses the established indented JSON
+representation. The attempt regression fixture proves nested objects remain
+indented and multiline strings remain quoted and escaped; recovery evidence is
+still rendered generically through the same view.
+
+`WorkflowEvidencePage.items` is explicitly generic. The specific Phase 3
+attempt and persistent-session recovery interfaces remain available behind
+pure runtime guards, which the inspector uses for stable typed item identities.
+Partial and legacy records stay on the generic fallback instead of falsely
+narrowing.
+
+The quality fixes used three independent RED/GREEN cycles:
+
+- Migration RED: **41 passed / 1 failed** because the backend-authored
+  migration was absent from its finding; GREEN: **42 passed / 0 failed**.
+- Evidence readability RED: **40 passed / 2 failed** because nested attempt
+  evidence was flattened and recovery remained `key=value`; GREEN:
+  **42 passed / 0 failed**.
+- Type-guard RED: **42 passed / 1 failed** because the desired attempt guard did
+  not exist; focused index/review GREEN after the guards and generic page
+  contract: **85 passed / 0 failed**.
+
+Final closure verification: exact backend matrix **321 passed / 0 failed**;
+exact Desktop matrix **114 passed / 0 failed**; Desktop typecheck, scoped Ruff,
+scoped Prettier, and `git diff --check` passed. Scoped ESLint reported zero
+errors and only 21 pre-existing warnings.
+
+No security-focused validation suite was invoked during this closure pass.

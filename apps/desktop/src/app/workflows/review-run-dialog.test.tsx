@@ -339,7 +339,9 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(within(dialog).getByText('Normalizer 3')).toBeTruthy()
-    expect(within(dialog).getByText('Backend-authored compatibility guidance')).toBeTruthy()
+    const message = within(dialog).getByText('Backend-authored compatibility guidance')
+    expect(message).toBeTruthy()
+    expect(within(message.closest('li')!).getByText('Backend-authored migration guidance')).toBeTruthy()
   })
 
   it('reviews a future server-authored workflow language profile without Archon relabeling', async () => {
