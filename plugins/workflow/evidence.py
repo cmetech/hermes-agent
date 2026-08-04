@@ -36,6 +36,7 @@ _PHASE3_RETRY_FIELDS = (
     "effective_total_attempts",
     "retry_consumed",
     "remaining_attempts",
+    "additional_provider_attempts",
     "capped",
 )
 _PERSISTENT_SESSION_RECOVERY_FIELDS = (

@@ -359,6 +359,10 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
             f"/api/plugins/workflow/runs/{admitted.run_id}/evidence",
             params={"kind": "artifacts"},
         )
+        attempt_response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence",
+            params={"kind": "attempts"},
+        )
         preview = client.get(f"{base}/preview")
         download = client.get(f"{base}/download")
 
@@ -369,6 +373,26 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
         if item.get("publication_id") == publication["publication_id"]
     )
     assert desktop_item == typed
+    assert attempt_response.status_code == 200
+    desktop_attempt = next(
+        item
+        for item in attempt_response.json()["items"]
+        if item.get("node_id") == "producer"
+    )
+    assert desktop_attempt == {
+        "node_id": "producer",
+        "attempt_id": producer_attempt["attempt_id"],
+        "state": "succeeded",
+        "retry": {
+            "requested_retries": 2,
+            "requested_total_attempts": 3,
+            "effective_total_attempts": 3,
+            "retry_consumed": 1,
+            "remaining_attempts": 2,
+            "additional_provider_attempts": 0,
+            "capped": False,
+        },
+    }
     assert preview.status_code == 200
     assert preview.json() == {
         "publication_id": publication["publication_id"],

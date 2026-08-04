@@ -83,3 +83,23 @@ Result: **113 passed / 0 failed** across three files.
 None blocking. Legacy attempt evidence intentionally retains its established
 shape; the closed retry/error projection activates only when the complete Phase
 3 retry metadata contract is present.
+
+## Specification Review Fix
+
+The closed Phase 3 retry projection now retains the producer-authored
+`additional_provider_attempts` integer, and the Desktop retry interface exposes
+the same required field. `provider_attempts_exact` and unrelated attempt
+metadata remain outside the approved evidence shape.
+
+The focused RED command was:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_evidence_api.py \
+  tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+```
+
+RED: **30 passed / 2 failed**. The exact synthetic projection and a real Archon
+v3 scheduler-to-authenticated-evidence-route assertion both failed because the
+field was absent. After the allowlist fix, the same command was GREEN:
+**32 passed / 0 failed**.

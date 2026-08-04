@@ -343,6 +343,7 @@ export interface WorkflowAttemptEvidence extends Record<string, unknown> {
   error?: { code: string; message?: null | string }
   node_id: string
   retry?: {
+    additional_provider_attempts: number
     capped: boolean
     effective_total_attempts: number
     remaining_attempts: number
