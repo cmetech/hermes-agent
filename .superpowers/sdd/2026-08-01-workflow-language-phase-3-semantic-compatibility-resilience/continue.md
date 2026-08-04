@@ -1,42 +1,36 @@
-# Continue — Phase 3 / Task 16
+# Continue — Phase 3 complete / integration handoff
 
 ## Last action
 
-Closed Task 15 at reviewed implementation
-`b10ae833f40a2f09d529bc24744e8a3c8432c712` (tree
-`5a2f00e60b2c1e09d9284531330d78c6de7ed5f5`). Fresh independent specification
-and quality closure rereviews both passed with 0 Critical, 0 Important, and 0
-Minor findings. Controller verification passed the exact Task 15 matrix at
-1,764/1,764; the installed-wheel integration passed 1/1; dynamic Archon and
-legacy wire probes resolved all 96 references; scoped Ruff, diff, branch,
-commit, tree, and clean-worktree checks passed. Threat-model/security testing
-and validation were explicitly excluded by user instruction and must remain
-excluded from Task 16.
+Closed Task 16 and Phase 3 at reviewed production implementation
+`8a1fe704484bf63e0e84f536f7fb690a2f024ccf` (tree
+`94f4fd4572b63ba6dd496213b603e67748b41b46`). Independent final specification
+and quality reviews both passed with 0 Critical, 0 Important, and 0 Minor
+findings. The explicit ordinary functional, Desktop, schema, customization,
+merge, and manual integration-only upstream/OTTO/LOOP24 gates passed. Broad
+discovery and the generic ledger-validation stage were superseded because they
+could select security/threat-focused tests prohibited by the user. No such
+evidence is used for completion.
 
 ## Next action
 
-Read `AGENTS.md`, the approved Phase 3 design and plan, this handoff, and the
-final Task 15 closure rereviews; verify the exact branch/HEAD/tree and clean
-worktree; then execute Task 16's final Phase 3 functional/regression,
-customization, review, and release-rehearsal gates. Remove or skip every
-historical Task 16 item that requests threat-model/security analysis, testing,
-or validation. Use `scripts/run_tests.sh` with retries disabled for
-authoritative Python gates, and record the exact green candidate identity
-before final specification and quality reviews.
+Wait for explicit user authorization before integration. If authorized, use
+the project branch rule that developer shorthand `main` means `base`; do not
+target literal `main`. Reverify the reviewed production identity, the
+report-only closure identity, clean worktree, and current `base` state before
+any merge, push, PR, release, branch deletion, or worktree removal.
 
 ## Why
 
-Tasks 1–15 now implement and publish the bounded Phase 3 contract through the
-runtime, API, Desktop, generated schema, documentation, skill, and installed
-distribution surfaces. Task 16 is the final convergence gate before Phase 3 can
-be declared complete.
+Tasks 1–16 implement, publish, and verify the bounded Phase 3 contract through
+the runtime, API, Desktop, generated schema, documentation, skill, installed
+distribution, customization gates, and disposable brand integration rehearsal.
 
 ## Open threads
 
-- Task 16 remains pending; Tasks 1–15 are complete.
-- Task 16 must run final ordinary functional/regression, Desktop,
-  customization, base-merge, and release-rehearsal gates, then obtain clean
-  specification and quality reviews against the exact final tree.
+- Tasks 1–16 are complete; no implementation or review finding remains open.
+- Integration, push, publication, release propagation, and cleanup remain
+  unauthorized until the user requests them separately.
 - The shared `base` checkout remains at `5b974a53593fc880d18417ee2fc0e5eaff5599f4`
   with unrelated user-owned changes.
 
@@ -53,5 +47,7 @@ be declared complete.
 - Do not remove MCP/skills as documented options or promote loops/includes
   before Phase 4.
 - Do not begin Phase 4 loops/includes or new artifact/provider surfaces.
+- Do not merge, push, publish, propagate brand refs, delete the branch, or
+  remove the feature worktree without separate user authorization.
 - Do not modify the shared base checkout, literal `main`, push, publish, or
   delete branches/worktrees.
