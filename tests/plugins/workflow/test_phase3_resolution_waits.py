@@ -191,6 +191,40 @@ def _start_noncondition_reference_run(
     return store, admitted.run_id
 
 
+def _ready_consumer_after_one_retry(
+    tmp_path,
+    workflow_writer,
+    *,
+    name: str,
+) -> tuple[RunStore, str]:
+    store, run_id = _start_noncondition_reference_run(
+        tmp_path,
+        workflow_writer,
+        name=name,
+    )
+
+    class RetryableFailure:
+        def execute(self, _context):
+            return NodeExecutionResult(
+                "failed",
+                error_code="network_error",
+                error_message="ordinary retryable failure",
+            )
+
+    scheduler = RunScheduler(store, jitter=lambda: 0.5)
+    scheduler.executors["bash"] = RetryableFailure()
+    waiting = scheduler.advance(run_id, max_nodes=1)
+    retry_at = datetime.fromisoformat(
+        waiting["nodes"]["consumer"]["next_attempt_at"]
+    )
+    assert store.wake_due_retries(run_id, now=retry_at) == ("consumer",)
+    ready = store.load_run(run_id)["nodes"]["consumer"]
+    assert ready["state"] == "ready"
+    assert len(ready["attempts"]) == 1
+    assert ready["retry_consumed"] == 1
+    return store, run_id
+
+
 def test_store_persists_exact_resolution_backoff_and_exhausts_on_sixth_read(
     tmp_path, workflow_writer
 ) -> None:
@@ -254,6 +288,50 @@ def test_store_persists_exact_resolution_backoff_and_exhausts_on_sixth_read(
         "message": "output reference remained unavailable after 6 reads",
         "node_id": "consumer",
     }
+
+
+def test_resolution_wait_preserves_prior_attempt_and_retry_consumption(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _ready_consumer_after_one_retry(
+        tmp_path,
+        workflow_writer,
+        name="resolution-after-retry",
+    )
+
+    assert store.defer_output_resolution(
+        run_id,
+        "consumer",
+        producer_identity=_PRODUCER_IDENTITY,
+        now=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    consumer = store.load_run(run_id)["nodes"]["consumer"]
+    assert consumer["state"] == "waiting_resolution"
+    assert len(consumer["attempts"]) == 1
+    assert consumer["retry_consumed"] == 1
+
+
+def test_terminal_reference_transition_preserves_prior_retry_history(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _ready_consumer_after_one_retry(
+        tmp_path,
+        workflow_writer,
+        name="terminal-reference-after-retry",
+    )
+
+    assert store.transition_v3_reference_node(
+        run_id,
+        "consumer",
+        code="output_reference_integrity",
+        message="ordinary terminal reference failure",
+    )
+
+    consumer = store.load_run(run_id)["nodes"]["consumer"]
+    assert consumer["state"] == "failed"
+    assert len(consumer["attempts"]) == 1
+    assert consumer["retry_consumed"] == 1
 
 
 def test_resolution_wait_round_trips_every_restart_state(

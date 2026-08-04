@@ -12912,11 +12912,9 @@ class RunStore:
                 "ready",
             }:
                 return False
-            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
-                raise RuntimeError("reference failure already consumed an attempt")
             self._clear_output_resolution_fields(node)
             node["state"] = "failed"
-            node["retry_consumed"] = 0
+            node["retry_consumed"] = int(node.get("retry_consumed", 0))
             projection["last_error"] = {
                 "code": code,
                 "message": safe_message,
@@ -12956,7 +12954,7 @@ class RunStore:
         node["resolution_read_count"] = read_count
         node.pop("next_resolution_at", None)
         node.pop("resolution_resume_state", None)
-        node["retry_consumed"] = 0
+        node["retry_consumed"] = int(node.get("retry_consumed", 0))
         projection["last_error"] = {
             "code": code,
             "message": message,
@@ -13002,9 +13000,6 @@ class RunStore:
                 "ready",
             }:
                 return False
-            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
-                raise RuntimeError("output resolution wait consumed an executor attempt")
-
             retained_identity = node.get("resolution_producer_identity")
             read_count = int(node.get("resolution_read_count", 0)) + 1
             if retained_identity is not None and retained_identity != identity:
@@ -13038,7 +13033,7 @@ class RunStore:
             node["resolution_resume_state"] = str(node["state"])
             node["state"] = "waiting_resolution"
             node["next_resolution_at"] = next_resolution_at.isoformat()
-            node["retry_consumed"] = 0
+            node["retry_consumed"] = int(node.get("retry_consumed", 0))
             self._append_locked(
                 directory,
                 projection,
