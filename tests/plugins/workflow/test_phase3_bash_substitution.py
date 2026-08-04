@@ -96,6 +96,19 @@ _PREFIXED_ARRAY_SUBSCRIPT_CONTEXTS = (
     ('export "items[{reference}]=9"', "quoted-export"),
 )
 
+_ARITHMETIC_BUILTIN_CONTEXTS = (
+    ('let "x = {reference}"', "let"),
+    ('command let "x = {reference}"', "command-let"),
+    ('builtin -- let "x = {reference}"', "builtin-let"),
+    ('declare -i "x = {reference}"', "declare-i"),
+    ('"declare" "-ri" "x = {reference}"', "quoted-declare-ri"),
+    ('command -- typeset -ir "x = {reference}"', "command-typeset-ir"),
+    (
+        'function f {{ local -i "x = {reference}"; }}; f',
+        "function-local-i",
+    ),
+)
+
 _FD_HEREDOC_ARRAY_SUBSCRIPT_CONTEXTS = tuple(
     (
         f"{descriptor}{operator}EOF items[{{reference}}]=9\n{tab}body\n{tab}EOF\n",
@@ -619,6 +632,35 @@ def test_v3_bash_rejects_arithmetic_array_subscripts_at_admission(
 )
 @pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
 def test_v3_bash_rejects_prefixed_arithmetic_array_subscripts_at_admission(
+    tmp_path,
+    workflow_writer,
+    template,
+    context,
+    reference,
+) -> None:
+    command = template.format(reference=reference)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        _archon_bash_package(
+            workflow_writer,
+            tmp_path,
+            command,
+            depends_on=("producer",) if reference == "$producer.output" else (),
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "bash_reference_context_unsupported"
+    ], context
+    assert exc.value.issues[0].path == "nodes[1].bash"
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ARITHMETIC_BUILTIN_CONTEXTS,
+    ids=[context for _template, context in _ARITHMETIC_BUILTIN_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+def test_v3_bash_rejects_arithmetic_builtin_operands_at_admission(
     tmp_path,
     workflow_writer,
     template,
@@ -1316,6 +1358,28 @@ def test_v3_bash_rejects_process_substitution_before_resolution_spill_or_launch(
 @pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
 @pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
 def test_v3_bash_rejects_extglob_and_brace_expansion_before_side_effects(
+    tmp_path,
+    template,
+    context,
+    reference,
+    size,
+) -> None:
+    _execute_rejected_bash_context(
+        tmp_path / context / reference.removeprefix("$"),
+        command=template.format(reference=reference),
+        reference=reference,
+        size=size,
+    )
+
+
+@pytest.mark.parametrize(
+    ("template", "context"),
+    _ARITHMETIC_BUILTIN_CONTEXTS,
+    ids=[context for _template, context in _ARITHMETIC_BUILTIN_CONTEXTS],
+)
+@pytest.mark.parametrize("reference", ("$USER_MESSAGE", "$producer.output"))
+@pytest.mark.parametrize("size", (64, 32_769), ids=("inline", "spill"))
+def test_v3_bash_rejects_arithmetic_builtin_operands_before_executor_launch(
     tmp_path,
     template,
     context,

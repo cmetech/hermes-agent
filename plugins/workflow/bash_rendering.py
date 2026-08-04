@@ -564,6 +564,8 @@ def _classify_authored_bash_reference_spans(
     array_subscript_depth = 0
     top_level_command_position = True
     top_level_assignment_builtin = False
+    top_level_arithmetic_builtin: str | None = None
+    top_level_integer_attribute = False
     top_level_command_wrapper: str | None = None
     top_level_redirection_operand = False
     top_level_word_start: int | None = None
@@ -753,8 +755,10 @@ def _classify_authored_bash_reference_spans(
 
     def finish_top_level_word(end: int) -> None:
         nonlocal top_level_assignment_builtin
+        nonlocal top_level_arithmetic_builtin
         nonlocal top_level_command_position
         nonlocal top_level_command_wrapper
+        nonlocal top_level_integer_attribute
         nonlocal top_level_redirection_operand
         nonlocal top_level_word_start
         if top_level_word_start is None:
@@ -777,9 +781,26 @@ def _classify_authored_bash_reference_spans(
                 dequoted.source_starts[bracket_start],
                 dequoted.source_ends[bracket_end - 1],
             )
-        if assignment_word(word):
+        if top_level_arithmetic_builtin == "let":
+            unsupported_range(start, end)
             return
         if top_level_assignment_builtin:
+            is_assignment = assignment_word(word)
+            if not is_assignment and word == "--":
+                return
+            if (
+                not is_assignment
+                and len(word) > 1
+                and word[0] in {"-", "+"}
+                and word[1:].isalpha()
+            ):
+                if "i" in word[1:]:
+                    top_level_integer_attribute = word[0] == "-"
+                return
+            if top_level_integer_attribute:
+                unsupported_range(start, end)
+            return
+        if assignment_word(word):
             return
         if word in {"builtin", "command"}:
             top_level_command_wrapper = word
@@ -789,8 +810,12 @@ def _classify_authored_bash_reference_spans(
         if top_level_command_wrapper == "builtin" and word == "--":
             return
         top_level_command_wrapper = None
+        if word == "let":
+            top_level_arithmetic_builtin = "let"
+            return
         if word in {"declare", "export", "local", "readonly", "typeset"}:
             top_level_assignment_builtin = True
+            top_level_integer_attribute = False
             return
         if word in {
             "!",
@@ -1443,6 +1468,8 @@ def _classify_authored_bash_reference_spans(
             ):
                 top_level_command_position = True
                 top_level_assignment_builtin = False
+                top_level_arithmetic_builtin = None
+                top_level_integer_attribute = False
                 top_level_command_wrapper = None
 
         if character == "\n":
