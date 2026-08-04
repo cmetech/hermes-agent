@@ -66,6 +66,7 @@ class NodeExecutionContext:
     spawn_intent: Callable[[str], bool] | None = None
     spawn_failed: Callable[[str, str], bool] | None = None
     process_started: Callable[[ProcessIdentity], bool] | None = None
+    provider_dispatch: Callable[[str], bool] | None = None
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     termination_policy: TerminationPolicy = field(

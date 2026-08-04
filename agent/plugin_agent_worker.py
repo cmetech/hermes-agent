@@ -12,7 +12,7 @@ import re
 import sys
 import threading
 import unicodedata
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
 from agent.plugin_agent import (
@@ -1250,7 +1250,11 @@ def _prompt_with_structured_output(prompt: str, request) -> str:
     return f"{prompt}\n\n{block}"
 
 
-def _run(payload: dict[str, Any]) -> dict[str, Any]:
+def _run(
+    payload: dict[str, Any],
+    *,
+    provider_start_gate: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     global _active_agent
     from agent.plugin_agent import PluginAgentRunRequest, _validate_request
 
@@ -1697,6 +1701,10 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError("agent tool scope verification failed")
 
             _emit("progress", phase="running", session_id=agent.session_id)
+            if provider_start_gate is not None:
+                provider_start_gate()
+            if _cancel_event.is_set():
+                agent._interrupt_requested = True
             try:
                 response = agent.run_conversation(
                     prompt, conversation_history=history
@@ -1876,6 +1884,8 @@ def main() -> int:
         ):
             raise ValueError("unsupported plugin-agent protocol frame")
 
+        lifeline_started = threading.Event()
+
         def watch_coordinator() -> None:
             # The parent keeps stdin open as a lifeline after the request. EOF
             # means it died or cancelled; interrupt the synchronous agent loop.
@@ -1885,11 +1895,54 @@ def main() -> int:
             if agent is not None:
                 agent._interrupt_requested = True
 
-        threading.Thread(
-            target=watch_coordinator, name="plugin-agent-lifeline", daemon=True
-        ).start()
+        def start_lifeline() -> None:
+            if lifeline_started.is_set():
+                return
+            lifeline_started.set()
+            threading.Thread(
+                target=watch_coordinator,
+                name="plugin-agent-lifeline",
+                daemon=True,
+            ).start()
+
+        handshake = payload.get("provider_start_handshake")
+        handshake_required = (
+            isinstance(handshake, dict) and handshake.get("required") is True
+        )
+        executor_nonce = (
+            handshake.get("executor_nonce") if handshake_required else None
+        )
+        if handshake_required and (
+            not isinstance(executor_nonce, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", executor_nonce)
+        ):
+            raise ValueError("provider start handshake is malformed")
+
+        def await_provider_start() -> None:
+            assert isinstance(executor_nonce, str)
+            _emit("provider_ready", executor_nonce=executor_nonce)
+            control_raw = sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1)
+            if not control_raw or len(control_raw) > _MAX_REQUEST_BYTES:
+                _cancel_event.set()
+                raise InterruptedError("provider start coordinator disappeared")
+            control = json.loads(control_raw)
+            if control != {
+                "protocol_version": _PROTOCOL_VERSION,
+                "type": "provider_start",
+                "executor_nonce": executor_nonce,
+            }:
+                raise ValueError("provider start authorization is malformed")
+            start_lifeline()
+
+        if not handshake_required:
+            start_lifeline()
         with redirect_stdout(sys.stderr):
-            result = _run(payload)
+            result = _run(
+                payload,
+                provider_start_gate=(
+                    await_provider_start if handshake_required else None
+                ),
+            )
     except BaseException as exc:
         plugin_id = ""
         try:
@@ -1901,7 +1954,8 @@ def main() -> int:
     # Keep the direct worker alive until the coordinator acknowledges receipt
     # by closing its stdin lifeline. This closes the tiny result/exit race in
     # which descendants could otherwise outlive an already-reaped parent.
-    _cancel_event.wait(timeout=2.0)
+    if "lifeline_started" in locals() and lifeline_started.is_set():
+        _cancel_event.wait(timeout=2.0)
     return 0
 
 

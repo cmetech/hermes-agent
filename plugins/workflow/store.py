@@ -63,6 +63,7 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
+from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     ArchonOutputUnavailableError,
@@ -209,6 +210,37 @@ def _session_registry_candidate_payload(
     }
 
 
+def _private_authority_json(authority: Mapping[str, object]) -> str:
+    return json.dumps(
+        authority,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _session_recovery_selection_authority(
+    selection: PersistentSessionRecoverySelection,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": selection.run_id,
+        "attempt_id": selection.attempt_id,
+        "key": {
+            "workflow": selection.key.workflow,
+            "node_id": selection.key.node_id,
+            "scope": selection.key.scope,
+            "provider": selection.key.provider,
+            "profile": selection.key.profile,
+        },
+        "expected_generation": selection.expected_generation,
+        "missing_session_id": selection.missing_session_id,
+        "cache_fingerprint": selection.cache_fingerprint,
+        "source": selection.source,
+        "provider_attempts_before_recovery": 0,
+    }
+
+
 def _session_registry_candidate_from_payload(
     value: object,
 ) -> tuple[SessionRegistryUpdateCandidate, int]:
@@ -290,7 +322,7 @@ def _session_registry_candidate_from_payload(
     return candidate, retry_count
 
 
-_MAX_PENDING_SESSION_REGISTRY_UPDATES = 64
+_MAX_PENDING_SESSION_REGISTRY_UPDATES = WORKFLOW_DEFINITION_MAX_NODES
 
 
 def _pending_session_registry_payloads(
@@ -686,29 +718,64 @@ def _redact_private_session_authority(
 ) -> dict[str, object]:
     """Copy a public run/event projection without exact session authority."""
     projected = copy.deepcopy(dict(value))
-    projected.pop("pending_session_registry_update", None)
-    projected.pop("pending_session_registry_updates", None)
-    nodes = projected.get("nodes")
+    authority_projection = (
+        projected["projection"]
+        if isinstance(projected.get("projection"), dict)
+        else projected
+    )
+    authority_projection.pop("pending_session_registry_update", None)
+    authority_projection.pop("pending_session_registry_updates", None)
+    nodes = authority_projection.get("nodes")
+    protected_attempts: set[tuple[str, str]] = set()
     if isinstance(nodes, dict):
-        for node in nodes.values():
+        for node_id, node in nodes.items():
             if not isinstance(node, dict):
                 continue
-            node.pop("session_id", None)
-            node.pop("cache_fingerprint", None)
+            node_is_protected = False
             for attempt in node.get("attempts", ()):
                 if not isinstance(attempt, dict):
                     continue
+                attempt_id = attempt.get("attempt_id")
+                if not isinstance(
+                    attempt.get("session_registry_authority"), Mapping
+                ) or not isinstance(attempt_id, str):
+                    continue
+                node_is_protected = True
+                protected_attempts.add((str(node_id), attempt_id))
                 attempt.pop("session_registry_authority", None)
                 metadata = attempt.get("metadata")
                 if isinstance(metadata, dict):
                     metadata.pop("session_id", None)
                     metadata.pop("cache_fingerprint", None)
+            if node_is_protected:
+                node.pop("session_id", None)
+                node.pop("cache_fingerprint", None)
+    artifacts = authority_projection.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            if (
+                str(artifact.get("node_id")),
+                str(artifact.get("attempt_id")),
+            ) in protected_attempts:
+                artifact.pop("session_id", None)
     payload = projected.get("payload")
     if isinstance(payload, dict):
-        metadata = payload.get("metadata")
-        if isinstance(metadata, dict):
-            metadata.pop("session_id", None)
-            metadata.pop("cache_fingerprint", None)
+        event_identity = (
+            str(projected.get("node_id")),
+            str(projected.get("attempt_id")),
+        )
+        if event_identity in protected_attempts:
+            metadata = payload.get("metadata")
+            if isinstance(metadata, dict):
+                metadata.pop("session_id", None)
+                metadata.pop("cache_fingerprint", None)
+            payload_artifacts = payload.get("artifacts")
+            if isinstance(payload_artifacts, list):
+                for artifact in payload_artifacts:
+                    if isinstance(artifact, dict):
+                        artifact.pop("session_id", None)
     return projected
 
 
@@ -1921,6 +1988,26 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS obligation_journal_reserves_run
                     ON obligation_journal_reserves(run_id);
+                    CREATE TABLE IF NOT EXISTS session_recovery_selection_authority (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        authority_json TEXT NOT NULL,
+                        authority_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS session_recovery_selection_run
+                    ON session_recovery_selection_authority(run_id);
+                    CREATE TABLE IF NOT EXISTS session_registry_winner_authority (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        authority_json TEXT NOT NULL,
+                        authority_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS session_registry_winner_run
+                    ON session_registry_winner_authority(run_id);
                     CREATE TABLE IF NOT EXISTS store_repair_state (
                         run_id TEXT NOT NULL,
                         attempt_id TEXT NOT NULL,
@@ -4188,6 +4275,161 @@ class RunStore:
         return connection
 
     @staticmethod
+    def _write_private_authority(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        run_id: str,
+        attempt_id: str,
+        authority: Mapping[str, object],
+    ) -> None:
+        if table not in {
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        }:
+            raise ValueError("invalid private authority table")
+        authority_json = _private_authority_json(authority)
+        authority_sha256 = _sha256(authority_json.encode("utf-8"))
+        existing = connection.execute(
+            f"SELECT run_id, authority_json, authority_sha256 FROM {table} "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["run_id"] != run_id
+                or not hmac.compare_digest(
+                    str(existing["authority_json"]), authority_json
+                )
+                or not hmac.compare_digest(
+                    str(existing["authority_sha256"]), authority_sha256
+                )
+            ):
+                raise JournalRecoveryError("private session authority conflicts")
+            return
+        connection.execute(
+            f"INSERT INTO {table} "
+            "(attempt_id, run_id, authority_json, authority_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                run_id,
+                authority_json,
+                authority_sha256,
+                _utc_now(),
+            ),
+        )
+
+    def _read_private_session_authorities(
+        self,
+        *,
+        run_id: str,
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        tables = (
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        )
+        authorities: dict[str, dict[str, Mapping[str, object]]] = {
+            table: {} for table in tables
+        }
+        try:
+            with self._connect() as connection:
+                rows = {
+                    table: connection.execute(
+                        f"SELECT attempt_id, authority_json, authority_sha256 "
+                        f"FROM {table} WHERE run_id=?",
+                        (run_id,),
+                    ).fetchall()
+                    for table in tables
+                }
+        except sqlite3.Error:
+            return authorities
+        for table, table_rows in rows.items():
+            for row in table_rows:
+                authority_json = str(row["authority_json"])
+                authority_sha256 = str(row["authority_sha256"])
+                if not hmac.compare_digest(
+                    _sha256(authority_json.encode("utf-8")), authority_sha256
+                ):
+                    continue
+                try:
+                    authority = json.loads(authority_json)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(authority, dict) or not hmac.compare_digest(
+                    _private_authority_json(authority), authority_json
+                ):
+                    continue
+                authorities[table][str(row["attempt_id"])] = authority
+        return authorities
+
+    def _private_session_registry_authority_matches(
+        self,
+        projection: Mapping[str, object],
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ] | None = None,
+    ) -> bool:
+        authorities = private_authorities or self._read_private_session_authorities(
+            run_id=candidate.winning_run_id
+        )
+        winner_authority = authorities.get(
+            "session_registry_winner_authority", {}
+        ).get(candidate.winning_attempt_id)
+        if winner_authority != _session_registry_candidate_payload(candidate):
+            return False
+        if not candidate.recovery_selected:
+            return True
+        selection_authority = authorities.get(
+            "session_recovery_selection_authority", {}
+        ).get(candidate.winning_attempt_id)
+        if not isinstance(selection_authority, Mapping):
+            return False
+        key = selection_authority.get("key")
+        if not isinstance(key, Mapping):
+            return False
+        node = projection.get("nodes", {}).get(candidate.winning_node_id)
+        recoveries = node.get("session_recoveries") if isinstance(node, dict) else None
+        matches = [
+            recovery
+            for recovery in recoveries
+            if isinstance(recovery, Mapping)
+            and recovery.get("attempt_id") == candidate.winning_attempt_id
+        ] if isinstance(recoveries, list) else []
+        if len(matches) != 1:
+            return False
+        recovery = matches[0]
+        missing_session_id = selection_authority.get("missing_session_id")
+        cache_fingerprint = selection_authority.get("cache_fingerprint")
+        return (
+            selection_authority.get("schema_version") == 1
+            and selection_authority.get("run_id") == candidate.winning_run_id
+            and selection_authority.get("attempt_id")
+            == candidate.winning_attempt_id
+            and key
+            == {
+                "workflow": candidate.key.workflow,
+                "node_id": candidate.key.node_id,
+                "scope": candidate.key.scope,
+                "provider": candidate.key.provider,
+                "profile": candidate.key.profile,
+            }
+            and selection_authority.get("expected_generation")
+            == candidate.expected_generation
+            and isinstance(missing_session_id, str)
+            and recovery.get("missing_session_sha256")
+            == _sha256(missing_session_id.encode("utf-8"))
+            and cache_fingerprint == candidate.cache_fingerprint
+            and recovery.get("cache_fingerprint_sha256")
+            == _sha256(candidate.cache_fingerprint.encode("utf-8"))
+            and selection_authority.get("source") == recovery.get("source")
+            and selection_authority.get("provider_attempts_before_recovery") == 0
+            and recovery.get("provider_attempts_before_recovery") == 0
+        )
+
+    @staticmethod
     def _record_coordinator_wake(
         connection: sqlite3.Connection,
         *,
@@ -5890,8 +6132,15 @@ class RunStore:
             return latest.get("projection_sha256") == _projection_digest(projection)
         return True
 
-    @staticmethod
-    def _valid_projection(value: object, *, run_id: str) -> bool:
+    def _valid_projection(
+        self,
+        value: object,
+        *,
+        run_id: str,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ] | None = None,
+    ) -> bool:
         if not isinstance(value, dict) or value.get("run_id") != run_id:
             return False
         if value.get("schema_version") not in {1, 2}:
@@ -5936,6 +6185,8 @@ class RunStore:
             return False
         if not pending:
             return next_registry_update_at is None
+        if private_authorities is None:
+            private_authorities = self._read_private_session_authorities(run_id=run_id)
         retry_counts = []
         for payload in pending.values():
             try:
@@ -5956,6 +6207,11 @@ class RunStore:
                 or value.get("status")
                 in {"succeeded", "failed", "cancelled", "abandoned"}
                 or not _session_registry_candidate_is_corroborated(value, candidate)
+                or not self._private_session_registry_authority_matches(
+                    value,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
             ):
                 return False
             retry_counts.append(retry_count)
@@ -5989,6 +6245,7 @@ class RunStore:
         latest = None
         latest_migration_count = 0
         expected_sequence = 1
+        private_authorities = self._read_private_session_authorities(run_id=run_id)
         events = self._read_journal_events(
             directory,
             journal_data=journal_data,
@@ -6003,7 +6260,11 @@ class RunStore:
                 raise JournalRecoveryError("journal run identity mismatch")
             snapshot = event.get("projection")
             checksum = event.get("projection_sha256")
-            if self._valid_projection(snapshot, run_id=run_id):
+            if self._valid_projection(
+                snapshot,
+                run_id=run_id,
+                private_authorities=private_authorities,
+            ):
                 if snapshot["event_sequence"] != expected_sequence:
                     raise JournalRecoveryError("journal projection sequence mismatch")
                 if checksum != _projection_digest(snapshot):
@@ -7096,12 +7357,10 @@ class RunStore:
         )[:limit]
         public_events = []
         for event in selected:
-            event = dict(event)
+            event = _redact_private_session_authority(event)
             event.pop("projection", None)
             event.pop("projection_sha256", None)
-            public_events.append(
-                _sanitize(_redact_private_session_authority(event))
-            )
+            public_events.append(_sanitize(event))
         return tuple(public_events)
 
     def events_after(
@@ -8815,12 +9074,29 @@ class RunStore:
                     ),
                     None,
                 )
-                if existing is not None:
-                    return existing.get("outcome") == "fresh_start_selected"
-                if len(recoveries) == 6:
+                if existing is None and len(recoveries) == 6:
                     raise StorageQuotaError(
                         "persistent session recovery evidence is full"
                     )
+                selection_authority = _session_recovery_selection_authority(selection)
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as authority_connection:
+                    if fence_connection is None:
+                        authority_connection.execute("BEGIN IMMEDIATE")
+                    self._write_private_authority(
+                        authority_connection,
+                        table="session_recovery_selection_authority",
+                        run_id=claim.run_id,
+                        attempt_id=claim.attempt_id,
+                        authority=selection_authority,
+                    )
+                    if fence_connection is None:
+                        authority_connection.commit()
+                if existing is not None:
+                    return existing.get("outcome") == "fresh_start_selected"
                 public_selection = {
                     "attempt_id": claim.attempt_id,
                     "registry_generation": selection.expected_generation,
@@ -9192,6 +9468,73 @@ class RunStore:
                         self._release_worker_claim(
                             claim.attempt_id, connection=connection
                         )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_provider_dispatch(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Authorize one registered worker to cross the provider boundary."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                existing = attempt.get("provider_dispatch")
+                if isinstance(existing, Mapping):
+                    return (
+                        existing.get("executor_nonce") == nonce
+                        and existing.get("state") == "authorized"
+                    )
+                spawn = attempt.get("spawn")
+                if (
+                    not isinstance(spawn, Mapping)
+                    or spawn.get("executor_nonce") != nonce
+                    or spawn.get("state") != "started"
+                    or not isinstance(attempt.get("process_identity"), Mapping)
+                ):
+                    return False
+                dispatch = {
+                    "state": "authorized",
+                    "executor_nonce": nonce,
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = dispatch
+                active["provider_dispatch"] = dict(dispatch)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_dispatch_authorized",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
                 return True
         except RuntimeError as exc:
             if "execution fence" in str(exc):
@@ -10303,6 +10646,24 @@ class RunStore:
                     raise JournalRecoveryError(
                         "attempt already has a pending session registry update"
                     )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as authority_connection:
+                    if fence_connection is None:
+                        authority_connection.execute("BEGIN IMMEDIATE")
+                    self._write_private_authority(
+                        authority_connection,
+                        table="session_registry_winner_authority",
+                        run_id=claim.run_id,
+                        attempt_id=claim.attempt_id,
+                        authority=_session_registry_candidate_payload(
+                            session_registry_update
+                        ),
+                    )
+                    if fence_connection is None:
+                        authority_connection.commit()
             if status == "paused":
                 with (
                     nullcontext(fence_connection)
@@ -10459,7 +10820,8 @@ class RunStore:
                     "metadata": {
                         key: value
                         for key, value in safe_metadata.items()
-                        if key not in {"session_id", "cache_fingerprint"}
+                        if session_registry_update is None
+                        or key not in {"session_id", "cache_fingerprint"}
                     },
                 },
                 node_id=claim.node_id,
@@ -12148,14 +12510,22 @@ class RunStore:
                 "approval",
             }
             process_stop = attempt.get("process_stop")
+            provider_dispatch = attempt.get("provider_dispatch")
+            provider_work_possible = bool(
+                provider_worker_started
+                and isinstance(provider_dispatch, Mapping)
+                and provider_dispatch.get("state") == "authorized"
+            )
             if (
-                not provider_worker_started
+                not provider_work_possible
                 and isinstance(process_stop, Mapping)
                 and process_stop.get("identity_matched") is True
                 and process_stop.get("cleaned") is True
             ):
                 return "known_stopped"
             observation = cls._observe_process_identity(serialized)
+            if not provider_work_possible:
+                return observation
             return (
                 "still_running"
                 if observation == "still_running"
@@ -12164,7 +12534,12 @@ class RunStore:
         spawn = attempt.get("spawn")
         if not isinstance(spawn, Mapping):
             return "not_started"
-        if spawn.get("state") == "failed":
+        if spawn.get("state") in {"intent", "failed"}:
+            if (
+                spawn.get("state") == "intent"
+                and attempt.get("effect_classification") == "outward"
+            ):
+                return "outcome_uncertain"
             return "not_started"
         return "outcome_uncertain"
 

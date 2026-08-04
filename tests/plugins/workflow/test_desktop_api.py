@@ -65,6 +65,7 @@ from plugins.workflow.scheduled_revalidation import (
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
+from plugins.workflow.sessions import NodeSessionKey, SessionRegistryUpdateCandidate
 from plugins.workflow.store import (
     ArtifactRef,
     RunStore,
@@ -148,6 +149,7 @@ def _published_run(
     scope: str | None = None,
     output_type: str = "DesktopReport",
     session_id: str | None = "desktop-artifact-session",
+    protected_session: bool = False,
 ):
     workflow = workflow_writer(
         root,
@@ -188,6 +190,25 @@ def _published_run(
         store.run_directory(admitted.run_id)
     ).as_posix()
     digest = sha256(data).hexdigest()
+    registry_update = (
+        SessionRegistryUpdateCandidate(
+            key=NodeSessionKey(
+                package.definition.name,
+                "produce",
+                scope or "local",
+                "desktop-provider",
+                "default",
+            ),
+            expected_generation=0,
+            new_session_id=str(session_id),
+            cache_fingerprint="a" * 64,
+            winning_run_id=admitted.run_id,
+            winning_node_id="produce",
+            winning_attempt_id=claim.attempt_id,
+        )
+        if protected_session
+        else None
+    )
     store.complete_node(
         claim,
         status="succeeded",
@@ -204,6 +225,16 @@ def _published_run(
             canonicalization_version=1,
             session_id=session_id,
         ),
+        metadata=(
+            {
+                "session_id": session_id,
+                "cache_fingerprint": "a" * 64,
+            }
+            if protected_session
+            else None
+        ),
+        session_registry_update=registry_update,
+        session_registry_authority=registry_update,
     )
     artifact = next(
         item
@@ -3111,6 +3142,78 @@ def test_artifact_endpoints_require_verified_authentication(endpoint) -> None:
     assert response.json() == {
         "detail": {"code": "authentication_required"}
     }
+
+
+def test_recovered_typed_session_is_private_in_authenticated_api_projections(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "protected-publication-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "protected-publication",
+        data=b"protected publication",
+        media_type="text/markdown; charset=utf-8",
+        session_id="protected-publication-session",
+        protected_session=True,
+    )
+    client = TestClient(_app(_router()))
+
+    responses = {
+        "detail": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}"
+        ),
+        "events": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/events"
+        ),
+        "artifacts": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence?kind=artifacts"
+        ),
+        "timeline": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence?kind=timeline"
+        ),
+    }
+    for name, response in responses.items():
+        assert response.status_code == 200, name
+        assert b"protected-publication-session" not in response.content, name
+
+
+def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "legacy-session-api-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "legacy-session-api",
+            name="legacy-session-api",
+            nodes=[{"id": "legacy", "prompt": "Legacy"}],
+        )
+    )
+    store = RunStore(home)
+    admitted = _start(store, package, "legacy-session-api")
+    claim = store.claim_node(admitted.run_id, "legacy", "legacy-api-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": "legacy-api-session",
+            "cache_fingerprint": "legacy-api-fingerprint",
+        },
+    )
+    client = TestClient(_app(_router()))
+
+    detail = client.get(f"/api/plugins/workflow/runs/{admitted.run_id}")
+    events = client.get(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/events"
+    )
+    assert detail.status_code == events.status_code == 200
+    for response in (detail, events):
+        assert b"legacy-api-session" in response.content
+        assert b"legacy-api-fingerprint" in response.content
 
 
 def test_runs_list_never_opens_real_artifact_bodies(

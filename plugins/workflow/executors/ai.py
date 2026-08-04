@@ -1095,6 +1095,7 @@ class AgentNodeExecutor:
                     "spawn_intent": context.spawn_intent,
                     "spawn_failed": context.spawn_failed,
                     "process_started": context.process_started,
+                    "provider_dispatch": context.provider_dispatch,
                     "process_stopped": context.process_stopped,
                 }
                 if getattr(agent_runner, "starts_request_mcp", False):
@@ -1187,7 +1188,13 @@ class AgentNodeExecutor:
                 ValueError,
                 sqlite3.DatabaseError,
             ) as exc:
-                if strict_v3 and session_source == "cross_run_registry":
+                if strict_v3 and (
+                    session_source == "cross_run_registry"
+                    or (
+                        session_source == "same_run_predecessor"
+                        and isinstance(exc, sqlite3.DatabaseError)
+                    )
+                ):
                     return self._recovery_unavailable()
                 raise
             missing_after_worker_load = (

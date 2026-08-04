@@ -3235,6 +3235,12 @@ class RunScheduler:
                             process_started=lambda identity: (
                                 self.store.record_process_started(claim, identity)
                             ),
+                            provider_dispatch=lambda executor_nonce: (
+                                self.store.record_provider_dispatch(
+                                    claim,
+                                    executor_nonce=executor_nonce,
+                                )
+                            ),
                             process_stopped=lambda identity, cleaned: (
                                 self.store.record_process_stopped(
                                     claim, identity, cleaned=cleaned

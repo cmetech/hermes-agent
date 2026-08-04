@@ -1132,6 +1132,7 @@ def _request_payload(plugin_id: str, request: PluginAgentRunRequest) -> dict[str
         "protocol_version": _PROTOCOL_VERSION,
         "type": "run",
         "plugin_id": plugin_id,
+        "provider_start_handshake": {"required": True},
         "request": body,
     }
 
@@ -1177,8 +1178,22 @@ def _exchange_worker_once(
     spawn_intent: Callable[[str], bool] | None = None,
     spawn_failed: Callable[[str, str], bool] | None = None,
     process_started: Callable[[ProcessIdentity], bool] | None = None,
+    provider_dispatch: Callable[[str], bool] | None = None,
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
+    executor_nonce = secrets.token_hex(16)
+    handshake = payload.get("provider_start_handshake")
+    handshake_required = (
+        isinstance(handshake, Mapping) and handshake.get("required") is True
+    )
+    if handshake_required:
+        payload = {
+            **payload,
+            "provider_start_handshake": {
+                "required": True,
+                "executor_nonce": executor_nonce,
+            },
+        }
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
         raise ValueError("plugin-agent request frame is too large")
@@ -1193,7 +1208,6 @@ def _exchange_worker_once(
         ),
         str(package_root),
     ]
-    executor_nonce = secrets.token_hex(16)
     if spawn_intent is not None and not spawn_intent(executor_nonce):
         raise _PluginAgentCancelled("plugin-agent spawn intent was rejected")
     try:
@@ -1258,6 +1272,7 @@ def _exchange_worker_once(
 
     started = last_activity = time.monotonic()
     stderr_tail = ""
+    provider_dispatched = False
     limits = resource_limits or ProcessResourceLimits()
     try:
         while True:
@@ -1298,6 +1313,34 @@ def _exchange_worker_once(
                 raise RuntimeError("plugin-agent emitted invalid JSON") from exc
             if frame.get("protocol_version") != _PROTOCOL_VERSION:
                 raise RuntimeError("plugin-agent protocol version mismatch")
+            if frame.get("type") == "provider_ready":
+                if (
+                    not handshake_required
+                    or provider_dispatched
+                    or frame.get("executor_nonce") != executor_nonce
+                ):
+                    raise RuntimeError(
+                        "plugin-agent provider handshake is invalid"
+                    )
+                if provider_dispatch is not None and not provider_dispatch(
+                    executor_nonce
+                ):
+                    raise _PluginAgentCancelled(
+                        "plugin-agent provider dispatch was rejected"
+                    )
+                control = json.dumps(
+                    {
+                        "protocol_version": _PROTOCOL_VERSION,
+                        "type": "provider_start",
+                        "executor_nonce": executor_nonce,
+                    },
+                    separators=(",", ":"),
+                )
+                tree.process.stdin.write(control + "\n")
+                tree.process.stdin.flush()
+                provider_dispatched = True
+                last_activity = time.monotonic()
+                continue
             if frame.get("type") == "result":
                 return frame
             if frame.get("type") not in {"progress", "interaction"}:
@@ -1336,6 +1379,7 @@ def _exchange_worker(
     spawn_intent: Callable[[str], bool] | None = None,
     spawn_failed: Callable[[str, str], bool] | None = None,
     process_started: Callable[[ProcessIdentity], bool] | None = None,
+    provider_dispatch: Callable[[str], bool] | None = None,
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
 ) -> dict[str, Any]:
     """Exchange one frame while owning any top-level sealed grant broker."""
@@ -1370,6 +1414,7 @@ def _exchange_worker(
             spawn_intent=spawn_intent,
             spawn_failed=spawn_failed,
             process_started=process_started,
+            provider_dispatch=provider_dispatch,
             process_stopped=process_stopped,
         )
     finally:
@@ -1395,6 +1440,7 @@ class PluginAgentRunner:
         spawn_intent: Callable[[str], bool] | None = None,
         spawn_failed: Callable[[str, str], bool] | None = None,
         process_started: Callable[[ProcessIdentity], bool] | None = None,
+        provider_dispatch: Callable[[str], bool] | None = None,
         process_stopped: Callable[[ProcessIdentity, bool], None] | None = None,
     ) -> PluginAgentRunResult:
         _validate_request(request)
@@ -1438,6 +1484,7 @@ class PluginAgentRunner:
                 spawn_intent=spawn_intent,
                 spawn_failed=spawn_failed,
                 process_started=process_started,
+                provider_dispatch=provider_dispatch,
                 process_stopped=process_stopped,
             )
             result = frame.get("result")

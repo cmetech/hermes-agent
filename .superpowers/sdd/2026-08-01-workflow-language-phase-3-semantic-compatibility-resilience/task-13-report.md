@@ -514,3 +514,256 @@ reported no whitespace errors.
   boundaries. Existing typed-publication session metadata remains governed by
   its separate established contract.
 - No blocking concerns remain.
+
+## Fix Round 2
+
+### Authenticated review base and disposition
+
+Fix Round 2 started from the clean reviewed base
+`b1587ccadd91e59231b7181a5bda886da5558145`. It addresses every remaining
+finding in `task-13-spec-rereview-1.md` and
+`task-13-quality-rereview-1.md`:
+
+- Protected recovered-session authority is now removed from public typed
+  artifacts, node-completion artifact payloads, status, event/timeline,
+  artifact evidence, and authenticated Desktop/API detail. Redaction is bound
+  to attempts carrying the protected v3 registry authority, so ordinary
+  legacy/v1/v2 session and fingerprint fields retain their exact prior public
+  behavior.
+- Selection and winner authority now have separate, insert-only SQLite
+  anchors. The selection anchor retains the private missing session ID needed
+  to authenticate its public digest; the winner anchor retains the canonical
+  exact CAS candidate. Journal rebuild batch-loads and validates those anchors
+  and rejects lockstep substitution of the pending obligation, attempt copy,
+  node metadata, or recovery digest.
+- A real same-run predecessor `SessionDB` corruption now maps to
+  `persistent_session_recovery_unavailable` with zero provider attempts,
+  matching the existing cross-run operational classification.
+- The pending-obligation bound now equals the admitted workflow-definition
+  maximum of 512 nodes. A valid 65-node replenished workflow can therefore
+  retain its 65th successful provider result when the registry remains
+  unavailable.
+- The isolated worker protocol now has a two-phase provider-start handshake.
+  The child prepares through the last pre-provider boundary and emits a nonce-
+  bound `provider_ready`; the coordinator durably records
+  `provider_dispatch_authorized` before sending the exact nonce-bound start
+  frame. Registered-but-undispatched workers are known zero-effect, while a
+  dispatched provider worker remains outcome-uncertain after coordinator loss.
+- The crash proof now kills a separate coordinator OS process at eight cuts:
+  before selection; after selection; after spawn intent; after real process
+  registration but before provider dispatch; after provider launch; after
+  atomic completion but before CAS; after CAS but before outcome journaling;
+  and after the outcome. The test uses a real `ManagedProcessTree` provider
+  child, restarts `RunStore`, and verifies zero replay, finalization blocking,
+  idempotent CAS recovery, and exact terminal state.
+- Scope, profile, and provider substitutions fail closed; recovery history
+  rejects a seventh record before creating private authority; exact legacy
+  normalizer v1/v2 store projection and authenticated API parity are covered.
+
+The rereview explicitly extended scope to `agent/plugin_agent_worker.py` for
+the required child-ready/provider-start protocol. No model tool, system prompt,
+prior message, toolset, user configuration, workflow language surface, or
+unrelated product area changed.
+
+### Exact Fix Round 2 RED/GREEN evidence
+
+Every Python test command below used the repository harness with retries
+disabled. No direct pytest invocation or fallback was used.
+
+#### Typed artifact privacy and legacy/API parity
+
+Exact RED and GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_desktop_api.py
+```
+
+RED: **196 passed / 5 failed**. The exact protected fresh session ID remained
+in typed artifact status, event/timeline, artifact evidence, and authenticated
+API responses, while unconditional redaction removed legacy fields. GREEN
+after attempt-bound artifact/event redaction and legacy gating: **201 passed /
+0 failed**.
+
+#### Independent winner and missing-session authority
+
+Exact focused file command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py
+```
+
+RED: **44 passed / 2 failed**. A recomputed frame could substitute the pending
+candidate and attempt authority in lockstep, and the missing-session hash had
+no private raw-value anchor. GREEN after the separate canonical SQLite anchors
+and rebuild verification: **46 passed / 0 failed**.
+
+#### Same-run real session database corruption
+
+Exact RED and GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'same_run_real_session_database_failure'
+```
+
+RED: **0 passed / 1 failed** with real `sqlite3.DatabaseError: file is not a
+database`. GREEN after source-independent strict-v3 database-error
+normalization at the same-run preflight: **1 passed / 0 failed**.
+
+#### Admitted 65th obligation under scheduler replenishment
+
+Exact RED and GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'scheduler_replenishment_retains'
+```
+
+RED: **0 passed / 1 failed** after provider completion with
+`StorageQuotaError: session registry obligation capacity is exhausted`.
+GREEN after binding capacity to the 512-node admission invariant: **1 passed /
+0 failed**; the actual scheduler retained all 65 obligations with no provider
+replay or post-effect completion exception.
+
+#### Child-ready/durable-dispatch/provider-start handshake
+
+Exact runner RED command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py -k 'authorizes_provider_after_child_is_ready'
+```
+
+RED: **0 passed / 1 failed** because `PluginAgentRunner` had no durable
+provider-dispatch seam.
+
+Exact store recovery RED command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'reaped_provider_worker or reaped_real_worker'
+```
+
+RED: **0 passed / 2 failed** because there was no dispatch record and a real
+registered-but-undispatched worker recovered as outcome-uncertain.
+
+Exact combined GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py -k 'authorizes_provider_after_child_is_ready or reaped_provider_worker or reaped_real_worker'
+```
+
+GREEN: **3 passed / 0 failed**. The full plugin-agent file subsequently passed
+**124/124**.
+
+#### Real killed-coordinator crash cuts
+
+Exact final command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'killed_coordinator_restart'
+```
+
+Final result: **8 passed / 0 failed**. The first six-cut matrix passed **6/6**;
+final diff review strengthened it with real spawn-intent and registered-before-
+dispatch coordinator deaths, and the expanded matrix remained green.
+
+#### Scope/profile/provider separation and bounded history
+
+Exact command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'history_is_bounded or substituted_registry_authority'
+```
+
+Result: **9 passed / 0 failed** across live and rebuilt authority substitution
+plus the seventh-record capacity boundary.
+
+#### Regression found by the required gate
+
+The first Round 2 required-gate run reported **277 passed / 2 failed**:
+
+- `test_spawn_intent_without_process_identity_is_outcome_uncertain`
+- `test_foreground_owner_death_with_unresolved_outward_spawn_reconciles`
+
+The provider handshake correctly made replay-safe intent-only attempts
+`not_started`, but had over-broadened that classification to established
+outward-effect attempts. The correction retains outcome uncertainty for the
+legacy outward path while using the new provider-dispatch marker only for
+provider workers.
+
+Exact focused GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py
+```
+
+Result: **2 files, 37 passed / 0 failed**.
+
+### Final Fix Round 2 verification
+
+The exact required ten-file command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Final result: **10 files, 281 passed / 0 failed**, 14 workers, 12.6 seconds.
+
+The exact expanded changed-seam/scheduler/Desktop command was:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Final result: **9 files, 523 passed / 0 failed**, 14 workers, 59.6 seconds.
+The final focused recovery file passed **59/59** and the authenticated Desktop
+API file passed **157/157**.
+
+Exact static lint command:
+
+```bash
+../../.venv/bin/ruff check agent/plugin_agent.py agent/plugin_agent_worker.py plugins/workflow/executors/ai.py plugins/workflow/executors/base.py plugins/workflow/scheduler.py plugins/workflow/store.py tests/agent/test_plugin_agent.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persistent_session_recovery.py
+```
+
+Result: `All checks passed!`. `ruff format --check` reports whole-file format
+drift in eight of those large files; running the same check on each `HEAD`
+version reports the identical eight-file baseline drift, so no unrelated bulk
+format rewrite was made. `git diff --check` is clean.
+
+### Fix Round 2 changed files
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `agent/plugin_agent.py`
+- `agent/plugin_agent_worker.py`
+- `plugins/workflow/executors/ai.py`
+- `plugins/workflow/executors/base.py`
+- `plugins/workflow/scheduler.py`
+- `plugins/workflow/store.py`
+- `tests/agent/test_plugin_agent.py`
+- `tests/plugins/workflow/test_desktop_api.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+### Fix Round 2 self-review and deviations
+
+- The system prompt, prior messages, model tools, and per-conversation toolset
+  remain byte-stable. The handshake is transport/lifecycle authority only.
+- Public redaction is narrowly activated by protected registry authority;
+  private execution and CAS reconciliation retain the exact session ID and
+  fingerprint, while legacy/v1/v2 public fields remain exact.
+- The two private authority tables are insert-only through store APIs,
+  canonicalized, independently checksummed, bounded by run/attempt admission,
+  batch-validated during rebuild, and removed by the existing run foreign-key
+  cascade.
+- A pending registry obligation is bounded by the maximum admitted node count,
+  not instantaneous scheduler concurrency, so provider work cannot outrun
+  durable completion capacity.
+- Two intermediate capacity-fixture designs hit unrelated lease/journal reserve
+  limits before the 65th obligation. They were not counted as behavioral
+  evidence; the final test reconstructs 64 fully corroborated durable
+  obligations, restarts the store to validate them, and uses the actual
+  scheduler/provider seam for the 65th completion.
+- One node-id-style harness invocation reported `No test files to run`; the
+  supported `-k` form was used thereafter. No direct pytest invocation,
+  harness change, retry, test deletion, test weakening, or flaky marker was
+  used. The real `SIGTERM`/`SIGKILL` coordinator matrix is guarded only on
+  native Windows because its asserted OS semantics are POSIX-specific.
+- No push, publication, merge, branch deletion, worktree deletion,
+  literal-`main` mutation, or shared `base` checkout mutation was performed.
+- No blocking concerns remain.

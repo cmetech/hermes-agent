@@ -2735,6 +2735,60 @@ def test_worker_exchange_reports_spawn_lifecycle_in_order() -> None:
     assert lifecycle[2][2] is True
 
 
+@pytest.mark.live_system_guard_bypass
+def test_worker_exchange_authorizes_provider_after_child_is_ready() -> None:
+    lifecycle = []
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+nonce = request["provider_start_handshake"]["executor_nonce"]
+print(json.dumps({
+    "protocol_version": 1,
+    "type": "provider_ready",
+    "executor_nonce": nonce,
+}), flush=True)
+control = json.loads(sys.stdin.readline())
+assert control == {
+    "protocol_version": 1,
+    "type": "provider_start",
+    "executor_nonce": nonce,
+}
+print(json.dumps({"protocol_version": 1, "type": "result", "result": {}}),
+      flush=True)
+"""
+
+    frame = _exchange_worker(
+        {
+            "protocol_version": 1,
+            "type": "run",
+            "provider_start_handshake": {"required": True},
+        },
+        workdir=None,
+        idle_timeout_seconds=5,
+        wall_timeout_seconds=10,
+        worker_argv=[sys.executable, "-c", code],
+        spawn_intent=lambda nonce: lifecycle.append(("intent", nonce)) or True,
+        process_started=lambda identity: lifecycle.append(("started", identity))
+        or True,
+        provider_dispatch=lambda nonce: lifecycle.append(("dispatch", nonce))
+        or True,
+        process_stopped=lambda identity, cleaned: lifecycle.append(
+            ("stopped", identity, cleaned)
+        ),
+    )
+
+    assert frame["type"] == "result"
+    assert [item[0] for item in lifecycle] == [
+        "intent",
+        "started",
+        "dispatch",
+        "stopped",
+    ]
+    assert lifecycle[0][1] == lifecycle[2][1]
+
+
 def test_worker_exchange_rejected_spawn_intent_creates_no_process(monkeypatch) -> None:
     import agent.plugin_agent as plugin_agent
 
