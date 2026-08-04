@@ -107,6 +107,70 @@ socket.socket.connect = _forbid_network
     return completed, before, after, home, hermes_home
 
 
+def _run_packaged_startup_with_recovery_marker(
+    tmp_path: Path, arguments: list[str]
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    recovery_root = tmp_path / "recovery-root"
+    recovery_root.mkdir()
+    marker = recovery_root / ".lazy-refresh-incomplete"
+    marker.write_text("pending\n", encoding="utf-8")
+    (recovery_root / "pyproject.toml").write_text(
+        '[project]\nname = "workflow-schema-startup-test"\nversion = "0"\n',
+        encoding="utf-8",
+    )
+
+    trace = tmp_path / "early-recovery.trace"
+    guard_dir = tmp_path / "recovery-probe"
+    guard_dir.mkdir()
+    (guard_dir / "sitecustomize.py").write_text(
+        """
+import os
+from pathlib import Path
+
+from hermes_cli import _early_recovery as recovery
+
+recovery._project_root = lambda: Path(os.environ["HERMES_TEST_RECOVERY_ROOT"])
+recovery._probe_broken_packages = lambda: []
+original_recover_if_needed = recovery.recover_if_needed
+
+def record_recovery_call(*args, **kwargs):
+    Path(os.environ["HERMES_TEST_RECOVERY_TRACE"]).write_text(
+        "called\\n", encoding="utf-8"
+    )
+    return original_recover_if_needed(*args, **kwargs)
+
+recovery.recover_if_needed = record_recovery_call
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "HERMES_TEST_RECOVERY_ROOT": str(recovery_root),
+        "HERMES_TEST_RECOVERY_TRACE": str(trace),
+        "HERMES_TEST_STARTUP_ARGV": json.dumps(arguments),
+        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, runpy, sys; "
+                "sys.argv = ['hermes', *json.loads(os.environ['HERMES_TEST_STARTUP_ARGV'])]; "
+                "runpy.run_module('hermes_cli.main', run_name='__main__')"
+            ),
+        ],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, marker, trace
+
+
 def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
     ordinary = machine_contract.success_envelope(
         "workflow list",
@@ -824,6 +888,29 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
     assert after == before
     assert not home.exists()
     assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "returncode", "early_recovery_called"),
+    [
+        (["workflow", "schema", "--json"], 0, False),
+        (["workflow", "schema", "--help"], 0, False),
+        (["workflow", "schema", "--definitely-child"], 2, False),
+        (["--version"], 0, True),
+        (["update", "--help"], 0, True),
+    ],
+    ids=["schema-success", "schema-help", "schema-error", "normal", "update"],
+)
+def test_packaged_schema_alone_skips_early_recovery_marker_probe(
+    tmp_path, arguments, returncode, early_recovery_called
+):
+    completed, marker, trace = _run_packaged_startup_with_recovery_marker(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == returncode, completed.stderr
+    assert trace.exists() is early_recovery_called
+    assert marker.read_text(encoding="utf-8") == "pending\n"
 
 
 @pytest.mark.parametrize(
