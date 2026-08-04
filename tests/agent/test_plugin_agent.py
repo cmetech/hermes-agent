@@ -28,7 +28,9 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    PluginAgentResultProtocolError,
     PluginAgentSessionMissingError,
+    PluginAgentSessionUnavailableError,
     _ProviderAttemptAuthority,
     _PluginAgentCancelled,
     _PluginAgentResourceExceeded,
@@ -928,7 +930,7 @@ def test_missing_shared_session_is_a_typed_zero_provider_preflight(
 
 
 @pytest.mark.parametrize("broken_layout", ("corrupt", "path-is-directory"))
-def test_shared_session_preflight_preserves_real_database_open_failures(
+def test_shared_session_preflight_types_real_database_open_failures(
     monkeypatch, tmp_path: Path, broken_layout: str
 ) -> None:
     import agent.plugin_agent as plugin_agent
@@ -952,18 +954,18 @@ def test_shared_session_preflight_preserves_real_database_open_failures(
 
     monkeypatch.setattr(plugin_agent, "_exchange_worker", should_not_start)
 
-    with pytest.raises(sqlite3.Error) as caught:
+    with pytest.raises(PluginAgentSessionUnavailableError) as caught:
         PluginAgentRunner("test-plugin").run(
             PluginAgentRunRequest(
                 prompt="x", context_mode="shared", session_id="exact-session-id"
             )
         )
 
-    assert not isinstance(caught.value, PluginAgentSessionMissingError)
+    assert isinstance(caught.value.__cause__, sqlite3.Error)
     assert started is False
 
 
-def test_shared_session_preflight_preserves_real_post_open_read_failure(
+def test_shared_session_preflight_types_real_post_open_read_failure(
     monkeypatch, tmp_path: Path
 ) -> None:
     import agent.plugin_agent as plugin_agent
@@ -995,9 +997,7 @@ def test_shared_session_preflight_preserves_real_post_open_read_failure(
     monkeypatch.setattr(hermes_state, "SessionDB", lambda: real_db)
     monkeypatch.setattr(plugin_agent, "_exchange_worker", should_not_start)
     try:
-        with pytest.raises(
-            sqlite3.OperationalError, match="no such table: sessions"
-        ) as caught:
+        with pytest.raises(PluginAgentSessionUnavailableError) as caught:
             PluginAgentRunner("test-plugin").run(
                 PluginAgentRunRequest(
                     prompt="x",
@@ -1008,7 +1008,8 @@ def test_shared_session_preflight_preserves_real_post_open_read_failure(
     finally:
         real_db.close()
 
-    assert not isinstance(caught.value, PluginAgentSessionMissingError)
+    assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+    assert "no such table: sessions" in str(caught.value.__cause__)
     assert started is False
     assert real_db._conn is None
 
@@ -1054,9 +1055,33 @@ def test_shared_session_preflight_preserves_real_permission_denial(
 
     if isinstance(caught.value, AssertionError) and started:
         pytest.skip("this platform/user can bypass the requested file permissions")
-    assert isinstance(caught.value, (OSError, sqlite3.Error))
-    assert not isinstance(caught.value, PluginAgentSessionMissingError)
+    assert isinstance(caught.value, PluginAgentSessionUnavailableError)
+    assert isinstance(caught.value.__cause__, (OSError, sqlite3.Error))
     assert started is False
+
+
+def test_post_worker_result_validation_has_a_distinct_protocol_failure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *_args, **_kwargs: {
+            "result": {
+                "final_response": "provider completed",
+                "session_id": "session",
+                "provider": "fake",
+                "status": "completed",
+                "pending_interaction": None,
+                "usage": {},
+                "audit": {"provider_attempts": "not-an-integer"},
+            }
+        },
+    )
+
+    with pytest.raises(PluginAgentResultProtocolError) as caught:
+        PluginAgentRunner("test-plugin").run(PluginAgentRunRequest(prompt="x"))
+
+    assert isinstance(caught.value.__cause__, ValueError)
 
 
 @pytest.mark.parametrize("message_count", [0, 1], ids=("empty", "history-light"))

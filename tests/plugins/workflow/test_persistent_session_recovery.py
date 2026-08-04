@@ -16,6 +16,7 @@ from typing import Callable
 import pytest
 
 from agent.plugin_agent import (
+    PluginAgentSessionUnavailableError,
     PluginAgentRunResult,
     PluginAgentRunner,
     PluginAgentSessionMissingError,
@@ -680,7 +681,9 @@ def test_cross_run_session_probe_failure_is_not_treated_as_confirmed_absence(
     runner = _PersistentRunner()
 
     _run_once(store, package, runner, registry, "seed")
-    runner.shared_failure = OSError("private database path")
+    runner.shared_failure = PluginAgentSessionUnavailableError(
+        "persistent session store unavailable"
+    )
     _run_id, result = _run_once(store, package, runner, registry, "unavailable")
 
     assert result["status"] == "failed"
@@ -688,6 +691,88 @@ def test_cross_run_session_probe_failure_is_not_treated_as_confirmed_absence(
     assert attempt["error_code"] == "persistent_session_recovery_unavailable"
     assert attempt["metadata"]["provider_attempts"] == 0
     assert len(runner.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    (
+        (OSError("post-provider transport failure"), "network_error"),
+        (ValueError("post-provider protocol failure"), "outcome_unknown"),
+    ),
+)
+def test_cross_run_post_provider_failures_never_claim_zero_effect(
+    tmp_path, workflow_writer, failure, expected_code
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"post-provider-{expected_code}",
+    )
+    store = RunStore(tmp_path / f"post-provider-{expected_code}-home")
+    registry = NodeSessionRegistry(tmp_path / f"post-provider-{expected_code}-home")
+    runner = _PersistentRunner()
+
+    _run_once(store, package, runner, registry, f"{expected_code}-seed")
+    runner.shared_failure = failure
+    _run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"{expected_code}-failure",
+    )
+
+    attempt = result["nodes"]["analyze"]["attempts"][0]
+    assert attempt["error_code"] == expected_code
+    assert attempt["metadata"]["provider_attempts_exact"] is False
+    assert attempt["metadata"]["retry_consumed"] == 3
+    assert attempt["metadata"].get("known_no_effect") is not True
+    assert result["status"] in {"failed", "paused"}
+    assert attempt["error_code"] != "persistent_session_recovery_unavailable"
+
+
+def test_cross_run_completed_result_without_session_is_outcome_unknown(
+    tmp_path, workflow_writer
+) -> None:
+    class EmptySessionRunner(_PersistentRunner):
+        omit_session = False
+
+        def run(self, request, **kwargs):
+            if self.omit_session and request.context_mode == "shared":
+                self.requests.append(request)
+                return PluginAgentRunResult(
+                    final_response="provider completed",
+                    session_id="",
+                    provider=request.provider or "fake-provider",
+                    model=request.model or "fake-model",
+                    status="completed",
+                    pending_interaction=None,
+                    usage={},
+                    audit={"provider_attempts": 1},
+                )
+            return super().run(request, **kwargs)
+
+    package = _archon_package(workflow_writer, tmp_path / "empty-session-result")
+    store = RunStore(tmp_path / "empty-session-result-home")
+    registry = NodeSessionRegistry(tmp_path / "empty-session-result-home")
+    runner = EmptySessionRunner()
+
+    _run_once(store, package, runner, registry, "empty-session-seed")
+    runner.omit_session = True
+    _run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        "empty-session-result",
+    )
+
+    attempt = result["nodes"]["analyze"]["attempts"][0]
+    assert result["status"] == "paused"
+    assert attempt["error_code"] == "outcome_unknown"
+    assert attempt["metadata"]["provider_attempts"] == 0
+    assert attempt["metadata"]["provider_attempts_exact"] is True
+    assert attempt["metadata"]["retry_consumed"] == 1
+    assert attempt["metadata"].get("known_no_effect") is not True
 
 
 @pytest.mark.parametrize(
@@ -777,11 +862,13 @@ def test_recovery_reseals_authority_before_fresh_provider_launch(
 def test_real_session_database_failure_is_recovery_unavailable_before_spawn(
     tmp_path, monkeypatch
 ) -> None:
+    import agent.plugin_agent as plugin_agent
     import hermes_state
 
     database = tmp_path / "corrupt-state.db"
     database.write_bytes(b"not a sqlite database")
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", database)
+    monkeypatch.setattr(plugin_agent, "_agent_override_allowed", lambda *_args: True)
     registry = NodeSessionRegistry(tmp_path / "real-db-home")
     node = WorkflowNode(
         id="analyze",

@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentSessionMissingError,
+    PluginAgentSessionUnavailableError,
 )
 from agent.structured_output import (
     MAX_OUTPUT_BYTES,
@@ -1242,18 +1243,10 @@ class AgentNodeExecutor:
                 result = fresh_recovery_request()
                 if isinstance(result, NodeExecutionResult):
                     return result
-            except (
-                OSError,
-                PermissionError,
-                ValueError,
-                sqlite3.DatabaseError,
-            ) as exc:
+            except PluginAgentSessionUnavailableError:
                 if strict_v3 and (
                     session_source == "cross_run_registry"
-                    or (
-                        session_source == "same_run_predecessor"
-                        and isinstance(exc, sqlite3.DatabaseError)
-                    )
+                    or session_source == "same_run_predecessor"
                 ):
                     return self._recovery_unavailable()
                 raise
@@ -1302,6 +1295,22 @@ class AgentNodeExecutor:
                 )
             )
         except ValueError as exc:
+            if strict_v3:
+                return with_recovery_failure(
+                    NodeExecutionResult(
+                        "failed",
+                        error_code="outcome_unknown",
+                        error_message=str(exc),
+                        metadata={
+                            "provider_attempts": conservative_provider_retry_count(
+                                None,
+                                granted_attempts=granted_provider_attempts,
+                            ),
+                            "provider_attempts_exact": False,
+                            "outcome_unknown": True,
+                        },
+                    )
+                )
             return with_recovery_failure(self._failure("validation", str(exc)))
         except WorkflowOutputReferenceError:
             raise
@@ -1571,7 +1580,21 @@ class AgentNodeExecutor:
             if registry_key is not None and self.session_registry is not None:
                 if strict_v3:
                     if not result.session_id:
-                        return self._recovery_unavailable()
+                        return with_recovery_failure(
+                            NodeExecutionResult(
+                                "failed",
+                                artifacts=archon_result.artifacts,
+                                error_code="outcome_unknown",
+                                error_message=(
+                                    "completed persistent-session execution omitted "
+                                    "its session identifier"
+                                ),
+                                metadata={
+                                    **metadata,
+                                    "outcome_unknown": True,
+                                },
+                            )
+                        )
                     registry_update = SessionRegistryUpdateCandidate(
                         key=registry_key,
                         expected_generation=expected_generation,

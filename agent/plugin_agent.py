@@ -20,6 +20,7 @@ import queue
 import re
 import secrets
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -86,6 +87,14 @@ class PluginAgentSessionMissingError(ValueError):
     failure_kind = "persistent_session_missing"
     provider_attempts = 0
     model_calls = 0
+
+
+class PluginAgentSessionUnavailableError(RuntimeError):
+    """The parent could not determine session existence before provider use."""
+
+
+class PluginAgentResultProtocolError(RuntimeError):
+    """A spawned worker returned an invalid result after possible provider use."""
 
 
 class _ProviderAttemptGrantExhausted(RuntimeError):
@@ -1555,14 +1564,20 @@ class PluginAgentRunner:
         if request.context_mode == "shared":
             from hermes_state import SessionDB
 
-            session_db = SessionDB()
             try:
-                if session_db.get_session(request.session_id) is None:
-                    raise PluginAgentSessionMissingError(
-                        "persistent plugin-agent session is missing"
-                    )
-            finally:
-                session_db.close()
+                session_db = SessionDB()
+                try:
+                    session = session_db.get_session(request.session_id)
+                finally:
+                    session_db.close()
+            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                raise PluginAgentSessionUnavailableError(
+                    "persistent plugin-agent session could not be read"
+                ) from exc
+            if session is None:
+                raise PluginAgentSessionMissingError(
+                    "persistent plugin-agent session is missing"
+                )
 
         payload = _request_payload(self.plugin_id, request)
         try:
@@ -1595,13 +1610,16 @@ class PluginAgentRunner:
                 process_stopped=process_stopped,
             )
             result = frame.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError("plugin-agent result payload is missing")
-            parsed_result = PluginAgentRunResult.from_wire(result)
-            if not _correlate_persistent_session_result(
-                self.plugin_id, request, parsed_result
-            ):
-                _correlate_structured_result(request, parsed_result)
+            try:
+                if not isinstance(result, dict):
+                    raise ValueError("plugin-agent result payload is missing")
+                parsed_result = PluginAgentRunResult.from_wire(result)
+                if not _correlate_persistent_session_result(
+                    self.plugin_id, request, parsed_result
+                ):
+                    _correlate_structured_result(request, parsed_result)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise PluginAgentResultProtocolError(str(exc)) from exc
             return parsed_result
         except TimeoutError as exc:
             kind = "idle_timeout" if "idle" in str(exc) else "wall_timeout"
@@ -1644,8 +1662,10 @@ class PluginAgentRunner:
 
 
 __all__ = [
+    "PluginAgentResultProtocolError",
     "PluginAgentRunRequest",
     "PluginAgentRunResult",
     "PluginAgentRunner",
     "PluginAgentSessionMissingError",
+    "PluginAgentSessionUnavailableError",
 ]
