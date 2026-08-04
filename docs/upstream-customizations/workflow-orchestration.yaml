@@ -2489,6 +2489,48 @@ upstream_changes:
     canonical time handling, scheduled-wait presentation, and four-locale
     coverage while retaining the separate legacy CLI Cron showcase.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-provider-attempt-transport-authority
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - run_agent.py
+  - agent/anthropic_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/codex_runtime.py
+  - agent/provider_attempts.py
+  - tests/agent/test_provider_attempt_transport.py
+  owned_symbols:
+  - reserve_provider_transport_attempt
+  - AIAgent._anthropic_messages_create before_transport bridge
+  - chat-completions, Bedrock, MoA, and summary transport reservations
+  - create_anthropic_message per-transport before_transport callback
+  - Codex Responses and app-server transport reservations
+  owned_invariants:
+  - every actual provider transport is reserved before launch
+  - each retry or stream-to-create fallback receives a distinct reservation
+  - an absent request-local callback preserves ordinary Hermes behavior
+  - reservation refusal propagates before provider I/O
+  tests:
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_plugin_agent.py
+  - tests/plugins/workflow/test_ai_executor.py
+  expected_commit_subject: 'test(workflow): gate provider attempt transport seams'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the optional request-local reservation callback at every concrete
+    provider transport launch, including OpenAI-compatible chat completions,
+    Bedrock Converse, MoA, Anthropic stream and create fallback, Codex
+    Responses retries, Codex app-server turns, and iteration-limit summaries.
+    The reservation must execute immediately before each transport and its
+    refusal must propagate without provider I/O. Keep the hook optional so
+    ordinary non-workflow conversations retain their existing behavior. Any
+    upstream refactor that moves or adds provider launches must update the
+    focused transport contract and retain equivalent pre-launch accounting.
+  removal_condition: >-
+    Remove when upstream provides equivalent request-scoped, pre-transport
+    provider-attempt authority across every supported provider path with a
+    release-gated regression contract.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-run-execution-limits
   change_class: workflow-runtime
   owner: workflow-orchestration
@@ -3997,7 +4039,8 @@ upstream_changes:
   owned_invariants:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
-  - Phase 3 Bash security base merge-gate suite selection
+  - Phase 3 ordinary language and Bash regression suite selection
+  - provider-attempt transport contract base merge-gate selection
   - relative PYTHON_BIN canonicalization before repository switching
   - canonical per-file test isolation in the base merge gate
   - tests/plugins/workflow/test_language.py gate membership
@@ -4013,8 +4056,8 @@ upstream_changes:
   - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
   - tests/plugins/workflow/test_phase3_bash_substitution.py
   - tests/plugins/workflow/test_phase3_bash_descriptor_faults.py
-  - tests/plugins/workflow/test_phase3_bash_lexer_security.py
   - tests/plugins/workflow/test_phase3_bash_reference_ordering.py
+  - tests/agent/test_provider_attempt_transport.py
   - apps/desktop/src/app/workflows/index.test.tsx
   - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
   - tests/scripts/test_workflow_merge_gate.py

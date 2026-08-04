@@ -237,6 +237,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/gateway/test_plugin_background_services.py",
         "tests/gateway/test_plugin_delivery.py",
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
+        "tests/agent/test_provider_attempt_transport.py",
         "tests/scripts/test_workflow_merge_gate.py",
         "tests/plugins/workflow/test_catalog_api.py",
         "tests/plugins/workflow/test_workflow_detail_api.py",
@@ -354,6 +355,7 @@ def test_phase_1_language_customizations_and_regression_gate_are_tracked() -> No
 
     assert PHASE_1_LANGUAGE_CUSTOMIZATION_IDS <= customization_ids
     assert "workflow-language-regression-gates" in customization_ids
+    assert "workflow-provider-attempt-transport-authority" in customization_ids
 
 
 def test_native_workflow_matrix_covers_every_release_gate() -> None:

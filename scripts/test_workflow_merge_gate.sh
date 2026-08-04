@@ -393,7 +393,8 @@ if [[ "$PHASE" == "base" ]]; then
     fi
     HERMES_PYTHON="$PYTHON_BIN" "$ROOT/scripts/run_tests.sh" \
       tests/tools/test_managed_process.py tests/tools/test_process_registry.py \
-      tests/agent/test_plugin_agent.py tests/tools/test_registry.py \
+      tests/agent/test_plugin_agent.py \
+      tests/agent/test_provider_attempt_transport.py tests/tools/test_registry.py \
       tests/hermes_cli/test_execution_runtime_capabilities.py \
       tests/hermes_cli/test_kanban_mutation_preconditions.py \
       tests/hermes_cli/test_kanban_db.py \
