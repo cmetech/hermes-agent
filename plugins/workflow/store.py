@@ -7136,17 +7136,7 @@ class RunStore:
         except JournalRecoveryError:
             return False
         if private_authorities is None:
-            try:
-                directory = self.run_directory(run_id)
-            except KeyError:
-                private_authorities = self._read_private_session_authorities(
-                    run_id=run_id
-                )
-            else:
-                private_authorities = self._read_bound_private_session_authorities(
-                    run_id=run_id,
-                    events=self._read_journal_events(directory),
-                )
+            private_authorities = self._read_private_session_authorities(run_id=run_id)
         if not self._private_session_authorities_match_projection(
             value,
             private_authorities=private_authorities,
