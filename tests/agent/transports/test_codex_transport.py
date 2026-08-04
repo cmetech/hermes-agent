@@ -6,6 +6,28 @@ from types import SimpleNamespace
 
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
+
+
+_STRUCTURED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _structured_request(strategy: StructuredOutputStrategy) -> StructuredOutputRequest:
+    return StructuredOutputRequest(
+        schema=normalize_schema(_STRUCTURED_SCHEMA),
+        strategy=strategy,
+        adapter_version=1,
+    )
 
 
 @pytest.fixture
@@ -53,6 +75,438 @@ class TestCodexBuildKwargs:
         assert kw["instructions"] == "You are helpful."
         assert "input" in kw
         assert kw["store"] is False
+
+    def test_direct_openai_native_schema_uses_exact_text_format(self, transport):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            }
+        }
+
+    def test_native_schema_merges_existing_text_verbosity(self, transport):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={"text": {"verbosity": "low"}},
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["text"] == {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_non_schema_strategies_never_emit_text_format(
+        self, transport, strategy
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "format" not in kwargs.get("text", {})
+
+    @pytest.mark.parametrize(
+        ("provider_name", "base_url"),
+        [
+            ("openai-codex", "https://chatgpt.com/backend-api/codex"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("custom", "https://gateway.example/v1"),
+            ("openai-api", "https://gateway.example/v1"),
+        ],
+    )
+    def test_non_direct_routes_never_emit_text_format(
+        self, transport, provider_name, base_url
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name=provider_name,
+            base_url=base_url,
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert "format" not in kwargs.get("text", {})
+
+    @pytest.mark.parametrize(
+        ("strategy", "provider_name", "base_url"),
+        [
+            (
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_MODE,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.UNSUPPORTED,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "custom",
+                "https://gateway.example/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openai-codex",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ],
+    )
+    def test_structured_requests_reserve_text_format_from_overrides(
+        self, transport, strategy, provider_name, base_url
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name=provider_name,
+            base_url=base_url,
+            request_overrides={
+                "text": {
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "smuggled",
+                        "schema": {"type": "string"},
+                        "strict": False,
+                    },
+                },
+                "service_tier": "priority",
+            },
+            structured_output=_structured_request(strategy),
+        )
+
+        assert kwargs["text"] == {"verbosity": "low"}
+        assert kwargs["service_tier"] == "priority"
+
+    def test_legacy_call_preserves_text_format_override(self, transport):
+        override = {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "legacy_output",
+                "schema": {"type": "string"},
+                "strict": False,
+            },
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"text": override},
+        )
+
+        assert kwargs["text"] == override
+
+    def test_native_schema_replaces_malformed_format_and_preserves_verbosity(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "text": {"verbosity": "high", "format": "malformed"}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["text"] == {
+            "verbosity": "high",
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_structured_non_native_preflight_strips_extra_body_text_injection(
+        self, transport, strategy
+    ):
+        extra_body = {
+            "text": {
+                "verbosity": "low",
+                "format": {
+                    "type": "json_schema",
+                    "name": "smuggled",
+                    "schema": {"type": "string"},
+                    "strict": False,
+                },
+                "unapproved": "drop-me",
+            },
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={"extra_body": extra_body},
+            structured_output=_structured_request(strategy),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": "low"}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": "low"}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+        assert extra_body["text"]["format"]["name"] == "smuggled"
+
+    def test_native_schema_preflight_cannot_be_shadowed_by_extra_body_text(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": {
+                    "text": {
+                        "verbosity": "high",
+                        "format": {
+                            "type": "json_schema",
+                            "name": "smuggled",
+                            "schema": {"type": "string"},
+                            "strict": False,
+                        },
+                    },
+                    "trace_id": "keep-me",
+                },
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+        expected_text = {
+            "verbosity": "high",
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+        assert kwargs["text"] == expected_text
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == expected_text
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+
+    @pytest.mark.parametrize(
+        "nested_verbosity",
+        [[], {}, True, 1, None, "ultra"],
+        ids=["list", "dict", "bool", "int", "none", "wrong-string"],
+    )
+    def test_structured_request_discards_malformed_nested_verbosity(
+        self, transport, nested_verbosity
+    ):
+        extra_body = {
+            "text": {
+                "verbosity": nested_verbosity,
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": extra_body,
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": "medium"}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": "medium"}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+        assert extra_body == {
+            "text": {
+                "verbosity": nested_verbosity,
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "keep-me",
+        }
+
+    @pytest.mark.parametrize("nested_verbosity", ["low", "medium", "high"])
+    def test_structured_request_promotes_only_valid_nested_verbosity_strings(
+        self, transport, nested_verbosity
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": {
+                    "text": {"verbosity": nested_verbosity},
+                    "trace_id": "keep-me",
+                },
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": nested_verbosity}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": nested_verbosity}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+
+    @pytest.mark.parametrize(
+        "nested_verbosity",
+        [[], {}, True, 1, None, "ultra"],
+        ids=["list", "dict", "bool", "int", "none", "wrong-string"],
+    )
+    def test_legacy_call_preserves_malformed_nested_verbosity(
+        self, transport, nested_verbosity
+    ):
+        extra_body = {
+            "text": {"verbosity": nested_verbosity},
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
+
+    @pytest.mark.parametrize(
+        "nested_text",
+        [
+            "malformed",
+            {"verbosity": "ultra", "format": {"type": "json_object"}},
+        ],
+    )
+    def test_structured_request_drops_unapproved_extra_body_text_subtree(
+        self, transport, nested_text
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "extra_body": {"text": nested_text, "trace_id": "keep-me"}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "text" not in kwargs
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+
+    def test_structured_request_removes_empty_extra_body_after_text_reservation(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "extra_body": {"text": {"format": {"type": "json_object"}}}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "text" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_legacy_call_preserves_extra_body_text_override(self, transport):
+        extra_body = {
+            "text": {
+                "verbosity": "low",
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
 
     def test_system_extracted_from_messages(self, transport):
         messages = [

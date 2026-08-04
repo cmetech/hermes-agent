@@ -1,0 +1,255 @@
+# Review package: 2e7f1f227784a72f68b24a2112af455b2b74af20..HEAD
+
+## Commits
+b7cba382c fix(workflow): preserve desktop projection failure reason
+
+## Files changed
+ .../task-13-round-9-closure-report.md              | 77 ++++++++++++++++++++++
+ plugins/workflow/notifications.py                  |  8 +++
+ .../plugins/workflow/test_notification_delivery.py | 65 +++++++++++++++++-
+ 3 files changed, 149 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md
+index dadb01641..9884c57b7 100644
+--- a/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md
++++ b/.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-round-9-closure-report.md
+@@ -166,10 +166,87 @@ assertion now passes.
+ - The selected-recovery paused behavioral test exercises the real
+   `AgentNodeExecutor` shared-to-fresh transition and verifies request order,
+   resumability data, exact bounded metadata, recovery outcome, and absence of
+   private canaries/fingerprint.
+ - Ordinary non-recovery paused handling remains on its original return path.
+ - Test taxonomy was not changed in production. Exact stable messages are
+   asserted for malformed authority, sequence damage, prefix commitment damage,
+   and the notification reconciliation wrapper.
+ - The two pre-existing ignored rereview artifacts and all unrelated files were
+   preserved.
++
++## Follow-up closure: Desktop projection failure reason
++
++### Finding and correction
++
++The Desktop notification failure endpoint supplies the fixed fallback
++`projection_failed` when the Electron client omits `error`, but the centralized
++stable-reason allowlist did not contain that code. The existing normalization
++boundary consequently replaced the host-owned fallback with `notification
++delivery failed`.
++
++The correction adds the fixed Desktop fallback and the gateway producer's
++platform-neutral `SEND_ERROR_KINDS` values to the same exact-value allowlist.
++No prefix, pattern, or arbitrary-detail acceptance was added.
++
++### Producer audit
++
++The audit was limited to the two notification-failure producer families:
++
++- Desktop API: `projection_failed`.
++- Coordinator delivery receipts: receipt status fallbacks
++  (`retryable_failure`, `permanent_failure`, `outcome_uncertain`,
++  `unauthorized`); gateway delivery codes (`gateway_loop_unavailable`,
++  `adapter_unavailable`, `adapter_send_timeout`, `adapter_send_failed`,
++  `invalid_text`, `delivery_store_unavailable`); and the platform-neutral
++  error kinds (`too_long`, `bad_format`, `forbidden`, `not_found`,
++  `rate_limited`, `transient`, `unknown`).
++
++All fixed host-owned codes from those producers are now represented. Dynamic
++exception details such as `delivery_exception:<type>` and
++`adapter_send_exception:<type>`, plus provider/platform free-form error text,
++continue to normalize to the generic reason.
++
++### TDD evidence
++
++Two API-level tests were added through `/notifications/{id}/fail`: one proves
++an omitted error retains `projection_failed`; the other proves a free-form
++detail is normalized and not persisted.
++
++Initial exact-file RED:
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notification_delivery.py
++```
++
++Result: **14 passed / 2 failed**. One failure was the intended missing
++`projection_failed` behavior. The other was an unrelated stale compatibility
++fixture whose bash timeout was now runnable, so it reached a later package
++permission check instead of the compatibility refusal it was meant to assert.
++Running that existing test alone reproduced the same failure.
++
++The owned fixture was updated to use a prompt node with unsupported `effort`,
++preserving its original pre-persistence compatibility-block contract. The
++exact-file RED was then rerun before the production change.
++
++Result: **15 passed / 1 failed**. The sole failure was the intended assertion:
++expected `projection_failed`, actual `notification delivery failed`. The
++free-form normalization test already passed.
++
++### GREEN and static evidence
++
++```text
++HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notification_delivery.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_coordinator.py
++```
++
++Result: **3 files / 70 passed / 0 failed**
++(`16 + 15 + 39`).
++
++```text
++../../.venv/bin/ruff check plugins/workflow/notifications.py tests/plugins/workflow/test_notification_delivery.py
++git diff --check
++```
++
++Result: **all checks passed / clean diff check**.
++
++Retries were disabled for every test command. Only ordinary functional tests
++were run.
+diff --git a/plugins/workflow/notifications.py b/plugins/workflow/notifications.py
+index 2909588be..8c5c24d28 100644
+--- a/plugins/workflow/notifications.py
++++ b/plugins/workflow/notifications.py
+@@ -31,27 +31,35 @@ ATTENTION_KINDS = frozenset(
+         "stalled",
+         "reconciliation_required",
+     }
+ )
+ _GENERIC_DELIVERY_FAILURE_REASON = "notification delivery failed"
+ _STABLE_DELIVERY_FAILURE_REASONS = frozenset(
+     {
+         "adapter_send_failed",
+         "adapter_send_timeout",
+         "adapter_unavailable",
++        "bad_format",
+         "delivery_store_unavailable",
++        "forbidden",
+         "gateway_loop_unavailable",
+         "invalid_text",
++        "not_found",
+         "outcome_uncertain",
+         "permanent_failure",
++        "projection_failed",
++        "rate_limited",
+         "retryable_failure",
++        "too_long",
++        "transient",
+         "unauthorized",
++        "unknown",
+     }
+ )
+
+
+ class NotificationReconciliationError(RuntimeError):
+     """A run journal could not be safely corroborated for notifications."""
+
+
+ class _NotificationRepairPageFull(Exception):
+     """The next safe journal would exceed this scanner iteration's budget."""
+diff --git a/tests/plugins/workflow/test_notification_delivery.py b/tests/plugins/workflow/test_notification_delivery.py
+index 497d60d60..f46d1f1b2 100644
+--- a/tests/plugins/workflow/test_notification_delivery.py
++++ b/tests/plugins/workflow/test_notification_delivery.py
+@@ -167,20 +167,83 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
+     )
+     assert wrong.status_code == 409
+     ack = client.post(
+         f"/api/plugins/workflow/notifications/{notification_id}/ack",
+         json={"client_id": "electron-stable"},
+     )
+     assert ack.status_code == 200
+     assert outbox.history(run_id="run-api")[0]["state"] == "delivered"
+
+
++def test_desktop_projection_failure_retains_fixed_fallback_reason(
++    tmp_path, monkeypatch
++) -> None:
++    home = tmp_path / "projection-fallback-home"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    outbox = NotificationOutbox(RunStore(home))
++    notification_id = outbox.record(
++        run_id="projection-fallback-run",
++        kind="completion",
++        destination="desktop",
++        transition_version=1,
++        payload={"status": "succeeded"},
++    )
++    client = TestClient(_app(_module().router))
++    lease = client.get(
++        "/api/plugins/workflow/notifications/lease?client_id=electron-projection"
++    )
++    assert lease.status_code == 200
++    assert lease.json()["items"][0]["notification_id"] == notification_id
++
++    failed = client.post(
++        f"/api/plugins/workflow/notifications/{notification_id}/fail",
++        json={"client_id": "electron-projection"},
++    )
++
++    assert failed.status_code == 200
++    assert failed.json()["outcome"] == "retry_scheduled"
++    history = outbox.history(run_id="projection-fallback-run")
++    assert history[0]["last_error"] == "projection_failed"
++
++
++def test_desktop_projection_failure_normalizes_free_form_detail(
++    tmp_path, monkeypatch
++) -> None:
++    home = tmp_path / "projection-free-form-home"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    outbox = NotificationOutbox(RunStore(home))
++    notification_id = outbox.record(
++        run_id="projection-free-form-run",
++        kind="completion",
++        destination="desktop",
++        transition_version=1,
++        payload={"status": "succeeded"},
++    )
++    canary = "private desktop provider session /path history"
++    client = TestClient(_app(_module().router))
++    lease = client.get(
++        "/api/plugins/workflow/notifications/lease?client_id=electron-free-form"
++    )
++    assert lease.status_code == 200
++    assert lease.json()["items"][0]["notification_id"] == notification_id
++
++    failed = client.post(
++        f"/api/plugins/workflow/notifications/{notification_id}/fail",
++        json={"client_id": "electron-free-form", "error": canary},
++    )
++
++    assert failed.status_code == 200
++    history = outbox.history(run_id="projection-free-form-run")
++    assert history[0]["last_error"] == "notification delivery failed"
++    assert canary not in json.dumps(history, sort_keys=True)
++
++
+ def test_dismissal_records_presentation_only(tmp_path, monkeypatch):
+     home = tmp_path / "home"
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     outbox = NotificationOutbox(RunStore(home))
+     notification_id = outbox.record(
+         run_id="run-dismiss",
+         kind="failure",
+         destination="desktop",
+         transition_version=3,
+         payload={},
+@@ -628,21 +691,21 @@ def test_authenticated_gateway_command_starts_real_background_run(
+     assert run["provenance"]["return_route"] == "opaque-capability"
+
+
+ def test_gateway_run_refuses_declared_archon_incompatibility_before_persistence(
+     tmp_path, workflow_writer
+ ) -> None:
+     home = tmp_path / "home"
+     workflow_path = workflow_writer(
+         tmp_path / "package",
+         name="gateway-archon-blocked",
+-        nodes=[{"id": "start", "bash": "true", "timeout": 1000}],
++        nodes=[{"id": "start", "prompt": "x", "effort": "high"}],
+     )
+     workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+         "language_compatibility: archon-2026-07\n", encoding="utf-8"
+     )
+     store = RunStore(home)
+     assert CoordinatorStore(store.database).try_acquire(
+         CoordinatorIdentity(
+             owner_id="gateway-test",
+             host_kind="gateway",
+             host_instance_id="gateway-test",

@@ -110,6 +110,37 @@ The app also surfaces the broader Hermes management surface so you don't have to
 - **Messaging** — set up gateway channels.
 - **Agents** and **Command Center** — orchestration surfaces for multi-agent work.
 
+#### Workflow typed artifacts
+
+Open **Workflows**, select a run, and choose its **Artifacts** evidence tab to
+inspect typed output. Desktop renders a typed-artifact row only when the backend
+returns confirmed metadata with a valid opaque publication ID. It does not read
+workflow YAML or infer a publication from `output_type`. A new app connected to
+an older backend keeps showing its generic artifact evidence instead of
+inventing typed controls.
+
+Each confirmed row shows the semantic output type and media type, producer and
+winning attempt, size and SHA-256, optional schema fingerprint, production
+time/session identity when available, and integrity/recovery state. The output
+type is an open, case-sensitive label; it is not a local filename.
+
+Preview is opt-in: select **Preview** on the artifact you want to inspect.
+Backend preview is authenticated and bounded to 64 KiB. Desktop formats JSON
+only when the backend returns the complete canonical value. Other supported
+text stays plain and may show a truncation notice. Unknown or future media
+types are download-only rather than interpreted inline.
+
+Select **Download** to open the operating system's save dialog and choose a
+destination. The Electron bridge performs the authenticated download without
+exposing the session token to the renderer. Preview, metadata, integrity, and
+download errors remain inside the artifact tab with retry or error guidance;
+they do not replace or disable chat, the terminal, or another Desktop pane.
+
+See [Workflows](./features/workflows.md#inspect-typed-output) for the publication
+and recovery model, and the
+[Workflow YAML reference](./features/workflow-yaml-reference.md#typed-artifact-publication)
+for authoring details.
+
 ### Keyboard & navigation
 
 - **Command palette** — press **Cmd+K** (Ctrl+K on Windows/Linux) to jump to actions and navigate the app from the keyboard.

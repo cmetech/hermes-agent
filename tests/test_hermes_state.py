@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 from unittest import mock
@@ -1386,6 +1387,77 @@ class TestMessageStorage:
         assert conv[1]["role"] == "assistant"
         assert conv[1]["content"] == "Hi!"
         assert isinstance(conv[1]["timestamp"], float)
+
+    def test_get_existing_session_conversation_distinguishes_absent_empty_and_history(
+        self, db
+    ):
+        """The atomic loader must not collapse absence into empty history."""
+        assert db.get_existing_session_conversation("absent") is None
+
+        db.create_session(session_id="empty", source="cli")
+        assert db.get_existing_session_conversation("empty") == []
+
+        db.create_session(session_id="history", source="cli")
+        db.append_message("history", role="user", content="Hello")
+        db.append_message("history", role="assistant", content="Hi!")
+
+        assert db.get_existing_session_conversation("history") == (
+            db.get_messages_as_conversation("history")
+        )
+
+    def test_get_existing_session_conversation_has_no_split_read_delete_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        """A writer deleting after the legacy existence read cannot yield ``[]``.
+
+        The patched ``get_session`` creates the deterministic interleaving that
+        made ``get_session`` followed by ``get_messages_as_conversation`` unsafe:
+        a second connection deletes the row after existence was observed.  The
+        atomic public loader must not use that split-read boundary at all.
+        """
+        db_path = tmp_path / "atomic-read.db"
+        reader = SessionDB(db_path=db_path)
+        writer = SessionDB(db_path=db_path)
+        delete_requested = threading.Event()
+        delete_complete = threading.Event()
+        writer_thread = None
+        try:
+            reader.create_session(session_id="shared", source="plugin")
+            reader.append_message("shared", role="user", content="persisted")
+            expected = reader.get_messages_as_conversation("shared")
+            original_get_session = reader.get_session
+
+            def delete_after_legacy_existence_read(session_id):
+                observed = original_get_session(session_id)
+                delete_requested.set()
+                assert delete_complete.wait(timeout=5)
+                return observed
+
+            monkeypatch.setattr(reader, "get_session", delete_after_legacy_existence_read)
+
+            def delete_when_requested():
+                assert delete_requested.wait(timeout=5)
+                writer.delete_session("shared")
+                delete_complete.set()
+
+            writer_thread = threading.Thread(target=delete_when_requested)
+            writer_thread.start()
+
+            actual = reader.get_existing_session_conversation("shared")
+
+            # Let the writer exit when the correct implementation never enters
+            # the legacy split-read hook, then verify the coherent result.
+            delete_requested.set()
+            writer_thread.join(timeout=5)
+            assert not writer_thread.is_alive()
+            assert actual == expected
+            assert reader.get_session("shared") is None
+        finally:
+            delete_requested.set()
+            if writer_thread is not None:
+                writer_thread.join(timeout=5)
+            writer.close()
+            reader.close()
 
     def test_get_messages_as_conversation_orders_by_id_not_timestamp(self, db):
         """Replay must follow AUTOINCREMENT id (insertion order), never the
@@ -7234,4 +7306,3 @@ class TestDisplayMetadataPersistence:
         switched = [m for m in reloaded if m.get("display_kind") == "model_switch"]
         assert len(switched) == 1
         assert switched[0]["display_metadata"] == meta
-

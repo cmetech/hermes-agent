@@ -63,6 +63,21 @@ def test_builder_references_cover_portable_shape_and_authoring_gate() -> None:
     ):
         assert gate in checklist.lower()
 
+    for phase3_contract in (
+        "120,000 ms",
+        "retries after the initial attempt",
+        "direct dependency",
+        "32,768-byte",
+        "confirmed missing cross-run session",
+        "compatibility_codes",
+    ):
+        assert phase3_contract.lower() in schema.lower()
+    assert "blocked pending Phase 3" not in schema
+    assert "loops and includes remain phase 4" in schema.lower()
+
+    assert "Archon timeout and retry fields are supported" in checklist
+    assert "loops and includes remain phase 4" in checklist.lower()
+
 
 def test_builder_contract_fixtures_are_valid_portable_packages() -> None:
     workflows = sorted(

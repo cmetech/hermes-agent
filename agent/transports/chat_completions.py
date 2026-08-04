@@ -9,6 +9,7 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
+import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -16,6 +17,79 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+def _build_native_response_format(
+    request: Any,
+    *,
+    provider_name: Any,
+    base_url: Any,
+    model: str,
+) -> dict[str, Any] | None:
+    """Build the direct OpenAI Chat Completions schema contract."""
+    from agent.structured_output import (
+        StructuredOutputRequest,
+        StructuredOutputStrategy,
+    )
+
+    if (
+        not isinstance(request, StructuredOutputRequest)
+        or request.strategy is not StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    ):
+        return None
+
+    from hermes_cli.runtime_provider import (
+        classify_resolved_execution_runtime,
+        resolve_structured_output_capability,
+    )
+
+    decision = resolve_structured_output_capability(
+        classify_resolved_execution_runtime(
+            {
+                "provider": provider_name,
+                "base_url": base_url,
+                "api_mode": "chat_completions",
+                "model": model,
+            },
+            target_model=model,
+        ),
+        schema_fingerprint=request.schema.schema_fingerprint,
+        model=model,
+    )
+    if (
+        decision.strategy is not request.strategy
+        or decision.adapter_version != request.adapter_version
+        or decision.schema_fingerprint != request.schema.schema_fingerprint
+    ):
+        return None
+
+    schema = json.loads(request.schema.canonical_schema_bytes.decode("utf-8"))
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "hermes_output",
+            "schema": schema,
+            "strict": True,
+        },
+    }
+
+
+def _reserve_structured_response_format(
+    api_kwargs: dict[str, Any], request: Any
+) -> None:
+    """Keep SDK ``extra_body`` merging from overriding governed output format."""
+    if request is None:
+        return
+
+    api_kwargs.pop("response_format", None)
+    extra_body = api_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        sanitized_extra_body = dict(extra_body)
+        sanitized_extra_body.pop("response_format", None)
+        if sanitized_extra_body:
+            api_kwargs["extra_body"] = sanitized_extra_body
+        else:
+            api_kwargs.pop("extra_body", None)
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
@@ -336,9 +410,21 @@ class ChatCompletionsTransport(ProviderTransport):
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
         if _profile:
-            return self._build_kwargs_from_profile(
+            api_kwargs = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
             )
+            _reserve_structured_response_format(
+                api_kwargs, params.get("structured_output")
+            )
+            response_format = _build_native_response_format(
+                params.get("structured_output"),
+                provider_name=params.get("provider_name"),
+                base_url=params.get("base_url"),
+                model=model,
+            )
+            if response_format is not None:
+                api_kwargs["response_format"] = response_format
+            return api_kwargs
 
         # ── Legacy fallback (unregistered / unknown provider) ───────────
         # Reached only when get_provider_profile() returned None.
@@ -508,6 +594,18 @@ class ChatCompletionsTransport(ProviderTransport):
         overrides = params.get("request_overrides")
         if overrides:
             api_kwargs.update(overrides)
+
+        _reserve_structured_response_format(
+            api_kwargs, params.get("structured_output")
+        )
+        response_format = _build_native_response_format(
+            params.get("structured_output"),
+            provider_name=params.get("provider_name"),
+            base_url=params.get("base_url"),
+            model=model,
+        )
+        if response_format is not None:
+            api_kwargs["response_format"] = response_format
 
         return api_kwargs
 

@@ -16,8 +16,9 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     conservative_provider_retry_count,
+    sealed_provider_request_for_launch,
 )
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
 
@@ -48,7 +49,12 @@ class ApprovalExecutor:
         message = str(approval["message"])
         variables = context.variable_context
         if isinstance(variables, VariableContext):
-            message = variables.render_prompt(message)
+            renderer = substitution_renderer(
+                variables,
+                direct_dependencies=context.node.depends_on,
+                output_resolver=context.output_resolver,
+            )
+            message = renderer.render_prompt(message)
         identity = hashlib.sha256(
             f"{context.run_id}\0{context.node.id}\0{generation}\0{message}".encode()
         ).hexdigest()
@@ -110,7 +116,12 @@ class ApprovalExecutor:
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
         variables = replace(variables, rejection_reason=str(rework.get("reason") or ""))
-        prompt = variables.render_prompt(str(on_reject["prompt"]))
+        renderer = substitution_renderer(
+            variables,
+            direct_dependencies=context.node.depends_on,
+            output_resolver=context.output_resolver,
+        )
+        prompt = renderer.render_prompt(str(on_reject["prompt"]))
         wall_timeout = (
             context.deadline_budget.remaining_wall(context.monotonic())
             if context.deadline_budget is not None
@@ -195,6 +206,14 @@ class ApprovalExecutor:
                 else context.termination_policy.kill_grace_seconds
             ),
         )
+        request = sealed_provider_request_for_launch(context, request)
+        if request is None:
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                error_message="workflow attempt deadline expired",
+                metadata={"provider_attempts": 0},
+            )
         try:
             result = agent_runner.run(request, is_cancelled=context.is_cancelled)
         except PermissionError as exc:

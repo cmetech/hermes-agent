@@ -20,12 +20,35 @@ from agent.anthropic_adapter import (
     build_anthropic_kwargs,
     convert_messages_to_anthropic,
     convert_tools_to_anthropic,
+    create_anthropic_message,
     is_claude_code_token_valid,
     normalize_model_name,
     read_claude_code_credentials,
     resolve_anthropic_token,
     run_oauth_setup_token,
 )
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
+
+
+_STRUCTURED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _structured_request(strategy: StructuredOutputStrategy) -> StructuredOutputRequest:
+    return StructuredOutputRequest(
+        schema=normalize_schema(_STRUCTURED_SCHEMA),
+        strategy=strategy,
+        adapter_version=1,
+    )
 from agent.transports import get_transport
 
 
@@ -1491,6 +1514,131 @@ class TestBuildAnthropicKwargs:
         assert kwargs["system"] == "Be helpful."
         assert kwargs["max_tokens"] == 4096
         assert "tools" not in kwargs
+
+    def test_direct_anthropic_native_schema_uses_exact_output_config_format(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["output_config"] == {
+            "format": {"type": "json_schema", "schema": _STRUCTURED_SCHEMA}
+        }
+
+    def test_native_schema_merges_adaptive_effort_without_replacement(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "Think and answer"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {
+            "effort": "max",
+            "format": {"type": "json_schema", "schema": _STRUCTURED_SCHEMA},
+        }
+
+    def test_native_schema_survives_streaming_dispatch_and_sanitization(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+        captured = {}
+
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get_final_message(self):
+                return "streamed"
+
+        class Messages:
+            def stream(self, **stream_kwargs):
+                captured.update(stream_kwargs)
+                return Stream()
+
+        result = create_anthropic_message(
+            SimpleNamespace(messages=Messages()), kwargs
+        )
+
+        assert result == "streamed"
+        assert captured["output_config"] == {
+            "format": {"type": "json_schema", "schema": _STRUCTURED_SCHEMA}
+        }
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_non_schema_strategies_never_emit_output_format(self, strategy):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "format" not in kwargs.get("output_config", {})
+
+    @pytest.mark.parametrize(
+        ("provider_name", "base_url"),
+        [
+            ("custom", "https://gateway.example/anthropic"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("anthropic", "https://gateway.example/anthropic"),
+        ],
+    )
+    def test_non_direct_routes_never_emit_output_format(
+        self, provider_name, base_url
+    ):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            provider_name=provider_name,
+            base_url=base_url,
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert "format" not in kwargs.get("output_config", {})
 
     def test_strips_anthropic_prefix(self):
         kwargs = build_anthropic_kwargs(

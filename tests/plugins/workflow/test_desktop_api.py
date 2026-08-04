@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import asyncio
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -48,6 +50,10 @@ from plugins.workflow.coordinator_store import (
 )
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.output_resolution import (
+    ArchonOutputUnavailableError,
+    _RETRYABLE_READ_ERRNOS,
+)
 from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
@@ -58,7 +64,14 @@ from plugins.workflow.scheduled_revalidation import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.store import RunStore
+from plugins.workflow.sessions import NodeSessionRegistry
+from plugins.workflow.sessions import NodeSessionKey, SessionRegistryUpdateCandidate
+from plugins.workflow.store import (
+    ArtifactRef,
+    RunStore,
+    TypedPublicationCandidate,
+)
+import plugins.workflow.store as store_module
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
@@ -124,6 +137,156 @@ def _start(store, package, key, *, scope=None):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def _published_run(
+    home,
+    workflow_writer,
+    root,
+    *,
+    data: bytes,
+    media_type: str,
+    scope: str | None = None,
+    output_type: str = "DesktopReport",
+    session_id: str | None = "desktop-artifact-session",
+    protected_session: bool = False,
+):
+    workflow = workflow_writer(
+        root,
+        name=f"artifact-{root.name}",
+        nodes=[
+            {
+                "id": "produce",
+                "bash": "true",
+                "output_type": output_type,
+            },
+            {
+                "id": "finish",
+                "bash": "true",
+                "depends_on": ["produce"],
+            },
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(home)
+    admitted = _start(store, package, root.name, scope=scope)
+    claim = store.claim_node(admitted.run_id, "produce", "desktop-api-worker")
+    assert claim is not None
+    suffix = "json" if media_type == "application/json" else "md"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / f"output.{suffix}"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    relative_path = source.relative_to(
+        store.run_directory(admitted.run_id)
+    ).as_posix()
+    digest = sha256(data).hexdigest()
+    registry_update = (
+        SessionRegistryUpdateCandidate(
+            key=NodeSessionKey(
+                package.definition.name,
+                "produce",
+                scope or "local",
+                "desktop-provider",
+                "default",
+            ),
+            expected_generation=0,
+            new_session_id=str(session_id),
+            cache_fingerprint="a" * 64,
+            winning_run_id=admitted.run_id,
+            winning_node_id="produce",
+            winning_attempt_id=claim.attempt_id,
+        )
+        if protected_session
+        else None
+    )
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(
+            ArtifactRef(relative_path, media_type, len(data), digest),
+        ),
+        typed_publication=TypedPublicationCandidate(
+            attempt_relative_path=relative_path,
+            output_type=output_type,
+            media_type=media_type,
+            size_bytes=len(data),
+            sha256=digest,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            session_id=session_id,
+        ),
+        metadata=(
+            {
+                "session_id": session_id,
+                "cache_fingerprint": "a" * 64,
+            }
+            if protected_session
+            else None
+        ),
+        session_registry_update=registry_update,
+        session_registry_authority=registry_update,
+    )
+    artifact = next(
+        item
+        for item in store.get_run_status(
+            admitted.run_id,
+            operator_scope=scope,
+        )["artifacts"]
+        if "publication_id" in item
+    )
+    return store, admitted, artifact
+
+
+def _forge_checked_typed_descriptor(
+    store: RunStore,
+    run_id: str,
+    corruption: str,
+) -> tuple[str, str]:
+    projection = store.load_run(run_id)
+    artifacts = deepcopy(projection["artifacts"])
+    descriptor = next(
+        artifact for artifact in artifacts if "publication_id" in artifact
+    )
+    updates: dict[str, object] = {"artifacts": artifacts}
+    if corruption == "unknown_media":
+        descriptor["media_type"] = "application/octet-stream"
+    elif corruption == "invalid_size_type":
+        descriptor["size_bytes"] = True
+    elif corruption == "duplicate_publication_id":
+        artifacts.append(dict(descriptor))
+    elif corruption == "non_winning_attempt":
+        nodes = deepcopy(projection["nodes"])
+        winner = next(
+            attempt
+            for attempt in nodes[descriptor["node_id"]]["attempts"]
+            if attempt["attempt_id"] == descriptor["attempt_id"]
+        )
+        winner["state"] = "failed"
+        updates["nodes"] = nodes
+    elif corruption == "sealed_output_type_mismatch":
+        descriptor["output_type"] = "ForgedOutputType"
+    elif corruption == "sealed_schema_mismatch":
+        descriptor["schema_fingerprint"] = "f" * 64
+    elif corruption == "legacy_unversioned":
+        descriptor.pop("typed_publication_version")
+    else:
+        raise AssertionError(f"unknown corruption fixture: {corruption}")
+    store.append_event(
+        run_id,
+        "forged_typed_descriptor",
+        projection_updates=updates,
+    )
+    return descriptor["publication_id"], descriptor["content_name"]
 
 
 def _trusted_catalog_workflow(home, workflow_writer, *, name, nodes=None, **options):
@@ -670,6 +833,9 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
     assert result["status"] == "queued"
     run = store.get_run_status(result["run_id"])
     risk = build_risk_summary(package, assess_compatibility(package))
+    execution_context = background_execution_context(
+        production_workflow_runner_binding(), requires_ai=None
+    )
     assert run["status"] == "queued"
     assert run["execution_mode"] == "background"
     assert run["started_at"] is None
@@ -678,9 +844,8 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
         "catalog_source": "profile",
         "catalog_source_relative": "scheduled-api.yaml",
         "catalog_source_root": str((home / "workflows").resolve()),
-        "execution_identity": background_execution_context(
-            production_workflow_runner_binding(), requires_ai=None
-        ).identity_digest,
+        "execution_identity": execution_context.identity_digest_for(package),
+        "execution_runtime_identity": execution_context.identity_digest,
         "package_digest": risk.package_digest,
         "risk_digest": risk.risk_digest,
         "schedule_at": SCHEDULE_AT,
@@ -1265,6 +1430,85 @@ def test_scheduled_mutation_success_uses_public_run_projection(
     assert cleanup.status_code == 200
     assert run_id in cleanup.json()["run_ids"]
     assert run_directory.is_dir()
+
+
+def test_recovery_pending_detail_and_resume_use_explicit_operator_actions(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.cli as workflow_cli
+
+    class UnavailableRegistry(NodeSessionRegistry):
+        def compare_and_set_or_observe(self, *args, **kwargs):
+            raise OSError("private registry path")
+
+    class Runner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="ok",
+                session_id="private-session",
+                provider=request.provider or "fake-provider",
+                model=request.model or "fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={"provider_attempts": 1},
+            )
+
+    home = tmp_path / "recovery-pending-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(
+        tmp_path / "recovery-pending-package",
+        name="desktop-recovery-pending",
+        persist_sessions=True,
+        provider="fake-provider",
+        model="fake-model",
+        nodes=[{"id": "analyze", "prompt": "Analyze"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    admitted = _start(store, package, "desktop-recovery-pending")
+    clock = [datetime(2026, 8, 1, tzinfo=timezone.utc)]
+    scheduler = RunScheduler(
+        store,
+        agent_runner=Runner(),
+        session_registry=UnavailableRegistry(home),
+        utcnow=lambda: clock[0],
+    )
+    scheduler.advance(admitted.run_id)
+    for delay in (1, 2, 4, 8):
+        clock[0] += timedelta(seconds=delay)
+        scheduler.advance(admitted.run_id)
+    assert store.load_run(admitted.run_id)["status"] == "recovery_pending"
+
+    monkeypatch.setattr(
+        workflow_cli,
+        "_scheduler",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            verified_always_run_nodes=lambda _run_id: frozenset()
+        ),
+    )
+    client = TestClient(_app(_router()))
+    detail = client.get(
+        f"/api/plugins/workflow/runs/{admitted.run_id}"
+    ).json()
+
+    assert detail["next_actions"] == ["status", "events", "resume", "cancel"]
+    archived = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/archive",
+        json={"expected_version": detail["state_version"]},
+    )
+    assert archived.status_code == 409
+    assert archived.json()["detail"]["code"] == "invalid_transition"
+    resumed = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/resume",
+        json={"expected_version": detail["state_version"]},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
 
 
 @pytest.mark.parametrize(
@@ -2883,6 +3127,650 @@ def test_events_cursor_and_stale_action_conflict(
     assert evidence.status_code == 200
     assert evidence.json()["kind"] == "timeline"
     assert evidence.json()["items"][0]["event_type"] == "run_admitted"
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+def test_artifact_endpoints_require_verified_authentication(endpoint) -> None:
+    client = TestClient(_app(_router(), local_admin=False))
+
+    response = client.get(
+        "/api/plugins/workflow/runs/run-id/artifacts/"
+        f"{'a' * 32}/{endpoint}"
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": {"code": "authentication_required"}
+    }
+
+
+def test_recovered_typed_session_is_private_in_authenticated_api_projections(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "protected-publication-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "protected-publication",
+        data=b"protected publication",
+        media_type="text/markdown; charset=utf-8",
+        session_id="protected-publication-session",
+        protected_session=True,
+    )
+    client = TestClient(_app(_router()))
+
+    responses = {
+        "detail": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}"
+        ),
+        "events": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/events"
+        ),
+        "artifacts": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence?kind=artifacts"
+        ),
+        "timeline": client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence?kind=timeline"
+        ),
+    }
+    for name, response in responses.items():
+        assert response.status_code == 200, name
+        assert b"protected-publication-session" not in response.content, name
+
+
+def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "legacy-session-api-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "legacy-session-api",
+            name="legacy-session-api",
+            nodes=[{"id": "legacy", "prompt": "Legacy"}],
+        )
+    )
+    store = RunStore(home)
+    admitted = _start(store, package, "legacy-session-api")
+    claim = store.claim_node(admitted.run_id, "legacy", "legacy-api-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": "legacy-api-session",
+            "cache_fingerprint": "legacy-api-fingerprint",
+        },
+    )
+    client = TestClient(_app(_router()))
+
+    detail = client.get(f"/api/plugins/workflow/runs/{admitted.run_id}")
+    events = client.get(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/events"
+    )
+    assert detail.status_code == events.status_code == 200
+    for response in (detail, events):
+        assert b"legacy-api-session" in response.content
+        assert b"legacy-api-fingerprint" in response.content
+
+
+def test_runs_list_never_opens_real_artifact_bodies(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-list-metadata"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "list-metadata",
+        data=b"REAL_LIST_PUBLICATION_BODY",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_path = (
+        f"publications/{artifact['publication_id']}/{artifact['content_name']}"
+    )
+    real_read = store_module._read_descriptor_relative
+
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail("GET runs must not open publication bodies")
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
+    )
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/runs?view=all"
+    )
+
+    assert response.status_code == 200
+    assert any(
+        run["run_id"] == admitted.run_id
+        for run in response.json()["runs"]
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "unknown_media",
+        "invalid_size_type",
+        "duplicate_publication_id",
+        "non_winning_attempt",
+        "sealed_output_type_mismatch",
+        "sealed_schema_mismatch",
+        "legacy_unversioned",
+    ],
+)
+def test_runs_list_rejects_corrupt_checked_typed_metadata_without_body_reads(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    corruption,
+) -> None:
+    home = tmp_path / f"home-list-corrupt-{corruption}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"list-corrupt-{corruption}",
+        data=b"CORRUPT_LIST_PUBLICATION_BODY",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_id, content_name = _forge_checked_typed_descriptor(
+        store,
+        admitted.run_id,
+        corruption,
+    )
+    publication_path = f"publications/{publication_id}/{content_name}"
+    real_read = store_module._read_descriptor_relative
+
+    def reject_publication_body(directory, relative_path, *, size_bytes):
+        if str(relative_path) == publication_path:
+            pytest.fail(
+                "run-list metadata validation must not open publication bodies"
+            )
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        reject_publication_body,
+    )
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/runs?view=all"
+    )
+
+    assert response.status_code == 200
+    listed = next(
+        run
+        for run in response.json()["runs"]
+        if run["run_id"] == admitted.run_id
+    )
+    assert listed["status_authoritative"] is False
+    assert listed["health"] == "storage_degraded"
+    assert "typed_publication_integrity" in store._active_run_repair_reasons(
+        admitted.run_id
+    )
+
+
+def test_text_artifact_preview_is_bounded_and_download_streams_verified_bytes(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    data = ("é" * 40_000).encode("utf-8")
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "text-preview",
+        data=data,
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_id = artifact["publication_id"]
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{publication_id}"
+    )
+
+    with TestClient(_app(_router())) as client:
+        preview = client.get(f"{base}/preview")
+        download = client.get(f"{base}/download")
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["publication_id"] == publication_id
+    assert payload["media_type"] == "text/markdown; charset=utf-8"
+    assert payload["size_bytes"] == len(data)
+    assert payload["bytes_returned"] == 65_536
+    assert payload["truncated"] is True
+    assert isinstance(payload["content"], str)
+    assert len(payload["content"].encode("utf-8")) <= 65_539
+    assert len(preview.content) < 70_000
+    assert download.status_code == 200
+    assert download.content == data
+    assert download.headers["content-type"] == "text/markdown; charset=utf-8"
+    assert download.headers["content-length"] == str(len(data))
+    assert download.headers["content-disposition"] == (
+        f'attachment; filename="{publication_id}-content.md"'
+    )
+
+
+def test_artifact_preview_and_download_accept_producer_metadata_boundary(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-metadata-boundary"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    output_type = "O" * 16_384
+    session_id = "S" * 16_384
+    body = b"BOUNDARY_BODY_MUST_ONLY_APPEAR_IN_EXPLICIT_CONTENT_RESPONSES"
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "metadata-boundary",
+        data=body,
+        media_type="text/markdown; charset=utf-8",
+        output_type=output_type,
+        session_id=session_id,
+    )
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(_app(_router())) as client:
+        preview = client.get(f"{base}/preview")
+        download = client.get(f"{base}/download")
+        evidence = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/evidence",
+            params={"kind": "artifacts"},
+        )
+
+    assert preview.status_code == 200
+    assert preview.json()["content"] == body.decode()
+    assert len(preview.content) < 1_024
+    assert download.status_code == 200
+    assert download.content == body
+    assert evidence.status_code == 200
+    item = next(
+        value
+        for value in evidence.json()["items"]
+        if value.get("publication_id") == artifact["publication_id"]
+    )
+    assert item["output_type"] == output_type
+    assert item["session_id"] == session_id
+    assert body not in evidence.content
+    assert len(evidence.content) < 40_000
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+@pytest.mark.parametrize("fault_target", ["content", "sealed_definition"])
+def test_artifact_endpoints_preserve_retryable_publication_unavailability(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    endpoint,
+    fault_target,
+) -> None:
+    home = tmp_path / f"home-unavailable-{endpoint}-{fault_target}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"unavailable-{endpoint}-{fault_target}",
+        data=b"retryable publication",
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_path = (
+        f"publications/{artifact['publication_id']}/{artifact['content_name']}"
+    )
+    target = (
+        publication_path
+        if fault_target == "content"
+        else "definition.yaml"
+    )
+    fault_active = True
+    real_read = store_module._read_descriptor_relative
+
+    def transient_read_failure(directory, relative_path, *, size_bytes):
+        if fault_active and str(relative_path) == target:
+            raise ArchonOutputUnavailableError(
+                "injected transient publication read failure"
+            )
+        return real_read(
+            directory,
+            relative_path,
+            size_bytes=size_bytes,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "_read_descriptor_relative",
+        transient_read_failure,
+    )
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        unavailable = client.get(f"{base}/{endpoint}")
+        fault_active = False
+        recovered = client.get(f"{base}/{endpoint}")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        "detail": {
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        }
+    }
+    assert "typed_publication_integrity" not in (
+        store._active_run_repair_reasons(admitted.run_id)
+    )
+    assert recovered.status_code == 200
+
+
+_RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS = tuple(
+    (name, getattr(errno, name))
+    for name in (
+        "EAGAIN",
+        "EINTR",
+        "EIO",
+        "EMFILE",
+        "ENOMEM",
+        "ENFILE",
+        "ESTALE",
+    )
+    if hasattr(errno, name)
+)
+
+
+def test_retryable_sealed_definition_lstat_matrix_matches_authoritative_set() -> None:
+    assert {
+        error_number
+        for _name, error_number in _RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS
+    } == {
+        error_number
+        for error_number in _RETRYABLE_READ_ERRNOS
+        if error_number != -1
+    }
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+@pytest.mark.parametrize(
+    "error_number",
+    [
+        pytest.param(error_number, id=name)
+        for name, error_number in _RETRYABLE_SEALED_DEFINITION_LSTAT_ERRNOS
+    ],
+)
+def test_artifact_endpoints_preserve_retryable_sealed_definition_lstat_errors(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    endpoint,
+    error_number,
+) -> None:
+    home = tmp_path / f"home-lstat-{endpoint}-{error_number}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"lstat-{endpoint}-{error_number}",
+        data=b"retryable sealed definition stat",
+        media_type="text/markdown; charset=utf-8",
+    )
+    definition = store.run_directory(admitted.run_id) / "definition.yaml"
+    fault_active = True
+    real_lstat = Path.lstat
+
+    def transient_definition_lstat(path):
+        if fault_active and path == definition:
+            raise OSError(
+                error_number,
+                "injected transient sealed-definition stat failure",
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", transient_definition_lstat)
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}"
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        unavailable = client.get(f"{base}/{endpoint}")
+        fault_active = False
+        recovered = client.get(f"{base}/{endpoint}")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        "detail": {
+            "code": "artifact_temporarily_unavailable",
+            "retryable": True,
+        }
+    }
+    assert len(unavailable.content) < 256
+    assert "typed_publication_integrity" not in (
+        store._active_run_repair_reasons(admitted.run_id)
+    )
+    assert recovered.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_content", "expected_bytes", "truncated"),
+    [
+        (b'{"answer":42}', {"answer": 42}, 13, False),
+        (
+            json.dumps(
+                {"payload": "x" * 70_000},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            None,
+            0,
+            True,
+        ),
+    ],
+)
+def test_json_artifact_preview_is_complete_or_omitted(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    data,
+    expected_content,
+    expected_bytes,
+    truncated,
+) -> None:
+    home = tmp_path / f"home-{len(data)}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"json-preview-{len(data)}",
+        data=data,
+        media_type="application/json",
+    )
+
+    with TestClient(_app(_router())) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["content"] == expected_content
+    assert payload["bytes_returned"] == expected_bytes
+    assert payload["size_bytes"] == len(data)
+    assert payload["truncated"] is truncated
+    assert len(response.content) < 70_000
+
+
+def test_json_artifact_preview_rejects_noncanonical_nonfinite_content(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-nonfinite-json"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "json-preview-nonfinite",
+        data=b'{"value":NaN}',
+        media_type="application/json",
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "typed_publication_integrity"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b'{"value":1e10000}',
+        b"[" * 1_200 + b"0" + b"]" * 1_200,
+        b'{"a":1,"a":2}',
+        b'{ "b":2, "a":1 }',
+    ],
+    ids=[
+        "overflowing-number",
+        "excessive-nesting",
+        "duplicate-keys",
+        "noncanonical-bytes",
+    ],
+)
+def test_json_artifact_preview_rejects_noncanonical_or_unsafe_json(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    data,
+) -> None:
+    home = tmp_path / f"home-invalid-json-{sha256(data).hexdigest()[:8]}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"invalid-json-{sha256(data).hexdigest()[:8]}",
+        data=data,
+        media_type="application/json",
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "typed_publication_integrity"}
+    }
+    assert len(response.content) < 256
+
+
+@pytest.mark.parametrize(
+    ("publication_id", "expected_code"),
+    [
+        ("f" * 32, "artifact_not_found"),
+        ("..%2Fmetadata.json", None),
+    ],
+)
+def test_artifact_endpoints_reject_unknown_and_path_like_ids(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    publication_id,
+    expected_code,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"unknown-id-{publication_id[0]}",
+        data=b"body",
+        media_type="text/markdown; charset=utf-8",
+    )
+
+    with TestClient(_app(_router())) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{publication_id}/preview"
+        )
+
+    assert response.status_code == 404
+    if expected_code is not None:
+        assert response.json()["detail"]["code"] == expected_code
+
+
+def test_artifact_lookup_enforces_operator_scope_and_profile(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "owner-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    owner_scope = "service:test:owner"
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "owned-artifact",
+        data=b"owned",
+        media_type="text/markdown; charset=utf-8",
+        scope=owner_scope,
+    )
+    reader = TokenPrincipal(
+        principal="other",
+        provider="test",
+        scopes=("workflow:read",),
+    )
+    path = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}/preview"
+    )
+
+    with TestClient(_app(_router(), token=reader)) as client:
+        wrong_scope = client.get(path)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-home"))
+    with TestClient(_app(_router())) as client:
+        wrong_profile = client.get(path)
+
+    assert wrong_scope.status_code == 404
+    assert wrong_scope.json()["detail"]["code"] == "run_not_found"
+    assert wrong_profile.status_code == 404
+    assert wrong_profile.json()["detail"]["code"] == "run_not_found"
 
 
 @pytest.mark.parametrize(

@@ -51,14 +51,26 @@ _MUTABLE_RUN_FILES = frozenset({
     "events.jsonl",
     "run.json",
 })
-# These are the only namespaces written by node executors after admission.
+_MUTABLE_RUN_RECOVERY_ARTIFACT = re.compile(
+    r"^(?:run\.json\.corrupt|events\.jsonl\.torn)-[0-9a-f]{32}$"
+)
+# These are the only namespaces written by node execution or typed publication
+# after admission.
 # They remain non-authoritative: resource resolution is separately restricted
 # to journal-corroborated sealed paths.
-_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes"})
+_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes", "publications"})
 
 
 class ScheduledRunRevalidationError(RuntimeError):
     """The current source or execution authority no longer matches admission."""
+
+
+def _is_mutable_run_file(relative: str) -> bool:
+    """Return whether one root file is owned by mutable run bookkeeping."""
+    return len(PurePosixPath(relative).parts) == 1 and (
+        relative in _MUTABLE_RUN_FILES
+        or _MUTABLE_RUN_RECOVERY_ARTIFACT.fullmatch(relative) is not None
+    )
 
 
 def showcase_scenario_digest(scenario: object) -> str:
@@ -93,7 +105,7 @@ def read_sealed_snapshot_paths(value: object) -> tuple[str, ...]:
             relative.is_absolute()
             or relative.as_posix() != item
             or any(part in {"", ".", ".."} for part in relative.parts)
-            or item in _MUTABLE_RUN_FILES
+            or _is_mutable_run_file(item)
             or item in seen
         ):
             raise ScheduledRunRevalidationError("sealed snapshot path is invalid")
@@ -158,7 +170,7 @@ def sealed_snapshot_digest(
                             entries.append((relative, path))
                         elif (
                             not allow_unsealed_regular_files
-                            and relative not in _MUTABLE_RUN_FILES
+                            and not _is_mutable_run_file(relative)
                             and first_part not in _MUTABLE_RUN_ROOTS
                         ):
                             raise ScheduledRunRevalidationError(
@@ -198,7 +210,7 @@ def sealed_snapshot_digest(
                             continue
                         pending.append(path)
                     elif entry.is_file(follow_symlinks=False):
-                        if relative not in _MUTABLE_RUN_FILES:
+                        if not _is_mutable_run_file(relative):
                             entries.append((relative, path))
                     else:
                         raise ScheduledRunRevalidationError(
@@ -476,7 +488,10 @@ def revalidate_scheduled_run(
     if not isinstance(run_id, str) or not isinstance(state_version, int):
         raise ScheduledRunRevalidationError("scheduled run identity is missing")
     execution_identity = _required_digest(metadata, "execution_identity")
-    if execution_identity != execution_capability_context.identity_digest:
+    execution_runtime_identity = _required_digest(
+        metadata, "execution_runtime_identity"
+    )
+    if execution_runtime_identity != execution_capability_context.identity_digest:
         raise ScheduledRunRevalidationError("execution capability changed")
     package_identity = _required_digest(metadata, "package_digest")
     risk_identity = _required_digest(metadata, "risk_digest")
@@ -505,11 +520,17 @@ def revalidate_scheduled_run(
                 read_budget=budget,
                 force_reverify=True,
             )
+            if execution_identity != execution_capability_context.identity_digest_for(
+                verified.package
+            ):
+                raise ScheduledRunRevalidationError("execution capability changed")
             compatibility, risk = assess_package_execution(
                 verified.package,
                 execution_capability_context,
                 read_budget=budget,
             )
+        except ScheduledRunRevalidationError:
+            raise
         except Exception as exc:
             raise ScheduledRunRevalidationError("showcase verification failed") from exc
         comparisons = (
@@ -532,6 +553,10 @@ def revalidate_scheduled_run(
                 run,
                 hermes_home=Path(hermes_home),
             )
+            if execution_identity != execution_capability_context.identity_digest_for(
+                package
+            ):
+                raise ScheduledRunRevalidationError("execution capability changed")
             live_digest = compute_package_digest(package, read_budget=budget).sha256
             compatibility, risk = assess_package_execution(
                 package,

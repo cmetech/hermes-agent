@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 import json
 import math
+import re
 from types import MappingProxyType
 from typing import Any
 
 from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
-    WORKFLOW_NORMALIZER_VERSION,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -20,9 +21,72 @@ from plugins.workflow.models import WorkflowLanguageProfile
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _PROFILES = tuple(WorkflowLanguageProfile)
 MAX_WORKFLOW_DOCUMENT_BYTES = 2 * 1024 * 1024
-CONTRACT_READER_VERSION = 1
+DURABLE_METADATA_STRING_MAX_CHARS = 16_384
+ARCHON_V3_CONDITION_MAX_BYTES = 16_384
+ARCHON_V3_CONDITION_MAX_TOKENS = 256
+ARCHON_V3_CONDITION_MAX_NESTING = 3
+ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES = 2_000
+ARCHON_V3_CONDITION_EQUALITY_OPERATORS = ("==", "!=")
+ARCHON_V3_CONDITION_ORDERED_OPERATORS = ("<=", ">=", "<", ">")
+ARCHON_V3_CONDITION_COMPARISON_OPERATORS = (
+    *ARCHON_V3_CONDITION_EQUALITY_OPERATORS,
+    *ARCHON_V3_CONDITION_ORDERED_OPERATORS,
+)
+ARCHON_V3_CONDITION_LOGICAL_OPERATORS = ("&&", "||")
+ARCHON_V3_CONDITION_PRECEDENCE = (
+    (("&&",), "left", ("||",)),
+    (("||",), "left", ()),
+)
+ARCHON_V3_CONDITION_EVALUATION_ORDER = "left_to_right"
+ARCHON_V3_CONDITION_SHORT_CIRCUIT = True
+BASH_INLINE_MAX_BYTES = 32_768
+BASH_RENDERED_COMMAND_MAX_BYTES = 96 * 1024
+BASH_SPILL_MAX_FILES = 64
+BASH_SPILL_MAX_VALUE_BYTES = 500_000
+BASH_SPILL_MAX_TOTAL_BYTES = 2_000_000
+ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
+    "quoted_equality": "exact_string_only",
+    "unquoted_decimal_equality": "canonical_finite_number_only",
+    "ordered_lhs": (
+        "canonical_finite_number",
+        "schemaless_whole_decimal_text",
+    ),
+    "ordered_rhs": ("unquoted_decimal", "quoted_decimal"),
+    "structured_strings_coerce_to_number": False,
+})
+CONTRACT_READER_VERSION = 2
+EDITOR_PROJECTION_VERSION = 2
+CONTRACT_MAX_BYTES = 256_000
+CONTRACT_RESERVED_GROWTH_BYTES = 4_000
+CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
+    "definition_schema": 150_000,
+    "node_kinds": 72_000,
+    "compatibility_codes": 15_000,
+})
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
+ARCHON_V3_NODE_ID_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
+ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN = (
+    r"(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)"
+)
+ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
+    rf"\$(?P<node>{ARCHON_V3_NODE_ID_PATTERN})\.output"
+    rf"(?P<path>(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*)"
+)
+ARCHON_V3_DECIMAL_NUMBER_PATTERN = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
+ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
+    rf"\$({ARCHON_V3_NODE_ID_PATTERN})\.output"
+    rf"(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*"
+)
+ARCHON_V3_WHEN_CLAUSE_PATTERN = (
+    rf"{ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN}\s*"
+    r"(?:==|!=|<=|>=|<|>)\s*"
+    rf"(?:'[^']*'|\"[^\"]*\"|{ARCHON_V3_DECIMAL_NUMBER_PATTERN})"
+)
+ARCHON_V3_WHEN_EXPRESSION_PATTERN = (
+    rf"^\s*{ARCHON_V3_WHEN_CLAUSE_PATTERN}"
+    rf"(?:\s*(?:&&|\|\|)\s*{ARCHON_V3_WHEN_CLAUSE_PATTERN})*\s*$"
+)
 WHEN_CLAUSE_PATTERN = (
     r"\$[\w.:-]+\.output(?:\.[\w.-]+)*\s*"
     r"(?:==|!=|<=|>=|<|>)\s*"
@@ -38,12 +102,266 @@ ECMASCRIPT_WHEN_REFERENCE_PATTERN = (
 ECMASCRIPT_WHEN_CLAUSE_PATTERN = (
     r"\$[\p{L}\p{N}_.:-]+\.output(?:\.[\p{L}\p{N}_.-]+)*\s*"
     r"(?:==|!=|<=|>=|<|>)\s*"
-    r'''(?:'[^']*'|"[^"]*"|-?(?:\d+(?:\.\d*)?|\.\d+))'''
+    r"""(?:'[^']*'|"[^"]*"|-?(?:\d+(?:\.\d*)?|\.\d+))"""
 )
 ECMASCRIPT_WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN}"
     rf"(?:\s*(?:&&|\|\|)\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN})*\s*$"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputReferenceToken:
+    """One exact versioned workflow output reference in an authored surface."""
+
+    node_id: str
+    path: tuple[str, ...]
+    start: int
+    end: int
+
+
+class WorkflowReferenceSyntaxError(ValueError):
+    """A reference-like token cannot be represented by the v3 grammar."""
+
+    code = "output_reference_path_unsupported"
+
+    def __init__(self, message: str, *, start: int | None = None) -> None:
+        self.start = start
+        super().__init__(message)
+
+
+_ARCHON_V3_NODE_ID = re.compile(rf"^(?:{ARCHON_V3_NODE_ID_PATTERN})$", re.ASCII)
+_ARCHON_V3_OUTPUT_REFERENCE = re.compile(
+    ARCHON_V3_OUTPUT_REFERENCE_PATTERN, re.ASCII
+)
+_ARCHON_V3_WHEN_OPERATOR = re.compile(r"(?:==|!=|<=|>=|<|>)", re.ASCII)
+_ARCHON_V3_WHEN_NUMBER = re.compile(
+    ARCHON_V3_DECIMAL_NUMBER_PATTERN, re.ASCII
+)
+_REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
+
+
+def is_reference_safe_node_id(value: str) -> bool:
+    """Return whether a node ID is addressable by the Archon v3 grammar."""
+    return bool(_ARCHON_V3_NODE_ID.fullmatch(value))
+
+
+def _reference_candidate_end(template: str, start: int) -> int:
+    end = start + 1
+    while end < len(template) and template[end] not in _REFERENCE_CANDIDATE_END:
+        end += 1
+    return end
+
+
+def _bash_reference_candidate_end(template: str, start: int) -> int:
+    """Bound one shell candidate without swallowing a following dollar token."""
+    end = start + 1
+    while (
+        end < len(template)
+        and template[end] != "$"
+        and template[end] not in _REFERENCE_CANDIDATE_END
+    ):
+        end += 1
+    return end
+
+
+def _reference_like_candidate(template: str, start: int, end: int) -> bool:
+    """Recognize a possible output token without applying the strict grammar."""
+    if start + 1 >= end:
+        return False
+    first = template[start + 1]
+    if not (first == "_" or first.isalnum() or not first.isascii()):
+        return False
+    candidate = template[start:end]
+    return ".output" in candidate or bool(
+        re.search(r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII)
+    )
+
+
+def iter_output_reference_candidate_spans(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield reference-like dollar ranges without rejecting their grammar."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return
+        end = _bash_reference_candidate_end(template, start)
+        if _reference_like_candidate(template, start, end):
+            yield start, end
+        # Inspect nested dollars independently (for ${...}, $[], $(), and
+        # ANSI-C quote contexts) rather than trusting the outer shell token.
+        position = start + 1
+
+
+def iter_output_references_in_spans(
+    template: str,
+    spans: Iterable[tuple[int, int]],
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Apply the strict grammar only to lexically admitted candidate spans."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    previous_end = 0
+    for start, end in spans:
+        if start < previous_end or start < 0 or end <= start or end > len(template):
+            raise ValueError("output reference candidate spans are invalid")
+        previous_end = end
+        candidate = template[start:end]
+        try:
+            token = _output_reference_at(candidate, 0)
+        except WorkflowReferenceSyntaxError as exc:
+            local_start = exc.start if exc.start is not None else 0
+            raise WorkflowReferenceSyntaxError(
+                str(exc),
+                start=start + local_start,
+            ) from exc
+        if token is not None:
+            yield OutputReferenceToken(
+                node_id=token.node_id,
+                path=token.path,
+                start=start + token.start,
+                end=start + token.end,
+            )
+
+
+def _complete_reference_at(template: str, start: int) -> bool:
+    match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
+    if match is None:
+        return False
+    following = template[match.end()] if match.end() < len(template) else ""
+    return not following or not (
+        following in ".[\\/-"
+        or following == "_"
+        or following.isalnum()
+        or not following.isascii()
+    )
+
+
+def _output_reference_at(
+    template: str, start: int
+) -> OutputReferenceToken | None:
+    match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
+    if match is not None:
+        end = match.end()
+        if not _complete_reference_at(template, start):
+            raise WorkflowReferenceSyntaxError(
+                "output reference uses an unsupported path",
+                start=start,
+            )
+        raw_path = match.group("path")
+        return OutputReferenceToken(
+            node_id=match.group("node"),
+            path=tuple(raw_path[1:].split(".")) if raw_path else (),
+            start=start,
+            end=end,
+        )
+    candidate_end = _reference_candidate_end(template, start)
+    candidate = template[start:candidate_end]
+    if ".output" in candidate or re.search(
+        r"[./\\]output(?:[.\[\]/\\]|$)", candidate, re.ASCII
+    ):
+        raise WorkflowReferenceSyntaxError(
+            "output reference uses an unsupported path",
+            start=start,
+        )
+    return None
+
+
+def iter_output_references(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Iterate references with the single ASCII grammar used by Archon v3."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return
+        token = _output_reference_at(template, start)
+        if token is not None:
+            yield token
+            position = token.end
+            continue
+        candidate_end = _reference_candidate_end(template, start)
+        position = max(start + 1, candidate_end)
+
+
+def contains_output_reference(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> bool:
+    """Find any complete v3 reference despite other malformed candidates."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while True:
+        start = template.find("$", position)
+        if start < 0:
+            return False
+        if _complete_reference_at(template, start):
+            return True
+        position = start + 1
+
+
+def iter_when_output_references(
+    expression: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Yield only v3 condition operands; quoted RHS text stays literal."""
+    if normalizer_version != 3:
+        raise ValueError("strict output references require normalizer version 3")
+    position = 0
+    while position < len(expression) and expression[position].isspace():
+        position += 1
+    while position < len(expression):
+        token = _output_reference_at(expression, position)
+        if token is None:
+            return
+        position = token.end
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        operator = _ARCHON_V3_WHEN_OPERATOR.match(expression, position)
+        if operator is None:
+            return
+        position = operator.end()
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        if position >= len(expression):
+            return
+        quote = expression[position]
+        if quote in "'\"":
+            closing = expression.find(quote, position + 1)
+            if closing < 0:
+                return
+            position = closing + 1
+        else:
+            number = _ARCHON_V3_WHEN_NUMBER.match(expression, position)
+            if number is None:
+                return
+            position = number.end()
+        yield token
+        while position < len(expression) and expression[position].isspace():
+            position += 1
+        if expression.startswith("&&", position) or expression.startswith(
+            "||", position
+        ):
+            position += 2
+            while position < len(expression) and expression[position].isspace():
+                position += 1
+            continue
+        break
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +395,7 @@ class WorkflowFieldSpec:
     value_role: str | None
     default_value: object
     pattern: str | None
+    max_length: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +407,445 @@ class StructuralRequirement:
     equals: object
     required_field: str
     required_shape: str
+
+
+@dataclass(frozen=True, slots=True)
+class DurableWorkflowCode:
+    """Bounded public metadata for one versioned durable workflow code."""
+
+    code: str
+    public_meaning: str
+    area: str
+    profiles: frozenset[WorkflowLanguageProfile]
+    normalizer_versions: frozenset[int]
+    compatibility: bool
+    runtime_failure: bool
+    evidence: bool
+    fields: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "public_meaning": self.public_meaning,
+            "area": self.area,
+            "profiles": sorted(profile.value for profile in self.profiles),
+            "normalizer_versions": sorted(self.normalizer_versions),
+            "compatibility": self.compatibility,
+            "runtime_failure": self.runtime_failure,
+            "evidence": self.evidence,
+            "fields": list(self.fields),
+        }
+
+
+_ARCHON_V3 = frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
+_NORMALIZER_V3 = frozenset({3})
+# The projected Phase 3 code catalog is an authenticated/API-facing bounded
+# summary. 16 KiB covers the approved normalization/reference/condition codes
+# plus the remaining planned Bash and session-recovery entries without making
+# each additive task revise an unrelated test ceiling.
+PHASE3_DURABLE_CODE_CATALOG_MAX_BYTES = 16 * 1024
+
+
+PHASE3_DURABLE_CODES = (
+    DurableWorkflowCode(
+        "archon_timeout_node_unsupported",
+        "timeout is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_idle_timeout_node_unsupported",
+        "idle_timeout is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].idle_timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_node_unsupported",
+        "retry is not supported on this node kind",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_max_attempts_required",
+        "deterministic retries require max_attempts",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry.max_attempts",),
+    ),
+    DurableWorkflowCode(
+        "archon_timeout_invalid",
+        "timeout must be a positive finite millisecond number",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_idle_timeout_invalid",
+        "idle_timeout must be a positive finite millisecond number",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].idle_timeout",),
+    ),
+    DurableWorkflowCode(
+        "archon_retry_invalid",
+        "retry must use the bounded Archon v3 shape",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].retry",),
+    ),
+    DurableWorkflowCode(
+        "workflow_language_snapshot_mismatch",
+        "sealed language semantics differ from the normalized package",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("resources.language",),
+    ),
+    DurableWorkflowCode(
+        "workflow_execution_semantics_mismatch",
+        "sealed execution semantics are malformed or differ from the normalized request",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("resources.phase3_execution_semantics",),
+    ),
+    DurableWorkflowCode(
+        "archon_node_id_not_reference_safe",
+        "node id cannot be represented by the Archon v3 reference grammar",
+        "normalization",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].id",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_not_declared_dependency",
+        "referenced producer is not a direct declared dependency",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "output_reference_path_unsupported",
+        "output reference path cannot be represented or addressed",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "structured_output_field_impossible",
+        "declared structured output schema excludes the referenced path",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        (
+            "nodes[].when",
+            "nodes[].prompt",
+            "nodes[].bash",
+            "nodes[].script",
+            "nodes[].command",
+            "nodes[].loop",
+            "nodes[].approval",
+        ),
+    ),
+    DurableWorkflowCode(
+        "named_script_output_reference_unsupported",
+        "named scripts cannot interpolate workflow output references",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].script",),
+    ),
+    DurableWorkflowCode(
+        "invalid_command_resource",
+        "authenticated command bytes cannot be decoded and parsed safely",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].command",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_missing",
+        "declared producer has no successful winning output",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_not_structured",
+        "field access requires a declared structured output",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_field_missing",
+        "referenced structured field or index is absent",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_path_type",
+        "reference path cannot descend through the canonical value",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_integrity",
+        "winning output publication identity or content changed",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_temporarily_unavailable",
+        "winning output is temporarily unavailable to the host reader",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "output_reference_unavailable",
+        "bounded output-resolution reads were exhausted",
+        "references",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].output references",),
+    ),
+    DurableWorkflowCode(
+        "condition_operand_type",
+        "condition operands have incompatible canonical types",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_operand_nonfinite",
+        "condition numeric operand is not finite",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_numeric_invalid",
+        "condition numeric text is not an exact finite decimal",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "condition_runtime_syntax_invalid",
+        "sealed condition no longer matches the admitted v3 grammar",
+        "conditions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].when",),
+    ),
+    DurableWorkflowCode(
+        "bash_substitution_nul",
+        "Bash substitution contains a NUL byte that shell variables cannot carry",
+        "bash",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].bash",),
+    ),
+    DurableWorkflowCode(
+        "bash_substitution_limit",
+        "Bash substitutions exceed a bounded count or byte limit",
+        "bash",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].bash",),
+    ),
+    DurableWorkflowCode(
+        "bash_spill_integrity",
+        "Bash spill descriptor materialization or launch failed integrity checks",
+        "bash",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].bash",),
+    ),
+    DurableWorkflowCode(
+        "bash_reference_context_unsupported",
+        "Bash reference appears in a shell context that cannot be rewritten safely",
+        "bash",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].bash",),
+    ),
+    DurableWorkflowCode(
+        "context_missing_session",
+        "same-run shared context has no resumable provider session",
+        "sessions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("nodes[].context",),
+    ),
+    DurableWorkflowCode(
+        "persistent_session_recovery_unavailable",
+        "persistent session state could not be verified safely",
+        "sessions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        False,
+        ("persist_sessions", "nodes[].persist_session"),
+    ),
+    DurableWorkflowCode(
+        "persistent_session_missing_fresh_start",
+        "confirmed missing cross-run session selected one fresh execution",
+        "sessions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        False,
+        True,
+        ("evidence.recovery",),
+    ),
+    DurableWorkflowCode(
+        "persistent_session_registry_update_pending",
+        "winning persistent session update requires operator retry",
+        "sessions",
+        _ARCHON_V3,
+        _NORMALIZER_V3,
+        False,
+        True,
+        True,
+        ("evidence.recovery",),
+    ),
+)
 
 
 def _compatibility(
@@ -240,6 +998,118 @@ def _description_for(scope: str, yaml_name: str) -> str:
     return f"{subject} within the node's {scope.replace('_', ' ')} settings."
 
 
+def _field_description(
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+) -> str:
+    """Return stable prose; structured profile semantics are projected separately."""
+    return spec.description
+
+
+def _field_semantics(
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+) -> dict[str, object] | None:
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return None
+    key = (spec.scope, spec.yaml_name)
+    return {
+        ("node", "timeout"): {
+            "unit": "milliseconds",
+            "omitted": 120_000,
+            "scope": "attempt",
+        },
+        ("node", "idle_timeout"): {
+            "unit": "milliseconds",
+            "omitted": "sealed_ai_idle",
+            "scope": "attempt",
+        },
+        ("retry", "max_attempts"): {
+            "counts": "retries_after_initial",
+            "omitted_ai": 2,
+            "omitted_deterministic": 0,
+        },
+        ("node", "depends_on"): {"output_references": "direct_only"},
+        ("node", "when"): {
+            "operands": "typed_scalar",
+            "false": "skip",
+            "errors": "fail_pre_execution",
+        },
+        ("node", "bash"): {
+            "inline_utf8_bytes": BASH_INLINE_MAX_BYTES,
+            "rendered_command_utf8_bytes": BASH_RENDERED_COMMAND_MAX_BYTES,
+            "spill_value_utf8_bytes": BASH_SPILL_MAX_VALUE_BYTES,
+            "spill_files": BASH_SPILL_MAX_FILES,
+            "spill_total_utf8_bytes": BASH_SPILL_MAX_TOTAL_BYTES,
+            "large_values": "contents",
+            "contexts": {
+                "unquoted_token": "substitute",
+                "double_quoted_token": "substitute",
+                "single_quoted_token": "safe_quote_boundary",
+                "escaped_or_comment": "literal",
+            },
+            "unsupported_context": "fail",
+        },
+        ("node", "persist_session"): {
+            "confirmed_cross_run_missing": "one_fresh_execution"
+        },
+    }.get(key)
+
+
+def _field_semantics_id(spec: WorkflowFieldSpec) -> str:
+    """Return the stable contract-local id for one authoritative semantic record."""
+    return f"{spec.scope}.{spec.yaml_name}"
+
+
+def resolve_field_semantics(
+    profile: WorkflowLanguageProfile,
+    semantics_ref: str,
+) -> dict[str, object] | None:
+    """Resolve an editor semantic id through the same field-inventory authority."""
+    selected = _profile(profile)
+    spec = next(
+        (item for item in FIELD_INVENTORY if _field_semantics_id(item) == semantics_ref),
+        None,
+    )
+    return None if spec is None else _field_semantics(spec, selected)
+
+
+def field_definition_catalog(
+    profile: WorkflowLanguageProfile,
+    *,
+    definition_ids: frozenset[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Project self-contained editor metadata keyed by unique inventory scope."""
+    selected = _profile(profile)
+    catalog: dict[str, dict[str, object]] = {}
+    inventory_ids: set[str] = set()
+    for spec in FIELD_INVENTORY:
+        definition_id = _field_semantics_id(spec)
+        if definition_id in inventory_ids:
+            raise RuntimeError(f"duplicate workflow field definition id: {definition_id}")
+        inventory_ids.add(definition_id)
+        if definition_ids is not None and definition_id not in definition_ids:
+            continue
+        definition: dict[str, object] = {
+            "label": spec.title,
+            "description": _field_description(spec, selected),
+            "examples": [_thaw_editor_value(example) for example in spec.examples],
+            "widget": spec.widget,
+            "section": spec.section,
+        }
+        unit = _field_unit(spec, selected)
+        if unit is not None and (
+            selected is WorkflowLanguageProfile.HERMES_LEGACY
+            or _field_semantics(spec, selected) is not None
+        ):
+            definition["unit"] = unit
+        semantics = _field_semantics(spec, selected)
+        if semantics is not None:
+            definition["semantics"] = semantics
+        catalog[definition_id] = definition
+    return catalog
+
+
 def _freeze_editor_value(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({
@@ -252,9 +1122,7 @@ def _freeze_editor_value(value: object) -> object:
 
 def _thaw_editor_value(value: object) -> object:
     if isinstance(value, Mapping):
-        return {
-            str(key): _thaw_editor_value(item) for key, item in value.items()
-        }
+        return {str(key): _thaw_editor_value(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_editor_value(item) for item in value]
     return value
@@ -361,6 +1229,7 @@ def _field(
     value_role: str | None = None,
     default_value: object = _NO_DEFAULT,
     pattern: str | None = None,
+    max_length: int | None = None,
 ) -> WorkflowFieldSpec:
     return WorkflowFieldSpec(
         scope=scope,
@@ -391,12 +1260,18 @@ def _field(
         value_role=value_role or _value_role_for(yaml_name),
         default_value=default_value,
         pattern=pattern,
+        max_length=max_length,
     )
 
 
 NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
+_AI_EXTENSION_NODE_OPTIONS = (
+    ("mcp", "string", "nonempty_string"),
+    ("skills", "array", "string_list"),
+)
+ARCHON_EXTENSION_EXPANSION_PHASE = 4
 
 
 _DEFINITION_FIELDS = (
@@ -476,8 +1351,6 @@ _NODE_FIELDS = (
         phase=3,
         legacy_status="warning",
         legacy_code="legacy_idle_timeout_seconds",
-        archon_status="blocking",
-        archon_code="archon_idle_timeout_semantics_unavailable",
     ),
     _field(
         "node",
@@ -486,8 +1359,6 @@ _NODE_FIELDS = (
         "retry",
         node_types=_NON_LOOP_NODE_TYPES,
         phase=3,
-        archon_status="blocking",
-        archon_code="archon_retry_semantics_unavailable",
     ),
     _field("node", "always_run", "boolean", "boolean", node_types=NODE_TYPES),
     _field(
@@ -499,8 +1370,8 @@ _NODE_FIELDS = (
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_type_not_published",
-        archon_status="blocking",
-        archon_code="archon_output_type_unavailable",
+        pattern=r"\S",
+        max_length=DURABLE_METADATA_STRING_MAX_CHARS,
     ),
     _field(
         "node",
@@ -536,8 +1407,6 @@ _NODE_FIELDS = (
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_format_post_validation",
-        archon_status="blocking",
-        archon_code="archon_output_format_unavailable",
     ),
     _field(
         "node",
@@ -563,21 +1432,16 @@ _NODE_FIELDS = (
         node_types=_AI_NODE_TYPES,
         structural_node_types=NODE_TYPES,
     ),
-    _field(
-        "node",
-        "mcp",
-        "string",
-        "nonempty_string",
-        node_types=_AI_NODE_TYPES,
-        structural_node_types=NODE_TYPES,
-    ),
-    _field(
-        "node",
-        "skills",
-        "array",
-        "string_list",
-        node_types=_AI_NODE_TYPES,
-        structural_node_types=NODE_TYPES,
+    *(
+        _field(
+            "node",
+            name,
+            json_type,
+            shape,
+            node_types=_AI_NODE_TYPES,
+            structural_node_types=NODE_TYPES,
+        )
+        for name, json_type, shape in _AI_EXTENSION_NODE_OPTIONS
     ),
     _field(
         "node",
@@ -667,8 +1531,6 @@ _NODE_FIELDS = (
         phase=3,
         legacy_status="warning",
         legacy_code="legacy_timeout_seconds",
-        archon_status="blocking",
-        archon_code="archon_timeout_semantics_unavailable",
     ),
 )
 
@@ -857,6 +1719,18 @@ def common_node_field_names() -> frozenset[str]:
     return _field_names("node")
 
 
+def field_max_length(scope: str, yaml_name: str) -> int | None:
+    """Return the canonical authored string bound for one direct field."""
+    matches = tuple(
+        spec
+        for spec in FIELD_INVENTORY
+        if spec.scope == scope and spec.yaml_name == yaml_name
+    )
+    if len(matches) != 1:
+        raise ValueError(f"unknown or ambiguous workflow field: {scope}.{yaml_name}")
+    return matches[0].max_length
+
+
 def structural_node_field_names(node_type: str) -> frozenset[str]:
     """Return node fields the loader and JSON Schema accept structurally."""
     if node_type not in NODE_TYPES:
@@ -866,6 +1740,22 @@ def structural_node_field_names(node_type: str) -> frozenset[str]:
         for spec in _specs("node")
         if node_type in spec.structural_node_types
     )
+
+
+def _node_field_is_structural(
+    spec: WorkflowFieldSpec,
+    node_type: str,
+    profile: WorkflowLanguageProfile,
+) -> bool:
+    if node_type not in spec.structural_node_types:
+        return False
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return True
+    if spec.yaml_name == "idle_timeout":
+        return node_type in _AI_NODE_TYPES
+    if spec.yaml_name == "retry":
+        return node_type in {"command", "prompt", "bash", "script"}
+    return True
 
 
 def inapplicable_node_fields(node_type: str) -> dict[str, frozenset[str]]:
@@ -953,7 +1843,7 @@ def _field_unit(
         return (
             "seconds"
             if profile is WorkflowLanguageProfile.HERMES_LEGACY
-            else None
+            else "milliseconds"
         )
     if spec.yaml_name == "maxBudgetUsd":
         return "USD"
@@ -1132,7 +2022,7 @@ def _field_schema(
     status = _field_status(spec, profile)
     result.update({
         "title": spec.title,
-        "description": spec.description,
+        "description": _field_description(spec, profile),
         "x-hermes-section": spec.section,
         "x-hermes-order": _field_order(spec),
         "x-hermes-widget": spec.widget,
@@ -1152,11 +2042,22 @@ def _field_schema(
         )
     if spec.pattern is not None:
         result["pattern"] = spec.pattern
+    if (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and spec.scope == "node"
+        and spec.yaml_name == "id"
+    ):
+        result["pattern"] = rf"^{ARCHON_V3_NODE_ID_PATTERN}$"
+    if spec.max_length is not None:
+        result["maxLength"] = spec.max_length
     unit = _field_unit(spec, profile)
     if unit is not None:
         result["x-hermes-unit"] = unit
     if spec.value_role is not None:
         result["x-hermes-value-role"] = spec.value_role
+    semantics = _field_semantics(spec, profile)
+    if semantics is not None:
+        result["x-hermes-semantics"] = semantics
     if status.status != "supported":
         result["x-hermes-compatibility-code"] = status.code
         result["x-hermes-enforcement-phase"] = spec.enforcement_phase
@@ -1219,7 +2120,7 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
         properties = {
             spec.yaml_name: True
             for spec in specs
-            if node_type in spec.structural_node_types
+            if _node_field_is_structural(spec, node_type, profile)
         }
         variants.append({
             "type": "object",
@@ -1305,9 +2206,7 @@ def compatibility_code_catalog(
             status.code,
             {
                 "status": _editor_status(status.status),
-                "description": _compatibility_description(
-                    status.code, status.status
-                ),
+                "description": _compatibility_description(status.code, status.status),
                 "migration": _compatibility_migration(status.code),
                 "runtime_status": status.status,
                 "severity": "error" if status.status == "blocking" else "warning",
@@ -1332,6 +2231,29 @@ def compatibility_code_catalog(
             "enforcement_phase": spec.enforcement_phase,
             "fields": list(spec.fields),
         }
+    for spec in PHASE3_DURABLE_CODES:
+        if selected not in spec.profiles:
+            continue
+        entry = {
+            "status": "deferred",
+            "description": spec.public_meaning,
+            "fields": list(spec.fields),
+            "area": spec.area,
+            "profiles": sorted(profile.value for profile in spec.profiles),
+            "normalizer_versions": sorted(spec.normalizer_versions),
+            "compatibility": spec.compatibility,
+            "runtime_failure": spec.runtime_failure,
+            "evidence": spec.evidence,
+        }
+        if spec.compatibility:
+            entry.update({
+                "migration": _compatibility_migration(spec.code),
+                "runtime_status": "blocking",
+                "severity": "error",
+                "blocking": True,
+                "enforcement_phase": 3,
+            })
+        grouped[spec.code] = entry
     return {
         code: {**entry, "fields": sorted(entry["fields"])}
         for code, entry in sorted(grouped.items())
@@ -1339,13 +2261,15 @@ def compatibility_code_catalog(
 
 
 def _nested_specs_for_kind(
-    node_type: str,
+    node_type: str, profile: WorkflowLanguageProfile,
 ) -> tuple[tuple[WorkflowFieldSpec, str], ...]:
     nested: list[tuple[WorkflowFieldSpec, str]] = []
-    if node_type != "loop":
+    if node_type != "loop" and not (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and node_type not in {"command", "prompt", "bash", "script"}
+    ):
         nested.extend(
-            (spec, f"nodes[].retry.{spec.yaml_name}")
-            for spec in _specs("retry")
+            (spec, f"nodes[].retry.{spec.yaml_name}") for spec in _specs("retry")
         )
     if node_type == "loop":
         nested.extend(
@@ -1353,8 +2277,7 @@ def _nested_specs_for_kind(
         )
     if node_type == "approval":
         nested.extend(
-            (spec, f"nodes[].approval.{spec.yaml_name}")
-            for spec in _specs("approval")
+            (spec, f"nodes[].approval.{spec.yaml_name}") for spec in _specs("approval")
         )
         nested.extend(
             (spec, f"nodes[].approval.on_reject.{spec.yaml_name}")
@@ -1362,12 +2285,10 @@ def _nested_specs_for_kind(
         )
     if node_type in _AI_NODE_TYPES:
         nested.extend(
-            (spec, f"nodes[].agents.*.{spec.yaml_name}")
-            for spec in _specs("agent")
+            (spec, f"nodes[].agents.*.{spec.yaml_name}") for spec in _specs("agent")
         )
         nested.extend(
-            (spec, f"nodes[].hooks.{spec.yaml_name}")
-            for spec in _specs("hook_event")
+            (spec, f"nodes[].hooks.{spec.yaml_name}") for spec in _specs("hook_event")
         )
         nested.extend(
             (spec, f"nodes[].hooks.*[].{spec.yaml_name}")
@@ -1380,8 +2301,7 @@ def _nested_specs_for_kind(
         nested.extend(
             (
                 spec,
-                "nodes[].hooks.*[].response."
-                f"hookSpecificOutput.{spec.yaml_name}",
+                f"nodes[].hooks.*[].response.hookSpecificOutput.{spec.yaml_name}",
             )
             for spec in _specs("hook_specific")
         )
@@ -1406,22 +2326,19 @@ def _field_descriptor(
         and _editor_status(parent_status.status) == "deferred"
         else _editor_status(status.status)
     )
-    return {
+    descriptor: dict[str, object] = {
         "id": f"{node_type}.{spec.scope}.{spec.yaml_name}",
-        "label": spec.title,
-        "description": spec.description,
+        "definition_ref": _field_semantics_id(spec),
         "field_path": field_path,
         "applicability": {
             "profiles": [profile.value],
             "documents": ["definition"],
             "node_kinds": [node_type],
         },
-        "widget": spec.widget,
-        "section": spec.section,
         "order": _field_order(spec),
         "status": editor_status,
-        "examples": [_thaw_editor_value(example) for example in spec.examples],
     }
+    return descriptor
 
 
 def _node_example(node_type: str) -> dict[str, object]:
@@ -1438,7 +2355,10 @@ def _node_example(node_type: str) -> dict[str, object]:
         "approval": {"message": "Continue?"},
         "cancel": "Cancellation requested.",
     }
-    example: dict[str, object] = {"id": f"{node_type}-node", node_type: payloads[node_type]}
+    example: dict[str, object] = {
+        "id": f"{node_type}-node",
+        node_type: payloads[node_type],
+    }
     if node_type == "script":
         example["runtime"] = "uv"
     return example
@@ -1451,11 +2371,7 @@ def node_kind_descriptors(
     selected = _profile(profile)
     descriptors: list[dict[str, object]] = []
     for kind_order, node_type in enumerate(NODE_TYPES, start=1):
-        payload = next(
-            spec
-            for spec in _specs("node")
-            if spec.yaml_name == node_type
-        )
+        payload = next(spec for spec in _specs("node") if spec.yaml_name == node_type)
         fields = [
             _field_descriptor(
                 spec,
@@ -1465,6 +2381,7 @@ def node_kind_descriptors(
             )
             for spec in _specs("node")
             if node_type in spec.applicable_node_types
+            and _node_field_is_structural(spec, node_type, selected)
         ]
         fields.extend(
             _field_descriptor(
@@ -1489,7 +2406,7 @@ def node_kind_descriptors(
                     }[spec.scope]
                 ),
             )
-            for spec, field_path in _nested_specs_for_kind(node_type)
+            for spec, field_path in _nested_specs_for_kind(node_type, selected)
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
         descriptors.append({
@@ -1517,6 +2434,7 @@ def semantic_rule_descriptors(
 ) -> list[dict[str, object]]:
     """Publish only semantic rules enforced by the current workflow loader."""
     selected = _profile(profile)
+    archon_v3 = selected is WorkflowLanguageProfile.ARCHON_2026_07
     definition_applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
@@ -1550,13 +2468,53 @@ def semantic_rule_descriptors(
             "applicability": definition_applicability,
             "status": "supported",
             "parameters": {
-                "expression_pattern": ECMASCRIPT_WHEN_EXPRESSION_PATTERN,
+                "expression_pattern": (
+                    ARCHON_V3_WHEN_EXPRESSION_PATTERN
+                    if archon_v3
+                    else ECMASCRIPT_WHEN_EXPRESSION_PATTERN
+                ),
                 "expression_flags": "u",
+                **(
+                    {
+                        "limits": {
+                            "max_utf8_bytes": ARCHON_V3_CONDITION_MAX_BYTES,
+                            "max_tokens": ARCHON_V3_CONDITION_MAX_TOKENS,
+                            "max_parser_call_depth": ARCHON_V3_CONDITION_MAX_NESTING,
+                        },
+                        "comparison_operators": list(
+                            ARCHON_V3_CONDITION_COMPARISON_OPERATORS
+                        ),
+                        "logical_operators": list(
+                            ARCHON_V3_CONDITION_LOGICAL_OPERATORS
+                        ),
+                        "precedence": [
+                            {
+                                "operators": list(operators),
+                                "associativity": associativity,
+                                "higher_than": list(higher_than),
+                            }
+                            for operators, associativity, higher_than in (
+                                ARCHON_V3_CONDITION_PRECEDENCE
+                            )
+                        ],
+                        "evaluation": {
+                            "order": ARCHON_V3_CONDITION_EVALUATION_ORDER,
+                            "short_circuit": ARCHON_V3_CONDITION_SHORT_CIRCUIT,
+                        },
+                        "typed_operand_modes": {
+                            key: list(value) if isinstance(value, tuple) else value
+                            for key, value in (
+                                ARCHON_V3_CONDITION_TYPED_OPERAND_MODES.items()
+                            )
+                        },
+                    }
+                    if archon_v3
+                    else {}
+                ),
             },
             "examples": [
-                "$prepare.output.status == 'ready' && "
-                "$inspect.output.count >= 2",
-                "$café.output.status == 'ready'",
+                "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
+                *([] if archon_v3 else ["$café.output.status == 'ready'"]),
             ],
         },
         {
@@ -1570,16 +2528,57 @@ def semantic_rule_descriptors(
             "status": "supported",
             "parameters": {
                 "syntax": "$ID.output(.path)*",
-                "pattern": ECMASCRIPT_WHEN_REFERENCE_PATTERN,
+                "pattern": (
+                    ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN
+                    if archon_v3
+                    else ECMASCRIPT_WHEN_REFERENCE_PATTERN
+                ),
                 "pattern_flags": "u",
                 "node_id_capture_group": 1,
                 "require_upstream": True,
+                **({"require_direct_dependency": True} if archon_v3 else {}),
             },
             "examples": [
                 "$prepare.output.status == 'ready'",
-                "$café.output.status == 'ready'",
+                *([] if archon_v3 else ["$café.output.status == 'ready'"]),
             ],
         },
+        *(
+            [
+                {
+                    "id": "strict-output-reference",
+                    "label": "Strict output reference",
+                    "description": (
+                        "Every output reference names a direct dependency and uses "
+                        "the closed ASCII node and path grammar."
+                    ),
+                    "field_paths": [
+                        "nodes[].when",
+                        "nodes[].prompt",
+                        "nodes[].bash",
+                        "nodes[].script",
+                        "nodes[].command",
+                        "nodes[].loop.prompt",
+                        "nodes[].loop.until_bash",
+                        "nodes[].approval.message",
+                        "nodes[].approval.on_reject.prompt",
+                    ],
+                    "applicability": definition_applicability,
+                    "status": "supported",
+                    "parameters": {
+                        "syntax": "$ID.output(.path)*",
+                        "pattern": ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN,
+                        "pattern_flags": "u",
+                        "node_id_capture_group": 1,
+                        "require_upstream": True,
+                        "require_direct_dependency": True,
+                    },
+                    "examples": ["$prepare.output.status"],
+                }
+            ]
+            if archon_v3
+            else []
+        ),
         {
             "id": "companion-node-reference-list",
             "label": "Companion node references",
@@ -1623,6 +2622,28 @@ def contract_documentation(
         },
         separators=(",", ":"),
     )
+    phase3_topics = (
+        [
+            {
+                "id": "persistent-session-recovery",
+                "operator_surfaces": [
+                    "workflow doctor",
+                    "Run Inspector recovery evidence",
+                ],
+            },
+            {
+                "id": "extension-options",
+                "parameters": {
+                    "_".join(
+                        name for name, _json_type, _shape in _AI_EXTENSION_NODE_OPTIONS
+                    ): "options_not_node_kinds",
+                    "loops_includes_phase": ARCHON_EXTENSION_EXPANSION_PHASE,
+                },
+            },
+        ]
+        if selected is WorkflowLanguageProfile.ARCHON_2026_07
+        else []
+    )
     return {
         "topics": [
             {
@@ -1633,9 +2654,7 @@ def contract_documentation(
                     "The definition YAML is the workflow graph authority. Each node "
                     "declares exactly one node-kind field."
                 ),
-                "field_paths": [
-                    _contract_path(spec) for spec in _specs("definition")
-                ],
+                "field_paths": [_contract_path(spec) for spec in _specs("definition")],
                 "applicability": applicability,
                 "examples": [definition],
             },
@@ -1663,15 +2682,18 @@ def contract_documentation(
                     "The optional companion YAML may declare metadata and policy but "
                     "never graph topology or trust authority."
                 ),
-                "field_paths": [
-                    _contract_path(spec) for spec in _specs("sidecar")
-                ],
+                "field_paths": [_contract_path(spec) for spec in _specs("sidecar")],
                 "applicability": {
                     "profiles": [selected.value],
                     "documents": ["sidecar"],
                 },
                 "examples": [profile_sidecar],
             },
+            {
+                "id": "stable-codes",
+                "code_source": "compatibility_codes",
+            },
+            *phase3_topics,
         ],
         "examples": [
             {
@@ -1742,13 +2764,17 @@ def canonical_contract_json(value: object) -> str:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("canonical contract JSON object keys must be strings")
-        return "{" + ",".join(
-            f"{json.dumps(key, ensure_ascii=False)}:{canonical_contract_json(value[key])}"
-            for key in sorted(
-                value,
-                key=lambda item: item.encode("utf-16-be", "surrogatepass"),
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False)}:{canonical_contract_json(value[key])}"
+                for key in sorted(
+                    value,
+                    key=lambda item: item.encode("utf-16-be", "surrogatepass"),
+                )
             )
-        ) + "}"
+            + "}"
+        )
     if isinstance(value, list | tuple):
         return "[" + ",".join(canonical_contract_json(item) for item in value) + "]"
     raise TypeError(
@@ -1761,18 +2787,33 @@ def workflow_authoring_contract(
 ) -> dict[str, object]:
     """Return one bounded, side-effect-free workflow authoring contract."""
     selected = _profile(profile)
+    node_kinds = node_kind_descriptors(selected)
+    referenced_definitions = frozenset(
+        str(field["definition_ref"])
+        for node_kind in node_kinds
+        for field in node_kind["fields"]
+    )
     envelope: dict[str, object] = {
         "schema_version": 1,
         "contract_reader_version": CONTRACT_READER_VERSION,
+        "editor_projection_version": EDITOR_PROJECTION_VERSION,
         "profile": selected.value,
-        "normalizer_version": WORKFLOW_NORMALIZER_VERSION,
+        "normalizer_version": CURRENT_NORMALIZER_BY_PROFILE[selected],
+        "field_definitions": field_definition_catalog(
+            selected, definition_ids=referenced_definitions
+        ),
         "definition_schema": definition_json_schema(selected),
         "sidecar_schema": sidecar_json_schema(selected),
-        "node_kinds": node_kind_descriptors(selected),
+        "node_kinds": node_kinds,
         "semantic_rules": semantic_rule_descriptors(selected),
         "compatibility_codes": compatibility_code_catalog(selected),
         "documentation": contract_documentation(selected),
-        "limits": {"max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES},
+        "limits": {
+            "max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES,
+            "max_contract_bytes": CONTRACT_MAX_BYTES,
+            "reserved_growth_bytes": CONTRACT_RESERVED_GROWTH_BYTES,
+            "section_max_bytes": dict(CONTRACT_SECTION_MAX_BYTES),
+        },
         "x-hermes-provenance": {
             "producer": "hermes-agent",
             "command": "hermes workflow schema",

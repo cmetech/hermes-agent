@@ -182,6 +182,7 @@ export interface WorkflowCompatibilityFinding {
   code: string
   level: string
   message: string
+  migration?: string
   path: string
 }
 
@@ -305,12 +306,66 @@ export type WorkflowEvidenceKind =
   | 'recovery'
   | 'timeline'
 
+export interface WorkflowTypedArtifact extends Record<string, unknown> {
+  attempt_id?: null | string
+  integrity_status?: null | string
+  media_type?: null | string
+  node_id?: null | string
+  output_type?: null | string
+  produced_at?: null | string
+  publication_id: string
+  recovery_status?: null | string
+  schema_fingerprint?: null | string
+  session_id?: null | string
+  sha256?: null | string
+  size_bytes?: null | number
+}
+
+export interface WorkflowArtifactPreview {
+  bytes_returned: number
+  content?: unknown
+  media_type: string
+  publication_id: string
+  size_bytes: number
+  truncated: boolean
+}
+
 export interface WorkflowEvidencePage {
   items: Array<Record<string, unknown>>
   kind: WorkflowEvidenceKind
   next_cursor: number
   schema_version: number
   truncated: boolean
+}
+
+export interface WorkflowAttemptEvidence extends Record<string, unknown> {
+  attempt_id: string
+  error?: { code: string; message?: null | string }
+  node_id: string
+  retry: {
+    additional_provider_attempts: number
+    capped: boolean
+    effective_total_attempts: number
+    remaining_attempts: number
+    requested_retries: number
+    requested_total_attempts: number
+    retry_consumed: number
+  }
+  state?: string
+}
+
+export interface WorkflowPersistentSessionRecoveryEvidence extends Record<string, unknown> {
+  attempt_id: string
+  cache_fingerprint_sha256: string
+  missing_session_sha256: string
+  node_id: string
+  outcome: string
+  provider: string
+  provider_attempts_before_recovery: number
+  recovery_kind: 'persistent_session'
+  registry_generation: number
+  runtime_profile: string
+  source: string
 }
 
 export interface WorkflowRunPage {

@@ -62,6 +62,12 @@ class ProviderProfile:
     model_capabilities_path: str = ""
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
+    # Explicit provider-owned structured-output declaration. ``None`` means
+    # undeclared and therefore eligible only for the central managed-loop
+    # prompt adaptation fallback. An explicit ``"unsupported"`` forbids that
+    # fallback. Native declarations are honored only on a trusted direct URL.
+    structured_output_strategy: str | None = None
+
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
     # tool-result messages natively.  Set on providers that expose

@@ -64,6 +64,102 @@ except ModuleNotFoundError:
 import os
 import sys
 
+_PROFILE_VALUE_FLAGS = frozenset({
+    "-z",
+    "--oneshot",
+    "-m",
+    "--model",
+    "--provider",
+    "-t",
+    "--toolsets",
+    "-r",
+    "--resume",
+    "-s",
+    "--skills",
+    "--usage-file",
+})
+_PROFILE_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
+_WORKFLOW_ROOT_VALUE_FLAGS = frozenset({"--workdir", "--hermes-home"})
+
+
+def _workflow_schema_action_index(argv: list[str]) -> int | None:
+    """Resolve the exact top-level ``workflow schema`` action dependency-free."""
+    command_index = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return None
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("--profile=") or (arg.startswith("--") and "=" in arg):
+            i += 1
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        command_index = i
+        break
+    if command_index is None or argv[command_index] != "workflow":
+        return None
+
+    i = command_index + 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in _WORKFLOW_ROOT_VALUE_FLAGS or arg in {"--profile", "-p"}:
+            i += 2
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _WORKFLOW_ROOT_VALUE_FLAGS):
+            i += 1
+            continue
+        if arg.startswith("--profile="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return i if arg == "schema" else None
+    return None
+
+
+def _workflow_schema_owns_early_startup(argv: list[str]) -> bool:
+    """Identify schema-owned startup without importing the normal CLI graph."""
+    action_index = _workflow_schema_action_index(argv)
+    if action_index is None:
+        return False
+
+    # Normal dispatch gives global version and one-shot flags precedence when
+    # they occur before the top-level command. Preserve that authority here;
+    # occurrences under ``workflow`` remain schema parse candidates.
+    i = 0
+    while i < action_index:
+        arg = argv[i]
+        if arg == "workflow":
+            return True
+        if arg in {"--version", "-V", "-z", "--oneshot"}:
+            return False
+        if arg.startswith("--oneshot="):
+            return False
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < action_index and not argv[i].startswith("-"):
+                i += 1
+            continue
+        i += 1
+    return False
+
+
+_WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = _workflow_schema_owns_early_startup(sys.argv[1:])
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
@@ -78,10 +174,11 @@ import sys
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+if not _WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP:
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -495,58 +592,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
-_PROFILE_VALUE_FLAGS = frozenset({
-    "-z", "--oneshot", "-m", "--model", "--provider", "-t", "--toolsets",
-    "-r", "--resume", "-s", "--skills", "--usage-file",
-})
-_PROFILE_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
-_WORKFLOW_ROOT_VALUE_FLAGS = frozenset({"--workdir", "--hermes-home"})
-
-
-def _workflow_schema_action_index(argv: list[str]) -> int | None:
-    """Resolve the exact top-level ``workflow schema`` action dependency-free."""
-    command_index = None
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--":
-            return None
-        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
-            i += 2
-            continue
-        if arg.startswith("--profile=") or (arg.startswith("--") and "=" in arg):
-            i += 1
-            continue
-        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
-            i += 1
-            if i < len(argv) and not argv[i].startswith("-"):
-                i += 1
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        command_index = i
-        break
-    if command_index is None or argv[command_index] != "workflow":
-        return None
-
-    i = command_index + 1
-    while i < len(argv):
-        arg = argv[i]
-        if arg in _WORKFLOW_ROOT_VALUE_FLAGS or arg in {"--profile", "-p"}:
-            i += 2
-            continue
-        if any(arg.startswith(f"{flag}=") for flag in _WORKFLOW_ROOT_VALUE_FLAGS):
-            i += 1
-            continue
-        if arg.startswith("--profile="):
-            i += 1
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        return i if arg == "schema" else None
-    return None
 
 
 def _parse_workflow_schema_candidate(argv: list[str]):

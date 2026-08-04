@@ -32,6 +32,29 @@ ATTENTION_KINDS = frozenset(
         "reconciliation_required",
     }
 )
+_GENERIC_DELIVERY_FAILURE_REASON = "notification delivery failed"
+_STABLE_DELIVERY_FAILURE_REASONS = frozenset(
+    {
+        "adapter_send_failed",
+        "adapter_send_timeout",
+        "adapter_unavailable",
+        "bad_format",
+        "delivery_store_unavailable",
+        "forbidden",
+        "gateway_loop_unavailable",
+        "invalid_text",
+        "not_found",
+        "outcome_uncertain",
+        "permanent_failure",
+        "projection_failed",
+        "rate_limited",
+        "retryable_failure",
+        "too_long",
+        "transient",
+        "unauthorized",
+        "unknown",
+    }
+)
 
 
 class NotificationReconciliationError(RuntimeError):
@@ -40,6 +63,12 @@ class NotificationReconciliationError(RuntimeError):
 
 class _NotificationRepairPageFull(Exception):
     """The next safe journal would exceed this scanner iteration's budget."""
+
+
+def _stable_delivery_failure_reason(error: object) -> str:
+    if isinstance(error, str) and error in _STABLE_DELIVERY_FAILURE_REASONS:
+        return error
+    return _GENERIC_DELIVERY_FAILURE_REASON
 
 
 def install_notification_schema(connection: sqlite3.Connection) -> None:
@@ -145,6 +174,77 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str 
     return None
 
 
+def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Project notification data without durable raw recovery/error authority."""
+    projected = sanitize_projection(dict(payload))
+    if not isinstance(projected, dict):
+        return {}
+    sensitive_values: set[str] = set()
+
+    def normalized_key(key: object) -> str:
+        return "".join(
+            character for character in str(key).lower() if character.isalnum()
+        )
+
+    def is_sensitive_key(key: object) -> bool:
+        normalized = normalized_key(key)
+        return (
+            normalized.endswith("sessionid")
+            or normalized.endswith("cachefingerprint")
+            or normalized in {"sessionalias", "fingerprintalias"}
+        ) and not normalized.endswith("sha256")
+
+    to_collect: list[object] = [projected]
+    while to_collect:
+        current = to_collect.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if is_sensitive_key(key) and isinstance(value, str):
+                    sensitive_values.add(value)
+                to_collect.append(value)
+        elif isinstance(current, list):
+            to_collect.extend(current)
+
+    pending: list[object] = [projected]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key in tuple(current):
+                normalized = normalized_key(key)
+                if is_sensitive_key(key) or normalized in {
+                    "sessionregistryupdatecandidate",
+                    "pendingsessionregistryupdate",
+                    "pendingsessionregistryupdates",
+                }:
+                    current.pop(key, None)
+                    continue
+                if normalized == "lasterror":
+                    current[key] = "workflow operation failed"
+                    continue
+                child = current[key]
+                if isinstance(child, str):
+                    for private_value in sorted(
+                        sensitive_values, key=len, reverse=True
+                    ):
+                        if private_value:
+                            child = child.replace(private_value, "[REDACTED]")
+                    current[key] = child
+                else:
+                    pending.append(child)
+        elif isinstance(current, list):
+            for index, child in enumerate(current):
+                if isinstance(child, str):
+                    for private_value in sorted(
+                        sensitive_values, key=len, reverse=True
+                    ):
+                        if private_value:
+                            child = child.replace(private_value, "[REDACTED]")
+                    current[index] = child
+                else:
+                    pending.append(child)
+    return projected
+
+
 class NotificationOutbox:
     """Lease-based delivery authority backed by the RunStore SQLite index."""
 
@@ -179,7 +279,9 @@ class NotificationOutbox:
         occurred_at: str,
     ) -> None:
         safe_payload = json.dumps(
-            sanitize_projection({"decision": decision, **dict(payload)}),
+            _value_free_notification_payload(
+                {"decision": decision, **dict(payload)}
+            ),
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -225,7 +327,9 @@ class NotificationOutbox:
             f"{run_id}:{kind}:{transition_version}:{transition_destination}"
         )
         safe_payload = json.dumps(
-            sanitize_projection(dict(payload)), sort_keys=True, separators=(",", ":")
+            _value_free_notification_payload(payload),
+            sort_keys=True,
+            separators=(",", ":"),
         )
         gateway_destination = self._gateway_destination(
             run_id,
@@ -435,8 +539,9 @@ class NotificationOutbox:
                     raise NotificationReconciliationError(
                         "journal exceeds its enforced quota"
                     )
-                events = self.store._read_journal_events(
+                events = self.store._verified_public_journal_events_locked(
                     directory,
+                    run_id=run_id,
                     recover_torn_tail=False,
                     journal_data=data,
                 )
@@ -754,6 +859,7 @@ class NotificationOutbox:
     ) -> bool:
         """Durably stop a delivery that is unsafe or pointless to replay."""
         observed = self._aware(now or datetime.now(timezone.utc))
+        failure_reason = _stable_delivery_failure_reason(error)
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -773,14 +879,17 @@ class NotificationOutbox:
                 "UPDATE workflow_notification_outbox SET state='dead', "
                 "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, "
                 "last_error=? WHERE notification_id=?",
-                (observed.isoformat(), error[:512], notification_id),
+                (observed.isoformat(), failure_reason, notification_id),
             )
             self._record_decision_fact(
                 connection,
                 row,
                 decision=decision,
                 occurrence_key=f"{decision}:{uuid.uuid4().hex}",
-                payload={"error": error[:512], "attempts": row["attempts"]},
+                payload={
+                    "error": failure_reason,
+                    "attempts": row["attempts"],
+                },
                 occurred_at=observed.isoformat(),
             )
             connection.commit()
@@ -806,6 +915,7 @@ class NotificationOutbox:
         now: datetime | None = None,
     ) -> bool:
         observed = self._aware(now or datetime.now(timezone.utc))
+        failure_reason = _stable_delivery_failure_reason(error)
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -826,7 +936,7 @@ class NotificationOutbox:
                     "dead" if dead else "pending",
                     available.isoformat(),
                     observed.isoformat(),
-                    error[:512],
+                    failure_reason,
                     notification_id,
                 ),
             )
@@ -836,7 +946,10 @@ class NotificationOutbox:
                     row,
                     decision="terminal_dead_letter",
                     occurrence_key=f"terminal-dead:{attempts}:{uuid.uuid4().hex}",
-                    payload={"attempts": attempts, "error": error[:512]},
+                    payload={
+                        "attempts": attempts,
+                        "error": failure_reason,
+                    },
                     occurred_at=observed.isoformat(),
                 )
             connection.commit()

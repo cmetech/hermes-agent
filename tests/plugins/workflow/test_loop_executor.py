@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
+
+import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.loop import LoopExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.models import (
+    DeadlineBudget,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    freeze_value,
+)
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+)
+from plugins.workflow.resources import StrictSubstitutionRenderer, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -40,9 +52,11 @@ def _context(
     variable_context: VariableContext | None = None,
     node_state: dict[str, object] | None = None,
     is_cancelled=None,
+    depends_on: tuple[str, ...] = (),
 ) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
     run_directory.mkdir(exist_ok=True)
+    variables = variable_context or VariableContext(workflow_id="run-1")
     return NodeExecutionContext(
         run_id="run-1",
         run_directory=run_directory,
@@ -50,7 +64,7 @@ def _context(
             id="iterate",
             node_type="loop",
             value=freeze_value(loop),
-            depends_on=(),
+            depends_on=depends_on,
             source_index=0,
             source_line=1,
             options=freeze_value({}),
@@ -61,10 +75,85 @@ def _context(
             "provider": "fake-provider",
             "model": "fake-model",
         }),
-        variable_context=variable_context or VariableContext(workflow_id="run-1"),
+        variable_context=variables,
+        language_profile=(
+            WorkflowLanguageProfile.ARCHON_2026_07
+            if variables.normalizer_version == 3
+            else WorkflowLanguageProfile.HERMES_LEGACY
+        ),
         node_state=node_state or {},
         is_cancelled=is_cancelled,
     )
+
+
+def test_v3_loop_prompt_rechecks_direct_dependency_before_iteration(tmp_path) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Use $producer.output.answer",
+            "until": "DONE",
+            "max_iterations": 1,
+        },
+        variable_context=VariableContext(
+            normalizer_version=3,
+            node_outputs={
+                "producer": ResolvedNodeOutput(
+                    canonical_bytes=b'{"answer":"ready"}',
+                    value={"answer": "ready"},
+                    text='{"answer":"ready"}',
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="producer",
+                    attempt_id="attempt-winner",
+                    publication_id="a" * 32,
+                    schema_fingerprint="3" * 64,
+                    canonicalization_version=1,
+                )
+            },
+        ),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
+
+
+def test_loop_child_rechecks_shared_attempt_wall_before_provider(
+    tmp_path, monkeypatch
+) -> None:
+    runner = FakeAgentRunner("must not run")
+    clock = {"now": 10.0}
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    executor = LoopExecutor(runner)
+
+    def prepare_inline_agents(_context):
+        clock["now"] = 11.0
+        return {}
+
+    monkeypatch.setattr(executor._agent, "_inline_agents", prepare_inline_agents)
+    context = replace(
+        _context(
+            tmp_path,
+            {"prompt": "Work", "until": "DONE", "max_iterations": 1},
+        ),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: clock["now"],
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_timeout"
+    assert runner.requests == []
 
 
 def _artifact_text(context: NodeExecutionContext, result, index: int = -1) -> str:
@@ -182,6 +271,234 @@ def test_until_bash_exit_zero_completes_using_shell_quoted_previous_output(
     assert result.status == "succeeded"
     assert result.metadata["loop_state"]["completed_by"] == "until_bash"
     assert _artifact_text(context, result) == "value with spaces"
+
+
+def test_v3_loop_prompt_and_until_bash_share_strict_rendered_field(tmp_path) -> None:
+    runner = FakeAgentRunner("keep going")
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"value with spaces"}',
+                value={"answer": "value with spaces"},
+                text='{"answer":"value with spaces"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Use $producer.output.answer",
+            "until": "DONE",
+            "until_bash": "test $producer.output.answer = 'value with spaces'",
+            "max_iterations": 2,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert runner.requests[0].prompt == "Use value with spaces"
+
+
+def test_v3_loop_prompt_renders_authored_tokens_once_without_rescanning_output(
+    tmp_path,
+) -> None:
+    runner = FakeAgentRunner("DONE")
+    literal_output = (
+        "$ARGUMENTS|$other.output.value|$bad.output-field|$LOOP_PREV_OUTPUT"
+    )
+    variables = VariableContext(
+        arguments="must not replace output data",
+        loop_prev_output="must not replace output data",
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=(
+                    b'{"answer":"$ARGUMENTS|$other.output.value|'
+                    b'$bad.output-field|$LOOP_PREV_OUTPUT"}'
+                ),
+                value={"answer": literal_output},
+                text=(
+                    '{"answer":"$ARGUMENTS|$other.output.value|'
+                    '$bad.output-field|$LOOP_PREV_OUTPUT"}'
+                ),
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Previous=<$LOOP_PREV_OUTPUT> data=<$producer.output.answer>",
+            "until": "DONE",
+            "max_iterations": 1,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].prompt == f"Previous=<> data=<{literal_output}>"
+
+
+def test_v3_until_bash_reference_failure_precedes_spill_side_effect(tmp_path) -> None:
+    runner = FakeAgentRunner("keep going")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Work",
+            "until": "DONE",
+            "until_bash": "test $producer.output.answer = ready",
+            "max_iterations": 2,
+        },
+        variable_context=VariableContext(normalizer_version=3),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert runner.requests == []
+    assert list(context.run_directory.glob("**/until-0001-variables")) == []
+
+
+def test_v3_until_bash_field_failure_precedes_provider_and_bash_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runner = FakeAgentRunner("provider must not run")
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Work",
+            "until": "DONE",
+            "until_bash": "test $producer.output.missing = ready",
+            "max_iterations": 2,
+        },
+        variable_context=variables,
+        depends_on=("producer",),
+    )
+    bash_calls: list[NodeExecutionContext] = []
+
+    def reject_bash(_self, bash_context):
+        bash_calls.append(bash_context)
+        pytest.fail("Bash launched before until_bash strict preflight")
+
+    monkeypatch.setattr(
+        "plugins.workflow.executors.bash.BashExecutor.execute",
+        reject_bash,
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        LoopExecutor(runner).execute(context)
+
+    assert exc.value.code == "output_reference_field_missing"
+    assert runner.requests == []
+    assert bash_calls == []
+    assert not (context.run_directory / "nodes").exists()
+
+
+def test_v3_until_bash_preflight_keeps_loop_previous_output_dynamic(tmp_path) -> None:
+    runner = FakeAgentRunner("first value", "second value")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Previous: $LOOP_PREV_OUTPUT",
+            "until": "DONE",
+            "until_bash": "test $LOOP_PREV_OUTPUT = 'second value'",
+            "max_iterations": 2,
+            "fresh_context": True,
+        },
+        variable_context=VariableContext(normalizer_version=3),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert [request.prompt for request in runner.requests] == [
+        "Previous: ",
+        "Previous: first value",
+    ]
+
+
+def test_v3_until_bash_does_not_rescan_reference_like_model_output(
+    tmp_path, monkeypatch
+) -> None:
+    runner = FakeAgentRunner("$ARGUMENTS")
+    render_calls: list[tuple[str, bool]] = []
+    original_render = StrictSubstitutionRenderer.render_bash
+
+    def count_render(self, template, **kwargs):
+        render_calls.append((template, bool(kwargs.get("secure_v3", False))))
+        return original_render(self, template, **kwargs)
+
+    monkeypatch.setattr(
+        StrictSubstitutionRenderer,
+        "render_bash",
+        count_render,
+    )
+    context = replace(
+        _context(
+            tmp_path,
+            {
+                "prompt": "Produce a literal token",
+                "until": "DONE",
+                "until_bash": "test $LOOP_PREV_OUTPUT = \\$ARGUMENTS",
+                "max_iterations": 1,
+            },
+            variable_context=VariableContext(
+                arguments="must-not-replace-model-output",
+                normalizer_version=3,
+            ),
+        ),
+        normalizer_version=3,
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
+    assert render_calls == [
+        ("test $LOOP_PREV_OUTPUT = \\$ARGUMENTS", True),
+    ]
 
 
 def test_interactive_loop_pauses_and_resume_injects_user_input_fresh(
@@ -319,22 +636,25 @@ def test_scheduler_uses_ai_wall_deadline_for_loop_nodes(
 def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     tmp_path: Path, workflow_writer
 ) -> None:
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="journaled-loop",
-            nodes=[
-                {
-                    "id": "iterate",
-                    "loop": {
-                        "prompt": "Refine",
-                        "until": "DONE",
-                        "max_iterations": 2,
-                    },
-                }
-            ],
-        )
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="journaled-loop",
+        nodes=[
+            {
+                "id": "iterate",
+                "loop": {
+                    "prompt": "Refine",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                },
+                "output_type": "LoopReport",
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -373,6 +693,23 @@ def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     ]
     assert [event["payload"]["iteration"] for event in iteration_events] == [1, 2]
     assert len(result["artifacts"]) == 2
+    published = [
+        artifact
+        for artifact in result["artifacts"]
+        if artifact.get("publication_id") is not None
+    ]
+    assert len(published) == 1
+    completion = next(
+        event
+        for event in store.tail_events(admitted.run_id)
+        if event["event_type"] == "node_succeeded"
+    )
+    journaled = next(
+        artifact
+        for artifact in completion["payload"]["artifacts"]
+        if artifact["relative_path"] == published[0]["relative_path"]
+    )
+    assert journaled == published[0]
 
 
 def test_scheduler_preserves_terminal_frames_when_loop_reaches_journal_quota(
@@ -432,25 +769,27 @@ def test_scheduler_preserves_terminal_frames_when_loop_reaches_journal_quota(
 def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     tmp_path: Path, workflow_writer
 ) -> None:
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="resumable-loop",
-            interactive=True,
-            nodes=[
-                {
-                    "id": "iterate",
-                    "loop": {
-                        "prompt": "Feedback: $LOOP_USER_INPUT",
-                        "until": "DONE",
-                        "max_iterations": 2,
-                        "interactive": True,
-                        "gate_message": "Review",
-                    },
-                }
-            ],
-        )
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="resumable-loop",
+        interactive=True,
+        nodes=[
+            {
+                "id": "iterate",
+                "loop": {
+                    "prompt": "Feedback: $LOOP_USER_INPUT",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                    "interactive": True,
+                    "gate_message": "Review",
+                },
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -467,6 +806,7 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     )
     RunScheduler(store, agent_runner=FakeAgentRunner("draft")).advance(admitted.run_id)
     paused = store.load_run(admitted.run_id)
+    assert paused["nodes"]["iterate"].get("retry_consumed", 0) == 0
     interaction_id = paused["nodes"]["iterate"]["pending_interaction"][
         "interaction_id"
     ]
@@ -482,6 +822,7 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
 
     assert resumed["status"] == "running"
     assert completed["status"] == "succeeded"
+    assert completed["nodes"]["iterate"]["retry_consumed"] == 1
     assert runner.requests[0].prompt == "Feedback: tighten evidence"
     assert (
         "tighten evidence"

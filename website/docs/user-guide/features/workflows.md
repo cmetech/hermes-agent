@@ -12,13 +12,19 @@ Hermes workflows are durable, resumable packages that coordinate commands, promp
 
 Existing unversioned packages retain `hermes-legacy` behavior. New packages can
 opt into the fail-closed `archon-2026-07` contract by declaring it in the
-Hermes companion file. Archon-profile packages require a Phase-1-capable
+Hermes companion file. Archon-profile packages require a profile-aware
 backend; keep workflow directories shared with older runtimes unversioned until
 every consumer recognizes the declaration.
 
 See the [Workflow YAML reference](./workflow-yaml-reference) for the generated
-schema commands, complete field inventory, current Phase 1 status, examples,
+schema commands, complete field inventory, current Phase 2 status, examples,
 and migration steps.
+
+The portable graph has seven node kinds: `command`, `prompt`, `bash`, `script`,
+`loop`, `approval`, and `cancel`. MCP and skills are existing per-node options
+on `command` and `prompt`, not extra node kinds. Script nodes already support
+the documented `uv` and `bun` runtimes; structured data does not add another
+script or extension node type.
 
 ## Browse the catalog
 
@@ -140,6 +146,35 @@ hermes workflow cancel RUN_ID
 ```
 
 Use `hermes workflow --help` or `hermes workflow ACTION --help` for the exact options supported by your installed version.
+
+### Inspect typed output
+
+Under `archon-2026-07`, a successful output-producing node with an
+`output_type` can publish one typed artifact for its winning attempt. The label
+is open and case-sensitive. It never becomes a path or filename, and a stale or
+losing attempt cannot publish. `hermes-legacy` remains unchanged:
+`output_format` is post-execution validation and `output_type` does not create a
+typed publication.
+
+Publication is atomic and journal-authoritative. Content and metadata become
+visible together; recovery removes incomplete or unjournaled bundles and
+reconstructs missing content only from the corroborated winning attempt with
+the recorded digest. A mismatch becomes an explicit integrity or
+reconciliation state instead of silently selecting another attempt.
+
+Run evidence contains bounded metadata—output type, media type, producer,
+winning attempt, size, SHA-256, optional schema fingerprint, production time,
+and optional session identity—not the body. The backend issues an opaque
+publication ID. Authenticated preview and download operations accept that ID,
+never a filesystem path. Preview is limited to 64 KiB: complete canonical JSON
+can be formatted, text can be truncated, and unknown media remains download
+only. Empty successful text is a valid zero-byte artifact.
+
+In Desktop, open a run and choose its **Artifacts** evidence tab. A row appears
+only when the backend confirms a valid publication ID. Select **Preview**
+explicitly or **Download** to choose a native destination. An older backend's
+generic artifact evidence remains visible in the generic evidence view instead
+of being guessed into a typed artifact.
 
 ## Background operation
 

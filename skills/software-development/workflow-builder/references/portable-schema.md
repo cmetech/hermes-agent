@@ -44,19 +44,38 @@ because older strict companion parsers reject the new field. An explicit
 `hermes-legacy` declaration is suitable only when every reader recognizes
 `language_compatibility`.
 
-Phase 1 intentionally blocks these Archon declarations:
+Phase 3 supports Archon AI `output_format` and `output_type`. `output_format`
+is normalized as bounded Draft 2020-12 JSON Schema when the package loads, and
+direct `$node.output.field` condition references are rejected only when every
+closed schema branch proves that field path impossible. `output_type` is
+an open, case-sensitive semantic label. A successful Archon output-producing
+node publishes only its winning attempt; the same declaration under legacy
+does not publish a typed artifact.
+
+Under `hermes-legacy`, these same declarations retain their existing warning
+semantics: `output_format` emits `legacy_output_format_post_validation`, and
+`output_type` emits `legacy_output_type_not_published` because no typed artifact
+is published.
+
+Phase 3 supports node timeout and retry authoring under Archon:
+
+- Bash/script `timeout` is positive finite milliseconds; omission requests
+  120,000 ms before the sealed subprocess ceiling is applied.
+- AI `idle_timeout` is positive finite milliseconds; omission uses the sealed
+  AI idle ceiling.
+- `retry.max_attempts` counts retries after the initial attempt. AI nodes
+  default to two retries; deterministic Bash/script nodes default to none.
+- Every output reference names a direct dependency. Conditions use strict
+  typed scalar comparisons and fail on syntax, missing-value, or type errors.
+
+The following declarations remain intentionally blocked under Archon:
 
 | Field | Archon contract code | Archon enforcement phase | Current legacy meaning and warning code |
 | --- | --- | ---: | --- |
-| AI `output_format` | `archon_output_format_unavailable` | 2 | Post-generation JSON Schema validation; `legacy_output_format_post_validation`. |
-| Any `output_type` | `archon_output_type_unavailable` | 2 | Accepted but no typed artifact is published; `legacy_output_type_not_published`. |
-| Node `idle_timeout` | `archon_idle_timeout_semantics_unavailable` | 3 | Positive seconds without reinterpretation; `legacy_idle_timeout_seconds`. Archon millisecond normalization is deferred to Phase 3. |
-| Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds; `legacy_timeout_seconds`. |
-| Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts and `delay_ms` is milliseconds; `legacy_retry_total_attempts`. |
 | `maxBudgetUsd` | `archon_budget_enforcement_unavailable` | 5 | Provider-capability mapping only; not a portable guarantee. |
 | Workflow/node `sandbox` | `archon_sandbox_enforcement_unavailable` | 5 | Provider/backend capability only; resource limits are not a sandbox. |
 
-When one is requested, apply the two-choice recipe in the parent skill. Do not
+When a blocked declaration is requested, apply the two-choice recipe in the parent skill. Do not
 rewrite the request into legacy silently. Companion `limits` and
 `resource_limits` may be included inside the omit-and-remain-Archon choice to
 tighten Hermes execution policy without claiming the blocked Archon semantics;
@@ -80,18 +99,119 @@ array. Each node has `id`, exactly one node-type payload, and optional
 `approval`, and `cancel`. Graph and `$node.output` references must be upstream.
 
 Common fields include `when`, `trigger_rule`, `context`, `idle_timeout`,
-`always_run`, plus the deferred `retry` and `output_type`. AI nodes may use
+`always_run`, `output_type`, and supported `retry`. AI nodes may use
 provider/model selection, `persist_session`, `allowed_tools`, `denied_tools`,
 `hooks`, `mcp`, `skills`, inline `agents`, reasoning controls, `systemPrompt`, and
 fallbacks when doctor confirms the Hermes mapping. Tool aliases such as
 `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, and
 `Agent` are resolved by doctor; unknown aliases block.
 
-Treat `idle_timeout` as profile-sensitive even though it is structurally valid
-on every node. Hermes legacy interprets the authored value as seconds and
-emits `legacy_idle_timeout_seconds`. Under `archon-2026-07`, it blocks with
-`archon_idle_timeout_semantics_unavailable`; do not convert or reinterpret the
-value until Phase 3 supplies Archon millisecond normalization.
+MCP and skills remain options on `command` and `prompt`. They are not node
+kinds. Script nodes with `uv` or `bun` are existing execution behavior, not a
+new structured-data node kind.
+
+Treat timeout and retry as profile-sensitive. Hermes legacy timeout values are
+seconds and legacy `max_attempts` counts total attempts. Archon timeout values
+are milliseconds and Archon `max_attempts` counts retries after the initial
+attempt. Always consult the generated field metadata before converting.
+
+For a structured Archon output, declare a bounded local JSON Schema directly
+on the AI node:
+
+```yaml
+name: structured-summary
+description: Produce a validated summary and consume its answer
+nodes:
+  - id: summarize
+    prompt: Summarize the evidence as JSON.
+    output_type: Report/V1
+    output_format:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [answer]
+      properties:
+        answer: {type: string}
+      additionalProperties: false
+  - id: consume
+    depends_on: [summarize]
+    bash: 'printf "%s\n" "$summarize.output.answer"'
+```
+
+Put `language_compatibility: archon-2026-07` in the matching Hermes companion.
+Do not place it in the portable definition.
+
+`when: $summarize.output.answer != ''` is valid; a reference to an undeclared
+field of a closed object is blocked with
+`structured_output_field_impossible`. Open objects, optional declared fields,
+and schema branches that permit the field remain admissible for runtime
+evaluation.
+
+Schemas must be self-contained Draft 2020-12 documents. `$ref` may point only
+below the same document's `$defs`; reject external, absolute, unresolved, and
+cyclic references, `$dynamicRef`, `$id`, `$anchor`, and `$dynamicAnchor`.
+Preserve these contract ceilings when generating a schema:
+
+| Dimension | Maximum |
+| --- | ---: |
+| Canonical schema bytes | 65,536 |
+| Nesting depth | 32 |
+| Traversed schema nodes | 4,096 |
+| Object properties | 1,024 |
+| Local references | 256 |
+| One regex / all regex text | 1,024 / 16,384 bytes |
+| One enum | 1,024 values |
+| Canonical output | 500,000 bytes |
+
+The optional `jsonschema` validator must be usable before an Archon structured
+node can contact its provider; run
+`python -m pip install 'hermes-agent[mcp]'` (or install the `all` extra) when
+doctor reports it unavailable. Schemaless Archon workflows remain runnable
+without that extra. Legacy intentionally keeps post-provider validation.
+
+Hermes honors native structured output only for a trusted direct runtime with
+an explicit declaration. Custom endpoints, aggregators, undeclared routes, and
+community model metadata do not imply native support; a complete Hermes-managed
+loop uses bounded prompt adaptation instead. A runtime that is unsupported or
+drifts from the admitted decision fails before the provider request.
+
+Prompt-adapted invalid output may receive at most one action-free repair. The
+fresh one-turn repair has no original task/history, tools, hooks, MCP, skills,
+agents, delegation, fallback, persistent session, or interactive prompts. It
+is forbidden for outward or uncertain effects, cancellation, exhausted shared
+budgets, or responses over 256,000 bytes. Diagnostics are capped at 16,384
+bytes. Native validation misses are never repaired.
+
+Accepted output becomes one complete canonical JSON value: UTF-8, compact,
+Unicode-code-point-sorted object keys, finite numbers only, and no prose,
+Markdown fence, extra JSON value, or trailing newline. Downstream consumers,
+hashing, evidence, publication, and preview all use those same bytes.
+
+For `output_type`, JSON publishes as `content.json` with `application/json`;
+other UTF-8 output publishes as `content.md` with
+`text/markdown; charset=utf-8`. Empty text is valid. The bundle and
+`metadata.json` live under an opaque publication ID; metadata is capped at
+65,536 bytes. Publication is claim-checked, atomic, journaled, and recoverable
+only from the corroborated winning attempt. Evidence contains bounded metadata
+rather than content. Authenticated preview is bounded to 64 KiB and download
+uses the opaque ID.
+
+Phase 3 Bash values through the 32,768-byte UTF-8 boundary render inline;
+larger values are consumed as bounded contents, never pathnames. Only ordinary
+authenticated token contexts are rewritten. Escaped/comment references stay
+literal, and ambiguous expansions fail before launch. The complete rendered
+command, including descriptor prologue and every inline replacement, is capped
+at 98,304 UTF-8 bytes before materialization or launch.
+
+Only a confirmed missing cross-run session may select one fresh execution,
+with zero provider attempts before recovery. Same-run missing context fails;
+storage errors remain operational failures; fingerprint mismatch retains its
+warning/fresh behavior. Use `workflow doctor`, generated
+`compatibility_codes`, and Run Inspector recovery evidence as the operator
+authority.
+
+MCP and skills remain options, not node kinds. Loops and includes remain Phase 4.
+Do not synthesize Phase 4 loop/include behavior or Phase 5 `maxBudgetUsd`,
+sandbox, or provider-portability guarantees.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

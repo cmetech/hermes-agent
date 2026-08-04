@@ -107,6 +107,70 @@ socket.socket.connect = _forbid_network
     return completed, before, after, home, hermes_home
 
 
+def _run_packaged_startup_with_recovery_marker(
+    tmp_path: Path, arguments: list[str]
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    recovery_root = tmp_path / "recovery-root"
+    recovery_root.mkdir()
+    marker = recovery_root / ".lazy-refresh-incomplete"
+    marker.write_text("pending\n", encoding="utf-8")
+    (recovery_root / "pyproject.toml").write_text(
+        '[project]\nname = "workflow-schema-startup-test"\nversion = "0"\n',
+        encoding="utf-8",
+    )
+
+    trace = tmp_path / "early-recovery.trace"
+    guard_dir = tmp_path / "recovery-probe"
+    guard_dir.mkdir()
+    (guard_dir / "sitecustomize.py").write_text(
+        """
+import os
+from pathlib import Path
+
+from hermes_cli import _early_recovery as recovery
+
+recovery._project_root = lambda: Path(os.environ["HERMES_TEST_RECOVERY_ROOT"])
+recovery._probe_broken_packages = lambda: []
+original_recover_if_needed = recovery.recover_if_needed
+
+def record_recovery_call(*args, **kwargs):
+    Path(os.environ["HERMES_TEST_RECOVERY_TRACE"]).write_text(
+        "called\\n", encoding="utf-8"
+    )
+    return original_recover_if_needed(*args, **kwargs)
+
+recovery.recover_if_needed = record_recovery_call
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "HERMES_TEST_RECOVERY_ROOT": str(recovery_root),
+        "HERMES_TEST_RECOVERY_TRACE": str(trace),
+        "HERMES_TEST_STARTUP_ARGV": json.dumps(arguments),
+        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, runpy, sys; "
+                "sys.argv = ['hermes', *json.loads(os.environ['HERMES_TEST_STARTUP_ARGV'])]; "
+                "runpy.run_module('hermes_cli.main', run_name='__main__')"
+            ),
+        ],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, marker, trace
+
+
 def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
     ordinary = machine_contract.success_envelope(
         "workflow list",
@@ -156,7 +220,7 @@ def _write(workflow_writer, workdir):
 
 
 def _archon_package(workflow_writer, tmp_path, *, field, value):
-    """Write one declared Archon package with a Phase 1 deferred field."""
+    """Write one declared Archon package with the requested field."""
     node = (
         {"id": "start", "bash": "true", field: value}
         if field == "timeout"
@@ -177,10 +241,6 @@ def _archon_package(workflow_writer, tmp_path, *, field, value):
 @pytest.mark.parametrize(
     "field, value, code",
     [
-        ("timeout", 1000, "archon_timeout_semantics_unavailable"),
-        ("retry", {"max_attempts": 2}, "archon_retry_semantics_unavailable"),
-        ("output_format", {"type": "object"}, "archon_output_format_unavailable"),
-        ("output_type", "report", "archon_output_type_unavailable"),
         ("maxBudgetUsd", 1.0, "archon_budget_enforcement_unavailable"),
         ("sandbox", {"enabled": True}, "archon_sandbox_enforcement_unavailable"),
     ],
@@ -231,11 +291,133 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
     assert list(store.staging_root.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout", 1000),
+        ("retry", {"max_attempts": 2}),
+    ],
+)
+def test_archon_phase3_timeout_and_retry_fields_validate(
+    workflow_writer, tmp_path, capsys, field, value
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    result = _json_result(capsys)
+    assert result["valid"] is True
+    assert result["issues"] == []
+    assert result["language"]["normalizer_version"] == 3
+
+
+def test_archon_cli_admission_seals_resolved_profile_execution_authority(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="archon-sealed-cli-limits",
+        filename="archon-sealed-cli-limits.yaml",
+        nodes=[{"id": "start", "bash": "true"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "plugins": {
+                "entries": {
+                    "workflow": {
+                        "runtime": {
+                            "ai_idle_timeout_seconds": 120,
+                            "ai_wall_timeout_seconds": 240,
+                            "provider_request_timeout_seconds": 90,
+                            "subprocess_timeout_seconds": 30,
+                            "combined_retries": 2,
+                        }
+                    }
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(home),
+        "run",
+        path.stem,
+        "--foreground",
+        "--idempotency-key",
+        "archon-sealed-cli-limits",
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    result = _json_result(capsys)
+    resources = json.loads(
+        (RunStore(home).run_directory(result["run_id"]) / "resources.json").read_bytes()
+    )
+    assert resources["phase3_execution_semantics"]["limits"] == {
+        "ai_idle_timeout_seconds": 120.0,
+        "ai_wall_timeout_seconds": 240.0,
+        "provider_request_timeout_seconds": 90.0,
+        "subprocess_timeout_seconds": 30.0,
+        "combined_total_attempts": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("output_format", {"type": "object"}),
+        ("output_type", "report"),
+    ],
+)
+def test_archon_phase_2_output_fields_validate(
+    workflow_writer, tmp_path, capsys, field, value
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    parser = _parser()
+    home = tmp_path / "home"
+    validate = parser.parse_args([
+        "--workdir",
+        str(tmp_path),
+        "--hermes-home",
+        str(home),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert validate.func(validate) == 0
+    result = _json_result(capsys)
+    assert result["valid"] is True
+    assert result["issues"] == []
+    assert result["language"]["effective_profile"] == "archon-2026-07"
+
+
 def test_archon_validate_text_reports_field_specific_compatibility_finding(
     workflow_writer, tmp_path, capsys
 ):
     path = _archon_package(
-        workflow_writer, tmp_path, field="timeout", value=1000
+        workflow_writer, tmp_path, field="maxBudgetUsd", value=1.0
     )
     args = _parser().parse_args([
         "--workdir",
@@ -247,9 +429,9 @@ def test_archon_validate_text_reports_field_specific_compatibility_finding(
     assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
     output = capsys.readouterr()
     assert output.err == ""
-    assert "archon-timeout: invalid" in output.out
-    assert "nodes[0].timeout" in output.out
-    assert "Archon timeout semantics are not enforceable in Phase 1" in output.out
+    assert "archon-maxBudgetUsd: invalid" in output.out
+    assert "nodes[0].maxBudgetUsd" in output.out
+    assert "Archon budget enforcement is not available in Phase 1" in output.out
 
 
 def test_module_entrypoint_propagates_blocking_doctor_exit(
@@ -260,7 +442,7 @@ def test_module_entrypoint_propagates_blocking_doctor_exit(
     path = workflow_writer(
         workdir / ".hermes" / "workflows",
         name="sample",
-        nodes=[{"id": "start", "bash": "true", "timeout": 1_000}],
+        nodes=[{"id": "start", "prompt": "work", "maxBudgetUsd": 1.0}],
     )
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n",
@@ -335,7 +517,7 @@ def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
 ):
     """Catch doctor text that omits actionable safe finding diagnostics."""
     path = _archon_package(
-        workflow_writer, tmp_path, field="timeout", value=1_000
+        workflow_writer, tmp_path, field="maxBudgetUsd", value=1.0
     )
     args = _parser().parse_args([
         "--workdir",
@@ -349,9 +531,9 @@ def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
     output = capsys.readouterr()
     assert output.err == ""
-    assert "archon_timeout_semantics_unavailable" in output.out
-    assert "nodes[0].timeout" in output.out
-    assert "Remove timeout or wait for Phase 3 timeout semantics." in output.out
+    assert "archon_budget_enforcement_unavailable" in output.out
+    assert "nodes[0].maxBudgetUsd" in output.out
+    assert "Remove maxBudgetUsd or wait for Phase 5 budget enforcement." in output.out
     assert "SECRET_BODY" not in output.out
     assert str(tmp_path) not in output.out
 
@@ -709,6 +891,29 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "returncode", "early_recovery_called"),
+    [
+        (["workflow", "schema", "--json"], 0, False),
+        (["workflow", "schema", "--help"], 0, False),
+        (["workflow", "schema", "--definitely-child"], 2, False),
+        (["--version"], 0, True),
+        (["update", "--help"], 0, True),
+    ],
+    ids=["schema-success", "schema-help", "schema-error", "normal", "update"],
+)
+def test_packaged_schema_alone_skips_early_recovery_marker_probe(
+    tmp_path, arguments, returncode, early_recovery_called
+):
+    completed, marker, trace = _run_packaged_startup_with_recovery_marker(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == returncode, completed.stderr
+    assert trace.exists() is early_recovery_called
+    assert marker.read_text(encoding="utf-8") == "pending\n"
+
+
+@pytest.mark.parametrize(
     "arguments",
     [
         ["--definitely-unknown", "workflow", "schema", "--json"],
@@ -1062,13 +1267,12 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     assert args.func(args) == 0
     validation = _json_result(capsys)
     assert validation["valid"] is True
+    package = load_workflow(path)
     assert validation["language"] == {
         "declared_profile": None,
         "effective_profile": "hermes-legacy",
-        "normalizer_version": 1,
-        "normalized_definition_digest": load_workflow(
-            path
-        ).language.normalized_definition_digest,
+        "normalizer_version": package.language.normalizer_version,
+        "normalized_definition_digest": package.language.normalized_definition_digest,
         "legacy": True,
     }
 

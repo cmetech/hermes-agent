@@ -744,7 +744,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                       {(detail.compatibility?.findings ?? [])
                         .filter(finding => finding.blocking)
                         .map(finding => (
-                          <li key={`${finding.path}:${finding.code}`}>{finding.message}</li>
+                          <li key={`${finding.path}:${finding.code}`}>
+                            <p>{finding.message}</p>
+                            {finding.migration ? (
+                              <p className="text-(--ui-text-secondary)">{finding.migration}</p>
+                            ) : null}
+                          </li>
                         ))}
                     </ul>
                   ) : null}

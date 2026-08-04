@@ -24,6 +24,37 @@ REHEARSAL = ROOT / "scripts/test_workflow_upstream_merge.sh"
 LEDGER_RUNNER = ROOT / "scripts/run_workflow_ledger_invariants.py"
 
 
+def _install_python_test_wrapper(
+    repo: Path,
+    *,
+    invocation_record: Path | None = None,
+) -> None:
+    """Install the real wrapper in a fixture, optionally behind a recording shim."""
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "scripts/run_tests_parallel.py", scripts)
+    if invocation_record is None:
+        shutil.copy2(ROOT / "scripts/run_tests.sh", scripts)
+        return
+
+    shutil.copy2(ROOT / "scripts/run_tests.sh", scripts / "canonical_run_tests.sh")
+    wrapper = scripts / "run_tests.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "SCRIPT_DIR=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\n"
+        f"printf '%s\\n' \"$@\" > {str(invocation_record)!r}\n"
+        'exec "$SCRIPT_DIR/canonical_run_tests.sh" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+
+def _assert_only_wrapper_pycache(temp_root: Path) -> None:
+    """The wrapper cache is expected; sealed-worktree residue is not."""
+    assert [path.name for path in temp_root.iterdir()] == ["hermes-test-pycache"]
+    shutil.rmtree(temp_root / "hermes-test-pycache")
+
+
 def _write_workspace_lock(repo: Path, name: str, version: str) -> None:
     (repo / "package-lock.json").write_text(json.dumps({
         "name": "fixture",
@@ -92,7 +123,10 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
         "    for name in ('HERMES_PYTHON', 'PYTEST_ADDOPTS', 'PYTHON_BIN', "
         "'WORKFLOW_MERGE_GATE_FAST'):\n"
         "        assert name not in os.environ\n"
-        "    assert os.environ['WORKFLOW_LEDGER_PRESERVED_PROBE'] == 'preserved'\n"
+        "    assert 'WORKFLOW_LEDGER_PRESERVED_PROBE' not in os.environ\n"
+        "    assert os.environ['HERMES_OFFLINE'] == '1'\n"
+        "    assert os.environ['WORKFLOW_LEDGER_EXECUTION_ACTIVE'] == '1'\n"
+        "    assert os.environ['HERMES_TEST_FILE_RETRIES'] == '0'\n"
         "    assert Path(sys.executable).is_absolute()\n"
     )
     (repo / "unmanaged.txt").write_text("common\n")
@@ -115,6 +149,7 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     shutil.copy2(
         ROOT / "scripts/run_workflow_ledger_invariants.py", repo / "scripts"
     )
+    _install_python_test_wrapper(repo)
     shutil.copy2(
         ROOT / "docs/upstream-customizations/merge-evidence.schema.json",
         repo / "docs/upstream-customizations/merge-evidence.schema.json",
@@ -708,6 +743,9 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit wrapper fixture")
     output = repo / "results.json"
 
     result = subprocess.run(
@@ -748,19 +786,177 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
     assert "FIRST_ATTEMPT_STDERR_DIAGNOSTIC" not in serialized
 
 
+def test_ledger_python_invariant_uses_sealed_wrapper_with_single_attempts(
+    tmp_path: Path,
+) -> None:
+    """Python ledger attempts enter through the sealed canonical test wrapper."""
+    repo = tmp_path / "sealed-wrapper-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    invocation_record = tmp_path / "sealed-wrapper-args.txt"
+    test_path = repo / "tests/plugins/workflow/test_installed_distribution_e2e.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "import os\n"
+        "import pytest\n\n"
+        "@pytest.mark.integration\n"
+        "def test_sealed_wrapper_environment():\n"
+        "    assert 'HERMES_PYTHON' not in os.environ\n"
+        "    assert 'WORKFLOW_LEDGER_PRESERVED_PROBE' not in os.environ\n"
+        "    assert os.environ['HERMES_OFFLINE'] == '1'\n"
+        "    assert os.environ['WORKFLOW_LEDGER_EXECUTION_ACTIVE'] == '1'\n"
+        "    assert os.environ['HERMES_TEST_FILE_RETRIES'] == '0'\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": [str(test_path.relative_to(repo))]}]},
+            sort_keys=False,
+        )
+    )
+    _install_python_test_wrapper(repo, invocation_record=invocation_record)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit sealed wrapper fixture")
+    output = tmp_path / "sealed-wrapper-results.json"
+    env = os.environ.copy()
+    env["HERMES_PYTHON"] = "/caller-controlled/python"
+    env["WORKFLOW_LEDGER_PRESERVED_PROBE"] = "must be scrubbed"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+            "--timeout-seconds",
+            "30",
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocation = invocation_record.read_text().splitlines()
+    assert invocation[:3] == [
+        "--workflow-ledger-single-file",
+        "tests/plugins/workflow/test_installed_distribution_e2e.py",
+        "--workflow-ledger-pytest-basetemp",
+    ]
+    basetemp = Path(invocation[3])
+    assert invocation[4:] == [
+        "--workflow-ledger-pytest-capability",
+        invocation[5],
+        "--file-retries",
+        "0",
+        "-q",
+        "-m",
+        "integration",
+    ]
+    assert len(invocation[5]) == 64
+    assert basetemp.name == "basetemp"
+    assert basetemp.parent.name.startswith("workflow-ledger-pytest-")
+    assert not basetemp.exists()
+    assert not basetemp.parent.exists()
+    record = json.loads(output.read_text())[0]
+    assert [attempt["result"] for attempt in record["attempts"]] == ["passed"]
+
+
+def test_ledger_python_command_uses_validated_external_bash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "sealed repo"
+    repo.mkdir()
+    external_bash = tmp_path / "external toolchain/bin/bash"
+    external_bash.parent.mkdir(parents=True)
+    external_bash.write_text("#!/bin/sh\nexit 0\n")
+    external_bash.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda name: str(external_bash))
+
+    bash_path = ledger_runner._external_executable(repo, "bash")
+    command, cwd = ledger_runner._command(
+        repo,
+        "tests/test_invariant.py",
+        "python",
+        bash_path=bash_path,
+        pytest_basetemp=tmp_path / "workflow-ledger-pytest-test/basetemp",
+        pytest_capability="a" * 64,
+    )
+
+    assert command[:2] == [
+        str(external_bash.resolve()),
+        (repo / "scripts/run_tests.sh").as_posix(),
+    ]
+    assert command[2:] == [
+        "--workflow-ledger-single-file",
+        "tests/test_invariant.py",
+        "--workflow-ledger-pytest-basetemp",
+        (tmp_path / "workflow-ledger-pytest-test/basetemp").as_posix(),
+        "--workflow-ledger-pytest-capability",
+        "a" * 64,
+        "--file-retries",
+        "0",
+        "-q",
+    ]
+    assert cwd == repo
+
+
+def test_ledger_python_command_preserves_windows_bash_and_wrapper_paths() -> None:
+    repo = Path("C:/sealed checkout")
+
+    command, cwd = ledger_runner._command(
+        repo,
+        "tests/test_invariant.py",
+        "python",
+        bash_path="C:/Program Files/Git/bin/bash.exe",
+        pytest_basetemp=Path("C:/Temp/workflow-ledger-pytest-123/basetemp"),
+        pytest_capability="b" * 64,
+    )
+
+    assert command[:2] == [
+        "C:/Program Files/Git/bin/bash.exe",
+        "C:/sealed checkout/scripts/run_tests.sh",
+    ]
+    assert command[2:] == [
+        "--workflow-ledger-single-file",
+        "tests/test_invariant.py",
+        "--workflow-ledger-pytest-basetemp",
+        "C:/Temp/workflow-ledger-pytest-123/basetemp",
+        "--workflow-ledger-pytest-capability",
+        "b" * 64,
+        "--file-retries",
+        "0",
+        "-q",
+    ]
+    assert cwd == repo
+
+
 def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) -> None:
     repo = tmp_path / "runner-cli-repo"
     repo.mkdir()
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    cache_output = tmp_path / "outside-cache.txt"
     test_path = repo / "tests/test_pass.py"
     test_path.parent.mkdir()
     test_path.write_text(
-        "import os\n"
         "from pathlib import Path\n\n"
         "def test_pass():\n"
-        "    Path(os.environ['LEDGER_CACHE_OUTPUT']).write_text('cache output')\n"
+        f"    Path({str(cache_output)!r}).write_text('cache output')\n"
         "    assert True\n"
     )
     manifest = repo / "ledger.yaml"
@@ -770,15 +966,14 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "runner fixture")
     report = tmp_path / "outside-report.json"
-    cache_output = tmp_path / "outside-cache.txt"
     temp_root = tmp_path / "sealed-temp"
     temp_root.mkdir()
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
     env = os.environ.copy()
-    env["LEDGER_CACHE_OUTPUT"] = str(cache_output)
     env["TMPDIR"] = str(temp_root)
 
     result = subprocess.run(
@@ -806,7 +1001,7 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
     assert json.loads(report.read_text())[0]["result"] == "passed"
     assert cache_output.read_text() == "cache output"
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
@@ -1049,6 +1244,7 @@ def test_sealed_ledger_runner_ignores_untracked_pytest_discovery_inputs(
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit failing invariant")
     (repo / "conftest.py").write_text(
@@ -1094,7 +1290,7 @@ def test_sealed_ledger_runner_ignores_untracked_pytest_discovery_inputs(
     ]
     assert (repo / "conftest.py").is_file()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="FIFO mutation handshake requires POSIX")
@@ -1107,13 +1303,13 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    handshake = tmp_path / "mutation-handshake"
     test_path = repo / "tests/test_delayed_authority.py"
     test_path.parent.mkdir()
     test_path.write_text(
-        "import os\n"
         "from pathlib import Path\n\n"
         "def test_delayed_authority():\n"
-        "    handshake = Path(os.environ['LEDGER_MUTATION_HANDSHAKE'])\n"
+        f"    handshake = Path({str(handshake)!r})\n"
         "    first_attempt = handshake.with_suffix('.first')\n"
         "    if not first_attempt.exists():\n"
         "        first_attempt.write_text('started\\n')\n"
@@ -1133,11 +1329,11 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
             sort_keys=False,
         )
     )
+    _install_python_test_wrapper(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit failing delayed authority")
     outside = tmp_path / "outside-authority.py"
     outside.write_text("ALLOW = True\n")
-    handshake = tmp_path / "mutation-handshake"
     ready = handshake.with_suffix(".ready")
     go = handshake.with_suffix(".go")
     os.mkfifo(ready)
@@ -1146,7 +1342,6 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     temp_root = tmp_path / "runner-temp"
     temp_root.mkdir()
     env = os.environ.copy()
-    env["LEDGER_MUTATION_HANDSHAKE"] = str(handshake)
     env["TMPDIR"] = str(temp_root)
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
 
@@ -1190,7 +1385,7 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     ]
     assert authority.is_symlink()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
-    assert list(temp_root.iterdir()) == []
+    _assert_only_wrapper_pycache(temp_root)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
@@ -1846,15 +2041,19 @@ def _run_ledger_fixture(
     tmp_path: Path,
     sources: dict[str, str],
     *,
-    timeout_seconds: float = 0.4,
+    timeout_seconds: float = 2,
     output_limit_bytes: int = 2048,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
     repo = tmp_path / "ledger-fixture"
     repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
     for path, source in sources.items():
         target = repo / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(source)
+    _install_python_test_wrapper(repo)
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
@@ -1862,6 +2061,8 @@ def _run_ledger_fixture(
             sort_keys=False,
         )
     )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit ledger fixture")
     output = repo / "results.json"
     started = time.monotonic()
     result = subprocess.run(
@@ -1884,11 +2085,89 @@ def _run_ledger_fixture(
         cwd=repo,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=15,
     )
     result.elapsed_seconds = time.monotonic() - started  # type: ignore[attr-defined]
     records = json.loads(output.read_text()) if output.exists() else []
     return result, records
+
+
+def _concurrent_basetemp_probe_source(
+    *,
+    probe_dir: Path,
+    name: str,
+    peer: str,
+    fail: bool,
+) -> str:
+    failure = "    raise AssertionError('exercise retry cleanup')\n" if fail else ""
+    return (
+        "from pathlib import Path\n"
+        "import time\n\n"
+        "def test_attempt_private_basetemp(tmp_path):\n"
+        f"    probe_dir = Path({str(probe_dir)!r})\n"
+        f"    counter = probe_dir / {f'{name}.counter'!r}\n"
+        "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(attempt))\n"
+        "    basetemp = tmp_path.parent.resolve()\n"
+        "    assert not basetemp.is_relative_to(Path.cwd().resolve())\n"
+        f"    with (probe_dir / 'basetemps.txt').open('a') as record:\n"
+        f"        record.write({name!r} + ':' + str(attempt) + ':' + str(basetemp) + '\\n')\n"
+        f"    (probe_dir / ({name!r} + '-' + str(attempt) + '.ready')).touch()\n"
+        f"    peer = probe_dir / ({peer!r} + '-' + str(attempt) + '.ready')\n"
+        "    deadline = time.monotonic() + 5\n"
+        "    while not peer.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    assert peer.exists(), 'ledger did not execute Python invariants concurrently'\n"
+        + failure
+    )
+
+
+@pytest.mark.parametrize(
+    ("fail", "expected_returncode", "expected_attempts"),
+    [(False, 0, 1), (True, 1, 2)],
+    ids=["success", "failure-retry"],
+)
+def test_concurrent_python_invariants_use_distinct_cleaned_attempt_basetemps(
+    tmp_path: Path,
+    fail: bool,
+    expected_returncode: int,
+    expected_attempts: int,
+) -> None:
+    probe_dir = tmp_path / "attempt-probes"
+    probe_dir.mkdir()
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {
+            "tests/test_alpha.py": _concurrent_basetemp_probe_source(
+                probe_dir=probe_dir,
+                name="alpha",
+                peer="beta",
+                fail=fail,
+            ),
+            "tests/test_beta.py": _concurrent_basetemp_probe_source(
+                probe_dir=probe_dir,
+                name="beta",
+                peer="alpha",
+                fail=fail,
+            ),
+        },
+        timeout_seconds=8,
+    )
+
+    assert result.returncode == expected_returncode, result.stderr
+    assert len(records) == 2
+    assert all(len(record["attempts"]) == expected_attempts for record in records)
+    observations = [
+        line.split(":", 2)
+        for line in (probe_dir / "basetemps.txt").read_text().splitlines()
+    ]
+    assert len(observations) == 2 * expected_attempts
+    basetemps = [Path(raw_path) for _, _, raw_path in observations]
+    assert len(set(basetemps)) == len(basetemps)
+    assert all(path.name == "basetemp" for path in basetemps)
+    assert all(path.parent.name.startswith("workflow-ledger-pytest-") for path in basetemps)
+    assert all(not path.exists() for path in basetemps)
+    assert all(not path.parent.exists() for path in basetemps)
 
 
 def test_ledger_runner_times_out_hang_without_retry(tmp_path: Path) -> None:
@@ -1912,7 +2191,7 @@ def test_ledger_runner_timeout_terminates_spawned_process_group(tmp_path: Path) 
                 "import subprocess\nimport sys\nimport time\n\n"
                 "def test_process_group():\n"
                 "    subprocess.Popen([sys.executable, '-c', "
-                "\"import time; from pathlib import Path; time.sleep(1); \""
+                "\"import time; from pathlib import Path; time.sleep(3); \""
                 "\"Path('escaped-child.marker').write_text('escaped')\"])\n"
                 "    time.sleep(30)\n"
             )
@@ -1962,12 +2241,14 @@ def test_ledger_runner_does_not_retry_signaled_process(
     signal_name: str,
     signal_number: int,
 ) -> None:
+    basetemp_record = tmp_path / "signaled-basetemp.txt"
     result, records = _run_ledger_fixture(
         tmp_path,
         {
             "tests/test_signal.py": (
-                "import os\nimport signal\n\n"
-                "def test_signal():\n"
+                "import os\nfrom pathlib import Path\nimport signal\n\n"
+                "def test_signal(tmp_path):\n"
+                f"    Path({str(basetemp_record)!r}).write_text(str(tmp_path.parent.resolve()))\n"
                 f"    signal.signal(signal.{signal_name}, signal.SIG_DFL)\n"
                 f"    os.kill(os.getpid(), signal.{signal_name})\n"
             )
@@ -1977,6 +2258,7 @@ def test_ledger_runner_does_not_retry_signaled_process(
     assert result.returncode == 1
     assert [item["result"] for item in records[0]["attempts"]] == ["signaled"]
     assert records[0]["attempts"][0]["termination_signal"] == signal_number
+    _assert_recorded_basetemps_cleaned(basetemp_record)
 
 
 def test_ledger_runner_retries_ordinary_failure_once_then_fails(tmp_path: Path) -> None:
@@ -2055,6 +2337,41 @@ def test_posix_supervisor_spawn_failure_is_terminal_infrastructure(
     assert result.returncode == 1
     attempts = json.loads(report.read_text())[0]["attempts"]
     assert [attempt["result"] for attempt in attempts] == ["infrastructure_error"]
+
+
+def test_python_spawn_failure_cleans_runner_owned_basetemp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owned_root = tmp_path / "workflow-ledger-pytest-spawn-failure"
+
+    def fake_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "workflow-ledger-pytest-"
+        owned_root.mkdir()
+        return str(owned_root)
+
+    def fail_spawn(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("synthetic spawn failure")
+
+    monkeypatch.setattr(ledger_runner.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(ledger_runner.subprocess, "Popen", fail_spawn)
+
+    attempt = ledger_runner._execute_attempt(
+        repo,
+        "tests/test_never_started.py",
+        "python",
+        timeout_seconds=1,
+        output_limit_bytes=2048,
+        cancel_event=threading.Event(),
+        bash_path="/validated/external/bash",
+    )
+
+    assert attempt["result"] == "infrastructure_error"
+    assert "synthetic spawn failure" in attempt["_stderr"]
+    assert not owned_root.exists()
 
 
 def test_windows_job_bootstrap_reserves_spawn_failure_as_infrastructure(
@@ -2393,10 +2710,11 @@ def _resistant_descendant_source(*, signal_parent: bool) -> str:
         "import sys\n"
         "import time\n\n"
         "def test_resistant_descendant():\n"
-        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
         "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
-        "        \"Path('.resistant-child.ready').write_text(str(os.getpid())); \"\n"
-        "        \"time.sleep(3); Path('.resistant-child.marker').write_text('escaped'); \"\n"
+        "        \"Path('.resistant-child.ready').write_text(\"\n"
+        "        \"f'{os.getpid()}:{psutil.Process().create_time()}'); \"\n"
+        "        \"time.sleep(5); Path('.resistant-child.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child])\n"
         "    ready = Path('.resistant-child.ready')\n"
@@ -2412,22 +2730,36 @@ def _assert_resistant_descendants_were_reaped(repo: Path, *stems: str) -> None:
     ready_paths = [repo / f".{stem}.ready" for stem in stems]
     marker_paths = [repo / f".{stem}.marker" for stem in stems]
     assert all(path.is_file() for path in ready_paths)
-    child_pids = [int(path.read_text()) for path in ready_paths]
-    time.sleep(3.2)
+    child_identities = [
+        (int(pid), float(created_at))
+        for pid, created_at in (path.read_text().split(":", 1) for path in ready_paths)
+    ]
+    time.sleep(2.2)
     escaped = [path.exists() for path in marker_paths]
     alive = []
-    for child_pid in child_pids:
+    for child_pid, child_created_at in child_identities:
         try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            alive.append(False)
-        else:
-            alive.append(True)
+            candidate = ledger_runner.psutil.Process(child_pid)
+            original_identity_alive = (
+                candidate.create_time() == child_created_at
+                and candidate.status() != ledger_runner.psutil.STATUS_ZOMBIE
+            )
+        except (ledger_runner.psutil.NoSuchProcess, ledger_runner.psutil.ZombieProcess):
+            original_identity_alive = False
+        alive.append(original_identity_alive)
+        if original_identity_alive:
             subprocess.run(
                 [
                     sys.executable,
                     "-c",
-                    f"import os, signal; os.kill({child_pid}, signal.SIGKILL)",
+                    (
+                        "import os, psutil, signal, sys; "
+                        "candidate = psutil.Process(int(sys.argv[1])); "
+                        "candidate.create_time() == float(sys.argv[2]) and "
+                        "os.kill(candidate.pid, signal.SIGKILL)"
+                    ),
+                    str(child_pid),
+                    str(child_created_at),
                 ],
                 capture_output=True,
                 check=False,
@@ -2452,10 +2784,11 @@ def _leader_exit_with_resistant_descendant_source(*, passes: bool) -> str:
         "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "    counter.write_text(str(attempt))\n"
         "    stem = f'exit-child-{attempt}'\n"
-        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
         "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
-        "        f\"Path('.{stem}.ready').write_text(str(os.getpid())); \"\n"
-        "        f\"time.sleep(3); Path('.{stem}.marker').write_text('escaped'); \"\n"
+        "        f\"Path('.{stem}.ready').write_text("
+        "f'{{os.getpid()}}:{{psutil.Process().create_time()}}'); \"\n"
+        "        f\"time.sleep(5); Path('.{stem}.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
@@ -2470,10 +2803,11 @@ def _leader_exit_with_resistant_descendant_source(*, passes: bool) -> str:
 
 def _leader_signal_after_fast_intermediate_source() -> str:
     grandchild = (
-        "import os, signal, time; from pathlib import Path; "
+        "import os, psutil, signal, time; from pathlib import Path; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "Path('.fast-grandchild.ready').write_text(str(os.getpid())); "
-        "time.sleep(3); Path('.fast-grandchild.marker').write_text('escaped'); "
+        "Path('.fast-grandchild.ready').write_text("
+        "f'{os.getpid()}:{psutil.Process().create_time()}'); "
+        "time.sleep(5); Path('.fast-grandchild.marker').write_text('escaped'); "
         "time.sleep(30)"
     )
     intermediate = (
@@ -2560,7 +2894,7 @@ def test_ledger_runner_escalates_group_after_timeout_leader_exits(
     result, records = _run_ledger_fixture(
         tmp_path,
         {"tests/test_resistant_timeout.py": _resistant_descendant_source(signal_parent=False)},
-        timeout_seconds=0.5,
+        timeout_seconds=2,
     )
 
     assert result.returncode == 1
@@ -2594,16 +2928,23 @@ def _setsid_descendant_source(stem: str, outcome: str) -> str:
         "import subprocess\n"
         "import sys\n"
         "import time\n\n"
-        "def test_setsid_descendant():\n"
+        "def test_setsid_descendant(tmp_path):\n"
         f"    counter = Path('.{stem}-attempt')\n"
         "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "    counter.write_text(str(attempt))\n"
+        f"    Path(f'.{stem}-{{attempt}}.basetemp').write_text(\n"
+        "        str(tmp_path.parent.resolve())\n"
+        "    )\n"
         f"    child_stem = f'{stem}-{{attempt}}'\n"
         "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
-        "        \"os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
+        "        \"os.setsid(); \"\n"
+        "        f\"basetemp=Path({str(tmp_path.parent.resolve())!r}); \"\n"
+        "        f\"signal.signal(signal.SIGTERM, lambda *_: \"\n"
+        "        f\"Path('.{child_stem}.basetemp-live').write_text(\"\n"
+        "        f\"str(basetemp.exists()))); \"\n"
         "        f\"Path('.{child_stem}.ready').write_text("
         "f'{{os.getpid()}}:{{psutil.Process().create_time()}}'); \"\n"
-        "        f\"time.sleep(2); Path('.{child_stem}.marker').write_text('escaped'); \"\n"
+        "        f\"time.sleep(5); Path('.{child_stem}.marker').write_text('escaped'); \"\n"
         "        \"time.sleep(30)\")\n"
         "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, \n"
         "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
@@ -2620,6 +2961,7 @@ def _setsid_descendant_source(stem: str, outcome: str) -> str:
 def _assert_setsid_descendants_were_reaped(repo: Path, *stems: str) -> None:
     ready_paths = [repo / f".{stem}.ready" for stem in stems]
     marker_paths = [repo / f".{stem}.marker" for stem in stems]
+    basetemp_live_paths = [repo / f".{stem}.basetemp-live" for stem in stems]
     assert all(path.is_file() for path in ready_paths)
     child_identities = [
         (int(pid), float(created_at))
@@ -2659,6 +3001,17 @@ def _assert_setsid_descendants_were_reaped(repo: Path, *stems: str) -> None:
             )
     assert escaped == [False] * len(stems)
     assert alive == [False] * len(stems)
+    assert [path.read_text() for path in basetemp_live_paths] == [
+        "True"
+    ] * len(stems)
+
+
+def _assert_recorded_basetemps_cleaned(*records: Path) -> None:
+    basetemps = [Path(record.read_text()) for record in records]
+    assert all(path.name == "basetemp" for path in basetemps)
+    assert all(path.parent.name.startswith("workflow-ledger-pytest-") for path in basetemps)
+    assert all(not path.exists() for path in basetemps)
+    assert all(not path.parent.exists() for path in basetemps)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
@@ -2673,6 +3026,9 @@ def test_ledger_runner_reaps_setsid_descendant_after_success(tmp_path: Path) -> 
     assert [attempt["result"] for attempt in records[0]["attempts"]] == ["passed"]
     _assert_setsid_descendants_were_reaped(
         tmp_path / "ledger-fixture", "setsid-success-1"
+    )
+    _assert_recorded_basetemps_cleaned(
+        tmp_path / "ledger-fixture/.setsid-success-1.basetemp"
     )
 
 
@@ -2694,6 +3050,10 @@ def test_ledger_runner_reaps_setsid_descendants_after_ordinary_failures(
     _assert_setsid_descendants_were_reaped(
         tmp_path / "ledger-fixture", "setsid-failure-1", "setsid-failure-2"
     )
+    _assert_recorded_basetemps_cleaned(
+        tmp_path / "ledger-fixture/.setsid-failure-1.basetemp",
+        tmp_path / "ledger-fixture/.setsid-failure-2.basetemp",
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
@@ -2701,13 +3061,16 @@ def test_ledger_runner_reaps_setsid_descendant_after_timeout(tmp_path: Path) -> 
     result, records = _run_ledger_fixture(
         tmp_path,
         {"tests/test_setsid_timeout.py": _setsid_descendant_source("setsid-timeout", "timeout")},
-        timeout_seconds=0.5,
+        timeout_seconds=3,
     )
 
     assert result.returncode == 1
     assert [attempt["result"] for attempt in records[0]["attempts"]] == ["timed_out"]
     _assert_setsid_descendants_were_reaped(
         tmp_path / "ledger-fixture", "setsid-timeout-1"
+    )
+    _assert_recorded_basetemps_cleaned(
+        tmp_path / "ledger-fixture/.setsid-timeout-1.basetemp"
     )
 
 
@@ -2717,9 +3080,16 @@ def test_ledger_runner_reaps_setsid_descendant_after_cancellation(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "cancelled-ledger-fixture"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
     test_path = repo / "tests/test_setsid_cancellation.py"
     test_path.parent.mkdir(parents=True)
     test_path.write_text(_setsid_descendant_source("setsid-cancellation", "cancellation"))
+    _install_python_test_wrapper(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit cancellation fixture")
     cancel_event = threading.Event()
     ready = repo / ".setsid-cancellation-1.ready"
 
@@ -2744,6 +3114,9 @@ def test_ledger_runner_reaps_setsid_descendant_after_cancellation(
     canceller.join(timeout=3)
     assert not canceller.is_alive()
     _assert_setsid_descendants_were_reaped(repo, "setsid-cancellation-1")
+    _assert_recorded_basetemps_cleaned(
+        repo / ".setsid-cancellation-1.basetemp"
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process identity policy")

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import shutil
 import stat
@@ -41,6 +42,8 @@ _NODE_DEPENDENCY_AUDIT_SECONDS = 60.0
 _NODE_DEPENDENCY_CACHE_PATHS = frozenset({Path(".vite"), Path(".vite-temp")})
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PYTEST_ATTEMPT_PREFIX = "workflow-ledger-pytest-"
+_PYTEST_OWNERSHIP_MARKER = ".workflow-ledger-pytest-owner"
 
 
 @dataclass(frozen=True)
@@ -772,13 +775,28 @@ def _command(
     path: str,
     kind: str,
     *,
+    bash_path: str | None = None,
+    pytest_basetemp: Path | None = None,
+    pytest_capability: str | None = None,
     node_path: str | None = None,
     npx_path: str | None = None,
 ) -> tuple[list[str], Path]:
     if kind == "python":
-        # Keep the absolute virtualenv entry point.  Resolving the symlink to
-        # uv's base interpreter would silently discard the venv/site-packages.
-        command = [str(Path(sys.executable).absolute()), "-m", "pytest", "-q", path]
+        if bash_path is None or pytest_basetemp is None or pytest_capability is None:
+            raise AssertionError("Python invariants require an owned pytest launch")
+        command = [
+            bash_path,
+            (repo / "scripts/run_tests.sh").as_posix(),
+            "--workflow-ledger-single-file",
+            path,
+            "--workflow-ledger-pytest-basetemp",
+            pytest_basetemp.as_posix(),
+            "--workflow-ledger-pytest-capability",
+            pytest_capability,
+            "--file-retries",
+            "0",
+            "-q",
+        ]
         if path == "tests/plugins/workflow/test_installed_distribution_e2e.py":
             command.extend(["-m", "integration"])
         return command, repo
@@ -791,6 +809,48 @@ def _command(
     if kind == "node":
         return [node_path or "node", "--test", path], repo
     raise AssertionError(f"unsupported executable invariant kind: {kind}")
+
+
+@dataclass(frozen=True)
+class _OwnedPytestAttempt:
+    root: Path
+    basetemp: Path
+    capability: str
+
+
+def _create_owned_pytest_attempt(repo: Path) -> _OwnedPytestAttempt:
+    """Create one unforgeable, runner-owned pytest namespace outside the checkout."""
+    root: Path | None = None
+    try:
+        root = Path(tempfile.mkdtemp(prefix=_PYTEST_ATTEMPT_PREFIX)).resolve(
+            strict=True
+        )
+        if _is_within(root, repo.resolve()):
+            raise ValueError("pytest attempt root must be outside the sealed checkout")
+        root.chmod(0o700)
+        capability = secrets.token_hex(32)
+        marker = root / _PYTEST_OWNERSHIP_MARKER
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(marker, flags, 0o600)
+        try:
+            os.write(descriptor, capability.encode("ascii"))
+        finally:
+            os.close(descriptor)
+        return _OwnedPytestAttempt(
+            root=root,
+            basetemp=root / "basetemp",
+            capability=capability,
+        )
+    except BaseException:
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
+def _cleanup_owned_pytest_attempt(attempt: _OwnedPytestAttempt) -> None:
+    shutil.rmtree(attempt.root)
 
 
 class _BoundedCapture:
@@ -1050,7 +1110,7 @@ def _terminate_process_group(
     process.wait()
 
 
-def _execute_attempt(
+def _execute_prepared_attempt(
     repo: Path,
     path: str,
     kind: str,
@@ -1058,6 +1118,9 @@ def _execute_attempt(
     timeout_seconds: float,
     output_limit_bytes: int,
     cancel_event: threading.Event,
+    bash_path: str | None = None,
+    pytest_basetemp: Path | None = None,
+    pytest_capability: str | None = None,
     node_path: str | None = None,
     npx_path: str | None = None,
     source_repo: Path | None = None,
@@ -1066,6 +1129,9 @@ def _execute_attempt(
         repo,
         path,
         kind,
+        bash_path=bash_path,
+        pytest_basetemp=pytest_basetemp,
+        pytest_capability=pytest_capability,
         node_path=node_path,
         npx_path=npx_path,
     )
@@ -1077,6 +1143,14 @@ def _execute_attempt(
         "WORKFLOW_MERGE_GATE_FAST",
     ):
         env.pop(inherited, None)
+    if kind == "python":
+        # The sealed worktree intentionally has no local virtualenv. Supply
+        # the already-running ledger interpreter as trusted wrapper bootstrap
+        # authority, then let run_tests.sh remove it from pytest's clean env.
+        env["HERMES_PYTHON"] = str(Path(sys.executable).absolute())
+        # Keep the wrapper controller to one attempt; _execute owns the sole
+        # bounded retry and its evidence/diagnostic state machine.
+        env["HERMES_TEST_FILE_RETRIES"] = "0"
     env.update(
         {
             "HERMES_OFFLINE": "1",
@@ -1277,6 +1351,80 @@ def _execute_attempt(
     return record
 
 
+def _execute_attempt(
+    repo: Path,
+    path: str,
+    kind: str,
+    *,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+    cancel_event: threading.Event,
+    bash_path: str | None = None,
+    node_path: str | None = None,
+    npx_path: str | None = None,
+    source_repo: Path | None = None,
+) -> dict[str, Any]:
+    """Execute one attempt and retire its pytest namespace after tree reaping."""
+    owned_attempt: _OwnedPytestAttempt | None = None
+    started = time.monotonic_ns()
+    if kind == "python":
+        try:
+            if bash_path is None:
+                bash_path = _external_executable(source_repo or repo, "bash")
+            owned_attempt = _create_owned_pytest_attempt(repo)
+        except (OSError, ValueError) as exc:
+            return {
+                "result": "infrastructure_error",
+                "duration_ms": (time.monotonic_ns() - started) // 1_000_000,
+                "output_truncated": False,
+                "_stdout": "",
+                "_stderr": str(exc),
+            }
+
+    result: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
+    try:
+        result = _execute_prepared_attempt(
+            repo,
+            path,
+            kind,
+            timeout_seconds=timeout_seconds,
+            output_limit_bytes=output_limit_bytes,
+            cancel_event=cancel_event,
+            bash_path=bash_path,
+            pytest_basetemp=(
+                owned_attempt.basetemp if owned_attempt is not None else None
+            ),
+            pytest_capability=(
+                owned_attempt.capability if owned_attempt is not None else None
+            ),
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
+        )
+    except BaseException as exc:
+        primary_error = exc
+
+    cleanup_error: OSError | None = None
+    if owned_attempt is not None:
+        try:
+            _cleanup_owned_pytest_attempt(owned_attempt)
+        except OSError as exc:
+            cleanup_error = exc
+
+    if primary_error is not None:
+        if cleanup_error is not None:
+            primary_error.add_note(
+                f"pytest attempt cleanup failed: {cleanup_error}"
+            )
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    assert result is not None
+    if cleanup_error is not None:
+        result["result"] = "infrastructure_error"
+        result["_stderr"] += f"\npytest attempt cleanup failed: {cleanup_error}"
+    return result
+
+
 def _execute(
     repo: Path,
     path: str,
@@ -1286,6 +1434,7 @@ def _execute(
     output_limit_bytes: int,
     cancel_event: threading.Event,
     *,
+    bash_path: str | None = None,
     node_path: str | None = None,
     npx_path: str | None = None,
     source_repo: Path | None = None,
@@ -1301,6 +1450,7 @@ def _execute(
             timeout_seconds=timeout_seconds,
             output_limit_bytes=output_limit_bytes,
             cancel_event=cancel_event,
+            bash_path=bash_path,
             node_path=node_path,
             npx_path=npx_path,
             source_repo=source_repo,
@@ -1396,6 +1546,7 @@ def _run_group(
     timeout_seconds: float,
     output_limit_bytes: int,
     *,
+    bash_path: str | None = None,
     node_path: str | None = None,
     npx_path: str | None = None,
     source_repo: Path | None = None,
@@ -1425,6 +1576,7 @@ def _run_group(
                 timeout_seconds,
                 output_limit_bytes,
                 cancel_event,
+                bash_path=bash_path,
                 node_path=node_path,
                 npx_path=npx_path,
                 source_repo=source_repo,
@@ -1598,6 +1750,7 @@ def _execute_manifest_invariants(
         kind: [path for path in paths if _kind(path) == kind]
         for kind in ("python", "desktop", "desktop-node", "node")
     }
+    bash_path: str | None = None
     node_path: str | None = None
     npx_path: str | None = None
     dependency_roots: list[_NodeDependencyRoot] = []
@@ -1605,6 +1758,8 @@ def _execute_manifest_invariants(
     needs_desktop_toolchain = any(
         by_kind[kind] for kind in ("desktop", "desktop-node")
     )
+    if by_kind["python"]:
+        bash_path = _external_executable(source_repo or repo, "bash")
     if source_repo is not None and needs_node:
         node_path = _external_executable(source_repo, "node")
     if source_repo is not None and needs_desktop_toolchain:
@@ -1648,6 +1803,7 @@ def _execute_manifest_invariants(
                 platform,
                 2,
                 *group_options,
+                bash_path=bash_path,
                 node_path=node_path,
                 npx_path=npx_path,
                 source_repo=source_repo,

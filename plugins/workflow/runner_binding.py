@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
-from hermes_cli.config import get_compatible_custom_providers, read_raw_config
+from hermes_cli.config import read_raw_config
 from hermes_cli.runtime_provider import (
+    ConfiguredExecutionRoute,
     ExecutionRuntimeCapabilities,
+    StructuredOutputCapabilityDecision,
+    classify_configured_execution_route,
     classify_execution_runtime,
+    resolve_structured_output_capability,
+    snapshot_configured_execution_routes,
 )
 from plugins.workflow.entitlement import (
     AIEntitlementResolution,
@@ -26,9 +32,76 @@ if TYPE_CHECKING:
     )
 
 
+_RUN_METADATA_VALUE_MAX_CHARS = 512
+_STRUCTURED_OUTPUT_METADATA_FIELD_LIMITS = MappingProxyType(
+    {
+        "strategy": 32,
+        "effective_provider": 64,
+        "model": 192,
+        "api_mode": 64,
+        "declaration_source": 64,
+        "schema_fingerprint": 64,
+        "rationale": 256,
+    }
+)
+
+
+class StructuredOutputMetadataCapacityError(ValueError):
+    """A sealed decision cannot fit the persistent run metadata contract."""
+
+    def __init__(self, node_id: str, detail: str) -> None:
+        super().__init__(detail)
+        self.node_id = node_id
+
+
+def _structured_output_metadata_row(
+    node_id: str,
+    decision: StructuredOutputCapabilityDecision,
+) -> str:
+    row: dict[str, object] = {
+        "strategy": decision.strategy.value,
+        "effective_provider": decision.effective_provider,
+        "model": decision.model,
+        "api_mode": decision.api_mode,
+        "declaration_source": decision.declaration_source,
+        "adapter_version": decision.adapter_version,
+        "schema_fingerprint": decision.schema_fingerprint,
+        "rationale": decision.rationale,
+    }
+    for field_name, maximum in _STRUCTURED_OUTPUT_METADATA_FIELD_LIMITS.items():
+        value = row[field_name]
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > maximum:
+            raise StructuredOutputMetadataCapacityError(
+                node_id,
+                f"{field_name} exceeds its run metadata limit",
+            )
+    serialized = json.dumps(row, sort_keys=True, separators=(",", ":"))
+    if len(serialized) > _RUN_METADATA_VALUE_MAX_CHARS:
+        raise StructuredOutputMetadataCapacityError(
+            node_id,
+            "structured output decision exceeds the run metadata row limit",
+        )
+    return serialized
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerCapabilities:
     starts_request_mcp: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProviderSnapshot:
+    runtime_capabilities: ExecutionRuntimeCapabilities
+    configured_provider_routes: Mapping[str, ConfiguredExecutionRoute]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "configured_provider_routes",
+            MappingProxyType(dict(self.configured_provider_routes)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,10 +111,184 @@ class ExecutionCapabilityContext:
     runner_capabilities: RunnerCapabilities
     runtime_capabilities: ExecutionRuntimeCapabilities
     mcp_available: bool
+    configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "configured_provider_routes",
+            MappingProxyType(dict(self.configured_provider_routes)),
+        )
+
+    def _runtime_capabilities_for_node(
+        self,
+        package: "WorkflowPackage",
+        node_id: str,
+    ) -> tuple[ExecutionRuntimeCapabilities, ConfiguredExecutionRoute | None]:
+        """Classify the provider route the executor will use for one node."""
+        node = next(node for node in package.definition.nodes if node.id == node_id)
+        workflow_provider = package.definition.options.get("provider")
+        node_provider = node.options.get("provider")
+        configured_provider = node_provider or workflow_provider
+        configured_model = node.options.get("model") or package.definition.options.get(
+            "model"
+        )
+        if not isinstance(configured_provider, str) or not configured_provider.strip():
+            if not isinstance(configured_model, str) or not configured_model.strip():
+                return self.runtime_capabilities, None
+            return ExecutionRuntimeCapabilities(
+                api_mode=self.runtime_capabilities.api_mode,
+                hermes_managed_tool_loop=(
+                    self.runtime_capabilities.hermes_managed_tool_loop
+                ),
+                effective_provider=self.runtime_capabilities.effective_provider,
+                model=configured_model.strip(),
+                base_url_trust_class=(
+                    self.runtime_capabilities.base_url_trust_class
+                ),
+                declared_structured_output_strategy=(
+                    self.runtime_capabilities.declared_structured_output_strategy
+                ),
+                structured_output_declaration_source=(
+                    self.runtime_capabilities.structured_output_declaration_source
+                ),
+            ), None
+
+        provider = configured_provider.strip()
+        model = configured_model.strip() if isinstance(configured_model, str) else ""
+        configured_route = self.configured_provider_routes.get(provider.casefold())
+        if configured_route is not None:
+            return (
+                classify_configured_execution_route(
+                    configured_route,
+                    target_model=model or None,
+                ),
+                configured_route,
+            )
+        return (
+            classify_execution_runtime(
+                provider=provider,
+                model_config={"provider": provider, "default": model},
+                target_model=model or None,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _provider_route_fingerprint(
+        runtime_capabilities: ExecutionRuntimeCapabilities,
+        configured_route: ConfiguredExecutionRoute | None,
+    ) -> str:
+        route_material = {
+            "api_mode": runtime_capabilities.api_mode,
+            "base_url_trust_class": runtime_capabilities.base_url_trust_class,
+            "declared_structured_output_strategy": (
+                runtime_capabilities.declared_structured_output_strategy
+            ),
+            "declaration_source": (
+                runtime_capabilities.structured_output_declaration_source
+            ),
+            "effective_provider": runtime_capabilities.effective_provider,
+            "configured_route": (
+                {
+                    "requested_provider": configured_route.requested_provider,
+                    "effective_provider": configured_route.effective_provider,
+                    "model_config": dict(configured_route.model_config),
+                    "provider_config": dict(configured_route.provider_config),
+                    "route_evidence_error": (
+                        configured_route.route_evidence_error
+                    ),
+                }
+                if configured_route is not None
+                else None
+            ),
+        }
+        encoded = json.dumps(
+            route_material, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def structured_output_decisions(
+        self,
+        package: "WorkflowPackage",
+    ) -> Mapping[str, StructuredOutputCapabilityDecision]:
+        """Return immutable per-node decisions for sealed Archon schemas."""
+        decisions: dict[str, StructuredOutputCapabilityDecision] = {}
+        for node_id, output in sorted(package.language.structured_outputs.items()):
+            runtime_capabilities, _configured_route = (
+                self._runtime_capabilities_for_node(package, node_id)
+            )
+            decisions[node_id] = resolve_structured_output_capability(
+                runtime_capabilities,
+                schema_fingerprint=output.schema_fingerprint,
+            )
+        return MappingProxyType(decisions)
+
+    def structured_output_identity_material(
+        self,
+        package: "WorkflowPackage",
+    ) -> tuple[dict[str, object], ...]:
+        """Return canonical schema-free material for every sealed decision."""
+        material: list[dict[str, object]] = []
+        for node_id, decision in self.structured_output_decisions(package).items():
+            runtime_capabilities, configured_route = (
+                self._runtime_capabilities_for_node(package, node_id)
+            )
+            material.append({
+                "node_id": node_id,
+                "strategy": decision.strategy.value,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "declaration_source": decision.declaration_source,
+                "adapter_version": decision.adapter_version,
+                "schema_fingerprint": decision.schema_fingerprint,
+                "rationale": decision.rationale,
+                "provider_route_fingerprint": self._provider_route_fingerprint(
+                    runtime_capabilities,
+                    configured_route,
+                ),
+            })
+        return tuple(material)
+
+    def structured_output_run_metadata(
+        self,
+        package: "WorkflowPackage",
+    ) -> dict[str, str]:
+        """Serialize complete decisions as bounded immutable run metadata rows."""
+        metadata: dict[str, str] = {}
+        for node_id, decision in self.structured_output_decisions(package).items():
+            key = (
+                "structured_output_decision."
+                + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
+            )
+            metadata[key] = _structured_output_metadata_row(node_id, decision)
+        return metadata
 
     @property
-    def identity_digest(self) -> str:
-        """Return the canonical identity sealed for scheduled revalidation."""
+    def _structured_output_runtime_identity(self) -> dict[str, object]:
+        decision = resolve_structured_output_capability(
+            self.runtime_capabilities,
+            schema_fingerprint="0" * 64,
+        )
+        return {
+            "adapter_version": decision.adapter_version,
+            "api_mode": decision.api_mode,
+            "declaration_source": decision.declaration_source,
+            "effective_provider": decision.effective_provider,
+            "model": decision.model,
+            "rationale": decision.rationale,
+            "schema_fingerprint": decision.schema_fingerprint,
+            "strategy": decision.strategy.value,
+        }
+
+    def _identity_digest(
+        self,
+        structured_output_decisions: object,
+    ) -> str:
+        """Hash shared execution authority plus structured-output decisions."""
         material = json.dumps(
             {
                 "entitlement": self.entitlement.value,
@@ -54,12 +301,30 @@ class ExecutionCapabilityContext:
                 "runtime_hermes_managed_tool_loop": (
                     self.runtime_capabilities.hermes_managed_tool_loop
                 ),
+                "runtime_provider": self.runtime_capabilities.effective_provider,
+                "runtime_model": self.runtime_capabilities.model,
+                "runtime_base_url_trust_class": (
+                    self.runtime_capabilities.base_url_trust_class
+                ),
+                "runtime_declared_structured_output_strategy": (
+                    self.runtime_capabilities.declared_structured_output_strategy
+                ),
+                "structured_output_decisions": structured_output_decisions,
                 "surface": self.surface,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(material).hexdigest()
+
+    @property
+    def identity_digest(self) -> str:
+        """Return the package-independent runtime identity for early checks."""
+        return self._identity_digest((self._structured_output_runtime_identity,))
+
+    def identity_digest_for(self, package: "WorkflowPackage") -> str:
+        """Return the identity sealing complete actual per-node decisions."""
+        return self._identity_digest(self.structured_output_identity_material(package))
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,9 +334,19 @@ class WorkflowRunnerBinding:
     real_capabilities: RunnerCapabilities
     deterministic_capabilities: RunnerCapabilities
     runtime_capabilities: ExecutionRuntimeCapabilities
+    configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     runtime_capabilities_provider: (
-        Callable[[], ExecutionRuntimeCapabilities] | None
+        Callable[[], ExecutionRuntimeCapabilities | ExecutionProviderSnapshot] | None
     ) = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "configured_provider_routes",
+            MappingProxyType(dict(self.configured_provider_routes)),
+        )
 
     def runner_for(self, entitlement: AIEntitlementResolution) -> object:
         return (
@@ -89,10 +364,19 @@ class WorkflowRunnerBinding:
             else self.deterministic_capabilities
         )
 
-    def _runtime_capabilities_for_context(self) -> ExecutionRuntimeCapabilities:
+    def _provider_snapshot_for_context(self) -> ExecutionProviderSnapshot:
         if self.runtime_capabilities_provider is not None:
-            return self.runtime_capabilities_provider()
-        return self.runtime_capabilities
+            refreshed = self.runtime_capabilities_provider()
+            if isinstance(refreshed, ExecutionProviderSnapshot):
+                return refreshed
+            return ExecutionProviderSnapshot(
+                refreshed,
+                self.configured_provider_routes,
+            )
+        return ExecutionProviderSnapshot(
+            self.runtime_capabilities,
+            self.configured_provider_routes,
+        )
 
     def execution_context(
         self,
@@ -100,11 +384,13 @@ class WorkflowRunnerBinding:
         surface: Literal["background", "cli"],
         entitlement: AIEntitlementResolution,
     ) -> ExecutionCapabilityContext:
+        provider_snapshot = self._provider_snapshot_for_context()
         return execution_capability_context(
             surface=surface,
             entitlement=entitlement,
             runner_capabilities=self.capabilities_for(entitlement),
-            runtime_capabilities=self._runtime_capabilities_for_context(),
+            runtime_capabilities=provider_snapshot.runtime_capabilities,
+            configured_provider_routes=provider_snapshot.configured_provider_routes,
         )
 
 
@@ -114,12 +400,14 @@ def execution_capability_context(
     entitlement: AIEntitlementResolution,
     runner_capabilities: RunnerCapabilities,
     runtime_capabilities: ExecutionRuntimeCapabilities,
+    configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] | None = None,
 ) -> ExecutionCapabilityContext:
     return ExecutionCapabilityContext(
         surface=surface,
         entitlement=entitlement,
         runner_capabilities=runner_capabilities,
         runtime_capabilities=runtime_capabilities,
+        configured_provider_routes=configured_provider_routes or MappingProxyType({}),
         mcp_available=(
             surface == "background"
             and entitlement.value == "real"
@@ -137,25 +425,43 @@ def _configured_provider_metadata(
     if not isinstance(model_config, Mapping):
         return "", model_config, {}
     provider = model_config.get("provider", "")
-    provider_config: Mapping[str, object] = {}
-    if isinstance(provider, str) and provider.strip():
-        normalized = provider.strip().casefold()
-        for candidate in get_compatible_custom_providers(dict(config)):
-            name = candidate.get("name") if isinstance(candidate, Mapping) else None
-            if isinstance(name, str) and name.strip().casefold() == normalized:
-                provider_config = candidate
-                break
-    return provider, model_config, provider_config
+    return provider, model_config, {}
+
+
+def _production_provider_snapshot() -> ExecutionProviderSnapshot:
+    config = read_raw_config()
+    configured_provider_routes = snapshot_configured_execution_routes(config)
+    provider, model_config, provider_config = _configured_provider_metadata(config)
+    configured_route = (
+        configured_provider_routes.get(provider.strip().casefold())
+        if isinstance(provider, str)
+        else None
+    )
+    target_model = (
+        str(model_config.get("default") or model_config.get("model") or "").strip()
+        if isinstance(model_config, Mapping)
+        else ""
+    )
+    runtime_capabilities = (
+        classify_configured_execution_route(
+            configured_route,
+            target_model=target_model or None,
+        )
+        if configured_route is not None
+        else classify_execution_runtime(
+            provider=provider,
+            model_config=model_config,
+            provider_config=provider_config,
+        )
+    )
+    return ExecutionProviderSnapshot(
+        runtime_capabilities=runtime_capabilities,
+        configured_provider_routes=configured_provider_routes,
+    )
 
 
 def _production_runtime_capabilities() -> ExecutionRuntimeCapabilities:
-    config = read_raw_config()
-    provider, model_config, provider_config = _configured_provider_metadata(config)
-    return classify_execution_runtime(
-        provider=provider,
-        model_config=model_config,
-        provider_config=provider_config,
-    )
+    return _production_provider_snapshot().runtime_capabilities
 
 
 def production_workflow_runner_binding() -> WorkflowRunnerBinding:
@@ -167,7 +473,7 @@ def production_workflow_runner_binding() -> WorkflowRunnerBinding:
         AIEntitlementResolution("deterministic"),
         real_runner,
     )
-    runtime_capabilities = _production_runtime_capabilities()
+    provider_snapshot = _production_provider_snapshot()
     return WorkflowRunnerBinding(
         real_runner=real_runner,
         deterministic_runner=deterministic_runner,
@@ -177,8 +483,9 @@ def production_workflow_runner_binding() -> WorkflowRunnerBinding:
             )
         ),
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
-        runtime_capabilities=runtime_capabilities,
-        runtime_capabilities_provider=_production_runtime_capabilities,
+        runtime_capabilities=provider_snapshot.runtime_capabilities,
+        configured_provider_routes=provider_snapshot.configured_provider_routes,
+        runtime_capabilities_provider=_production_provider_snapshot,
     )
 
 
@@ -215,7 +522,29 @@ def assess_package_execution(
     compatibility = assess_compatibility(
         package,
         mcp_available=context.mcp_available,
+        structured_output_decisions=context.structured_output_decisions(package),
     )
+    try:
+        context.structured_output_run_metadata(package)
+    except StructuredOutputMetadataCapacityError as exc:
+        compatibility = CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                *compatibility.findings,
+                CompatibilityFinding(
+                    path=f"nodes[{exc.node_id!r}].output_format",
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message=(
+                        "structured output decision exceeds persistent run "
+                        "metadata limits"
+                    ),
+                    blocking=True,
+                    code="structured_output_metadata_too_large",
+                    effective_profile=package.language.effective_profile,
+                ),
+            ),
+            runnable=False,
+        )
     if package.sidecar.get("execution_environment", "trusted_local") != (
         "trusted_local"
     ):

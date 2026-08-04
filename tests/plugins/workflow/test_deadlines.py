@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, asdict, fields
+from datetime import datetime, timedelta, timezone
 import shlex
 import sys
+import time
 
 import pytest
+import yaml
 
 import plugins.workflow.models as workflow_models
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.models import DeadlineBudget, WorkflowRuntimeConfig
+from plugins.workflow.models import (
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowRuntimeConfig,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -247,6 +254,380 @@ def test_scheduler_threads_limits_from_sealed_snapshot_to_process_boundary(
     assert context.termination_policy.cooperative_grace_seconds == 1
     assert context.termination_policy.term_grace_seconds == 2
     assert context.termination_policy.kill_grace_seconds == 1
+
+
+@pytest.mark.parametrize(
+    ("node_type", "node", "subprocess_ceiling", "expected_wall"),
+    [
+        ("bash", {"id": "shell", "bash": "true", "timeout": 1_500.5}, 30.0, 1.5005),
+        ("bash", {"id": "shell", "bash": "true"}, 60.0, 60.0),
+        ("bash", {"id": "shell", "bash": "true"}, 120.0, 120.0),
+        ("bash", {"id": "shell", "bash": "true"}, 240.0, 120.0),
+        (
+            "script",
+            {
+                "id": "shell",
+                "script": "print('ok')",
+                "runtime": "uv",
+                "timeout": 1_500.5,
+            },
+            30.0,
+            1.5005,
+        ),
+        (
+            "script",
+            {"id": "shell", "script": "print('ok')", "runtime": "uv"},
+            60.0,
+            60.0,
+        ),
+        (
+            "script",
+            {"id": "shell", "script": "print('ok')", "runtime": "uv"},
+            120.0,
+            120.0,
+        ),
+        (
+            "script",
+            {"id": "shell", "script": "print('ok')", "runtime": "uv"},
+            240.0,
+            120.0,
+        ),
+    ],
+)
+def test_archon_claim_uses_sealed_per_attempt_subprocess_wall(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    node_type,
+    node,
+    subprocess_ceiling,
+    expected_wall,
+):
+    workflow = workflow_writer(tmp_path / "package", nodes=[node])
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=RunExecutionLimits(
+            subprocess_timeout_seconds=subprocess_ceiling,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"sealed-{subprocess_ceiling}-{expected_wall}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = []
+
+    class CaptureBoundary:
+        def execute(self, context):
+            observed.append(context)
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(store, subprocess_timeout_seconds=1.0)
+    scheduler.executors[node_type] = CaptureBoundary()
+    monkeypatch.setattr(
+        scheduler,
+        "_run_execution_limits",
+        lambda _package: (_ for _ in ()).throw(
+            AssertionError("resumed v3 consulted current timeout config")
+        ),
+    )
+    try:
+        result = scheduler.advance(
+            admitted.run_id,
+            max_nodes=1 if "timeout" in node else None,
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    context = observed[0]
+    assert context.timeout_seconds == pytest.approx(expected_wall)
+    assert context.deadline_budget is not None
+    assert context.deadline_budget.remaining_wall(
+        context.deadline_budget.last_semantic_progress
+    ) == pytest.approx(expected_wall)
+
+
+def test_archon_claim_uses_sealed_ai_wall_idle_and_provider_intersection(
+    tmp_path, workflow_writer
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[{"id": "agent", "prompt": "work", "idle_timeout": 1_250.5}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=RunExecutionLimits(
+            ai_idle_timeout_seconds=3.0,
+            ai_wall_timeout_seconds=4.0,
+            provider_request_timeout_seconds=2.0,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="sealed-ai-timeouts",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    observed = []
+
+    class CaptureBoundary:
+        def execute(self, context):
+            observed.append(context)
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(
+        store,
+        ai_idle_timeout_seconds=100.0,
+        ai_wall_timeout_seconds=100.0,
+        provider_request_timeout_seconds=100.0,
+    )
+    scheduler.executors["prompt"] = CaptureBoundary()
+    try:
+        result = scheduler.advance(admitted.run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    context = observed[0]
+    assert context.timeout_seconds == 4.0
+    assert context.deadline_budget is not None
+    assert context.deadline_budget.idle_seconds == pytest.approx(1.2505)
+    assert context.deadline_budget.provider_seconds == 2.0
+
+
+def test_archon_workflow_retry_gets_a_fresh_sealed_attempt_budget_after_backoff(
+    tmp_path, workflow_writer, monkeypatch
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[{
+            "id": "shell",
+            "bash": "true",
+            "timeout": 1_500.5,
+            "retry": {"max_attempts": 1},
+        }],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        execution_limits=RunExecutionLimits(subprocess_timeout_seconds=30.0),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="retry-fresh-attempt-budget",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    wall_clock = {"now": datetime(2030, 1, 1, tzinfo=timezone.utc)}
+    first_origin = time.monotonic()
+    monotonic_clock = {"now": first_origin}
+    observed = []
+
+    class RetryOnce:
+        def execute(self, context):
+            observed.append(context.deadline_budget)
+            if len(observed) == 1:
+                return NodeExecutionResult(
+                    "failed", error_code="timeout", error_message="retry me"
+                )
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(
+        store,
+        utcnow=lambda: wall_clock["now"],
+        monotonic=lambda: monotonic_clock["now"],
+    )
+    scheduler.executors["bash"] = RetryOnce()
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    try:
+        first_result = scheduler.advance(admitted.run_id, max_nodes=1)
+        assert first_result["nodes"]["shell"]["state"] == "waiting_retry"
+        retry_at = datetime.fromisoformat(
+            first_result["nodes"]["shell"]["next_attempt_at"].replace(
+                "Z", "+00:00"
+            )
+        )
+        wall_clock["now"] = retry_at - timedelta(milliseconds=1)
+        monotonic_clock["now"] = first_origin + 1.75
+        assert store.wake_due_retries(
+            admitted.run_id, now=wall_clock["now"]
+        ) == ()
+        assert len(observed) == 1
+        wall_clock["now"] = retry_at + timedelta(milliseconds=1)
+        monotonic_clock["now"] = first_origin + 2.0
+        assert store.wake_due_retries(
+            admitted.run_id, now=wall_clock["now"]
+        ) == ("shell",)
+        if store.load_run(admitted.run_id)["status"] == "queued":
+            assert store.try_promote_run(
+                admitted.run_id, now=wall_clock["now"]
+            )
+        final = scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert len(observed) == 2
+    assert final["status"] == "succeeded"
+    assert observed[0].wall_deadline == pytest.approx(first_origin + 1.5005)
+    assert observed[1].wall_deadline == pytest.approx(first_origin + 3.5005)
+    assert observed[0].remaining_wall(first_origin) == pytest.approx(1.5005)
+    assert observed[1].remaining_wall(first_origin + 2.0) == pytest.approx(1.5005)
+
+
+@pytest.mark.parametrize("entrypoint", ("advance", "advance_all"))
+def test_archon_attempt_wall_starts_at_successful_claim_before_dispatch(
+    tmp_path, workflow_writer, monkeypatch, entrypoint
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[{"id": "shell", "bash": "true", "timeout": 1_000}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"claim-origin-{entrypoint}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim_origin = time.monotonic()
+    clock = {"now": claim_origin}
+    observed_budgets = []
+
+    scheduler = RunScheduler(store, monotonic=lambda: clock["now"])
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_claim",
+        lambda *_args: observed_budgets.append(_args[-1]),
+    )
+    original_claim = store.claim_node
+
+    def claim_then_delay(*args, **kwargs):
+        claim = original_claim(*args, **kwargs)
+        if claim is not None:
+            clock["now"] = claim_origin + 1.0
+        return claim
+
+    monkeypatch.setattr(store, "claim_node", claim_then_delay)
+    try:
+        if entrypoint == "advance":
+            scheduler.advance(admitted.run_id, max_nodes=1)
+        else:
+            scheduler.advance_all([admitted.run_id])
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert len(observed_budgets) == 1
+    assert observed_budgets[0].wall_deadline == claim_origin + 1.0
+    assert observed_budgets[0].wall_expired(claim_origin + 1.0)
+
+
+def test_advance_all_releases_prior_zero_effect_claim_after_fence_loss(
+    tmp_path, workflow_writer, monkeypatch
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            nodes=[
+                {"id": "first", "bash": "true"},
+                {"id": "second", "bash": "true"},
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="batch-fence-cleanup",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    scheduler = RunScheduler(store, max_parallel_nodes=2)
+    original_claim = store.claim_node
+    claim_calls = 0
+    executor_calls = []
+
+    def lose_second_claim(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 2:
+            raise RuntimeError("execution fence changed")
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim_node", lose_second_claim)
+    monkeypatch.setattr(scheduler, "_is_execution_fence_loss", lambda _exc: True)
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_claim",
+        lambda *_args, **_kwargs: executor_calls.append(True),
+    )
+    try:
+        result = scheduler.advance_all([admitted.run_id])[admitted.run_id]
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["nodes"]["first"]["state"] == "ready"
+    assert result["nodes"]["second"]["state"] == "ready"
+    assert executor_calls == []
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])

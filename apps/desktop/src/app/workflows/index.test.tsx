@@ -7,11 +7,12 @@ import { I18nProvider } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
-import { RunInspector } from './run-inspector'
+import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
 const getWorkflowEvidence = vi.fn()
+const getWorkflowArtifactPreview = vi.fn()
 const listWorkflowAttention = vi.fn()
 const listWorkflowEvents = vi.fn()
 const listWorkflowRuns = vi.fn()
@@ -24,7 +25,10 @@ const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null 
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
 vi.mock('@/hermes', () => ({
+  cancelWorkflowArtifactDownload: vi.fn().mockResolvedValue({ cancelled: true }),
+  downloadWorkflowArtifact: vi.fn().mockResolvedValue({ status: 'cancelled' }),
   getApiRequestProfile: () => apiRequestState.profile,
+  getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
   getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
   getWorkflowRun: (...args: unknown[]) => getWorkflowRun(...args),
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
@@ -147,6 +151,7 @@ beforeEach(() => {
 
   for (const mock of [
     getWorkflowEvidence,
+    getWorkflowArtifactPreview,
     getWorkflowRun,
     listWorkflowAttention,
     listWorkflowEvents,
@@ -168,6 +173,14 @@ beforeEach(() => {
     kind: 'attempts',
     next_cursor: 0,
     schema_version: 1,
+    truncated: false
+  })
+  getWorkflowArtifactPreview.mockResolvedValue({
+    bytes_returned: 0,
+    content: '',
+    media_type: 'text/markdown; charset=utf-8',
+    publication_id: 'publication-1',
+    size_bytes: 0,
     truncated: false
   })
   listWorkflowAttention.mockResolvedValue({ items: [], next_cursor: null, schema_version: 1 })
@@ -961,8 +974,16 @@ describe('WorkflowsView', () => {
   it('loads selected evidence on demand and sends bounded input through one mutation', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
     getWorkflowRun.mockResolvedValue(run({ next_actions: ['provide-input'] }))
+
+    const attemptEvidence = {
+      attempt_id: 'attempt-1',
+      error: { code: 'provider_timeout', message: 'first line\nsecond line' },
+      retry: { requested_retries: 2 },
+      state: 'failed'
+    }
+
     getWorkflowEvidence.mockResolvedValue({
-      items: [{ attempt_id: 'attempt-1', state: 'failed' }],
+      items: [attemptEvidence],
       kind: 'attempts',
       next_cursor: 1,
       schema_version: 1,
@@ -974,7 +995,17 @@ describe('WorkflowsView', () => {
     fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Attempts' }), { button: 0, ctrlKey: false })
     await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'attempts'))
     const attempt = await screen.findByRole('listitem')
-    expect(attempt.textContent).toContain('attempt-1')
+    expect(attempt.textContent).toBe(`{
+  "attempt_id": "attempt-1",
+  "error": {
+    "code": "provider_timeout",
+    "message": "first line\\nsecond line"
+  },
+  "retry": {
+    "requested_retries": 2
+  },
+  "state": "failed"
+}`)
 
     fireEvent.change(screen.getByLabelText('Input value'), { target: { value: 'bounded answer' } })
     fireEvent.click(screen.getByRole('button', { name: 'Provide input' }))
@@ -986,6 +1017,135 @@ describe('WorkflowsView', () => {
         expect.objectContaining({ expected_version: 1, interaction_id: 'interaction-1', value: 'bounded answer' })
       )
     )
+  })
+
+  it('requests and renders generic persistent-session recovery evidence', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowEvidence.mockResolvedValue({
+      items: [
+        {
+          attempt_id: 'attempt-1',
+          outcome: 'stale_entry_replaced',
+          recovery_kind: 'persistent_session'
+        }
+      ],
+      kind: 'recovery',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector run={run()} />
+      </QueryClientProvider>
+    )
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Recovery' }), { button: 0, ctrlKey: false })
+
+    await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'recovery'))
+    expect(await screen.findByText(/"recovery_kind": "persistent_session"/)).toBeTruthy()
+    expect(screen.getByText(/"outcome": "stale_entry_replaced"/)).toBeTruthy()
+  })
+
+  it('narrows only complete Phase 3 attempt and persistent-session recovery evidence', () => {
+    const attempt: Record<string, unknown> = {
+      attempt_id: 'attempt-1',
+      node_id: 'producer',
+      retry: {
+        additional_provider_attempts: 2,
+        capped: false,
+        effective_total_attempts: 3,
+        remaining_attempts: 0,
+        requested_retries: 2,
+        requested_total_attempts: 3,
+        retry_consumed: 3
+      },
+      state: 'succeeded'
+    }
+
+    const recovery: Record<string, unknown> = {
+      attempt_id: 'attempt-2',
+      cache_fingerprint_sha256: 'b'.repeat(64),
+      missing_session_sha256: 'a'.repeat(64),
+      node_id: 'producer',
+      outcome: 'stale_entry_replaced',
+      provider: 'test-provider',
+      provider_attempts_before_recovery: 0,
+      recovery_kind: 'persistent_session',
+      registry_generation: 7,
+      runtime_profile: 'default',
+      source: 'cross_run_registry'
+    }
+
+    expect(isWorkflowAttemptEvidence(attempt)).toBe(true)
+
+    if (!isWorkflowAttemptEvidence(attempt)) {
+      throw new Error('attempt evidence did not narrow')
+    }
+
+    expect(attempt.retry.additional_provider_attempts).toBe(2)
+    expect(isWorkflowAttemptEvidence({ attempt_id: 'legacy-attempt', state: 'failed' })).toBe(false)
+
+    expect(isWorkflowPersistentSessionRecoveryEvidence(recovery)).toBe(true)
+
+    if (!isWorkflowPersistentSessionRecoveryEvidence(recovery)) {
+      throw new Error('recovery evidence did not narrow')
+    }
+
+    expect(recovery.recovery_kind).toBe('persistent_session')
+    expect(isWorkflowPersistentSessionRecoveryEvidence({ recovery_kind: 'persistent_session' })).toBe(false)
+  })
+
+  it('uses typed artifacts only for backend-confirmed publication identities and preserves legacy evidence fallback', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowEvidence.mockResolvedValueOnce({
+      items: [
+        { relative_path: 'legacy.txt' },
+        {
+          attempt_id: 'attempt-1',
+          integrity_status: 'verified',
+          media_type: 'text/markdown; charset=utf-8',
+          node_id: 'producer',
+          output_type: 'Report',
+          publication_id: 'publication-1',
+          recovery_status: 'verified',
+          sha256: 'b'.repeat(64),
+          size_bytes: 42
+        }
+      ],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    })
+    await renderView(client)
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Verified artifacts' }), {
+      button: 0,
+      ctrlKey: false
+    })
+
+    expect(await screen.findByText('Report')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Download artifact:/ })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /Download artifact:/ })).toBeNull()
+    expect(screen.queryByText(/legacy\.txt/)).toBeNull()
+
+    cleanup()
+    getWorkflowEvidence.mockResolvedValueOnce({
+      items: [{ publication_id: '   ', relative_path: 'legacy.txt' }],
+      kind: 'artifacts',
+      next_cursor: 0,
+      schema_version: 1,
+      truncated: false
+    })
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <RunInspector run={run()} />
+      </QueryClientProvider>
+    )
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Verified artifacts' }), { button: 0, ctrlKey: false })
+
+    expect(await screen.findByText(/legacy\.txt/)).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Download artifact' })).toBeNull()
   })
 
   it('separates archive views from explicit preview-token cleanup', async () => {

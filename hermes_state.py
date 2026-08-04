@@ -6516,6 +6516,42 @@ class SessionDB:
             repair_alternation=repair_alternation,
         )
 
+    def get_existing_session_conversation(
+        self, session_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Atomically load one existing session's active conversation.
+
+        Returns ``None`` when the session does not exist, ``[]`` when it
+        exists without active messages, and otherwise the same decoded shape
+        as ``get_messages_as_conversation(session_id)``.  The session row and
+        message rows are observed by one ``LEFT JOIN`` statement, so callers
+        never need an unsafe existence-check followed by a separate history
+        read.  This intentionally exposes only the narrow single-session,
+        active-history contract required by persistent plugin-agent replay;
+        lineage and alternation-repair consumers retain the existing loader.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT m.id AS _message_id, {self._CONVERSATION_ROW_COLUMNS} "
+                "FROM sessions AS s "
+                "LEFT JOIN messages AS m "
+                "ON m.session_id = s.id AND m.active = 1 "
+                "WHERE s.id = ? ORDER BY m.id",
+                (session_id,),
+            ).fetchall()
+
+        if not rows:
+            return None
+        message_rows = [row for row in rows if row["_message_id"] is not None]
+        if not message_rows:
+            return []
+        return self._rows_to_conversation(
+            message_rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+        )
+
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
     # SELECT can feed both the model-fed and display views.

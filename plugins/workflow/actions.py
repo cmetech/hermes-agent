@@ -64,6 +64,8 @@ def available_actions(
         actions.append("cancel")
         if status == "running" and health == "stalled" and can_resume:
             actions.append("resume")
+    elif status == "recovery_pending":
+        actions.extend(("resume", "cancel"))
     elif status in {"failed", "interrupted"}:
         actions.extend(("resume", "retry", "abandon"))
     else:

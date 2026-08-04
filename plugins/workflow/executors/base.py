@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution
-from plugins.workflow.models import DeadlineBudget, RunExecutionLimits, WorkflowNode
+from plugins.workflow.models import (
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    WorkflowStructuredOutput,
+)
+from plugins.workflow.output_resolution import (
+    PrimaryOutputCandidate,
+    ResolvedOutputReference,
+)
+from plugins.workflow.sessions import (
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
+)
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
     ProcessIdentity,
@@ -63,6 +78,22 @@ class NodeExecutionContext:
     )
     sealed_resource_paths: frozenset[str] | None = None
     sealed_resource_bytes: Mapping[str, bytes] | None = None
+    language_profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY
+    normalizer_version: int = 2
+    structured_output: WorkflowStructuredOutput | None = None
+    structured_output_decision: StructuredOutputCapabilityDecision | None = None
+    outward_action: bool = False
+    output_resolver: (
+        Callable[[str, tuple[str, ...]], ResolvedOutputReference] | None
+    ) = None
+    sealed_attempt_timeout: bool = False
+    record_session_recovery_selection: (
+        Callable[[PersistentSessionRecoverySelection], bool] | None
+    ) = None
+    provider_dispatch: Callable[[str], bool] | None = None
+    provider_start_delivered: Callable[[str], bool] | None = None
+    provider_execute_received: Callable[[str], bool] | None = None
+    provider_execute_release: Callable[[str], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +103,38 @@ class NodeExecutionResult:
     error_code: str | None = None
     error_message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    primary_output: PrimaryOutputCandidate | None = None
+    session_registry_update: SessionRegistryUpdateCandidate | None = None
+    session_registry_authority: SessionRegistryUpdateCandidate | None = None
+    session_recovery_outcome: str | None = None
+
+
+def sealed_provider_request_for_launch(
+    context: NodeExecutionContext,
+    request: Any,
+) -> Any | None:
+    """Intersect a v3 provider handoff with the latest absolute attempt budget."""
+    if not context.sealed_attempt_timeout:
+        return request
+    if context.deadline_budget is None:
+        raise RuntimeError("sealed provider launch requires an attempt deadline")
+    remaining = context.deadline_budget.remaining_wall(context.monotonic())
+    if remaining <= 0:
+        return None
+    return replace(
+        request,
+        wall_timeout_seconds=remaining,
+        idle_timeout_seconds=min(
+            request.idle_timeout_seconds,
+            context.deadline_budget.idle_seconds,
+            remaining,
+        ),
+        provider_request_timeout_seconds=min(
+            request.provider_request_timeout_seconds,
+            context.deadline_budget.provider_seconds,
+            remaining,
+        ),
+    )
 
 
 def validated_provider_retry_count(
@@ -92,6 +155,27 @@ def validated_provider_retry_count(
         and 0 <= value < granted_attempts
     ):
         return value
+    return None
+
+
+def validated_provider_total_call_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int | None:
+    """Convert an exact total provider-call count to additional calls once."""
+    if (
+        isinstance(granted_attempts, bool)
+        or not isinstance(granted_attempts, int)
+        or granted_attempts <= 0
+    ):
+        raise ValueError("granted provider attempts must be a positive integer")
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= granted_attempts
+    ):
+        return value - 1
     return None
 
 

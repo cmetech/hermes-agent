@@ -83,6 +83,8 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       apiStructured: <T>(request: HermesApiRequest) => Promise<HermesStructuredApiResponse<T>>
+      downloadWorkflowArtifact: (request: WorkflowArtifactDownloadRequest) => Promise<WorkflowArtifactDownloadResult>
+      cancelWorkflowArtifactDownload: (requestId: string) => Promise<{ cancelled: boolean }>
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       readFileDataUrl: (filePath: string) => Promise<string>
@@ -684,6 +686,16 @@ export interface HermesApiRequest {
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
 }
+
+export interface WorkflowArtifactDownloadRequest {
+  path: string
+  profile?: string | null
+  requestId: string
+}
+
+export type WorkflowArtifactDownloadResult =
+  | { status: 'cancelled' }
+  | { filename: string; mediaType: string; sizeBytes: number; status: 'saved' }
 
 export type HermesStructuredApiResponse<T> = { ok: true; value: T } | { body: unknown; ok: false; status: number }
 

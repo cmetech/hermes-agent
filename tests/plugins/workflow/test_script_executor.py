@@ -12,7 +12,16 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    DeadlineBudget,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    freeze_value,
+)
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    WorkflowOutputReferenceError,
+)
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -72,8 +81,13 @@ def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
 
     assert context.monotonic is monotonic
     assert context.termination_policy is termination_policy
+    assert context.process_stopped is None
     assert context.sealed_resource_paths is None
     assert context.sealed_resource_bytes is None
+    assert context.provider_dispatch is None
+    assert context.provider_start_delivered is None
+    assert context.provider_execute_received is None
+    assert context.provider_execute_release is None
 
 
 def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
@@ -253,6 +267,7 @@ def _context(
     deps: tuple[str, ...] = (),
     timeout_seconds: float = 3,
     variable_context: VariableContext | None = None,
+    depends_on: tuple[str, ...] = (),
     termination_policy: TerminationPolicy | None = None,
 ) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
@@ -261,7 +276,7 @@ def _context(
         id="script",
         node_type="script",
         value=script,
-        depends_on=(),
+        depends_on=depends_on,
         source_index=0,
         source_line=1,
         options=freeze_value({"runtime": runtime, "deps": deps}),
@@ -279,6 +294,207 @@ def _context(
             else {}
         ),
     )
+
+
+def test_archon_script_does_not_resolve_runtime_at_exact_attempt_wall_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    context = replace(
+        _context(tmp_path, runtime="uv", script="print('must not run')\n"),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: 11.0,
+    )
+    executor = ScriptExecutor()
+    monkeypatch.setattr(
+        executor,
+        "_runtime_locator",
+        lambda _runtime: (_ for _ in ()).throw(
+            AssertionError("expired attempt resolved a script runtime")
+        ),
+    )
+
+    result = executor.execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+
+
+def test_archon_script_rechecks_wall_after_runtime_resolution_before_spawn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=1.0,
+        idle_seconds=1.0,
+        provider_seconds=1.0,
+    )
+    clock = {"now": 10.0}
+    spawn_calls = []
+
+    def locate(_runtime):
+        clock["now"] = 11.0
+        return "/fake/uv"
+
+    context = replace(
+        _context(tmp_path, runtime="uv", script="print('must not run')\n"),
+        deadline_budget=budget,
+        sealed_attempt_timeout=True,
+        monotonic=lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.executors.script.ManagedProcessTree.spawn",
+        lambda *_args, **_kwargs: spawn_calls.append(True),
+    )
+
+    result = ScriptExecutor(runtime_locator=locate).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+    assert spawn_calls == []
+
+
+def test_legacy_script_preserves_separate_absolute_and_elapsed_clock_samples(
+    tmp_path: Path,
+) -> None:
+    wrapper = tmp_path / "fake-uv"
+    wrapper.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    samples = iter((10.0, 10.5, 11.0))
+
+    def monotonic():
+        try:
+            return next(samples)
+        except StopIteration as exc:
+            raise AssertionError(
+                "legacy script sampled beyond its timeout boundary"
+            ) from exc
+
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('ignored')\n",
+            timeout_seconds=1.0,
+            termination_policy=TerminationPolicy(
+                cooperative_grace_seconds=0,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+                wait_timeout_seconds=0.1,
+            ),
+        ),
+        deadline_budget=DeadlineBudget.create(
+            now=10.0,
+            wall_seconds=100.0,
+            idle_seconds=100.0,
+            provider_seconds=100.0,
+        ),
+        monotonic=monotonic,
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(wrapper)
+    ).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+
+
+def test_v3_inline_script_rechecks_direct_dependency_before_runtime(tmp_path: Path) -> None:
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('$producer.output.answer')\n",
+            variable_context=variables,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        ScriptExecutor(runtime_locator=lambda _runtime: "/fake/uv").execute(context)
+
+    assert exc.value.code == "output_reference_not_declared_dependency"
+    assert not (context.run_directory / "nodes").exists()
+
+
+@pytest.mark.parametrize("runtime", ("uv", "bun"))
+def test_legacy_missing_named_script_preserves_attempt_tree_before_validation(
+    tmp_path: Path,
+    runtime: str,
+) -> None:
+    context = _context(tmp_path, runtime=runtime, script="missing")
+
+    result = ScriptExecutor(runtime_locator=lambda selected: f"/fake/{selected}").execute(
+        context
+    )
+
+    assert result.error_code == "validation"
+    attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+    assert attempt.is_dir()
+    assert (context.run_directory / "artifacts").is_dir()
+
+
+def test_v3_named_script_bytes_are_never_interpolated(tmp_path: Path) -> None:
+    source = b"print('$producer.output.answer')\n"
+    variables = VariableContext(
+        normalizer_version=3,
+        node_outputs={
+            "producer": ResolvedNodeOutput(
+                canonical_bytes=b'{"answer":"ready"}',
+                value={"answer": "ready"},
+                text='{"answer":"ready"}',
+                media_type="application/json",
+                sha256="1" * 64,
+                node_id="producer",
+                attempt_id="attempt-winner",
+                publication_id="a" * 32,
+                schema_fingerprint="3" * 64,
+                canonicalization_version=1,
+            )
+        },
+    )
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="named",
+            variable_context=variables,
+            depends_on=("producer",),
+        ),
+        sealed_resource_paths=frozenset({"scripts/named.py"}),
+        sealed_resource_bytes={"scripts/named.py": source},
+    )
+
+    _argv, _warnings, source_bytes = ScriptExecutor()._execution_plan(
+        context,
+        "/fake/uv",
+    )
+
+    assert source_bytes == source
 
 
 def test_uv_dependencies_are_distinct_argv_without_shell_interpolation(
@@ -315,6 +531,48 @@ def test_uv_dependencies_are_distinct_argv_without_shell_interpolation(
         "print('never')\n",
     ]
     assert not marker.exists()
+
+
+def test_inline_script_renders_frozen_nested_objects_and_arrays(tmp_path: Path) -> None:
+    wrapper = tmp_path / "fake-uv"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    canonical = b'{"items":[{"count":3}]}'
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script=(
+            "print('$collect.output.items.0', "
+            "'$collect.output.items')\n"
+        ),
+        variable_context=VariableContext(
+            node_outputs={
+                "collect": ResolvedNodeOutput(
+                    canonical_bytes=canonical,
+                    value={"items": [{"count": 3}]},
+                    text=canonical.decode("utf-8"),
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="collect",
+                    attempt_id="attempt-winner",
+                    publication_id=None,
+                )
+            }
+        ),
+    )
+
+    result = ScriptExecutor(runtime_locator=lambda _runtime: str(wrapper)).execute(
+        context
+    )
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert json.loads(output.read_text())[-1] == (
+        'print(\'{"count":3}\', \'[{"count":3}]\')\n'
+    )
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
@@ -460,13 +718,22 @@ def test_scheduler_executes_snapshotted_named_script(
     (scripts / "summarize.py").write_text(
         "import json; print(json.dumps({'status':'ok'}))\n", encoding="utf-8"
     )
-    package = load_workflow(
-        workflow_writer(
-            package_root / "workflows",
-            name="script-e2e",
-            nodes=[{"id": "summarize", "script": "summarize", "runtime": "uv"}],
-        )
+    workflow = workflow_writer(
+        package_root / "workflows",
+        name="script-e2e",
+        nodes=[
+            {
+                "id": "summarize",
+                "script": "summarize",
+                "runtime": "uv",
+                "output_type": "ScriptSummary",
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -488,3 +755,11 @@ def test_scheduler_executes_snapshotted_named_script(
     artifact = result["artifacts"][0]
     output = store.run_directory(admitted.run_id) / artifact["relative_path"]
     assert json.loads(output.read_text()) == {"status": "ok"}
+    assert artifact["publication_id"]
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / artifact["publication_id"]
+    )
+    assert artifact["media_type"] == "application/json"
+    assert (bundle / "content.json").read_bytes() == output.read_bytes()

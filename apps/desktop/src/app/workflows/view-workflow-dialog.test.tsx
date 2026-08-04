@@ -271,6 +271,20 @@ describe('workflow View dialog', () => {
     expect(within(dialog).queryByText('Archon 2026-07')).toBeNull()
   })
 
+  it('keeps an older backend detail usable when additive language fields are absent', async () => {
+    currentDetail = detail({
+      language: {
+        effective_profile: 'archon-2026-07',
+        legacy: false
+      }
+    })
+    renderView()
+
+    const dialog = await openView()
+    expect(await within(dialog).findByText('Archon 2026-07')).toBeTruthy()
+    expect(within(dialog).queryByText(/Normalizer/)).toBeNull()
+  })
+
   it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
     renderView()
     const dialog = await openView()

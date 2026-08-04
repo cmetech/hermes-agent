@@ -12,8 +12,14 @@ import re
 import sys
 import threading
 import unicodedata
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
+
+from agent.plugin_agent import (
+    _ProviderAttemptGrantExhausted,
+    _reserve_shared_provider_attempt,
+    _snapshot_shared_provider_attempts,
+)
 
 
 _PROTOCOL_VERSION = 1
@@ -1037,6 +1043,12 @@ def _build_inline_agent_handler(
             workdir=workdir,
             max_iterations=int(definition.get("max_iterations", 90)),
             max_api_attempts=getattr(parent, "max_api_attempts", 1),
+            sealed_provider_attempt_grant=getattr(
+                parent, "sealed_provider_attempt_grant", False
+            ),
+            _provider_attempt_authority=getattr(
+                parent, "_provider_attempt_authority", None
+            ),
             idle_timeout_seconds=getattr(parent, "idle_timeout_seconds", 300.0),
             wall_timeout_seconds=getattr(parent, "wall_timeout_seconds", 1800.0),
             provider_request_timeout_seconds=getattr(
@@ -1134,26 +1146,122 @@ def _tool_name(schema: dict[str, Any]) -> str:
     return str(function.get("name", "")) if isinstance(function, dict) else ""
 
 
-def _run(payload: dict[str, Any]) -> dict[str, Any]:
+def _structured_output_evidence(
+    decision,
+    *,
+    provider_attempts: int,
+    model_calls: int,
+) -> dict[str, str | int]:
+    return {
+        "provider_attempts": max(0, int(provider_attempts)),
+        "model_calls": max(0, int(model_calls)),
+        "strategy": decision.strategy.value,
+        "adapter_version": int(decision.adapter_version),
+        "schema_fingerprint": decision.schema_fingerprint,
+        "declaration_source": _sanitize(decision.declaration_source, 64),
+    }
+
+
+def _structured_output_failure(
+    *,
+    plugin_id: str,
+    decision,
+    failure_kind: str,
+) -> dict[str, Any]:
+    evidence = _structured_output_evidence(
+        decision,
+        provider_attempts=0,
+        model_calls=0,
+    )
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": _sanitize(decision.effective_provider, 64),
+        "model": _sanitize(decision.model, 192),
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": failure_kind,
+            "api_mode": _sanitize(decision.api_mode, 64),
+            **evidence,
+        },
+        "structured_output": evidence,
+    }
+
+
+def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "persistent_session_missing",
+            "provider_attempts": 0,
+            "model_calls": 0,
+        },
+        "structured_output": None,
+    }
+
+
+def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
+    failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
+    if (
+        not isinstance(failure_kind, str)
+        or not failure_kind
+        or failure_kind == "persistent_session_missing"
+    ):
+        failure_kind = type(exc).__name__
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": failure_kind,
+            "error": _sanitize(exc),
+        },
+    }
+
+
+def _prompt_with_structured_output(prompt: str, request) -> str:
+    schema = request.schema.canonical_schema_bytes.decode("utf-8")
+    block = (
+        '<hermes_structured_output adapter_version="'
+        f"{request.adapter_version}"
+        f' schema_fingerprint="{request.schema.schema_fingerprint}"'
+        f' output_bytes_limit="{request.output_bytes_limit}">\n'
+        "Return exactly one complete JSON value and no prose, markdown fences, "
+        "or trailing content. The value must validate against this Draft 2020-12 "
+        "JSON Schema:\n"
+        f"{schema}\n"
+        "</hermes_structured_output>"
+    )
+    return f"{prompt}\n\n{block}"
+
+
+def _run(
+    payload: dict[str, Any],
+    *,
+    provider_start_gate: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     global _active_agent
     from agent.plugin_agent import PluginAgentRunRequest, _validate_request
 
     request_data = payload.get("request")
     if not isinstance(request_data, dict):
         raise ValueError("request payload is missing")
-    request_data = dict(request_data)
-    if request_data.get("workdir"):
-        request_data["workdir"] = Path(request_data["workdir"])
-    for name in (
-        "enabled_toolsets",
-        "allowed_tools",
-        "denied_tools",
-        "skills",
-        "hooks",
-    ):
-        if request_data.get(name) is not None:
-            request_data[name] = tuple(request_data[name])
-    request = PluginAgentRunRequest(**request_data)
+    request = PluginAgentRunRequest.from_wire(request_data)
     _validate_request(request)
     plugin_id = str(payload.get("plugin_id") or "")
     if not plugin_id:
@@ -1174,8 +1282,25 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
     original_node_hooks = None
     original_node_middleware = None
     original_registry_generation = None
+    history = None
 
     try:
+        # Persistent replay eligibility is one atomic SessionDB read and is
+        # established before request-carried service configuration, runtime
+        # resolution, structured-output negotiation, or agent construction.
+        # Returning the privileged missing-state wire shape only at this exact
+        # DB observation prevents later plugin/provider exceptions from
+        # forging worker-origin zero-attempt evidence.
+        from hermes_state import SessionDB
+
+        if request.context_mode == "shared":
+            session_db = SessionDB()
+            history = session_db.get_existing_session_conversation(
+                request.session_id
+            )
+            if history is None:
+                return _persistent_session_missing_failure(plugin_id)
+
         # A node worker sees only the MCP definitions carried by its immutable
         # request. Environment placeholders resolve here, after IPC, and
         # resolved values are never returned to the plugin or parent process.
@@ -1223,6 +1348,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
         from hermes_cli.runtime_provider import (
             classify_resolved_execution_runtime,
             resolve_runtime_provider,
+            resolve_structured_output_capability,
         )
 
         model = _configured_model(request.model)
@@ -1361,8 +1487,6 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             return {"success": False, "stored_as": name, "validated": False}
 
         with registry.scoped_names(allowed_names=allowed, denied_names=denied):
-            from hermes_state import SessionDB
-
             known = set(registry._tools)
             unknown = sorted(
                 (set(request.allowed_tools or ()) | set(request.denied_tools)) - known
@@ -1375,12 +1499,39 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     requested=request.provider, target_model=model or None
                 )
 
-            session_db = SessionDB()
-            history = None
-            if request.context_mode == "shared":
-                if session_db.get_session(request.session_id) is None:
-                    raise ValueError("session_id does not identify an existing session")
-                history = session_db.get_messages_as_conversation(request.session_id)
+            structured_decision = None
+            if request.structured_output is not None:
+                runtime_capabilities = classify_resolved_execution_runtime(
+                    runtime, target_model=model or None
+                )
+                structured_decision = resolve_structured_output_capability(
+                    runtime_capabilities,
+                    schema_fingerprint=(
+                        request.structured_output.schema.schema_fingerprint
+                    ),
+                    model=model or None,
+                )
+                if request.structured_output.strategy.value == "unsupported":
+                    return _structured_output_failure(
+                        plugin_id=plugin_id,
+                        decision=structured_decision,
+                        failure_kind="structured_output_unsupported",
+                    )
+                if (
+                    request.structured_output.strategy != structured_decision.strategy
+                    or request.structured_output.adapter_version
+                    != structured_decision.adapter_version
+                    or request.structured_output.schema.schema_fingerprint
+                    != structured_decision.schema_fingerprint
+                ):
+                    return _structured_output_failure(
+                        plugin_id=plugin_id,
+                        decision=structured_decision,
+                        failure_kind="structured_output_capability_drift",
+                    )
+
+            if session_db is None:
+                session_db = SessionDB()
 
             prompt = request.prompt
             if request.skills:
@@ -1396,6 +1547,13 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     # system prompt mutation, preserving cache and role
                     # alternation.
                     prompt = f"{skill_text}\n\n{request.prompt}"
+            if (
+                request.structured_output is not None
+                and request.structured_output.strategy.value == "prompt_json_schema"
+            ):
+                prompt = _prompt_with_structured_output(
+                    prompt, request.structured_output
+                )
 
             from tools import skills_tool, terminal_tool
 
@@ -1427,6 +1585,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     else None
                 ),
                 request_overrides=dict(request.request_overrides),
+                structured_output=request.structured_output,
                 enabled_toolsets=(
                     list(request.enabled_toolsets)
                     if request.enabled_toolsets is not None
@@ -1439,6 +1598,81 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 clarify_callback=clarify,
             )
             agent._api_max_retries = request.max_api_attempts
+            provider_attempt_counter = [0]
+            provider_attempt_grant_exhausted = [False]
+            provider_attempt_lock = threading.Lock()
+            sealed_provider_grant = request.sealed_provider_attempt_grant
+            shared_provider_authority = request._provider_attempt_authority
+            counted_provider_methods = 0
+            if sealed_provider_grant:
+
+                def reserve_provider_attempt() -> None:
+                    if _cancel_event.is_set() or getattr(
+                        agent, "_interrupt_requested", False
+                    ):
+                        raise InterruptedError(
+                            "Agent interrupted before isolated provider call"
+                        )
+                    if shared_provider_authority is not None:
+                        try:
+                            provider_attempt_counter[0] = (
+                                _reserve_shared_provider_attempt(
+                                    shared_provider_authority
+                                )
+                            )
+                        except _ProviderAttemptGrantExhausted:
+                            provider_attempt_grant_exhausted[0] = True
+                            raise
+                        return
+                    with provider_attempt_lock:
+                        if (
+                            provider_attempt_counter[0]
+                            >= request.max_api_attempts
+                        ):
+                            provider_attempt_grant_exhausted[0] = True
+                            raise _ProviderAttemptGrantExhausted(
+                                "sealed provider attempt grant exhausted"
+                            )
+                        provider_attempt_counter[0] += 1
+
+                agent._provider_attempt_reservation_callback = (
+                    reserve_provider_attempt
+                )
+            else:
+                # Preserve the pre-v3 observation contract exactly. Legacy
+                # audit counts orchestration-method entries (including nested
+                # delegation) but never treats max_api_attempts as one sealed
+                # request-wide grant across recovery or fallback cycles.
+                for method_name in (
+                    "_interruptible_streaming_api_call",
+                    "_interruptible_api_call",
+                ):
+                    original_method = getattr(agent, method_name, None)
+                    if not callable(original_method):
+                        continue
+                    counted_provider_methods += 1
+
+                    def counted_provider_call(
+                        *args, _original_method=original_method, **kwargs
+                    ):
+                        provider_attempt_counter[0] += 1
+                        return _original_method(*args, **kwargs)
+
+                    setattr(agent, method_name, counted_provider_call)
+
+            def provider_attempt_state() -> tuple[int, bool]:
+                if sealed_provider_grant and shared_provider_authority is not None:
+                    snapshot = _snapshot_shared_provider_attempts(
+                        shared_provider_authority
+                    )
+                    return (
+                        int(snapshot["provider_attempts"]),
+                        bool(snapshot["exhausted"]),
+                    )
+                return (
+                    provider_attempt_counter[0],
+                    provider_attempt_grant_exhausted[0],
+                )
             _active_agent = agent
             from hermes_cli.plugins import get_plugin_manager
 
@@ -1467,7 +1701,67 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError("agent tool scope verification failed")
 
             _emit("progress", phase="running", session_id=agent.session_id)
-            response = agent.run_conversation(prompt, conversation_history=history)
+            if provider_start_gate is not None:
+                provider_start_gate()
+            if _cancel_event.is_set():
+                agent._interrupt_requested = True
+            try:
+                response = agent.run_conversation(
+                    prompt, conversation_history=history
+                )
+            except Exception as exc:
+                if request.structured_output is None:
+                    raise
+                assert structured_decision is not None
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
+                provider_attempts = (
+                    shared_attempts
+                    if sealed_provider_grant or counted_provider_methods
+                    else model_calls
+                )
+                structured_evidence = _structured_output_evidence(
+                    structured_decision,
+                    provider_attempts=provider_attempts,
+                    model_calls=model_calls,
+                )
+                failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
+                if not isinstance(failure_kind, str) or not failure_kind:
+                    failure_kind = type(exc).__name__
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {
+                        "input_tokens": int(
+                            getattr(agent, "session_input_tokens", 0) or 0
+                        ),
+                        "output_tokens": int(
+                            getattr(agent, "session_output_tokens", 0) or 0
+                        ),
+                        "cache_read_tokens": int(
+                            getattr(agent, "session_cache_read_tokens", 0) or 0
+                        ),
+                        "cache_write_tokens": int(
+                            getattr(agent, "session_cache_write_tokens", 0) or 0
+                        ),
+                    },
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": failure_kind,
+                        "error": _sanitize(exc),
+                        "tool_names": sorted(agent.valid_tool_names),
+                        "api_mode": _sanitize(runtime.get("api_mode"), 64),
+                        **structured_evidence,
+                    },
+                    "structured_output": structured_evidence,
+                }
             usage = {
                 "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
                 "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
@@ -1478,7 +1772,43 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     getattr(agent, "session_cache_write_tokens", 0) or 0
                 ),
             }
-            failed = bool(response.get("failed"))
+            shared_attempts, shared_exhausted = provider_attempt_state()
+            provider_attempt_grant_exhausted[0] = shared_exhausted
+            failed = bool(response.get("failed")) or shared_exhausted
+            model_calls = max(0, int(response.get("api_calls", 0) or 0))
+            provider_attempts = (
+                shared_attempts
+                if sealed_provider_grant or counted_provider_methods
+                else model_calls
+            )
+            structured_evidence = None
+            if request.structured_output is not None:
+                assert structured_decision is not None
+                structured_evidence = _structured_output_evidence(
+                    structured_decision,
+                    provider_attempts=provider_attempts,
+                    model_calls=model_calls,
+                )
+            audit = {
+                "plugin_id": plugin_id,
+                "tool_names": sorted(agent.valid_tool_names),
+                "api_calls": int(response.get("api_calls", 0) or 0),
+                "provider_attempts": provider_attempts,
+                "model_calls": model_calls,
+                "hook_events": hook_events,
+                "max_budget_usd": request.max_budget_usd,
+                "sandbox_policy_declared": request.sandbox_policy is not None,
+                **(
+                    {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
+                    if structured_evidence is not None
+                    else {}
+                ),
+                **(structured_evidence or {}),
+            }
+            if provider_attempt_grant_exhausted[0]:
+                audit["failure_kind"] = (
+                    _ProviderAttemptGrantExhausted.failure_kind
+                )
             return {
                 "final_response": _sanitize(
                     response.get("final_response", ""), 500_000
@@ -1491,14 +1821,8 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 else ("failed" if failed else "completed"),
                 "pending_interaction": pending[0] if pending else None,
                 "usage": usage,
-                "audit": {
-                    "plugin_id": plugin_id,
-                    "tool_names": sorted(agent.valid_tool_names),
-                    "api_calls": int(response.get("api_calls", 0) or 0),
-                    "hook_events": hook_events,
-                    "max_budget_usd": request.max_budget_usd,
-                    "sandbox_policy_declared": request.sandbox_policy is not None,
-                },
+                "audit": audit,
+                "structured_output": structured_evidence,
             }
     finally:
         _active_agent = None
@@ -1560,6 +1884,8 @@ def main() -> int:
         ):
             raise ValueError("unsupported plugin-agent protocol frame")
 
+        lifeline_started = threading.Event()
+
         def watch_coordinator() -> None:
             # The parent keeps stdin open as a lifeline after the request. EOF
             # means it died or cancelled; interrupt the synchronous agent loop.
@@ -1569,39 +1895,91 @@ def main() -> int:
             if agent is not None:
                 agent._interrupt_requested = True
 
-        threading.Thread(
-            target=watch_coordinator, name="plugin-agent-lifeline", daemon=True
-        ).start()
+        def start_lifeline() -> None:
+            if lifeline_started.is_set():
+                return
+            lifeline_started.set()
+            threading.Thread(
+                target=watch_coordinator,
+                name="plugin-agent-lifeline",
+                daemon=True,
+            ).start()
+
+        handshake = payload.get("provider_start_handshake")
+        handshake_required = (
+            isinstance(handshake, dict) and handshake.get("required") is True
+        )
+        executor_nonce = (
+            handshake.get("executor_nonce") if handshake_required else None
+        )
+        if handshake_required and (
+            not isinstance(executor_nonce, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", executor_nonce)
+        ):
+            raise ValueError("provider start handshake is malformed")
+
+        def await_provider_start() -> None:
+            assert isinstance(executor_nonce, str)
+            _emit("provider_ready", executor_nonce=executor_nonce)
+            control_raw = sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1)
+            if not control_raw or len(control_raw) > _MAX_REQUEST_BYTES:
+                _cancel_event.set()
+                raise InterruptedError("provider start coordinator disappeared")
+            control = json.loads(control_raw)
+            if control != {
+                "protocol_version": _PROTOCOL_VERSION,
+                "type": "provider_start",
+                "executor_nonce": executor_nonce,
+            }:
+                raise ValueError("provider start authorization is malformed")
+            _emit("provider_start_received", executor_nonce=executor_nonce)
+            execute_raw = sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1)
+            if not execute_raw or len(execute_raw) > _MAX_REQUEST_BYTES:
+                _cancel_event.set()
+                raise InterruptedError("provider execute coordinator disappeared")
+            execute = json.loads(execute_raw)
+            if execute != {
+                "protocol_version": _PROTOCOL_VERSION,
+                "type": "provider_execute",
+                "executor_nonce": executor_nonce,
+            }:
+                raise ValueError("provider execute authorization is malformed")
+            _emit("provider_execute_received", executor_nonce=executor_nonce)
+            release_raw = sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1)
+            if not release_raw or len(release_raw) > _MAX_REQUEST_BYTES:
+                _cancel_event.set()
+                raise InterruptedError("provider release coordinator disappeared")
+            release = json.loads(release_raw)
+            if release != {
+                "protocol_version": _PROTOCOL_VERSION,
+                "type": "provider_execute_release",
+                "executor_nonce": executor_nonce,
+            }:
+                raise ValueError("provider execute release is malformed")
+            start_lifeline()
+
+        if not handshake_required:
+            start_lifeline()
         with redirect_stdout(sys.stderr):
-            result = _run(payload)
+            result = _run(
+                payload,
+                provider_start_gate=(
+                    await_provider_start if handshake_required else None
+                ),
+            )
     except BaseException as exc:
         plugin_id = ""
         try:
             plugin_id = str(payload.get("plugin_id") or "")
         except Exception:
             pass
-        failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
-        if not isinstance(failure_kind, str) or not failure_kind:
-            failure_kind = type(exc).__name__
-        result = {
-            "final_response": "",
-            "session_id": "",
-            "provider": "",
-            "model": "",
-            "status": "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
-            "pending_interaction": None,
-            "usage": {},
-            "audit": {
-                "plugin_id": plugin_id,
-                "failure_kind": failure_kind,
-                "error": _sanitize(exc),
-            },
-        }
+        result = _worker_failure_result(plugin_id, exc)
     _emit("result", result=result)
     # Keep the direct worker alive until the coordinator acknowledges receipt
     # by closing its stdin lifeline. This closes the tiny result/exit race in
     # which descendants could otherwise outlive an already-reaped parent.
-    _cancel_event.wait(timeout=2.0)
+    if "lifeline_started" in locals() and lifeline_started.is_set():
+        _cancel_event.wait(timeout=2.0)
     return 0
 
 

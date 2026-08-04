@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -17,6 +18,7 @@ from plugins.workflow.store import (
     StorageQuotaError,
 )
 import plugins.workflow.store as store_module
+import plugins.workflow.sessions as sessions_module
 from tools.managed_process import ProcessIdentity
 
 
@@ -475,6 +477,58 @@ def test_process_stop_keeps_active_claim_until_terminal_evidence_is_indexed(
             "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
             (claim.attempt_id,),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_typed_mirror_index_replace_crash_is_idempotently_recoverable(
+    tmp_path, monkeypatch, side
+) -> None:
+    mirror_store_type = getattr(sessions_module, "TypedMirrorStore", None)
+    obligation_type = getattr(sessions_module, "TypedMirrorObligation", None)
+    assert mirror_store_type is not None
+    assert obligation_type is not None
+    data = b"mirror crash bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    obligation = obligation_type(
+        mirror_id=hashlib.sha256(b"mirror-obligation").hexdigest(),
+        workflow="workflow",
+        node_id="node",
+        operator_scope="scope",
+        run_id="run",
+        attempt_id="attempt",
+        publication_id="a" * 32,
+        content_name="content.md",
+        output_type="Report",
+        media_type="text/markdown; charset=utf-8",
+        size_bytes=len(data),
+        sha256=digest,
+    )
+    mirrors = mirror_store_type(tmp_path / "home")
+    original = sessions_module._atomic_bytes_at
+    index_name = mirrors._scope_id("workflow", "node", "scope") + ".json"
+    armed = True
+
+    def fail_index(directory, name, payload):
+        nonlocal armed
+        if name == index_name and armed:
+            armed = False
+            if side == "before":
+                raise OSError("index replace crash")
+            original(directory, name, payload)
+            raise OSError("index replace crash")
+        return original(directory, name, payload)
+
+    monkeypatch.setattr(sessions_module, "_atomic_bytes_at", fail_index)
+    with pytest.raises(OSError, match="index replace crash"):
+        mirrors.complete(obligation, data)
+    monkeypatch.setattr(sessions_module, "_atomic_bytes_at", original)
+
+    recovered = mirrors.complete(obligation, data)
+    repeated = mirrors.complete(obligation, data)
+
+    assert repeated == recovered
+    assert mirrors.get("workflow", "node", "scope") == recovered
+    assert len(mirrors.list_history("workflow", "node", "scope")) == 1
 
 
 def test_hundred_duplicate_deliveries_publish_exactly_one_run(

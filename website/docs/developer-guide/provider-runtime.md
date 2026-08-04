@@ -137,6 +137,44 @@ Codex uses a separate Responses API path:
 - `api_mode = codex_responses`
 - dedicated credential resolution and auth store support
 
+Direct OpenAI API support and ChatGPT subscription/OAuth execution are separate
+runtime authorities. Native structured-output behavior proved for the direct
+API-key route must not be inferred for a subscription route.
+
+## Structured-output strategy resolution
+
+An Archon workflow with `output_format` seals a structured-output decision at
+admission. The decision records the effective provider, model, API mode,
+declaration source, adapter version, and schema fingerprint. Provider and
+runtime declarations—not model naming or community catalog metadata—are the
+authority.
+
+| Resolved route | Strategy |
+| --- | --- |
+| Trusted direct route with an explicit `native_json_schema` declaration | Send the tested native schema wire field, then validate locally. |
+| Trusted direct route with an explicit `native_json_mode` declaration | Request native JSON syntax, then validate the portable schema locally. |
+| Custom endpoint, aggregator, or undeclared route inside the complete Hermes agent loop | Use bounded `prompt_json_schema` adaptation. |
+| Explicitly unsupported route, route with a query that cannot be classified safely, or delegated runtime outside the Hermes loop | Fail closed without a provider request. |
+
+Reusing an OpenAI-compatible URL or API mode does not make a custom route
+native. An aggregator cannot inherit a direct provider's declaration, and live
+or community model metadata cannot promote unknown support. Prompt adaptation
+is deterministic user-message content; it does not mutate a conversation's
+system prompt.
+
+The isolated worker resolves the actual credential/provider/runtime mapping
+again before its first provider call. If it cannot honor the admitted strategy,
+execution stops with `structured_output_capability_drift` rather than changing
+provider, model, or enforcement mode. Missing or unusable `jsonschema`
+validation also stops an Archon structured request at this boundary; schemaless
+Archon calls remain independent of the optional validator.
+
+Every accepted response—native or adapted—is parsed as one complete JSON value,
+validated against the sealed Draft 2020-12 schema, and canonicalized before the
+workflow can consume it. Only prompt-adapted output can receive the single,
+action-free repair described in the
+[Workflow YAML reference](/user-guide/features/workflow-yaml-reference#provider-enforcement-and-repair).
+
 ## Auxiliary model routing
 
 Auxiliary tasks such as:

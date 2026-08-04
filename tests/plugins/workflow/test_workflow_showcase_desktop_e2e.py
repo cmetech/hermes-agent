@@ -127,7 +127,30 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         )
         assert detail_response.status_code == 200
         detail = detail_response.json()
-        assert detail["compatibility"] == compatibility
+        detail_compatibility = detail["compatibility"]
+        for field in (
+            "level",
+            "runnable",
+            "findings_truncated",
+            "finding_count",
+        ):
+            assert detail_compatibility[field] == compatibility[field]
+        catalog_findings = compatibility["findings"]
+        detail_findings = detail_compatibility["findings"]
+        assert len(catalog_findings) == len(detail_findings) == 512
+        assert all("migration" not in finding for finding in catalog_findings)
+        assert [
+            {key: value for key, value in finding.items() if key != "migration"}
+            for finding in detail_findings
+        ] == catalog_findings
+        assert detail_findings[0]["code"] == "legacy_language_profile"
+        assert detail_findings[0]["migration"] == (
+            'Run "hermes workflow doctor" and resolve compatibility code '
+            '"legacy_language_profile" before relying on this field in the '
+            "selected profile."
+        )
+        assert detail_findings[-1]["code"] == "compatibility_findings_truncated"
+        assert "migration" not in detail_findings[-1]
         assert len(detail_response.content) < 1024 * 1024
         assert detail["topology"]["mermaid"]
         assert detail["definition"]["nodes"][0]["value"] == "[REDACTED]"
@@ -200,3 +223,42 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         assert admitted["run_id"] in {
             item["run_id"] for item in board_response.json()["runs"]
         }
+
+
+def test_ai_showcase_desktop_projection_keeps_mcp_and_skills_on_ai_nodes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+    with TestClient(
+        web_server.app,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    ) as client:
+        response = client.get(
+            "/api/plugins/workflow/workflows/ai-extensions",
+            params={"catalog_source": "showcase"},
+        )
+
+    assert response.status_code == 200
+    nodes = response.json()["definition"]["nodes"]
+    assert nodes
+    mcp_nodes = [node for node in nodes if "mcp" in node["options"]]
+    skill_nodes = [node for node in nodes if "skills" in node["options"]]
+    extension_nodes = [*mcp_nodes, *skill_nodes]
+    assert mcp_nodes
+    assert skill_nodes
+    assert all(node["type"] in {"command", "prompt"} for node in extension_nodes)
+    assert all(
+        isinstance(node["options"]["mcp"], str) and node["options"]["mcp"]
+        for node in mcp_nodes
+    )
+    assert all(
+        isinstance(node["options"]["skills"], list)
+        and node["options"]["skills"]
+        and all(isinstance(skill, str) and skill for skill in node["options"]["skills"])
+        for node in skill_nodes
+    )
+    assert {"mcp", "skills"}.isdisjoint(node["type"] for node in nodes)

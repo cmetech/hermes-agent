@@ -11,8 +11,8 @@ from typing import Mapping
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
 
@@ -99,6 +99,26 @@ class LoopExecutor:
         base_variables = context.variable_context
         if not isinstance(base_variables, VariableContext):
             base_variables = VariableContext(workflow_id=context.run_id)
+        until_bash_template = loop.get("until_bash")
+        loop_output_resolver = context.output_resolver
+        if (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and base_variables.normalizer_version == 3
+        ):
+            strict_renderer = substitution_renderer(
+                base_variables,
+                direct_dependencies=context.node.depends_on,
+                output_resolver=context.output_resolver,
+            )
+            reference_snapshot = strict_renderer.resolve_outputs(
+                prompt,
+                until_bash_template if isinstance(until_bash_template, str) else "",
+            )
+
+            def frozen_output_resolver(node_id, path):
+                return reference_snapshot[(node_id, tuple(path))]
+
+            loop_output_resolver = frozen_output_resolver
         previous_output = ""
         previous_metadata: Mapping[str, object] | None = None
         resumed = isinstance(previous_state, Mapping)
@@ -141,7 +161,10 @@ class LoopExecutor:
                 id=context.node.id,
                 node_type="prompt",
                 value=prompt,
-                depends_on=("previous",) if share else (),
+                depends_on=tuple(dict.fromkeys((
+                    *context.node.depends_on,
+                    *(("previous",) if share else ()),
+                ))),
                 source_index=context.node.source_index,
                 source_line=context.node.source_line,
                 options=freeze_value(options),
@@ -151,6 +174,7 @@ class LoopExecutor:
                 node=child,
                 attempt_id=f"{context.attempt_id}/iteration-{iteration:04d}",
                 variable_context=variables,
+                output_resolver=loop_output_resolver,
                 predecessor_results=(
                     {"previous": previous_metadata}
                     if previous_metadata is not None and share
@@ -191,22 +215,14 @@ class LoopExecutor:
                 return NodeExecutionResult(
                     "succeeded", tuple(artifacts), metadata={"loop_state": state}
                 )
-            until_bash = loop.get("until_bash")
+            until_bash = until_bash_template
             if isinstance(until_bash, str) and until_bash:
                 bash_variables = replace(variables, loop_prev_output=cleaned)
-                spill = (
-                    context.run_directory
-                    / "nodes"
-                    / context.node.id
-                    / context.attempt_id
-                    / f"until-{iteration:04d}-variables"
-                )
-                rendered = bash_variables.render_bash(until_bash, spill_directory=spill)
                 bash_node = WorkflowNode(
                     id=context.node.id,
                     node_type="bash",
-                    value=rendered,
-                    depends_on=(),
+                    value=until_bash,
+                    depends_on=context.node.depends_on,
                     source_index=context.node.source_index,
                     source_line=context.node.source_line,
                     options=freeze_value({}),
@@ -217,6 +233,7 @@ class LoopExecutor:
                         node=bash_node,
                         attempt_id=f"{context.attempt_id}/until-{iteration:04d}",
                         variable_context=bash_variables,
+                        output_resolver=loop_output_resolver,
                         predecessor_results={},
                         node_state={},
                     )

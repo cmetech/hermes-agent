@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import copy
+import errno
 import gc
 import hashlib
 import hmac
@@ -12,6 +15,8 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -19,7 +24,7 @@ import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
@@ -37,6 +42,10 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
+from plugins.workflow.language_schema import (
+    ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES,
+    DURABLE_METADATA_STRING_MAX_CHARS,
+)
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
     lease_is_fresh,
@@ -45,12 +54,25 @@ from plugins.workflow.lease_clock import (
 from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
+    RunExecutionLimits,
     TerminalJournalReserve,
+    WorkflowLanguageProfile,
     WorkflowPackage,
 )
 from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
+)
+from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    ArchonOutputUnavailableError,
+    _RETRYABLE_READ_ERRNOS,
+    _read_descriptor_relative,
+    _safe_component,
+    canonical_output_publication_identity,
+    output_publication_identity_sha256,
+    write_archon_output_exclusive,
 )
 from plugins.workflow.schedule_time import (
     ScheduleInstantError,
@@ -63,6 +85,14 @@ from plugins.workflow.sanitize import (
     workflow_filename_components_are_distinct,
     workflow_input_name_is_portable,
     workflow_input_names_are_portable,
+)
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    PersistentSessionRecoverySelection,
+    SessionRegistryUpdateCandidate,
+    TypedMirrorIntegrityError,
+    TypedMirrorObligation,
+    TypedMirrorStore,
 )
 from plugins.workflow.trust import (
     WorkflowPackageDigest,
@@ -84,6 +114,18 @@ class StorageQuotaError(RuntimeError):
 
 class JournalRecoveryError(RuntimeError):
     pass
+
+
+class PublicationNotFoundError(LookupError):
+    """No authorized publication matches the opaque identifier."""
+
+
+class PublicationIntegrityError(RuntimeError):
+    """A requested publication failed descriptor or content verification."""
+
+
+class PublicationUnavailableError(RuntimeError):
+    """A requested publication could not be read due to a retryable host fault."""
 
 
 class ForegroundExecutionConflict(RuntimeError):
@@ -143,6 +185,528 @@ class ArtifactRef:
     sha256: str
 
 
+def _session_registry_candidate_payload(
+    candidate: SessionRegistryUpdateCandidate,
+    *,
+    retry_count: int = 0,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "key": {
+            "workflow": candidate.key.workflow,
+            "node_id": candidate.key.node_id,
+            "scope": candidate.key.scope,
+            "provider": candidate.key.provider,
+            "profile": candidate.key.profile,
+        },
+        "expected_generation": candidate.expected_generation,
+        "new_session_id": candidate.new_session_id,
+        "cache_fingerprint": candidate.cache_fingerprint,
+        "winning_run_id": candidate.winning_run_id,
+        "winning_node_id": candidate.winning_node_id,
+        "winning_attempt_id": candidate.winning_attempt_id,
+        "recovery_selected": candidate.recovery_selected,
+        "retry_count": retry_count,
+    }
+
+
+def _private_authority_json(authority: Mapping[str, object]) -> str:
+    return json.dumps(
+        authority,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _session_recovery_selection_authority(
+    selection: PersistentSessionRecoverySelection,
+    *,
+    activation_event_sequence: int,
+    activation_event_type: str,
+    activation_predecessor_chain_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "journal_order_version": 1,
+        "activation_event_sequence": activation_event_sequence,
+        "activation_predecessor_sequence": activation_event_sequence - 1,
+        "activation_predecessor_chain_sha256": (
+            activation_predecessor_chain_sha256
+        ),
+        "activation_event_type": activation_event_type,
+        "run_id": selection.run_id,
+        "attempt_id": selection.attempt_id,
+        "key": {
+            "workflow": selection.key.workflow,
+            "node_id": selection.key.node_id,
+            "scope": selection.key.scope,
+            "provider": selection.key.provider,
+            "profile": selection.key.profile,
+        },
+        "expected_generation": selection.expected_generation,
+        "missing_session_id": selection.missing_session_id,
+        "cache_fingerprint": selection.cache_fingerprint,
+        "source": selection.source,
+        "provider_attempts_before_recovery": 0,
+    }
+
+
+def _session_registry_winner_authority(
+    candidate: SessionRegistryUpdateCandidate,
+    *,
+    activation_event_sequence: int,
+    activation_event_type: str,
+    activation_predecessor_chain_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "journal_order_version": 1,
+        "activation_event_sequence": activation_event_sequence,
+        "activation_predecessor_sequence": activation_event_sequence - 1,
+        "activation_predecessor_chain_sha256": (
+            activation_predecessor_chain_sha256
+        ),
+        "activation_event_type": activation_event_type,
+        "candidate": _session_registry_candidate_payload(candidate),
+    }
+
+
+def _session_recovery_selection_from_authority(
+    value: object,
+) -> tuple[PersistentSessionRecoverySelection, int | None, str | None]:
+    if not isinstance(value, Mapping):
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    schema_version = value.get("schema_version")
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "attempt_id",
+        "key",
+        "expected_generation",
+        "missing_session_id",
+        "cache_fingerprint",
+        "source",
+        "provider_attempts_before_recovery",
+    }
+    activation: int | None = None
+    event_type: str | None = None
+    if schema_version in {2, 3}:
+        expected_fields.update({"activation_event_sequence", "activation_event_type"})
+        if schema_version == 3:
+            expected_fields.update(
+                {
+                    "journal_order_version",
+                    "activation_predecessor_sequence",
+                    "activation_predecessor_chain_sha256",
+                }
+            )
+            _validate_journal_order_authority_fields(value)
+        activation_value = value.get("activation_event_sequence")
+        if (
+            isinstance(activation_value, bool)
+            or not isinstance(activation_value, int)
+            or activation_value < 1
+        ):
+            raise JournalRecoveryError(
+                "session recovery selection activation is malformed"
+            )
+        activation = activation_value
+        event_type_value = value.get("activation_event_type")
+        if event_type_value != "persistent_session_missing_fresh_start":
+            raise JournalRecoveryError(
+                "session recovery selection activation event is malformed"
+            )
+        event_type = event_type_value
+    elif schema_version != 1:
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    if set(value) != expected_fields:
+        raise JournalRecoveryError("session recovery selection authority is malformed")
+    key = value.get("key")
+    if not isinstance(key, Mapping) or set(key) != {
+        "workflow",
+        "node_id",
+        "scope",
+        "provider",
+        "profile",
+    }:
+        raise JournalRecoveryError("session recovery selection key is malformed")
+    if value.get("provider_attempts_before_recovery") != 0:
+        raise JournalRecoveryError("session recovery selection attempts are malformed")
+    try:
+        selection = PersistentSessionRecoverySelection(
+            key=NodeSessionKey(
+                workflow=key["workflow"],
+                node_id=key["node_id"],
+                scope=key["scope"],
+                provider=key["provider"],
+                profile=key["profile"],
+            ),
+            expected_generation=value["expected_generation"],
+            missing_session_id=value["missing_session_id"],
+            cache_fingerprint=value["cache_fingerprint"],
+            run_id=value["run_id"],
+            attempt_id=value["attempt_id"],
+            source=value["source"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalRecoveryError(
+            "session recovery selection identity is malformed"
+        ) from exc
+    return selection, activation, event_type
+
+
+def _session_registry_candidate_from_authority(
+    value: object,
+) -> tuple[SessionRegistryUpdateCandidate, int, int | None, str | None]:
+    if isinstance(value, Mapping) and value.get("schema_version") in {2, 3}:
+        expected_fields = {
+            "schema_version",
+            "activation_event_sequence",
+            "activation_event_type",
+            "candidate",
+        }
+        if value.get("schema_version") == 3:
+            expected_fields.update(
+                {
+                    "journal_order_version",
+                    "activation_predecessor_sequence",
+                    "activation_predecessor_chain_sha256",
+                }
+            )
+            _validate_journal_order_authority_fields(value)
+        if set(value) != expected_fields:
+            raise JournalRecoveryError("session registry winner authority is malformed")
+        activation = value.get("activation_event_sequence")
+        if (
+            isinstance(activation, bool)
+            or not isinstance(activation, int)
+            or activation < 1
+        ):
+            raise JournalRecoveryError("session registry winner activation is malformed")
+        event_type = value.get("activation_event_type")
+        if event_type != "node_succeeded":
+            raise JournalRecoveryError(
+                "session registry winner activation event is malformed"
+            )
+        candidate, retry_count = _session_registry_candidate_from_payload(
+            value.get("candidate")
+        )
+        return candidate, retry_count, activation, event_type
+    candidate, retry_count = _session_registry_candidate_from_payload(value)
+    return candidate, retry_count, None, None
+
+
+def _session_registry_candidate_from_payload(
+    value: object,
+) -> tuple[SessionRegistryUpdateCandidate, int]:
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        raise JournalRecoveryError("session registry obligation is malformed")
+    key = value.get("key")
+    if not isinstance(key, Mapping) or set(key) != {
+        "workflow",
+        "node_id",
+        "scope",
+        "provider",
+        "profile",
+    }:
+        raise JournalRecoveryError("session registry obligation key is malformed")
+    retry_count = value.get("retry_count")
+    if (
+        isinstance(retry_count, bool)
+        or not isinstance(retry_count, int)
+        or not 0 <= retry_count <= 5
+    ):
+        raise JournalRecoveryError("session registry obligation retry is malformed")
+    if type(value.get("recovery_selected")) is not bool:
+        raise JournalRecoveryError(
+            "session registry obligation recovery flag is malformed"
+        )
+    bounded_text = (
+        key.get("workflow"),
+        key.get("node_id"),
+        key.get("scope"),
+        key.get("provider"),
+        key.get("profile"),
+        value.get("new_session_id"),
+        value.get("cache_fingerprint"),
+        value.get("winning_run_id"),
+        value.get("winning_node_id"),
+        value.get("winning_attempt_id"),
+    )
+    if any(
+        not isinstance(item, str) or not item or len(item) > 16_384
+        for item in bounded_text
+    ):
+        raise JournalRecoveryError(
+            "session registry obligation identity is malformed"
+        )
+    try:
+        candidate = SessionRegistryUpdateCandidate(
+            key=NodeSessionKey(
+                workflow=key["workflow"],
+                node_id=key["node_id"],
+                scope=key["scope"],
+                provider=key["provider"],
+                profile=key["profile"],
+            ),
+            expected_generation=value["expected_generation"],
+            new_session_id=value["new_session_id"],
+            cache_fingerprint=value["cache_fingerprint"],
+            winning_run_id=value["winning_run_id"],
+            winning_node_id=value["winning_node_id"],
+            winning_attempt_id=value["winning_attempt_id"],
+            recovery_selected=value["recovery_selected"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalRecoveryError(
+            "session registry obligation identity is malformed"
+        ) from exc
+    if set(value) != {
+        "schema_version",
+        "key",
+        "expected_generation",
+        "new_session_id",
+        "cache_fingerprint",
+        "winning_run_id",
+        "winning_node_id",
+        "winning_attempt_id",
+        "recovery_selected",
+        "retry_count",
+    }:
+        raise JournalRecoveryError("session registry obligation fields are malformed")
+    return candidate, retry_count
+
+
+_MAX_PENDING_SESSION_REGISTRY_UPDATES = WORKFLOW_DEFINITION_MAX_NODES
+
+
+def _pending_session_registry_payloads(
+    projection: Mapping[str, object],
+) -> dict[str, object]:
+    singular = projection.get("pending_session_registry_update")
+    plural = projection.get("pending_session_registry_updates")
+    if singular is not None and plural is not None:
+        raise JournalRecoveryError(
+            "session registry obligations have conflicting representations"
+        )
+    if singular is not None:
+        candidate, _retry_count = _session_registry_candidate_from_payload(singular)
+        return {candidate.winning_attempt_id: singular}
+    if plural is None:
+        return {}
+    if (
+        not isinstance(plural, Mapping)
+        or not 1 <= len(plural) <= _MAX_PENDING_SESSION_REGISTRY_UPDATES
+    ):
+        raise JournalRecoveryError("session registry obligations are malformed")
+    pending: dict[str, object] = {}
+    for attempt_id, payload in plural.items():
+        candidate, _retry_count = _session_registry_candidate_from_payload(payload)
+        if (
+            not isinstance(attempt_id, str)
+            or attempt_id != candidate.winning_attempt_id
+            or attempt_id in pending
+        ):
+            raise JournalRecoveryError(
+                "session registry obligation attempt identity is malformed"
+            )
+        pending[attempt_id] = payload
+    return pending
+
+
+def _store_pending_session_registry_payloads(
+    projection: dict[str, object],
+    pending: Mapping[str, object],
+) -> None:
+    projection.pop("pending_session_registry_update", None)
+    projection.pop("pending_session_registry_updates", None)
+    if len(pending) == 1:
+        projection["pending_session_registry_update"] = next(iter(pending.values()))
+    elif pending:
+        projection["pending_session_registry_updates"] = {
+            attempt_id: pending[attempt_id] for attempt_id in sorted(pending)
+        }
+
+
+def _set_pending_session_registry_update(
+    projection: dict[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+    *,
+    retry_count: int = 0,
+) -> None:
+    pending = _pending_session_registry_payloads(projection)
+    if (
+        candidate.winning_attempt_id not in pending
+        and len(pending) >= _MAX_PENDING_SESSION_REGISTRY_UPDATES
+    ):
+        raise StorageQuotaError("session registry obligation capacity is exhausted")
+    pending[candidate.winning_attempt_id] = _session_registry_candidate_payload(
+        candidate,
+        retry_count=retry_count,
+    )
+    _store_pending_session_registry_payloads(projection, pending)
+
+
+def _remove_pending_session_registry_update(
+    projection: dict[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+) -> None:
+    pending = _pending_session_registry_payloads(projection)
+    payload = pending.get(candidate.winning_attempt_id)
+    if payload is None:
+        raise RuntimeError("stale session registry update outcome")
+    current, _retry_count = _session_registry_candidate_from_payload(payload)
+    if current != candidate:
+        raise RuntimeError("stale session registry update outcome")
+    pending.pop(candidate.winning_attempt_id)
+    _store_pending_session_registry_payloads(projection, pending)
+
+
+def _session_registry_candidate_is_corroborated(
+    projection: Mapping[str, object],
+    candidate: SessionRegistryUpdateCandidate,
+) -> bool:
+    nodes = projection.get("nodes")
+    winning_node = (
+        nodes.get(candidate.winning_node_id) if isinstance(nodes, Mapping) else None
+    )
+    if not isinstance(winning_node, Mapping):
+        return False
+    winning_attempts = [
+        attempt
+        for attempt in winning_node.get("attempts", ())
+        if isinstance(attempt, Mapping)
+        and attempt.get("attempt_id") == candidate.winning_attempt_id
+        and attempt.get("state") == "succeeded"
+    ]
+    if len(winning_attempts) != 1:
+        return False
+    try:
+        authority, authority_retry_count = _session_registry_candidate_from_payload(
+            winning_attempts[0].get("session_registry_authority")
+        )
+    except JournalRecoveryError:
+        return False
+    if authority_retry_count != 0 or authority != candidate:
+        return False
+    winning_metadata = winning_attempts[0].get("metadata")
+    if (
+        not isinstance(winning_metadata, Mapping)
+        or winning_metadata.get("session_id") != candidate.new_session_id
+        or winning_metadata.get("cache_fingerprint")
+        != candidate.cache_fingerprint
+        or winning_node.get("session_id") != candidate.new_session_id
+        or winning_node.get("cache_fingerprint") != candidate.cache_fingerprint
+    ):
+        return False
+    for artifact in projection.get("artifacts", ()):
+        if (
+            isinstance(artifact, Mapping)
+            and artifact.get("node_id") == candidate.winning_node_id
+            and artifact.get("attempt_id") == candidate.winning_attempt_id
+            and "session_id" in artifact
+            and artifact.get("session_id") != candidate.new_session_id
+        ):
+            return False
+    if not candidate.recovery_selected:
+        return True
+    recoveries = winning_node.get("session_recoveries")
+    matches = [
+        recovery
+        for recovery in recoveries
+        if isinstance(recovery, Mapping)
+        and recovery.get("attempt_id") == candidate.winning_attempt_id
+    ] if isinstance(recoveries, list) else []
+    if len(matches) != 1:
+        return False
+    recovery = matches[0]
+    return (
+        recovery.get("registry_generation") == candidate.expected_generation
+        and recovery.get("cache_fingerprint_sha256")
+        == _sha256(candidate.cache_fingerprint.encode("utf-8"))
+        and recovery.get("source") == "cross_run_registry"
+        and recovery.get("provider") == candidate.key.provider
+        and recovery.get("runtime_profile") == candidate.key.profile
+        and recovery.get("provider_attempts_before_recovery") == 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TypedPublicationCandidate:
+    attempt_relative_path: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedPublicationRef:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    metadata_sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    produced_at: str
+    session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPublication:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    node_id: str
+    attempt_id: str
+    schema_fingerprint: str | None
+    produced_at: str
+    session_id: str | None
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _JournaledTypedPublication:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    metadata_sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    produced_at: str
+    session_id: str | None
+    run_id: str
+    node_id: str
+    attempt_id: str
+    relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DeclaredTypedOutput:
+    output_type: str
+    has_structured_schema: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RequiredTypedPublication:
+    output_type: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+
+
 @dataclass(frozen=True)
 class ForegroundExecutionLease:
     owner_id: str
@@ -153,13 +717,22 @@ class ForegroundExecutionLease:
     lease_seconds: float | None = None
 
 
-_NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
+_NONTERMINAL = {
+    "queued",
+    "running",
+    "waiting_retry",
+    "recovery_pending",
+    "paused",
+    "interrupted",
+}
 _EXECUTING = {"running"}
 _RUN_SCOPED_REPAIR_REASONS = frozenset(
     {
         "legacy_effect_policy_uncorroborated",
         "notification_reconciliation_unverified",
         "run_evidence_uncorroborated",
+        "typed_mirror_integrity",
+        "typed_publication_integrity",
     }
 )
 _UNATTENDED_REVALIDATION_REASONS = frozenset(
@@ -196,6 +769,7 @@ _PROJECTION_STATUSES = {
     "queued",
     "running",
     "waiting_retry",
+    "recovery_pending",
     "paused",
     "interrupted",
     "succeeded",
@@ -209,6 +783,7 @@ _NODE_STATES = {
     "claimed",
     "running",
     "waiting_retry",
+    "waiting_resolution",
     "paused",
     "interrupted",
     "succeeded",
@@ -220,6 +795,25 @@ _SECRET_DIAGNOSTIC = re.compile(
     r"(?i)(?:bearer\s+|(?:api[_ -]?key|token|password|secret)\s*[:=]\s*)"
     r"[^\s,;]+|\bsk-[A-Za-z0-9_-]{8,}\b"
 )
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_TYPED_PUBLICATION_METADATA_MAX_BYTES = 65_536
+_TYPED_PUBLICATION_DESCRIPTOR_VERSION = 2
+_LEGACY_TYPED_PUBLICATION_FIELDS = frozenset(
+    {
+        "publication_id",
+        "content_name",
+        "output_type",
+        "media_type",
+        "size_bytes",
+        "sha256",
+        "metadata_sha256",
+        "node_id",
+        "attempt_id",
+        "relative_path",
+    }
+)
+_TYPED_PUBLICATION_JSON_MEDIA_TYPE = "application/json"
+_TYPED_PUBLICATION_TEXT_MEDIA_TYPE = "text/markdown; charset=utf-8"
 
 
 def _utc_now() -> str:
@@ -244,6 +838,95 @@ def _journal_frame_digest(event: Mapping[str, object]) -> str:
         material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return _sha256(encoded)
+
+
+_JOURNAL_ORDER_GENESIS_DOMAIN = b"hermes.workflow.journal-order.v1.genesis\0"
+_JOURNAL_ORDER_STEP_DOMAIN = b"hermes.workflow.journal-order.v1.step\0"
+
+
+def _journal_order_genesis(run_id: str) -> bytes:
+    encoded = run_id.encode("utf-8")
+    return hashlib.sha256(
+        _JOURNAL_ORDER_GENESIS_DOMAIN
+        + len(encoded).to_bytes(8, "big")
+        + encoded
+    ).digest()
+
+
+def _journal_order_checkpoints(
+    run_id: str,
+    events: Iterable[Mapping[str, object]],
+) -> tuple[str, ...]:
+    """Return genesis and every domain-separated ordered frame checkpoint."""
+    chain = _journal_order_genesis(run_id)
+    checkpoints = [chain.hex()]
+    for sequence, event in enumerate(events, 1):
+        if event.get("sequence") != sequence:
+            raise JournalRecoveryError("journal sequence gap")
+        if event.get("run_id") != run_id:
+            raise JournalRecoveryError("journal run identity mismatch")
+        try:
+            frame_digest = bytes.fromhex(_journal_frame_digest(event))
+        except ValueError as exc:
+            raise JournalRecoveryError("journal order authority is invalid") from exc
+        chain = hashlib.sha256(
+            _JOURNAL_ORDER_STEP_DOMAIN
+            + chain
+            + sequence.to_bytes(8, "big")
+            + frame_digest
+        ).digest()
+        checkpoints.append(chain.hex())
+    return tuple(checkpoints)
+
+
+def _validate_journal_order_authority_fields(
+    authority: Mapping[str, object],
+) -> None:
+    activation = authority.get("activation_event_sequence")
+    predecessor = authority.get("activation_predecessor_sequence")
+    digest = authority.get("activation_predecessor_chain_sha256")
+    if (
+        authority.get("journal_order_version") != 1
+        or isinstance(activation, bool)
+        or not isinstance(activation, int)
+        or activation < 1
+        or isinstance(predecessor, bool)
+        or not isinstance(predecessor, int)
+        or predecessor != activation - 1
+        or not isinstance(digest, str)
+        or _SHA256_PATTERN.fullmatch(digest) is None
+    ):
+        raise JournalRecoveryError("private session journal order is malformed")
+
+
+def _validate_private_authority_journal_order(
+    authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
+    events: Iterable[Mapping[str, object]],
+    *,
+    run_id: str,
+) -> None:
+    """Validate every immutable prefix commitment in one bounded linear scan."""
+    ordered_authorities = tuple(
+        authority
+        for table in (
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        )
+        for authority in authorities.get(table, {}).values()
+        if authority.get("schema_version") == 3
+    )
+    if not ordered_authorities:
+        return
+    event_list = tuple(events)
+    checkpoints = _journal_order_checkpoints(run_id, event_list)
+    for authority in ordered_authorities:
+        _validate_journal_order_authority_fields(authority)
+        predecessor = int(authority["activation_predecessor_sequence"])
+        if predecessor >= len(checkpoints) or not hmac.compare_digest(
+            str(authority["activation_predecessor_chain_sha256"]),
+            checkpoints[predecessor],
+        ):
+            raise JournalRecoveryError("private session journal order is invalid")
 
 
 def _encode_journal_frame(event: Mapping[str, object]) -> tuple[dict[str, object], bytes]:
@@ -294,6 +977,252 @@ def _sanitize_diagnostic(value: str | None) -> str | None:
     return _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)[:2000]
 
 
+def _redact_private_session_authority(
+    value: Mapping[str, object],
+    *,
+    private_authorities: Mapping[
+        str, Mapping[str, Mapping[str, object]]
+    ] | None = None,
+    trusted_run_id: str | None = None,
+    trusted_event_sequence: int | None = None,
+) -> dict[str, object]:
+    """Copy a public run/event projection without exact session authority."""
+
+    sensitive_values: set[str] = set()
+
+    def sensitive_key(key: object) -> bool:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        return (
+            normalized.endswith("sessionid")
+            or normalized.endswith("cachefingerprint")
+            or normalized in {"sessionalias", "fingerprintalias"}
+        ) and not normalized.endswith("sha256")
+
+    def collect_sensitive_values(item: object) -> None:
+        pending = [item]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, Mapping):
+                for child_key, child_value in current.items():
+                    if sensitive_key(child_key) and isinstance(child_value, str):
+                        sensitive_values.add(child_value)
+                    pending.append(child_value)
+            elif isinstance(current, list | tuple):
+                pending.extend(current)
+
+    def redact_session_fields(item: object, *, aggressive: bool = False) -> None:
+        pending = [item]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                for child_key in tuple(current):
+                    normalized = re.sub(
+                        r"[^a-z0-9]", "", str(child_key).lower()
+                    )
+                    if sensitive_key(child_key) or normalized in {
+                        "sessionregistryupdatecandidate",
+                        "pendingsessionregistryupdate",
+                        "pendingsessionregistryupdates",
+                    }:
+                        current.pop(child_key, None)
+                        continue
+                    if aggressive and normalized in {
+                        "message",
+                        "warnings",
+                        "lasterror",
+                        "errormessage",
+                        "exception",
+                        "rawexception",
+                        "history",
+                        "providerpath",
+                        "providercontent",
+                        "rawproviderresponse",
+                    }:
+                        current.pop(child_key, None)
+                        continue
+                    child = current[child_key]
+                    if isinstance(child, str):
+                        for private_value in sorted(
+                            sensitive_values, key=len, reverse=True
+                        ):
+                            if private_value:
+                                child = child.replace(private_value, "[REDACTED]")
+                        current[child_key] = child
+                    else:
+                        pending.append(child)
+            elif isinstance(current, list):
+                for index, child in enumerate(current):
+                    if isinstance(child, str):
+                        for private_value in sorted(
+                            sensitive_values, key=len, reverse=True
+                        ):
+                            if private_value:
+                                child = child.replace(
+                                    private_value, "[REDACTED]"
+                                )
+                        current[index] = child
+                    else:
+                        pending.append(child)
+
+    projected = copy.deepcopy(dict(value))
+    authority_projection = (
+        projected["projection"]
+        if isinstance(projected.get("projection"), dict)
+        else projected
+    )
+    authority_projection.pop("pending_session_registry_update", None)
+    authority_projection.pop("pending_session_registry_updates", None)
+    nodes = authority_projection.get("nodes")
+    protected_attempts: set[tuple[str, str]] = set()
+    selection_event_privacy = False
+    unchained_all_run_privacy = False
+    authority_run_id = trusted_run_id or authority_projection.get("run_id")
+    if private_authorities is not None:
+        for authority in private_authorities.get(
+            "session_recovery_selection_authority", {}
+        ).values():
+            try:
+                selection, activation, _event_type = (
+                    _session_recovery_selection_from_authority(authority)
+                )
+            except JournalRecoveryError as exc:
+                raise JournalRecoveryError(
+                    "private session selection authority is malformed"
+                ) from exc
+            if selection.run_id == authority_run_id:
+                sensitive_values.update(
+                    {selection.missing_session_id, selection.cache_fingerprint}
+                )
+                protected_attempts.add(
+                    (selection.key.node_id, selection.attempt_id)
+                )
+                if (
+                    authority.get("schema_version") == 2
+                    and trusted_event_sequence is not None
+                ):
+                    selection_event_privacy = True
+                    unchained_all_run_privacy = True
+                elif (
+                    activation is not None
+                    and trusted_event_sequence is not None
+                    and trusted_event_sequence >= activation
+                ):
+                    selection_event_privacy = True
+        for authority in private_authorities.get(
+            "session_registry_winner_authority", {}
+        ).values():
+            try:
+                candidate, retry_count, _activation, _event_type = (
+                    _session_registry_candidate_from_authority(
+                        authority
+                    )
+                )
+            except JournalRecoveryError as exc:
+                raise JournalRecoveryError(
+                    "private session winner authority is malformed"
+                ) from exc
+            if (
+                retry_count == 0
+                and candidate.winning_run_id == authority_run_id
+            ):
+                sensitive_values.update(
+                    {candidate.new_session_id, candidate.cache_fingerprint}
+                )
+                protected_attempts.add(
+                    (candidate.winning_node_id, candidate.winning_attempt_id)
+                )
+    if isinstance(nodes, dict):
+        for node_id, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            node_is_protected = any(
+                protected_node_id == str(node_id)
+                for protected_node_id, _attempt_id in protected_attempts
+            )
+            for attempt in node.get("attempts", ()):
+                if not isinstance(attempt, dict):
+                    continue
+                attempt_id = attempt.get("attempt_id")
+                marker_is_protected = isinstance(
+                    attempt.get("session_registry_authority"), Mapping
+                )
+                anchored_is_protected = (
+                    str(node_id), str(attempt_id)
+                ) in protected_attempts
+                if (
+                    not isinstance(attempt_id, str)
+                    or not marker_is_protected
+                    and not anchored_is_protected
+                ):
+                    continue
+                node_is_protected = True
+                protected_attempts.add((str(node_id), attempt_id))
+                attempt.pop("session_registry_authority", None)
+                metadata = attempt.get("metadata")
+                if isinstance(metadata, dict):
+                    metadata.pop("session_id", None)
+                    metadata.pop("cache_fingerprint", None)
+            if node_is_protected:
+                node.pop("session_id", None)
+                node.pop("cache_fingerprint", None)
+    artifacts = authority_projection.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            if (
+                str(artifact.get("node_id")),
+                str(artifact.get("attempt_id")),
+            ) in protected_attempts:
+                artifact.pop("session_id", None)
+                artifact.pop("cache_fingerprint", None)
+    payload = projected.get("payload")
+    if isinstance(payload, dict):
+        payload_attempt_id = payload.get("attempt_id")
+        event_identity = (
+            str(projected.get("node_id") or payload.get("node_id")),
+            str(projected.get("attempt_id") or payload_attempt_id),
+        )
+        if selection_event_privacy or event_identity in protected_attempts:
+            collect_sensitive_values(payload)
+            redact_session_fields(payload)
+    if selection_event_privacy:
+        collect_sensitive_values(projected)
+        redact_session_fields(projected, aggressive=True)
+        if unchained_all_run_privacy and isinstance(projected.get("payload"), dict):
+            projected["payload"] = {}
+    return projected
+
+
+def _trusted_journal_positions(
+    events: Iterable[Mapping[str, object]],
+) -> tuple[tuple[int, Mapping[str, object]], ...]:
+    """Bind event privacy to contiguous journal order, not mutable identity."""
+    positioned = tuple(enumerate(events, 1))
+    for position, event in positioned:
+        if event.get("sequence") != position:
+            raise JournalRecoveryError(
+                f"journal sequence gap: expected {position}, "
+                f"received {event.get('sequence')}"
+            )
+    return positioned
+
+
+def _sanitize_v3_condition_diagnostic(value: str) -> str:
+    """Redact and truncate one condition diagnostic by valid UTF-8 bytes."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("v3 condition message must be valid UTF-8") from exc
+    sanitized = _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)
+    encoded = sanitized.encode("utf-8")
+    if len(encoded) <= ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES:
+        return sanitized
+    return encoded[:ARCHON_V3_CONDITION_DIAGNOSTIC_MAX_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
+
+
 def _fsync_directory(directory: Path) -> None:
     if os.name == "nt":
         return
@@ -307,6 +1236,261 @@ def _fsync_directory(directory: Path) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _publication_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _publication_noreplace_primitive():
+    if os.name != "posix":
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        primitive = getattr(library, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        primitive = getattr(library, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+    else:
+        return None
+    if primitive is None:
+        return None
+    primitive.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    primitive.restype = ctypes.c_int
+    return primitive, flag
+
+
+def _require_secure_publication_io() -> None:
+    required_dir_fd_functions = {
+        os.mkdir,
+        os.open,
+        os.rename,
+        os.rmdir,
+        os.stat,
+        os.unlink,
+    }
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or not required_dir_fd_functions <= os.supports_dir_fd
+        or os.listdir not in os.supports_fd
+        or _publication_noreplace_primitive() is None
+    ):
+        raise ArchonOutputIntegrityError(
+            "secure atomic typed publication is unavailable on this host"
+        )
+
+
+def _fsync_publication_directory(descriptor: int, *, boundary: str) -> None:
+    """Strictly flush one publication directory or propagate the failure."""
+    os.fsync(descriptor)
+
+
+def _publication_directory_identity(descriptor: int) -> tuple[int, int]:
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ArchonOutputIntegrityError("typed publication directory is unsafe")
+    return observed.st_dev, observed.st_ino
+
+
+def _verify_publication_directory_identity(
+    run_descriptor: int,
+    publications_descriptor: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    current_descriptor: int | None = None
+    try:
+        current_descriptor = os.open(
+            "publications",
+            _publication_directory_flags(),
+            dir_fd=run_descriptor,
+        )
+        if (
+            _publication_directory_identity(publications_descriptor)
+            != expected_identity
+            or _publication_directory_identity(current_descriptor)
+            != expected_identity
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication directory identity changed"
+            )
+    except ArchonOutputIntegrityError:
+        raise
+    except OSError as exc:
+        raise ArchonOutputIntegrityError(
+            "typed publication directory identity changed"
+        ) from exc
+    finally:
+        if current_descriptor is not None:
+            os.close(current_descriptor)
+
+
+def _commit_publication_directory_noreplace(
+    run_descriptor: int,
+    publications_descriptor: int,
+    staging_name: str,
+    final_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    _verify_publication_directory_identity(
+        run_descriptor,
+        publications_descriptor,
+        expected_identity,
+    )
+    loaded = _publication_noreplace_primitive()
+    if loaded is None:
+        raise ArchonOutputIntegrityError(
+            "secure atomic typed publication is unavailable on this host"
+        )
+    primitive, flag = loaded
+    result = primitive(
+        publications_descriptor,
+        os.fsencode(staging_name),
+        publications_descriptor,
+        os.fsencode(final_name),
+        flag,
+    )
+    if result == 0:
+        _verify_publication_directory_identity(
+            run_descriptor,
+            publications_descriptor,
+            expected_identity,
+        )
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ArchonOutputIntegrityError(
+            "typed publication destination already exists"
+        )
+    raise ArchonOutputIntegrityError(
+        "typed publication atomic commit failed"
+    ) from OSError(error, os.strerror(error))
+
+
+def _write_publication_file(
+    directory_descriptor: int,
+    name: str,
+    data: bytes,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+    try:
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("typed publication write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_publication_staging(
+    publications_descriptor: int,
+    staging_descriptor: int | None,
+    staging_name: str,
+    file_names: tuple[str, ...],
+) -> None:
+    if staging_descriptor is not None:
+        for name in file_names:
+            try:
+                os.unlink(name, dir_fd=staging_descriptor)
+            except OSError:
+                pass
+        os.close(staging_descriptor)
+    try:
+        os.rmdir(staging_name, dir_fd=publications_descriptor)
+    except OSError:
+        pass
+
+
+def _remove_publication_entry_at(parent_descriptor: int, name: str) -> None:
+    try:
+        observed = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    is_reparse = bool(
+        reparse_marker
+        and getattr(observed, "st_file_attributes", 0) & reparse_marker
+    )
+    if stat.S_ISDIR(observed.st_mode) and not is_reparse:
+        try:
+            descriptor = os.open(
+                name,
+                _publication_directory_flags(),
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise ArchonOutputIntegrityError(
+                "typed publication cleanup directory is unsafe"
+            ) from exc
+        try:
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (observed.st_dev, observed.st_ino)
+            ):
+                raise ArchonOutputIntegrityError(
+                    "typed publication cleanup directory identity changed"
+                )
+            for child in os.listdir(descriptor):
+                _remove_publication_entry_at(descriptor, child)
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_descriptor)
+    else:
+        os.unlink(name, dir_fd=parent_descriptor)
+
+
+def _discard_publication_entry_at(
+    publications_descriptor: int,
+    name: str,
+) -> None:
+    try:
+        os.stat(
+            name,
+            dir_fd=publications_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    discarded = f".discard-{uuid.uuid4().hex}"
+    os.rename(
+        name,
+        discarded,
+        src_dir_fd=publications_descriptor,
+        dst_dir_fd=publications_descriptor,
+    )
+    os.fsync(publications_descriptor)
+    _remove_publication_entry_at(publications_descriptor, discarded)
+    os.fsync(publications_descriptor)
 
 
 def _replace_with_retry(source: str | Path, target: str | Path) -> None:
@@ -372,11 +1556,14 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
         raise
 
 
-def _atomic_json(path: Path, value: object) -> None:
-    encoded = json.dumps(
+def _json_document_bytes(value: object) -> bytes:
+    return json.dumps(
         value, sort_keys=True, ensure_ascii=False, indent=2
     ).encode("utf-8") + b"\n"
-    _atomic_bytes(path, encoded)
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    _atomic_bytes(path, _json_document_bytes(value))
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -394,6 +1581,631 @@ def _atomic_text(path: Path, value: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _typed_publication_fields(reference: TypedPublicationRef) -> dict[str, object]:
+    return {
+        "typed_publication_version": _TYPED_PUBLICATION_DESCRIPTOR_VERSION,
+        "publication_id": reference.publication_id,
+        "content_name": reference.content_name,
+        "output_type": reference.output_type,
+        "media_type": reference.media_type,
+        "size_bytes": reference.size_bytes,
+        "sha256": reference.sha256,
+        "metadata_sha256": reference.metadata_sha256,
+        "schema_fingerprint": reference.schema_fingerprint,
+        "canonicalization_version": reference.canonicalization_version,
+        "produced_at": reference.produced_at,
+        "session_id": reference.session_id,
+    }
+
+
+def _typed_publication_metadata_bytes(
+    *,
+    publication_id: str,
+    content_name: str,
+    output_type: str,
+    media_type: str,
+    sha256: str,
+    node_id: str,
+    attempt_id: str,
+    run_id: str,
+    schema_fingerprint: str | None,
+    size_bytes: int,
+    produced_at: str,
+    session_id: str | None,
+    canonicalization_version: int,
+) -> bytes:
+    return json.dumps(
+        {
+            "publication_id": publication_id,
+            "content_name": content_name,
+            "output_type": output_type,
+            "media_type": media_type,
+            "sha256": sha256,
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
+            "language_profile": "archon-2026-07",
+            "schema_fingerprint": schema_fingerprint,
+            "size_bytes": size_bytes,
+            "produced_at": produced_at,
+            "session_id": session_id,
+            "canonicalization_version": canonicalization_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8") + b"\n"
+
+
+def _migrate_legacy_typed_publication_descriptors(
+    directory: Path,
+    projection: Mapping[str, object],
+) -> int:
+    artifacts = projection.get("artifacts")
+    run_id = projection.get("run_id")
+    if not isinstance(artifacts, list) or not isinstance(run_id, str):
+        raise JournalRecoveryError("typed publication descriptor authority is invalid")
+    migrated = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if "typed_publication_version" in artifact:
+            continue
+        artifact_fields = frozenset(artifact)
+        if artifact_fields != _LEGACY_TYPED_PUBLICATION_FIELDS:
+            if {
+                "publication_id",
+                "content_name",
+                "metadata_sha256",
+            }.intersection(artifact_fields):
+                raise JournalRecoveryError(
+                    "unversioned typed publication descriptor is invalid"
+                )
+            continue
+        publication_id = artifact.get("publication_id")
+        content_name = artifact.get("content_name")
+        size_bytes = artifact.get("size_bytes")
+        metadata_sha256 = artifact.get("metadata_sha256")
+        if (
+            not isinstance(publication_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+            or content_name not in {"content.json", "content.md"}
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= 500_000
+            or not isinstance(metadata_sha256, str)
+            or _SHA256_PATTERN.fullmatch(metadata_sha256) is None
+        ):
+            raise JournalRecoveryError("legacy typed publication descriptor is invalid")
+        metadata_path = directory / "publications" / publication_id / "metadata.json"
+        try:
+            observed = metadata_path.lstat()
+            reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+                or observed.st_size > _TYPED_PUBLICATION_METADATA_MAX_BYTES
+                or (
+                    reparse_marker
+                    and getattr(observed, "st_file_attributes", 0) & reparse_marker
+                )
+            ):
+                raise ArchonOutputIntegrityError(
+                    "legacy typed publication metadata is unsafe"
+                )
+            metadata_bytes = _read_descriptor_relative(
+                directory,
+                f"publications/{publication_id}/metadata.json",
+                size_bytes=observed.st_size,
+            )
+            content = _read_descriptor_relative(
+                directory,
+                f"publications/{publication_id}/{content_name}",
+                size_bytes=size_bytes,
+            )
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+        ) as exc:
+            raise JournalRecoveryError(
+                "legacy typed publication bundle is unavailable"
+            ) from exc
+        if (
+            not hmac.compare_digest(_sha256(metadata_bytes), metadata_sha256)
+            or len(content) != size_bytes
+            or not isinstance(artifact.get("sha256"), str)
+            or not hmac.compare_digest(_sha256(content), str(artifact["sha256"]))
+        ):
+            raise JournalRecoveryError(
+                "legacy typed publication bundle identity is invalid"
+            )
+        try:
+            metadata = json.loads(metadata_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise JournalRecoveryError(
+                "legacy typed publication metadata is malformed"
+            ) from exc
+        if not isinstance(metadata, Mapping):
+            raise JournalRecoveryError(
+                "legacy typed publication metadata is malformed"
+            )
+        produced_at = metadata.get("produced_at")
+        schema_fingerprint = metadata.get("schema_fingerprint")
+        canonicalization_version = metadata.get("canonicalization_version")
+        session_id = metadata.get("session_id")
+        try:
+            produced = datetime.fromisoformat(produced_at)
+        except (TypeError, ValueError) as exc:
+            raise JournalRecoveryError(
+                "legacy typed publication metadata is malformed"
+            ) from exc
+        if (
+            produced.tzinfo is None
+            or produced.utcoffset() is None
+            or (
+                schema_fingerprint is not None
+                and (
+                    not isinstance(schema_fingerprint, str)
+                    or _SHA256_PATTERN.fullmatch(schema_fingerprint) is None
+                )
+            )
+            or isinstance(canonicalization_version, bool)
+            or canonicalization_version != 1
+            or (
+                session_id is not None
+                and (
+                    not isinstance(session_id, str)
+                    or len(session_id) > DURABLE_METADATA_STRING_MAX_CHARS
+                )
+            )
+        ):
+            raise JournalRecoveryError(
+                "legacy typed publication metadata is malformed"
+            )
+        expected_metadata = _typed_publication_metadata_bytes(
+            publication_id=publication_id,
+            content_name=str(content_name),
+            output_type=str(artifact.get("output_type")),
+            media_type=str(artifact.get("media_type")),
+            sha256=str(artifact.get("sha256")),
+            node_id=str(artifact.get("node_id")),
+            attempt_id=str(artifact.get("attempt_id")),
+            run_id=run_id,
+            schema_fingerprint=schema_fingerprint,
+            size_bytes=size_bytes,
+            produced_at=produced_at,
+            session_id=session_id,
+            canonicalization_version=canonicalization_version,
+        )
+        if not hmac.compare_digest(metadata_bytes, expected_metadata):
+            raise JournalRecoveryError(
+                "legacy typed publication metadata is not corroborated"
+            )
+        artifact.update({
+            "typed_publication_version": _TYPED_PUBLICATION_DESCRIPTOR_VERSION,
+            "schema_fingerprint": schema_fingerprint,
+            "canonicalization_version": canonicalization_version,
+            "produced_at": produced_at,
+            "session_id": session_id,
+        })
+        migrated += 1
+    return migrated
+
+
+def _sealed_typed_output_declarations(
+    directory: Path,
+    projection: Mapping[str, object],
+) -> dict[str, _DeclaredTypedOutput]:
+    language = projection.get("language")
+    if (
+        not isinstance(language, Mapping)
+        or language.get("effective_profile") != "archon-2026-07"
+    ):
+        return {}
+    definition = directory / "definition.yaml"
+    try:
+        observed = definition.lstat()
+        reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_size > 2 * 1024 * 1024
+            or (
+                reparse_marker
+                and getattr(observed, "st_file_attributes", 0) & reparse_marker
+            )
+        ):
+            raise JournalRecoveryError(
+                "typed publication sealed definition is unsafe"
+            )
+        document = yaml.safe_load(
+            _read_descriptor_relative(
+                directory,
+                "definition.yaml",
+                size_bytes=observed.st_size,
+            )
+        )
+    except ArchonOutputUnavailableError:
+        raise
+    except OSError as exc:
+        if exc.errno in _RETRYABLE_READ_ERRNOS:
+            raise ArchonOutputUnavailableError(
+                "typed publication sealed definition is temporarily unavailable"
+            ) from exc
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    except (ArchonOutputIntegrityError, yaml.YAMLError) as exc:
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    if not isinstance(document, Mapping) or not isinstance(
+        document.get("nodes"), list
+    ):
+        raise JournalRecoveryError(
+            "typed publication sealed definition is malformed"
+        )
+    declarations: dict[str, _DeclaredTypedOutput] = {}
+    for node in document["nodes"]:
+        if not isinstance(node, Mapping) or not isinstance(node.get("id"), str):
+            raise JournalRecoveryError(
+                "typed publication sealed node declaration is malformed"
+            )
+        if "output_type" not in node:
+            continue
+        node_id = node["id"]
+        output_type = node.get("output_type")
+        if (
+            not node_id
+            or node_id in declarations
+            or not isinstance(output_type, str)
+            or not output_type.strip()
+            or len(output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+        ):
+            raise JournalRecoveryError(
+                "typed publication sealed output declaration is malformed"
+            )
+        declarations[node_id] = _DeclaredTypedOutput(
+            output_type=output_type,
+            has_structured_schema=node.get("output_format") is not None,
+        )
+    return declarations
+
+
+def _journaled_typed_publications(
+    projection: Mapping[str, object],
+    declared_outputs: Mapping[str, _DeclaredTypedOutput],
+) -> tuple[_JournaledTypedPublication, ...]:
+    run_id = projection.get("run_id")
+    nodes = projection.get("nodes")
+    artifacts = projection.get("artifacts")
+    if not isinstance(run_id, str) or not isinstance(nodes, Mapping) or not isinstance(
+        artifacts, list
+    ):
+        raise JournalRecoveryError("typed publication descriptor authority is invalid")
+    language = projection.get("language")
+    archon = (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+    )
+    structured_outputs = language.get("structured_outputs") if archon else None
+    if archon and not isinstance(structured_outputs, Mapping):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    requirements: dict[str, _RequiredTypedPublication] = {}
+    for node_id, declaration in declared_outputs.items():
+        node = nodes.get(node_id)
+        if not isinstance(node, Mapping):
+            raise JournalRecoveryError(
+                "typed publication node authority is invalid"
+            )
+        if not archon or node.get("state") != "succeeded":
+            continue
+        structured = structured_outputs.get(node_id)
+        if declaration.has_structured_schema:
+            if not isinstance(structured, Mapping):
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+            fingerprint = structured.get("schema_fingerprint")
+            version = structured.get("canonicalization_version")
+            if (
+                not isinstance(fingerprint, str)
+                or _SHA256_PATTERN.fullmatch(fingerprint) is None
+                or isinstance(version, bool)
+                or version != 1
+            ):
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+        else:
+            if structured is not None:
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+            fingerprint = None
+            version = 1
+        requirements[node_id] = _RequiredTypedPublication(
+            output_type=declaration.output_type,
+            schema_fingerprint=fingerprint,
+            canonicalization_version=version,
+        )
+    descriptors: list[_JournaledTypedPublication] = []
+    publication_ids: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        typed_markers = {
+            "typed_publication_version",
+            "publication_id",
+            "content_name",
+            "metadata_sha256",
+            "produced_at",
+        }
+        if not typed_markers.intersection(artifact):
+            continue
+        publication_id = artifact.get("publication_id")
+        descriptor_version = artifact.get("typed_publication_version")
+        content_name = artifact.get("content_name")
+        output_type = artifact.get("output_type")
+        media_type = artifact.get("media_type")
+        size_bytes = artifact.get("size_bytes")
+        content_sha256 = artifact.get("sha256")
+        metadata_sha256 = artifact.get("metadata_sha256")
+        schema_fingerprint = artifact.get("schema_fingerprint")
+        canonicalization_version = artifact.get("canonicalization_version")
+        produced_at = artifact.get("produced_at")
+        session_id = artifact.get("session_id")
+        node_id = artifact.get("node_id")
+        attempt_id = artifact.get("attempt_id")
+        relative_path = artifact.get("relative_path")
+        expected_content = (
+            {
+                _TYPED_PUBLICATION_JSON_MEDIA_TYPE: "content.json",
+                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE: "content.md",
+            }.get(media_type)
+            if isinstance(media_type, str)
+            else None
+        )
+        if (
+            isinstance(descriptor_version, bool)
+            or descriptor_version != _TYPED_PUBLICATION_DESCRIPTOR_VERSION
+            or not isinstance(publication_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+            or publication_id in publication_ids
+            or not isinstance(content_name, str)
+            or content_name != expected_content
+            or not isinstance(output_type, str)
+            or not output_type.strip()
+            or len(output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+            or not isinstance(node_id, str)
+            or not isinstance(attempt_id, str)
+            or not isinstance(relative_path, str)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= 500_000
+            or not isinstance(content_sha256, str)
+            or _SHA256_PATTERN.fullmatch(content_sha256) is None
+            or not isinstance(metadata_sha256, str)
+            or _SHA256_PATTERN.fullmatch(metadata_sha256) is None
+            or (
+                schema_fingerprint is not None
+                and (
+                    not isinstance(schema_fingerprint, str)
+                    or _SHA256_PATTERN.fullmatch(schema_fingerprint) is None
+                )
+            )
+            or isinstance(canonicalization_version, bool)
+            or canonicalization_version != 1
+            or not isinstance(produced_at, str)
+            or not produced_at
+            or len(produced_at) > DURABLE_METADATA_STRING_MAX_CHARS
+            or (
+                session_id is not None
+                and (
+                    not isinstance(session_id, str)
+                    or len(session_id) > DURABLE_METADATA_STRING_MAX_CHARS
+                )
+            )
+        ):
+            raise JournalRecoveryError("typed publication descriptor is invalid")
+        try:
+            produced = datetime.fromisoformat(produced_at)
+        except ValueError as exc:
+            raise JournalRecoveryError(
+                "typed publication descriptor production time is invalid"
+            ) from exc
+        if produced.tzinfo is None:
+            raise JournalRecoveryError(
+                "typed publication descriptor production time is invalid"
+            )
+        node = nodes.get(node_id)
+        relative = PurePosixPath(relative_path)
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+        }
+        loop_state = node.get("loop_state") if isinstance(node, Mapping) else None
+        iteration = (
+            loop_state.get("iteration")
+            if isinstance(loop_state, Mapping)
+            else None
+        )
+        if isinstance(iteration, int) and not isinstance(iteration, bool):
+            nested_attempt = f"{attempt_id}/iteration-{iteration:04d}"
+            owned_prefixes.add((
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", nested_attempt),
+            ))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) <= 3
+            or relative.parts[:3] not in owned_prefixes
+        ):
+            raise JournalRecoveryError(
+                "typed publication winning attempt path is invalid"
+            )
+        attempts = node.get("attempts") if isinstance(node, Mapping) else None
+        winners = (
+            [
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == attempt_id
+                and attempt.get("state") == "succeeded"
+            ]
+            if isinstance(attempts, list)
+            else []
+        )
+        if len(winners) != 1:
+            raise JournalRecoveryError(
+                "typed publication winning attempt is not corroborated"
+            )
+        if not archon:
+            raise JournalRecoveryError(
+                "typed publication language authority is invalid"
+            )
+        publication_ids.add(publication_id)
+        descriptors.append(
+            _JournaledTypedPublication(
+                publication_id=publication_id,
+                content_name=content_name,
+                output_type=output_type,
+                media_type=str(media_type),
+                size_bytes=size_bytes,
+                sha256=content_sha256,
+                metadata_sha256=metadata_sha256,
+                schema_fingerprint=schema_fingerprint,
+                canonicalization_version=canonicalization_version,
+                produced_at=produced_at,
+                session_id=session_id,
+                run_id=run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                relative_path=relative_path,
+            )
+        )
+    descriptors_by_node: dict[str, list[_JournaledTypedPublication]] = {}
+    for descriptor in descriptors:
+        descriptors_by_node.setdefault(descriptor.node_id, []).append(descriptor)
+    if set(descriptors_by_node) - set(requirements):
+        raise JournalRecoveryError(
+            "typed publication descriptor has no sealed output authority"
+        )
+    for node_id, requirement in requirements.items():
+        matches = descriptors_by_node.get(node_id, [])
+        if len(matches) != 1:
+            raise JournalRecoveryError(
+                "typed publication requires exactly one winning descriptor"
+            )
+        descriptor = matches[0]
+        if (
+            descriptor.output_type != requirement.output_type
+            or descriptor.schema_fingerprint != requirement.schema_fingerprint
+            or descriptor.canonicalization_version
+            != requirement.canonicalization_version
+        ):
+            raise JournalRecoveryError(
+                "typed publication descriptor conflicts with sealed output authority"
+            )
+    return tuple(descriptors)
+
+
+def _validate_typed_publication_metadata(
+    directory: Path,
+    projection: Mapping[str, object],
+    *,
+    migrate_legacy: bool,
+) -> int:
+    """Validate descriptor authority without opening versioned publication bodies."""
+    declared_outputs = _sealed_typed_output_declarations(
+        directory,
+        projection,
+    )
+    migrated = (
+        _migrate_legacy_typed_publication_descriptors(
+            directory,
+            projection,
+        )
+        if migrate_legacy
+        else 0
+    )
+    _journaled_typed_publications(
+        projection,
+        declared_outputs,
+    )
+    return migrated
+
+
+def _write_or_reuse_typed_approval_output(
+    run_directory: Path,
+    *,
+    node_id: str,
+    attempt_id: str,
+    data: bytes,
+) -> PurePosixPath:
+    relative = PurePosixPath(
+        "nodes",
+        _safe_component("node", node_id),
+        _safe_component("attempt", attempt_id),
+        "output.md",
+    )
+    try:
+        output_path = write_archon_output_exclusive(
+            run_directory,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            filename="output.md",
+            data=data,
+        )
+    except ArchonOutputIntegrityError:
+        existing = _read_descriptor_relative(
+            run_directory,
+            relative.as_posix(),
+            size_bytes=len(data),
+        )
+        if not hmac.compare_digest(_sha256(existing), _sha256(data)):
+            raise ArchonOutputIntegrityError(
+                "typed approval output source identity changed"
+            )
+        return relative
+    return PurePosixPath(output_path.relative_to(run_directory).as_posix())
+
+
+def _canonical_typed_publication_artifact(
+    artifacts: tuple[ArtifactRef, ...],
+    candidate: TypedPublicationCandidate,
+) -> ArtifactRef:
+    same_path = [
+        artifact
+        for artifact in artifacts
+        if artifact.relative_path == candidate.attempt_relative_path
+    ]
+    matching = [
+        artifact
+        for artifact in same_path
+        if artifact.media_type == candidate.media_type
+        and artifact.size_bytes == candidate.size_bytes
+        and artifact.sha256 == candidate.sha256
+    ]
+    if len(matching) != 1:
+        raise ArchonOutputIntegrityError(
+            "typed publication candidate does not match one executor artifact"
+        )
+    if len(same_path) != 1:
+        raise ArchonOutputIntegrityError(
+            "typed publication artifacts contain a conflicting same-path descriptor"
+        )
+    return matching[0]
 
 
 def _file_ends_with_newline(path: Path) -> bool:
@@ -594,6 +2406,37 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS attempt_journal_reserves_run
                     ON attempt_journal_reserves(run_id);
+                    CREATE TABLE IF NOT EXISTS obligation_journal_reserves (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        terminal_reserve_bytes INTEGER NOT NULL,
+                        projection_limit_bytes INTEGER NOT NULL,
+                        consumed_bytes INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS obligation_journal_reserves_run
+                    ON obligation_journal_reserves(run_id);
+                    CREATE TABLE IF NOT EXISTS session_recovery_selection_authority (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        authority_json TEXT NOT NULL,
+                        authority_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS session_recovery_selection_run
+                    ON session_recovery_selection_authority(run_id);
+                    CREATE TABLE IF NOT EXISTS session_registry_winner_authority (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(run_id)
+                            ON DELETE CASCADE,
+                        authority_json TEXT NOT NULL,
+                        authority_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS session_registry_winner_run
+                    ON session_registry_winner_authority(run_id);
                     CREATE TABLE IF NOT EXISTS store_repair_state (
                         run_id TEXT NOT NULL,
                         attempt_id TEXT NOT NULL,
@@ -934,6 +2777,21 @@ class RunStore:
             raise
         finally:
             connection.close()
+
+    def _commit_fenced_private_authority(
+        self,
+        connection: sqlite3.Connection | None,
+        fence: ExecutionFence | None,
+        now: LeaseClockSample | None = None,
+    ) -> None:
+        """Durably anchor private evidence before its activating journal frame."""
+        if connection is None:
+            return
+        if fence is None:
+            raise RuntimeError("private authority checkpoint requires a fence")
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        self.assert_execution_fence(connection, fence, now)
 
     def _migrate_runs_idempotency_namespace(
         self,
@@ -1873,11 +3731,19 @@ class RunStore:
         )
 
     def _corroborate_run_evidence(
-        self, directory: Path, *, run_id: str
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        migrate_legacy_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         with workflow_lock(self._run_lock_path(run_id)):
             return self._corroborate_run_evidence_locked(
-                directory, run_id=run_id
+                directory,
+                run_id=run_id,
+                migrate_legacy_typed_publications=(
+                    migrate_legacy_typed_publications
+                ),
             )
 
     def _corroborate_run_evidence_locked(
@@ -1887,6 +3753,7 @@ class RunStore:
         run_id: str,
         projection_data: bytes | None = None,
         journal_data: bytes | None = None,
+        migrate_legacy_typed_publications: bool = True,
     ) -> tuple[dict[str, object], str | None, str | None]:
         if (projection_data is None) != (journal_data is None):
             raise ValueError("projection and journal snapshots must be paired")
@@ -1904,6 +3771,9 @@ class RunStore:
             directory,
             run_id=run_id,
             journal_data=journal_data,
+            migrate_legacy_typed_publications=(
+                migrate_legacy_typed_publications
+            ),
         )
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
@@ -2023,7 +3893,11 @@ class RunStore:
         )
 
     def _sync_loaded_integrity(
-        self, directory: Path, projection: Mapping[str, object]
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        migrate_legacy_typed_publications: bool = True,
     ) -> None:
         journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
         scheduled_at = self._scheduled_at_from_projection(projection)
@@ -2071,7 +3945,11 @@ class RunStore:
             return
         try:
             corroborated, _, journal_sha256 = self._corroborate_run_evidence_locked(
-                directory, run_id=str(projection["run_id"])
+                directory,
+                run_id=str(projection["run_id"]),
+                migrate_legacy_typed_publications=(
+                    migrate_legacy_typed_publications
+                ),
             )
         except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
             self._mark_repair_required(
@@ -2677,11 +4555,13 @@ class RunStore:
         """Converge the capacity ledger with durable run projections."""
         active: dict[str, tuple[str, str, str, str]] = {}
         reserves: dict[str, TerminalJournalReserve] = {}
+        obligation_reserves: dict[str, tuple[str, TerminalJournalReserve]] = {}
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT run_id, run_directory FROM runs "
                 "WHERE admission_state='published' AND status IN "
-                "('running','waiting_retry','paused','interrupted')"
+                "('running','waiting_retry','paused','interrupted',"
+                "'recovery_pending')"
             ).fetchall()
         for row in rows:
             try:
@@ -2692,6 +4572,37 @@ class RunStore:
                 )
             except (OSError, json.JSONDecodeError):
                 continue
+            try:
+                pending_payloads = _pending_session_registry_payloads(projection)
+            except JournalRecoveryError:
+                pending_payloads = {}
+            for pending in pending_payloads.values():
+                try:
+                    candidate, _retry_count = _session_registry_candidate_from_payload(
+                        pending
+                    )
+                except JournalRecoveryError:
+                    continue
+                if candidate.winning_run_id == row["run_id"]:
+                    projection_bytes = len(
+                        json.dumps(
+                            projection,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    )
+                    reserve = TerminalJournalReserve.for_projection(
+                        projection_bytes
+                    )
+                    obligation_reserves[candidate.winning_attempt_id] = (
+                        row["run_id"],
+                        TerminalJournalReserve(
+                            projection_limit_bytes=reserve.projection_limit_bytes,
+                            terminal_reserve_bytes=(
+                                2 * reserve.terminal_reserve_bytes
+                            ),
+                        ),
+                    )
             for node_id, node in projection.get("nodes", {}).items():
                 claim = node.get("claim") if isinstance(node, dict) else None
                 if not isinstance(claim, dict) and isinstance(node, dict):
@@ -2764,6 +4675,30 @@ class RunStore:
                         _utc_now(),
                     ),
                 )
+            retained_obligations = set(obligation_reserves)
+            if retained_obligations:
+                placeholders = ",".join("?" for _ in retained_obligations)
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves "
+                    f"WHERE attempt_id NOT IN ({placeholders})",
+                    tuple(sorted(retained_obligations)),
+                )
+            else:
+                connection.execute("DELETE FROM obligation_journal_reserves")
+            for attempt_id, (run_id, reserve) in obligation_reserves.items():
+                connection.execute(
+                    "INSERT OR IGNORE INTO obligation_journal_reserves ("
+                    "attempt_id, run_id, terminal_reserve_bytes, "
+                    "projection_limit_bytes, consumed_bytes, created_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?)",
+                    (
+                        attempt_id,
+                        run_id,
+                        reserve.terminal_reserve_bytes,
+                        reserve.projection_limit_bytes,
+                        _utc_now(),
+                    ),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -2782,6 +4717,665 @@ class RunStore:
             connection.close()
             raise
         return connection
+
+    @staticmethod
+    def _write_private_authority(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        run_id: str,
+        attempt_id: str,
+        authority: Mapping[str, object],
+    ) -> None:
+        if table not in {
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        }:
+            raise ValueError("invalid private authority table")
+        authority_json = _private_authority_json(authority)
+        authority_sha256 = _sha256(authority_json.encode("utf-8"))
+        existing = connection.execute(
+            f"SELECT run_id, authority_json, authority_sha256 FROM {table} "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["run_id"] != run_id
+                or not hmac.compare_digest(
+                    str(existing["authority_json"]), authority_json
+                )
+                or not hmac.compare_digest(
+                    str(existing["authority_sha256"]), authority_sha256
+                )
+            ):
+                raise JournalRecoveryError("private session authority conflicts")
+            return
+        connection.execute(
+            f"INSERT INTO {table} "
+            "(attempt_id, run_id, authority_json, authority_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                run_id,
+                authority_json,
+                authority_sha256,
+                _utc_now(),
+            ),
+        )
+
+    def _read_private_session_authorities(
+        self,
+        *,
+        run_id: str,
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        tables = (
+            "session_recovery_selection_authority",
+            "session_registry_winner_authority",
+        )
+        authorities: dict[str, dict[str, Mapping[str, object]]] = {
+            table: {} for table in tables
+        }
+        try:
+            with self._connect() as connection:
+                rows = {
+                    table: connection.execute(
+                        f"SELECT attempt_id, authority_json, authority_sha256 "
+                        f"FROM {table} WHERE run_id=?",
+                        (run_id,),
+                    ).fetchall()
+                    for table in tables
+                }
+        except sqlite3.Error as exc:
+            raise JournalRecoveryError(
+                "private session authority is unavailable"
+            ) from exc
+        for table, table_rows in rows.items():
+            for row in table_rows:
+                authority_json = str(row["authority_json"])
+                authority_sha256 = str(row["authority_sha256"])
+                if not hmac.compare_digest(
+                    _sha256(authority_json.encode("utf-8")), authority_sha256
+                ):
+                    raise JournalRecoveryError(
+                        "private session authority digest is invalid"
+                    )
+                try:
+                    authority = json.loads(authority_json)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise JournalRecoveryError(
+                        "private session authority JSON is invalid"
+                    ) from exc
+                if not isinstance(authority, dict) or not hmac.compare_digest(
+                    _private_authority_json(authority), authority_json
+                ):
+                    raise JournalRecoveryError(
+                        "private session authority is noncanonical"
+                    )
+                if table == "session_recovery_selection_authority":
+                    _session_recovery_selection_from_authority(authority)
+                else:
+                    _session_registry_candidate_from_authority(authority)
+                authorities[table][str(row["attempt_id"])] = authority
+        return authorities
+
+    def _journal_predecessor_chain_locked(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        expected_predecessor_sequence: int,
+    ) -> str:
+        events = self._read_journal_events(directory)
+        if len(events) != expected_predecessor_sequence:
+            raise JournalRecoveryError("journal activation predecessor is invalid")
+        checkpoints = _journal_order_checkpoints(run_id, events)
+        return checkpoints[expected_predecessor_sequence]
+
+    @staticmethod
+    def _bind_private_session_authorities_to_events(
+        authorities: Mapping[str, Mapping[str, Mapping[str, object]]],
+        events: Iterable[Mapping[str, object]],
+        *,
+        run_id: str,
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        """Keep schema-v1/v3 authorities only when immutable activation binds."""
+        event_list = tuple(events)
+        _validate_private_authority_journal_order(
+            authorities,
+            event_list,
+            run_id=run_id,
+        )
+        event_by_sequence = {
+            int(event["sequence"]): event
+            for event in event_list
+            if isinstance(event.get("sequence"), int)
+            and not isinstance(event.get("sequence"), bool)
+        }
+        bound: dict[str, dict[str, Mapping[str, object]]] = {
+            "session_recovery_selection_authority": {},
+            "session_registry_winner_authority": {},
+        }
+        for attempt_id, authority in authorities.get(
+            "session_recovery_selection_authority", {}
+        ).items():
+            selection, activation, event_type = (
+                _session_recovery_selection_from_authority(authority)
+            )
+            if authority.get("schema_version") == 2:
+                # A historical unchained precommit is privacy-only. Inferring a
+                # prefix from the mutable journal would silently upgrade trust.
+                continue
+            if activation is not None:
+                event = event_by_sequence.get(activation)
+                if (
+                    event is None
+                    or event.get("run_id") != run_id
+                    or event.get("event_type") != event_type
+                    or event.get("node_id") != selection.key.node_id
+                    or event.get("attempt_id") != selection.attempt_id
+                ):
+                    continue
+            bound["session_recovery_selection_authority"][attempt_id] = authority
+        for attempt_id, authority in authorities.get(
+            "session_registry_winner_authority", {}
+        ).items():
+            candidate, _retry_count, activation, event_type = (
+                _session_registry_candidate_from_authority(authority)
+            )
+            if authority.get("schema_version") == 2:
+                continue
+            if activation is not None:
+                event = event_by_sequence.get(activation)
+                if (
+                    event is None
+                    or event.get("run_id") != run_id
+                    or event.get("event_type") != event_type
+                    or event.get("node_id") != candidate.winning_node_id
+                    or event.get("attempt_id") != candidate.winning_attempt_id
+                ):
+                    continue
+            bound["session_registry_winner_authority"][attempt_id] = authority
+        return bound
+
+    def _read_bound_private_session_authorities(
+        self,
+        *,
+        run_id: str,
+        events: Iterable[Mapping[str, object]],
+    ) -> dict[str, dict[str, Mapping[str, object]]]:
+        return self._bind_private_session_authorities_to_events(
+            self._read_private_session_authorities(run_id=run_id),
+            events,
+            run_id=run_id,
+        )
+
+    def _validate_recovery_completion_event_authority(
+        self,
+        events: Iterable[Mapping[str, object]],
+        *,
+        run_id: str,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ],
+    ) -> None:
+        """Fail closed before projecting a v3 recovery completion payload."""
+        event_list = tuple(events)
+        selections = private_authorities.get(
+            "session_recovery_selection_authority", {}
+        )
+        winners = private_authorities.get("session_registry_winner_authority", {})
+        if not selections and not winners:
+            return
+        events_by_sequence = {
+            int(event["sequence"]): event
+            for event in event_list
+            if isinstance(event.get("sequence"), int)
+            and not isinstance(event.get("sequence"), bool)
+        }
+        completion_sequences: set[int] = set()
+        for authority in winners.values():
+            _candidate, _retry_count, activation, _event_type = (
+                _session_registry_candidate_from_authority(authority)
+            )
+            if activation is not None:
+                completion_sequences.add(activation)
+        has_unframed_selection = False
+        for attempt_id, authority in selections.items():
+            selection, activation, _event_type = (
+                _session_recovery_selection_from_authority(authority)
+            )
+            if activation is None:
+                has_unframed_selection = True
+                continue
+            for event in event_list:
+                sequence = event.get("sequence")
+                if (
+                    isinstance(sequence, bool)
+                    or not isinstance(sequence, int)
+                    or sequence < activation
+                ):
+                    continue
+                projection = event.get("projection")
+                nodes = (
+                    projection.get("nodes")
+                    if isinstance(projection, Mapping)
+                    else None
+                )
+                node = (
+                    nodes.get(selection.key.node_id)
+                    if isinstance(nodes, Mapping)
+                    else None
+                )
+                attempts = node.get("attempts") if isinstance(node, Mapping) else None
+                if isinstance(attempts, list) and any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("attempt_id") == attempt_id
+                    and attempt.get("state") == "succeeded"
+                    for attempt in attempts
+                ):
+                    completion_sequences.add(sequence)
+                    break
+        for event in event_list:
+            projection = event.get("projection")
+            language = (
+                projection.get("language")
+                if isinstance(projection, Mapping)
+                else None
+            )
+            nodes = (
+                projection.get("nodes")
+                if isinstance(projection, Mapping)
+                else None
+            )
+            node = (
+                nodes.get(event.get("node_id"))
+                if isinstance(nodes, Mapping)
+                else None
+            )
+            recoveries = (
+                node.get("session_recoveries")
+                if isinstance(node, Mapping)
+                else None
+            )
+            if (
+                has_unframed_selection
+                and event.get("event_type") == "node_succeeded"
+                and isinstance(language, Mapping)
+                and language.get("normalizer_version") == 3
+                and isinstance(recoveries, list)
+                and any(
+                    isinstance(recovery, Mapping)
+                    and recovery.get("attempt_id") == event.get("attempt_id")
+                    for recovery in recoveries
+                )
+                and isinstance(event.get("sequence"), int)
+            ):
+                completion_sequences.add(int(event["sequence"]))
+        for sequence in completion_sequences:
+            event = events_by_sequence.get(sequence)
+            if event is None:
+                raise JournalRecoveryError(
+                    "persistent session completion authority is invalid"
+                )
+            projection = event.get("projection")
+            if not isinstance(projection, Mapping) or (
+                event.get("projection_sha256") != _projection_digest(projection)
+                or not self._private_session_authorities_match_projection(
+                    projection,
+                    private_authorities=private_authorities,
+                )
+            ):
+                raise JournalRecoveryError(
+                    "persistent session completion authority is invalid"
+                )
+
+    def _private_session_registry_authority_matches(
+        self,
+        projection: Mapping[str, object],
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ] | None = None,
+    ) -> bool:
+        authorities = private_authorities or self._read_private_session_authorities(
+            run_id=candidate.winning_run_id
+        )
+        winner_authority = authorities.get(
+            "session_registry_winner_authority", {}
+        ).get(candidate.winning_attempt_id)
+        try:
+            anchored_candidate, retry_count, activation, _event_type = (
+                _session_registry_candidate_from_authority(winner_authority)
+            )
+        except JournalRecoveryError:
+            return False
+        if (
+            anchored_candidate != candidate
+            or retry_count != 0
+            or activation is not None
+            and int(projection.get("event_sequence", 0)) < activation
+        ):
+            return False
+        if not candidate.recovery_selected:
+            return True
+        selection_authority = authorities.get(
+            "session_recovery_selection_authority", {}
+        ).get(candidate.winning_attempt_id)
+        return self._private_selection_authority_matches(
+            projection,
+            candidate.winning_attempt_id,
+            selection_authority,
+            require_active=True,
+        )
+
+    @staticmethod
+    def _private_selection_authority_matches(
+        projection: Mapping[str, object],
+        attempt_id: str,
+        selection_authority: object,
+        *,
+        require_active: bool,
+    ) -> bool:
+        if not isinstance(selection_authority, Mapping):
+            return False
+        schema_version = selection_authority.get("schema_version")
+        expected_fields = {
+            "schema_version",
+            "run_id",
+            "attempt_id",
+            "key",
+            "expected_generation",
+            "missing_session_id",
+            "cache_fingerprint",
+            "source",
+            "provider_attempts_before_recovery",
+        }
+        if schema_version in {2, 3}:
+            expected_fields.update(
+                {"activation_event_sequence", "activation_event_type"}
+            )
+            if schema_version == 3:
+                expected_fields.update(
+                    {
+                        "journal_order_version",
+                        "activation_predecessor_sequence",
+                        "activation_predecessor_chain_sha256",
+                    }
+                )
+        elif schema_version != 1:
+            return False
+        if set(selection_authority) != expected_fields:
+            return False
+        key = selection_authority.get("key")
+        if not isinstance(key, Mapping) or set(key) != {
+            "workflow",
+            "node_id",
+            "scope",
+            "provider",
+            "profile",
+        }:
+            return False
+        if (
+            selection_authority.get("run_id") != projection.get("run_id")
+            or selection_authority.get("attempt_id") != attempt_id
+            or key.get("workflow") != projection.get("workflow")
+            or key.get("scope")
+            != str(projection.get("operator_scope_digest") or "local")
+            or any(
+                not isinstance(key.get(field), str) or not key.get(field)
+                for field in ("node_id", "provider", "profile")
+            )
+        ):
+            return False
+        node_id = key.get("node_id")
+        nodes = projection.get("nodes")
+        node = nodes.get(node_id) if isinstance(nodes, Mapping) else None
+        attempts = node.get("attempts") if isinstance(node, Mapping) else None
+        matching_attempts = [
+            attempt
+            for attempt in attempts
+            if isinstance(attempt, Mapping)
+            and attempt.get("attempt_id") == attempt_id
+        ] if isinstance(attempts, list) else []
+        attempt = matching_attempts[0] if len(matching_attempts) == 1 else None
+        recoveries = node.get("session_recoveries") if isinstance(node, Mapping) else None
+        matches = [
+            recovery
+            for recovery in recoveries
+            if isinstance(recovery, Mapping)
+            and recovery.get("attempt_id") == attempt_id
+        ] if isinstance(recoveries, list) else []
+        if schema_version in {2, 3}:
+            activation = selection_authority.get("activation_event_sequence")
+            if (
+                isinstance(activation, bool)
+                or not isinstance(activation, int)
+                or activation < 1
+                or selection_authority.get("activation_event_type")
+                != "persistent_session_missing_fresh_start"
+            ):
+                return False
+            active = int(projection.get("event_sequence", 0)) >= activation
+        else:
+            active = bool(matches) or (
+                isinstance(attempt, Mapping)
+                and attempt.get("state")
+                in {"succeeded", "failed", "cancelled", "interrupted"}
+            )
+        if not active:
+            return not require_active
+        if attempt is None or len(matches) != 1:
+            return False
+        recovery = matches[0]
+        missing_session_id = selection_authority.get("missing_session_id")
+        cache_fingerprint = selection_authority.get("cache_fingerprint")
+        return (
+            selection_authority.get("run_id") == projection.get("run_id")
+            and selection_authority.get("attempt_id") == attempt_id
+            and key
+            == {
+                "workflow": projection.get("workflow"),
+                "node_id": node_id,
+                "scope": str(projection.get("operator_scope_digest") or "local"),
+                "provider": recovery.get("provider"),
+                "profile": recovery.get("runtime_profile"),
+            }
+            and selection_authority.get("expected_generation")
+            == recovery.get("registry_generation")
+            and isinstance(missing_session_id, str)
+            and recovery.get("missing_session_sha256")
+            == _sha256(missing_session_id.encode("utf-8"))
+            and isinstance(cache_fingerprint, str)
+            and recovery.get("cache_fingerprint_sha256")
+            == _sha256(cache_fingerprint.encode("utf-8"))
+            and selection_authority.get("source") == recovery.get("source")
+            and selection_authority.get("provider_attempts_before_recovery") == 0
+            and recovery.get("provider_attempts_before_recovery") == 0
+        )
+
+    def _private_session_authorities_match_projection(
+        self,
+        projection: Mapping[str, object],
+        *,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ],
+    ) -> bool:
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return False
+        selections = private_authorities.get(
+            "session_recovery_selection_authority", {}
+        )
+        winners = private_authorities.get("session_registry_winner_authority", {})
+        bound_selected_successes: set[str] = set()
+        for attempt_id, selection_authority in selections.items():
+            if not self._private_selection_authority_matches(
+                projection,
+                attempt_id,
+                selection_authority,
+                require_active=False,
+            ):
+                return False
+            try:
+                selection, activation, _event_type = (
+                    _session_recovery_selection_from_authority(selection_authority)
+                )
+            except JournalRecoveryError:
+                return False
+            if (
+                activation is None
+                or int(projection.get("event_sequence", 0)) < activation
+            ):
+                continue
+            node = nodes.get(selection.key.node_id)
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            if isinstance(attempts, list) and any(
+                isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == attempt_id
+                and attempt.get("state") == "succeeded"
+                for attempt in attempts
+            ):
+                bound_selected_successes.add(attempt_id)
+        anchored_winners: dict[str, SessionRegistryUpdateCandidate] = {}
+        for attempt_id, authority in winners.items():
+            try:
+                candidate, retry_count, activation, _event_type = (
+                    _session_registry_candidate_from_authority(authority)
+                )
+            except JournalRecoveryError:
+                return False
+            if (
+                retry_count != 0
+                or candidate.winning_attempt_id != attempt_id
+                or candidate.winning_run_id != projection.get("run_id")
+            ):
+                return False
+            anchored_winners[attempt_id] = candidate
+            if activation is not None:
+                if int(projection.get("event_sequence", 0)) < activation:
+                    continue
+            else:
+                node = nodes.get(candidate.winning_node_id)
+                attempts = (
+                    node.get("attempts") if isinstance(node, Mapping) else None
+                )
+                if not isinstance(attempts, list) or not any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("attempt_id") == attempt_id
+                    and attempt.get("state") == "succeeded"
+                    for attempt in attempts
+                ):
+                    continue
+            if (
+                not _session_registry_candidate_is_corroborated(
+                    projection, candidate
+                )
+                or not self._private_session_registry_authority_matches(
+                    projection,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
+            ):
+                return False
+        for attempt_id in bound_selected_successes:
+            candidate = anchored_winners.get(attempt_id)
+            if (
+                candidate is None
+                or not _session_registry_candidate_is_corroborated(
+                    projection, candidate
+                )
+                or not self._private_session_registry_authority_matches(
+                    projection,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
+            ):
+                return False
+        for node in nodes.values():
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            if not isinstance(attempts, list):
+                continue
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping) or not isinstance(
+                    attempt.get("session_registry_authority"), Mapping
+                ):
+                    continue
+                attempt_id = attempt.get("attempt_id")
+                candidate = anchored_winners.get(str(attempt_id))
+                if (
+                    candidate is None
+                    or not _session_registry_candidate_is_corroborated(
+                        projection, candidate
+                    )
+                    or not self._private_session_registry_authority_matches(
+                        projection,
+                        candidate,
+                        private_authorities=private_authorities,
+                    )
+                ):
+                    return False
+        language = projection.get("language")
+        strict_recovery = (
+            isinstance(language, Mapping)
+            and language.get("normalizer_version") == 3
+        )
+        if strict_recovery:
+            for node in nodes.values():
+                recoveries = (
+                    node.get("session_recoveries")
+                    if isinstance(node, Mapping)
+                    else None
+                )
+                if not isinstance(recoveries, list):
+                    continue
+                for recovery in recoveries:
+                    attempt_id = (
+                        recovery.get("attempt_id")
+                        if isinstance(recovery, Mapping)
+                        else None
+                    )
+                    if (
+                        not isinstance(attempt_id, str)
+                        or attempt_id not in selections
+                        or not self._private_selection_authority_matches(
+                            projection,
+                            attempt_id,
+                            selections[attempt_id],
+                            require_active=True,
+                        )
+                    ):
+                        return False
+                    attempts = node.get("attempts")
+                    matching_attempt = next(
+                        (
+                            attempt
+                            for attempt in attempts
+                            if isinstance(attempt, Mapping)
+                            and attempt.get("attempt_id") == attempt_id
+                        ),
+                        None,
+                    ) if isinstance(attempts, list) else None
+                    if (
+                        isinstance(matching_attempt, Mapping)
+                        and matching_attempt.get("state") == "succeeded"
+                    ):
+                        candidate = anchored_winners.get(attempt_id)
+                        if (
+                            candidate is None
+                            or not _session_registry_candidate_is_corroborated(
+                                projection, candidate
+                            )
+                            or not self._private_session_registry_authority_matches(
+                                projection,
+                                candidate,
+                                private_authorities=private_authorities,
+                            )
+                        ):
+                            return False
+        return True
 
     @staticmethod
     def _record_coordinator_wake(
@@ -2827,6 +5421,7 @@ class RunStore:
         verified_inputs: Mapping[str, tuple[bytes, str]] | None = None,
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
+        execution_limits: RunExecutionLimits | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -2853,6 +5448,20 @@ class RunStore:
                 package, read_budget=resource_read_budget
             )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
+            phase3_execution_semantics = None
+            if (
+                package.language.effective_profile
+                is WorkflowLanguageProfile.ARCHON_2026_07
+                and package.language.normalizer_version == 3
+            ):
+                from plugins.workflow.execution_semantics import (
+                    build_phase3_execution_semantics,
+                )
+
+                phase3_execution_semantics = build_phase3_execution_semantics(
+                    package,
+                    execution_limits or RunExecutionLimits(),
+                ).to_dict()
 
             def read_package_file(path: Path) -> bytes:
                 if resource_read_budget is None:
@@ -3056,14 +5665,19 @@ class RunStore:
                 }
                 | {"resources.json"}
             )
+            snapshot_resources: dict[str, object] = {
+                "inputs_sha256": _sha256(manifest_data),
+                "node_skills": node_skill_digests,
+                "node_agent_skills": node_agent_skill_digests,
+                "language": language,
+                "sealed_paths": sealed_paths,
+            }
+            if phase3_execution_semantics is not None:
+                snapshot_resources["phase3_execution_semantics"] = (
+                    phase3_execution_semantics
+                )
             snapshot_manifest = json.dumps(
-                {
-                    "inputs_sha256": _sha256(manifest_data),
-                    "node_skills": node_skill_digests,
-                    "node_agent_skills": node_agent_skill_digests,
-                    "language": language,
-                    "sealed_paths": sealed_paths,
-                },
+                snapshot_resources,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
@@ -3112,12 +5726,13 @@ class RunStore:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
-    def _ensure_free_disk(self) -> None:
+    def _ensure_free_disk(self, required_bytes: int = 0) -> None:
         usage = shutil.disk_usage(self.root)
         watermark = max(1024**3, min(5 * 1024**3, int(usage.total * 0.05)))
-        if usage.free < watermark:
+        if usage.free - required_bytes < watermark:
             raise StorageQuotaError(
-                f"free_disk_watermark not met: {usage.free} < {watermark}"
+                "free_disk_watermark not met after reservation: "
+                f"{usage.free} - {required_bytes} < {watermark}"
             )
 
     @staticmethod
@@ -3132,6 +5747,22 @@ class RunStore:
                 # concurrent capacity scan is walking the run tree.
                 continue
         return total
+
+    def _profile_storage_bytes(self) -> int:
+        return self._directory_bytes(self.runs_root) + self._directory_bytes(
+            self.root / "typed-mirrors"
+        )
+
+    def _ensure_mirror_capacity(
+        self,
+        mirror_bytes: int,
+        required_bytes: int,
+    ) -> None:
+        runs_bytes = self._directory_bytes(self.runs_root)
+        if runs_bytes + mirror_bytes + required_bytes > self.max_profile_bytes:
+            raise StorageQuotaError(
+                "profile_storage_quota exceeded by typed mirror"
+            )
 
     def _ensure_run_capacity(
         self,
@@ -3162,7 +5793,7 @@ class RunStore:
             raise StorageQuotaError(
                 "run_storage_quota would be exceeded before worker allocation"
             )
-        profile_bytes = self._directory_bytes(self.runs_root)
+        profile_bytes = self._profile_storage_bytes()
         if profile_bytes + required > self.max_profile_bytes:
             raise StorageQuotaError(
                 "profile_storage_quota would be exceeded before worker allocation"
@@ -3185,9 +5816,12 @@ class RunStore:
         ) as reserve_connection:
             rows = reserve_connection.execute(
                 "SELECT attempt_id, terminal_reserve_bytes, "
-                "projection_limit_bytes, consumed_bytes "
-                "FROM attempt_journal_reserves WHERE run_id=?",
-                (run_id,),
+                "projection_limit_bytes, consumed_bytes, 'attempt' AS kind "
+                "FROM attempt_journal_reserves WHERE run_id=? "
+                "UNION ALL SELECT attempt_id, terminal_reserve_bytes, "
+                "projection_limit_bytes, consumed_bytes, 'obligation' AS kind "
+                "FROM obligation_journal_reserves WHERE run_id=?",
+                (run_id, run_id),
             ).fetchall()
         if not rows:
             if journal_bytes + frame_bytes > self.max_journal_bytes:
@@ -3211,7 +5845,10 @@ class RunStore:
                         "terminal_journal_reserve exhausted before durable completion"
                     )
                 remaining -= frame_bytes
-            elif projection_bytes > int(row["projection_limit_bytes"]):
+            elif (
+                row["kind"] == "attempt"
+                and projection_bytes > int(row["projection_limit_bytes"])
+            ):
                 # A concurrently live sibling reserved against the projection as
                 # it stood when that sibling claimed. Ordinary progress -- every
                 # other sibling in the same fan-out completing and appending its
@@ -3281,6 +5918,13 @@ class RunStore:
                 "AND consumed_bytes+?<=terminal_reserve_bytes",
                 (frame_bytes, attempt_id, frame_bytes),
             ).rowcount
+            if updated != 1:
+                updated = reserve_connection.execute(
+                    "UPDATE obligation_journal_reserves "
+                    "SET consumed_bytes=consumed_bytes+? WHERE attempt_id=? "
+                    "AND consumed_bytes+?<=terminal_reserve_bytes",
+                    (frame_bytes, attempt_id, frame_bytes),
+                ).rowcount
         if updated != 1:
             raise StorageQuotaError(
                 "terminal_journal_reserve consumption could not be indexed"
@@ -3627,11 +6271,7 @@ class RunStore:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "nonterminal_capacity")
-            profile_bytes = sum(
-                path.stat().st_size
-                for path in self.runs_root.rglob("*")
-                if path.is_file()
-            )
+            profile_bytes = self._profile_storage_bytes()
             if (
                 profile_bytes + immutable_snapshot.reserved_bytes
                 > self.max_profile_bytes
@@ -3960,6 +6600,25 @@ class RunStore:
             raise JournalRecoveryError(
                 f"unsupported journal frame at line {line_number}"
             )
+        allowed_fields = {
+            "sequence",
+            "timestamp",
+            "run_id",
+            "node_id",
+            "attempt_id",
+            "event_type",
+            "payload",
+            "payload_truncated",
+            "projection",
+            "projection_sha256",
+            "schema_version",
+            "frame_version",
+            "frame_sha256",
+        }
+        if not set(event) <= allowed_fields:
+            raise JournalRecoveryError(
+                f"journal frame fields are invalid at line {line_number}"
+            )
         checksum = event.get("frame_sha256")
         if not isinstance(checksum, str) or len(checksum) != 64:
             raise JournalRecoveryError(
@@ -4025,6 +6684,28 @@ class RunStore:
             _atomic_bytes(journal_path, data + b"\n")
         return events
 
+    @staticmethod
+    def _journal_may_contain_typed_mirror_events(directory: Path) -> bool:
+        """Parse event types cheaply before deciding a full mirror replay is unnecessary."""
+        try:
+            data = (directory / "events.jsonl").read_bytes()
+        except OSError as exc:
+            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        for raw_frame in data.splitlines():
+            if not raw_frame.strip():
+                continue
+            try:
+                event = json.loads(raw_frame.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Full replay owns malformed/torn-frame recovery and taxonomy.
+                return True
+            if isinstance(event, Mapping) and event.get("event_type") in {
+                "typed_mirror_required",
+                "typed_mirror_completed",
+            }:
+                return True
+        return False
+
     def _read_journal_tail_event(self, directory: Path) -> dict[str, object]:
         journal_path = directory / "events.jsonl"
         try:
@@ -4065,6 +6746,29 @@ class RunStore:
     def load_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
+        return self._load_run_projection(
+            run_id,
+            operator_scope=operator_scope,
+            recover_typed_publications=True,
+        )
+
+    def _load_run_metadata(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        """Load checked run metadata without opening typed-publication bodies."""
+        return self._load_run_projection(
+            run_id,
+            operator_scope=operator_scope,
+            recover_typed_publications=False,
+        )
+
+    def _load_run_projection(
+        self,
+        run_id: str,
+        *,
+        operator_scope: str | None,
+        recover_typed_publications: bool,
+    ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         path = directory / "run.json"
         with workflow_lock(self._run_lock_path(run_id)):
@@ -4095,6 +6799,46 @@ class RunStore:
                     )
                     raise
                 if journal_current:
+                    try:
+                        migrated = _validate_typed_publication_metadata(
+                            directory,
+                            projection,
+                            migrate_legacy=recover_typed_publications,
+                        )
+                    except JournalRecoveryError:
+                        self._transition_run_repair(
+                            "typed_publication_integrity",
+                            run_id=run_id,
+                            outcome="repair_required",
+                        )
+                        raise
+                    if not recover_typed_publications:
+                        self._sync_loaded_integrity(
+                            directory,
+                            projection,
+                            migrate_legacy_typed_publications=False,
+                        )
+                        self._transition_run_repair(
+                            "run_evidence_uncorroborated",
+                            run_id=run_id,
+                            outcome="repair_verified",
+                        )
+                        return projection
+                    if migrated:
+                        self._append_locked(
+                            directory,
+                            projection,
+                            "typed_publication_migrated",
+                            {"descriptor_count": migrated},
+                        )
+                    verified_content = self._recover_typed_publications_locked(
+                        directory, projection
+                    )
+                    self._recover_typed_mirrors_locked(
+                        directory,
+                        projection,
+                        verified_content,
+                    )
                     self._sync_loaded_integrity(directory, projection)
                     self._transition_run_repair(
                         "run_evidence_uncorroborated",
@@ -4106,7 +6850,13 @@ class RunStore:
                 quarantine = directory / f"run.json.corrupt-{uuid.uuid4().hex}"
                 _durable_replace(path, quarantine)
             try:
-                rebuilt = self._rebuild_projection(directory, run_id=run_id)
+                rebuilt = self._rebuild_projection(
+                    directory,
+                    run_id=run_id,
+                    migrate_legacy_typed_publications=(
+                        recover_typed_publications
+                    ),
+                )
             except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
                 # Projection replay is confined to this run. Cross-run/index
                 # reconciliation failures are handled by their global callers.
@@ -4116,6 +6866,15 @@ class RunStore:
                     outcome="repair_required",
                 )
                 raise
+            if recover_typed_publications:
+                verified_content = self._recover_typed_publications_locked(
+                    directory, rebuilt
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    rebuilt,
+                    verified_content,
+                )
             scheduled_at = self._scheduled_at_from_projection(rebuilt)
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
@@ -4143,6 +6902,178 @@ class RunStore:
             )
             return rebuilt
 
+    def lookup_publication(
+        self,
+        run_id: str,
+        publication_id: str,
+        *,
+        operator_scope: str | None = None,
+    ) -> VerifiedPublication:
+        """Authorize and verify one checked publication without sweeping siblings."""
+        # Metadata loading performs run/scope authorization before the caller's
+        # opaque ID is examined and never opens typed-publication bodies.
+        try:
+            projection = self._load_run_metadata(
+                run_id,
+                operator_scope=operator_scope,
+            )
+        except ArchonOutputUnavailableError as exc:
+            raise PublicationUnavailableError(
+                "publication metadata is temporarily unavailable"
+            ) from exc
+        except JournalRecoveryError as exc:
+            if "typed_publication_integrity" in (
+                self._active_run_repair_reasons(run_id)
+            ):
+                raise PublicationIntegrityError(
+                    "publication descriptor is not corroborated"
+                ) from exc
+            raise
+        if (
+            not isinstance(publication_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+        ):
+            raise PublicationNotFoundError(publication_id)
+        directory = self.run_directory(
+            run_id,
+            operator_scope=operator_scope,
+        )
+        with workflow_lock(self._run_lock_path(run_id)):
+            try:
+                current = json.loads(
+                    (directory / "run.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise JournalRecoveryError(
+                    "run projection is unavailable during publication lookup"
+                ) from exc
+            if (
+                not self._valid_projection(current, run_id=run_id)
+                or _projection_digest(current) != _projection_digest(projection)
+                or not self._journal_matches_projection(
+                    directory,
+                    projection=current,
+                    run_id=run_id,
+                )
+            ):
+                raise JournalRecoveryError(
+                    "run projection changed during publication lookup"
+                )
+            try:
+                descriptor = self._requested_publication_descriptor(
+                    directory,
+                    current,
+                    publication_id,
+                )
+                content = _read_descriptor_relative(
+                    directory,
+                    (
+                        f"publications/{descriptor.publication_id}/"
+                        f"{descriptor.content_name}"
+                    ),
+                    size_bytes=descriptor.size_bytes,
+                )
+                if (
+                    len(content) != descriptor.size_bytes
+                    or not hmac.compare_digest(
+                        _sha256(content),
+                        descriptor.sha256,
+                    )
+                ):
+                    raise PublicationIntegrityError(
+                        "publication content identity changed"
+                    )
+            except PublicationNotFoundError:
+                raise
+            except ArchonOutputUnavailableError as exc:
+                raise PublicationUnavailableError(
+                    "publication content is temporarily unavailable"
+                ) from exc
+            except (
+                ArchonOutputIntegrityError,
+                JournalRecoveryError,
+                OSError,
+                PublicationIntegrityError,
+            ) as exc:
+                self._transition_run_repair(
+                    "typed_publication_integrity",
+                    run_id=run_id,
+                    outcome="repair_required",
+                )
+                if isinstance(exc, PublicationIntegrityError):
+                    raise
+                raise PublicationIntegrityError(
+                    "publication descriptor or content is not corroborated"
+                ) from exc
+        return VerifiedPublication(
+            publication_id=descriptor.publication_id,
+            content_name=descriptor.content_name,
+            output_type=descriptor.output_type,
+            media_type=descriptor.media_type,
+            size_bytes=descriptor.size_bytes,
+            sha256=descriptor.sha256,
+            node_id=descriptor.node_id,
+            attempt_id=descriptor.attempt_id,
+            schema_fingerprint=descriptor.schema_fingerprint,
+            produced_at=descriptor.produced_at,
+            session_id=descriptor.session_id,
+            content=content,
+        )
+
+    def _requested_publication_descriptor(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        publication_id: str,
+    ) -> _JournaledTypedPublication:
+        artifacts = projection.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise JournalRecoveryError(
+                "typed publication descriptor authority is invalid"
+            )
+        matches = [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, Mapping)
+            and artifact.get("publication_id") == publication_id
+        ]
+        if not matches:
+            raise PublicationNotFoundError(publication_id)
+        declarations = _sealed_typed_output_declarations(
+            directory,
+            projection,
+        )
+        requested_node_ids = {
+            artifact.get("node_id")
+            for artifact in matches
+            if isinstance(artifact.get("node_id"), str)
+        }
+        selected_declarations = {
+            node_id: declarations[node_id]
+            for node_id in requested_node_ids
+            if node_id in declarations
+        }
+        selected_projection = dict(projection)
+        selected_projection["artifacts"] = matches
+        descriptors = _journaled_typed_publications(
+            selected_projection,
+            selected_declarations,
+        )
+        if len(descriptors) != 1:
+            raise JournalRecoveryError(
+                "requested typed publication descriptor is ambiguous"
+            )
+        descriptor = descriptors[0]
+        expected_metadata = self._expected_publication_metadata(descriptor)
+        if not hmac.compare_digest(
+            _sha256(expected_metadata),
+            descriptor.metadata_sha256,
+        ):
+            raise JournalRecoveryError(
+                "requested typed publication metadata is not corroborated"
+            )
+        return descriptor
+
     def _journal_matches_projection(
         self,
         directory: Path,
@@ -4168,8 +7099,15 @@ class RunStore:
             return latest.get("projection_sha256") == _projection_digest(projection)
         return True
 
-    @staticmethod
-    def _valid_projection(value: object, *, run_id: str) -> bool:
+    def _valid_projection(
+        self,
+        value: object,
+        *,
+        run_id: str,
+        private_authorities: Mapping[
+            str, Mapping[str, Mapping[str, object]]
+        ] | None = None,
+    ) -> bool:
         if not isinstance(value, dict) or value.get("run_id") != run_id:
             return False
         if value.get("schema_version") not in {1, 2}:
@@ -4207,6 +7145,65 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
+        next_registry_update_at = value.get("next_registry_update_at")
+        try:
+            pending = _pending_session_registry_payloads(value)
+        except JournalRecoveryError:
+            return False
+        if private_authorities is None:
+            private_authorities = self._read_private_session_authorities(run_id=run_id)
+        if not self._private_session_authorities_match_projection(
+            value,
+            private_authorities=private_authorities,
+        ):
+            return False
+        if not pending:
+            return next_registry_update_at is None
+        retry_counts = []
+        for payload in pending.values():
+            try:
+                candidate, retry_count = _session_registry_candidate_from_payload(
+                    payload
+                )
+            except JournalRecoveryError:
+                return False
+            winning_node = nodes.get(candidate.winning_node_id)
+            if (
+                candidate.winning_run_id != run_id
+                or candidate.key.workflow != value.get("workflow")
+                or candidate.key.node_id != candidate.winning_node_id
+                or candidate.key.scope
+                != str(value.get("operator_scope_digest") or "local")
+                or not isinstance(winning_node, dict)
+                or winning_node.get("state") != "succeeded"
+                or value.get("status")
+                in {"succeeded", "failed", "cancelled", "abandoned"}
+                or not _session_registry_candidate_is_corroborated(value, candidate)
+                or not self._private_session_registry_authority_matches(
+                    value,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
+            ):
+                return False
+            retry_counts.append(retry_count)
+        retrying = [count for count in retry_counts if count > 0]
+        if not retrying:
+            if next_registry_update_at is not None:
+                return False
+        else:
+            if len(retrying) != 1:
+                return False
+            if not isinstance(next_registry_update_at, str):
+                return False
+            try:
+                wake = datetime.fromisoformat(next_registry_update_at)
+            except ValueError:
+                return False
+            if wake.tzinfo is None or wake.utcoffset() is None:
+                return False
+        if value.get("status") == "recovery_pending" and retrying != [5]:
+            return False
         return True
 
     def _rebuild_projection(
@@ -4215,12 +7212,18 @@ class RunStore:
         *,
         run_id: str,
         journal_data: bytes | None = None,
+        migrate_legacy_typed_publications: bool = True,
     ) -> dict[str, object]:
         latest = None
+        latest_migration_count = 0
         expected_sequence = 1
         events = self._read_journal_events(
             directory,
             journal_data=journal_data,
+        )
+        private_authorities = self._read_bound_private_session_authorities(
+            run_id=run_id,
+            events=events,
         )
         for event in events:
             if event.get("sequence") != expected_sequence:
@@ -4232,11 +7235,32 @@ class RunStore:
                 raise JournalRecoveryError("journal run identity mismatch")
             snapshot = event.get("projection")
             checksum = event.get("projection_sha256")
-            if self._valid_projection(snapshot, run_id=run_id):
+            if self._valid_projection(
+                snapshot,
+                run_id=run_id,
+                private_authorities=private_authorities,
+            ):
                 if snapshot["event_sequence"] != expected_sequence:
                     raise JournalRecoveryError("journal projection sequence mismatch")
                 if checksum != _projection_digest(snapshot):
                     raise JournalRecoveryError("journal projection digest mismatch")
+                try:
+                    latest_migration_count = (
+                        _validate_typed_publication_metadata(
+                            directory,
+                            snapshot,
+                            migrate_legacy=(
+                                migrate_legacy_typed_publications
+                            ),
+                        )
+                    )
+                except JournalRecoveryError:
+                    self._transition_run_repair(
+                        "typed_publication_integrity",
+                        run_id=run_id,
+                        outcome="repair_required",
+                    )
+                    raise
                 latest = snapshot
             elif event.get("event_type") == "node_heartbeat" and latest is not None:
                 node = latest["nodes"].get(event.get("node_id"))
@@ -4269,6 +7293,13 @@ class RunStore:
             expected_sequence += 1
         if latest is None:
             raise JournalRecoveryError("journal contains no recoverable projection")
+        if latest_migration_count:
+            self._append_locked(
+                directory,
+                latest,
+                "typed_publication_migrated",
+                {"descriptor_count": latest_migration_count},
+            )
         return latest
 
     def request_runnable(
@@ -4635,6 +7666,164 @@ class RunStore:
         self._notify_coordinator()
         return True
 
+    def _fail_package_validation(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+        error_code: str,
+        error_path: str,
+        error_message: str,
+        schedule_revalidation: object | None = None,
+    ) -> bool:
+        """Atomically fail a claim-free run on authenticated package validation."""
+        if (
+            isinstance(expected_state_version, bool)
+            or not isinstance(expected_state_version, int)
+            or expected_state_version < 1
+        ):
+            raise ValueError("expected_state_version must be a positive integer")
+        bounded = (
+            ("error_code", error_code, 128),
+            ("error_path", error_path, 1_024),
+            ("error_message", error_message, 2_000),
+        )
+        if any(
+            not isinstance(value, str) or not value or len(value) > maximum
+            for _name, value, maximum in bounded
+        ):
+            raise ValueError("package validation diagnostics must be bounded text")
+        safe_message = _sanitize_diagnostic(error_message)
+        if safe_message is None:
+            raise ValueError("package validation message must be bounded text")
+
+        directory = self.run_directory(run_id)
+        changed = False
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                scheduled_at = self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                status = projection.get("status")
+                if (
+                    row["status"] != status
+                    or status not in {"queued", "running"}
+                    or int(projection.get("state_version", -1))
+                    != expected_state_version
+                    or projection.get("desired_status") is not None
+                ):
+                    connection.rollback()
+                    return False
+                metadata = projection.get("run_metadata")
+                if schedule_revalidation is not None:
+                    if (
+                        scheduled_at is None
+                        or status != "queued"
+                        or not isinstance(metadata, Mapping)
+                        or not isinstance(metadata.get("execution_identity"), str)
+                    ):
+                        raise RuntimeError(
+                            "scheduled package failure requires server admission evidence"
+                        )
+                elif scheduled_at is not None:
+                    connection.rollback()
+                    return False
+
+                nodes = projection.get("nodes")
+                if not isinstance(nodes, Mapping):
+                    raise RuntimeError("workflow run nodes are missing")
+                projected_claim = any(
+                    not isinstance(node, Mapping)
+                    or isinstance(node.get("claim"), Mapping)
+                    or node.get("state") in {"claimed", "running"}
+                    for node in nodes.values()
+                )
+                indexed_claim = connection.execute(
+                    "SELECT 1 FROM worker_claims WHERE run_id=? LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if projected_claim or indexed_claim is not None:
+                    connection.rollback()
+                    return False
+
+                if schedule_revalidation is not None:
+                    from plugins.workflow.scheduled_revalidation import (
+                        ScheduledRunRevalidationError,
+                    )
+
+                    try:
+                        self._consume_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                            projection,
+                        )
+                    except ScheduledRunRevalidationError:
+                        self._fail_scheduled_revalidation_locked(
+                            connection,
+                            directory,
+                            projection,
+                        )
+                        connection.commit()
+                        changed = True
+                if not changed:
+                    projection["status"] = "failed"
+                    projection["queue_position"] = None
+                    projection["queue_sequence"] = None
+                    projection["blocked_by_run_id"] = None
+                    projection["last_error"] = {
+                        "code": error_code,
+                        "path": error_path,
+                        "message": safe_message,
+                    }
+                    for node in nodes.values():
+                        if node["state"] not in {"succeeded", "failed", "skipped"}:
+                            node["state"] = "cancelled"
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "run_failed",
+                        {
+                            "reason_code": "package_validation_failed",
+                            "validation_code": error_code,
+                            "validation_path": error_path,
+                        },
+                        defer_notification=True,
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="run_failed",
+                    )
+                    connection.commit()
+                    changed = True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        if changed:
+            self._notify_coordinator()
+        return changed
+
     def try_promote_run(
         self,
         run_id: str,
@@ -4943,16 +8132,32 @@ class RunStore:
             ).fetchall()
         for row in rows:
             if row["status"] == "queued":
-                projection = self.load_run(str(row["run_id"]))
+                projection = self._load_run_metadata(str(row["run_id"]))
                 self._scheduled_at_from_projection(
                     projection,
                     indexed=row["scheduled_at"],
                 )
-        page = rows[:limit]
+        raw_page = rows[:limit]
+        page = []
+        for row in raw_page:
+            if row["status"] == "running":
+                projection = self._load_run_metadata(str(row["run_id"]))
+                recovery_due_at = projection.get("next_registry_update_at")
+                if isinstance(recovery_due_at, str):
+                    try:
+                        if datetime.fromisoformat(recovery_due_at) > now:
+                            continue
+                    except ValueError:
+                        # Full projection validation owns malformed durable data.
+                        self.load_run(str(row["run_id"]))
+                        raise JournalRecoveryError(
+                            "session registry obligation wake is invalid"
+                        )
+            page.append(row)
         exhausted = len(rows) <= limit
         cursor = (
-            (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
-            if page
+            (str(raw_page[-1]["created_at"]), str(raw_page[-1]["run_id"]))
+            if raw_page
             else after
         )
         return tuple(dict(row) for row in page), cursor, exhausted
@@ -5109,6 +8314,42 @@ class RunStore:
             )
         return observed, fence
 
+    def _verified_public_journal_events_locked(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes | None = None,
+        recover_torn_tail: bool = True,
+    ) -> tuple[dict[str, object], ...]:
+        """Return one chain-verified, value-free journal view under the run lock."""
+        events = self._read_journal_events(
+            directory,
+            journal_data=journal_data,
+            recover_torn_tail=recover_torn_tail,
+        )
+        positioned_events = _trusted_journal_positions(events)
+        private_authorities = self._read_private_session_authorities(run_id=run_id)
+        bound_private_authorities = self._bind_private_session_authorities_to_events(
+            private_authorities,
+            events,
+            run_id=run_id,
+        )
+        self._validate_recovery_completion_event_authority(
+            events,
+            run_id=run_id,
+            private_authorities=bound_private_authorities,
+        )
+        return tuple(
+            _redact_private_session_authority(
+                event,
+                private_authorities=private_authorities,
+                trusted_run_id=run_id,
+                trusted_event_sequence=position,
+            )
+            for position, event in positioned_events
+        )
+
     def tail_events(
         self,
         run_id: str,
@@ -5121,13 +8362,15 @@ class RunStore:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            events = self._read_journal_events(directory)
+            events = self._verified_public_journal_events_locked(
+                directory,
+                run_id=run_id,
+            )
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
         public_events = []
         for event in selected:
-            event = dict(event)
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(_sanitize(event))
@@ -5181,16 +8424,24 @@ class RunStore:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            all_events = self._read_journal_events(directory)
-            selected = all_events[-limit:]
+            all_events = self._verified_public_journal_events_locked(
+                directory,
+                run_id=run_id,
+            )
+            selected_start = max(0, len(all_events) - limit)
+            selected = all_events[selected_start:]
         truncated = (
             len(all_events) > limit
-            or projection_was_truncated(selected)
-            or any(bool(event.get("payload_truncated")) for event in selected)
+            or projection_was_truncated(
+                tuple(selected)
+            )
+            or any(
+                bool(event.get("payload_truncated"))
+                for event in selected
+            )
         )
         public_events = []
         for event in selected:
-            event = dict(event)
             event.pop("projection", None)
             event.pop("projection_sha256", None)
             public_events.append(sanitize_projection(event))
@@ -5298,6 +8549,7 @@ class RunStore:
                     run_id,
                     operator_scope=operator_scope,
                     now=observed_at,
+                    _metadata_only=True,
                 )
             except (
                 JournalRecoveryError,
@@ -5363,7 +8615,7 @@ class RunStore:
         ]
         values: list[object] = [observed_at.isoformat()]
         attention_states = [
-            "runs.status IN ('failed','paused')",
+            "runs.status IN ('failed','paused','recovery_pending')",
             "(runs.status='running' AND ("
             "(runs.execution_mode='foreground' AND "
             "(runs.foreground_lease_expires_at IS NULL OR "
@@ -6092,8 +9344,18 @@ class RunStore:
         *,
         operator_scope: str | None = None,
         now: datetime | None = None,
+        _metadata_only: bool = False,
     ) -> dict[str, object]:
-        run = self.load_run(run_id, operator_scope=operator_scope)
+        run = (
+            self._load_run_metadata(run_id, operator_scope=operator_scope)
+            if _metadata_only
+            else self.load_run(run_id, operator_scope=operator_scope)
+        )
+        run = _redact_private_session_authority(
+            run,
+            private_authorities=self._read_private_session_authorities(run_id=run_id),
+            trusted_run_id=run_id,
+        )
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
@@ -6199,8 +9461,10 @@ class RunStore:
         blocking_reason = None
         if status in {"succeeded", "failed", "cancelled", "abandoned"}:
             health = "terminal"
-        elif status == "paused":
+        elif status in {"paused", "recovery_pending"}:
             health = "user_wait"
+            if status == "recovery_pending":
+                blocking_reason = "persistent_session_registry_update_pending"
         elif status == "interrupted":
             health = "interrupted"
         elif status == "queued":
@@ -6413,6 +9677,7 @@ class RunStore:
         now: datetime | None = None,
         monotonic_now: float | None = None,
         journal_reserve_bytes: int = 0,
+        terminal_journal_reserve_bytes: int = 0,
         executor_id: str = "unknown",
         owner_epoch: str | None = None,
         effect_classification: str = "replay_safe",
@@ -6445,6 +9710,14 @@ class RunStore:
             or max_run_workers <= 0
         ):
             raise ValueError("max_run_workers must be a positive integer")
+        if (
+            isinstance(terminal_journal_reserve_bytes, bool)
+            or not isinstance(terminal_journal_reserve_bytes, int)
+            or terminal_journal_reserve_bytes < 0
+        ):
+            raise ValueError(
+                "terminal_journal_reserve_bytes must be a non-negative integer"
+            )
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -6615,7 +9888,8 @@ class RunStore:
                         (
                             attempt_id,
                             run_id,
-                            reserve.terminal_reserve_bytes,
+                            reserve.terminal_reserve_bytes
+                            + terminal_journal_reserve_bytes,
                             reserve.projection_limit_bytes,
                             _utc_now(),
                         ),
@@ -6658,6 +9932,50 @@ class RunStore:
             connection.execute(
                 "DELETE FROM worker_claims WHERE attempt_id=?", (attempt_id,)
             )
+
+    def _transfer_obligation_journal_reserve(
+        self,
+        attempt_id: str,
+        run_id: str,
+        *,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Retain pre-provider capacity after the worker claim is released."""
+        row = connection.execute(
+            "SELECT terminal_reserve_bytes, projection_limit_bytes, "
+            "consumed_bytes FROM attempt_journal_reserves WHERE attempt_id=? "
+            "AND run_id=?",
+            (attempt_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise StorageQuotaError(
+                "persistent session obligation journal reserve is missing"
+            )
+        remaining = int(row["terminal_reserve_bytes"]) - int(
+            row["consumed_bytes"]
+        )
+        if remaining <= 0:
+            raise StorageQuotaError(
+                "persistent session obligation journal reserve is exhausted"
+            )
+        connection.execute(
+            "INSERT INTO obligation_journal_reserves ("
+            "attempt_id, run_id, terminal_reserve_bytes, "
+            "projection_limit_bytes, consumed_bytes, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?) "
+            "ON CONFLICT(attempt_id) DO UPDATE SET "
+            "run_id=excluded.run_id, "
+            "terminal_reserve_bytes=excluded.terminal_reserve_bytes, "
+            "projection_limit_bytes=excluded.projection_limit_bytes, "
+            "consumed_bytes=0",
+            (
+                attempt_id,
+                run_id,
+                remaining,
+                int(row["projection_limit_bytes"]),
+                _utc_now(),
+            ),
+        )
 
     def release_claim_before_execution(self, claim: NodeClaim) -> bool:
         """Durably make a fenced claim retryable only when no executor ran."""
@@ -6734,6 +10052,192 @@ class RunStore:
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
             )
+
+    def record_persistent_session_recovery_selection(
+        self,
+        claim: NodeClaim,
+        selection: PersistentSessionRecoverySelection,
+        *,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Journal a bounded active-claim recovery choice before provider use."""
+        if (
+            selection.run_id != claim.run_id
+            or selection.attempt_id != claim.attempt_id
+            or selection.key.node_id != claim.node_id
+        ):
+            raise ValueError("persistent session recovery selection is misbound")
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if (
+                    projection.get("status") != "running"
+                    or active.get("attempt_id") != claim.attempt_id
+                    or selection.key.workflow != projection.get("workflow")
+                    or selection.key.scope
+                    != str(projection.get("operator_scope_digest") or "local")
+                ):
+                    return False
+                recoveries = node.setdefault("session_recoveries", [])
+                if not isinstance(recoveries, list) or len(recoveries) > 6:
+                    raise JournalRecoveryError(
+                        "persistent session recovery projection is malformed"
+                    )
+                existing = next(
+                    (
+                        item
+                        for item in recoveries
+                        if isinstance(item, Mapping)
+                        and item.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if existing is None and len(recoveries) == 6:
+                    raise StorageQuotaError(
+                        "persistent session recovery evidence is full"
+                    )
+                selection_authority = _session_recovery_selection_authority(
+                    selection,
+                    activation_event_sequence=int(projection["event_sequence"]) + 1,
+                    activation_event_type=(
+                        "persistent_session_missing_fresh_start"
+                    ),
+                    activation_predecessor_chain_sha256=(
+                        self._journal_predecessor_chain_locked(
+                            directory,
+                            run_id=claim.run_id,
+                            expected_predecessor_sequence=int(
+                                projection["event_sequence"]
+                            ),
+                        )
+                    ),
+                )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as authority_connection:
+                    if fence_connection is None:
+                        authority_connection.execute("BEGIN IMMEDIATE")
+                    self._write_private_authority(
+                        authority_connection,
+                        table="session_recovery_selection_authority",
+                        run_id=claim.run_id,
+                        attempt_id=claim.attempt_id,
+                        authority=selection_authority,
+                    )
+                    if fence_connection is None:
+                        authority_connection.commit()
+                self._commit_fenced_private_authority(
+                    fence_connection,
+                    claim.execution_fence,
+                    now,
+                )
+                if existing is not None:
+                    return existing.get("outcome") == "fresh_start_selected"
+                public_selection = {
+                    "attempt_id": claim.attempt_id,
+                    "registry_generation": selection.expected_generation,
+                    "missing_session_sha256": _sha256(
+                        selection.missing_session_id.encode("utf-8")
+                    ),
+                    "cache_fingerprint_sha256": _sha256(
+                        selection.cache_fingerprint.encode("utf-8")
+                    ),
+                    "source": selection.source,
+                    "provider": selection.key.provider,
+                    "runtime_profile": selection.key.profile,
+                    "provider_attempts_before_recovery": 0,
+                    "outcome": "fresh_start_selected",
+                }
+                recoveries.append(public_selection)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "persistent_session_missing_fresh_start",
+                    public_selection,
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_persistent_session_recovery_outcome(
+        self,
+        claim: NodeClaim,
+        *,
+        outcome: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Journal a bounded recovery result while the winning claim is active."""
+        if outcome != "fresh_execution_failed":
+            raise ValueError("invalid active persistent session recovery outcome")
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if (
+                    projection.get("status") != "running"
+                    or active.get("attempt_id") != claim.attempt_id
+                ):
+                    return False
+                recoveries = node.get("session_recoveries")
+                if not isinstance(recoveries, list):
+                    raise JournalRecoveryError(
+                        "persistent session recovery evidence is missing"
+                    )
+                matches = [
+                    item
+                    for item in recoveries
+                    if isinstance(item, dict)
+                    and item.get("attempt_id") == claim.attempt_id
+                ]
+                if len(matches) != 1:
+                    raise JournalRecoveryError(
+                        "persistent session recovery evidence is uncorroborated"
+                    )
+                if matches[0].get("outcome") == outcome:
+                    return True
+                if matches[0].get("outcome") != "fresh_start_selected":
+                    raise JournalRecoveryError(
+                        "persistent session recovery outcome conflicts"
+                    )
+                matches[0]["outcome"] = outcome
+                self._append_locked(
+                    directory,
+                    projection,
+                    "persistent_session_recovery_outcome",
+                    {"outcome": outcome},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     @staticmethod
     def _executor_nonce(value: str) -> str:
@@ -7015,6 +10519,292 @@ class RunStore:
                 return False
             raise
 
+    def record_provider_dispatch(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Authorize one registered worker to cross the provider boundary."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                existing = attempt.get("provider_dispatch")
+                if isinstance(existing, Mapping):
+                    return (
+                        existing.get("executor_nonce") == nonce
+                        and existing.get("state")
+                        in {
+                            "authorized",
+                            "delivered",
+                            "execute_received",
+                            "released",
+                        }
+                    )
+                spawn = attempt.get("spawn")
+                if (
+                    not isinstance(spawn, Mapping)
+                    or spawn.get("executor_nonce") != nonce
+                    or spawn.get("state") != "started"
+                    or not isinstance(attempt.get("process_identity"), Mapping)
+                ):
+                    return False
+                dispatch = {
+                    "state": "authorized",
+                    "executor_nonce": nonce,
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = dispatch
+                active["provider_dispatch"] = dict(dispatch)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_dispatch_authorized",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_provider_start_delivered(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Record the child's provider-start receipt before execution release."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                dispatch = attempt.get("provider_dispatch")
+                if not isinstance(dispatch, Mapping) or dispatch.get(
+                    "executor_nonce"
+                ) != nonce:
+                    return False
+                if dispatch.get("state") in {
+                    "delivered",
+                    "execute_received",
+                    "released",
+                }:
+                    return True
+                if dispatch.get("state") != "authorized":
+                    return False
+                delivered = {
+                    "state": "delivered",
+                    "executor_nonce": nonce,
+                    "authorized_at": dispatch.get("recorded_at"),
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = delivered
+                active["provider_dispatch"] = dict(delivered)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_start_delivered",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_provider_execute_received(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Record execute intent receipt while the child remains blocked."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                dispatch = attempt.get("provider_dispatch")
+                if not isinstance(dispatch, Mapping) or dispatch.get(
+                    "executor_nonce"
+                ) != nonce:
+                    return False
+                if dispatch.get("state") in {"execute_received", "released"}:
+                    return True
+                if dispatch.get("state") != "delivered":
+                    return False
+                received = {
+                    "state": "execute_received",
+                    "executor_nonce": nonce,
+                    "authorized_at": dispatch.get("authorized_at"),
+                    "start_received_at": dispatch.get("recorded_at"),
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = received
+                active["provider_dispatch"] = dict(received)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_execute_received",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_provider_execute_released(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Atomically linearize provider execution release against cancellation."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                if (
+                    projection.get("status") != "running"
+                    or projection.get("desired_status") is not None
+                ):
+                    return False
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                dispatch = attempt.get("provider_dispatch")
+                if not isinstance(dispatch, Mapping) or dispatch.get(
+                    "executor_nonce"
+                ) != nonce:
+                    return False
+                if dispatch.get("state") == "released":
+                    return True
+                if dispatch.get("state") != "execute_received":
+                    return False
+                released = {
+                    **dict(dispatch),
+                    "state": "released",
+                    "recorded_at": _utc_now(),
+                }
+                attempt["provider_dispatch"] = released
+                active["provider_dispatch"] = dict(released)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "provider_execute_released",
+                    {"executor_nonce": nonce},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
     @contextmanager
     def _terminal_completion_guard(self, claim: NodeClaim):
         try:
@@ -7052,15 +10842,984 @@ class RunStore:
                 )
             raise
 
+    def _publish_typed_bundle_locked(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        artifact: ArtifactRef,
+        candidate: TypedPublicationCandidate,
+    ) -> TypedPublicationRef:
+        if (
+            not isinstance(candidate.media_type, str)
+            or candidate.media_type
+            not in {
+                _TYPED_PUBLICATION_JSON_MEDIA_TYPE,
+                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+            }
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication media type is invalid"
+            )
+        if (
+            not isinstance(candidate.attempt_relative_path, str)
+            or not candidate.attempt_relative_path
+            or not isinstance(candidate.output_type, str)
+            or not candidate.output_type.strip()
+            or len(candidate.output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+            or isinstance(candidate.size_bytes, bool)
+            or not isinstance(candidate.size_bytes, int)
+            or not 0 <= candidate.size_bytes <= 500_000
+            or not isinstance(candidate.sha256, str)
+            or _SHA256_PATTERN.fullmatch(candidate.sha256) is None
+            or (
+                candidate.schema_fingerprint is not None
+                and (
+                    not isinstance(candidate.schema_fingerprint, str)
+                    or _SHA256_PATTERN.fullmatch(candidate.schema_fingerprint) is None
+                )
+            )
+            or isinstance(candidate.canonicalization_version, bool)
+            or candidate.canonicalization_version != 1
+            or (
+                candidate.session_id is not None
+                and (
+                    not isinstance(candidate.session_id, str)
+                    or len(candidate.session_id)
+                    > DURABLE_METADATA_STRING_MAX_CHARS
+                )
+            )
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication candidate is invalid"
+            )
+        relative = PurePosixPath(candidate.attempt_relative_path)
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+        }
+        node_state = projection.get("nodes", {}).get(node_id, {})
+        loop_state = (
+            node_state.get("loop_state")
+            if isinstance(node_state, Mapping)
+            else None
+        )
+        iteration = (
+            loop_state.get("iteration")
+            if isinstance(loop_state, Mapping)
+            else None
+        )
+        if isinstance(iteration, int) and not isinstance(iteration, bool):
+            nested_attempt = f"{attempt_id}/iteration-{iteration:04d}"
+            owned_prefixes.add((
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", nested_attempt),
+            ))
+        if len(relative.parts) <= 3 or relative.parts[:3] not in owned_prefixes:
+            raise ArchonOutputIntegrityError(
+                "typed publication content is not owned by the active attempt"
+            )
+        language = projection.get("language")
+        language_profile = (
+            language.get("effective_profile")
+            if isinstance(language, Mapping)
+            else None
+        )
+        if language_profile != "archon-2026-07":
+            raise ArchonOutputIntegrityError(
+                "typed publication requires the Archon language profile"
+            )
+        if (
+            artifact.relative_path != candidate.attempt_relative_path
+            or artifact.media_type != candidate.media_type
+            or artifact.size_bytes != candidate.size_bytes
+            or artifact.sha256 != candidate.sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication candidate does not match one executor artifact"
+            )
+        try:
+            content = _read_descriptor_relative(
+                directory,
+                candidate.attempt_relative_path,
+                size_bytes=candidate.size_bytes,
+            )
+        except ArchonOutputUnavailableError as exc:
+            raise ArchonOutputIntegrityError(
+                "typed publication content is unavailable"
+            ) from exc
+        if (
+            len(content) != candidate.size_bytes
+            or _sha256(content) != candidate.sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication content digest does not match"
+            )
+        if candidate.media_type == _TYPED_PUBLICATION_TEXT_MEDIA_TYPE:
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ArchonOutputIntegrityError(
+                    "typed publication Markdown content is not valid UTF-8"
+                ) from exc
+
+        publication_id = uuid.uuid4().hex
+        content_name = (
+            "content.json"
+            if candidate.media_type == _TYPED_PUBLICATION_JSON_MEDIA_TYPE
+            else "content.md"
+        )
+        produced_at = _utc_now()
+        metadata_bytes = _typed_publication_metadata_bytes(
+            publication_id=publication_id,
+            content_name=content_name,
+            output_type=candidate.output_type,
+            media_type=candidate.media_type,
+            sha256=candidate.sha256,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            run_id=run_id,
+            schema_fingerprint=candidate.schema_fingerprint,
+            size_bytes=candidate.size_bytes,
+            produced_at=produced_at,
+            session_id=candidate.session_id,
+            canonicalization_version=candidate.canonicalization_version,
+        )
+        if len(metadata_bytes) > _TYPED_PUBLICATION_METADATA_MAX_BYTES:
+            raise ArchonOutputIntegrityError(
+                "typed publication metadata exceeds its byte ceiling"
+            )
+
+        self._ensure_free_disk()
+        required_bytes = len(content) + len(metadata_bytes)
+        if self._directory_bytes(directory) + required_bytes > self.max_run_bytes:
+            raise StorageQuotaError("run_storage_quota exceeded by typed publication")
+        if self._profile_storage_bytes() + required_bytes > self.max_profile_bytes:
+            raise StorageQuotaError("profile_storage_quota exceeded by typed publication")
+
+        _require_secure_publication_io()
+        run_descriptor: int | None = None
+        publications_descriptor: int | None = None
+        staging_descriptor: int | None = None
+        staging_name = f".staging-{uuid.uuid4().hex}"
+        file_names = (content_name, "metadata.json")
+        staging_created = False
+        committed = False
+        try:
+            run_descriptor = os.open(directory, _publication_directory_flags())
+            run_identity = _publication_directory_identity(run_descriptor)
+            publications_created = False
+            try:
+                os.mkdir(
+                    "publications",
+                    mode=0o700,
+                    dir_fd=run_descriptor,
+                )
+                publications_created = True
+            except FileExistsError:
+                pass
+            try:
+                publications_descriptor = os.open(
+                    "publications",
+                    _publication_directory_flags(),
+                    dir_fd=run_descriptor,
+                )
+            except OSError as exc:
+                raise ArchonOutputIntegrityError(
+                    "typed publication directory is unsafe"
+                ) from exc
+            publications_identity = _publication_directory_identity(
+                publications_descriptor
+            )
+            if publications_identity[0] != run_identity[0]:
+                raise ArchonOutputIntegrityError(
+                    "typed publication directory is not on the run filesystem"
+                )
+            if publications_created:
+                os.fchmod(publications_descriptor, 0o700)
+                _fsync_publication_directory(
+                    run_descriptor,
+                    boundary="run root",
+                )
+
+            os.mkdir(
+                staging_name,
+                mode=0o700,
+                dir_fd=publications_descriptor,
+            )
+            staging_created = True
+            staging_descriptor = os.open(
+                staging_name,
+                _publication_directory_flags(),
+                dir_fd=publications_descriptor,
+            )
+            os.fchmod(staging_descriptor, 0o700)
+            for name, data in (
+                (content_name, content),
+                ("metadata.json", metadata_bytes),
+            ):
+                _write_publication_file(staging_descriptor, name, data)
+            _fsync_publication_directory(
+                staging_descriptor,
+                boundary="staging",
+            )
+            _commit_publication_directory_noreplace(
+                run_descriptor,
+                publications_descriptor,
+                staging_name,
+                publication_id,
+                publications_identity,
+            )
+            committed = True
+            _fsync_publication_directory(
+                publications_descriptor,
+                boundary="publication parent",
+            )
+        except BaseException:
+            if (
+                staging_created
+                and not committed
+                and publications_descriptor is not None
+            ):
+                _cleanup_publication_staging(
+                    publications_descriptor,
+                    staging_descriptor,
+                    staging_name,
+                    file_names,
+                )
+                staging_descriptor = None
+            raise
+        finally:
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if publications_descriptor is not None:
+                os.close(publications_descriptor)
+            if run_descriptor is not None:
+                os.close(run_descriptor)
+        return TypedPublicationRef(
+            publication_id=publication_id,
+            content_name=content_name,
+            output_type=candidate.output_type,
+            media_type=candidate.media_type,
+            size_bytes=candidate.size_bytes,
+            sha256=candidate.sha256,
+            metadata_sha256=_sha256(metadata_bytes),
+            schema_fingerprint=candidate.schema_fingerprint,
+            canonicalization_version=candidate.canonicalization_version,
+            produced_at=produced_at,
+            session_id=candidate.session_id,
+        )
+
+    def _commit_recovered_publication_bundle(
+        self,
+        directory: Path,
+        descriptor: _JournaledTypedPublication,
+        content: bytes,
+        metadata_bytes: bytes,
+    ) -> None:
+        self._ensure_free_disk()
+        required_bytes = len(content) + len(metadata_bytes)
+        if self._directory_bytes(directory) + required_bytes > self.max_run_bytes:
+            raise StorageQuotaError(
+                "run_storage_quota exceeded during typed publication recovery"
+            )
+        if self._profile_storage_bytes() + required_bytes > self.max_profile_bytes:
+            raise StorageQuotaError(
+                "profile_storage_quota exceeded during typed publication recovery"
+            )
+        _require_secure_publication_io()
+        run_descriptor: int | None = None
+        publications_descriptor: int | None = None
+        staging_descriptor: int | None = None
+        staging_name = f".staging-{uuid.uuid4().hex}"
+        file_names = (descriptor.content_name, "metadata.json")
+        staging_created = False
+        committed = False
+        try:
+            run_descriptor = os.open(directory, _publication_directory_flags())
+            run_identity = _publication_directory_identity(run_descriptor)
+            try:
+                os.mkdir("publications", mode=0o700, dir_fd=run_descriptor)
+                _fsync_publication_directory(run_descriptor, boundary="run root")
+            except FileExistsError:
+                pass
+            publications_descriptor = os.open(
+                "publications",
+                _publication_directory_flags(),
+                dir_fd=run_descriptor,
+            )
+            publications_identity = _publication_directory_identity(
+                publications_descriptor
+            )
+            if publications_identity[0] != run_identity[0]:
+                raise JournalRecoveryError(
+                    "typed publication directory is not on the run filesystem"
+                )
+            os.mkdir(staging_name, mode=0o700, dir_fd=publications_descriptor)
+            staging_created = True
+            staging_descriptor = os.open(
+                staging_name,
+                _publication_directory_flags(),
+                dir_fd=publications_descriptor,
+            )
+            os.fchmod(staging_descriptor, 0o700)
+            _write_publication_file(staging_descriptor, descriptor.content_name, content)
+            _write_publication_file(staging_descriptor, "metadata.json", metadata_bytes)
+            _fsync_publication_directory(staging_descriptor, boundary="staging")
+            _commit_publication_directory_noreplace(
+                run_descriptor,
+                publications_descriptor,
+                staging_name,
+                descriptor.publication_id,
+                publications_identity,
+            )
+            committed = True
+            _fsync_publication_directory(
+                publications_descriptor,
+                boundary="publication parent",
+            )
+        except BaseException:
+            if staging_created and not committed and publications_descriptor is not None:
+                _cleanup_publication_staging(
+                    publications_descriptor,
+                    staging_descriptor,
+                    staging_name,
+                    file_names,
+                )
+                staging_descriptor = None
+            raise
+        finally:
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if publications_descriptor is not None:
+                os.close(publications_descriptor)
+            if run_descriptor is not None:
+                os.close(run_descriptor)
+
+    @staticmethod
+    def _expected_publication_metadata(
+        descriptor: _JournaledTypedPublication,
+    ) -> bytes:
+        return _typed_publication_metadata_bytes(
+            publication_id=descriptor.publication_id,
+            content_name=descriptor.content_name,
+            output_type=descriptor.output_type,
+            media_type=descriptor.media_type,
+            sha256=descriptor.sha256,
+            node_id=descriptor.node_id,
+            attempt_id=descriptor.attempt_id,
+            run_id=descriptor.run_id,
+            schema_fingerprint=descriptor.schema_fingerprint,
+            size_bytes=descriptor.size_bytes,
+            produced_at=descriptor.produced_at,
+            session_id=descriptor.session_id,
+            canonicalization_version=descriptor.canonicalization_version,
+        )
+
+    def _verified_publication_content(
+        self,
+        directory: Path,
+        descriptor: _JournaledTypedPublication,
+    ) -> bytes | None:
+        bundle = directory / "publications" / descriptor.publication_id
+        try:
+            observed = bundle.lstat()
+        except FileNotFoundError:
+            return None
+        reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            reparse_marker
+            and getattr(observed, "st_file_attributes", 0) & reparse_marker
+        ):
+            raise JournalRecoveryError(
+                "typed publication integrity: bundle is a reparse point"
+            )
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+        ):
+            return None
+        try:
+            names = {entry.name for entry in os.scandir(bundle)}
+        except OSError:
+            return None
+        if names != {descriptor.content_name, "metadata.json"}:
+            return None
+        metadata_path = bundle / "metadata.json"
+        try:
+            metadata_size = metadata_path.lstat().st_size
+            if metadata_size > _TYPED_PUBLICATION_METADATA_MAX_BYTES:
+                return None
+            content = _read_descriptor_relative(
+                directory,
+                f"publications/{descriptor.publication_id}/{descriptor.content_name}",
+                size_bytes=descriptor.size_bytes,
+            )
+            metadata = _read_descriptor_relative(
+                directory,
+                f"publications/{descriptor.publication_id}/metadata.json",
+                size_bytes=metadata_size,
+            )
+        except (ArchonOutputIntegrityError, ArchonOutputUnavailableError, OSError):
+            return None
+        expected_metadata = self._expected_publication_metadata(descriptor)
+        if (
+            len(content) != descriptor.size_bytes
+            or not hmac.compare_digest(_sha256(content), descriptor.sha256)
+            or not hmac.compare_digest(metadata, expected_metadata)
+            or not hmac.compare_digest(_sha256(metadata), descriptor.metadata_sha256)
+        ):
+            return None
+        return content
+
+    def _recover_typed_publications_locked(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+    ) -> dict[str, bytes]:
+        run_id = str(projection["run_id"])
+        run_descriptor: int | None = None
+        publications_descriptor: int | None = None
+        try:
+            declared_outputs = _sealed_typed_output_declarations(
+                directory,
+                projection,
+            )
+            descriptors = _journaled_typed_publications(
+                projection,
+                declared_outputs,
+            )
+            expected = {descriptor.publication_id: descriptor for descriptor in descriptors}
+            publications = directory / "publications"
+            if not descriptors:
+                try:
+                    publications.lstat()
+                except FileNotFoundError:
+                    self._transition_run_repair(
+                        "typed_publication_integrity",
+                        run_id=run_id,
+                        outcome="repair_verified",
+                    )
+                    return {}
+            _require_secure_publication_io()
+            run_descriptor = os.open(directory, _publication_directory_flags())
+            run_identity = _publication_directory_identity(run_descriptor)
+            try:
+                publications_descriptor = os.open(
+                    "publications",
+                    _publication_directory_flags(),
+                    dir_fd=run_descriptor,
+                )
+            except FileNotFoundError:
+                publications_descriptor = None
+            except OSError as exc:
+                raise JournalRecoveryError(
+                    "typed publication integrity: publication root is unsafe"
+                ) from exc
+            if publications_descriptor is not None:
+                publications_identity = _publication_directory_identity(
+                    publications_descriptor
+                )
+                observed = publications.lstat()
+                reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_ISLNK(observed.st_mode)
+                    or (
+                        reparse_marker
+                        and getattr(observed, "st_file_attributes", 0)
+                        & reparse_marker
+                    )
+                    or (observed.st_dev, observed.st_ino)
+                    != publications_identity
+                    or publications_identity[0] != run_identity[0]
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: publication root is unsafe"
+                    )
+                _verify_publication_directory_identity(
+                    run_descriptor,
+                    publications_descriptor,
+                    publications_identity,
+                )
+                for name in tuple(os.listdir(publications_descriptor)):
+                    if (
+                        name.startswith(".staging-")
+                        or name.startswith(".discard-")
+                        or name not in expected
+                    ):
+                        _discard_publication_entry_at(
+                            publications_descriptor,
+                            name,
+                        )
+            verified: dict[str, bytes] = {}
+            for descriptor in descriptors:
+                content = self._verified_publication_content(directory, descriptor)
+                if content is not None:
+                    verified[descriptor.publication_id] = content
+                    continue
+                if publications_descriptor is not None:
+                    _discard_publication_entry_at(
+                        publications_descriptor,
+                        descriptor.publication_id,
+                    )
+                try:
+                    source_observed = (directory / descriptor.relative_path).lstat()
+                    reparse_marker = getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+                    )
+                    if (
+                        not stat.S_ISREG(source_observed.st_mode)
+                        or stat.S_ISLNK(source_observed.st_mode)
+                        or (
+                            reparse_marker
+                            and getattr(source_observed, "st_file_attributes", 0)
+                            & reparse_marker
+                        )
+                    ):
+                        raise ArchonOutputUnavailableError(
+                            "winning attempt source is not a regular file"
+                        )
+                    content = _read_descriptor_relative(
+                        directory,
+                        descriptor.relative_path,
+                        size_bytes=descriptor.size_bytes,
+                    )
+                except (
+                    ArchonOutputIntegrityError,
+                    ArchonOutputUnavailableError,
+                    OSError,
+                ) as exc:
+                    raise JournalRecoveryError(
+                        "typed publication integrity: winning attempt is unavailable"
+                    ) from exc
+                if (
+                    len(content) != descriptor.size_bytes
+                    or not hmac.compare_digest(_sha256(content), descriptor.sha256)
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: winning attempt digest mismatch"
+                    )
+                metadata_bytes = self._expected_publication_metadata(descriptor)
+                if not hmac.compare_digest(
+                    _sha256(metadata_bytes), descriptor.metadata_sha256
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: metadata descriptor mismatch"
+                    )
+                self._commit_recovered_publication_bundle(
+                    directory,
+                    descriptor,
+                    content,
+                    metadata_bytes,
+                )
+                verified[descriptor.publication_id] = content
+        except ArchonOutputIntegrityError as exc:
+            self._transition_run_repair(
+                "typed_publication_integrity",
+                run_id=run_id,
+                outcome="repair_required",
+            )
+            raise JournalRecoveryError(
+                "typed publication integrity: publication directory identity changed"
+            ) from exc
+        except (
+            JournalRecoveryError,
+            OSError,
+            StorageQuotaError,
+            ValueError,
+        ):
+            self._transition_run_repair(
+                "typed_publication_integrity",
+                run_id=run_id,
+                outcome="repair_required",
+            )
+            raise
+        finally:
+            if publications_descriptor is not None:
+                os.close(publications_descriptor)
+            if run_descriptor is not None:
+                os.close(run_descriptor)
+        self._transition_run_repair(
+            "typed_publication_integrity",
+            run_id=run_id,
+            outcome="repair_verified",
+        )
+        return verified
+
+    @staticmethod
+    def _typed_mirror_payload(
+        obligation: TypedMirrorObligation,
+    ) -> dict[str, object]:
+        return {
+            "mirror_id": obligation.mirror_id,
+            "workflow": obligation.workflow,
+            "node_id": obligation.node_id,
+            "operator_scope": obligation.operator_scope,
+            "run_id": obligation.run_id,
+            "attempt_id": obligation.attempt_id,
+            "publication_id": obligation.publication_id,
+            "content_name": obligation.content_name,
+            "output_type": obligation.output_type,
+            "media_type": obligation.media_type,
+            "size_bytes": obligation.size_bytes,
+            "sha256": obligation.sha256,
+        }
+
+    @classmethod
+    def _typed_mirror_obligation(
+        cls,
+        projection: Mapping[str, object],
+        descriptor: _JournaledTypedPublication,
+    ) -> TypedMirrorObligation:
+        operator_scope = str(projection.get("operator_scope_digest") or "local")
+        identity = {
+            "workflow": str(projection["workflow"]),
+            "node_id": descriptor.node_id,
+            "operator_scope": operator_scope,
+            "run_id": descriptor.run_id,
+            "attempt_id": descriptor.attempt_id,
+            "publication_id": descriptor.publication_id,
+            "content_name": descriptor.content_name,
+            "output_type": descriptor.output_type,
+            "media_type": descriptor.media_type,
+            "size_bytes": descriptor.size_bytes,
+            "sha256": descriptor.sha256,
+        }
+        mirror_id = _sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        return TypedMirrorObligation(mirror_id=mirror_id, **identity)
+
+    @staticmethod
+    def _effective_persistent_publication(
+        directory: Path,
+        projection: Mapping[str, object],
+        descriptor: _JournaledTypedPublication,
+    ) -> bool:
+        if descriptor.session_id is None:
+            return False
+        metadata = projection.get("run_metadata")
+        if isinstance(metadata, Mapping) and metadata.get("ai_entitlement") == (
+            "deterministic"
+        ):
+            return False
+        node_state = projection.get("nodes", {}).get(descriptor.node_id)
+        if (
+            not isinstance(node_state, Mapping)
+            or node_state.get("session_id") != descriptor.session_id
+            or not isinstance(node_state.get("cache_fingerprint"), str)
+            or not node_state.get("cache_fingerprint")
+        ):
+            return False
+        definition = directory / "definition.yaml"
+        try:
+            observed = definition.lstat()
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size > 2 * 1024 * 1024:
+                raise JournalRecoveryError(
+                    "typed mirror workflow definition is unsafe"
+                )
+            document = yaml.safe_load(
+                _read_descriptor_relative(
+                    directory,
+                    "definition.yaml",
+                    size_bytes=observed.st_size,
+                )
+            )
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+            yaml.YAMLError,
+        ) as exc:
+            raise JournalRecoveryError(
+                "typed mirror workflow definition is unavailable"
+            ) from exc
+        if not isinstance(document, Mapping) or not isinstance(
+            document.get("nodes"), list
+        ):
+            raise JournalRecoveryError("typed mirror workflow definition is malformed")
+        matching = [
+            node
+            for node in document["nodes"]
+            if isinstance(node, Mapping) and node.get("id") == descriptor.node_id
+        ]
+        if len(matching) != 1:
+            raise JournalRecoveryError("typed mirror node definition is ambiguous")
+        node = matching[0]
+        if not ("command" in node or "prompt" in node):
+            return False
+        context = node.get("context")
+        if context in {"fresh", "shared"}:
+            return False
+        persist = node.get("persist_session", document.get("persist_sessions", False))
+        return persist is True
+
+    @classmethod
+    def _typed_mirror_from_payload(
+        cls,
+        payload: object,
+    ) -> TypedMirrorObligation:
+        if not isinstance(payload, Mapping):
+            raise JournalRecoveryError("typed mirror obligation is malformed")
+        value = payload.get("mirror")
+        if not isinstance(value, Mapping):
+            raise JournalRecoveryError("typed mirror obligation is malformed")
+        try:
+            obligation = TypedMirrorObligation(
+                mirror_id=value["mirror_id"],
+                workflow=value["workflow"],
+                node_id=value["node_id"],
+                operator_scope=value["operator_scope"],
+                run_id=value["run_id"],
+                attempt_id=value["attempt_id"],
+                publication_id=value["publication_id"],
+                content_name=value["content_name"],
+                output_type=value["output_type"],
+                media_type=value["media_type"],
+                size_bytes=value["size_bytes"],
+                sha256=value["sha256"],
+            )
+            TypedMirrorStore._validate_obligation(obligation)
+        except (KeyError, TypeError, TypedMirrorIntegrityError) as exc:
+            raise JournalRecoveryError("typed mirror obligation is malformed") from exc
+        expected_identity = dict(cls._typed_mirror_payload(obligation))
+        expected_identity.pop("mirror_id")
+        expected_mirror_id = _sha256(
+            json.dumps(
+                expected_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        if not hmac.compare_digest(obligation.mirror_id, expected_mirror_id):
+            raise JournalRecoveryError("typed mirror obligation identity is invalid")
+        return obligation
+
+    def _recover_typed_mirrors_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        verified_content: Mapping[str, bytes],
+    ) -> None:
+        run_id = str(projection["run_id"])
+        try:
+            self._recover_typed_mirrors_checked_locked(
+                directory,
+                projection,
+                verified_content,
+            )
+        except (JournalRecoveryError, OSError, StorageQuotaError):
+            self._transition_run_repair(
+                "typed_mirror_integrity",
+                run_id=run_id,
+                outcome="repair_required",
+            )
+            raise
+        except (TypedMirrorIntegrityError, ValueError) as exc:
+            self._transition_run_repair(
+                "typed_mirror_integrity",
+                run_id=run_id,
+                outcome="repair_required",
+            )
+            raise JournalRecoveryError("typed mirror integrity failure") from exc
+        self._transition_run_repair(
+            "typed_mirror_integrity",
+            run_id=run_id,
+            outcome="repair_verified",
+        )
+
+    def _recover_typed_mirrors_checked_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        verified_content: Mapping[str, bytes],
+    ) -> None:
+        descriptors = {
+            descriptor.publication_id: descriptor
+            for descriptor in _journaled_typed_publications(
+                projection,
+                _sealed_typed_output_declarations(directory, projection),
+            )
+        }
+        if (
+            not descriptors
+            and not self._journal_may_contain_typed_mirror_events(directory)
+        ):
+            return
+        expected = {
+            obligation.mirror_id: obligation
+            for descriptor in descriptors.values()
+            if self._effective_persistent_publication(
+                directory,
+                projection,
+                descriptor,
+            )
+            for obligation in (self._typed_mirror_obligation(projection, descriptor),)
+        }
+        events = self._read_journal_events(directory)
+        required: dict[str, TypedMirrorObligation] = {}
+        completed: dict[str, str] = {}
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type == "typed_mirror_required":
+                obligation = self._typed_mirror_from_payload(event.get("payload"))
+                if (
+                    event.get("node_id") != obligation.node_id
+                    or event.get("attempt_id") != obligation.attempt_id
+                    or obligation.run_id != projection.get("run_id")
+                ):
+                    raise JournalRecoveryError(
+                        "typed mirror obligation is not corroborated"
+                    )
+                if obligation.mirror_id in required and required[
+                    obligation.mirror_id
+                ] != obligation:
+                    raise JournalRecoveryError(
+                        "typed mirror obligation identity conflicts"
+                    )
+                required[obligation.mirror_id] = obligation
+            elif event_type == "typed_mirror_completed":
+                payload = event.get("payload")
+                mirror_id = payload.get("mirror_id") if isinstance(payload, Mapping) else None
+                entry_id = payload.get("entry_id") if isinstance(payload, Mapping) else None
+                if (
+                    not isinstance(mirror_id, str)
+                    or _SHA256_PATTERN.fullmatch(mirror_id) is None
+                    or not isinstance(entry_id, str)
+                    or _SHA256_PATTERN.fullmatch(entry_id) is None
+                    or mirror_id not in required
+                    or event.get("node_id") != required[mirror_id].node_id
+                    or event.get("attempt_id") != required[mirror_id].attempt_id
+                ):
+                    raise JournalRecoveryError(
+                        "typed mirror completion is not corroborated"
+                    )
+                expected_entry_id = TypedMirrorStore._entry_document(
+                    required[mirror_id]
+                )["entry_id"]
+                if not hmac.compare_digest(entry_id, str(expected_entry_id)):
+                    raise JournalRecoveryError(
+                        "typed mirror completion identity is invalid"
+                    )
+                previous = completed.get(mirror_id)
+                if previous is not None and previous != entry_id:
+                    raise JournalRecoveryError(
+                        "typed mirror completion identity conflicts"
+                    )
+                completed[mirror_id] = entry_id
+        unbacked = (set(required) | set(completed)) - set(expected)
+        if not expected and not unbacked:
+            return
+        mirror_store = TypedMirrorStore(
+            self.hermes_home,
+            capacity_check=self._ensure_mirror_capacity,
+            free_disk_check=self._ensure_free_disk,
+        )
+        if unbacked:
+            for mirror_id in sorted(unbacked):
+                mirror_store.invalidate(required[mirror_id])
+            raise JournalRecoveryError(
+                "typed mirror journal obligation is not backed by a publication"
+            )
+        for mirror_id, obligation in expected.items():
+            existing = required.get(mirror_id)
+            if existing is not None and existing != obligation:
+                raise JournalRecoveryError(
+                    "typed mirror obligation conflicts with journal"
+                )
+            descriptor = descriptors.get(obligation.publication_id)
+            content = verified_content.get(obligation.publication_id)
+            if descriptor is None or content is None:
+                raise JournalRecoveryError(
+                    "typed mirror requires a verified run publication"
+                )
+            new_requirement = existing is None
+            was_completed = mirror_id in completed
+            transaction_bytes = self._typed_mirror_transaction_bytes(
+                projection,
+                obligation,
+                requirement_pending=new_requirement,
+                completion_pending=not was_completed,
+            )
+            with mirror_store.capacity_reservation(
+                obligation,
+                content,
+                transaction_bytes=transaction_bytes,
+            ):
+                if new_requirement:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "typed_mirror_required",
+                        {"mirror": self._typed_mirror_payload(obligation)},
+                        node_id=obligation.node_id,
+                        attempt_id=obligation.attempt_id,
+                    )
+                    required[mirror_id] = obligation
+                try:
+                    record = mirror_store.stage(
+                        obligation,
+                        content,
+                    )
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
+                try:
+                    pointed = mirror_store.point(
+                        record,
+                        replace_current=not was_completed,
+                    )
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
+                if not was_completed and not pointed:
+                    continue
+                if not was_completed:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "typed_mirror_completed",
+                        {"mirror_id": mirror_id, "entry_id": record.entry_id},
+                        node_id=obligation.node_id,
+                        attempt_id=obligation.attempt_id,
+                    )
+                    completed[mirror_id] = record.entry_id
+                try:
+                    mirror_store.verify(record)
+                except TypedMirrorIntegrityError as exc:
+                    raise JournalRecoveryError(
+                        "typed mirror integrity failure"
+                    ) from exc
+
     def complete_node(
         self,
         claim: NodeClaim,
         *,
         status: str,
         artifacts: Iterable[ArtifactRef] = (),
+        typed_publication: TypedPublicationCandidate | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
+        session_registry_update: SessionRegistryUpdateCandidate | None = None,
+        session_registry_authority: SessionRegistryUpdateCandidate | None = None,
         now: LeaseClockSample | None = None,
     ) -> None:
         if status not in {
@@ -7071,6 +11830,7 @@ class RunStore:
             "paused",
         }:
             raise ValueError(f"invalid node completion state: {status}")
+        artifacts = tuple(artifacts)
         directory = self.run_directory(claim.run_id)
         with (
             self._terminal_completion_guard(claim),
@@ -7112,8 +11872,80 @@ class RunStore:
             if (
                 projection["status"] in {"cancelled", "abandoned"}
                 or projection.get("desired_status") == "cancelled"
-            ) and status != "cancelled":
+            ) and status != "cancelled" and not (
+                status == "succeeded" and session_registry_update is not None
+            ):
                 raise RuntimeError("stale completion for terminal run")
+            if (session_registry_update is None) != (
+                session_registry_authority is None
+            ):
+                raise ValueError(
+                    "session registry update authority is incomplete"
+                )
+            if session_registry_update is not None:
+                completion_metadata = metadata or {}
+                if (
+                    status != "succeeded"
+                    or session_registry_authority != session_registry_update
+                    or completion_metadata.get("session_id")
+                    != session_registry_update.new_session_id
+                    or completion_metadata.get("cache_fingerprint")
+                    != session_registry_update.cache_fingerprint
+                    or session_registry_update.winning_run_id != claim.run_id
+                    or session_registry_update.winning_node_id != claim.node_id
+                    or session_registry_update.winning_attempt_id
+                    != claim.attempt_id
+                    or session_registry_update.key.workflow
+                    != projection.get("workflow")
+                    or session_registry_update.key.scope
+                    != str(projection.get("operator_scope_digest") or "local")
+                ):
+                    raise ValueError(
+                        "session registry update does not match winning completion"
+                    )
+                if (
+                    session_registry_update.winning_attempt_id
+                    in _pending_session_registry_payloads(projection)
+                ):
+                    raise JournalRecoveryError(
+                        "attempt already has a pending session registry update"
+                    )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as authority_connection:
+                    if fence_connection is None:
+                        authority_connection.execute("BEGIN IMMEDIATE")
+                    self._write_private_authority(
+                        authority_connection,
+                        table="session_registry_winner_authority",
+                        run_id=claim.run_id,
+                        attempt_id=claim.attempt_id,
+                        authority=_session_registry_winner_authority(
+                            session_registry_update,
+                            activation_event_sequence=(
+                                int(projection["event_sequence"]) + 1
+                            ),
+                            activation_event_type="node_succeeded",
+                            activation_predecessor_chain_sha256=(
+                                self._journal_predecessor_chain_locked(
+                                    directory,
+                                    run_id=claim.run_id,
+                                    expected_predecessor_sequence=int(
+                                        projection["event_sequence"]
+                                    ),
+                                )
+                            ),
+                        ),
+                    )
+                    if fence_connection is None:
+                        authority_connection.commit()
+                self._commit_fenced_private_authority(
+                    fence_connection,
+                    claim.execution_fence,
+                    now,
+                )
             if status == "paused":
                 with (
                     nullcontext(fence_connection)
@@ -7133,6 +11965,40 @@ class RunStore:
                         for key, value in dict(metadata or {}).items()
                         if key != "pending_interaction"
                     }
+            publication_ref = None
+            publication_artifact = None
+            if status == "succeeded" and typed_publication is not None:
+                publication_artifact = _canonical_typed_publication_artifact(
+                    artifacts,
+                    typed_publication,
+                )
+                projected_matches = [
+                    entry
+                    for entry in projection["artifacts"]
+                    if isinstance(entry, dict)
+                    and entry.get("node_id") == claim.node_id
+                    and entry.get("attempt_id") == claim.attempt_id
+                    and entry.get("relative_path")
+                    == publication_artifact.relative_path
+                ]
+                if len(projected_matches) > 1 or any(
+                    entry.get("media_type") != publication_artifact.media_type
+                    or entry.get("size_bytes") != publication_artifact.size_bytes
+                    or entry.get("sha256") != publication_artifact.sha256
+                    for entry in projected_matches
+                ):
+                    raise ArchonOutputIntegrityError(
+                        "projected artifact conflicts with typed publication"
+                    )
+                publication_ref = self._publish_typed_bundle_locked(
+                    directory,
+                    projection,
+                    run_id=claim.run_id,
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    artifact=publication_artifact,
+                    candidate=typed_publication,
+                )
             node["state"] = status
             node.pop("claim", None)
             safe_error_message = _sanitize_diagnostic(error_message)
@@ -7145,6 +12011,12 @@ class RunStore:
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
             node["attempts"][-1]["metadata"] = safe_metadata
+            if session_registry_update is not None:
+                node["attempts"][-1]["session_registry_authority"] = (
+                    _session_registry_candidate_payload(
+                        session_registry_authority
+                    )
+                )
             if status == "cancelled":
                 for other_id, other in projection["nodes"].items():
                     if other_id == claim.node_id or other["state"] in {
@@ -7182,11 +12054,6 @@ class RunStore:
                 if isinstance(warning, str) and warning not in projection["warnings"]:
                     projection["warnings"].append(warning)
             refs = []
-            existing_artifacts = {
-                (entry.get("attempt_id"), entry.get("relative_path"))
-                for entry in projection["artifacts"]
-                if isinstance(entry, dict)
-            }
             for artifact in artifacts:
                 entry = {
                     "node_id": claim.node_id,
@@ -7196,9 +12063,35 @@ class RunStore:
                     "size_bytes": artifact.size_bytes,
                     "sha256": artifact.sha256,
                 }
+                if (
+                    publication_ref is not None
+                    and artifact == publication_artifact
+                ):
+                    entry.update(_typed_publication_fields(publication_ref))
                 refs.append(entry)
-                if (claim.attempt_id, artifact.relative_path) not in existing_artifacts:
+                existing_indices = [
+                    index
+                    for index, existing in enumerate(projection["artifacts"])
+                    if isinstance(existing, dict)
+                    and existing.get("attempt_id") == claim.attempt_id
+                    and existing.get("relative_path") == artifact.relative_path
+                ]
+                if artifact == publication_artifact and existing_indices:
+                    projection["artifacts"][existing_indices[0]] = entry
+                elif not existing_indices:
                     projection["artifacts"].append(entry)
+            if session_registry_update is not None:
+                if not _session_registry_candidate_is_corroborated(
+                    projection,
+                    session_registry_update,
+                ):
+                    raise JournalRecoveryError(
+                        "session registry update authority is uncorroborated"
+                    )
+                _set_pending_session_registry_update(
+                    projection,
+                    session_registry_update,
+                )
             self._append_locked(
                 directory,
                 projection,
@@ -7206,7 +12099,12 @@ class RunStore:
                 {
                     "artifacts": refs,
                     "error_code": error_code,
-                    "metadata": safe_metadata,
+                    "metadata": {
+                        key: value
+                        for key, value in safe_metadata.items()
+                        if session_registry_update is None
+                        or key not in {"session_id", "cache_fingerprint"}
+                    },
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
@@ -7214,6 +12112,16 @@ class RunStore:
                 terminal_reserve_attempt_id=claim.attempt_id,
                 reserve_connection=fence_connection,
             )
+            if publication_ref is not None:
+                verified_content = self._recover_typed_publications_locked(
+                    directory,
+                    projection,
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    projection,
+                    verified_content,
+                )
             states = {candidate["state"] for candidate in projection["nodes"].values()}
             terminal = None
             if status == "failed":
@@ -7232,6 +12140,8 @@ class RunStore:
                 "interrupted",
             }:
                 terminal = "failed" if "failed" in states else "succeeded"
+            if _pending_session_registry_payloads(projection):
+                terminal = None
             if terminal:
                 projection["status"] = terminal
                 self._append_locked(
@@ -7305,13 +12215,253 @@ class RunStore:
                         (directory / "events.jsonl").read_bytes()
                     ),
                 )
+                if session_registry_update is not None:
+                    self._transfer_obligation_journal_reserve(
+                        claim.attempt_id,
+                        claim.run_id,
+                        connection=final_connection,
+                    )
                 self._release_worker_claim(
                     claim.attempt_id, connection=final_connection
                 )
                 if fence_connection is None:
                     final_connection.commit()
-            if terminal or projection["status"] == "waiting_retry":
+            if session_registry_update is not None:
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as pending_connection:
+                    self._record_coordinator_wake(
+                        pending_connection,
+                        run_id=claim.run_id,
+                        reason_code="pending_session_registry_update",
+                    )
+            if (
+                terminal
+                or projection["status"] == "waiting_retry"
+                or session_registry_update is not None
+            ):
                 self._notify_coordinator()
+
+    @staticmethod
+    def _set_session_recovery_outcome(
+        projection: dict[str, object],
+        candidate: SessionRegistryUpdateCandidate,
+        outcome: str,
+    ) -> None:
+        if not candidate.recovery_selected:
+            return
+        node = projection.get("nodes", {}).get(candidate.winning_node_id)
+        recoveries = node.get("session_recoveries") if isinstance(node, dict) else None
+        if not isinstance(recoveries, list):
+            raise JournalRecoveryError(
+                "persistent session recovery evidence is missing"
+            )
+        matches = [
+            item
+            for item in recoveries
+            if isinstance(item, dict)
+            and item.get("attempt_id") == candidate.winning_attempt_id
+        ]
+        if len(matches) != 1:
+            raise JournalRecoveryError(
+                "persistent session recovery evidence is uncorroborated"
+            )
+        matches[0]["outcome"] = outcome
+
+    def pending_session_registry_update(
+        self,
+        run_id: str,
+    ) -> tuple[SessionRegistryUpdateCandidate, int, str | None] | None:
+        projection = self.load_run(run_id)
+        pending = _pending_session_registry_payloads(projection)
+        if not pending:
+            return None
+        decoded = [
+            _session_registry_candidate_from_payload(payload)
+            for payload in pending.values()
+        ]
+        retrying = [item for item in decoded if item[1] > 0]
+        candidate, retry_count = (
+            retrying[0]
+            if retrying
+            else min(decoded, key=lambda item: item[0].winning_attempt_id)
+        )
+        if candidate.winning_run_id != run_id:
+            raise JournalRecoveryError("session registry obligation run is invalid")
+        next_at = projection.get("next_registry_update_at")
+        if next_at is not None and not isinstance(next_at, str):
+            raise JournalRecoveryError("session registry obligation wake is invalid")
+        return candidate, retry_count, next_at
+
+    def defer_session_registry_update(
+        self,
+        run_id: str,
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        now: datetime,
+    ) -> int:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            pending = _pending_session_registry_payloads(projection)
+            payload = pending.get(candidate.winning_attempt_id)
+            if payload is None:
+                raise RuntimeError("stale session registry obligation deferral")
+            current, retry_count = _session_registry_candidate_from_payload(payload)
+            if current != candidate or retry_count >= 5:
+                raise RuntimeError("stale session registry obligation deferral")
+            attempt = retry_count + 1
+            delay_seconds = (1, 2, 4, 8, 16)[retry_count]
+            _set_pending_session_registry_update(
+                projection,
+                candidate,
+                retry_count=attempt,
+            )
+            projection["next_registry_update_at"] = (
+                now.astimezone(timezone.utc) + timedelta(seconds=delay_seconds)
+            ).isoformat()
+            self._set_session_recovery_outcome(
+                projection,
+                candidate,
+                "registry_update_deferred",
+            )
+            if attempt == 5:
+                projection["status"] = "recovery_pending"
+                projection["last_error"] = {
+                    "code": "persistent_session_registry_update_pending",
+                    "message": "persistent session registry update remains pending",
+                    "node_id": candidate.winning_node_id,
+                }
+            self._append_locked(
+                directory,
+                projection,
+                "persistent_session_registry_update_deferred",
+                {
+                    "attempt_id": candidate.winning_attempt_id,
+                    "registry_generation": candidate.expected_generation,
+                    "outcome": "registry_update_deferred",
+                    "registry_update_attempt": attempt,
+                    "next_registry_update_at": projection[
+                        "next_registry_update_at"
+                    ],
+                },
+                node_id=candidate.winning_node_id,
+                attempt_id=candidate.winning_attempt_id,
+                terminal_reserve_attempt_id=candidate.winning_attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+            self._notify_coordinator()
+            return attempt
+
+    def resolve_session_registry_update(
+        self,
+        run_id: str,
+        candidate: SessionRegistryUpdateCandidate,
+        *,
+        outcome: str,
+    ) -> str:
+        if outcome not in {
+            "stale_entry_replaced",
+            "stale_entry_replaced_already_applied",
+            "newer_entry_retained",
+        }:
+            raise ValueError("invalid session registry update outcome")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            self._set_session_recovery_outcome(projection, candidate, outcome)
+            _remove_pending_session_registry_update(projection, candidate)
+            projection.pop("next_registry_update_at", None)
+            has_pending = bool(_pending_session_registry_payloads(projection))
+            if (
+                isinstance(projection.get("last_error"), Mapping)
+                and projection["last_error"].get("code")
+                == "persistent_session_registry_update_pending"
+            ):
+                projection["last_error"] = None
+            if outcome == "newer_entry_retained":
+                warning = "newer persistent session retained"
+                if warning not in projection["warnings"]:
+                    projection["warnings"].append(warning)
+            terminal = None
+            if has_pending:
+                terminal = None
+            elif projection.get("desired_status") == "cancelled":
+                projection["desired_status"] = None
+                for node in projection["nodes"].values():
+                    if node["state"] not in {"succeeded", "failed", "skipped"}:
+                        node.pop("claim", None)
+                        node["state"] = "cancelled"
+                terminal = "cancelled"
+            else:
+                states = {
+                    node["state"] for node in projection["nodes"].values()
+                }
+                if states and states <= {
+                    "succeeded",
+                    "failed",
+                    "skipped",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    terminal = "failed" if "failed" in states else "succeeded"
+            projection["status"] = terminal or "running"
+            event_type = (
+                f"run_{terminal}"
+                if terminal is not None
+                else "persistent_session_registry_update_resolved"
+            )
+            self._append_locked(
+                directory,
+                projection,
+                event_type,
+                {
+                    "attempt_id": candidate.winning_attempt_id,
+                    "registry_generation": candidate.expected_generation,
+                    "outcome": outcome,
+                },
+                node_id=candidate.winning_node_id,
+                attempt_id=candidate.winning_attempt_id,
+                terminal_reserve_attempt_id=candidate.winning_attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (candidate.winning_attempt_id,),
+                )
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code=event_type,
+                )
+            self._notify_coordinator()
+            return outcome
 
     def record_loop_iteration(
         self,
@@ -7372,9 +12522,17 @@ class RunStore:
         *,
         artifacts: Iterable[ArtifactRef] = (),
         error_message: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        consumed_attempts: int | None = None,
         now: LeaseClockSample | None = None,
     ) -> None:
         """Keep ownership blocked when an executor cannot prove tree cleanup."""
+        if consumed_attempts is not None and (
+            isinstance(consumed_attempts, bool)
+            or not isinstance(consumed_attempts, int)
+            or consumed_attempts < 0
+        ):
+            raise ValueError("consumed attempts must be a non-negative integer")
         directory = self.run_directory(claim.run_id)
         with workflow_lock(
             self._run_lock_path(claim.run_id)
@@ -7386,6 +12544,13 @@ class RunStore:
             active = node.get("claim", {})
             if active.get("attempt_id") != claim.attempt_id:
                 raise RuntimeError("stale cleanup failure")
+            safe_metadata = None
+            if metadata is not None:
+                safe_metadata = dict(_sanitize(dict(metadata)))
+                safe_metadata.pop("output", None)
+                node["attempts"][-1]["metadata"] = safe_metadata
+            if consumed_attempts is not None:
+                node["retry_consumed"] = consumed_attempts
             projection["desired_status"] = "cleanup_failed"
             projection["last_error"] = {
                 "code": "cleanup_failed",
@@ -7415,7 +12580,16 @@ class RunStore:
                 directory,
                 projection,
                 "cleanup_failed",
-                {"artifacts": refs, "cleanup_complete": False},
+                {
+                    "artifacts": refs,
+                    "cleanup_complete": False,
+                    **(
+                        {"retry_consumed": consumed_attempts}
+                        if consumed_attempts is not None
+                        else {}
+                    ),
+                    **({"metadata": safe_metadata} if safe_metadata is not None else {}),
+                },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
@@ -7437,9 +12611,8 @@ class RunStore:
                     reason_code="uninterruptible_process",
                 )
 
-    def _append_locked(
+    def _prepare_journal_frame(
         self,
-        directory: Path,
         projection: dict[str, object],
         event_type: str,
         payload: Mapping[str, object] | None = None,
@@ -7447,10 +12620,9 @@ class RunStore:
         node_id: str | None = None,
         attempt_id: str | None = None,
         compact_recovery: bool = False,
-        defer_notification: bool = False,
-        terminal_reserve_attempt_id: str | None = None,
-        reserve_connection: sqlite3.Connection | None = None,
-    ) -> dict[str, object]:
+        sample: LeaseClockSample | None = None,
+        timestamp: str | None = None,
+    ) -> tuple[dict[str, object], bytes]:
         projection.setdefault("pause_lane_policy", "hold")
         projection.setdefault("queue_sequence", None)
         projection["lane_state"] = self._lane_state(projection)
@@ -7459,13 +12631,13 @@ class RunStore:
             "run_stalled",
             "evidence_annotation",
         }:
-            sample = self._lease_clock()
-            projection["last_runnable_progress_at"] = sample.utc_now.isoformat()
-            projection["last_runnable_progress_monotonic"] = sample.monotonic_now
-            projection["last_runnable_progress_boot_id"] = sample.boot_id
-            projection["progress_boot_id"] = sample.boot_id
+            observed = sample or self._lease_clock()
+            projection["last_runnable_progress_at"] = observed.utc_now.isoformat()
+            projection["last_runnable_progress_monotonic"] = observed.monotonic_now
+            projection["last_runnable_progress_boot_id"] = observed.boot_id
+            projection["progress_boot_id"] = observed.boot_id
         sequence = int(projection["event_sequence"]) + 1
-        now = _utc_now()
+        now = timestamp or _utc_now()
         projection["event_sequence"] = sequence
         projection["state_version"] = int(projection["state_version"]) + 1
         projection["updated_at"] = now
@@ -7487,7 +12659,80 @@ class RunStore:
         }
         if projection_was_truncated(raw_payload):
             event["payload_truncated"] = True
-        event, encoded = _encode_journal_frame(event)
+        return _encode_journal_frame(event)
+
+    def _typed_mirror_transaction_bytes(
+        self,
+        projection: Mapping[str, object],
+        obligation: TypedMirrorObligation,
+        *,
+        requirement_pending: bool,
+        completion_pending: bool,
+    ) -> int:
+        """Bound journal frames and projection temp files for one mirror."""
+        simulated = json.loads(
+            json.dumps(projection, sort_keys=True, ensure_ascii=False)
+        )
+        pessimistic_sample = LeaseClockSample(
+            datetime.max.replace(tzinfo=timezone.utc),
+            1.7976931348623157e308,
+            "f" * 256,
+        )
+        timestamp = pessimistic_sample.utc_now.isoformat()
+        transitions: list[tuple[str, Mapping[str, object]]] = []
+        if requirement_pending:
+            transitions.append((
+                "typed_mirror_required",
+                {"mirror": self._typed_mirror_payload(obligation)},
+            ))
+        if completion_pending:
+            entry_id = str(
+                TypedMirrorStore._entry_document(obligation)["entry_id"]
+            )
+            transitions.append((
+                "typed_mirror_completed",
+                {"mirror_id": obligation.mirror_id, "entry_id": entry_id},
+            ))
+        required = 0
+        for event_type, payload in transitions:
+            _event, encoded = self._prepare_journal_frame(
+                simulated,
+                event_type,
+                payload,
+                node_id=obligation.node_id,
+                attempt_id=obligation.attempt_id,
+                sample=pessimistic_sample,
+                timestamp=timestamp,
+            )
+            # The frame is a durable addition. Atomic run.json replacement
+            # temporarily retains the current projection beside the full new
+            # document; summing both transition peaks is deliberately
+            # pessimistic and leaves room for platform JSON-number variance.
+            required += len(encoded) + len(_json_document_bytes(simulated)) + 2_048
+        return required
+
+    def _append_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        event_type: str,
+        payload: Mapping[str, object] | None = None,
+        *,
+        node_id: str | None = None,
+        attempt_id: str | None = None,
+        compact_recovery: bool = False,
+        defer_notification: bool = False,
+        terminal_reserve_attempt_id: str | None = None,
+        reserve_connection: sqlite3.Connection | None = None,
+    ) -> dict[str, object]:
+        event, encoded = self._prepare_journal_frame(
+            projection,
+            event_type,
+            payload,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            compact_recovery=compact_recovery,
+        )
         journal_path = directory / "events.jsonl"
         if journal_path.stat().st_size and not _file_ends_with_newline(journal_path):
             self._read_journal_events(directory)
@@ -7550,7 +12795,7 @@ class RunStore:
                         if projection.get("execution_mode") == "background"
                         else "suppressed"
                     ),
-                    now=datetime.fromisoformat(now),
+                    now=datetime.fromisoformat(str(event["timestamp"])),
                 )
         except sqlite3.Error:
             pass
@@ -7589,6 +12834,327 @@ class RunStore:
                 changed.append(node_id)
         return tuple(changed)
 
+    def transition_v3_condition_node(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        state: str,
+        code: str,
+        message: str,
+    ) -> bool:
+        """CAS one Archon v3 condition outcome before any executor claim."""
+        if state not in {"skipped", "failed"}:
+            raise ValueError("v3 condition state must be skipped or failed")
+        if state == "skipped" and code != "condition_false":
+            raise ValueError("v3 skipped condition must use condition_false")
+        try:
+            code_size = len(code.encode("utf-8")) if isinstance(code, str) else 0
+        except UnicodeEncodeError as exc:
+            raise ValueError("v3 condition code must be valid UTF-8") from exc
+        if not isinstance(code, str) or not code or code_size > 128:
+            raise ValueError("v3 condition diagnostics must be bounded text")
+        if not isinstance(message, str) or not message:
+            raise ValueError("v3 condition message must be bounded text")
+        safe_message = _sanitize_v3_condition_diagnostic(message)
+
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("v3 condition transition requires an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") != "pending":
+                return False
+            if node.get("attempts") or int(node.get("retry_consumed", 0)) != 0:
+                raise RuntimeError("pending condition node already consumed an attempt")
+
+            node["state"] = state
+            node["retry_consumed"] = 0
+            payload: dict[str, object]
+            if state == "skipped":
+                node["skip_reason"] = code
+                payload = {"reason": code}
+                if code not in projection["warnings"]:
+                    projection["warnings"].append(code)
+            else:
+                projection["last_error"] = {
+                    "code": code,
+                    "message": safe_message,
+                    "node_id": node_id,
+                }
+                payload = {"error_code": code, "error_message": safe_message}
+            self._append_locked(
+                directory,
+                projection,
+                f"node_{state}",
+                payload,
+                node_id=node_id,
+            )
+            return True
+
+    def transition_v3_reference_node(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """CAS one non-transient v3 reference failure before executor claim."""
+        if (
+            not isinstance(code, str)
+            or not code.startswith("output_reference_")
+            or code == "output_reference_temporarily_unavailable"
+            or len(code.encode("utf-8")) > 128
+        ):
+            raise ValueError("v3 reference failure code is invalid")
+        if not isinstance(message, str) or not message:
+            raise ValueError("v3 reference failure message is invalid")
+        safe_message = _sanitize_v3_condition_diagnostic(message)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("v3 reference transition requires an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") not in {
+                "pending",
+                "ready",
+            }:
+                return False
+            self._clear_output_resolution_fields(node)
+            node["state"] = "failed"
+            node["retry_consumed"] = int(node.get("retry_consumed", 0))
+            projection["last_error"] = {
+                "code": code,
+                "message": safe_message,
+                "node_id": node_id,
+            }
+            self._append_locked(
+                directory,
+                projection,
+                "node_failed",
+                {"error_code": code, "error_message": safe_message},
+                node_id=node_id,
+            )
+            return True
+
+    @staticmethod
+    def _clear_output_resolution_fields(node: dict[str, object]) -> None:
+        for field in (
+            "next_resolution_at",
+            "resolution_producer_identity",
+            "resolution_read_count",
+            "resolution_resume_state",
+        ):
+            node.pop(field, None)
+
+    def _fail_output_resolution_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        node_id: str,
+        node: dict[str, object],
+        *,
+        code: str,
+        message: str,
+        read_count: int,
+    ) -> None:
+        node["state"] = "failed"
+        node["resolution_read_count"] = read_count
+        node.pop("next_resolution_at", None)
+        node.pop("resolution_resume_state", None)
+        node["retry_consumed"] = int(node.get("retry_consumed", 0))
+        projection["last_error"] = {
+            "code": code,
+            "message": message,
+            "node_id": node_id,
+        }
+        self._append_locked(
+            directory,
+            projection,
+            "node_failed",
+            {"error_code": code, "error_message": message},
+            node_id=node_id,
+        )
+
+    def defer_output_resolution(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        producer_identity: Mapping[str, object],
+        now: datetime | None = None,
+    ) -> bool:
+        """CAS one transient v3 read into the bounded durable wait protocol."""
+        identity = canonical_output_publication_identity(producer_identity)
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("resolution observation time must be timezone-aware")
+        instant = instant.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if (
+                not isinstance(language, Mapping)
+                or language.get("effective_profile") != "archon-2026-07"
+                or language.get("normalizer_version") != 3
+            ):
+                raise ValueError("output resolution waits require an Archon v3 run")
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if not isinstance(node, dict) or node.get("state") not in {
+                "pending",
+                "ready",
+            }:
+                return False
+            retained_identity = node.get("resolution_producer_identity")
+            read_count = int(node.get("resolution_read_count", 0)) + 1
+            if retained_identity is not None and retained_identity != identity:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_integrity",
+                    message="output reference producer identity changed during resolution",
+                    read_count=read_count,
+                )
+                return True
+
+            node["resolution_producer_identity"] = identity
+            if read_count >= 6:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_unavailable",
+                    message="output reference remained unavailable after 6 reads",
+                    read_count=read_count,
+                )
+                return True
+
+            delay_seconds = (0.25, 0.5, 1.0, 2.0, 4.0)[read_count - 1]
+            next_resolution_at = instant + timedelta(seconds=delay_seconds)
+            node["resolution_read_count"] = read_count
+            node["resolution_resume_state"] = str(node["state"])
+            node["state"] = "waiting_resolution"
+            node["next_resolution_at"] = next_resolution_at.isoformat()
+            node["retry_consumed"] = int(node.get("retry_consumed", 0))
+            self._append_locked(
+                directory,
+                projection,
+                "output_resolution_deferred",
+                {
+                    "error_code": "output_reference_temporarily_unavailable",
+                    "next_resolution_at": next_resolution_at.isoformat(),
+                    "producer_identity_sha256": output_publication_identity_sha256(
+                        identity
+                    ),
+                    "resolution_read_count": read_count,
+                },
+                node_id=node_id,
+            )
+            return True
+
+    def wake_due_output_resolutions(
+        self, run_id: str, *, now: datetime | None = None
+    ) -> tuple[str, ...]:
+        """Wake each due resolution waiter exactly once under the run CAS lock."""
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("resolution wake time must be timezone-aware")
+        instant = instant.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        ready: list[str] = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("status") != "running":
+                return ()
+            for candidate_id, node in projection.get("nodes", {}).items():
+                if (
+                    not isinstance(node, dict)
+                    or node.get("state") != "waiting_resolution"
+                    or not isinstance(node.get("next_resolution_at"), str)
+                    or datetime.fromisoformat(node["next_resolution_at"]) > instant
+                ):
+                    continue
+                resume_state = node.pop("resolution_resume_state", None)
+                if resume_state not in {"pending", "ready"}:
+                    raise RuntimeError("resolution wait resume state is invalid")
+                node["state"] = resume_state
+                node.pop("next_resolution_at", None)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "output_resolution_ready",
+                    {"resolution_read_count": node["resolution_read_count"]},
+                    node_id=str(candidate_id),
+                )
+                ready.append(str(candidate_id))
+        return tuple(ready)
+
+    def clear_output_resolution(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        producer_identity: Mapping[str, object],
+    ) -> bool:
+        """Clear one matching durable wait after a successful strict read."""
+        identity = canonical_output_publication_identity(producer_identity)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("status") != "running":
+                return False
+            node = projection.get("nodes", {}).get(node_id)
+            if (
+                not isinstance(node, dict)
+                or node.get("state") not in {"pending", "ready"}
+                or "resolution_read_count" not in node
+            ):
+                return False
+            if node.get("resolution_producer_identity") != identity:
+                self._fail_output_resolution_locked(
+                    directory,
+                    projection,
+                    node_id,
+                    node,
+                    code="output_reference_integrity",
+                    message="output reference producer identity changed during resolution",
+                    read_count=int(node.get("resolution_read_count", 0)) + 1,
+                )
+                return True
+            read_count = int(node["resolution_read_count"])
+            self._clear_output_resolution_fields(node)
+            self._append_locked(
+                directory,
+                projection,
+                "output_resolution_cleared",
+                {"resolution_read_count": read_count},
+                node_id=node_id,
+            )
+            return True
+
     def finalize_if_complete(self, run_id: str) -> bool:
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock), workflow_lock(
@@ -7596,6 +13162,8 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] != "running":
+                return False
+            if _pending_session_registry_payloads(projection):
                 return False
             states = {node["state"] for node in projection["nodes"].values()}
             if states - {
@@ -8208,11 +13776,47 @@ class RunStore:
     def _observe_attempt(cls, attempt: Mapping[str, object]) -> str:
         serialized = attempt.get("process_identity")
         if isinstance(serialized, Mapping):
-            return cls._observe_process_identity(serialized)
+            # Reaping an AI worker proves only that its process stopped. The
+            # provider may already have accepted work whose result was never
+            # journaled, so that cut must remain outcome-uncertain.
+            provider_worker_started = attempt.get("executor_id") in {
+                "agent",
+                "command",
+                "prompt",
+                "loop",
+                "approval",
+            }
+            process_stop = attempt.get("process_stop")
+            provider_dispatch = attempt.get("provider_dispatch")
+            provider_work_possible = bool(
+                provider_worker_started
+                and isinstance(provider_dispatch, Mapping)
+                and provider_dispatch.get("state") == "released"
+            )
+            if (
+                not provider_work_possible
+                and isinstance(process_stop, Mapping)
+                and process_stop.get("identity_matched") is True
+                and process_stop.get("cleaned") is True
+            ):
+                return "known_stopped"
+            observation = cls._observe_process_identity(serialized)
+            if not provider_work_possible:
+                return observation
+            return (
+                "still_running"
+                if observation == "still_running"
+                else "outcome_uncertain"
+            )
         spawn = attempt.get("spawn")
         if not isinstance(spawn, Mapping):
             return "not_started"
-        if spawn.get("state") == "failed":
+        if spawn.get("state") in {"intent", "failed"}:
+            if (
+                spawn.get("state") == "intent"
+                and attempt.get("effect_classification") == "outward"
+            ):
+                return "outcome_uncertain"
             return "not_started"
         return "outcome_uncertain"
 
@@ -8279,6 +13883,12 @@ class RunStore:
                 effect_classification = str(
                     attempt.get("effect_classification", "replay_safe")
                 )
+                process_stop = attempt.get("process_stop")
+                termination_confirmed = observation == "not_started" or bool(
+                    isinstance(process_stop, Mapping)
+                    and process_stop.get("identity_matched") is True
+                    and process_stop.get("cleaned") is True
+                )
                 node["recovery"] = {
                     "attempt_id": claim["attempt_id"],
                     "owner_id": attempt.get("owner_id", claim.get("owner_id")),
@@ -8290,8 +13900,7 @@ class RunStore:
                     "process_identity": attempt.get("process_identity"),
                     "observation": observation,
                     "interrupted_at": _utc_now(),
-                    "termination_confirmed": observation
-                    in {"known_stopped", "not_started"},
+                    "termination_confirmed": termination_confirmed,
                 }
                 requires_reconcile = effect_classification == "outward" or (
                     observation == "outcome_uncertain"
@@ -8433,6 +14042,12 @@ class RunStore:
             effect_classification = str(
                 attempt.get("effect_classification", "replay_safe")
             )
+            process_stop = attempt.get("process_stop")
+            termination_confirmed = observation == "not_started" or bool(
+                isinstance(process_stop, Mapping)
+                and process_stop.get("identity_matched") is True
+                and process_stop.get("cleaned") is True
+            )
             node.pop("claim", None)
             node["recovery"] = {
                 "attempt_id": claim.attempt_id,
@@ -8445,8 +14060,7 @@ class RunStore:
                 "process_identity": attempt.get("process_identity"),
                 "observation": observation,
                 "interrupted_at": _utc_now(),
-                "termination_confirmed": observation
-                in {"known_stopped", "not_started"},
+                "termination_confirmed": termination_confirmed,
             }
             requires_reconcile = effect_classification == "outward" or (
                 observation == "outcome_uncertain"
@@ -8815,6 +14429,59 @@ class RunStore:
             if failed_cleanup:
                 return {**projection, "cancellation_outcome": "cleanup_failed"}
 
+            pending_registry_payloads = _pending_session_registry_payloads(projection)
+            if pending_registry_payloads:
+                if projection.get("status") == "recovery_pending":
+                    reset_payloads = {}
+                    for pending_payload in pending_registry_payloads.values():
+                        candidate, _retry_count = (
+                            _session_registry_candidate_from_payload(
+                                pending_payload
+                            )
+                        )
+                        reset_payloads[candidate.winning_attempt_id] = (
+                            _session_registry_candidate_payload(
+                                candidate,
+                                retry_count=0,
+                            )
+                        )
+                    _store_pending_session_registry_payloads(
+                        projection,
+                        reset_payloads,
+                    )
+                    projection.pop("next_registry_update_at", None)
+                    projection["status"] = "running"
+                    projection["last_error"] = None
+                self._append_locked(
+                    directory,
+                    projection,
+                    "cancel_registry_update_pending",
+                    {"reason_code": "pending_session_registry_update"},
+                )
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status=?, desired_status='cancelled', "
+                        "updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="cancel_registry_update_pending",
+                    )
+                self._notify_coordinator()
+                return {
+                    **projection,
+                    "cancellation_outcome": "registry_update_pending",
+                }
+
             projection["status"] = "cancelled"
             projection["desired_status"] = None
             for node in projection["nodes"].values():
@@ -8864,6 +14531,38 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise WorkflowConflict("stale resume decision")
+            if projection["status"] == "recovery_pending":
+                pending_registry_payloads = _pending_session_registry_payloads(
+                    projection
+                )
+                reset_payloads = {}
+                for pending_payload in pending_registry_payloads.values():
+                    candidate, _retry_count = (
+                        _session_registry_candidate_from_payload(pending_payload)
+                    )
+                    reset_payloads[candidate.winning_attempt_id] = (
+                        _session_registry_candidate_payload(
+                            candidate,
+                            retry_count=0,
+                        )
+                    )
+                _store_pending_session_registry_payloads(
+                    projection,
+                    reset_payloads,
+                )
+                projection.pop("next_registry_update_at", None)
+                projection["last_error"] = None
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_resumed",
+                    {"reason_code": "persistent_session_registry_update_retry"},
+                )
+                return self._request_runnable_locked(
+                    directory,
+                    projection,
+                    reason="persistent_session_registry_update_retry",
+                )
             if projection["status"] not in {"failed", "interrupted"}:
                 if (
                     projection.get("status") == "running"
@@ -9069,17 +14768,81 @@ class RunStore:
                     definition = definitions[node_id]
                     approval = definition.value
                     if bool(approval.get("capture_response")):
-                        relative = Path("nodes") / node_id / "approval" / "output.txt"
                         encoded = safe_response.encode("utf-8")
-                        _atomic_text(directory / relative, safe_response)
+                        output_type = definition.options.get("output_type")
+                        typed_approval = (
+                            projection.get("language", {}).get("effective_profile")
+                            == WorkflowLanguageProfile.ARCHON_2026_07.value
+                            and output_type is not None
+                        )
+                        attempt_id = (
+                            str(node["attempts"][-1]["attempt_id"])
+                            if typed_approval
+                            else None
+                        )
+                        if attempt_id is not None:
+                            relative = _write_or_reuse_typed_approval_output(
+                                directory,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                data=encoded,
+                            )
+                        else:
+                            relative = (
+                                Path("nodes")
+                                / node_id
+                                / "approval"
+                                / "output.txt"
+                            )
+                            _atomic_text(directory / relative, safe_response)
                         artifact = {
                             "node_id": node_id,
-                            "attempt_id": None,
+                            "attempt_id": attempt_id,
                             "relative_path": relative.as_posix(),
-                            "media_type": "text/plain",
+                            "media_type": (
+                                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE
+                                if typed_approval
+                                else "text/plain"
+                            ),
                             "size_bytes": len(encoded),
                             "sha256": _sha256(encoded),
                         }
+                        if typed_approval:
+                            assert attempt_id is not None
+                            artifact_ref = ArtifactRef(
+                                relative_path=relative.as_posix(),
+                                media_type=_TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+                                size_bytes=len(encoded),
+                                sha256=_sha256(encoded),
+                            )
+                            publication_candidate = TypedPublicationCandidate(
+                                attempt_relative_path=relative.as_posix(),
+                                output_type=str(output_type),
+                                media_type=_TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+                                size_bytes=len(encoded),
+                                sha256=_sha256(encoded),
+                                schema_fingerprint=None,
+                                canonicalization_version=1,
+                                session_id=None,
+                            )
+                            canonical_artifact = (
+                                _canonical_typed_publication_artifact(
+                                    (artifact_ref,),
+                                    publication_candidate,
+                                )
+                            )
+                            publication_ref = self._publish_typed_bundle_locked(
+                                directory,
+                                projection,
+                                run_id=run_id,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                artifact=canonical_artifact,
+                                candidate=publication_candidate,
+                            )
+                            artifact.update(
+                                _typed_publication_fields(publication_ref)
+                            )
                         projection["artifacts"].append(artifact)
                         event_payload["artifact"] = artifact
                     node["state"] = "succeeded"
@@ -9984,6 +15747,12 @@ __all__ = [
     "ForegroundExecutionConflict",
     "InputSnapshotError",
     "NodeClaim",
+    "PublicationIntegrityError",
+    "PublicationNotFoundError",
+    "PublicationUnavailableError",
     "RunStore",
     "StorageQuotaError",
+    "TypedPublicationCandidate",
+    "TypedPublicationRef",
+    "VerifiedPublication",
 ]
