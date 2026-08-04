@@ -174,6 +174,69 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
     assert outbox.history(run_id="run-api")[0]["state"] == "delivered"
 
 
+def test_desktop_projection_failure_retains_fixed_fallback_reason(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "projection-fallback-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    outbox = NotificationOutbox(RunStore(home))
+    notification_id = outbox.record(
+        run_id="projection-fallback-run",
+        kind="completion",
+        destination="desktop",
+        transition_version=1,
+        payload={"status": "succeeded"},
+    )
+    client = TestClient(_app(_module().router))
+    lease = client.get(
+        "/api/plugins/workflow/notifications/lease?client_id=electron-projection"
+    )
+    assert lease.status_code == 200
+    assert lease.json()["items"][0]["notification_id"] == notification_id
+
+    failed = client.post(
+        f"/api/plugins/workflow/notifications/{notification_id}/fail",
+        json={"client_id": "electron-projection"},
+    )
+
+    assert failed.status_code == 200
+    assert failed.json()["outcome"] == "retry_scheduled"
+    history = outbox.history(run_id="projection-fallback-run")
+    assert history[0]["last_error"] == "projection_failed"
+
+
+def test_desktop_projection_failure_normalizes_free_form_detail(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "projection-free-form-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    outbox = NotificationOutbox(RunStore(home))
+    notification_id = outbox.record(
+        run_id="projection-free-form-run",
+        kind="completion",
+        destination="desktop",
+        transition_version=1,
+        payload={"status": "succeeded"},
+    )
+    canary = "private desktop provider session /path history"
+    client = TestClient(_app(_module().router))
+    lease = client.get(
+        "/api/plugins/workflow/notifications/lease?client_id=electron-free-form"
+    )
+    assert lease.status_code == 200
+    assert lease.json()["items"][0]["notification_id"] == notification_id
+
+    failed = client.post(
+        f"/api/plugins/workflow/notifications/{notification_id}/fail",
+        json={"client_id": "electron-free-form", "error": canary},
+    )
+
+    assert failed.status_code == 200
+    history = outbox.history(run_id="projection-free-form-run")
+    assert history[0]["last_error"] == "notification delivery failed"
+    assert canary not in json.dumps(history, sort_keys=True)
+
+
 def test_dismissal_records_presentation_only(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -635,7 +698,7 @@ def test_gateway_run_refuses_declared_archon_incompatibility_before_persistence(
     workflow_path = workflow_writer(
         tmp_path / "package",
         name="gateway-archon-blocked",
-        nodes=[{"id": "start", "bash": "true", "timeout": 1000}],
+        nodes=[{"id": "start", "prompt": "x", "effort": "high"}],
     )
     workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"

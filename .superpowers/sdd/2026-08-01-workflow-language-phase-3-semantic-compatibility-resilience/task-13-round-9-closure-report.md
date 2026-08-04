@@ -173,3 +173,80 @@ assertion now passes.
   and the notification reconciliation wrapper.
 - The two pre-existing ignored rereview artifacts and all unrelated files were
   preserved.
+
+## Follow-up closure: Desktop projection failure reason
+
+### Finding and correction
+
+The Desktop notification failure endpoint supplies the fixed fallback
+`projection_failed` when the Electron client omits `error`, but the centralized
+stable-reason allowlist did not contain that code. The existing normalization
+boundary consequently replaced the host-owned fallback with `notification
+delivery failed`.
+
+The correction adds the fixed Desktop fallback and the gateway producer's
+platform-neutral `SEND_ERROR_KINDS` values to the same exact-value allowlist.
+No prefix, pattern, or arbitrary-detail acceptance was added.
+
+### Producer audit
+
+The audit was limited to the two notification-failure producer families:
+
+- Desktop API: `projection_failed`.
+- Coordinator delivery receipts: receipt status fallbacks
+  (`retryable_failure`, `permanent_failure`, `outcome_uncertain`,
+  `unauthorized`); gateway delivery codes (`gateway_loop_unavailable`,
+  `adapter_unavailable`, `adapter_send_timeout`, `adapter_send_failed`,
+  `invalid_text`, `delivery_store_unavailable`); and the platform-neutral
+  error kinds (`too_long`, `bad_format`, `forbidden`, `not_found`,
+  `rate_limited`, `transient`, `unknown`).
+
+All fixed host-owned codes from those producers are now represented. Dynamic
+exception details such as `delivery_exception:<type>` and
+`adapter_send_exception:<type>`, plus provider/platform free-form error text,
+continue to normalize to the generic reason.
+
+### TDD evidence
+
+Two API-level tests were added through `/notifications/{id}/fail`: one proves
+an omitted error retains `projection_failed`; the other proves a free-form
+detail is normalized and not persisted.
+
+Initial exact-file RED:
+
+```text
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notification_delivery.py
+```
+
+Result: **14 passed / 2 failed**. One failure was the intended missing
+`projection_failed` behavior. The other was an unrelated stale compatibility
+fixture whose bash timeout was now runnable, so it reached a later package
+permission check instead of the compatibility refusal it was meant to assert.
+Running that existing test alone reproduced the same failure.
+
+The owned fixture was updated to use a prompt node with unsupported `effort`,
+preserving its original pre-persistence compatibility-block contract. The
+exact-file RED was then rerun before the production change.
+
+Result: **15 passed / 1 failed**. The sole failure was the intended assertion:
+expected `projection_failed`, actual `notification delivery failed`. The
+free-form normalization test already passed.
+
+### GREEN and static evidence
+
+```text
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_notification_delivery.py tests/plugins/workflow/test_notifications.py tests/plugins/workflow/test_coordinator.py
+```
+
+Result: **3 files / 70 passed / 0 failed**
+(`16 + 15 + 39`).
+
+```text
+../../.venv/bin/ruff check plugins/workflow/notifications.py tests/plugins/workflow/test_notification_delivery.py
+git diff --check
+```
+
+Result: **all checks passed / clean diff check**.
+
+Retries were disabled for every test command. Only ordinary functional tests
+were run.

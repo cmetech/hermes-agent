@@ -38,13 +38,21 @@ _STABLE_DELIVERY_FAILURE_REASONS = frozenset(
         "adapter_send_failed",
         "adapter_send_timeout",
         "adapter_unavailable",
+        "bad_format",
         "delivery_store_unavailable",
+        "forbidden",
         "gateway_loop_unavailable",
         "invalid_text",
+        "not_found",
         "outcome_uncertain",
         "permanent_failure",
+        "projection_failed",
+        "rate_limited",
         "retryable_failure",
+        "too_long",
+        "transient",
         "unauthorized",
+        "unknown",
     }
 )
 
