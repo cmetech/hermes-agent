@@ -1196,3 +1196,124 @@ Result: `All checks passed!`. `git diff --check` is clean.
 - Existing opposite-order journal-before-SQLite failure behavior and schema-v1
   compatibility remain covered and green.
 - No Task 14 work or out-of-scope mutation was performed.
+
+## Fix Round 6 — Selection-derived completion event privacy
+
+### Starting identity and review disposition
+
+- HEAD: `17ab0ece5cdbc8e876f88e13483a67f22cec9b01`
+- Tree: `f4c49ab306792cb26f2e8aaf5641067ed6b68660`
+- Worktree: clean
+
+The user explicitly authorized this sixth bounded Task 13 fix round. The round
+addresses the sole Important finding shared by
+`task-13-spec-rereview-5.md` and `task-13-quality-rereview-5.md`: public event
+privacy could opt in through mutable completion-frame fields even though an
+exact selection authority was already bound to its immutable selection journal
+frame.
+
+### Correction
+
+- Event validation now starts from the exact bound private selection authority
+  and its activation sequence. It finds the first journal projection in which
+  that exact selected attempt succeeds, without trusting the completion's
+  outer event type, language normalizer, public recovery list, or public
+  registry marker.
+- An exact bound winner activation is also validated directly. Historical
+  schema-v1 selections retain their prior v3 completion fallback; ordinary v3
+  non-recovery and legacy/v1/v2 events have no bound Task 13 selection and keep
+  their existing public behavior.
+- Projection authority now requires an exact winner for every succeeded attempt
+  derived from a framed selection, independently of the projection's mutable
+  normalizer and recovery list. Removing the marker and winner therefore fails
+  closed even when the completion rewrites its other opt-in fields.
+- Validation remains scoped to the completion boundary rather than every later
+  projection. A later post-resolution head may be damaged while the immutable
+  winner still protects public redaction; it does not retroactively replace the
+  already validated completion event.
+
+### Exact TDD evidence
+
+Every Python test command used `scripts/run_tests.sh` with
+`HERMES_PYTHON=../../.venv/bin/python` and
+`HERMES_TEST_FILE_RETRIES=0`. No direct pytest invocation or retry was used.
+
+Exact RED and first GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'selected_recovery_event_privacy_does_not_trust_mutable_completion_fields'
+```
+
+RED before production edits: **0 passed / 4 failed** with **88 deselected**.
+All four cases returned a damaged recovery completion instead of raising
+`JournalRecoveryError`: removal of the public recovery list, rewrite of the
+outer event type, rewrite of the projection normalizer, and all three together.
+Every case also removed the public attempt marker and private winner while
+retaining the valid exact-bound selection authority and selection event.
+
+First GREEN after the selection-derived correction: **4 passed / 0 failed**.
+
+The first complete recovery-file run then found one compatibility regression:
+**91 passed / 1 failed** at
+`test_postresolution_event_privacy_uses_private_anchor_without_public_marker`.
+The first implementation validated every later projection, so it rejected an
+intentionally damaged later post-resolution head rather than using the intact
+completion and winner to redact it. No test was weakened. Validation was
+narrowed to the first selected-attempt success projection plus the exact winner
+activation.
+
+Exact focused compatibility GREEN command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py -k 'selected_recovery_event_privacy_does_not_trust_mutable_completion_fields or postresolution_event_privacy_uses_private_anchor_without_public_marker or session_bearing_completion_event_fails_closed_without_winner_authority'
+```
+
+Result: **7 passed / 0 failed**. The complete modified recovery file then
+passed **92/92**.
+
+### Final Fix Round 6 verification
+
+Canonical Task 13 ten-file command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_phase3_code_catalog.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_journal_reserve_fanout.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_coordinator_multiprocess.py tests/plugins/workflow/test_evidence_api.py
+```
+
+Result: **10 files, 314 passed / 0 failed**, 14 workers, 23.5 seconds.
+
+Expanded changed-seam/scheduler/Desktop command:
+
+```bash
+HERMES_PYTHON=../../.venv/bin/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_persistent_session_recovery.py tests/plugins/workflow/test_run_queries.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_cli.py
+```
+
+Result: **9 files, 561 passed / 0 failed**, 14 workers, 82.3 seconds. The
+generic plugin-agent file passed **129/129** and authenticated Desktop API file
+passed **157/157**.
+
+Exact static command:
+
+```bash
+../../.venv/bin/ruff check plugins/workflow/store.py tests/plugins/workflow/test_persistent_session_recovery.py
+git diff --check
+```
+
+Result: Ruff reported `All checks passed!`; `git diff --check` was clean.
+
+### Fix Round 6 changed files and self-review
+
+- `.superpowers/sdd/2026-08-01-workflow-language-phase-3-semantic-compatibility-resilience/task-13-report.md`
+- `plugins/workflow/store.py`
+- `tests/plugins/workflow/test_persistent_session_recovery.py`
+
+The mutation matrix exercises `tail_events()`, `latest_event_page()`,
+`events_after()`/timeline evidence, and the real `workflow events --json` CLI.
+Every fail-closed diagnostic/output is asserted not to contain the original or
+substituted session ID or fingerprint. The behavior is anchored in private
+selection identity and an actual recovered typed-publication completion, not a
+mocked event API.
+
+No Task 14 code, endpoint, Desktop production file, prompt, history, toolset,
+model-tool schema, workflow language surface, user configuration, Phase 4/5
+behavior, shared-base checkout, literal `main`, or brand ref was changed. No
+push, publication, merge, branch deletion, or worktree deletion was performed.

@@ -4631,18 +4631,74 @@ class RunStore:
         ],
     ) -> None:
         """Fail closed before projecting a v3 recovery completion payload."""
-        for event in events:
-            if event.get("event_type") != "node_succeeded":
+        event_list = tuple(events)
+        selections = private_authorities.get(
+            "session_recovery_selection_authority", {}
+        )
+        winners = private_authorities.get("session_registry_winner_authority", {})
+        if not selections and not winners:
+            return
+        events_by_sequence = {
+            int(event["sequence"]): event
+            for event in event_list
+            if isinstance(event.get("sequence"), int)
+            and not isinstance(event.get("sequence"), bool)
+        }
+        completion_sequences: set[int] = set()
+        for authority in winners.values():
+            _candidate, _retry_count, activation, _event_type = (
+                _session_registry_candidate_from_authority(authority)
+            )
+            if activation is not None:
+                completion_sequences.add(activation)
+        has_unframed_selection = False
+        for attempt_id, authority in selections.items():
+            selection, activation, _event_type = (
+                _session_recovery_selection_from_authority(authority)
+            )
+            if activation is None:
+                has_unframed_selection = True
                 continue
+            for event in event_list:
+                sequence = event.get("sequence")
+                if (
+                    isinstance(sequence, bool)
+                    or not isinstance(sequence, int)
+                    or sequence < activation
+                ):
+                    continue
+                projection = event.get("projection")
+                nodes = (
+                    projection.get("nodes")
+                    if isinstance(projection, Mapping)
+                    else None
+                )
+                node = (
+                    nodes.get(selection.key.node_id)
+                    if isinstance(nodes, Mapping)
+                    else None
+                )
+                attempts = node.get("attempts") if isinstance(node, Mapping) else None
+                if isinstance(attempts, list) and any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("attempt_id") == attempt_id
+                    and attempt.get("state") == "succeeded"
+                    for attempt in attempts
+                ):
+                    completion_sequences.add(sequence)
+                    break
+        for event in event_list:
             projection = event.get("projection")
-            if not isinstance(projection, Mapping):
-                continue
-            language = projection.get("language")
-            if not isinstance(language, Mapping) or language.get(
-                "normalizer_version"
-            ) != 3:
-                continue
-            nodes = projection.get("nodes")
+            language = (
+                projection.get("language")
+                if isinstance(projection, Mapping)
+                else None
+            )
+            nodes = (
+                projection.get("nodes")
+                if isinstance(projection, Mapping)
+                else None
+            )
             node = (
                 nodes.get(event.get("node_id"))
                 if isinstance(nodes, Mapping)
@@ -4653,13 +4709,28 @@ class RunStore:
                 if isinstance(node, Mapping)
                 else None
             )
-            if not isinstance(recoveries, list) or not any(
-                isinstance(recovery, Mapping)
-                and recovery.get("attempt_id") == event.get("attempt_id")
-                for recovery in recoveries
-            ):
-                continue
             if (
+                has_unframed_selection
+                and event.get("event_type") == "node_succeeded"
+                and isinstance(language, Mapping)
+                and language.get("normalizer_version") == 3
+                and isinstance(recoveries, list)
+                and any(
+                    isinstance(recovery, Mapping)
+                    and recovery.get("attempt_id") == event.get("attempt_id")
+                    for recovery in recoveries
+                )
+                and isinstance(event.get("sequence"), int)
+            ):
+                completion_sequences.add(int(event["sequence"]))
+        for sequence in completion_sequences:
+            event = events_by_sequence.get(sequence)
+            if event is None:
+                raise JournalRecoveryError(
+                    "persistent session completion authority is invalid"
+                )
+            projection = event.get("projection")
+            if not isinstance(projection, Mapping) or (
                 event.get("projection_sha256") != _projection_digest(projection)
                 or not self._private_session_authorities_match_projection(
                     projection,
@@ -4842,6 +4913,7 @@ class RunStore:
             "session_recovery_selection_authority", {}
         )
         winners = private_authorities.get("session_registry_winner_authority", {})
+        bound_selected_successes: set[str] = set()
         for attempt_id, selection_authority in selections.items():
             if not self._private_selection_authority_matches(
                 projection,
@@ -4850,6 +4922,26 @@ class RunStore:
                 require_active=False,
             ):
                 return False
+            try:
+                selection, activation, _event_type = (
+                    _session_recovery_selection_from_authority(selection_authority)
+                )
+            except JournalRecoveryError:
+                return False
+            if (
+                activation is None
+                or int(projection.get("event_sequence", 0)) < activation
+            ):
+                continue
+            node = nodes.get(selection.key.node_id)
+            attempts = node.get("attempts") if isinstance(node, Mapping) else None
+            if isinstance(attempts, list) and any(
+                isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == attempt_id
+                and attempt.get("state") == "succeeded"
+                for attempt in attempts
+            ):
+                bound_selected_successes.add(attempt_id)
         anchored_winners: dict[str, SessionRegistryUpdateCandidate] = {}
         for attempt_id, authority in winners.items():
             try:
@@ -4882,6 +4974,20 @@ class RunStore:
                     continue
             if (
                 not _session_registry_candidate_is_corroborated(
+                    projection, candidate
+                )
+                or not self._private_session_registry_authority_matches(
+                    projection,
+                    candidate,
+                    private_authorities=private_authorities,
+                )
+            ):
+                return False
+        for attempt_id in bound_selected_successes:
+            candidate = anchored_winners.get(attempt_id)
+            if (
+                candidate is None
+                or not _session_registry_candidate_is_corroborated(
                     projection, candidate
                 )
                 or not self._private_session_registry_authority_matches(

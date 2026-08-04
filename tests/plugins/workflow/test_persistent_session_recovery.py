@@ -3355,3 +3355,121 @@ def test_session_bearing_completion_event_fails_closed_without_winner_authority(
     cli_output = capsys.readouterr().out
     assert original_session not in cli_output
     assert substituted_session not in cli_output
+
+
+@pytest.mark.parametrize(
+    "completion_damage",
+    ("recovery-list", "event-type", "normalizer", "all"),
+)
+def test_selected_recovery_event_privacy_does_not_trust_mutable_completion_fields(
+    tmp_path, workflow_writer, capsys, completion_damage
+) -> None:
+    """Bound selection authority must identify damaged recovery completions."""
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / f"event-selection-{completion_damage}",
+        name=f"event-selection-{completion_damage}",
+        nodes=[
+            {
+                "id": "analyze",
+                "prompt": "Analyze",
+                "output_type": "RecoveredReport",
+            }
+        ],
+    )
+    home = tmp_path / f"event-selection-{completion_damage}-home"
+    store = RunStore(home)
+    registry = NodeSessionRegistry(home)
+    runner = _PersistentRunner()
+    _run_once(store, package, runner, registry, f"{completion_damage}-seed")
+    runner.shared_failure = PluginAgentSessionMissingError("confirmed absent")
+    run_id, result = _run_once(
+        store,
+        package,
+        runner,
+        registry,
+        f"event-selection-{completion_damage}",
+    )
+    internal = store.load_run(run_id)
+    original_session = internal["nodes"]["analyze"]["session_id"]
+    original_fingerprint = internal["nodes"]["analyze"]["cache_fingerprint"]
+    substituted_session = f"substituted-{completion_damage}-session"
+    substituted_fingerprint = "f" * 64
+    attempt_id = result["nodes"]["analyze"]["attempts"][-1]["attempt_id"]
+
+    def damage_completion(event) -> None:
+        projection = event["projection"]
+        node = projection["nodes"]["analyze"]
+        attempt = node["attempts"][-1]
+        attempt.pop("session_registry_authority", None)
+        attempt["metadata"]["session_id"] = substituted_session
+        attempt["metadata"]["cache_fingerprint"] = substituted_fingerprint
+        node["session_id"] = substituted_session
+        node["cache_fingerprint"] = substituted_fingerprint
+        if completion_damage in {"recovery-list", "all"}:
+            node["session_recoveries"] = []
+        if completion_damage in {"normalizer", "all"}:
+            projection["language"]["normalizer_version"] = 2
+        if completion_damage in {"event-type", "all"}:
+            event["event_type"] = "node_completion_rewritten"
+        for artifact in projection["artifacts"]:
+            if artifact.get("attempt_id") == attempt_id:
+                artifact["session_id"] = substituted_session
+        event["payload"]["metadata"]["session_id"] = substituted_session
+        event["payload"]["metadata"][
+            "cache_fingerprint"
+        ] = substituted_fingerprint
+        for artifact in event["payload"].get("artifacts", []):
+            artifact["session_id"] = substituted_session
+
+    _rewrite_journal_event(store, run_id, "node_succeeded", damage_completion)
+    with sqlite3.connect(store.database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM session_recovery_selection_authority "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone() is not None
+        connection.execute(
+            "DELETE FROM session_registry_winner_authority WHERE attempt_id=?",
+            (attempt_id,),
+        )
+        connection.commit()
+
+    public_reads = (
+        lambda: store.tail_events(run_id),
+        lambda: store.latest_event_page(run_id),
+        lambda: store.events_after(run_id),
+        lambda: EvidenceReader(store).query(run_id, kind="timeline"),
+    )
+    for read_public in public_reads:
+        with pytest.raises(JournalRecoveryError) as exc_info:
+            read_public()
+        diagnostic = str(exc_info.value)
+        for private_value in (
+            original_session,
+            original_fingerprint,
+            substituted_session,
+            substituted_fingerprint,
+        ):
+            assert private_value not in diagnostic
+
+    from plugins.workflow.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args([
+        "--hermes-home",
+        str(home),
+        "events",
+        run_id,
+        "--json",
+    ])
+    assert args.func(args) == 70
+    cli_output = capsys.readouterr().out
+    for private_value in (
+        original_session,
+        original_fingerprint,
+        substituted_session,
+        substituted_fingerprint,
+    ):
+        assert private_value not in cli_output
