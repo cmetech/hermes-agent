@@ -52,6 +52,7 @@ upstream_changes:
   - hermes_constants.py
   - hermes_cli/banner.py
   - hermes_cli/main.py
+  - hermes_cli/_startup_fast.py
   - tests/hermes_cli/test_version_product_label.py
   - tests/hermes_cli/test_banner_git_state.py
   - tests/hermes_cli/test_tui_resume_flow.py
@@ -443,6 +444,38 @@ upstream_changes:
     without granting a different action or exposing process-global resources.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: plugin-agent-worker-tool-search-pin
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent_worker.py
+  owned_symbols:
+  - worker_tool_search
+  - original_tool_search_config
+  tests:
+  - tests/plugins/workflow/test_node_mcp.py
+  expected_commit_subject: 'fix(workflow): pin tool-search off inside plugin-agent workers'
+  upstream_candidate: false
+  merge_guidance: Upstream v0.20.0's Tool Search progressive disclosure
+    (tools/tool_search.py, assembled as the last step of
+    model_tools.get_tool_definitions) replaces MCP and non-core plugin tools with
+    tool_search/describe/call bridge tools past a size threshold. A plugin-agent
+    node's tool surface is pinned EXACTLY by its immutable request (allowed_tools
+    plus the request MCP mapping), so deferral breaks the node contract - the
+    pinned names vanish from the model-visible tool list while the run still
+    "completes". The worker therefore pins tool-search off for its own process by
+    swapping tools.tool_search.load_config through the same private-loader seam
+    used for the request MCP config, and restores it on the teardown path. On a
+    merge, keep this pin adjacent to the worker's _load_mcp_config swap; if
+    upstream adds a per-call opt-out (get_tool_definitions
+    skip_tool_search_assembly plumbed through the agent), prefer adapting to that
+    and drop the process-local pin. Guarded by
+    tests/plugins/workflow/test_node_mcp.py::test_real_plugin_agent_runs_request_mcp_and_reaps_it
+    (first provider request must carry the pinned MCP tool names verbatim).
+  removal_condition: Remove when the agent construction path lets a caller
+    disable tool-search assembly per run (not per process), or when tool-search
+    exempts explicitly allowlisted tool names from deferral.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: plugin-agent-persistent-session-missing-classification
   change_class: agent-core-generic
