@@ -781,10 +781,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
-        # banner when a `ready` task would otherwise sit idle because no
-        # gateway is running (or dispatch_in_gateway=false). Only emit
-        # for ready+assigned tasks; triage/todo are expected to wait,
-        # and unassigned tasks can't be dispatched regardless.
+        # banner when a task needs a running dispatcher. This includes:
+        # triage/todo (which depend on dispatcher tick for auto-decompose),
+        # and ready tasks with an assignee. Exclude unassigned ready tasks
+        # since the dispatcher skips them regardless; the missing piece
+        # there is the assignee, not the dispatcher.
         if task and _task_needs_dispatcher(task.status, task.assignee):
             try:
                 from hermes_cli.kanban import _check_dispatcher_presence
