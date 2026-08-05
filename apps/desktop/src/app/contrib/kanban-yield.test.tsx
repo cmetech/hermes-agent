@@ -37,6 +37,9 @@ vi.mock('./panes', () => ({
   useStatusbarContributions: () => []
 }))
 vi.mock('../kanban', () => ({ KanbanView: () => <div data-testid="builtin-kanban" /> }))
+// The banner needs a QueryClientProvider this route table doesn't set up;
+// the yield contract under test is which board renders, not the banner.
+vi.mock('../kanban/dispatcher-banner', () => ({ DispatcherBanner: () => null }))
 vi.mock('@/store/profile', () => ({ $activeGatewayProfile: atom(null) }))
 vi.mock('@/store/session', () => ({ $freshDraftReady: atom(false), $gatewayState: atom('closed') }))
 
