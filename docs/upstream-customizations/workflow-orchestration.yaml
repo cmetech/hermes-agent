@@ -663,6 +663,7 @@ upstream_changes:
   - apps/desktop/src/app/kanban/index.test.tsx
   - apps/desktop/src/app/kanban/store.ts
   - apps/desktop/src/app/kanban/task-inspector.tsx
+  - apps/desktop/src/plugins/kanban/plugin.tsx
   - apps/desktop/src/components/activity-board/activity-board.tsx
   - apps/desktop/src/components/activity-board/activity-board.test.tsx
   - apps/desktop/src/components/activity-board/types.ts
@@ -693,7 +694,11 @@ upstream_changes:
   - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
   expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
   upstream_candidate: true
-  merge_guidance: "YIELD CONTRACT (2026-08-05, after upstream v0.20.0 shipped its opt-in\
+  merge_guidance: "YIELD CONTRACT + FORK DEFAULT (2026-08-05): the SDK kanban plugin's\
+    \ defaultEnabled is flipped to true on this fork (upstream ships false) - the SDK\
+    \ board is the product's kanban surface; a persisted user toggle always wins. On a\
+    \ merge keep defaultEnabled: true in apps/desktop/src/plugins/kanban/plugin.tsx.\
+    \ (2026-08-05, after upstream v0.20.0 shipped its opt-in\
     \ SDK kanban plugin at apps/desktop/src/plugins/kanban registering its own /kanban\
     \ route + sidebar row): the built-in KanbanView route in contrib/surfaces.tsx is\
     \ gated on no ROUTES_AREA contribution claiming KANBAN_ROUTE, and the sidebar\
