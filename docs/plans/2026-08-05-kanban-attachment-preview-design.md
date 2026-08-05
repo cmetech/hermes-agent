@@ -225,9 +225,13 @@ TDD, extending `apps/desktop/src/plugins/kanban/attachments.test.tsx`:
 - Secondary click calls `revealPath` with `stored_path`.
 - A `false` result from the preview door surfaces a warning toast.
 - No `stored_path` → neither control rendered, filename still visible.
-- The plugin binds the preview door at register time — the Tier 1 lesson: the
-  feature is inert in the real app while every render test passes if the door
-  is never bound.
+
+There is deliberately **no** "binds the door at register time" test here, unlike
+Tier 1. `host` is a module-level object in the SDK that closes over core
+functions directly (`sdk/index.ts:58`), so a `host` door needs no per-plugin
+binding — that requirement is specific to `ctx.*` doors like Tier 1's
+`bindOs(ctx.os)`. Adding a bind step would be cargo-culting Tier 1's shape onto
+a surface that does not have it.
 
 Plus an SDK-level test that `host.previewFile` resolves `false` for a missing
 file rather than throwing.
