@@ -693,7 +693,15 @@ upstream_changes:
   - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
   expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
   upstream_candidate: true
-  merge_guidance: "Preserve separate Workflow and Kanban lifecycle authorities, durable\
+  merge_guidance: "YIELD CONTRACT (2026-08-05, after upstream v0.20.0 shipped its opt-in\
+    \ SDK kanban plugin at apps/desktop/src/plugins/kanban registering its own /kanban\
+    \ route + sidebar row): the built-in KanbanView route in contrib/surfaces.tsx is\
+    \ gated on no ROUTES_AREA contribution claiming KANBAN_ROUTE, and the sidebar\
+    \ filters any built-in row whose route a contributed row claims. Decision class:\
+    \ adapt - the built-in operations board is the fallback when the richer plugin is\
+    \ disabled; never render both (duplicate menu items, and the earlier static route\
+    \ shadows the plugin's page). Do not resolve a merge by unconditionally restoring\
+    \ the static route. Preserve separate Workflow and Kanban lifecycle authorities, durable\
     \ non-overlay routes, profile-scoped REST calls, extension-safe chat, and complete\
     \ locale/navigation composition while reconciling upstream shell changes. The\
     \ shell host MOVES across upstream refactors: v0.19.0 retired apps/desktop/src/app/desktop-controller.tsx\
