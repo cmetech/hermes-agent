@@ -19,7 +19,7 @@ import { $freshDraftReady, $gatewayState } from '@/store/session'
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
-import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
+import { contributedRoutes, KANBAN_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
@@ -121,6 +121,11 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   const gatewayState = useStore($gatewayState)
   useContributions(ROUTES_AREA)
   const routeContributions = contributedRoutes()
+  // Upstream's SDK kanban plugin (v0.20.0, opt-in) registers its own richer
+  // `/kanban` board page. When it is enabled, the built-in operations board
+  // stands down — otherwise this static route shadows the contributed one
+  // (same path, earlier in the table) and BOTH nav rows land on the old page.
+  const kanbanContributed = routeContributions.some(route => route.path === KANBAN_ROUTE)
 
   // Recapture the live gateway instance whenever the connection state flips.
   // getGateway reads a controller ref, so gatewayState is the intentional
@@ -172,7 +177,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
       <Route element={page(<WorkflowsView />)} path="workflows" />
-      <Route element={page(<KanbanView />)} path="kanban" />
+      {!kanbanContributed && <Route element={page(<KanbanView />)} path="kanban" />}
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
       <Route element={null} path="cron" />

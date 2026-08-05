@@ -294,6 +294,18 @@ export function ChatSidebar({
     [navContributions]
   )
 
+  // A contributed row that claims a built-in row's route supersedes it (a
+  // plugin page replacing a built-in page must not leave two menu items for
+  // one path — e.g. the SDK kanban plugin vs the built-in operations board).
+  const navItems = useMemo<SidebarNavItem[]>(() => {
+    const contributedPaths = new Set(contributedNav.map(item => item.route))
+
+    return [
+      ...SIDEBAR_NAV.filter(item => !(item.route && contributedPaths.has(item.route))),
+      ...contributedNav
+    ]
+  }, [contributedNav])
+
   const panesFlipped = useStore($panesFlipped)
   const agentsGrouped = useStore($sidebarAgentsGrouped)
   const pinnedSessionIds = useStore($pinnedSessionIds)
@@ -1136,7 +1148,7 @@ export function ChatSidebar({
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
           <SidebarGroupContent>
             <SidebarMenu className="gap-px">
-              {[...SIDEBAR_NAV, ...contributedNav].map(item => {
+              {navItems.map(item => {
                 const isInteractive = Boolean(item.action) || Boolean(item.route)
 
                 const active =
