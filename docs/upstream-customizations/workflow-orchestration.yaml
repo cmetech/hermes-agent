@@ -52,6 +52,7 @@ upstream_changes:
   - hermes_constants.py
   - hermes_cli/banner.py
   - hermes_cli/main.py
+  - hermes_cli/_startup_fast.py
   - tests/hermes_cli/test_version_product_label.py
   - tests/hermes_cli/test_banner_git_state.py
   - tests/hermes_cli/test_tui_resume_flow.py
