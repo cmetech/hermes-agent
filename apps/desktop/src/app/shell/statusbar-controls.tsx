@@ -109,10 +109,23 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
               <StatusbarItemView item={item} key={`left:${item.id}`} navigate={navigate} />
             ))}
           </div>
-          <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
-            {items.filter(visible).map(item => (
-              <StatusbarItemView item={item} key={`right:${item.id}`} navigate={navigate} />
-            ))}
+          {/* Locked items (the version/update pills) render OUTSIDE the clipped
+              cluster: `lockedVisible` promises "the user can never lose this",
+              but on a narrow window (small RDP sessions especially) the clip
+              silently ate the rightmost item — which is exactly the version
+              pill. Pin them in a shrink-0 tail so width pressure clips the
+              optional middle items instead. */}
+          <div className="flex min-w-0 items-stretch gap-0.5">
+            <div className="flex min-w-0 items-stretch gap-0.5 overflow-x-clip">
+              {items.filter(item => visible(item) && !item.lockedVisible).map(item => (
+                <StatusbarItemView item={item} key={`right:${item.id}`} navigate={navigate} />
+              ))}
+            </div>
+            <div className="flex shrink-0 items-stretch gap-0.5">
+              {items.filter(item => visible(item) && item.lockedVisible).map(item => (
+                <StatusbarItemView item={item} key={`right:${item.id}`} navigate={navigate} />
+              ))}
+            </div>
           </div>
         </footer>
       </ContextMenuTrigger>

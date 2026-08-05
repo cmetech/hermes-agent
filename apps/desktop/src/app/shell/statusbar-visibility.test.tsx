@@ -96,6 +96,22 @@ describe('statusbar item visibility', () => {
     expect(row.getAttribute('aria-checked')).toBe('true')
   })
 
+  it('pins locked right-side items outside the clipped cluster (never lost to overflow)', () => {
+    const statusbar = bar([
+      item('optional-a', 'Optional A'),
+      item('version-client', 'Version', { lockedVisible: true })
+    ])
+
+    const version = within(statusbar).getByText('Version')
+    // The locked pill lives in the shrink-0 tail, not the overflow-x-clip
+    // cluster, so a narrow window clips optional items instead of the version.
+    const pinned = version.closest('.shrink-0')
+    expect(pinned).not.toBeNull()
+    expect(pinned?.className).not.toContain('overflow-x-clip')
+    const optional = within(statusbar).getByText('Optional A')
+    expect(optional.closest('.overflow-x-clip')).not.toBeNull()
+  })
+
   it('leaves items that never opted into the menu alone', () => {
     $statusbarHiddenIds.set(['plugin-thing'])
     bar([{ id: 'plugin-thing', label: 'Plugin thing', variant: 'action' }])
