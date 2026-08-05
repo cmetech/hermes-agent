@@ -81,6 +81,15 @@ export const APP_ROUTES = [
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))
 const RESERVED_PATHS: ReadonlySet<string> = new Set(APP_ROUTES.map(route => route.path))
 
+// Built-in pages that YIELD to a contributed page claiming the same path (the
+// SDK kanban plugin over the built-in operations board — see kanbanContributed
+// in contrib/surfaces.tsx). These contributions must survive the reserved-path
+// filter below: /kanban is in APP_ROUTES on this fork, and silently dropping
+// the plugin's route makes the yield gate unreachable, so the old board
+// renders forever. Every other reserved path stays blocked — a plugin cannot
+// shadow /settings, /skills, ….
+const YIELDING_PATHS: ReadonlySet<string> = new Set([KANBAN_ROUTE])
+
 // ── Contributed routes — the `routes` registry area ─────────────────────────
 // A contribution mounts a FULL PAGE in the workspace pane at `data.path`
 // (`render` on the contribution itself, like every other area). Contributed
@@ -104,7 +113,11 @@ export function contributedRoutes(): Array<{ key: string; path: string; title?: 
       title: c.title,
       render: c.render!
     }))
-    .filter(route => Boolean(route.path.startsWith('/') && route.render) && !RESERVED_PATHS.has(route.path))
+    .filter(
+      route =>
+        Boolean(route.path.startsWith('/') && route.render) &&
+        (!RESERVED_PATHS.has(route.path) || YIELDING_PATHS.has(route.path))
+    )
 }
 
 function isContributedPath(pathname: string): boolean {
