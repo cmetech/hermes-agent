@@ -1347,18 +1347,120 @@ function Test-NodeVersionOk {
     return ($v.Major -gt 22)
 }
 
+# npm 11.10.0-11.16.x honor `min-release-age` but ignore
+# `min-release-age-exclude`, both of which .npmrc sets. That combination applies
+# the 14-day age gate to packages we deliberately exempted, so every install
+# fails ETARGET on a freshly published dependency. The root package.json
+# excludes that band via `engines.npm`, and `engine-strict=true` makes it fatal
+# -- so a system npm in the band cannot install this repo, no matter how new its
+# Node is. Node 24 bundles npm 11.16.0 and clears the Node floor, so this is the
+# common case, not a corner one. Returns $true when the npm is usable.
+#
+# Mirrors npm_supports_npmrc in scripts/install.sh; keep the band in sync with
+# `engines.npm` (tests/test_install_ps1_npm_band_guard.py enforces agreement).
+# An unreadable version is treated as unusable, matching the POSIX side: the
+# cost is provisioning a managed Node we may not have needed, and the cost of
+# the other default is an install whose npm silently cannot install anything.
+function Test-NpmSupportsNpmrc {
+    param([string]$Version)
+
+    if ($Version -match '^v?(\d+)\.(\d+)') {
+        $major = [int]$Matches[1]
+        $minor = [int]$Matches[2]
+        # The bad band is 11.10.0 through 11.16.x.
+        if ($major -eq 11 -and $minor -ge 10 -and $minor -le 16) { return $false }
+        return $true
+    }
+    return $false
+}
+
+# `npm --version` for an npm we already resolved, or $null when it cannot be
+# run at all.  Never throws: callers treat "unreadable" as "unusable".
+function Get-NpmVersion {
+    param([string]$NpmExe)
+
+    if (-not $NpmExe) { return $null }
+    try { return (& $NpmExe --version 2>$null) } catch { return $null }
+}
+
+# True when the npm on PATH can install this checkout.  No npm at all is not
+# this gate's problem (the node-deps stage skips itself), so only a *present*
+# npm in the bad band rejects the system toolchain -- matching check_node() in
+# scripts/install.sh.
+function Test-SystemNpmUsable {
+    $systemNpm = Resolve-NpmCmd
+    if (-not $systemNpm) { return $true }
+    return (Test-NpmSupportsNpmrc (Get-NpmVersion $systemNpm))
+}
+
+# Return an npm that can actually install this checkout, preferring the one
+# passed in.  When it is in the bad band (see Test-NpmSupportsNpmrc), fall back
+# to the Hermes-managed tree's npm, which Test-Node keeps in range.
+#
+# Test-Node already refuses to adopt a bad-band system toolchain, but its
+# managed-Node PATH ordering only reaches later stages through the persisted
+# User PATH: a locked-down machine can refuse that write, and a cross-process
+# stage driver (the desktop bootstrap runs each -Stage in a fresh powershell)
+# reads PATH before this stage runs. Re-checking at the point of use lets the
+# node-deps stage converge on its own instead of failing fail-soft and leaving
+# browser tools dead.
+function Select-UsableNpm {
+    param([string]$NpmExe)
+
+    if (-not $NpmExe) { return $NpmExe }
+
+    $version = $null
+    try { $version = (& $NpmExe --version 2>$null) } catch { }
+    if (Test-NpmSupportsNpmrc $version) { return $NpmExe }
+
+    $managedDir = Join-Path $HermesHome "node"
+    $managedNpm = Join-Path $managedDir "npm.cmd"
+    if (Test-Path $managedNpm) {
+        $managedVersion = $null
+        try { $managedVersion = (& $managedNpm --version 2>$null) } catch { }
+        if (Test-NpmSupportsNpmrc $managedVersion) {
+            Write-Info "npm $version cannot install this repo (npm 11.10-11.16 ignore min-release-age-exclude)"
+            Write-Info "Using the Hermes-managed npm $managedVersion instead"
+            # npm.cmd prefers its sibling node.exe, but lifecycle scripts spawn
+            # a bare `node` -- put the managed tree first so both halves match.
+            $pathParts = $env:Path -split ";"
+            if ($pathParts -notcontains $managedDir) {
+                $env:Path = "$managedDir;$env:Path"
+            }
+            return $managedNpm
+        }
+    }
+
+    Write-Warn "npm $version cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
+    Write-Warn "min-release-age-exclude) and no Hermes-managed npm is available -- npm"
+    Write-Warn "install will fail with EBADENGINE."
+    return $NpmExe
+}
+
 function Test-Node {
     Write-Info "Checking Node.js (for browser tools)..."
 
+    # The system toolchain is only usable when BOTH halves work: a Node new
+    # enough for the desktop build AND an npm that can read our .npmrc. A
+    # bad-band npm fails `npm install` outright (see Test-NpmSupportsNpmrc),
+    # and the Hermes-managed Node we fall through to bundles one that works.
+    # Probed before the version gate so the accept path stays a single check.
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
+        $systemNpmUsable = Test-SystemNpmUsable
         if (Test-NodeVersionOk $version) {
-            Ensure-NodeExeOnPath | Out-Null
-            Write-Success "Node.js $version found"
-            $script:HasNode = $true
-            return $true
+            if ($systemNpmUsable) {
+                Ensure-NodeExeOnPath | Out-Null
+                Write-Success "Node.js $version found"
+                $script:HasNode = $true
+                return $true
+            }
+            Write-Warn "npm $(Get-NpmVersion (Resolve-NpmCmd)) cannot honor this repo's .npmrc"
+            Write-Warn "(npm 11.10-11.16 ignore min-release-age-exclude) -- using Hermes-managed"
+            Write-Warn "Node $NodeVersion instead..."
+        } else {
+            Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
         }
-        Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
@@ -2971,6 +3073,13 @@ function Install-NodeDeps {
             Write-Info "  If it fails, either enable PS script execution or install Node via winget."
         }
     }
+
+    # A system npm in the 11.10-11.16 band cannot install this repo at all:
+    # engine-strict makes engines.npm fatal, so BOTH npm installs below die with
+    # EBADENGINE. This stage is fail-soft, so that failure surfaces only as two
+    # warnings while the stage reports success -- and browser tools are silently
+    # dead. Swap in the Hermes-managed npm when the one on PATH is unusable.
+    $npmExe = Select-UsableNpm $npmExe
 
     # Helper: run "npm install" in a given directory and surface the real
     # error when it fails.  Returns $true on success.
