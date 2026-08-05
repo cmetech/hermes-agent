@@ -1269,6 +1269,8 @@ def _run(
 
     worker_mcp = None
     original_mcp_loader = None
+    worker_tool_search = None
+    original_tool_search_config = None
     timeout_mod = None
     configured_timeout = None
     registry = None
@@ -1328,6 +1330,23 @@ def _run(
         }
         original_mcp_loader = worker_mcp._load_mcp_config
         worker_mcp._load_mcp_config = lambda: resolved_mcp
+
+        # Tool Search progressive disclosure (upstream v0.20.0) rewrites MCP
+        # and non-core plugin tools into tool_search/describe/call bridge
+        # tools past a size threshold. A node worker's tool surface is pinned
+        # EXACTLY by its immutable request (allowed_tools + the request MCP
+        # mapping), so deferral would break the node contract — the pinned
+        # names would no longer exist in the model-visible list. Disable it
+        # for this process only, mirroring the private MCP loader above.
+        from tools import tool_search as worker_tool_search_mod
+
+        worker_tool_search = worker_tool_search_mod
+        original_tool_search_config = worker_tool_search.load_config
+        worker_tool_search.load_config = (
+            lambda: worker_tool_search_mod.ToolSearchConfig.from_raw(
+                {"enabled": "off"}
+            )
+        )
 
         # Bound provider calls inside this isolated process without introducing
         # a parent-visible config/env mutation or a new AIAgent constructor
@@ -1858,6 +1877,13 @@ def _run(
                                 and original_mcp_loader is not None
                             ):
                                 worker_mcp._load_mcp_config = original_mcp_loader
+                            if (
+                                worker_tool_search is not None
+                                and original_tool_search_config is not None
+                            ):
+                                worker_tool_search.load_config = (
+                                    original_tool_search_config
+                                )
                             if (
                                 timeout_mod is not None
                                 and configured_timeout is not None
