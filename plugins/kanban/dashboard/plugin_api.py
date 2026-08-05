@@ -704,6 +704,23 @@ def get_task(
         conn.close()
 
 
+def _task_needs_dispatcher(status: str, assignee: Optional[str]) -> bool:
+    """True when this task cannot progress without a running dispatcher.
+
+    ``triage``/``todo`` are included because auto-decompose
+    (``kanban.auto_decompose``, default True) runs on the dispatcher tick --
+    so those columns depend on it exactly as ``ready`` does. They were
+    excluded on the assumption that they "are expected to wait", which
+    predates auto-decompose and made a stalled card indistinguishable from a
+    queued one. An unassigned ``ready`` task is excluded on purpose: the
+    dispatcher skips it whatever its own state, so the missing piece is the
+    assignee, not the dispatcher.
+    """
+    if status in ("triage", "todo"):
+        return True
+    return status == "ready" and bool(assignee)
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks
 # ---------------------------------------------------------------------------
@@ -768,7 +785,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         # gateway is running (or dispatch_in_gateway=false). Only emit
         # for ready+assigned tasks; triage/todo are expected to wait,
         # and unassigned tasks can't be dispatched regardless.
-        if task and task.status == "ready" and task.assignee:
+        if task and _task_needs_dispatcher(task.status, task.assignee):
             try:
                 from hermes_cli.kanban import _check_dispatcher_presence
                 from hermes_constants import get_hermes_home
