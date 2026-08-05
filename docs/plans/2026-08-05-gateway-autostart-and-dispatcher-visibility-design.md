@@ -69,10 +69,11 @@ swallowed, never blocking backend startup.
 (`windows_detach_flags()` / `start_new_session=True`), already guarded against
 concurrent restarts via `_ACTION_PROCS`.
 
-**Guards — all three required:**
+**Guards — all four required:**
 
 | Guard | Why |
 |---|---|
+| Backend is desktop-spawned (`HERMES_DESKTOP=1`) | A server `hermes dashboard` relies on its own gateway; this behavior is desktop-only and must not change that deployment. The lifespan already uses this exact env check to gate the desktop cron ticker |
 | Gateway not already running (`resolve_gateway_liveness`) | Idempotent across backend restarts |
 | `_HERMES_GATEWAY` absent from the environment | The backend runs *inside* the gateway in some deployments; without this it would spawn itself. `_spawn_hermes_action` already scrubs this var for the same reason (#52470) |
 | `gateway.autostart_with_desktop` is not `false` | New key in `hermes_cli/config_defaults.py` under the existing `gateway` block, default `true`, so the behavior can be turned off |
