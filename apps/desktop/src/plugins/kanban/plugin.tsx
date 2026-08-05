@@ -5,8 +5,11 @@
  * through `ctx.rest` (namespace-scoped to `/api/plugins/kanban`). No new
  * backend, no core edits.
  *
- * Ships OFF by default (`defaultEnabled: false`): it inventories in
- * Settings ▸ Plugins and registers nothing until the user flips the switch.
+ * Upstream ships this OFF by default (`defaultEnabled: false`). This fork
+ * flips it ON by default — the SDK board is the product's kanban surface and
+ * the built-in operations board is the fallback (see the kanban yield
+ * contract in contrib/surfaces.tsx). A user's explicit toggle in
+ * Settings ▸ Plugins is persisted and always wins over this default.
  */
 
 import './kanban.css'
@@ -80,7 +83,8 @@ function KanbanCount() {
 const plugin: HermesPlugin = {
   id: 'kanban',
   name: 'Kanban',
-  defaultEnabled: false,
+  // Fork default: ON (upstream ships false). Persisted user choice wins.
+  defaultEnabled: true,
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket))
