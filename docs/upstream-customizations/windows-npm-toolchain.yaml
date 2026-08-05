@@ -1,0 +1,94 @@
+schema_version: 1
+feature: windows-npm-toolchain
+# The Windows installer must not adopt an npm that cannot install this repo.
+#
+# Field report (LOOP24 v5.2.1 release install, Windows Server): first-launch
+# bootstrap logged two warnings and carried on --
+#
+#     [!] Browser tools npm install failed -- exit code 1
+#     [!] TUI npm install failed -- exit code 1
+#
+# The node-deps stage is fail-soft, so it still reported ok:true. The app ran;
+# browser tools were dead, with nothing in the UI saying so.
+#
+# Root cause is an installer asymmetry, not a Node bug. npm 11.10.0-11.16.x
+# honor `min-release-age` but ignore `min-release-age-exclude`, both of which
+# .npmrc sets; the root package.json therefore excludes that band via
+# `engines.npm` and `engine-strict=true` makes the exclusion FATAL. Upstream
+# fixed this in scripts/install.sh (npm_supports_npmrc, commit 8e08a4a16) by
+# refusing to adopt a system toolchain whose npm is in the band -- but
+# scripts/install.ps1 got no equivalent and gated on the NODE floor alone.
+#
+# That gap is not a corner case: Node 24 bundles npm 11.16.0. It clears the
+# Node floor (>=22.22.0), so Windows adopted it, and every `npm install` in the
+# checkout then died with EBADENGINE. Reproduced directly against this repo
+# with npm 11.12.1 -- exit 1 for BOTH the root install and ui-tui, because
+# ui-tui is a workspace member and so resolves the root .npmrc and engines.
+upstream_changes:
+- id: windows-installer-npm-band-guard
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - scripts/install.ps1
+  - tests/test_install_ps1_npm_band_guard.py
+  owned_symbols:
+  - Test-NpmSupportsNpmrc
+  - Test-SystemNpmUsable
+  - Get-NpmVersion
+  - Select-UsableNpm
+  - Test-Node
+  - Install-NodeDeps
+  tests:
+  - tests/test_install_ps1_npm_band_guard.py
+  expected_commit_subject: 'fix(install): reject a Windows npm that cannot install this repo'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. scripts/install.ps1 is shared with upstream
+    and also carries the python-isolation customizations (see
+    python-isolation.yaml); it must stay pure ASCII
+    (tests/test_install_ps1_ascii_only.py).
+
+    Two layers, and both are load-bearing for different machines:
+
+    (1) Test-Node refuses the SYSTEM toolchain unless BOTH halves work -- a Node
+    clearing Test-NodeVersionOk AND an npm clearing Test-NpmSupportsNpmrc -- and
+    otherwise falls through to the Hermes-managed Node, whose npm
+    Update-ManagedNpm keeps in range. This mirrors check_node() in
+    scripts/install.sh; keep the two sides in step. Note the fall-through is
+    deliberately NOT install.sh's direct install_node() call: the PowerShell
+    path first prefers an existing managed tree, which is strictly better than
+    re-downloading, so do not "align" it by removing that branch.
+
+    (2) Install-NodeDeps re-checks at the point of use via Select-UsableNpm.
+    Layer 1 alone is not enough. Test-Node's managed-Node PATH ordering reaches
+    later stages only through the persisted User PATH, and the desktop
+    bootstrap runs each -Stage in a FRESH powershell.exe that reads PATH before
+    this stage runs -- so on a locked-down machine that refuses the User PATH
+    write (exactly the kind of box this was reported on), the stage would still
+    pick up the bad npm. Select-UsableNpm also prepends the managed tree to the
+    session PATH, because npm.cmd prefers its sibling node.exe while lifecycle
+    scripts spawn a bare `node`; both halves must point at the same tree.
+
+    THE FAILURE MODE TO GUARD IS A SILENT REVERT PLUS A SILENT FAILURE. An
+    upstream rewrite of Test-Node or Install-NodeDeps can drop either layer with
+    NO conflict and NO error -- and because the node-deps stage is fail-soft,
+    the regression does not fail the install either. It surfaces only as two
+    warnings in a bootstrap log and browser tools that never work. Verify
+    against tests/test_install_ps1_npm_band_guard.py by name after any merge
+    touching this file; a green suite elsewhere proves nothing about it.
+
+    Do NOT "fix" a future recurrence by loosening engines.npm or by disabling
+    engine-strict. The band is excluded because those npm versions genuinely
+    cannot honor this repo's .npmrc, and tests/test_engines_satisfiable.py
+    encodes both directions of that constraint. The band in
+    Test-NpmSupportsNpmrc must keep agreeing with engines.npm -- the behavioural
+    test runs the PowerShell predicate under pwsh and compares its answer
+    against the manifest for each npm version a stock Node bundles, so a
+    hand-edited band that drifts from the manifest fails there.
+  removal_condition: >-
+    Remove when upstream's own scripts/install.ps1 refuses a system npm that
+    engines.npm excludes -- i.e. when its Node detection consults the npm
+    version and not only Test-NodeVersionOk. At that point drop these helpers in
+    favour of upstream's, but KEEP tests/test_install_ps1_npm_band_guard.py:
+    the pwsh parity assertion is what stops the band drifting from the manifest.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
