@@ -68,6 +68,21 @@ interface StatusbarItemsOptions {
   toggleCommandCenter: () => void
 }
 
+/** Label for the messaging gateway — the process that hosts kanban dispatch
+ *  and cron. Distinct from the desktop<->backend websocket and from the
+ *  inference gateway, both of which the chip already reports. `undefined`
+ *  means no status response yet, which must not read as "stopped". */
+export function gatewayAutomationLabel(
+  gatewayRunning: boolean | undefined,
+  copy: { automationRunning: string; automationStopped: string; automationUnknown: string }
+): string {
+  if (gatewayRunning === undefined) {
+    return copy.automationUnknown
+  }
+
+  return gatewayRunning ? copy.automationRunning : copy.automationStopped
+}
+
 export function useStatusbarItems({
   agentsOpen,
   chatOpen,
