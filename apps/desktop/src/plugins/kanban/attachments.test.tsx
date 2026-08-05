@@ -66,7 +66,9 @@ describe('attachments section', () => {
     bindOs({ revealPath })
     renderSection([attachment()])
 
-    fireEvent.click(screen.getByRole('button', { name: /report\.md/ }))
+    // The row's reveal action lives on the secondary (folder) control now
+    // that the primary control opens the in-app preview instead.
+    fireEvent.click(screen.getByRole('button', { name: 'revealAttachment' }))
 
     expect(revealPath).toHaveBeenCalledWith('/home/u/.hermes/kanban/attachments/t-1/report.md')
   })
@@ -93,7 +95,7 @@ describe('attachments section', () => {
     bindOs({ revealPath: vi.fn().mockResolvedValue(false) })
     renderSection([attachment()])
 
-    fireEvent.click(screen.getByRole('button', { name: /report\.md/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'revealAttachment' }))
     await waitFor(() => expect(notify).toHaveBeenCalled())
 
     expect(notify.mock.calls[0][0]).toMatchObject({ kind: 'warning' })
@@ -111,5 +113,58 @@ describe('plugin registration', () => {
 
     await expect(revealAttachment('/tmp/report.md')).resolves.toBe(true)
     expect(revealPath).toHaveBeenCalledWith('/tmp/report.md')
+  })
+})
+
+describe('attachment row controls', () => {
+  it('opens the file in the preview rail when the filename is activated', async () => {
+    const previewFile = vi.spyOn(host, 'previewFile').mockResolvedValue(true)
+    const revealPath = vi.fn().mockResolvedValue(true)
+
+    bindOs({ revealPath })
+    renderSection([attachment()])
+
+    fireEvent.click(screen.getByRole('button', { name: /report\.md/ }))
+    await waitFor(() => expect(previewFile).toHaveBeenCalled())
+
+    expect(previewFile).toHaveBeenCalledWith('/home/u/.hermes/kanban/attachments/t-1/report.md')
+    // Viewing must not also throw the user into the OS file manager.
+    expect(revealPath).not.toHaveBeenCalled()
+  })
+
+  it('keeps a separate control that reveals the file in the file manager', () => {
+    const revealPath = vi.fn().mockResolvedValue(true)
+    const previewFile = vi.spyOn(host, 'previewFile').mockResolvedValue(true)
+
+    bindOs({ revealPath })
+    renderSection([attachment()])
+
+    // Plugin tests can't register locale bundles (@/i18n is lint-fenced for
+    // plugins), so k.revealAttachment(...) yields its raw key here.
+    fireEvent.click(screen.getByRole('button', { name: 'revealAttachment' }))
+
+    expect(revealPath).toHaveBeenCalledWith('/home/u/.hermes/kanban/attachments/t-1/report.md')
+    expect(previewFile).not.toHaveBeenCalled()
+  })
+
+  it('says so when the file could not be opened', async () => {
+    vi.spyOn(host, 'previewFile').mockResolvedValue(false)
+    const notify = vi.spyOn(host, 'notify').mockReturnValue('toast-id')
+
+    bindOs({ revealPath: vi.fn().mockResolvedValue(true) })
+    renderSection([attachment()])
+
+    fireEvent.click(screen.getByRole('button', { name: /report\.md/ }))
+    await waitFor(() => expect(notify).toHaveBeenCalled())
+
+    expect(notify.mock.calls[0][0]).toMatchObject({ kind: 'warning' })
+  })
+
+  it('renders neither control without a stored path', () => {
+    renderSection([attachment({ stored_path: '' })])
+
+    expect(screen.getByText('report.md')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /report\.md/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'revealAttachment' })).toBeNull()
   })
 })

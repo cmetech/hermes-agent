@@ -153,6 +153,7 @@ type KanbanMessages = {
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
+  openAttachment: (name: string) => string
   revealAttachment: (name: string) => string
   couldNotReveal: string
   couldNotOpenAttachment: string
@@ -348,6 +349,7 @@ const en: KanbanMessages = {
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
+  openAttachment: name => `Open ${name}`,
   revealAttachment: name => `Reveal ${name} in file manager`,
   couldNotReveal: 'Could not open the file manager',
   couldNotOpenAttachment: 'Could not open this file',
@@ -542,6 +544,7 @@ const ja: KanbanMessages = {
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
+  openAttachment: name => `${name} を開く`,
   revealAttachment: name => `${name} をファイルマネージャーで表示`,
   couldNotReveal: 'ファイルマネージャーを開けませんでした',
   couldNotOpenAttachment: 'このファイルを開けませんでした',
@@ -734,6 +737,7 @@ const zh: KanbanMessages = {
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
+  openAttachment: name => `打开 ${name}`,
   revealAttachment: name => `在文件管理器中显示 ${name}`,
   couldNotReveal: '无法打开文件管理器',
   couldNotOpenAttachment: '无法打开此文件',
@@ -925,6 +929,7 @@ const zhHant: KanbanMessages = {
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',
+  openAttachment: name => `開啟 ${name}`,
   revealAttachment: name => `在檔案管理員中顯示 ${name}`,
   couldNotReveal: '無法開啟檔案管理員',
   couldNotOpenAttachment: '無法開啟此檔案',
