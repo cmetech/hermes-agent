@@ -60,19 +60,6 @@ describe('attachment reveal door', () => {
 })
 
 describe('attachments section', () => {
-  it('reveals the stored file when the row is activated', () => {
-    const revealPath = vi.fn().mockResolvedValue(true)
-
-    bindOs({ revealPath })
-    renderSection([attachment()])
-
-    // The row's reveal action lives on the secondary (folder) control now
-    // that the primary control opens the in-app preview instead.
-    fireEvent.click(screen.getByRole('button', { name: 'revealAttachment' }))
-
-    expect(revealPath).toHaveBeenCalledWith('/home/u/.hermes/kanban/attachments/t-1/report.md')
-  })
-
   it('still shows an attachment with no stored path, but not as a dead control', () => {
     renderSection([attachment({ stored_path: '' })])
 
