@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { StatusResponse } from '@/types/hermes'
 
-import { gatewayAutomationLabel } from './hooks/use-statusbar-items'
+import { gatewayAutomationLabel } from './gateway-states'
 
 interface GatewayMenuPanelProps {
   gatewayState: string
