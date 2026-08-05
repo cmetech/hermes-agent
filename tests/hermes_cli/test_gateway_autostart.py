@@ -15,6 +15,25 @@ from hermes_cli import web_server
 from hermes_cli.web_server import _maybe_autostart_gateway, _should_autostart_gateway
 
 
+def _live_web_server():
+    """Resolve hermes_cli.web_server FRESH, at call time.
+
+    Sibling suites evict ``hermes_cli.*`` from ``sys.modules`` between tests
+    (tests/hermes_cli/test_kanban_default_assignee.py and
+    test_kanban_cli_dispatch_passthrough.py both do; test_kanban_core_
+    functionality.py documents the same hazard). After such an eviction the
+    module object bound at import time above is a STALE copy: patching
+    ``hermes_cli.web_server._spawn_gateway_restart`` then lands on the fresh
+    module while the stale function's globals still hold the real one — so the
+    test silently exercises the REAL spawn and launches an actual
+    ``hermes gateway restart`` subprocess. Resolving here keeps the object we
+    patch and the function we call the same one.
+    """
+    from hermes_cli import web_server as live
+
+    return live
+
+
 class TestShouldAutostartGateway:
     def test_starts_when_desktop_and_nothing_is_running(self):
         assert _should_autostart_gateway(
@@ -82,6 +101,16 @@ class TestShouldAutostartGateway:
 
 
 class TestMaybeAutostartGateway:
+    """End-to-end guard behaviour.
+
+    Every test resolves the module through ``_live_web_server()`` and patches
+    the spawn on THAT object. Binding the module at import time is unsafe here:
+    sibling suites evict ``hermes_cli.*`` from ``sys.modules``, after which a
+    patch aimed at the fresh module never reaches the stale function actually
+    under test, and the assertion silently exercises the REAL
+    ``hermes gateway restart``.
+    """
+
     def _patch(
         self,
         monkeypatch,
@@ -94,9 +123,7 @@ class TestMaybeAutostartGateway:
     ):
         monkeypatch.setenv("HERMES_DESKTOP", desktop)
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda *a, **k: cfg
-        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
 
         def _resolve(*a, **k):
             if calls is not None:
@@ -109,83 +136,82 @@ class TestMaybeAutostartGateway:
 
         monkeypatch.setattr("gateway.status.resolve_gateway_liveness", _resolve)
 
-    def test_spawns_when_no_gateway_is_running(self, monkeypatch):
-        spawned = []
-        self._patch(monkeypatch, running=False, cfg={})
+        return _live_web_server()
+
+    @staticmethod
+    def _record_spawn(monkeypatch, live, sink: list):
         monkeypatch.setattr(
-            "hermes_cli.web_server._spawn_gateway_restart",
-            lambda *a, **k: spawned.append(True) or (None, False),
+            live,
+            "_spawn_gateway_restart",
+            lambda *a, **k: sink.append(True) or (None, False),
         )
-        assert _maybe_autostart_gateway() is True
+
+    def test_spawns_when_no_gateway_is_running(self, monkeypatch):
+        spawned: list = []
+        live = self._patch(monkeypatch, running=False, cfg={})
+        self._record_spawn(monkeypatch, live, spawned)
+        assert live._maybe_autostart_gateway() is True
         assert spawned == [True]
 
     def test_does_not_spawn_when_config_disables_it(self, monkeypatch):
-        spawned = []
-        self._patch(
+        spawned: list = []
+        live = self._patch(
             monkeypatch,
             running=False,
             cfg={"gateway": {"autostart_with_desktop": False}},
         )
-        monkeypatch.setattr(
-            "hermes_cli.web_server._spawn_gateway_restart",
-            lambda *a, **k: spawned.append(True) or (None, False),
-        )
-        assert _maybe_autostart_gateway() is False
+        self._record_spawn(monkeypatch, live, spawned)
+        assert live._maybe_autostart_gateway() is False
         assert spawned == []
 
     def test_does_not_spawn_when_the_probe_could_not_tell(self, monkeypatch):
         """A raising PID probe must not be read as "no gateway".
 
-        `_spawn_gateway_restart` runs `hermes gateway restart`, which stops the
-        running gateway first -- so this would kill a healthy gateway on every
-        desktop launch for as long as the probe stays unreadable.
+        ``_spawn_gateway_restart`` runs ``hermes gateway restart``, which stops
+        the running gateway first -- so this would kill a healthy gateway on
+        every desktop launch for as long as the probe stayed unreadable.
         """
-        spawned = []
-        self._patch(monkeypatch, running=False, cfg={}, probe_error=True)
-        monkeypatch.setattr(
-            "hermes_cli.web_server._spawn_gateway_restart",
-            lambda *a, **k: spawned.append(True) or (None, False),
-        )
-        assert _maybe_autostart_gateway() is False
+        spawned: list = []
+        live = self._patch(monkeypatch, running=False, cfg={}, probe_error=True)
+        self._record_spawn(monkeypatch, live, spawned)
+        assert live._maybe_autostart_gateway() is False
         assert spawned == []
 
     def test_probes_gateway_health_url_when_configured(self, monkeypatch):
         """Rung 2 covers a cross-container gateway with no local PID file.
 
         Without it, a GATEWAY_HEALTH_URL deployment reports gateway_running
-        true on /api/status while autostart sees "nothing running" and spawns
-        a second local gateway on every launch.
+        true on /api/status while autostart sees "nothing running" and spawns a
+        second local gateway on every launch.
         """
         calls: list = []
-        self._patch(monkeypatch, running=True, cfg={}, calls=calls)
-        monkeypatch.setattr(
-            "hermes_cli.web_server._GATEWAY_HEALTH_URL", "http://gw:8080/health"
-        )
-        monkeypatch.setattr(
-            "hermes_cli.web_server._spawn_gateway_restart",
-            lambda *a, **k: (None, False),
-        )
-        assert _maybe_autostart_gateway() is False
-        assert calls and calls[0]["health_probe"] is web_server._probe_gateway_health
+        spawned: list = []
+        live = self._patch(monkeypatch, running=True, cfg={}, calls=calls)
+        monkeypatch.setattr(live, "_GATEWAY_HEALTH_URL", "http://gw:8080/health")
+        self._record_spawn(monkeypatch, live, spawned)
+        assert live._maybe_autostart_gateway() is False
+        assert calls and calls[0]["health_probe"] is live._probe_gateway_health
 
     def test_omits_the_health_probe_when_no_url_is_configured(self, monkeypatch):
         calls: list = []
-        self._patch(monkeypatch, running=False, cfg={}, calls=calls)
-        monkeypatch.setattr("hermes_cli.web_server._GATEWAY_HEALTH_URL", None)
-        monkeypatch.setattr(
-            "hermes_cli.web_server._spawn_gateway_restart",
-            lambda *a, **k: (None, False),
-        )
-        assert _maybe_autostart_gateway() is True
+        spawned: list = []
+        live = self._patch(monkeypatch, running=False, cfg={}, calls=calls)
+        monkeypatch.setattr(live, "_GATEWAY_HEALTH_URL", None)
+        self._record_spawn(monkeypatch, live, spawned)
+        assert live._maybe_autostart_gateway() is True
         assert calls and calls[0]["health_probe"] is None
 
     def test_is_fail_safe(self, monkeypatch):
         """A broken probe must never stop the backend from starting."""
         monkeypatch.setenv("HERMES_DESKTOP", "1")
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        spawned: list = []
+        live = _live_web_server()
+        self._record_spawn(monkeypatch, live, spawned)
 
         def boom(*a, **k):
             raise RuntimeError("probe exploded")
 
         monkeypatch.setattr("gateway.status.resolve_gateway_liveness", boom)
-        assert _maybe_autostart_gateway() is False
+        assert live._maybe_autostart_gateway() is False
+        assert spawned == []

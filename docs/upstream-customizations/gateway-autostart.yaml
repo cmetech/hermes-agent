@@ -23,11 +23,13 @@ upstream_changes:
   - hermes_cli/web_server.py
   - hermes_cli/config_defaults.py
   - tests/hermes_cli/test_gateway_autostart.py
+  - tests/hermes_cli/test_kanban_default_assignee.py
   owned_symbols:
   - _should_autostart_gateway
   - _maybe_autostart_gateway
   tests:
   - tests/hermes_cli/test_gateway_autostart.py
+  - tests/hermes_cli/test_kanban_default_assignee.py
   expected_commit_subject: 'fix(desktop): start the gateway so kanban dispatch actually runs'
   upstream_candidate: true
   merge_guidance: >-
@@ -64,6 +66,19 @@ upstream_changes:
     users are non-technical and will create a task, see nothing happen, and
     have no path to the cause. Do not "make it opt-in for safety" -- that
     restores the original defect.
+
+    SECOND SHIPPED DEFAULT IN THIS FILE: kanban.default_assignee ships as
+    "default", not "". The two consumers read an empty value differently --
+    kanban_decompose._resolve_default_assignee already falls back to the active
+    profile, but the dispatcher treats empty as "no fallback, keep skipping".
+    Shipped empty, a task created without an assignee reaches `ready` and then
+    stalls forever with nothing in the UI explaining why, which is the same
+    silent dead-end class as a board with no dispatcher at all -- and starting
+    the gateway (above) makes it the NEXT wall a user hits. "default" is the
+    canonical profile alias (normalize_profile_name), so it always resolves.
+    An upstream merge that restores "" re-opens the stall with no test failure
+    outside tests/hermes_cli/test_kanban_default_assignee.py::
+    test_stock_config_gives_unassigned_ready_tasks_an_owner.
   removal_condition: >-
     Remove when upstream starts the gateway for desktop installs on its own --
     i.e. when a desktop backend with kanban enabled and no messaging configured
