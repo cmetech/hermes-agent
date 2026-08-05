@@ -650,6 +650,7 @@ upstream_changes:
   - apps/desktop/src/app/chat/sidebar/index.tsx
   - apps/desktop/src/app/types.ts
   - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/contrib/kanban-yield.test.tsx
   - apps/desktop/src/app/workflows/adapter.ts
   - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/attention-inbox.tsx
@@ -682,6 +683,7 @@ upstream_changes:
   - KanbanView
   tests:
   - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/contrib/kanban-yield.test.tsx
   - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
   - apps/desktop/src/app/workflows/index.test.tsx
@@ -706,7 +708,22 @@ upstream_changes:
     \ adapt - the built-in operations board is the fallback when the richer plugin is\
     \ disabled; never render both (duplicate menu items, and the earlier static route\
     \ shadows the plugin's page). Do not resolve a merge by unconditionally restoring\
-    \ the static route. Preserve separate Workflow and Kanban lifecycle authorities, durable\
+    \ the static route. RESERVED-PATH TRAP (2026-08-05, the LOOP24 v5.2.1 field bug):\
+    \ because this fork adds kanban to APP_ROUTES, /kanban is in RESERVED_PATHS and\
+    \ contributedRoutes() in routes.ts silently DROPPED the plugin's /kanban\
+    \ contribution - the yield gate was unreachable and the old board rendered\
+    \ forever (upstream has no /kanban APP_ROUTE, so upstream never hits this).\
+    \ routes.ts now carries YIELDING_PATHS (= {KANBAN_ROUTE}); the contributedRoutes\
+    \ filter must keep letting a contribution claim a YIELDING path while blocking\
+    \ every other reserved path. A merge that rewrites contributedRoutes back to a\
+    \ bare !RESERVED_PATHS.has(path) reverts the fix with no conflict and no build\
+    \ error - the only guard is apps/desktop/src/app/contrib/kanban-yield.test.tsx\
+    \ plus the contributedRoutes tests in routes.test.ts; verify those pass by name\
+    \ after any merge touching routes.ts. Note while the plugin claims /kanban,\
+    \ appViewForPath('/kanban') classifies as 'extension' (the contributed-page\
+    \ view), not 'kanban' - intended; the built-in sidebar row is hidden in that\
+    \ state and the contributed row lights by pathname.\
+    \ Preserve separate Workflow and Kanban lifecycle authorities, durable\
     \ non-overlay routes, profile-scoped REST calls, extension-safe chat, and complete\
     \ locale/navigation composition while reconciling upstream shell changes. The\
     \ shell host MOVES across upstream refactors: v0.19.0 retired apps/desktop/src/app/desktop-controller.tsx\
