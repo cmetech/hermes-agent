@@ -865,6 +865,9 @@ upstream_changes:
   - apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
   - apps/desktop/src/app/shell/gateway-menu-panel.tsx
   - apps/desktop/src/app/shell/gateway-states.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/zh.ts
   owned_symbols:
   - _task_needs_dispatcher
   - DispatcherBanner
@@ -900,6 +903,17 @@ upstream_changes:
     The banner renders only on an explicit false, never on undefined. A banner
     that flashes on every mount trains users to ignore it, which costs the
     signal this exists to provide.
+
+    THE i18n KEYS ARE PART OF THIS SURFACE, not incidental. operations.
+    dispatcherOffline and shell.statusbar.automation* must stay declared in
+    src/i18n/types.ts and defined in BOTH en.ts and zh.ts -- those two files
+    declare `: Translations` and must satisfy every required key, while
+    ar/ja/zh-hant use defineLocale() and fall back. An upstream rewrite of a
+    locale file drops a key with no conflict; the banner then renders an empty
+    box and the chip an empty state, which is worse than the original bug
+    because it looks deliberate. Note also that `npm run test:ui` does NOT
+    typecheck -- a dropped key passes every test and fails only `tsc`, so run
+    `npx tsc --noEmit` after any merge touching i18n.
   removal_condition: >-
     Remove when upstream's own kanban surfaces disclose dispatcher absence --
     i.e. when a board with no gateway running says so without this code.
