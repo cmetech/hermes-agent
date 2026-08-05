@@ -12,7 +12,8 @@
 
 - Branch is `base` (brand-neutral). Never hardcode a brand name (`OTTO`, `LOOP24`) in code, copy, or tests.
 - New user-facing copy must contain no product name, so the build-time brand transform has nothing to rewrite.
-- New i18n keys go in `apps/desktop/src/i18n/en.ts` only. Other locales fall back to English; the locale allowlist ships `en` only.
+- A new i18n key must be added in THREE places or the build fails `tsc`: declared in `apps/desktop/src/i18n/types.ts` (an explicit `Translations` interface), then defined in `en.ts` AND `zh.ts` — both declare `: Translations` and must satisfy every required key. Do NOT add it to `ar.ts`, `ja.ts`, or `zh-hant.ts`: those use `defineLocale()` and fall back to English by design. Follow the existing `operations.kanbanUnavailable` key as the precedent.
+- `npm run test:ui` does NOT typecheck. Any task touching TypeScript must also pass `cd apps/desktop && npx tsc --noEmit -p tsconfig.json`.
 - Every touched file is shared with upstream. Changes are additive; never restructure surrounding code.
 - Python tests run with `./venv/bin/python -m pytest`. Desktop UI tests run with `npm run test:ui --prefix apps/desktop`.
 - Do not modify `scripts/install.ps1` or `scripts/install.sh` (out of scope, and inside the python-isolation ledger's blast radius).
@@ -658,9 +659,18 @@ git commit -m "feat(kanban): show the dispatcher banner on both boards"
 
 **Context:** the chip fuses the desktop↔backend websocket (`gatewayState`) with the inference gateway (`inferenceStatus.ready`) and has no concept of the messaging gateway. That is what reported "Gateway ready" while the gateway the board needed was down.
 
-- [ ] **Step 1: Add the copy**
+- [ ] **Step 1: Add the copy — in three files, or `tsc` fails**
 
-In `apps/desktop/src/i18n/en.ts`, next to `gatewayReady`:
+First declare the keys in `apps/desktop/src/i18n/types.ts`, in the same block that declares `gatewayReady`:
+
+```ts
+      automation: string
+      automationRunning: string
+      automationStopped: string
+      automationUnknown: string
+```
+
+Then define them in `apps/desktop/src/i18n/en.ts`, next to `gatewayReady`:
 
 ```ts
       automation: 'Automation',
@@ -668,6 +678,17 @@ In `apps/desktop/src/i18n/en.ts`, next to `gatewayReady`:
       automationStopped: 'stopped',
       automationUnknown: 'unknown',
 ```
+
+Then define them in `apps/desktop/src/i18n/zh.ts`, in the same block as its `gatewayReady`:
+
+```ts
+      automation: '自动化',
+      automationRunning: '运行中',
+      automationStopped: '已停止',
+      automationUnknown: '未知',
+```
+
+Do NOT add these to `ar.ts`, `ja.ts`, or `zh-hant.ts` — those are partial locales using `defineLocale()` and fall back to English by design.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -895,8 +916,11 @@ Expected: exit 0, no output
 ```bash
 ./venv/bin/python -m pytest tests/hermes_cli/test_gateway_autostart.py tests/hermes_cli/test_kanban_dispatcher_warning.py tests/hermes_cli/test_kanban_core_functionality.py tests/hermes_cli/test_web_server.py -q
 npm run test:ui --prefix apps/desktop -- src/app/kanban/ src/app/contrib/ src/app/shell/ src/app/routes.test.ts
+cd apps/desktop && npx tsc --noEmit -p tsconfig.json && cd -
 ```
-Expected: PASS
+Expected: PASS, and `tsc` reports no errors.
+
+The `tsc` leg is not redundant: `npm run test:ui` does not typecheck, so a missing i18n type declaration passes every test and still breaks the build.
 
 - [ ] **Step 4: Confirm base is still brand-neutral**
 
