@@ -42,6 +42,7 @@ import {
   PROFILES_KEY,
   reassignTask,
   reclaimTask,
+  revealAttachment,
   taskKey,
   uploadAttachment
 } from './api'
@@ -409,7 +410,38 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
 // administrative note into that slot; hide those (Runs still shows them).
 const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
 
-function AttachmentsSection({
+// The clickable form of an attachment row. Styled to sit flush in the list —
+// it reads as text until hovered — but it is a real button. The filename stays
+// the accessible NAME (that's what the user is looking for); what a click does
+// is the description, so assistive tech announces both.
+function AttachmentRow({ filename, storedPath }: { filename: string; storedPath: string }) {
+  const k = useKanban()
+
+  return (
+    <Button
+      className="-mx-1 h-auto justify-start gap-1.5 px-1 py-0.5 font-normal text-(--ui-text-tertiary)"
+      onClick={() =>
+        void revealAttachment(storedPath).then(ok => {
+          if (!ok) {
+            host.notify({ kind: 'warning', message: k.couldNotReveal })
+          }
+        })
+      }
+      size="xs"
+      title={k.revealAttachment(filename)}
+      variant="ghost"
+    >
+      <Codicon name="file" size="0.75rem" />
+      {filename}
+    </Button>
+  )
+}
+
+// A completed task's output lands here (`kanban_complete` auto-attaches it), so
+// this row is the only path a non-technical user has to their own result file.
+// It renders as a control whenever the backend gave us a `stored_path`; without
+// one (older backend) it stays plain text rather than a button that can't work.
+export function AttachmentsSection({
   attachments,
   onUpload,
   pending
@@ -456,8 +488,14 @@ function AttachmentsSection({
         <ul className="flex flex-col gap-1">
           {attachments.map(attachment => (
             <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <Codicon name="file" size="0.75rem" />
-              {attachment.filename}
+              {attachment.stored_path ? (
+                <AttachmentRow filename={attachment.filename} storedPath={attachment.stored_path} />
+              ) : (
+                <>
+                  <Codicon name="file" size="0.75rem" />
+                  {attachment.filename}
+                </>
+              )}
             </li>
           ))}
         </ul>
