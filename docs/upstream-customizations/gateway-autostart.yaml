@@ -1,0 +1,120 @@
+schema_version: 1
+feature: gateway-autostart
+# The desktop must start the process that does the work.
+#
+# A LOOP24 user created a kanban task in the UI. It landed in Triage and never
+# moved; nothing in the product said why. The dispatcher that sweeps Triage,
+# promotes todo -> ready and spawns workers exists only inside gateway/run.py,
+# and the gateway's autostart is gated on MESSAGING tokens
+# (Start-GatewayIfConfigured) -- while the gateway also hosts kanban dispatch
+# and cron, and says so at boot:
+#
+#     WARNING gateway.run: No messaging platforms enabled.
+#     INFO    gateway.run: Gateway will continue running for cron job execution.
+#
+# The process knows it is useful without messaging; the code deciding whether
+# to start it does not. Configure kanban, skip messaging, and the board is
+# permanently and silently inert.
+upstream_changes:
+- id: desktop-backend-gateway-autostart
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - hermes_cli/web_server.py
+  - hermes_cli/config_defaults.py
+  - tests/hermes_cli/test_gateway_autostart.py
+  owned_symbols:
+  - _should_autostart_gateway
+  - _maybe_autostart_gateway
+  tests:
+  - tests/hermes_cli/test_gateway_autostart.py
+  expected_commit_subject: 'fix(desktop): start the gateway so kanban dispatch actually runs'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. Four guards, each load-bearing: desktop-only
+    (a server `hermes dashboard` owns its own gateway), not-in-gateway (the
+    backend runs INSIDE the gateway in some deployments and would spawn itself
+    -- the same hazard _spawn_hermes_action scrubs _HERMES_GATEWAY for),
+    config-disabled, and already-running. Dropping any one produces no build
+    error and no failing test outside the named file.
+
+    The spawn MUST stay routed through _spawn_gateway_restart: it is already
+    detached (windows_detach_flags / start_new_session) and already reuses an
+    in-flight restart. A hand-rolled Popen would tie the gateway's lifetime to
+    the desktop backend and reintroduce the bug from the other direction.
+
+    Default-on is deliberate and was agreed with the product owner: the target
+    users are non-technical and will create a task, see nothing happen, and
+    have no path to the cause. Do not "make it opt-in for safety" -- that
+    restores the original defect.
+  removal_condition: >-
+    Remove when upstream starts the gateway for desktop installs on its own --
+    i.e. when a desktop backend with kanban enabled and no messaging configured
+    gets a dispatcher without this hook. Keep the tests.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: dispatcher-presence-visibility
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - plugins/kanban/dashboard/plugin_api.py
+  - apps/desktop/src/app/kanban/dispatcher-banner.tsx
+  - apps/desktop/src/app/kanban/dispatcher-banner.test.tsx
+  - apps/desktop/src/app/contrib/surfaces.tsx
+  - apps/desktop/src/app/contrib/kanban-banner.test.tsx
+  - apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+  - apps/desktop/src/app/shell/gateway-menu-panel.tsx
+  - apps/desktop/src/app/shell/gateway-states.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/zh.ts
+  owned_symbols:
+  - _task_needs_dispatcher
+  - DispatcherBanner
+  - KanbanRouteContent
+  - gatewayAutomationLabel
+  tests:
+  - tests/hermes_cli/test_kanban_dispatcher_warning.py
+  - apps/desktop/src/app/kanban/dispatcher-banner.test.tsx
+  - apps/desktop/src/app/contrib/kanban-banner.test.tsx
+  - apps/desktop/src/app/shell/gateway-states.test.tsx
+  expected_commit_subject: 'feat(kanban): show the dispatcher banner on both boards'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. THE FAILURE MODE IS A SILENT REVERT OF A
+    SILENCE FIX: dropping any of this restores a board that looks healthy while
+    nothing runs. There is no build error, no type error, and no failing test
+    outside the named files.
+
+    KanbanRouteContent must wrap BOTH kanban routes. The SDK kanban plugin's UI
+    is a prebuilt bundle (plugins/kanban/dashboard/dist/index.js) with no source
+    in this repo, so the banner cannot be moved inside the board; the shell
+    wrapper is the only site that covers the contributed page. An upstream
+    refactor of the contributed-routes map will drop the KANBAN_ROUTE branch
+    with no conflict -- re-verify against kanban-banner.test.tsx by name.
+
+    _task_needs_dispatcher deliberately includes triage/todo and deliberately
+    excludes unassigned ready. Upstream's comment "triage/todo are expected to
+    wait" predates auto-decompose (kanban.auto_decompose, default True) and is
+    no longer true; do not restore it. plugin_api.py is already a Bucket-1
+    UNION seam under workflow-orchestration.yaml -- this is additive inside
+    that contract.
+
+    The banner renders only on an explicit false, never on undefined. A banner
+    that flashes on every mount trains users to ignore it, which costs the
+    signal this exists to provide.
+
+    THE i18n KEYS ARE PART OF THIS SURFACE, not incidental. operations.
+    dispatcherOffline and shell.statusbar.automation* must stay declared in
+    src/i18n/types.ts and defined in BOTH en.ts and zh.ts -- those two files
+    declare `: Translations` and must satisfy every required key, while
+    ar/ja/zh-hant use defineLocale() and fall back. An upstream rewrite of a
+    locale file drops a key with no conflict; the banner then renders an empty
+    box and the chip an empty state, which is worse than the original bug
+    because it looks deliberate. Note also that `npm run test:ui` does NOT
+    typecheck -- a dropped key passes every test and fails only `tsc`, so run
+    `npx tsc --noEmit` after any merge touching i18n.
+  removal_condition: >-
+    Remove when upstream's own kanban surfaces disclose dispatcher absence --
+    i.e. when a board with no gateway running says so without this code.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
