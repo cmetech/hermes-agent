@@ -2461,6 +2461,15 @@ DEFAULT_CONFIG = {
         # crash/restart, as before.
         "delivery_ledger": True,
 
+        # Start the messaging gateway alongside a desktop-spawned backend.
+        # The gateway hosts the kanban dispatcher and cron, both enabled by
+        # default, so a desktop install with no messaging configured would
+        # otherwise never get a dispatcher: the installer's
+        # Start-GatewayIfConfigured fires only when a messaging token exists,
+        # leaving the board permanently and silently inert. Set false to keep
+        # gateway lifecycle fully manual.
+        "autostart_with_desktop": True,
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash
