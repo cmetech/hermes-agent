@@ -89,3 +89,61 @@ upstream_changes:
     i.e. when a completed task's attached output file can be reached from the
     desktop UI without this code. Keep the tests.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: kanban-attachment-preview
+  change_class: product-surface-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/sdk/index.ts
+  - apps/desktop/src/sdk/preview-file.test.ts
+  - apps/desktop/src/plugins/kanban/drawer.tsx
+  - apps/desktop/src/plugins/kanban/i18n.ts
+  - apps/desktop/src/plugins/kanban/attachments.test.tsx
+  owned_symbols:
+  - previewFile
+  - AttachmentRow
+  tests:
+  - apps/desktop/src/sdk/preview-file.test.ts
+  - apps/desktop/src/plugins/kanban/attachments.test.tsx
+  expected_commit_subject: 'feat(kanban): open a task attachment in the app instead of the file manager'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. Additive throughout, so an upstream rewrite
+    of any file drops it with no conflict and no failing test outside the named
+    ones.
+
+    THE SOURCE TAG IS THE SILENT TRAP. host.previewFile calls
+    openPreview(target, 'tool-result'). previewTargetForSource maps
+    'file-browser' and 'manual' to renderMode 'source' and everything else to
+    'preview'. The file tree -- the sibling caller anyone will look at first --
+    passes 'file-browser', so "fixing" this to match it degrades every HTML
+    artifact to raw source code. There is no type error and no failing test
+    outside the "tags the preview as a tool result" case in
+    src/sdk/preview-file.test.ts. Verify that test by name after any merge
+    touching either file.
+
+    THE ROW IS TWO SIBLING BUTTONS, NOT ONE. Tier 1 shipped a single Button for
+    the whole row; Tier 2 splits it because a second action cannot nest inside
+    it. A merge that restores Tier 1's single-button shape produces valid-looking
+    markup that silently drops the view action -- the primary one.
+
+    The primary control's accessible NAME must stay the filename, with the
+    action in `title`. An aria-label would replace the name, hide the filename
+    from assistive tech, and break the role+name queries. Those queries must
+    stay locale-independent: plugins may import only @hermes/plugin-sdk, so a
+    plugin test cannot register locale bundles and every k.* call returns its
+    raw key under test.
+
+    There is deliberately no bind-at-register-time step here, unlike Tier 1's
+    bindOs. `host` is a module-level SDK object closing over core functions, so
+    a host door needs no per-plugin binding. Do not add one.
+
+    i18n keys openAttachment and couldNotOpenAttachment live in the
+    PLUGIN-scoped bundle and are required by KanbanMessages in all four locale
+    objects. `npm run test:ui` does NOT typecheck; a dropped key fails only
+    `npx tsc --noEmit -p apps/desktop/tsconfig.json`.
+  removal_condition: >-
+    Remove when upstream's own kanban drawer opens an attachment in the preview
+    rail -- i.e. when clicking a completed task's output file shows it in the
+    app without this code. Keep the tests.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
