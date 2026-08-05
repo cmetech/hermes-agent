@@ -27,7 +27,12 @@ import type {
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
+/** Just the slice of `ctx.os` this plugin uses — narrower than PluginOs so the
+ *  binding stays trivially fake-able in tests. */
+type Os = { revealPath: (path: string) => Promise<boolean> }
+
 let rest: null | Rest = null
+let os: null | Os = null
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -109,6 +114,20 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => 
     close?.()
     rest = null
   }
+}
+
+/** Bind (or release, with null) the plugin's curated OS door. Separate from
+ *  `bindApi` because it is optional: an older desktop shell — or a plain
+ *  browser — has no bridge, and the reveal control simply stays hidden. */
+export function bindOs(door: null | Os): void {
+  os = door
+}
+
+/** Open the OS file manager on an attachment's stored path. Resolves false
+ *  when no door is bound or the shell can't oblige, so callers can tell the
+ *  user instead of leaving a click that does nothing. */
+export function revealAttachment(path: string): Promise<boolean> {
+  return os && path ? os.revealPath(path) : Promise.resolve(false)
 }
 
 function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {

@@ -89,6 +89,10 @@ export interface KanbanAttachment {
   id: number | string
   filename: string
   size?: null | number
+  /** Absolute on-disk path under `<HERMES_HOME>/kanban/attachments/<task>/`.
+   *  The backend has always sent it (`_attachment_dict`); the drawer needs it
+   *  to reveal the file in the OS file manager. Absent on an older backend. */
+  stored_path?: null | string
 }
 
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).

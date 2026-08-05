@@ -1,0 +1,91 @@
+schema_version: 1
+feature: kanban-attachment-access
+# A user must be able to reach the file the agent produced for them.
+#
+# `kanban_complete` auto-attaches a finished task's output file, and the file is
+# stored safely under <HERMES_HOME>/kanban/attachments/<task_id>/<name>. The
+# desktop drawer listed it -- as inert text. The filename was visible and
+# unreachable: no handler, no link, nothing on click. For a non-technical user
+# that is indistinguishable from the work having produced nothing, and there is
+# no other path in the product to their own result.
+#
+# The backend had always sent the path (`_attachment_dict` -> stored_path); the
+# client type simply omitted the field and the row simply rendered a string.
+upstream_changes:
+- id: kanban-attachment-reveal
+  change_class: product-surface-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/plugins/kanban/types.ts
+  - apps/desktop/src/plugins/kanban/api.ts
+  - apps/desktop/src/plugins/kanban/plugin.tsx
+  - apps/desktop/src/plugins/kanban/drawer.tsx
+  - apps/desktop/src/plugins/kanban/i18n.ts
+  - apps/desktop/src/plugins/kanban/attachments.test.tsx
+  owned_symbols:
+  - KanbanAttachment
+  - bindOs
+  - revealAttachment
+  - AttachmentRow
+  - AttachmentsSection
+  tests:
+  - apps/desktop/src/plugins/kanban/attachments.test.tsx
+  expected_commit_subject: 'fix(kanban): make a task attachment reachable from the drawer'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. THE FAILURE MODE IS A SILENT REVERT: every
+    piece is additive, so an upstream rewrite of any one file drops it with no
+    conflict, no build error, and no failing test outside
+    apps/desktop/src/plugins/kanban/attachments.test.tsx. The row goes back to
+    rendering a filename the user cannot open, which looks deliberate.
+
+    FOUR pieces, all load-bearing, and each dies silently on its own:
+
+    1. types.ts -- KanbanAttachment.stored_path. The backend has always sent it
+    (plugins/kanban/dashboard/plugin_api.py::_attachment_dict); only the client
+    type omitted it. Declared optional because an older backend may not send it.
+    Drop the field and drawer.tsx stops compiling, so this one at least fails
+    loudly -- it is the only piece that does.
+
+    2. api.ts -- bindOs / revealAttachment. The plugin reaches the OS through
+    ctx.os (the curated door in src/contrib/plugin.ts), which is bound at
+    register time exactly like ctx.rest. revealAttachment MUST keep resolving
+    false rather than throwing when no door is bound or the path is empty: the
+    renderer can outlive an older Electron shell, and the whole point of the
+    result shape is that the caller can tell the user.
+
+    3. plugin.tsx -- `bindOs(ctx.os)` in register, released via ctx.onDispose.
+    THIS IS THE HIGHEST-RISK LINE IN THE CHANGE. Without it the feature is
+    inert in the real app while the rendering tests still pass: the row draws,
+    the click fires, and revealAttachment has no door to call. Guarded by the
+    "plugin registration" describe block by name -- a green suite elsewhere
+    proves nothing about it.
+
+    4. drawer.tsx -- AttachmentRow, rendered by AttachmentsSection only when
+    stored_path is non-empty. The no-path branch MUST stay plain text: a button
+    that cannot work is worse than a label, because it teaches the user their
+    click did nothing. AttachmentsSection is exported solely so the test can
+    render it; keep the export.
+
+    ACCESSIBILITY IS DELIBERATE, not incidental. The filename is the button's
+    accessible NAME (that is what the user is hunting for) and the action is
+    the DESCRIPTION (title). Do not "improve" this into an aria-label -- that
+    replaces the name, hides the filename from assistive tech, and breaks the
+    role+name queries in the test. Note that plugins may import ONLY
+    @hermes/plugin-sdk (enforced by no-restricted-imports), so the test cannot
+    register the plugin's locale bundles; the accessible name must therefore
+    stay locale-independent.
+
+    THE i18n KEYS ARE PART OF THIS SURFACE. revealAttachment and
+    couldNotReveal live in the PLUGIN-scoped bundle
+    (apps/desktop/src/plugins/kanban/i18n.ts), not core en.ts, and the
+    KanbanMessages type requires them in ALL FOUR locale objects (en, ja, zh,
+    zh-hant). `npm run test:ui` does NOT typecheck -- a dropped key passes
+    every test and fails only `npx tsc --noEmit -p apps/desktop/tsconfig.json`.
+    Run it after any merge touching this file.
+  removal_condition: >-
+    Remove when upstream's own kanban drawer makes an attachment openable --
+    i.e. when a completed task's attached output file can be reached from the
+    desktop UI without this code. Keep the tests.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
