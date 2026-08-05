@@ -155,6 +155,7 @@ type KanbanMessages = {
   uploadAttachment: string
   revealAttachment: (name: string) => string
   couldNotReveal: string
+  couldNotOpenAttachment: string
   taskActions: string
   copyTaskId: string
   copyTitle: string
@@ -349,6 +350,7 @@ const en: KanbanMessages = {
   uploadAttachment: 'Upload attachment',
   revealAttachment: name => `Reveal ${name} in file manager`,
   couldNotReveal: 'Could not open the file manager',
+  couldNotOpenAttachment: 'Could not open this file',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
   copyTitle: 'Copy title',
@@ -542,6 +544,7 @@ const ja: KanbanMessages = {
   uploadAttachment: '添付をアップロード',
   revealAttachment: name => `${name} をファイルマネージャーで表示`,
   couldNotReveal: 'ファイルマネージャーを開けませんでした',
+  couldNotOpenAttachment: 'このファイルを開けませんでした',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
   copyTitle: 'タイトルをコピー',
@@ -733,6 +736,7 @@ const zh: KanbanMessages = {
   uploadAttachment: '上传附件',
   revealAttachment: name => `在文件管理器中显示 ${name}`,
   couldNotReveal: '无法打开文件管理器',
+  couldNotOpenAttachment: '无法打开此文件',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
   copyTitle: '复制标题',
@@ -923,6 +927,7 @@ const zhHant: KanbanMessages = {
   uploadAttachment: '上傳附件',
   revealAttachment: name => `在檔案管理員中顯示 ${name}`,
   couldNotReveal: '無法開啟檔案管理員',
+  couldNotOpenAttachment: '無法開啟此檔案',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',
   copyTitle: '複製標題',
