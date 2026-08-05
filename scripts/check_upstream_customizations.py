@@ -1863,6 +1863,19 @@ def _exact_pattern(symbol: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])")
 
 
+def _powershell_pattern(symbol: str) -> re.Pattern[str]:
+    """Exact-match pattern for PowerShell sources.
+
+    PowerShell spells a variable reference as ``$Name`` — the sigil belongs to
+    the reference syntax, not the identifier — so a preceding ``$`` must not
+    block a match the way it does for JS-style ``$name`` identifiers. Without
+    this, an owned symbol like ``InheritedPythonEnvVars`` (only ever written as
+    ``$InheritedPythonEnvVars`` in .ps1) can never be found and manifest
+    validation fails against a tree that plainly contains it.
+    """
+    return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_$])")
+
+
 def _parse_error(path: str, kind: str, exc: Exception) -> ValueError:
     detail = " ".join(str(exc).split())[:240]
     return ValueError(f"cannot parse {path} as {kind}: {detail}")
@@ -2041,7 +2054,10 @@ def _symbol_spans(
                     offset = declaration.end() + member_match.start()
                     line = searchable.count("\n", 0, offset) + 1
                     spans[symbol].append((line, line))
-        pattern = _exact_pattern(symbol)
+        if suffix in {".ps1", ".psm1", ".psd1"}:
+            pattern = _powershell_pattern(symbol)
+        else:
+            pattern = _exact_pattern(symbol)
         for match in pattern.finditer(searchable):
             line = searchable.count("\n", 0, match.start()) + 1
             spans[symbol].append((line, line))
