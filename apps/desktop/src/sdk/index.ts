@@ -23,8 +23,10 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -85,6 +87,38 @@ export const host = {
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
+  },
+
+  /** Open a local file in the app's preview rail — the in-app way to SHOW a
+   *  file, as opposed to `ctx.os.revealPath`, which hands it to the OS file
+   *  manager. Absolute paths anywhere on disk are accepted; the main process
+   *  resolver confines nothing, so a plugin's own data directory works.
+   *  Resolves false only for an empty path, or when preview resolution/open
+   *  fails outright (no desktop bridge reachable, an internal throw). A file
+   *  that exists but can't be read (deleted, moved, unreadable) still resolves
+   *  true and opens a preview tab — the renderer-side fallback classifies from
+   *  the path alone without checking the file exists, so the panel itself is
+   *  what reports the problem, not this return value. */
+  previewFile: async (path: string): Promise<boolean> => {
+    if (!path) {
+      return false
+    }
+
+    try {
+      const target = await normalizeOrLocalPreviewTarget(path)
+
+      if (!target) {
+        return false
+      }
+
+      // NOT 'file-browser'/'manual' — those flip HTML to renderMode 'source'
+      // (previewTargetForSource). A task artifact must render.
+      openPreview(target, 'tool-result')
+
+      return true
+    } catch {
+      return false
+    }
   },
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool

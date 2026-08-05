@@ -410,30 +410,50 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
 // administrative note into that slot; hide those (Runs still shows them).
 const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
 
-// The clickable form of an attachment row. Styled to sit flush in the list —
-// it reads as text until hovered — but it is a real button. The filename stays
-// the accessible NAME (that's what the user is looking for); what a click does
-// is the description, so assistive tech announces both.
+// The clickable form of an attachment row: TWO sibling controls, never nested
+// (a button inside a button is invalid and breaks activation). The filename
+// opens the file in the preview rail — the thing the user actually wants — and
+// the folder icon hands it to the OS file manager for copying it elsewhere.
+// The filename stays the primary control's accessible NAME (that's what the
+// user is looking for); what a click does is the description.
 function AttachmentRow({ filename, storedPath }: { filename: string; storedPath: string }) {
   const k = useKanban()
 
   return (
-    <Button
-      className="-mx-1 h-auto justify-start gap-1.5 px-1 py-0.5 font-normal text-(--ui-text-tertiary)"
-      onClick={() =>
-        void revealAttachment(storedPath).then(ok => {
-          if (!ok) {
-            host.notify({ kind: 'warning', message: k.couldNotReveal })
-          }
-        })
-      }
-      size="xs"
-      title={k.revealAttachment(filename)}
-      variant="ghost"
-    >
-      <Codicon name="file" size="0.75rem" />
-      {filename}
-    </Button>
+    <div className="flex min-w-0 flex-1 items-center gap-0.5">
+      <Button
+        className="-mx-1 h-auto min-w-0 flex-1 justify-start gap-1.5 px-1 py-0.5 font-normal text-(--ui-text-tertiary)"
+        onClick={() =>
+          void host.previewFile(storedPath).then(ok => {
+            if (!ok) {
+              host.notify({ kind: 'warning', message: k.couldNotOpenAttachment })
+            }
+          })
+        }
+        size="xs"
+        title={k.openAttachment(filename)}
+        variant="ghost"
+      >
+        <Codicon name="file" size="0.75rem" />
+        <span className="truncate">{filename}</span>
+      </Button>
+      <Button
+        aria-label={k.revealAttachment(filename)}
+        className="shrink-0"
+        onClick={() =>
+          void revealAttachment(storedPath).then(ok => {
+            if (!ok) {
+              host.notify({ kind: 'warning', message: k.couldNotReveal })
+            }
+          })
+        }
+        size="icon-xs"
+        title={k.revealAttachment(filename)}
+        variant="ghost"
+      >
+        <Codicon name="folder-opened" size="0.75rem" />
+      </Button>
+    </div>
   )
 }
 
