@@ -1,7 +1,7 @@
 import { lazy, Suspense, useId, useMemo, useState } from 'react'
 
 import { RichBoundary } from '@/components/assistant-ui/embeds/rich-boundary'
-import { CodeCard, CodeCardBody, CodeCardHeader, CodeCardTitle } from '@/components/chat/code-card'
+import { CodeCard, CodeCardBody } from '@/components/chat/code-card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -173,15 +173,19 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
               <div className="grid min-h-0 min-w-0 gap-2" data-workflow-view-scroll>
                 <p className="text-xs text-(--ui-text-secondary)">{copy.workflowViewDefinitionCaption}</p>
                 <CodeCard>
-                  <CodeCardHeader>
-                    <CodeCardTitle>{copy.workflowViewDefinitionTitle}</CodeCardTitle>
+                  {/* Upstream v0.20.0 removed CodeCardHeader/CodeCardTitle (headerless
+                      code cards); keep the title + copy affordance as an inline row. */}
+                  <div className="flex items-center justify-between gap-2 border-b border-border px-2 py-1.5">
+                    <span className="flex min-w-0 items-center gap-1.5 truncate text-[length:var(--conversation-tool-font-size)] font-medium leading-(--conversation-line-height) text-foreground/80">
+                      {copy.workflowViewDefinitionTitle}
+                    </span>
                     <CopyButton
                       appearance="icon"
                       buttonSize="icon-xs"
                       label={copy.workflowViewCopyDefinition}
                       text={definitionJson}
                     />
-                  </CodeCardHeader>
+                  </div>
                   <CodeCardBody className="max-h-[48dvh] overflow-auto select-text">
                     <pre data-testid="workflow-definition-json">{definitionJson}</pre>
                   </CodeCardBody>
