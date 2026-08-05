@@ -120,12 +120,11 @@ Rejected alternatives:
 ## Architecture
 
 ```
-click filename → previewAttachment(path) → host.previewFile(path)
-                                             → normalizeOrLocalPreviewTarget(path)
-                                             → openPreview(target, 'tool-result')
-                                             → right-rail preview tab
+click filename → host.previewFile(path) → normalizeOrLocalPreviewTarget(path)
+                                          → openPreview(target, 'tool-result')
+                                          → right-rail preview tab
 
-click folder   → revealAttachment(path)  → ctx.os.revealPath  (Tier 1, unchanged)
+click folder   → revealAttachment(path) → ctx.os.revealPath  (Tier 1, unchanged)
 ```
 
 ### The new capability: a preview door on the plugin SDK
@@ -141,11 +140,17 @@ host.previewFile(path: string): Promise<boolean>
 
 Contract:
 
-- Resolves `true` when a preview tab was opened.
-- Resolves `false` when the path is empty, the file is missing or unreadable, or
-  no desktop bridge is present. **Never throws** — matching every other `host`
-  door, which are wrapped so an internal sync throw becomes a rejection rather
-  than an error-boundary crash.
+- Resolves `true` when a preview tab was opened — including when the file
+  turns out to be missing or unreadable. The renderer-side fallback
+  (`normalizeOrLocalPreviewTarget`, kept so an older Electron shell without the
+  newer preview IPC can still preview text/images) classifies purely from the
+  path string and never checks that the file exists, so it still returns a
+  target. The read failure is reported by the preview panel itself, not by
+  this return value.
+- Resolves `false` only for an empty path, or when preview resolution/open
+  fails outright (an internal throw). **Never throws** — matching every other
+  `host` door, which are wrapped so an internal sync throw becomes a rejection
+  rather than an error-boundary crash.
 
 It belongs on `host`, not `ctx.os`: `ctx.os` is documented as "every way a
 plugin reaches outside the app window," and preview is squarely inside it.
@@ -197,10 +202,16 @@ exactly as Tier 1 specifies. That rule is unchanged.
 
 | Case | Behavior |
 |---|---|
-| File deleted or moved | `normalizePreviewTarget` returns `null` → door resolves `false` → warning toast. Closes the Tier 1 silent-no-op gap. |
+| File deleted or moved | Main-process IPC returns `null` for a missing file; `normalizeOrLocalPreviewTarget` falls back to renderer-side path classification, which never checks the file exists. The door still resolves `true` and opens a preview tab — the panel itself reports the read failure in place. No toast. |
 | Binary or oversized | Existing refusal screen with "Preview anyway". No new code. |
-| No desktop bridge (browser, older shell) | Door resolves `false` → same toast. |
+| No desktop bridge (browser, older shell) | Same fallback applies — a missing bridge is a no-throw, not an error. The door still resolves `true` and opens a preview tab that reports the problem in place, not a toast. |
+| Empty path | Door resolves `false` without touching the resolver, and the row shows the `couldNotOpenAttachment` warning toast. This is the only case that produces the toast; it can't happen from a real attachment click, since the row only renders a control when `stored_path` is non-empty. |
 | No `stored_path` | No controls rendered; plain text. |
+
+The failure becomes **visible** in the preview panel instead of a silent
+no-op — still an improvement over Tier 1's `shell.showItemInFolder`, which
+no-ops on a missing path with no feedback at all — but it is not the toast
+this design originally promised.
 
 The reveal button keeps Tier 1's behavior and its `couldNotReveal` toast
 unchanged, including the known limitation that `showItemInFolder` cannot report
@@ -263,7 +274,9 @@ record:
   source view, with no test failure outside the named file.
 - The two-sibling-button structure, and that the primary control's accessible
   name must stay the filename.
-- That the door is bound at register time, like Tier 1's `bindOs`.
+- That, unlike Tier 1's `bindOs`, the door needs **no** per-plugin binding —
+  `host` is a module-level SDK object that closes over core functions
+  directly, so there is nothing to bind at register time.
 
 Validate with:
 

@@ -448,6 +448,7 @@ function AttachmentRow({ filename, storedPath }: { filename: string; storedPath:
           })
         }
         size="icon-xs"
+        title={k.revealAttachment(filename)}
         variant="ghost"
       >
         <Codicon name="folder-opened" size="0.75rem" />

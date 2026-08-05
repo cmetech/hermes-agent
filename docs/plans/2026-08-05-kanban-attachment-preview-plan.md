@@ -568,7 +568,7 @@ Run: `npm run dev --prefix apps/desktop` (or launch the built app). Open a kanba
 1. Clicking the filename opens the file in the right-rail preview.
 2. An HTML artifact **renders**; it does not show raw source. This is the `'tool-result'` behavior and no automated test can prove it end-to-end.
 3. The folder button opens Finder/Explorer with the file selected.
-4. Renaming the file on disk, then clicking the filename, shows the warning toast rather than doing nothing.
+4. Renaming the file on disk, then clicking the filename, opens a preview tab that reports the file cannot be read — not a warning toast, and not doing nothing. (The renderer-side fallback classifies from the path alone and doesn't check the file exists, so the door still resolves `true`; only an empty path or an outright throw produces the toast.)
 
 ---
 

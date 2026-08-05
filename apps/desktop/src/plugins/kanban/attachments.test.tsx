@@ -17,7 +17,7 @@ import type { KanbanAttachment } from './types'
 afterEach(() => {
   cleanup()
   bindOs(null)
-  vi.clearAllMocks()
+  vi.restoreAllMocks()
 })
 
 const attachment = (over: Partial<KanbanAttachment> = {}): KanbanAttachment => ({

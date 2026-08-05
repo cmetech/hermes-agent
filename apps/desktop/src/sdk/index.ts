@@ -93,8 +93,12 @@ export const host = {
    *  file, as opposed to `ctx.os.revealPath`, which hands it to the OS file
    *  manager. Absolute paths anywhere on disk are accepted; the main process
    *  resolver confines nothing, so a plugin's own data directory works.
-   *  Resolves false when the path is empty or the file is missing/unreadable,
-   *  so callers can tell the user instead of leaving a dead click. */
+   *  Resolves false only for an empty path, or when preview resolution/open
+   *  fails outright (no desktop bridge reachable, an internal throw). A file
+   *  that exists but can't be read (deleted, moved, unreadable) still resolves
+   *  true and opens a preview tab — the renderer-side fallback classifies from
+   *  the path alone without checking the file exists, so the panel itself is
+   *  what reports the problem, not this return value. */
   previewFile: async (path: string): Promise<boolean> => {
     if (!path) {
       return false
