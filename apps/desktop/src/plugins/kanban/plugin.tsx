@@ -33,7 +33,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 
-import { $boardSlug, bindApi, boardKey, fetchBoard } from './api'
+import { $boardSlug, bindApi, bindOs, boardKey, fetchBoard } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
@@ -88,6 +88,11 @@ const plugin: HermesPlugin = {
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket))
+
+    // The curated OS door — the drawer reveals a task's attachment (its output
+    // file) in the file manager through it. Released on unload like `rest`.
+    bindOs(ctx.os)
+    ctx.onDispose(() => bindOs(null))
 
     // The plugin command pattern: ONE action id (`kanban.newTask`) wired into
     // two areas — a keybind (dispatch + rebindable panel row) and a palette row
