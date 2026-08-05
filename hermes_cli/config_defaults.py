@@ -2281,9 +2281,20 @@ DEFAULT_CONFIG = {
         # auxiliary.kanban_decomposer.
         "orchestrator_profile": "",
         # Where a child task lands if the orchestrator can't match an
-        # assignee to any installed profile. When unset, falls back to the
-        # default profile. A task never ends up with assignee=None.
-        "default_assignee": "",
+        # assignee to any installed profile, AND which profile the dispatcher
+        # gives an unassigned `ready` task.
+        #
+        # Ships as the canonical `default` profile rather than empty. The two
+        # consumers read an empty value differently: the orchestrator
+        # (kanban_decompose._resolve_default_assignee) already falls back to
+        # the active profile, but the dispatcher treats empty as "no fallback,
+        # keep skipping" -- so on a stock install a task created without an
+        # assignee reaches `ready` and then stalls there forever with nothing
+        # in the UI explaining why. That silent dead-end is the same class of
+        # failure as a board with no dispatcher at all. `default` is the
+        # canonical profile alias (normalize_profile_name), so it always
+        # resolves. Set to "" to restore the skip-forever behaviour.
+        "default_assignee": "default",
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,
         # even if the global max_in_progress / max_spawn caps would allow
@@ -2460,6 +2471,15 @@ DEFAULT_CONFIG = {
         # at-least-once). Disable to lose in-flight final responses on
         # crash/restart, as before.
         "delivery_ledger": True,
+
+        # Start the messaging gateway alongside a desktop-spawned backend.
+        # The gateway hosts the kanban dispatcher and cron, both enabled by
+        # default, so a desktop install with no messaging configured would
+        # otherwise never get a dispatcher: the installer's
+        # Start-GatewayIfConfigured fires only when a messaging token exists,
+        # leaving the board permanently and silently inert. Set false to keep
+        # gateway lifecycle fully manual.
+        "autostart_with_desktop": True,
 
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular

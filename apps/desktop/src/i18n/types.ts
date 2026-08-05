@@ -1853,6 +1853,7 @@ export interface Translations {
     loadMore: string
     workflowUnavailable: string
     kanbanUnavailable: string
+    dispatcherOffline: string
     physicalBoard: (board: string) => string
   }
 
@@ -2270,6 +2271,10 @@ export interface Translations {
       gatewayReady: string
       gatewayNeedsSetup: string
       gatewayChecking: string
+      automation: string
+      automationRunning: string
+      automationStopped: string
+      automationUnknown: string
       gatewayConnecting: string
       gatewayOffline: string
       gatewayRestarting: string

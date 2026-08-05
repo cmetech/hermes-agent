@@ -2374,6 +2374,7 @@ export const zh: Translations = {
     loadMore: '加载更多',
     workflowUnavailable: 'Workflow 插件不可用。请运行 hermes plugins enable workflow。',
     kanbanUnavailable: 'Kanban 插件不可用。请运行 hermes plugins enable kanban。',
+    dispatcherOffline: '调度器未运行，这些卡片不会被处理。请从状态栏启动网关以开始处理。',
     physicalBoard: board => `机器共享物理看板：${board}`
   },
 
@@ -2874,6 +2875,10 @@ export const zh: Translations = {
       gatewayReady: '就绪',
       gatewayNeedsSetup: '需要设置',
       gatewayChecking: '检查中',
+      automation: '自动化',
+      automationRunning: '运行中',
+      automationStopped: '已停止',
+      automationUnknown: '未知',
       gatewayConnecting: '连接中',
       gatewayOffline: '离线',
       gatewayRestarting: '重启中…',

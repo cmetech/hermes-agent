@@ -12,6 +12,8 @@ import { cn } from '@/lib/utils'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { StatusResponse } from '@/types/hermes'
 
+import { gatewayAutomationLabel } from './gateway-states'
+
 interface GatewayMenuPanelProps {
   gatewayState: string
   inferenceStatus: RuntimeReadinessResult | null
@@ -155,6 +157,12 @@ export function GatewayMenuPanel({
             <StatusDot tone={inferenceReady ? 'good' : gatewayOpen ? 'warn' : 'bad'} />
             {inferenceLabel}
           </span>
+          <div className="flex items-center justify-between gap-2">
+            <span>{t.shell.statusbar.automation}</span>
+            <span className={statusSnapshot?.gateway_running === false ? 'text-amber-600' : undefined}>
+              {gatewayAutomationLabel(statusSnapshot?.gateway_running, t.shell.statusbar)}
+            </span>
+          </div>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           <Tip label={t.commandCenter.restartGateway}>

@@ -18,6 +18,7 @@ import { $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
+import { DispatcherBanner } from '../kanban/dispatcher-banner'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, KANBAN_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
@@ -45,6 +46,19 @@ export function LegacySessionRedirect() {
   const { sessionId } = useParams()
 
   return <Navigate replace to={sessionId ? sessionRoute(sessionId) : NEW_CHAT_ROUTE} />
+}
+
+/** Kanban board content with the inert-board warning above it.
+ *
+ *  Exported so one wrapper serves BOTH boards: the contributed SDK plugin
+ *  page (a prebuilt bundle we cannot edit) and the built-in fallback. */
+export function KanbanRouteContent({ children }: { children: ReactNode }) {
+  return (
+    <>
+      <DispatcherBanner />
+      {children}
+    </>
+  )
 }
 
 export const SidebarSurface = memo(function SidebarSurface({
@@ -189,7 +203,9 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
       <Route element={page(<WorkflowsView />)} path="workflows" />
-      {!kanbanContributed && <Route element={page(<KanbanView />)} path="kanban" />}
+      {!kanbanContributed && (
+        <Route element={page(<KanbanRouteContent><KanbanView /></KanbanRouteContent>)} path="kanban" />
+      )}
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
       <Route element={null} path="cron" />
@@ -200,13 +216,21 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       {/* Registry-contributed pages (core features + plugins) render in the
           workspace pane like any built-in view — behind the same blast wall
           as every other contribution mount. */}
-      {routeContributions.map(route => (
-        <Route
-          element={page(<ContribBoundary id={route.key}>{route.render()}</ContribBoundary>)}
-          key={route.key}
-          path={route.path.slice(1)}
-        />
-      ))}
+      {routeContributions.map(route => {
+        const content = <ContribBoundary id={route.key}>{route.render()}</ContribBoundary>
+
+        return (
+          <Route
+            element={page(
+              route.path === KANBAN_ROUTE
+                ? <KanbanRouteContent>{content}</KanbanRouteContent>
+                : content
+            )}
+            key={route.key}
+            path={route.path.slice(1)}
+          />
+        )
+      })}
       <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="new" />
       <Route element={<LegacySessionRedirect />} path="sessions/:sessionId" />
       <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="*" />
