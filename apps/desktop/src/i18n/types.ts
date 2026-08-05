@@ -1853,6 +1853,7 @@ export interface Translations {
     loadMore: string
     workflowUnavailable: string
     kanbanUnavailable: string
+    dispatcherOffline: string
     physicalBoard: (board: string) => string
   }
 
