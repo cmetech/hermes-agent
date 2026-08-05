@@ -23,6 +23,7 @@ import { contributedRoutes, KANBAN_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRo
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
+import { StatusbarBoundary } from '../shell/statusbar-fallback'
 import { StatusbarControls } from '../shell/statusbar-controls'
 
 import { latestChatActions, latestSidebarActions } from './latest-actions'
@@ -69,7 +70,7 @@ export const TerminalSurface = memo(function TerminalSurface() {
 /** Owns the statusbar's own data hooks (status snapshot poll, contributed
  *  items) so its 15s refresh — and any statusbar-only churn — re-renders the
  *  bar alone, never the chat/sidebar/terminal. */
-export const StatusbarSurface = memo(function StatusbarSurface({
+const StatusbarSurfaceInner = memo(function StatusbarSurfaceInner({
   actions,
   agentsOpen,
   chatOpen,
@@ -104,6 +105,17 @@ export const StatusbarSurface = memo(function StatusbarSurface({
 
   return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} />
 })
+
+/** Containment: a throwing status item must degrade to the minimal fallback
+ *  bar (version still visible, crash logged), never silently remove the whole
+ *  footer. See statusbar-fallback.tsx. */
+export function StatusbarSurface(props: ComponentProps<typeof StatusbarSurfaceInner>) {
+  return (
+    <StatusbarBoundary>
+      <StatusbarSurfaceInner {...props} />
+    </StatusbarBoundary>
+  )
+}
 
 /** The workspace pane: the real route table (chat + full-page views + plugin
  *  routes). Subscribes to `$gatewayState` and ROUTES_AREA itself; the gateway
