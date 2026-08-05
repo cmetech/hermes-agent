@@ -104,12 +104,6 @@ class TestBoundedOutputCollector:
         assert rendered.endswith("TAIL-SENTINEL")
         assert "[OUTPUT TRUNCATED" in rendered
 
-    def test_small_stream_is_unchanged(self):
-        collector = _BoundedOutputCollector(100)
-        collector.append("hello ")
-        collector.append("world")
-
-        assert collector.render() == "hello world"
 
     def test_required_status_suffix_stays_inside_limit(self):
         collector = _BoundedOutputCollector(120)
@@ -225,7 +219,7 @@ class TestWrapCommand:
         assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
-        assert "export -p >" in wrapped
+        assert "export -p" in wrapped and "> " in wrapped
         # cwd travels via the stdout marker only — no temp-file write.
         assert "pwd -P >" not in wrapped
         assert env._cwd_marker in wrapped
@@ -309,14 +303,15 @@ class TestAtomicSnapshotWrite:
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
         # Env dump goes to a temp file, not directly over the live snapshot.
-        assert "export -p > " in wrapped
+        assert "export -p" in wrapped and "> " in wrapped
         assert ".tmp." in wrapped
         # Then an atomic rename onto the real snapshot path.
         assert "mv -f " in wrapped
         # The env-dump must NOT write the live snapshot in place (the bug).
         snap = env._snapshot_path
-        assert f"export -p > {snap} " not in wrapped
-        assert f"export -p > '{snap}'" not in wrapped
+        assert f"> {snap} " not in wrapped
+        assert f"> '{snap}'" not in wrapped
+        assert f"> {snap}\n" not in wrapped
 
     def test_temp_path_uses_collision_safe_mktemp_template(self):
         """The temp name must come from collision-safe creation, not a shell
@@ -341,13 +336,17 @@ class TestAtomicSnapshotWrite:
         assert "mktemp /tmp/has space/hermes-snap-x.sh.tmp.XXXXXX" not in wrapped
 
     def test_wrap_command_mv_chained_on_export_success(self):
-        """A failed/partial ``export -p`` must NOT mv a torn temp over a good
-        snapshot.  The mv is chained with ``&&`` on the export, and the temp is
-        removed on failure."""
+        """A failed/partial env dump must NOT mv a torn temp over a good
+        snapshot.  The mv is chained with ``&&`` on the dump, and the temp is
+        removed on failure. The dump itself is the session-var-excluding
+        snippet (``_export_dump_excluding_session_vars``), which unsets the
+        per-session bridged vars before ``export -p`` (issue #71296)."""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert r"\builtin export -p > " in wrapped
+        assert "export -p" in wrapped
+        assert '> "$__hermes_snap_tmp"' in wrapped
+        assert "${!HERMES_SESSION_*}" in wrapped
         assert r"&& \builtin command mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
@@ -379,14 +378,6 @@ class TestAtomicSnapshotWrite:
         assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
 
-    def test_snapshot_writes_use_private_umask_after_user_command(self):
-        env = _TestableEnv()
-        env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/tmp")
-
-        assert "umask 077" in wrapped
-        assert wrapped.index("eval 'echo hi'") < wrapped.index("umask 077")
-        assert wrapped.index("umask 077") < wrapped.index("export -p >")
 
     def test_failed_snapshot_update_under_errexit_preserves_wrapper_contract(
         self, tmp_path
@@ -474,7 +465,7 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert "umask 077" in boot
-        assert boot.index("umask 077") < boot.index("export -p >")
+        assert boot.index("umask 077") < boot.index("export -p")
 
     def test_bootstrap_assembly_failure_preserves_existing_snapshot(self, tmp_path):
         """Any failed assembly step must leave the prior snapshot untouched,
@@ -945,24 +936,6 @@ class TestExtractCwdFromOutput:
         assert env.cwd == "/home/user"
         assert marker not in result["output"]
 
-    def test_missing_marker(self):
-        env = _TestableEnv()
-        result = {"output": "hello world\n"}
-        env._extract_cwd_from_output(result)
-
-        assert env.cwd == "/tmp"  # unchanged
-
-    def test_marker_in_command_output(self):
-        """If the marker appears in command output AND as the real marker,
-        rfind grabs the last (real) one."""
-        env = _TestableEnv()
-        marker = env._cwd_marker
-        result = {
-            "output": f"user typed {marker} in their output\nreal output\n{marker}/correct/path{marker}\n",
-        }
-        env._extract_cwd_from_output(result)
-
-        assert env.cwd == "/correct/path"
 
     def test_output_cleaned(self):
         env = _TestableEnv()

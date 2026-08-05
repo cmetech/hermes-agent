@@ -516,7 +516,9 @@ race or authentication gap merely because its interleaving is difficult.
 
 Write the review to:
 
-`docs/reviews/2026-07-27-workflow-language-foundation-adversarial-review.md`
+`docs/reviews/2026-07-27-workflow-language-foundation-adversarial-review-<model_name>.md`
+
+model_name is the name of the model performing the review (i.e. claude, codex, etc.)
 
 The review must contain:
 

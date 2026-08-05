@@ -110,7 +110,7 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=15,
                 stdin=subprocess.DEVNULL,
             )
@@ -128,7 +128,7 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=10,
                 stdin=subprocess.DEVNULL,
             )
@@ -155,7 +155,7 @@ class SSHEnvironment(BaseEnvironment):
         subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
@@ -170,7 +170,7 @@ class SSHEnvironment(BaseEnvironment):
         subprocess.run(
             mkdir_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
@@ -184,7 +184,7 @@ class SSHEnvironment(BaseEnvironment):
         result = subprocess.run(
             scp_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             stdin=subprocess.DEVNULL,
         )
@@ -213,7 +213,7 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=30,
                 stdin=subprocess.DEVNULL,
             )
@@ -331,7 +331,7 @@ class SSHEnvironment(BaseEnvironment):
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )

@@ -27,6 +27,7 @@ import type {
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { evaluateModelEligibility, type ModelUsageKind } from '@/lib/model-eligibility'
+import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
@@ -83,10 +84,6 @@ export function ModelSettingsSkeleton() {
   )
 }
 
-// Hermes' reasoning levels (VALID_REASONING_EFFORTS); `none` = thinking off.
-// Empty config = Hermes default (medium), shown as Medium.
-const EFFORT_VALUES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
-
 // agent.service_tier stores "fast"/"priority"/"on" for fast; anything else is
 // normal (mirrors tui_gateway _load_service_tier).
 const isFastTier = (tier: unknown): boolean =>
@@ -95,9 +92,6 @@ const isFastTier = (tier: unknown): boolean =>
       .trim()
       .toLowerCase()
   )
-
-// Reuse the composer's effort labels.
-const effortLabelKey = (v: string) => v as 'high' | 'low' | 'max' | 'medium' | 'minimal' | 'ultra' | 'xhigh'
 
 // A provider row is "ready" to pick a model from when it reports models. The
 // backend now surfaces the full `hermes model` universe (every canonical
@@ -415,6 +409,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
   // Mirror of `moa` so inline edits compute the next state purely (outside the
   // setState updater) and hand it straight to the debounced autosave.
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     moaRef.current = moa
   }, [moa])
@@ -665,7 +660,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     .trim()
     .toLowerCase()
 
-  const effortValue = rawEffort === 'false' || rawEffort === 'disabled' ? 'none' : rawEffort || 'medium'
+  const effortValue = rawEffort === 'false' || rawEffort === 'disabled' ? 'none' : rawEffort || DEFAULT_REASONING_EFFORT
 
   const fastOn = isFastTier(getNested(config ?? {}, 'agent.service_tier'))
 
@@ -776,7 +771,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setSelectionWarning(false)
 
     try {
-      const result = await setModelAssignment({ model: selectedModel, provider: selectedProvider, scope: 'main' })
+      const result = await setModelAssignment({
+        model: selectedModel,
+        provider: selectedProvider,
+        scope: 'main',
+        ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
+      })
 
       if (profileEpoch.current !== epoch) {
         return
@@ -794,7 +794,21 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, selectedModel, selectedProvider])
+  }, [onMainModelChanged, refresh, selectedModel, selectedProvider, selectedProviderRow])
+
+  // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
+  // assignments targeting a user-defined provider must carry that provider's
+  // endpoint too, or the backend pins the slot without a base_url and the
+  // aux resolver falls back to the (possibly different, possibly cleared)
+  // main endpoint.
+  const endpointForProvider = useCallback(
+    (provider: string) => {
+      const row = providers.find(entry => entry.slug === provider)
+
+      return row?.api_url ? { base_url: row.api_url } : {}
+    },
+    [providers]
+  )
 
   const setAuxiliaryToMain = useCallback(
     async (task: string) => {
@@ -807,6 +821,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setSelectionWarning(false)
 
       try {
+        // OTTO verified-model selection: "use main" assigns the auto
+        // follow-main sentinel rather than pinning the current main model.
         const result = await setModelAssignment({
           model: '',
           provider: 'auto',
@@ -822,7 +838,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [mainModel, refresh]
+    [endpointForProvider, mainModel, refresh]
   )
 
   const applyAuxiliaryDraft = useCallback(
@@ -840,7 +856,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           model: auxDraft.model,
           provider: auxDraft.provider,
           scope: 'auxiliary',
-          task
+          task,
+          ...endpointForProvider(auxDraft.provider)
         })
 
         setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
@@ -852,7 +869,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [auxDraft, refresh]
+    [auxDraft, endpointForProvider, refresh]
   )
 
   const beginAuxiliaryEdit = useCallback(
@@ -1017,9 +1034,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {EFFORT_VALUES.map(value => (
+                    {REASONING_EFFORT_VALUES.map(value => (
                       <SelectItem key={value} value={value}>
-                        {value === 'none' ? m.reasoningOff : t.shell.modelOptions[effortLabelKey(value)]}
+                        {value === 'none' ? m.reasoningOff : t.shell.modelOptions[value]}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1213,6 +1230,15 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                 ))}
               </SelectContent>
             </Select>
+            <label className="flex items-center gap-2 rounded-sm border border-border px-2 py-1 text-xs">
+              Enabled
+              <Switch
+                checked={currentMoaPreset.enabled !== false}
+                disabled={applying}
+                onCheckedChange={checked => updateMoaPreset(prev => ({ ...prev, enabled: checked }))}
+                size="xs"
+              />
+            </label>
             <Button
               disabled={applying}
               onClick={() => {
@@ -1289,6 +1315,21 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           <div className="grid gap-1">
             {currentMoaPreset.reference_models.map((slot, index) => (
               <ListRow
+                action={
+                  <Switch
+                    aria-label={`${slot.enabled !== false ? 'Disable' : 'Enable'} reference ${index + 1}`}
+                    checked={slot.enabled !== false}
+                    disabled={applying}
+                    onCheckedChange={checked =>
+                      updateMoaPreset(prev => ({
+                        ...prev,
+                        reference_models: prev.reference_models.map((s, i) =>
+                          i === index ? { ...s, enabled: checked === true } : s
+                        )
+                      }))
+                    }
+                  />
+                }
                 below={
                   <div className="mt-2 flex flex-wrap items-center gap-2 pt-1">
                     <Select
@@ -1351,6 +1392,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                     </Button>
                   </div>
                 }
+                className={cn(slot.enabled === false && 'opacity-60')}
                 description={
                   <span className="font-mono text-[0.68rem]">
                     {slot.provider} · {slot.model || m.model}
@@ -1363,7 +1405,10 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <Button
               disabled={applying}
               onClick={() =>
-                updateMoaPreset(prev => ({ ...prev, reference_models: [...prev.reference_models, prev.aggregator] }))
+                updateMoaPreset(prev => ({
+                  ...prev,
+                  reference_models: [...prev.reference_models, { ...prev.aggregator, enabled: true }]
+                }))
               }
               size="sm"
               variant="textStrong"

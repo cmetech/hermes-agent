@@ -228,7 +228,11 @@ def test_cli_startup_writes_brand_json(tmp_path):
     env["OTTO_CAPABILITY_SOURCE"] = str(tmp_path / "no-such-capability-source")
     hermes = Path(sys.executable).parent / "hermes"
     assert hermes.exists(), f"expected {hermes} in the venv"
-    subprocess.run([str(hermes), "--version"], env=env, capture_output=True, timeout=120)
+    # v0.20.0 made `--version` an everywhere fast path (_startup_fast) that
+    # exits before main()'s brand-startup seam — by design, brand.json is
+    # skipped on fast paths. Drive `--help` instead: it reaches main() (and
+    # therefore run_brand_startup) before argparse prints help and exits.
+    subprocess.run([str(hermes), "--help"], env=env, capture_output=True, timeout=120)
     assert (tmp_path / "brand.json").exists()
     data = json.loads((tmp_path / "brand.json").read_text())
     assert data["schemes"][-1] == "hermes"
