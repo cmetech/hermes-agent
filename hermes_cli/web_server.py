@@ -409,6 +409,19 @@ async def _lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
+    # The gateway hosts the kanban dispatcher and cron. Its only other
+    # autostart path fires solely when a MESSAGING platform is configured, so
+    # a desktop install that uses kanban and no messaging would never get a
+    # dispatcher and the board would sit inert with no signal. Runs on a
+    # thread (the liveness probe does file I/O and may issue an HTTP health
+    # check) so backend startup is never blocked; mirrors the cron ticker.
+    if os.getenv("HERMES_DESKTOP") == "1":
+        threading.Thread(
+            target=_maybe_autostart_gateway,
+            daemon=True,
+            name="gateway-autostart",
+        ).start()
+
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
 
@@ -4124,6 +4137,89 @@ def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Po
             return existing, True
         raise RuntimeError("gateway restart already in progress for another profile")
     return _spawn_hermes_action(subcommand, "gateway-restart"), False
+
+
+def _should_autostart_gateway(
+    *,
+    is_desktop: bool,
+    in_gateway: bool,
+    autostart_enabled: bool,
+    gateway_running: bool,
+    probe_failed: bool = False,
+) -> bool:
+    """Decide whether this backend should spawn a gateway.
+
+    Pure, so the five guards are testable without a process, a config file or
+    a live probe. Every guard is load-bearing:
+
+    * ``is_desktop`` -- a server ``hermes dashboard`` relies on its own
+      gateway; this behaviour is desktop-only.
+    * ``in_gateway`` -- the backend runs INSIDE the gateway in some
+      deployments and would otherwise spawn itself (#52470).
+    * ``autostart_enabled`` -- ``gateway.autostart_with_desktop``.
+    * ``gateway_running`` -- idempotent across backend restarts.
+    * ``probe_failed`` -- ``GatewayLiveness.probe_error``: a rung RAISED
+      instead of answering, so ``running=False`` means "could not tell", not
+      "nothing is running". Acting on it is destructive here in a way it is
+      not for a status badge: the spawn routes through ``hermes gateway
+      restart``, which STOPS a healthy gateway first. A locked
+      ``gateway.lock`` or a permissions hiccup would then kill a live gateway
+      mid-turn on every desktop launch. Same fail-OPEN reasoning as the
+      kanban dispatcher warning (``hermes_cli/kanban.py``), which refuses to
+      cry wolf on an unreadable probe.
+    """
+    if not is_desktop:
+        return False
+    if in_gateway:
+        return False
+    if not autostart_enabled:
+        return False
+    if probe_failed:
+        return False
+    return not gateway_running
+
+
+def _maybe_autostart_gateway() -> bool:
+    """Start the gateway for a desktop backend when nothing else has.
+
+    Fail-safe by construction: the desktop must start even if the probe, the
+    config read or the spawn fails. Returns True when a spawn was issued (a
+    test seam; the lifespan ignores the result).
+    """
+    try:
+        from gateway.status import resolve_gateway_liveness
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+        # Same probe ladder every other liveness caller uses (/api/status and
+        # the messaging-platform catalog). Rung 2 -- the HTTP health probe --
+        # is what covers a gateway running in another container with no local
+        # PID file: without it this decides "nothing is running" and spawns a
+        # SECOND local gateway on every launch (two dispatchers, two cron
+        # schedulers), which the gateway's own local double-run guard cannot
+        # see. Gated on _GATEWAY_HEALTH_URL exactly like the other two callers.
+        liveness = resolve_gateway_liveness(
+            use_cache=False,
+            health_probe=_probe_gateway_health if _GATEWAY_HEALTH_URL else None,
+        )
+        if not _should_autostart_gateway(
+            is_desktop=os.getenv("HERMES_DESKTOP") == "1",
+            in_gateway=os.getenv("_HERMES_GATEWAY") is not None,
+            autostart_enabled=bool(gateway_cfg.get("autostart_with_desktop", True)),
+            gateway_running=bool(getattr(liveness, "running", False)),
+            probe_failed=bool(getattr(liveness, "probe_error", False)),
+        ):
+            return False
+        _spawn_gateway_restart()
+        _log.info(
+            "gateway autostart: no gateway running; started one so kanban "
+            "dispatch and cron are available to the desktop"
+        )
+        return True
+    except Exception:
+        _log.exception("gateway autostart failed; desktop backend continues")
+        return False
 
 
 def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:

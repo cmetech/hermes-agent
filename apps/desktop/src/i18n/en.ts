@@ -2185,6 +2185,7 @@ export const en: Translations = {
     loadMore: 'Load more',
     workflowUnavailable: 'Workflow plugin unavailable. Enable it with hermes plugins enable workflow.',
     kanbanUnavailable: 'Kanban plugin unavailable. Enable it with hermes plugins enable kanban.',
+    dispatcherOffline: 'No dispatcher is running, so these cards will not be picked up. Start the gateway from the status bar to work them.',
     physicalBoard: board => `Machine-shared physical board: ${board}`
   },
 
@@ -2697,6 +2698,10 @@ export const en: Translations = {
       gatewayReady: 'ready',
       gatewayNeedsSetup: 'needs setup',
       gatewayChecking: 'checking',
+      automation: 'Automation',
+      automationRunning: 'running',
+      automationStopped: 'stopped',
+      automationUnknown: 'unknown',
       gatewayConnecting: 'connecting',
       gatewayOffline: 'offline',
       gatewayRestarting: 'restarting…',

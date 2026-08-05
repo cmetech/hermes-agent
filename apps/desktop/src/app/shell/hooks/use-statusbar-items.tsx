@@ -5,6 +5,7 @@ import type { CommandCenterSection } from '@/app/command-center'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { gatewayAutomationLabel } from '@/app/shell/gateway-states'
 import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -252,10 +253,22 @@ export function useStatusbarItems({
   const gatewayConnecting = gatewayState === 'connecting'
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true
   const gatewayDegraded = gatewayOpen || gatewayConnecting
+  // The third state. The chip fused the websocket and inference legs and left
+  // this one out entirely, so with both of those healthy it read "ready" while
+  // the messaging gateway -- the process that hosts kanban dispatch and cron --
+  // was down. That is the display that told a real user everything was fine
+  // while their board sat inert. Only an explicit `false` counts: `undefined`
+  // means no status response has arrived yet and must keep the previous
+  // behaviour rather than raise a false alarm on first paint.
+  const automationStopped = statusSnapshot?.gateway_running === false
+  // "Healthy" now means all three, not two.
+  const gatewayHealthy = inferenceReady && !automationStopped
 
   const gatewayDetail = gatewayOpen
     ? inferenceStatus?.ready
-      ? copy.gatewayReady
+      ? automationStopped
+        ? `${copy.automation}: ${gatewayAutomationLabel(false, copy)}`
+        : copy.gatewayReady
       : inferenceStatus
         ? copy.gatewayNeedsSetup
         : copy.gatewayChecking
@@ -263,7 +276,7 @@ export function useStatusbarItems({
       ? copy.gatewayConnecting
       : copy.gatewayOffline
 
-  const gatewayClassName = inferenceReady
+  const gatewayClassName = gatewayHealthy
     ? undefined
     : gatewayDegraded
       ? 'text-amber-600 hover:text-amber-600'
@@ -407,7 +420,7 @@ export function useStatusbarItems({
         detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
         icon: gatewayRestarting ? (
           <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
-        ) : inferenceReady ? (
+        ) : gatewayHealthy ? (
           <Activity className="size-3" />
         ) : (
           <AlertCircle className="size-3" />
@@ -510,8 +523,8 @@ export function useStatusbarItems({
       gatewayMenuContent,
       gatewayClassName,
       gatewayDetail,
+      gatewayHealthy,
       gatewayRestarting,
-      inferenceReady,
       inferenceStatus?.reason,
       openAgents,
       projectName,

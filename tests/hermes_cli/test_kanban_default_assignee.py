@@ -93,3 +93,32 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
 
 
+
+
+def test_stock_config_gives_unassigned_ready_tasks_an_owner():
+    """A stock install must not leave a `ready` task unclaimed forever.
+
+    The dispatcher skips unassigned ready tasks, and `kanban.default_assignee`
+    is the only thing that gives them an owner (the orchestrator path has its
+    own fallback, the dispatcher does not). Shipped empty, a user who creates a
+    task in the UI and never assigns it watches it reach `ready` and stop, with
+    nothing on the board explaining why — the same silent dead-end as a board
+    with no dispatcher running at all.
+
+    Asserted behaviourally rather than as a literal snapshot: the value must be
+    non-empty and already in canonical profile form, so the dispatcher can use
+    it verbatim without normalising.
+    """
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from hermes_cli.profiles import normalize_profile_name
+
+    shipped = DEFAULT_CONFIG["kanban"]["default_assignee"]
+
+    assert shipped, (
+        "kanban.default_assignee ships empty, so the dispatcher will skip every "
+        "unassigned ready task and the board dead-ends with no signal."
+    )
+    assert normalize_profile_name(shipped) == shipped, (
+        f"kanban.default_assignee ships {shipped!r}, which is not canonical "
+        "profile form; the dispatcher passes it straight to the spawn."
+    )
