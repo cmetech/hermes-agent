@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_constants import agent_browser_runnable
+from hermes_constants import agent_browser_runnable, find_node_executable
 from tools.environments.local import hermes_subprocess_env
 
 # os.name, not platform.system(): the latter spawns `cmd /c ver` on Windows and
@@ -29,7 +29,10 @@ from tools.environments.local import hermes_subprocess_env
 _IS_WINDOWS = os.name == "nt"
 
 _DEP_CHECKS = {
-    "node": lambda: shutil.which("node") is not None,
+    # find_node_executable() rather than a bare which(): $HERMES_HOME/node is
+    # not on PATH, so which() would report Node missing on an install that has
+    # a managed one and trigger a redundant re-install.
+    "node": lambda: find_node_executable("node") is not None,
     "browser": lambda: (
         agent_browser_runnable(shutil.which("agent-browser"))
         or _has_system_browser()

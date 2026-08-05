@@ -16,6 +16,9 @@ describe('desktop i18n languages', () => {
     expect(normalizeLocale('zh_HK')).toBe('zh-hant')
     expect(normalizeLocale('ja')).toBe('ja')
     expect(normalizeLocale('ja-JP')).toBe('ja')
+    expect(normalizeLocale('ar')).toBe('ar')
+    expect(normalizeLocale('AR-SA')).toBe('ar')
+    expect(normalizeLocale(' ar_eg ')).toBe('ar')
   })
 
   it('falls back to English for empty or unsupported values', () => {
@@ -33,6 +36,7 @@ describe('desktop i18n languages', () => {
     expect(isLocale('zh')).toBe(true)
     expect(isLocale('zh-hant')).toBe(true)
     expect(isLocale('ja')).toBe(true)
+    expect(isLocale('ar')).toBe(true)
   })
 
   it('returns the persisted config value for supported locales', () => {
@@ -40,6 +44,7 @@ describe('desktop i18n languages', () => {
     expect(localeConfigValue('zh')).toBe('zh')
     expect(localeConfigValue('zh-hant')).toBe('zh-hant')
     expect(localeConfigValue('ja')).toBe('ja')
+    expect(localeConfigValue('ar')).toBe('ar')
   })
 
   it('describes one-shot workflow scheduling in every locale without claiming Cron creation', () => {

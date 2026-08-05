@@ -84,6 +84,7 @@ def test_agent_anthropic_bridge_installs_the_reservation_callback(
         log_prefix="",
         _provider_attempt_reservation_callback=lambda: events.append("reserve"),
         _try_refresh_anthropic_client_credentials=lambda: None,
+        _capture_anthropic_response_headers=lambda *_a, **_k: None,
     )
 
     result = AIAgent._anthropic_messages_create(agent, {"model": "test"})
@@ -171,10 +172,14 @@ def test_all_provider_transport_launch_sites_remain_reserved() -> None:
         "agent/chat_completion_helpers.py", "reserve_provider_transport_attempt"
     ) == {
         "_dispatch_nonstreaming_api_request": 3,
-        "handle_max_iterations": 2,
-        "_bedrock_call": 2,
-        "_call_chat_completions": 1,
-        "_call_anthropic": 1,
+        # v0.20.0 moved each launch into a per-attempt opener/callback that
+        # the managed Relay layer invokes; the reservation moved with it so
+        # every physical retry still receives a distinct reservation.
+        "_reserved_summary_create": 1,
+        "_reserved_summary_retry_create": 1,
+        "_open_bedrock_stream": 2,
+        "_open_stream": 1,
+        "_open_anthropic_stream": 1,
     }
     assert _call_counts("agent/anthropic_adapter.py", "before_transport") == {
         "create_anthropic_message": 2,
@@ -183,7 +188,7 @@ def test_all_provider_transport_launch_sites_remain_reserved() -> None:
         "agent/codex_runtime.py", "reserve_provider_transport_attempt"
     ) == {
         "run_codex_app_server_turn": 1,
-        "run_codex_stream": 1,
+        "_open_codex_stream": 1,
     }
     assert _call_counts(
         "run_agent.py", "reserve_provider_transport_attempt"
