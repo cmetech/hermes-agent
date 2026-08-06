@@ -86,6 +86,256 @@ def test_v4_resource_body_rewrites_preserve_nonreference_text(
     ) == expected
 
 
+def test_authenticated_included_command_body_is_rewritten_before_validation(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch digest admission validating child-local command references unchanged."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.trust import compute_package_digest
+
+    root_path = workflow_writer(
+        tmp_path / "command-root",
+        name="command-root",
+        nodes=[{"id": "checks", "include": "command-child"}],
+    )
+    sidecar_bytes = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
+    commands = root_path.parent / "commands"
+    commands.mkdir()
+    (commands / "consume.md").write_text(
+        "consume $producer.output and $$HOME\n",
+        encoding="utf-8",
+    )
+    child_path = workflow_writer(
+        tmp_path / "command-child",
+        name="command-child",
+        filename="child.yaml",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    root = _parse(
+        root_path,
+        sidecar_bytes=sidecar_bytes,
+    )
+    child = _parse(child_path)
+    compiled = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+
+    assert compute_package_digest(compiled.package).sha256
+
+
+def test_authenticated_root_command_include_alias_selects_first_sink(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch root resource bodies bypassing ordered include-alias resolution."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.resources import ResourceResolver
+    from plugins.workflow.schema import validate_authenticated_command_references
+    from plugins.workflow.trust import compute_package_digest
+
+    root_path = workflow_writer(
+        tmp_path / "alias-command-root",
+        name="alias-command-root",
+        nodes=[
+            {"id": "checks", "include": "alias-command-child"},
+            {
+                "id": "publish",
+                "command": "publish",
+                "depends_on": ["checks"],
+            },
+        ],
+    )
+    sidecar_bytes = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
+    commands = root_path.parent / "commands"
+    commands.mkdir()
+    (commands / "publish.md").write_text(
+        "publish $checks.output and $$HOME\n",
+        encoding="utf-8",
+    )
+    child_path = workflow_writer(
+        tmp_path / "alias-command-child",
+        name="alias-command-child",
+        filename="child.yaml",
+        nodes=[
+            {"id": "lint", "prompt": "lint"},
+            {"id": "unit", "prompt": "unit"},
+        ],
+    )
+    root = _parse(root_path, sidecar_bytes=sidecar_bytes)
+    child = _parse(child_path)
+    compiled = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+    package = compiled.package
+    body = ResourceResolver(package.root).command("publish").body
+
+    assert compute_package_digest(package).sha256
+    validated = validate_authenticated_command_references(
+        package,
+        {"publish": body},
+    )
+    assert validated.command_bodies == {
+        "publish": "publish $checks__lint.output and $$HOME\n",
+    }
+
+
+def test_authenticated_resource_validation_returns_final_id_bodies_for_binding(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch Task 5 receiving validated resource bodies with child-local IDs."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.resources import ResourceResolver
+    from plugins.workflow.schema import validate_authenticated_resource_references
+    from plugins.workflow.trust import compute_package_digest
+
+    root_path = workflow_writer(
+        tmp_path / "binding-root",
+        name="binding-root",
+        nodes=[{"id": "checks", "include": "binding-child"}],
+    )
+    sidecar_bytes = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
+    commands = root_path.parent / "commands"
+    commands.mkdir()
+    (commands / "consume.md").write_text(
+        "command $producer.output and $$HOME\n",
+        encoding="utf-8",
+    )
+    scripts = root_path.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "consume.py").write_text(
+        "print('$producer.output', '$$HOME')\n",
+        encoding="utf-8",
+    )
+    child_path = workflow_writer(
+        tmp_path / "binding-child",
+        name="binding-child",
+        filename="child.yaml",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "command-consumer",
+                "command": "consume",
+                "depends_on": ["producer"],
+            },
+            {
+                "id": "script-consumer",
+                "script": "consume.py",
+                "runtime": "uv",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    root = _parse(root_path, sidecar_bytes=sidecar_bytes)
+    child = _parse(child_path)
+    compiled = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+    package = compiled.package
+    resolver = ResourceResolver(package.root)
+
+    assert compute_package_digest(package).sha256
+    validated = validate_authenticated_resource_references(
+        package,
+        command_bodies={
+            "checks__command-consumer": resolver.command("consume").body,
+        },
+        named_script_bodies={
+            "checks__script-consumer": resolver.read_bytes(
+                "scripts/consume.py"
+            ).decode("utf-8"),
+        },
+    )
+
+    assert validated.command_bodies == {
+        "checks__command-consumer": (
+            "command $checks__producer.output and $$HOME\n"
+        ),
+    }
+    assert validated.named_script_bodies == {
+        "checks__script-consumer": (
+            "print('$checks__producer.output', '$$HOME')\n"
+        ),
+    }
+    assert (commands / "consume.md").read_text(encoding="utf-8") == (
+        "command $producer.output and $$HOME\n"
+    )
+    assert (scripts / "consume.py").read_text(encoding="utf-8") == (
+        "print('$producer.output', '$$HOME')\n"
+    )
+
+
+def test_invalid_included_named_script_reference_uses_logical_provenance(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch named-script escapes losing include provenance or leaking host paths."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.trust import compute_package_digest
+
+    root_path = workflow_writer(
+        tmp_path / "invalid-script-root",
+        name="invalid-script-root",
+        nodes=[{"id": "checks", "include": "invalid-script-child"}],
+    )
+    sidecar_bytes = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
+    scripts = root_path.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "consume.py").write_text(
+        "print('$outside.output')\n",
+        encoding="utf-8",
+    )
+    child_path = workflow_writer(
+        tmp_path / "invalid-script-child",
+        name="invalid-script-child",
+        filename="child.yaml",
+        nodes=[
+            {"id": "producer", "prompt": "produce"},
+            {
+                "id": "consumer",
+                "script": "consume.py",
+                "runtime": "uv",
+                "depends_on": ["producer"],
+            },
+        ],
+    )
+    root = _parse(root_path, sidecar_bytes=sidecar_bytes)
+    child = _parse(child_path)
+    compiled = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        compute_package_digest(compiled.package)
+
+    issue = exc.value.issues[0]
+    assert issue.code == "include_reference_invalid"
+    assert issue.path == "include[checks]/child.yaml:nodes[1].script"
+    assert issue.source_line == child.nodes[1].source_line
+    assert str(tmp_path) not in issue.path
+    assert str(tmp_path) not in issue.message
+
+
 def test_included_nodes_rewrite_every_inline_reference_surface(
     tmp_path: Path,
     workflow_writer,

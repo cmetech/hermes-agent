@@ -109,6 +109,26 @@ class WorkflowNode:
     origin: WorkflowNodeOrigin | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkflowResourceBodies:
+    """Authenticated resource templates normalized for later binding."""
+
+    command_bodies: Mapping[str, str]
+    named_script_bodies: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "command_bodies",
+            MappingProxyType(dict(self.command_bodies)),
+        )
+        object.__setattr__(
+            self,
+            "named_script_bodies",
+            MappingProxyType(dict(self.named_script_bodies)),
+        )
+
+
 _WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
 _WORKFLOW_SOURCE_NAME_MAX_CHARS = 128
 _WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS = (4 * _WORKFLOW_SOURCE_NAME_MAX_CHARS) + 6

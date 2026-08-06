@@ -63,6 +63,7 @@ from plugins.workflow.language_schema import (
 )
 from plugins.workflow.models import (
     ValidationIssue,
+    ValidatedWorkflowResourceBodies,
     WorkflowDefinition,
     WorkflowNode,
     WorkflowNodeOrigin,
@@ -1098,6 +1099,7 @@ def _validate_v3_static_output_references(
     structured_outputs: Mapping[str, object],
     *,
     command_bodies: Mapping[str, str] | None = None,
+    named_script_bodies: Mapping[str, str] | None = None,
     normalizer_version: int = 3,
 ) -> None:
     """Enforce the closed v3 grammar and direct-dependency reference rule."""
@@ -1110,6 +1112,7 @@ def _validate_v3_static_output_references(
         for surface_path, template in _interpolated_node_templates(
             node,
             command_bodies=command_bodies,
+            named_script_bodies=named_script_bodies,
             include_phase4_templates=phase4_templates,
         ):
             try:
@@ -1190,17 +1193,11 @@ def _interpolated_node_templates(
     node: WorkflowNode,
     *,
     command_bodies: Mapping[str, str] | None,
+    named_script_bodies: Mapping[str, str] | None = None,
     include_phase4_templates: bool = False,
 ) -> Iterable[tuple[str, str]]:
     """Yield only fields rendered by the Phase 2 runtime variable adapter."""
-    if node.origin is not None and node.origin.include_instance_path:
-        instance = "/".join(node.origin.include_instance_path)
-        prefix = (
-            f"include[{instance}]/{node.origin.definition_location}:"
-            f"nodes[{node.origin.source_index}]"
-        )
-    else:
-        prefix = f"nodes[{node.source_index}]"
+    prefix = _logical_node_path(node)
     when = node.options.get("when")
     if isinstance(when, str):
         yield f"{prefix}.when", when
@@ -1233,6 +1230,14 @@ def _interpolated_node_templates(
         body = command_bodies.get(node.id)
         if isinstance(body, str):
             yield f"{prefix}.command", body
+    elif (
+        include_phase4_templates
+        and node.node_type == "script"
+        and named_script_bodies is not None
+    ):
+        body = named_script_bodies.get(node.id)
+        if isinstance(body, str):
+            yield f"{prefix}.script", body
     if not include_phase4_templates:
         return
     system_prompt = node.options.get("systemPrompt")
@@ -1281,13 +1286,133 @@ def _interpolated_node_templates(
 def validate_authenticated_command_references(
     package: WorkflowPackage,
     command_bodies: Mapping[str, str],
-) -> None:
+) -> ValidatedWorkflowResourceBodies:
     """Validate command bodies already read from authenticated snapshot bytes."""
-    validate_authenticated_resource_references(
+    return validate_authenticated_resource_references(
         package,
         command_bodies=command_bodies,
         named_script_bodies={},
     )
+
+
+class _IncludedResourceReferenceInvalid(ValueError):
+    pass
+
+
+def _logical_node_path(node: WorkflowNode) -> str:
+    if node.origin is not None and node.origin.include_instance_path:
+        instance = "/".join(node.origin.include_instance_path)
+        return (
+            f"include[{instance}]/{node.origin.definition_location}:"
+            f"nodes[{node.origin.source_index}]"
+        )
+    return f"nodes[{node.source_index}]"
+
+
+def _rewrite_authenticated_resource_body(
+    package: WorkflowPackage,
+    node: WorkflowNode,
+    body: str,
+    *,
+    field: str,
+) -> str:
+    origin = node.origin
+    if origin is None:
+        return body
+    namespace = origin.include_instance_path
+    prefix = "__".join(namespace)
+    if prefix:
+        prefix += "__"
+    direct_nodes: dict[str, str] = {}
+    alias_ids: list[str] = []
+    for candidate in package.definition.nodes:
+        candidate_origin = candidate.origin
+        if candidate_origin is None:
+            continue
+        candidate_path = candidate_origin.include_instance_path
+        if candidate_path == namespace and candidate.id.startswith(prefix):
+            direct_nodes[candidate.id[len(prefix) :]] = candidate.id
+        elif (
+            len(candidate_path) > len(namespace)
+            and candidate_path[: len(namespace)] == namespace
+            and candidate_path[len(namespace)] not in alias_ids
+        ):
+            alias_ids.append(candidate_path[len(namespace)])
+
+    aliases: dict[str, str] = {}
+    for alias_id in alias_ids:
+        instance_path = (*namespace, alias_id)
+        instance_nodes = tuple(
+            candidate
+            for candidate in package.definition.nodes
+            if candidate.origin is not None
+            and candidate.origin.include_instance_path[: len(instance_path)]
+            == instance_path
+        )
+        instance_ids = frozenset(candidate.id for candidate in instance_nodes)
+        consumed = {
+            dependency
+            for candidate in instance_nodes
+            for dependency in candidate.depends_on
+            if dependency in instance_ids
+        }
+        sinks = tuple(
+            candidate.id
+            for candidate in instance_nodes
+            if candidate.id not in consumed
+        )
+        if sinks:
+            aliases[alias_id] = sinks[0]
+
+    def rename_node(node_id: str) -> str:
+        target = direct_nodes.get(node_id, aliases.get(node_id))
+        if target is None:
+            if not namespace:
+                return node_id
+            raise _IncludedResourceReferenceInvalid(
+                f"output reference escapes include instance: {node_id}"
+            )
+        return target
+
+    from plugins.workflow.includes import rewrite_reference_tokens
+
+    try:
+        tokens = tuple(
+            iter_output_references(
+                body,
+                normalizer_version=package.language.normalizer_version,
+            )
+        )
+        return rewrite_reference_tokens(body, tokens, rename_node)
+    except WorkflowReferenceSyntaxError as exc:
+        start = exc.start if exc.start is not None else 0
+        if any(
+            body.startswith(f"${alias_id}.", start)
+            and not body.startswith(f"${alias_id}.output", start)
+            for alias_id in aliases
+        ):
+            code = "include_reference_invalid"
+            message = "include output references cannot address a deep child"
+        else:
+            code = exc.code
+            message = str(exc)
+        raise WorkflowValidationError(
+            _issue(
+                f"{_logical_node_path(node)}.{field}",
+                code,
+                message,
+                line=node.source_line,
+            )
+        ) from exc
+    except _IncludedResourceReferenceInvalid as exc:
+        raise WorkflowValidationError(
+            _issue(
+                f"{_logical_node_path(node)}.{field}",
+                "include_reference_invalid",
+                str(exc),
+                line=node.source_line,
+            )
+        ) from exc
 
 
 def validate_authenticated_resource_references(
@@ -1295,22 +1420,70 @@ def validate_authenticated_resource_references(
     *,
     command_bodies: Mapping[str, str],
     named_script_bodies: Mapping[str, str],
-) -> None:
+) -> ValidatedWorkflowResourceBodies:
     """Scan authenticated command and named-script bytes before promotion."""
+    validated = ValidatedWorkflowResourceBodies(
+        command_bodies,
+        named_script_bodies,
+    )
     if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
-        return
+        return validated
     if supports_phase3_semantics(
         package.language.effective_profile, package.language.normalizer_version
     ):
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            rewritten_commands = dict(validated.command_bodies)
+            rewritten_scripts = dict(validated.named_script_bodies)
+            for node in package.definition.nodes:
+                command_body = rewritten_commands.get(node.id)
+                if command_body is not None:
+                    rewritten_commands[node.id] = (
+                        _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            command_body,
+                            field="command",
+                        )
+                    )
+                script_body = rewritten_scripts.get(node.id)
+                if script_body is not None:
+                    rewritten_scripts[node.id] = (
+                        _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            script_body,
+                            field="script",
+                        )
+                    )
+            validated = ValidatedWorkflowResourceBodies(
+                rewritten_commands,
+                rewritten_scripts,
+            )
         _validate_v3_static_output_references(
             package.definition.nodes,
             package.language.structured_outputs,
-            command_bodies=command_bodies,
+            command_bodies=validated.command_bodies,
+            named_script_bodies=(
+                validated.named_script_bodies
+                if supports_phase4_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                )
+                else None
+            ),
             normalizer_version=package.language.normalizer_version,
         )
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            return validated
         issues: list[ValidationIssue] = []
         for node in package.definition.nodes:
-            body = named_script_bodies.get(node.id)
+            body = validated.named_script_bodies.get(node.id)
             if body is None:
                 continue
             if contains_output_reference(
@@ -1327,12 +1500,13 @@ def validate_authenticated_resource_references(
                 )
         if issues:
             raise WorkflowValidationError(tuple(issues))
-        return
+        return validated
     _validate_structured_output_field_references(
         package.definition.nodes,
         package.language.structured_outputs,
-        command_bodies=command_bodies,
+        command_bodies=validated.command_bodies,
     )
+    return validated
 
 
 def _parse_sidecar(
