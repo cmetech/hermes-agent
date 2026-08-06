@@ -20,6 +20,7 @@ MUTATION_ACTIONS = frozenset({
     "archive",
     "restore",
 })
+WIRE_ACTIONS = frozenset(INSPECTION_ACTIONS) | MUTATION_ACTIONS
 LANE_STATES = frozenset({"held", "released"})
 
 
@@ -109,6 +110,7 @@ __all__ = [
     "INSPECTION_ACTIONS",
     "LANE_STATES",
     "MUTATION_ACTIONS",
+    "WIRE_ACTIONS",
     "available_actions",
     "lane_state_for",
     "mutation_is_valid",

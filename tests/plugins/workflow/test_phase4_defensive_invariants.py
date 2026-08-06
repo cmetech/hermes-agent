@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -62,6 +64,99 @@ def _root_command_compilation(tmp_path: Path, workflow_writer):
         precedence=1,
     )
     return _compile(source), source, command
+
+
+def test_phase4_diagnostics_defensively_hide_private_source_and_runtime_values(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    capsys,
+) -> None:
+    """Catch diagnostics exposing host paths or authenticated private bodies."""
+    from plugins.workflow.cli import _doctor_payload, register_cli, show_package
+
+    workflow = workflow_writer(
+        tmp_path / "private/workflows",
+        name="defensive-private-projection",
+        filename="defensive-private-projection.yaml",
+        nodes=[
+            {
+                "id": "draft",
+                "prompt": (
+                    "DEFENSIVE_PRIVATE_PROMPT_BODY "
+                    "DEFENSIVE_PRIVATE_FEEDBACK "
+                    "DEFENSIVE_PRIVATE_PROVIDER_RESPONSE"
+                ),
+            },
+            {"id": "review", "command": "review", "depends_on": ["draft"]},
+        ],
+    )
+    sidecar = (
+        b"language_compatibility: archon-2026-07\n"
+        b"required_secrets: [DEFENSIVE_API_KEY]\n"
+    )
+    workflow.with_name("defensive-private-projection.hermes.yaml").write_bytes(
+        sidecar
+    )
+    commands = tmp_path / "private/commands"
+    commands.mkdir()
+    (commands / "review.md").write_text(
+        "DEFENSIVE_PRIVATE_COMMAND_BODY\n",
+        encoding="utf-8",
+    )
+    compilation = _compile(
+        _parse(
+            workflow,
+            sidecar=sidecar,
+            source="project",
+            precedence=1,
+        )
+    )
+    monkeypatch.setenv("DEFENSIVE_API_KEY", "DEFENSIVE_PRIVATE_SECRET_VALUE")
+    monkeypatch.setattr(
+        "plugins.workflow.cli._resolve_compilation",
+        lambda *_args, **_kwargs: compilation,
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.cli._resolve",
+        lambda *_args, **_kwargs: compilation.package,
+    )
+    shown = show_package(compilation.package, compilation=compilation)
+    doctor = _doctor_payload(
+        compilation.package,
+        compilation=compilation,
+        hermes_home=tmp_path / "home",
+        compat_report=True,
+    )
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    text_outputs = []
+    for command in ("show", "validate", "doctor"):
+        args = parser.parse_args([
+            "--hermes-home",
+            str(tmp_path / "home"),
+            "--workdir",
+            str(tmp_path),
+            command,
+            "defensive-private-projection",
+        ])
+        assert args.func(args) == 0
+        text_outputs.append(capsys.readouterr().out)
+
+    for output in (
+        json.dumps(shown, sort_keys=True),
+        json.dumps(doctor, sort_keys=True),
+        *text_outputs,
+    ):
+        for private_value in (
+            str(tmp_path),
+            "DEFENSIVE_PRIVATE_PROMPT_BODY",
+            "DEFENSIVE_PRIVATE_COMMAND_BODY",
+            "DEFENSIVE_PRIVATE_FEEDBACK",
+            "DEFENSIVE_PRIVATE_SECRET_VALUE",
+            "DEFENSIVE_PRIVATE_PROVIDER_RESPONSE",
+        ):
+            assert private_value not in output
 
 
 def _defensive_signal_pause(

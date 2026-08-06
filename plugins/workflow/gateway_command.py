@@ -17,7 +17,9 @@ from plugins.workflow.compat import (
     require_runnable,
 )
 from plugins.workflow.models import RunExecutionLimits
+from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
@@ -91,6 +93,11 @@ def _parser() -> argparse.ArgumentParser:
         gate.add_argument("--interaction-id", required=True)
         gate.add_argument("--expected-version", type=int, required=True)
         gate.add_argument("--comment" if action == "approve" else "--reason", default="")
+    feedback = actions.add_parser("provide-input", add_help=False)
+    feedback.add_argument("run_id")
+    feedback.add_argument("--interaction-id", required=True)
+    feedback.add_argument("--expected-version", type=int, required=True)
+    feedback.add_argument("--value", required=True)
     return parser
 
 
@@ -201,17 +208,49 @@ def workflow_gateway_command(
 
             command_args = argparse.Namespace(hermes_home=str(home))
             store = _store(command_args, _runtime_config(home))
-            response = args.comment if args.action == "approve" else args.reason
-            decision = decide_gateway_run(
-                store,
-                decision="approved" if args.action == "approve" else "rejected",
-                run_id=args.run_id,
-                interaction_id=args.interaction_id,
-                expected_version=args.expected_version,
-                response=response,
-                invocation=invocation,
-            )
-            result = {"action": args.action, **asdict(decision)}
+            if args.action == "provide-input":
+                try:
+                    updated = store.provide_loop_input(
+                        args.run_id,
+                        args.value,
+                        expected_state_version=args.expected_version,
+                        interaction_id=args.interaction_id,
+                        actor=invocation.principal,
+                        channel="gateway",
+                        operator_scope=invocation.operator_scope,
+                    )
+                except WorkflowConflict as exc:
+                    current = store.get_run_status(
+                        args.run_id,
+                        operator_scope=invocation.operator_scope,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": exc.error.code,
+                            "message": str(exc)[:512],
+                            "current": public_run_projection(current),
+                        },
+                        sort_keys=True,
+                    )
+                result = {
+                    "action": args.action,
+                    **public_run_projection(updated),
+                }
+            else:
+                response = args.comment if args.action == "approve" else args.reason
+                decision = decide_gateway_run(
+                    store,
+                    decision=(
+                        "approved" if args.action == "approve" else "rejected"
+                    ),
+                    run_id=args.run_id,
+                    interaction_id=args.interaction_id,
+                    expected_version=args.expected_version,
+                    response=response,
+                    invocation=invocation,
+                )
+                result = {"action": args.action, **asdict(decision)}
         return json.dumps({"ok": True, "result": result}, sort_keys=True)
     except WorkflowCompatibilityBlockedError as exc:
         return json.dumps(

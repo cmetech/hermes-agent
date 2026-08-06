@@ -606,6 +606,7 @@ class WorkflowDetailResponse(BaseModel):
     coordinator: WorkflowCoordinatorResponse
     topology: WorkflowTopologyResponse
     definition: dict[str, object]
+    compilation: dict[str, object] | None = None
 
 
 @router.get(
@@ -1355,6 +1356,7 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
             "approval",
             "workflow_approval",
             "loop_input",
+            "loop_signal_confirmation",
             "capability",
             "reconcile",
         }:
@@ -2049,7 +2051,19 @@ def mutate_run(
             ) from exc
         except ValueError as exc:
             raise HTTPException(
-                status_code=409, detail={"code": "invalid_transition"}
+                status_code=409,
+                detail={
+                    "code": "invalid_transition",
+                    "current": public_run_projection(
+                        _load_authorized(
+                            store,
+                            run_id,
+                            operator,
+                            now=observed_at,
+                        ),
+                        now=observed_at,
+                    ),
+                },
             ) from exc
         return public_run_projection(
             _load_authorized(store, run_id, operator, now=observed_at),

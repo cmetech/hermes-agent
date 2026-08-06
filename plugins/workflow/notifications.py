@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
+from plugins.workflow.actions import available_actions
 from plugins.workflow.evidence import (
     _UnsafeEvidencePath,
     _read_contained_regular_file,
@@ -152,6 +153,8 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str 
         return "approval_required"
     if event_type in {"loop_input_required"}:
         return "input_required"
+    if event_type in {"loop_signal_confirmation_required"}:
+        return "approval_required"
     if event_type == "run_paused":
         pending = projection.get("pending_interaction")
         if not isinstance(pending, Mapping):
@@ -169,6 +172,8 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str 
             return "approval_required"
         if pending_type == "loop_input":
             return "input_required"
+        if pending_type == "loop_signal_confirmation":
+            return "approval_required"
         if pending_type == "reconcile":
             return "reconciliation_required"
     return None
@@ -326,8 +331,17 @@ class NotificationOutbox:
         transition_key = (
             f"{run_id}:{kind}:{transition_version}:{transition_destination}"
         )
+        projected_payload = _value_free_notification_payload(payload)
+        interaction = projected_payload.get("interaction")
+        status = projected_payload.get("status")
+        if isinstance(interaction, Mapping) and isinstance(status, str):
+            projected_payload["state_version"] = transition_version
+            projected_payload["next_actions"] = available_actions(
+                status,
+                interaction,
+            )
         safe_payload = json.dumps(
-            _value_free_notification_payload(payload),
+            projected_payload,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -611,6 +625,7 @@ class NotificationOutbox:
                     "status": projection.get("status"),
                     "event_type": event.get("event_type"),
                     "node_id": event.get("node_id"),
+                    "interaction": projection.get("pending_interaction"),
                     "last_error": projection.get("last_error"),
                 },
                 delivery_state=(

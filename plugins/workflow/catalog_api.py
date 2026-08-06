@@ -28,11 +28,15 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
-from plugins.workflow.language import language_projection
+from plugins.workflow.language import language_projection, supports_phase4_semantics
 from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowSourceDocument,
     WorkflowValidationError,
+)
+from plugins.workflow.projection_limits import (
+    WORKFLOW_DEFINITION_MAX_EDGES,
+    WORKFLOW_DEFINITION_MAX_NODES,
 )
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
@@ -371,6 +375,13 @@ def _discover_catalog_compilations(
     compiled_sources: list[WorkflowSourceDocument] = []
     compiled_by_source: dict[tuple[str, int, str], WorkflowCompilation] = {}
     for source_document in source_documents:
+        if (
+            len(source_document.nodes) > WORKFLOW_DEFINITION_MAX_NODES
+            or sum(len(node.depends_on) for node in source_document.nodes)
+            > WORKFLOW_DEFINITION_MAX_EDGES
+        ):
+            invalid.append(_error_entry(source_document.name, "catalog_capacity"))
+            continue
         try:
             compiled = compile_workflow(
                 source_document,
@@ -720,7 +731,10 @@ def _catalog_language_projection(
 
 
 def qualify_workflow_catalog_package(
-    package: WorkflowPackage, *, compatibility
+    package: WorkflowPackage,
+    *,
+    compatibility,
+    compilation: WorkflowCompilation | None = None,
 ) -> dict[str, object]:
     """Apply the shared bounded show/detail/admission projection contract."""
     try:
@@ -728,6 +742,7 @@ def qualify_workflow_catalog_package(
             package,
             compatibility_report=compatibility,
             include_argument_hints=False,
+            compilation=compilation,
         )
     except WorkflowDefinitionProjectionCapacityError as exc:
         raise WorkflowCatalogCapacityError(
@@ -1048,6 +1063,7 @@ def build_workflow_detail(
         max_files=CATALOG_MAX_RESOURCE_FILES,
     )
     verified_showcase = None
+    compilation: WorkflowCompilation | None = None
     if catalog_source == "showcase":
         try:
             from plugins.workflow.showcase import load_verified_showcase_packages
@@ -1068,20 +1084,23 @@ def build_workflow_detail(
         package = verified_showcase.package
     else:
         user_source = catalog_source if catalog_source in {"project", "profile"} else None
-        discovered, _truncated = _discover_catalog(
+        discovered, _truncated = _discover_catalog_compilations(
             Path(workdir).expanduser().resolve(), home
         )
-        package = next(
+        selected_compilation = next(
             (
                 item
                 for item in discovered
-                if isinstance(item, WorkflowPackage)
-                and item.definition.name == name
-                and (user_source is None or item.source == user_source)
+                if isinstance(item, WorkflowCompilation)
+                and item.package.definition.name == name
+                and (
+                    user_source is None
+                    or item.package.source == user_source
+                )
             ),
             None,
         )
-        if package is None:
+        if selected_compilation is None:
             if any(
                 isinstance(item, dict)
                 and item.get("name") == name
@@ -1092,6 +1111,12 @@ def build_workflow_detail(
                     "workflow detail definition limit exceeded"
                 )
             raise WorkflowDetailNotFoundError(name)
+        package = selected_compilation.package
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            compilation = selected_compilation
 
     execution_context = background_execution_context(
         binding,
@@ -1106,6 +1131,7 @@ def build_workflow_detail(
             package,
             execution_context,
             read_budget=resource_budget,
+            compilation=compilation,
         )
     except WorkflowResourceCapacityError as exc:
         raise WorkflowCatalogCapacityError(
@@ -1118,6 +1144,7 @@ def build_workflow_detail(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
+        compilation=compilation,
     )
     if verified_showcase is None:
         try:
@@ -1158,7 +1185,7 @@ def build_workflow_detail(
             ),
             "topology_mermaid_omitted",
         )
-    return {
+    detail = {
         "name": (
             str(verified_showcase.scenario.id)
             if verified_showcase is not None
@@ -1191,6 +1218,9 @@ def build_workflow_detail(
         },
         "definition": shown["definition"],
     }
+    if "compilation" in shown:
+        detail["compilation"] = shown["compilation"]
+    return detail
 
 
 __all__ = [

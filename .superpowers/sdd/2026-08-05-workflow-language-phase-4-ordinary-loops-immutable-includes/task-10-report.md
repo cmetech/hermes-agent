@@ -1,0 +1,106 @@
+# Task 10 report: expose Phase 4 workflow state
+
+Status: DONE WITH UPSTREAM TEST CONCERNS
+
+## Outcome
+
+Exposed the normalizer-v4 interaction and compilation state through the existing
+workflow operator surfaces without activating v4. A paused
+`loop_signal_confirmation` now has one backend-owned interaction/version/action
+contract across CLI status, REST run detail, attention, notification history, and
+evidence. Gateway adds the verified `provide-input` mutation, forwards the adapter
+principal/channel/operator scope to the existing compare-and-set store operation,
+and returns a bounded current public projection on version conflict.
+
+`show`, `validate`, `doctor`, and catalog detail now retain the authenticated Phase 4
+compilation and expose a bounded, body-free projection containing profile and schema
+versions, selected dependency sources and precedence, expanded counts/include depth,
+the composite digest, ignored child policy fields, logical node/resource origins,
+and per-origin risk. Doctor reports stable sealed-closure and future-admission
+revalidation findings and reads MCP environment references from sealed compilation
+bytes instead of rediscovering included resources beneath the root package.
+
+The public action vocabulary remains the existing `status`, `events`, `approve`,
+`reject`, `provide-input`, `resume`, `retry`, `reconcile`, `cancel`, `abandon`,
+`archive`, and `restore` verbs. The Archon current normalizer remains pinned to v3.
+
+## Files changed
+
+- `plugins/workflow/actions.py`: named the stable wire-action vocabulary.
+- `plugins/workflow/gateway_command.py`: added verified Gateway feedback dispatch and
+  bounded conflict refreshes.
+- `plugins/workflow/dashboard/plugin_api.py`: classified signal confirmations as
+  attention and allowed catalog-detail compilation diagnostics; invalid REST
+  transitions now include current public state.
+- `plugins/workflow/notifications.py`: classified signal confirmations and attached
+  the authoritative interaction/version/action facts to direct and reconciled
+  notification payloads.
+- `plugins/workflow/evidence.py`: attached the current state version and backend
+  `next_actions` to pending interaction evidence.
+- `plugins/workflow/cli.py`: added bounded Phase 4 compilation diagnostics to
+  show/validate/doctor, stable doctor findings, sealed MCP inspection, and a logical
+  public package location.
+- `plugins/workflow/catalog_api.py`: retained the selected Phase 4 compilation for
+  workflow detail and preserved catalog capacity classification.
+- `tests/plugins/workflow/test_phase4_surfaces.py`: added cross-surface parity,
+  verified Gateway authority, compilation diagnostics, old-vocabulary, and JSON/text
+  disclosure tests.
+- `tests/plugins/workflow/test_phase4_defensive_invariants.py`: duplicated the
+  absolute-path/body/feedback/secret/provider-response disclosure canaries.
+
+## TDD evidence
+
+Every Python test command used `scripts/run_tests.sh`.
+
+1. Cross-surface action parity RED:
+   - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_surfaces.py`
+   - Valid RED: 0 passed, 1 failed because the signal confirmation was missing from
+     attention. The earlier background fixture attempt was discarded because it
+     failed admission setup before reaching a production boundary.
+   - GREEN: the focused module now passes 2 tests.
+2. Compilation diagnostics RED:
+   - Same focused command.
+   - RED: `show_package()` rejected the new authenticated `compilation` argument.
+   - GREEN: show/validate/doctor/catalog detail agree on the bounded closure facts.
+3. Disclosure RED:
+   - Same focused command with private canaries.
+   - RED: structured doctor output disclosed the temporary package root.
+   - GREEN: the public doctor payload uses a logical package component and all JSON
+     and text canaries remain absent.
+
+## Final verification
+
+- Disclosure/evidence gate:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_surfaces.py tests/plugins/workflow/test_phase4_defensive_invariants.py tests/plugins/workflow/test_evidence_api.py`
+  - 46 passed, 0 failed.
+- Catalog/detail/doctor gate:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_surfaces.py tests/plugins/workflow/test_catalog_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_doctor.py`
+  - 153 passed, 1 pre-existing/stale failure described below.
+- CLI/Gateway/notification/Desktop gate:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_surfaces.py tests/plugins/workflow/test_cli.py tests/hermes_cli/test_authenticated_plugin_commands.py tests/plugins/workflow/test_notification_delivery.py tests/plugins/workflow/test_desktop_api.py`
+  - Task 10 surface, authenticated-command, and notification files passed. The gate
+    retained 5 packaged-schema and 18 Task 9 Desktop failures described below.
+- Ruff on every touched Python file: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07] == 3`: verified.
+
+## Concerns outside Task 10 scope
+
+- `test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry` expects a
+  forged 129-character package name created with `dataclasses.replace`. Task 9's
+  `WorkflowCompilation.__post_init__` now correctly rejects that forged package graph
+  before catalog code can observe it, so the safe invalid entry uses its authenticated
+  source name (`placeholder`) instead of forged text. Weakening that integrity check
+  would violate the Phase 4 defensive invariant.
+- Five packaged-schema read-only tests create `SOUL.md`, cache, cron, and related
+  startup files in their temporary Hermes home. The same five failures were present
+  in the first exact-gate attempt before Task 10 production edits; the remaining 81
+  CLI tests pass.
+- Eighteen Desktop API tests fail in Task 9 admission/compilation paths outside the
+  assigned files. Representative failures are monkeypatched
+  `assess_package_execution` callables that do not accept Task 9's `compilation`
+  keyword, a 513-node legacy fixture now rejected by the exact dependency-manifest
+  bound, and sealed-resource admission fixtures returning 500. No Task 10 production
+  file appears in those failure traces.
+
+No Task 11 security-review/UI work or Task 12 normalizer activation was included.

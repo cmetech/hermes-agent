@@ -517,6 +517,7 @@ def show_package(
     cron_jobs: Iterable[Mapping[str, object]] = (),
     compatibility_report: CompatibilityReport | None = None,
     include_argument_hints: bool = True,
+    compilation: WorkflowCompilation | None = None,
 ) -> dict[str, object]:
     report = compatibility_report or assess_compatibility(
         package,
@@ -605,7 +606,81 @@ def show_package(
     result["schedules"] = result["related_cron_schedules"]
     result["warnings"] = [item["message"] for item in result["blocking_findings"]]
     result["next_actions"] = ["run"] if report.runnable else ["doctor"]
+    if compilation is not None and supports_phase4_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        risk = build_risk_summary(
+            package,
+            report,
+            compilation=compilation,
+        )
+        result["compilation"] = compilation_diagnostics(
+            compilation,
+            risk_summary=risk,
+        )
     return result
+
+
+def compilation_diagnostics(
+    compilation: WorkflowCompilation,
+    *,
+    risk_summary=None,
+) -> dict[str, object]:
+    """Return one body-free, bounded projection of an authenticated closure."""
+    package = compilation.package
+    if not supports_phase4_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        raise ValueError("compilation diagnostics require Phase 4 semantics")
+    manifest = compilation.dependency_manifest
+    root = manifest.root.to_dict()
+    dependencies = [item.to_dict() for item in manifest.dependencies]
+    sources = [
+        {
+            "package_key": item["package_key"],
+            "workflow_name": item["workflow_name"],
+            "catalog_source": item["catalog_source"],
+            "precedence": item["precedence"],
+            "definition_location": item["definition_location"],
+            "sidecar_status": item["sidecar_status"],
+            "ignored_policy_fields": item["ignored_policy_fields"],
+        }
+        for item in (root, *dependencies)
+    ]
+    include_edges = [item.to_dict() for item in manifest.include_edges]
+    counts = manifest.counts.to_dict()
+    counts["expanded_edges"] = sum(
+        len(node.depends_on) for node in package.definition.nodes
+    )
+    risk = risk_summary.to_dict() if risk_summary is not None else {}
+    projection: dict[str, object] = {
+        "schema_version": 1,
+        "effective_profile": package.language.effective_profile.value,
+        "normalizer_version": package.language.normalizer_version,
+        "snapshot_format_version": 2,
+        "dependency_manifest_schema_version": manifest.schema_version,
+        "composite_digest": compilation.composite_digest,
+        "root": root,
+        "dependencies": dependencies,
+        "sources": sources,
+        "counts": counts,
+        "include_depth": max(
+            (len(item["include_instance_path"]) for item in include_edges),
+            default=0,
+        ),
+        "include_edges": include_edges,
+        "ignored_policies": risk.get("ignored_child_policies", []),
+        "origin_risks": risk.get("origin_risks", []),
+        "node_origins": [dict(item) for item in manifest.node_origins],
+        "resource_origins": [item.to_dict() for item in manifest.resources],
+    }
+    projection["truncated"] = projection_was_truncated(projection)
+    sanitized = sanitize_projection(projection)
+    if not isinstance(sanitized, dict):
+        raise TypeError("compilation diagnostics must project to a mapping")
+    return sanitized
 
 
 def _json_flag(parser: argparse.ArgumentParser) -> None:
@@ -1005,7 +1080,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "--topology cannot be combined with --json; JSON show always includes both projections",
             exit_code=EXIT_INVOCATION,
         )
-    detail = show_package(_resolve(args, args.name), cron_jobs=_cron_jobs())
+    package = _resolve(args, args.name)
+    compilation = (
+        _resolve_compilation(args, args.name)
+        if isinstance(package, WorkflowPackage)
+        and supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
+    detail = show_package(
+        compilation.package if compilation is not None else package,
+        cron_jobs=_cron_jobs(),
+        compilation=compilation,
+    )
     if args.json:
         _emit(detail, as_json=True)
         return 0
@@ -1013,6 +1102,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Description: {detail['description']}")
     print(f"Source: {detail['source']} (precedence {detail['precedence']})")
     print(f"Compatibility: {detail['compatibility']['level']}")
+    diagnostics = detail.get("compilation")
+    if isinstance(diagnostics, Mapping):
+        print(
+            "Compilation: "
+            f"normalizer={diagnostics['normalizer_version']} "
+            f"snapshot={diagnostics['snapshot_format_version']} "
+            f"manifest={diagnostics['dependency_manifest_schema_version']}"
+        )
+        print(f"Composite digest: {diagnostics['composite_digest']}")
     selector = args.topology or "text"
     if selector in {"text", "both"}:
         print(f"Topology: {detail['topology_text']}")
@@ -1041,6 +1139,16 @@ def _language_payload(package: WorkflowPackage) -> dict[str, object]:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
+    compilation = (
+        _resolve_compilation(args, args.name)
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
+    if compilation is not None:
+        package = compilation.package
     issues = validate_package(package)
     compatibility = assess_compatibility(package)
     if any(issue.blocking for issue in issues) and compatibility.runnable:
@@ -1083,6 +1191,19 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         "language": _language_payload(package),
         "issues": issue_entries,
     }
+    if supports_phase4_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        assert compilation is not None
+        payload["compilation"] = compilation_diagnostics(
+            compilation,
+            risk_summary=build_risk_summary(
+                package,
+                compatibility,
+                compilation=compilation,
+            ),
+        )
     try:
         require_runnable(compatibility)
     except WorkflowCompatibilityBlockedError as exc:
@@ -1100,6 +1221,15 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             f"{package.definition.name}: {'valid' if payload['valid'] else 'invalid'}"
         )
         print(f"Language: {payload['language']['effective_profile']}")
+        diagnostics = payload.get("compilation")
+        if isinstance(diagnostics, Mapping):
+            print(
+                "Compilation: "
+                f"normalizer={diagnostics['normalizer_version']} "
+                f"snapshot={diagnostics['snapshot_format_version']} "
+                f"manifest={diagnostics['dependency_manifest_schema_version']}"
+            )
+            print(f"Composite digest: {diagnostics['composite_digest']}")
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
     return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
@@ -1220,8 +1350,23 @@ def _input_requirements(
     return tuple(requirements)
 
 
-def _mcp_environment_names(package: WorkflowPackage) -> tuple[str, ...]:
+def _mcp_environment_names(
+    package: WorkflowPackage,
+    *,
+    compilation: WorkflowCompilation | None = None,
+) -> tuple[str, ...]:
     names: set[str] = set()
+    if compilation is not None:
+        for binding in compilation.dependency_manifest.resources:
+            if binding.resource_kind not in {"mcp", "mcp_resource"}:
+                continue
+            try:
+                text = compilation.sealed_files[binding.snapshot_path].decode("utf-8")
+            except (KeyError, UnicodeError):
+                continue
+            for match in _MCP_ENV_REFERENCE.finditer(text):
+                names.add(match.group(1) or match.group(2))
+        return tuple(sorted(names))
     digest = compute_package_digest(package)
     for relative in digest.covered_relative_paths:
         if not relative.startswith("mcp/"):
@@ -1305,6 +1450,7 @@ def doctor_package(
     package: WorkflowPackage,
     *,
     hermes_home: str | Path,
+    compilation: WorkflowCompilation | None = None,
     available_tools: AbstractSet[str] | None = None,
     available_services: AbstractSet[str] | None = None,
     provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
@@ -1352,8 +1498,25 @@ def doctor_package(
                     )
                 )
     findings.extend(_provider_override_findings(package, hermes_home=hermes_home))
-    risk = build_risk_summary(package, compatibility)
-    package_digest = compute_package_digest(package)
+    phase4_compilation = (
+        compilation
+        if compilation is not None
+        and supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        compilation=phase4_compilation,
+    )
+    package_digest = (
+        _admission_package_digest(compilation)
+        if compilation is not None
+        else compute_package_digest(package)
+    )
     covered = package_digest.covered_relative_paths
     commands = tuple(path for path in covered if path.startswith("commands/"))
     scripts = tuple(path for path in covered if path.startswith("scripts/"))
@@ -1444,7 +1607,10 @@ def doctor_package(
             )
 
     visible_environment = os.environ if environment is None else environment
-    for name in _mcp_environment_names(package):
+    for name in _mcp_environment_names(
+        package,
+        compilation=phase4_compilation,
+    ):
         if not visible_environment.get(name):
             findings.append(
                 _doctor_finding(
@@ -1486,6 +1652,25 @@ def doctor_package(
             message=f"matching concurrent invocations use the {policy} policy",
         )
     )
+    if phase4_compilation is not None:
+        findings.extend((
+            _doctor_finding(
+                code="phase4_sealed_closure",
+                path="compilation.resources",
+                message=(
+                    "admitted Phase 4 runs execute only from the sealed root and "
+                    "dependency closure"
+                ),
+            ),
+            _doctor_finding(
+                code="phase4_future_admission_revalidation",
+                path="compilation.composite_digest",
+                message=(
+                    "later source edits affect future admissions only and require "
+                    "a newly validated composite digest"
+                ),
+            ),
+        ))
 
     base_runtime = runtime_config or _runtime_config(hermes_home)
     limits = package.sidecar.get("limits", {})
@@ -1588,9 +1773,15 @@ def _doctor_payload(
     hermes_home: str | Path,
     compat_report: bool,
     mode: str | None = None,
+    compilation: WorkflowCompilation | None = None,
 ) -> dict[str, object]:
-    report = doctor_package(package, hermes_home=hermes_home)
+    report = doctor_package(
+        package,
+        hermes_home=hermes_home,
+        compilation=compilation,
+    )
     payload = report.to_dict()
+    payload["package"] = sanitize_projection(str(package.root), key="path")
     payload.update({
         "name": package.definition.name,
         "language": _language_payload(package),
@@ -1601,6 +1792,14 @@ def _doctor_payload(
             else "Review this risk summary, then trust the exact package digest before local execution."
         ),
     })
+    if compilation is not None and supports_phase4_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        payload["compilation"] = compilation_diagnostics(
+            compilation,
+            risk_summary=report.risk_summary,
+        )
     from plugins.workflow.coordinator_store import CoordinatorStore
 
     runtime_store = RunStore(hermes_home)
@@ -1668,11 +1867,24 @@ def _doctor_text_value(value: object, *, path: bool = False) -> object:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
+    package = _resolve(args, args.name)
+    compilation = (
+        _resolve_compilation(args, args.name)
+        if isinstance(package, WorkflowPackage)
+        and supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
+    if compilation is not None:
+        package = compilation.package
     payload = _doctor_payload(
-        _resolve(args, args.name),
+        package,
         hermes_home=args.hermes_home,
         compat_report=args.compat_report,
         mode=args.mode,
+        compilation=compilation,
     )
     blocking = any(
         isinstance(finding, Mapping) and bool(finding.get("blocking"))
@@ -1693,6 +1905,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"Risk digest: {payload['risk_summary']['risk_digest']}")
         print(f"Compatibility: {payload['compatibility']}")
         print(f"Language: {payload['language']['effective_profile']}")
+        diagnostics = payload.get("compilation")
+        if isinstance(diagnostics, Mapping):
+            print(
+                "Compilation: "
+                f"normalizer={diagnostics['normalizer_version']} "
+                f"snapshot={diagnostics['snapshot_format_version']} "
+                f"manifest={diagnostics['dependency_manifest_schema_version']}"
+            )
+            print(f"Composite digest: {diagnostics['composite_digest']}")
         print(
             f"Execution environment: {payload['risk_summary']['execution_environment']}"
         )

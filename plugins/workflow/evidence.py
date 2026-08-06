@@ -327,7 +327,12 @@ class EvidenceReader:
                 }
             ]
             pending_items = [
-                {"node_id": node_id, **pending}
+                {
+                    "node_id": node_id,
+                    **pending,
+                    "state_version": run.get("state_version"),
+                    "next_actions": run.get("next_actions", []),
+                }
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance((pending := node.get("pending_interaction")), Mapping)
