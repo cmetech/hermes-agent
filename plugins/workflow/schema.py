@@ -1537,6 +1537,19 @@ def parse_workflow_source_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
+    sidecar_path = (
+        workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        if sidecar_bytes is not None
+        else None
+    )
+    if sidecar_bytes is None:
+        sidecar = freeze_value({})
+    else:
+        _, sidecar = _parse_sidecar(sidecar_path, sidecar_bytes)
+    try:
+        resolve_language_profile(sidecar)
+    except WorkflowLanguageCompatibilityError as exc:
+        _fail("sidecar.language_compatibility", exc.code, str(exc))
     name = _validate_identifier(document.get("name"), "name")
     if not _SAFE_NAME.fullmatch(name):
         _fail(
@@ -1557,15 +1570,6 @@ def parse_workflow_source_bytes(
         )
         for index, node in enumerate(raw_nodes)
     )
-    sidecar_path = (
-        workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
-        if sidecar_bytes is not None
-        else None
-    )
-    if sidecar_bytes is None:
-        sidecar = freeze_value({})
-    else:
-        _, sidecar = _parse_sidecar(sidecar_path, sidecar_bytes)
     root = _package_root(workflow_path)
     options = {
         key: value

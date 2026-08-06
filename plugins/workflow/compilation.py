@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -69,14 +70,19 @@ class WorkflowCatalogSnapshot:
         selected: dict[str, WorkflowSourceDocument] = {}
         ambiguous: set[str] = set()
         for name, candidates in by_name.items():
-            winning_precedence = min(item.precedence for item in candidates)
-            winners = [
-                item for item in candidates if item.precedence == winning_precedence
-            ]
-            if len(winners) != 1:
+            candidates_by_precedence: dict[int, list[WorkflowSourceDocument]] = {}
+            for candidate in candidates:
+                candidates_by_precedence.setdefault(candidate.precedence, []).append(
+                    candidate
+                )
+            if any(
+                len(precedence_candidates) != 1
+                for precedence_candidates in candidates_by_precedence.values()
+            ):
                 ambiguous.add(name)
                 continue
-            selected[name] = winners[0]
+            winning_precedence = min(item.precedence for item in candidates)
+            selected[name] = candidates_by_precedence[winning_precedence][0]
         return cls(
             selected=selected,
             ambiguous_names=frozenset(ambiguous),
@@ -113,7 +119,9 @@ class WorkflowCompilation:
             raise ValueError("compiled active policy must be immutable bytes")
 
 
-_COMPILED_ROOT_CACHE: dict[
+COMPILED_ROOT_CACHE_MAX_ENTRIES = 128
+
+_COMPILED_ROOT_CACHE: OrderedDict[
     tuple[
         str,
         str,
@@ -121,7 +129,12 @@ _COMPILED_ROOT_CACHE: dict[
         tuple[tuple[str, str, str], ...],
     ],
     WorkflowCompilation,
-] = {}
+] = OrderedDict()
+
+
+def clear_compilation_cache() -> None:
+    """Release cached compiled packages and their authenticated byte streams."""
+    _COMPILED_ROOT_CACHE.clear()
 
 
 def compile_workflow(
@@ -147,8 +160,9 @@ def compile_workflow(
             for name, signature in catalog.signatures.items()
         ),
     )
-    cached = _COMPILED_ROOT_CACHE.get(cache_key)
+    cached = _COMPILED_ROOT_CACHE.pop(cache_key, None)
     if cached is not None:
+        _COMPILED_ROOT_CACHE[cache_key] = cached
         return cached
 
     from plugins.workflow.schema import _compile_workflow_source_document
@@ -162,5 +176,8 @@ def compile_workflow(
         definition_bytes=root.definition_bytes,
         active_policy_bytes=root.sidecar_bytes or b"",
     )
-    _COMPILED_ROOT_CACHE[cache_key] = compiled
+    if COMPILED_ROOT_CACHE_MAX_ENTRIES > 0:
+        _COMPILED_ROOT_CACHE[cache_key] = compiled
+        while len(_COMPILED_ROOT_CACHE) > COMPILED_ROOT_CACHE_MAX_ENTRIES:
+            _COMPILED_ROOT_CACHE.popitem(last=False)
     return compiled

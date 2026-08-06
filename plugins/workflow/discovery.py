@@ -5,7 +5,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.compilation import (
+    WorkflowCatalogSnapshot,
+    clear_compilation_cache,
+    compile_workflow,
+)
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowPackage,
@@ -23,6 +27,7 @@ _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".loc
 
 def clear_discovery_cache() -> None:
     _PARSE_CACHE.clear()
+    clear_compilation_cache()
 
 
 def _yaml_paths(
@@ -116,20 +121,25 @@ def discover_workflows(
     snapshot = WorkflowCatalogSnapshot.capture(source_documents)
     if snapshot.ambiguous_names:
         name = min(snapshot.ambiguous_names)
-        winning_precedence = min(
-            source_document.precedence
-            for source_document in source_documents
-            if source_document.name == name
-        )
-        duplicates = [
+        candidates = [
             source_document
             for source_document in source_documents
             if source_document.name == name
-            and source_document.precedence == winning_precedence
         ]
+        candidates_by_precedence: dict[int, list[WorkflowSourceDocument]] = {}
+        for candidate in candidates:
+            candidates_by_precedence.setdefault(candidate.precedence, []).append(
+                candidate
+            )
+        duplicate_precedence = min(
+            precedence
+            for precedence, precedence_candidates in candidates_by_precedence.items()
+            if len(precedence_candidates) > 1
+        )
+        duplicates = candidates_by_precedence[duplicate_precedence]
         raise WorkflowValidationError(
             ValidationIssue(
-                path=str(duplicates[1].workflow_path),
+                path=duplicates[1].definition_location,
                 code="duplicate_workflow_name",
                 message=(
                     f"duplicate workflow name at {duplicates[0].source} "
@@ -137,11 +147,9 @@ def discover_workflows(
                 ),
             )
         )
-    compiled_by_path = {
-        source_document.workflow_path: compile_workflow(source_document, snapshot).package
-        for source_document in source_documents
-    }
+    for source_document in source_documents:
+        compile_workflow(source_document, snapshot)
     return tuple(
-        compiled_by_path[snapshot.selected[name].workflow_path]
+        compile_workflow(snapshot.selected[name], snapshot).package
         for name in sorted(snapshot.selected)
     )

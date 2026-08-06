@@ -311,6 +311,86 @@ def test_compiled_cache_identity_includes_ordered_catalog_signatures(tmp_path) -
     assert changed.package == first.package
 
 
+def test_compiled_cache_is_bounded_lru_and_has_an_explicit_clear_path(
+    tmp_path, monkeypatch
+) -> None:
+    """Catch process-lifetime compilation retaining every admitted byte stream."""
+    import plugins.workflow.compilation as compilation_module
+
+    monkeypatch.setattr(compilation_module, "COMPILED_ROOT_CACHE_MAX_ENTRIES", 2)
+    compilation_module.clear_compilation_cache()
+    first_source = _parse_source(
+        tmp_path / "first.yaml", name="first", source="project", precedence=1
+    )
+    second_source = _parse_source(
+        tmp_path / "second.yaml", name="second", source="project", precedence=1
+    )
+    third_source = _parse_source(
+        tmp_path / "third.yaml", name="third", source="project", precedence=1
+    )
+    first_catalog = compilation_module.WorkflowCatalogSnapshot.capture((first_source,))
+    second_catalog = compilation_module.WorkflowCatalogSnapshot.capture(
+        (second_source,)
+    )
+    third_catalog = compilation_module.WorkflowCatalogSnapshot.capture((third_source,))
+
+    first = compilation_module.compile_workflow(first_source, first_catalog)
+    second = compilation_module.compile_workflow(second_source, second_catalog)
+    assert compilation_module.compile_workflow(first_source, first_catalog) is first
+    compilation_module.compile_workflow(third_source, third_catalog)
+
+    assert (
+        compilation_module.compile_workflow(second_source, second_catalog) is not second
+    )
+    compilation_module.clear_compilation_cache()
+    assert compilation_module.compile_workflow(first_source, first_catalog) is not first
+    compilation_module.clear_compilation_cache()
+
+
+def test_malformed_sidecar_precedes_definition_node_diagnostics(tmp_path) -> None:
+    """Catch source parsing changing the legacy first-diagnostic contract."""
+    path = tmp_path / "invalid.yaml"
+    workflow_bytes = b"name: invalid\ndescription: Invalid\nnodes: []\n"
+    sidecar_bytes = b"language_compatibility: [\n"
+    path.write_bytes(workflow_bytes)
+    path.with_name("invalid.hermes.yaml").write_bytes(sidecar_bytes)
+
+    with pytest.raises(WorkflowValidationError) as disk_exc:
+        schema_module.load_workflow(path)
+    with pytest.raises(WorkflowValidationError) as snapshot_exc:
+        schema_module.load_workflow_snapshot(
+            path,
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=sidecar_bytes,
+        )
+
+    assert disk_exc.value.issues[0].code == "invalid_sidecar"
+    assert snapshot_exc.value.issues[0].code == "invalid_sidecar"
+
+
+def test_unsupported_sidecar_profile_precedes_definition_node_diagnostics(
+    tmp_path,
+) -> None:
+    """Catch deferred language resolution changing the legacy first diagnostic."""
+    path = tmp_path / "unsupported.yaml"
+    workflow_bytes = b"name: unsupported\ndescription: Unsupported\nnodes: []\n"
+    sidecar_bytes = b"language_compatibility: future-profile\n"
+    path.write_bytes(workflow_bytes)
+    path.with_name("unsupported.hermes.yaml").write_bytes(sidecar_bytes)
+
+    with pytest.raises(WorkflowValidationError) as disk_exc:
+        schema_module.load_workflow(path)
+    with pytest.raises(WorkflowValidationError) as snapshot_exc:
+        schema_module.load_workflow_snapshot(
+            path,
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=sidecar_bytes,
+        )
+
+    assert disk_exc.value.issues[0].code == "workflow_language_profile_unsupported"
+    assert snapshot_exc.value.issues[0].code == "workflow_language_profile_unsupported"
+
+
 def test_public_loaders_parse_source_before_compiling(tmp_path, monkeypatch) -> None:
     """Catch compatibility loaders retaining a second parse/normalize implementation."""
     path = tmp_path / "legacy.yaml"
