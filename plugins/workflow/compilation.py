@@ -12,6 +12,7 @@ from types import MappingProxyType
 from plugins.workflow.dependency_manifest import (
     WorkflowDependencyManifest,
     composite_workflow_digest,
+    digest_expanded_compilation,
 )
 from plugins.workflow.models import WorkflowPackage, WorkflowSourceDocument
 
@@ -127,6 +128,18 @@ class WorkflowCompilation:
             raise ValueError("compiled active policy must be immutable bytes")
         if not isinstance(self.dependency_manifest, WorkflowDependencyManifest):
             raise ValueError("compiled dependency manifest must be exact and immutable")
+        if (
+            digest_expanded_compilation(self.definition_bytes, self.package)
+            != self.dependency_manifest.expanded_definition_digest
+        ):
+            raise ValueError(
+                "compiled definition or package graph does not match its manifest"
+            )
+        if (
+            hashlib.sha256(self.active_policy_bytes).hexdigest()
+            != self.dependency_manifest.active_root_policy_digest
+        ):
+            raise ValueError("compiled active policy does not match its manifest")
         sealed_files = MappingProxyType({
             str(path): bytes(data) for path, data in self.sealed_files.items()
         })
@@ -198,8 +211,17 @@ def compile_workflow(
             for name, signature in catalog.signatures.items()
         ),
     )
+    from plugins.workflow.language import (
+        resolve_language_profile,
+        select_normalizer_version,
+        supports_phase4_semantics,
+    )
+
     cached = _COMPILED_ROOT_CACHE.pop(cache_key, None)
-    if cached is not None:
+    if cached is not None and not supports_phase4_semantics(
+        cached.package.language.effective_profile,
+        cached.package.language.normalizer_version,
+    ):
         _COMPILED_ROOT_CACHE[cache_key] = cached
         return cached
 
@@ -209,12 +231,6 @@ def compile_workflow(
     definition_bytes = root.definition_bytes
     has_includes = any(node.node_type == "include" for node in root.nodes)
     from plugins.workflow.includes import expand_workflow_source
-    from plugins.workflow.language import (
-        resolve_language_profile,
-        select_normalizer_version,
-        supports_phase4_semantics,
-    )
-
     selection = resolve_language_profile(root.sidecar)
     selected_version = select_normalizer_version(selection, normalizer_version)
     expanded = None
@@ -268,6 +284,8 @@ def compile_workflow(
         composite_digest=composite_digest,
         covered_relative_paths=covered_paths,
     )
+    if cached is not None and compiled == cached:
+        compiled = cached
     if COMPILED_ROOT_CACHE_MAX_ENTRIES > 0:
         _COMPILED_ROOT_CACHE[cache_key] = compiled
         while len(_COMPILED_ROOT_CACHE) > COMPILED_ROOT_CACHE_MAX_ENTRIES:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -42,6 +42,7 @@ WORKFLOW_MANIFEST_MAX_EXPANDED_NODES = 512
 WORKFLOW_MANIFEST_MAX_FILES = 512
 WORKFLOW_MANIFEST_MAX_FILE_BYTES = 1 * 1024 * 1024
 WORKFLOW_MANIFEST_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+WORKFLOW_MANIFEST_MAX_IGNORED_POLICY_FIELDS = 64
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PACKAGE_FIELDS = frozenset({
@@ -179,6 +180,19 @@ def _bounded_integer(
     return value
 
 
+def _bounded_sequence(
+    value: object,
+    label: str,
+    *,
+    maximum: int,
+) -> list | tuple:
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{label} must be an ordered sequence")
+    if len(value) > maximum:
+        raise ValueError(f"{label} collection exceeds its exact bound")
+    return value
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(
         value,
@@ -186,6 +200,101 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _logical_graph_value(value: object) -> object:
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _logical_graph_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, tuple | list):
+        return [_logical_graph_value(item) for item in value]
+    if isinstance(value, set | frozenset):
+        projected = [_logical_graph_value(item) for item in value]
+        return sorted(projected, key=_canonical_json)
+    if is_dataclass(value):
+        return {
+            field.name: _logical_graph_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    raise TypeError(
+        f"workflow package graph contains unsupported {type(value).__name__} value"
+    )
+
+
+def _definition_graph(definition) -> dict[str, object]:
+    return {
+        "name": definition.name,
+        "description": definition.description,
+        "nodes": [
+            {
+                "id": node.id,
+                "node_type": node.node_type,
+                "value": _logical_graph_value(node.value),
+                "depends_on": list(node.depends_on),
+                "source_index": node.source_index,
+                "source_line": node.source_line,
+                "options": _logical_graph_value(node.options),
+                "origin": (
+                    _origin_to_dict(node.origin)
+                    if node.origin is not None
+                    else None
+                ),
+            }
+            for node in definition.nodes
+        ],
+        "options": _logical_graph_value(definition.options),
+    }
+
+
+def digest_workflow_package_graph(package: WorkflowPackage) -> str:
+    """Hash the complete logical package graph without host filesystem paths."""
+    if not isinstance(package, WorkflowPackage):
+        raise ValueError("package graph digest requires a WorkflowPackage")
+    language = package.language
+    graph = {
+        "source_definition": _definition_graph(package.source_definition),
+        "definition": _definition_graph(package.definition),
+        "sidecar": _logical_graph_value(package.sidecar),
+        "source": package.source,
+        "precedence": package.precedence,
+        "language": {
+            "declared_profile": (
+                language.declared_profile.value
+                if language.declared_profile is not None
+                else None
+            ),
+            "effective_profile": language.effective_profile.value,
+            "normalizer_version": language.normalizer_version,
+            "normalized_definition_digest": language.normalized_definition_digest,
+            "structured_outputs": _logical_graph_value(
+                language.structured_outputs
+            ),
+            "node_semantics": _logical_graph_value(language.node_semantics),
+        },
+        "compatibility_findings": _logical_graph_value(
+            package.compatibility_findings
+        ),
+        "validation_issues": _logical_graph_value(package.validation_issues),
+    }
+    return hashlib.sha256(_canonical_json(graph)).hexdigest()
+
+
+def digest_expanded_compilation(
+    definition_bytes: bytes,
+    package: WorkflowPackage,
+) -> str:
+    """Bind exact executable bytes and the final logical graph in one digest."""
+    if not isinstance(definition_bytes, bytes):
+        raise ValueError("expanded compilation definition must be immutable bytes")
+    identity = {
+        "definition_bytes_digest": hashlib.sha256(definition_bytes).hexdigest(),
+        "package_graph_digest": digest_workflow_package_graph(package),
+    }
+    return hashlib.sha256(_canonical_json(identity)).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,17 +325,21 @@ class WorkflowDependencyRecord:
                 raise ValueError("absent sidecar status cannot carry sidecar identity")
         elif sidecar_location is None or sidecar_digest is None:
             raise ValueError("authenticated sidecar status requires sidecar identity")
-        paths_value = value["covered_relative_paths"]
-        if not isinstance(paths_value, list | tuple):
-            raise ValueError("covered relative paths must be an ordered sequence")
+        paths_value = _bounded_sequence(
+            value["covered_relative_paths"],
+            "covered relative path",
+            maximum=WORKFLOW_MANIFEST_MAX_FILES,
+        )
         paths = tuple(
             _logical_path(path, "covered relative path") for path in paths_value
         )
         if not paths or paths != tuple(sorted(set(paths))):
             raise ValueError("covered relative paths must use canonical order")
-        ignored_value = value["ignored_policy_fields"]
-        if not isinstance(ignored_value, list | tuple):
-            raise ValueError("ignored policy fields must be an ordered sequence")
+        ignored_value = _bounded_sequence(
+            value["ignored_policy_fields"],
+            "ignored policy field",
+            maximum=WORKFLOW_MANIFEST_MAX_IGNORED_POLICY_FIELDS,
+        )
         ignored_fields = tuple(
             str(_bounded_text(item, "ignored policy field"))
             for item in ignored_value
@@ -504,19 +617,35 @@ class WorkflowDependencyManifest:
     @classmethod
     def from_dict(cls, raw: object) -> "WorkflowDependencyManifest":
         value = _exact_mapping(raw, _MANIFEST_FIELDS, "dependency manifest")
-        if value["schema_version"] != WORKFLOW_DEPENDENCY_MANIFEST_SCHEMA_VERSION:
-            raise ValueError("dependency manifest schema version is unsupported")
-        for field_name in (
-            "dependencies",
-            "include_edges",
-            "node_origins",
-            "resources",
+        if (
+            type(value["schema_version"]) is not int
+            or value["schema_version"]
+            != WORKFLOW_DEPENDENCY_MANIFEST_SCHEMA_VERSION
         ):
-            if not isinstance(value[field_name], list | tuple):
-                raise ValueError(f"manifest {field_name} must be an ordered sequence")
+            raise ValueError("dependency manifest schema version is unsupported")
+        dependencies_value = _bounded_sequence(
+            value["dependencies"],
+            "dependency",
+            maximum=WORKFLOW_MANIFEST_MAX_DEPENDENCIES,
+        )
+        edges_value = _bounded_sequence(
+            value["include_edges"],
+            "include edge",
+            maximum=WORKFLOW_MANIFEST_MAX_INCLUDE_EDGES,
+        )
+        origins_value = _bounded_sequence(
+            value["node_origins"],
+            "node origin",
+            maximum=WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+        )
+        resources_value = _bounded_sequence(
+            value["resources"],
+            "resource binding",
+            maximum=WORKFLOW_MANIFEST_MAX_FILES,
+        )
         dependencies = tuple(
             WorkflowDependencyRecord.from_dict(item)
-            for item in value["dependencies"]
+            for item in dependencies_value
         )
         dependency_key = lambda item: (
             item.catalog_source,
@@ -528,7 +657,7 @@ class WorkflowDependencyManifest:
         if dependencies != tuple(sorted(dependencies, key=dependency_key)):
             raise ValueError("dependencies must use canonical order")
         edges = tuple(
-            _WorkflowIncludeEdge.from_dict(item) for item in value["include_edges"]
+            _WorkflowIncludeEdge.from_dict(item) for item in edges_value
         )
         edge_key = lambda item: (
             item.include_instance_path,
@@ -538,11 +667,11 @@ class WorkflowDependencyManifest:
         )
         if edges != tuple(sorted(edges, key=edge_key)):
             raise ValueError("include edges must use canonical order")
-        origins = tuple(_origin_from_dict(item) for item in value["node_origins"])
+        origins = tuple(_origin_from_dict(item) for item in origins_value)
         if origins != tuple(sorted(origins, key=lambda item: item.expanded_node_id)):
             raise ValueError("node origins must use canonical order")
         resources = tuple(
-            WorkflowResourceBinding.from_dict(item) for item in value["resources"]
+            WorkflowResourceBinding.from_dict(item) for item in resources_value
         )
         if resources != tuple(sorted(resources, key=lambda item: item.binding_id)):
             raise ValueError("resource bindings must use canonical order")
@@ -565,10 +694,44 @@ class WorkflowDependencyManifest:
             )
         counts = _WorkflowManifestCounts.from_dict(value["counts"])
         root = WorkflowDependencyRecord.from_dict(value["root"])
+        package_keys = {root.package_key, *(item.package_key for item in dependencies)}
+        if len(package_keys) != len(dependencies) + 1:
+            raise ValueError("manifest package keys must be unique")
+        if any(binding.package_key not in package_keys for binding in resources):
+            raise ValueError("resource binding refers to an unknown package")
+        if any(
+            edge.source_package_key not in package_keys
+            or edge.target_package_key not in package_keys
+            for edge in edges
+        ):
+            raise ValueError("include edge refers to an unknown package key")
+        if any(origin.package_key not in package_keys for origin in origins):
+            raise ValueError("node origin refers to an unknown package key")
+        source_identities: dict[tuple[str, str], tuple[str, int]] = {}
+        for binding in resources:
+            key = (binding.package_key, binding.source_relative_path)
+            identity = (binding.source_digest, binding.source_byte_size)
+            previous = source_identities.setdefault(key, identity)
+            if previous != identity:
+                raise ValueError(
+                    "resource bindings disagree on authenticated source identity"
+                )
+        covered_paths = {
+            (record.package_key, path)
+            for record in (root, *dependencies)
+            for path in record.covered_relative_paths
+        }
+        if covered_paths != set(source_identities):
+            raise ValueError(
+                "manifest covered paths do not match unique resource bindings"
+            )
         if (
             counts.dependency_packages != len(dependencies)
             or counts.include_edges != len(edges)
             or counts.expanded_nodes != len(origins)
+            or counts.authenticated_files != len(source_identities)
+            or counts.authenticated_bytes
+            != sum(identity[1] for identity in source_identities.values())
             or counts.sealed_files != len(resources)
             or counts.sealed_bytes
             != sum(binding.compiled_byte_size for binding in resources)
@@ -581,11 +744,6 @@ class WorkflowDependencyManifest:
             for dependency in dependencies
         ):
             raise ValueError("dependency sidecars must be authenticated and ignored")
-        package_keys = {root.package_key, *(item.package_key for item in dependencies)}
-        if len(package_keys) != len(dependencies) + 1:
-            raise ValueError("manifest package keys must be unique")
-        if any(binding.package_key not in package_keys for binding in resources):
-            raise ValueError("resource binding refers to an unknown package")
         frozen_origins = tuple(
             MappingProxyType({
                 **_origin_to_dict(origin),
@@ -1291,6 +1449,13 @@ def seal_workflow_compilation(
             )
         )
     bindings_tuple = tuple(sorted(bindings, key=lambda item: item.binding_id))
+    authenticated_sources = {
+        (binding.package_key, binding.source_relative_path): (
+            binding.source_digest,
+            binding.source_byte_size,
+        )
+        for binding in bindings_tuple
+    }
     bound_definition_bytes = _bind_definition_resources(
         definition_bytes,
         bindings_tuple,
@@ -1379,14 +1544,17 @@ def seal_workflow_compilation(
             "dependency_packages": len(dependencies),
             "include_edges": len(include_edges),
             "expanded_nodes": len(origins),
-            "authenticated_files": budget.files_read,
-            "authenticated_bytes": budget.bytes_read,
+            "authenticated_files": len(authenticated_sources),
+            "authenticated_bytes": sum(
+                identity[1] for identity in authenticated_sources.values()
+            ),
             "sealed_files": len(sealed_files),
             "sealed_bytes": sum(len(data) for data in sealed_files.values()),
         },
-        "expanded_definition_digest": hashlib.sha256(
-            bound_definition_bytes
-        ).hexdigest(),
+        "expanded_definition_digest": digest_expanded_compilation(
+            bound_definition_bytes,
+            package,
+        ),
         "node_origins_digest": digest_node_origins(origins),
         "resource_bindings_digest": digest_resource_bindings(bindings_tuple),
         "active_root_policy_digest": hashlib.sha256(active_policy_bytes).hexdigest(),

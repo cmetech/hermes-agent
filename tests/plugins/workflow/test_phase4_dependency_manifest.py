@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -91,26 +93,116 @@ def _manifest_document() -> dict[str, object]:
                     "packages/" + "9" * 64 + "/" + "a" * 64
                     + "/commands/review.md"
                 ),
-            }
+            },
+            {
+                "binding_id": "profile:child:definition",
+                "node_id": None,
+                "resource_kind": "definition",
+                "package_key": "profile:child",
+                "source_relative_path": "library/child.yaml",
+                "source_digest": "4" * 64,
+                "compiled_digest": "4" * 64,
+                "source_byte_size": 120,
+                "compiled_byte_size": 120,
+                "media_type": "application/yaml",
+                "snapshot_path": (
+                    "packages/" + "9" * 64 + "/" + "b" * 64
+                    + "/library/child.yaml"
+                ),
+            },
+            {
+                "binding_id": "profile:child:sidecar",
+                "node_id": None,
+                "resource_kind": "sidecar",
+                "package_key": "profile:child",
+                "source_relative_path": "library/child.hermes.yaml",
+                "source_digest": "5" * 64,
+                "compiled_digest": "5" * 64,
+                "source_byte_size": 42,
+                "compiled_byte_size": 42,
+                "media_type": "application/yaml",
+                "snapshot_path": (
+                    "packages/" + "9" * 64 + "/" + "c" * 64
+                    + "/library/child.hermes.yaml"
+                ),
+            },
+            {
+                "binding_id": "project:root:definition",
+                "node_id": None,
+                "resource_kind": "definition",
+                "package_key": "project:root",
+                "source_relative_path": "workflows/root.yaml",
+                "source_digest": "1" * 64,
+                "compiled_digest": "1" * 64,
+                "source_byte_size": 100,
+                "compiled_byte_size": 100,
+                "media_type": "application/yaml",
+                "snapshot_path": (
+                    "packages/" + "c" * 64 + "/" + "d" * 64
+                    + "/workflows/root.yaml"
+                ),
+            },
+            {
+                "binding_id": "project:root:sidecar",
+                "node_id": None,
+                "resource_kind": "sidecar",
+                "package_key": "project:root",
+                "source_relative_path": "workflows/root.hermes.yaml",
+                "source_digest": "2" * 64,
+                "compiled_digest": "2" * 64,
+                "source_byte_size": 40,
+                "compiled_byte_size": 40,
+                "media_type": "application/yaml",
+                "snapshot_path": (
+                    "packages/" + "c" * 64 + "/" + "e" * 64
+                    + "/workflows/root.hermes.yaml"
+                ),
+            },
+            {
+                "binding_id": "root-review:command",
+                "node_id": "root-review",
+                "resource_kind": "command",
+                "package_key": "project:root",
+                "source_relative_path": "commands/review.md",
+                "source_digest": "d" * 64,
+                "compiled_digest": "d" * 64,
+                "source_byte_size": 12,
+                "compiled_byte_size": 12,
+                "media_type": "text/markdown",
+                "snapshot_path": (
+                    "packages/" + "c" * 64 + "/" + "f" * 64
+                    + "/commands/review.md"
+                ),
+            },
         ],
         "counts": {
             "dependency_packages": 1,
             "include_edges": 1,
             "expanded_nodes": 1,
             "authenticated_files": 6,
-            "authenticated_bytes": 462,
-            "sealed_files": 1,
-            "sealed_bytes": 39,
+            "authenticated_bytes": 345,
+            "sealed_files": 6,
+            "sealed_bytes": 353,
         },
         "expanded_definition_digest": "b" * 64,
         "node_origins_digest": (
             "27d8124e34c9c0b59375293df4e17c1cdc29f843c9178064a9d049c780a565a8"
         ),
         "resource_bindings_digest": (
-            "26590d181b0f3784db7cfeb9f7c17a1c10446c702cb711825d0f261555ea6181"
+            "f524fc0075362480ee6b6ae4f49993fcc8a4796bd443880b2003d9b6cd740472"
         ),
         "active_root_policy_digest": "e" * 64,
     }
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def test_manifest_codec_round_trips_exact_bounded_fields_immutably() -> None:
@@ -201,8 +293,118 @@ def test_manifest_codec_rejects_noncanonical_order_and_inexact_counts() -> None:
         WorkflowDependencyManifest.from_dict(forged)
 
     forged = _manifest_document()
-    forged["counts"]["sealed_bytes"] = 40
+    forged["counts"]["sealed_bytes"] = 352
     with pytest.raises(ValueError, match="counts"):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+def test_manifest_codec_rejects_forged_authenticated_counts() -> None:
+    """Catch claimed source-file totals diverging from unique resource bindings."""
+    for field, value in (("authenticated_files", 5), ("authenticated_bytes", 344)):
+        forged = _manifest_document()
+        forged["counts"][field] = value
+
+        with pytest.raises(ValueError, match="counts"):
+            WorkflowDependencyManifest.from_dict(forged)
+
+
+def test_manifest_codec_rejects_incomplete_authenticated_path_coverage() -> None:
+    """Catch covered package resources omitted from the sealed binding authority."""
+    forged = _manifest_document()
+    removed = forged["resources"].pop()
+    forged["counts"]["authenticated_files"] = 5
+    forged["counts"]["authenticated_bytes"] -= removed["source_byte_size"]
+    forged["counts"]["sealed_files"] = 5
+    forged["counts"]["sealed_bytes"] -= removed["compiled_byte_size"]
+    forged["resource_bindings_digest"] = _canonical_digest(forged["resources"])
+
+    with pytest.raises(ValueError, match="covered paths.*bindings"):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+@pytest.mark.parametrize("edge_field", ("source_package_key", "target_package_key"))
+def test_manifest_codec_rejects_include_edges_outside_package_set(
+    edge_field: str,
+) -> None:
+    """Catch dependency edges naming packages outside the authenticated closure."""
+    forged = _manifest_document()
+    forged["include_edges"][0][edge_field] = "profile:unbound"
+
+    with pytest.raises(ValueError, match="include edge.*package key"):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+def test_manifest_codec_rejects_node_origins_outside_package_set() -> None:
+    """Catch final nodes claiming provenance outside the authenticated closure."""
+    forged = _manifest_document()
+    forged["node_origins"][0]["package_key"] = "profile:unbound"
+    forged["node_origins_digest"] = _canonical_digest(forged["node_origins"])
+
+    with pytest.raises(ValueError, match="node origin.*package key"):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+@pytest.mark.parametrize(
+    ("field", "count", "message"),
+    (
+        ("dependencies", 65, "dependency collection.*bound"),
+        ("include_edges", 4097, "include edge collection.*bound"),
+        ("node_origins", 513, "node origin collection.*bound"),
+        ("resources", 513, "resource binding collection.*bound"),
+    ),
+)
+def test_manifest_codec_rejects_top_level_collections_before_decoding(
+    field: str,
+    count: int,
+    message: str,
+) -> None:
+    """Catch hostile collections being materialized before their hard limits."""
+    forged = _manifest_document()
+    item = deepcopy(forged[field][0])
+    forged[field] = [deepcopy(item) for _ in range(count)]
+
+    with pytest.raises(ValueError, match=message):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+@pytest.mark.parametrize(
+    ("record", "field", "values", "message"),
+    (
+        (
+            "root",
+            "covered_relative_paths",
+            [f"files/{index:03}.txt" for index in range(513)],
+            "covered relative path collection.*bound",
+        ),
+        (
+            "dependency",
+            "ignored_policy_fields",
+            [f"field_{index:03}" for index in range(65)],
+            "ignored policy field collection.*bound",
+        ),
+    ),
+)
+def test_manifest_codec_rejects_nested_collections_before_decoding(
+    record: str,
+    field: str,
+    values: list[str],
+    message: str,
+) -> None:
+    """Catch nested package metadata exceeding bounds before item validation."""
+    forged = _manifest_document()
+    target = forged["root"] if record == "root" else forged["dependencies"][0]
+    target[field] = values
+
+    with pytest.raises(ValueError, match=message):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
+def test_manifest_codec_rejects_boolean_schema_version() -> None:
+    """Catch Python boolean equality weakening exact schema-version semantics."""
+    forged = _manifest_document()
+    forged["schema_version"] = True
+
+    with pytest.raises(ValueError, match="schema version"):
         WorkflowDependencyManifest.from_dict(forged)
 
 
@@ -211,7 +413,7 @@ def test_composite_digest_uses_only_exact_canonical_digest_inputs() -> None:
     manifest = WorkflowDependencyManifest.from_dict(_manifest_document())
 
     assert composite_workflow_digest(manifest) == (
-        "ca7598d0fd2cb0fb81ac8617e892c70d41f1ac1f4075de12958a458cdfa6096e"
+        "56934dbbfb2212820b53166156331f4757bf081f9394a2c6689a7cf0ba5bc71f"
     )
 
 

@@ -34,6 +34,102 @@ def _compile(root, *dependencies):
     )
 
 
+def _root_command_compilation(tmp_path: Path, workflow_writer):
+    root_path = workflow_writer(
+        tmp_path / "authority/workflows",
+        name="authority-root",
+        filename="authority-root.yaml",
+        nodes=[{"id": "review", "command": "review"}],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name("authority-root.hermes.yaml").write_bytes(sidecar)
+    command = tmp_path / "authority/commands/review.md"
+    command.parent.mkdir()
+    command.write_text("first review\n", encoding="utf-8")
+    source = _parse(
+        root_path,
+        sidecar=sidecar,
+        source="project",
+        precedence=1,
+    )
+    return _compile(source), source, command
+
+
+def test_compilation_rejects_swapped_definition_bytes(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch callers replacing executable definition bytes under a trusted digest."""
+    compilation, _source, _command = _root_command_compilation(
+        tmp_path, workflow_writer
+    )
+
+    with pytest.raises(ValueError, match="definition.*manifest"):
+        replace(compilation, definition_bytes=b"{}")
+
+
+def test_compilation_rejects_swapped_active_policy_bytes(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch callers replacing active root policy under a trusted digest."""
+    compilation, _source, _command = _root_command_compilation(
+        tmp_path, workflow_writer
+    )
+
+    with pytest.raises(ValueError, match="policy.*manifest"):
+        replace(compilation, active_policy_bytes=b"required_secrets: [FORGED]\n")
+
+
+def test_compilation_rejects_swapped_final_package_graph(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch callers replacing normalized execution semantics under trusted identity."""
+    compilation, _source, _command = _root_command_compilation(
+        tmp_path, workflow_writer
+    )
+    forged_definition = replace(
+        compilation.package.definition,
+        description="forged graph",
+    )
+    forged_package = replace(
+        compilation.package,
+        definition=forged_definition,
+    )
+
+    with pytest.raises(ValueError, match="package graph.*manifest"):
+        replace(compilation, package=forged_package)
+
+
+def test_phase4_compilation_cache_reauthenticates_changed_resources(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch warm compilation cache hits retaining stale executable identity."""
+    from plugins.workflow.compilation import clear_compilation_cache
+
+    clear_compilation_cache()
+    first, source, command = _root_command_compilation(tmp_path, workflow_writer)
+    command.write_text("second review\n", encoding="utf-8")
+
+    second = _compile(source)
+
+    first_binding = next(
+        item
+        for item in first.dependency_manifest.resources
+        if item.resource_kind == "command"
+    )
+    second_binding = next(
+        item
+        for item in second.dependency_manifest.resources
+        if item.resource_kind == "command"
+    )
+    assert first.composite_digest != second.composite_digest
+    assert first.sealed_files[first_binding.snapshot_path] == b"first review\n"
+    assert second.sealed_files[second_binding.snapshot_path] == b"second review\n"
+
+
 def test_origin_resource_symlink_escape_fails_without_host_path_disclosure(
     tmp_path: Path,
     workflow_writer,
