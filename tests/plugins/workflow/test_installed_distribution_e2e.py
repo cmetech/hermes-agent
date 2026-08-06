@@ -136,7 +136,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     timeout_schema = installed_contract["definition_schema"]["properties"]["nodes"][
         "items"
     ]["properties"]["timeout"]
-    assert installed_contract["normalizer_version"] == 3
+    assert installed_contract["normalizer_version"] == 4
     assert timeout_schema["x-hermes-unit"] == "milliseconds"
     assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
     assert bash_schema["x-hermes-semantics"] == {
@@ -265,7 +265,6 @@ child = parse_workflow_source_bytes(
 compilation = compile_workflow(
     root,
     WorkflowCatalogSnapshot.capture((root, child)),
-    normalizer_version=4,
 )
 package = compilation.package
 validation = validate_package(package)
@@ -375,7 +374,7 @@ print(json.dumps({
     )
     assert phase4_probe.returncode == 0, phase4_probe.stderr
     phase4_result = json.loads(phase4_probe.stdout)
-    assert phase4_result["default_normalizer"] == 3
+    assert phase4_result["default_normalizer"] == 4
     assert phase4_result["explicit_normalizer"] == 4
     assert {
         "include_not_found",

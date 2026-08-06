@@ -1831,6 +1831,8 @@ def _admit_scheduled_authenticated_command(
     name: str,
     binding: WorkflowRunnerBinding,
 ):
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
     (home / "commands").mkdir(parents=True, exist_ok=True)
     (home / "commands/consume.md").write_text(
         "Use $producer.output.present\n", encoding="utf-8"
@@ -1861,11 +1863,22 @@ def _admit_scheduled_authenticated_command(
         "limits:\n  max_parallel_nodes: 1\n",
         encoding="utf-8",
     )
-    package = load_workflow(workflow)
+    compilation = resolve_workflow_catalog_compilation(
+        name,
+        hermes_home=home,
+        workdir=home.parent,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     context = background_execution_context(binding, requires_ai=None)
-    _compatibility, risk = assess_package_execution(package, context)
+    _compatibility, risk = assess_package_execution(
+        package,
+        context,
+        compilation=compilation,
+    )
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="schedule-revalidation-test",
         risk_digest=risk.risk_digest,
     )

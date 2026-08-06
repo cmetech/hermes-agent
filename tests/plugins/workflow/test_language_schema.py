@@ -52,15 +52,15 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
 
     assert contract["schema_version"] == 1
     assert contract["profile"] == "archon-2026-07"
-    assert contract["normalizer_version"] == 3
+    assert contract["normalizer_version"] == 4
     assert (
         contract["definition_schema"]["$schema"]
         == "https://json-schema.org/draft/2020-12/schema"
     )
-    assert len(json.dumps(contract).encode()) < 256_000
+    assert len(language_schema.canonical_contract_json(contract).encode()) < 256_000
 
 
-def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
+def test_phase4_loop_inventory_is_current_without_changing_v1_v3_schemas():
     loop_specs = {
         spec.yaml_name: spec
         for spec in FIELD_INVENTORY
@@ -74,23 +74,34 @@ def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
 
     schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
     loop_schema = schema["properties"]["nodes"]["items"]["properties"]["loop"]
-    assert "prompt" in loop_schema["required"]
-    assert "command" not in loop_schema["properties"]
-    assert "signal_completes" not in loop_schema["properties"]
+    assert "prompt" not in loop_schema.get("required", ())
+    assert "command" in loop_schema["properties"]
+    assert "signal_completes" in loop_schema["properties"]
 
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
     loop_kind = next(item for item in contract["node_kinds"] if item["id"] == "loop")
     loop_paths = {item["field_path"] for item in loop_kind["fields"]}
-    assert "nodes[].loop.command" not in loop_paths
-    assert "nodes[].loop.signal_completes" not in loop_paths
+    assert "nodes[].loop.command" in loop_paths
+    assert "nodes[].loop.signal_completes" in loop_paths
     assert schema == definition_json_schema(
         WorkflowLanguageProfile.ARCHON_2026_07,
-        normalizer_version=3,
+        normalizer_version=4,
     )
     assert contract["node_kinds"] == language_schema.node_kind_descriptors(
         WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+
+    phase3_schema = definition_json_schema(
+        WorkflowLanguageProfile.ARCHON_2026_07,
         normalizer_version=3,
     )
+    phase3_loop = phase3_schema["properties"]["nodes"]["items"]["properties"][
+        "loop"
+    ]
+    assert "prompt" in phase3_loop["required"]
+    assert "command" not in phase3_loop["properties"]
+    assert "signal_completes" not in phase3_loop["properties"]
 
     legacy_schema = definition_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
     legacy_kinds = language_schema.node_kind_descriptors(
@@ -107,7 +118,7 @@ def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
         )
 
 
-def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
+def test_explicit_v4_authoring_contract_exposes_current_loop_fields():
     contract = workflow_authoring_contract(
         WorkflowLanguageProfile.ARCHON_2026_07,
         normalizer_version=4,
@@ -133,14 +144,23 @@ def test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices():
     phase4 = workflow_authoring_contract(profile, normalizer_version=4)
 
     current_items = current["definition_schema"]["properties"]["nodes"]["items"]
+    phase3_items = workflow_authoring_contract(
+        profile,
+        normalizer_version=3,
+    )["definition_schema"]["properties"]["nodes"]["items"]
     phase4_variants = phase4["definition_schema"]["properties"]["nodes"][
         "items"
     ]["oneOf"]
-    assert current["normalizer_version"] == 3
+    assert current["normalizer_version"] == 4
     assert phase4["normalizer_version"] == 4
-    assert "include" not in current_items["properties"]
+    assert current_items == phase4["definition_schema"]["properties"]["nodes"][
+        "items"
+    ]
+    assert "include" in current_items["properties"]
+    assert any("include" in variant["required"] for variant in current_items["oneOf"])
+    assert "include" not in phase3_items["properties"]
     assert not any(
-        "include" in variant["required"] for variant in current_items["oneOf"]
+        "include" in variant["required"] for variant in phase3_items["oneOf"]
     )
     include = next(
         variant for variant in phase4_variants if "include" in variant["required"]
@@ -174,11 +194,14 @@ def test_explicit_v4_contract_documents_signal_interactions_and_stable_codes():
     """Catch generated v4 contracts omitting operational semantics or failures."""
     profile = WorkflowLanguageProfile.ARCHON_2026_07
     current = workflow_authoring_contract(profile)
+    phase3 = workflow_authoring_contract(profile, normalizer_version=3)
     phase4 = workflow_authoring_contract(profile, normalizer_version=4)
     current_topics = {item["id"]: item for item in current["documentation"]["topics"]}
+    phase3_topics = {item["id"]: item for item in phase3["documentation"]["topics"]}
     phase4_topics = {item["id"]: item for item in phase4["documentation"]["topics"]}
 
-    assert "ordinary-loops-and-includes" not in current_topics
+    assert "ordinary-loops-and-includes" not in phase3_topics
+    assert current_topics == phase4_topics
     topic = phase4_topics["ordinary-loops-and-includes"]
     assert topic["parameters"]["include_mode"] == "compile_only"
     assert topic["parameters"]["loop_prompt_sources"] == {
@@ -200,7 +223,8 @@ def test_explicit_v4_contract_documents_signal_interactions_and_stable_codes():
 
     registered = set(language_schema.phase4_durable_code_catalog())
     assert registered
-    assert registered.isdisjoint(current["compatibility_codes"])
+    assert registered.isdisjoint(phase3["compatibility_codes"])
+    assert registered <= set(current["compatibility_codes"])
     assert registered <= set(phase4["compatibility_codes"])
     assert not any(
         entry.get("blocking") and entry.get("enforcement_phase") == 4
@@ -253,10 +277,14 @@ def test_legacy_authoring_contract_preserves_supported_versions(
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
-    assert len(json.dumps(contract).encode()) <= 252_000
-    assert len(json.dumps(contract["definition_schema"]).encode()) <= 150_000
-    assert len(json.dumps(contract["node_kinds"]).encode()) <= 72_000
-    assert len(json.dumps(contract["compatibility_codes"]).encode()) <= 15_000
+    limits = contract["limits"]
+    assert len(language_schema.canonical_contract_json(contract).encode()) <= (
+        limits["max_contract_bytes"] - limits["reserved_growth_bytes"]
+    )
+    for section, maximum in limits["section_max_bytes"].items():
+        assert len(
+            language_schema.canonical_contract_json(contract[section]).encode()
+        ) <= maximum
 
 
 def test_serialized_editor_contract_resolves_every_field_definition_without_python():
@@ -498,7 +526,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         "section_max_bytes": {
             "definition_schema": 150_000,
             "node_kinds": 72_000,
-            "compatibility_codes": 15_000,
+            "compatibility_codes": 16_000,
         },
     }
     assert contract["x-hermes-provenance"]["field_authority"] == (
@@ -626,36 +654,41 @@ def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(pro
     assert isinstance(conditions["parameters"]["expression_pattern"], str)
 
 
-def test_strict_output_rule_adds_only_v4_loop_template_paths():
+def test_current_strict_output_rule_adds_only_v4_loop_template_paths():
     profile = WorkflowLanguageProfile.ARCHON_2026_07
     current_rule_list = workflow_authoring_contract(profile)["semantic_rules"]
     current_rules = {
         item["id"]: item
         for item in current_rule_list
     }
-    staged_rules = {
+    phase3_rule_list = workflow_authoring_contract(
+        profile,
+        normalizer_version=3,
+    )["semantic_rules"]
+    phase3_rules = {
         item["id"]: item
-        for item in workflow_authoring_contract(
-            profile,
-            normalizer_version=4,
-        )["semantic_rules"]
+        for item in phase3_rule_list
     }
     current_paths = set(current_rules["strict-output-reference"]["field_paths"])
-    staged_paths = set(staged_rules["strict-output-reference"]["field_paths"])
+    phase3_paths = set(phase3_rules["strict-output-reference"]["field_paths"])
 
-    assert staged_paths - current_paths == {
+    assert current_paths - phase3_paths == {
         "nodes[].loop.command",
         "nodes[].loop.gate_message",
     }
     assert {
         "nodes[].loop.command",
         "nodes[].loop.gate_message",
-    }.isdisjoint(current_paths)
+    }.isdisjoint(phase3_paths)
     assert language_schema.semantic_rule_descriptors(profile) == current_rule_list
     assert language_schema.semantic_rule_descriptors(
         profile,
-        normalizer_version=3,
+        normalizer_version=4,
     ) == current_rule_list
+    assert language_schema.semantic_rule_descriptors(
+        profile,
+        normalizer_version=3,
+    ) == phase3_rule_list
 
     legacy_default = language_schema.semantic_rule_descriptors(
         WorkflowLanguageProfile.HERMES_LEGACY
@@ -740,7 +773,7 @@ def test_archon_condition_contract_projects_runtime_bounds_and_typed_rules():
         "ordered_rhs": ["unquoted_decimal", "quoted_decimal"],
         "structured_strings_coerce_to_number": False,
     }
-    assert len(json.dumps(contract).encode("utf-8")) < 256_000
+    assert len(language_schema.canonical_contract_json(contract).encode()) < 256_000
 
 
 @pytest.mark.parametrize(
@@ -1130,7 +1163,14 @@ def test_every_node_field_has_schema_loader_and_compatibility_parity(
     profile, node_type, field
 ):
     document = _document_with_field(node_type, field)
-    schema_accepts, loader_accepts = _structural_outcomes(document, profile)
+    normalizer_version = (
+        3 if profile is WorkflowLanguageProfile.ARCHON_2026_07 else 2
+    )
+    schema_accepts, loader_accepts = _structural_outcomes(
+        document,
+        profile,
+        normalizer_version=normalizer_version,
+    )
 
     assert schema_accepts is loader_accepts
     if not loader_accepts:
@@ -1144,6 +1184,7 @@ def test_every_node_field_has_schema_loader_and_compatibility_parity(
             if profile is WorkflowLanguageProfile.ARCHON_2026_07
             else None
         ),
+        normalizer_version=normalizer_version,
     )
     path = f"nodes[{len(document['nodes']) - 1}].{field}"
     field_not_applicable = any(

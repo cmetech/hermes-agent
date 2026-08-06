@@ -65,7 +65,7 @@ CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 150_000,
     "node_kinds": 72_000,
-    "compatibility_codes": 15_000,
+    "compatibility_codes": 16_000,
 })
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"

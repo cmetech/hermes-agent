@@ -24,7 +24,7 @@ from plugins.workflow.output_resolution import (
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 
@@ -733,7 +733,14 @@ def test_scheduler_executes_snapshotted_named_script(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(

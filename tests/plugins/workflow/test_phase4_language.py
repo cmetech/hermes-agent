@@ -12,7 +12,7 @@ from plugins.workflow.language import (
 )
 from plugins.workflow.execution_semantics import build_phase3_execution_semantics
 from plugins.workflow.models import RunExecutionLimits, WorkflowLanguageProfile
-from plugins.workflow.schema import load_workflow_snapshot
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 
 
 @pytest.mark.parametrize(
@@ -58,10 +58,10 @@ def test_explicit_v4_is_rejected_for_unversioned_and_legacy_workflows(
     assert exc.value.code == "workflow_normalizer_version_unsupported"
 
 
-def test_explicit_v4_preserves_phase3_normalized_behavior(
+def test_current_v4_preserves_explicit_v3_normalized_behavior(
     tmp_path, workflow_writer
 ) -> None:
-    """Catch v4 admission bypassing strict references or v3 normalization."""
+    """Catch current Archon admission bypassing or dropping sealed v3 semantics."""
     path = workflow_writer(
         tmp_path,
         nodes=[
@@ -92,17 +92,13 @@ def test_explicit_v4_preserves_phase3_normalized_behavior(
         sidecar_bytes=sidecar.read_bytes(),
         normalizer_version=3,
     )
-    v4 = load_workflow_snapshot(
-        path,
-        workflow_bytes=path.read_bytes(),
-        sidecar_bytes=sidecar.read_bytes(),
-        normalizer_version=4,
-    )
+    current = load_workflow(path)
 
-    assert v4.definition == v3.definition
-    assert v4.language.structured_outputs == v3.language.structured_outputs
-    assert v4.language.node_semantics == v3.language.node_semantics
-    assert v4.language.node_semantics["shell"] == {
+    assert current.language.normalizer_version == 4
+    assert current.definition == v3.definition
+    assert current.language.structured_outputs == v3.language.structured_outputs
+    assert current.language.node_semantics == v3.language.node_semantics
+    assert current.language.node_semantics["shell"] == {
         "wall_timeout_seconds": 2.5,
         "retry": {
             "explicit": True,
@@ -121,13 +117,13 @@ def test_explicit_v4_preserves_phase3_normalized_behavior(
         combined_retries=3,
     )
     v3_execution = build_phase3_execution_semantics(v3, limits).to_dict()
-    v4_execution = build_phase3_execution_semantics(v4, limits).to_dict()
+    v4_execution = build_phase3_execution_semantics(current, limits).to_dict()
     assert v3_execution.pop("normalizer_version") == 3
     assert v4_execution.pop("normalizer_version") == 4
     assert v4_execution == v3_execution
 
     v3_snapshot = make_language_snapshot(v3, "a" * 64).to_dict()
-    v4_snapshot = make_language_snapshot(v4, "a" * 64).to_dict()
+    v4_snapshot = make_language_snapshot(current, "a" * 64).to_dict()
     assert read_language_snapshot(v4_snapshot).to_dict() == v4_snapshot
     for field in (
         "normalizer_version",

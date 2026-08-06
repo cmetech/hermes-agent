@@ -132,7 +132,7 @@ def test_showcase_admission_seals_resolved_profile_execution_authority(
 ) -> None:
     home = tmp_path / "profile"
     path = workflow_writer(
-        tmp_path / "package",
+        tmp_path / "package/workflows",
         name="archon-sealed-showcase-limits",
         nodes=[{"id": "start", "bash": "true"}],
     )

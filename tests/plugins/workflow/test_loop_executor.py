@@ -22,7 +22,7 @@ from plugins.workflow.output_resolution import (
 )
 from plugins.workflow.resources import StrictSubstitutionRenderer, VariableContext
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 
 
@@ -706,7 +706,14 @@ def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -841,7 +848,14 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(

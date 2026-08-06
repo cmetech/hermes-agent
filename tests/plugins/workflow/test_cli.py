@@ -37,22 +37,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def test_explicit_phase4_path_resolves_includes_from_bounded_catalog(
     tmp_path: Path,
-    monkeypatch,
     workflow_writer,
 ) -> None:
-    """An explicit root still compiles against the project/profile source closure."""
-    from types import MappingProxyType
-
-    import plugins.workflow.language as language_module
-
-    monkeypatch.setattr(
-        language_module,
-        "CURRENT_NORMALIZER_BY_PROFILE",
-        MappingProxyType({
-            WorkflowLanguageProfile.HERMES_LEGACY: 2,
-            WorkflowLanguageProfile.ARCHON_2026_07: 4,
-        }),
-    )
+    """A current Archon root compiles against the project/profile source closure."""
     workdir = tmp_path / "project"
     home = tmp_path / "home"
     root = workflow_writer(
@@ -91,10 +78,10 @@ def test_explicit_phase4_path_resolves_includes_from_bounded_catalog(
     ("declared_profile", "expected_version"),
     [
         pytest.param(None, 2, id="unversioned-v2"),
-        pytest.param("archon-2026-07", 3, id="archon-v3"),
+        pytest.param("hermes-legacy", 2, id="legacy-v2"),
     ],
 )
-def test_explicit_pre_phase4_run_ignores_unavailable_unrelated_catalog(
+def test_explicit_legacy_run_ignores_unavailable_unrelated_catalog(
     tmp_path: Path,
     monkeypatch,
     workflow_writer,
@@ -102,7 +89,7 @@ def test_explicit_pre_phase4_run_ignores_unavailable_unrelated_catalog(
     declared_profile: str | None,
     expected_version: int,
 ) -> None:
-    """Standalone pre-v4 admission must not depend on catalog enumeration."""
+    """Standalone legacy admission must not depend on catalog enumeration."""
     home = tmp_path / "home"
     workdir = tmp_path / "project"
     catalog_root = workdir / ".hermes/workflows"
@@ -419,7 +406,7 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
         ("retry", {"max_attempts": 2}),
     ],
 )
-def test_archon_phase3_timeout_and_retry_fields_validate(
+def test_current_archon_inherits_phase3_timeout_and_retry_fields(
     workflow_writer, tmp_path, capsys, field, value
 ):
     path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
@@ -435,7 +422,7 @@ def test_archon_phase3_timeout_and_retry_fields_validate(
     result = _json_result(capsys)
     assert result["valid"] is True
     assert result["issues"] == []
-    assert result["language"]["normalizer_version"] == 3
+    assert result["language"]["normalizer_version"] == 4
 
 
 def test_archon_cli_admission_seals_resolved_profile_execution_authority(
@@ -471,11 +458,20 @@ def test_archon_cli_admission_seals_resolved_profile_execution_authority(
         }),
         encoding="utf-8",
     )
-    package = load_workflow(path)
-    digest = compute_package_digest(package)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compilation = _resolve_compilation(
+        argparse.Namespace(workdir=workdir, hermes_home=home),
+        path.stem,
+    )
+    package = compilation.package
+    risk = build_risk_summary(
+        package,
+        assess_compatibility(package),
+        compilation=compilation,
+    )
     WorkflowTrustStore(home).trust(
-        digest.sha256, actor="test", risk_digest=risk.risk_digest
+        compilation.composite_digest,
+        actor="test",
+        risk_digest=risk.risk_digest,
     )
     args = _parser().parse_args([
         "--workdir",

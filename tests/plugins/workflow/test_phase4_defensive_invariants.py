@@ -52,11 +52,11 @@ class _TraversalBomb:
     """Fail the test if an over-limit v4 node reaches materialization."""
 
 
-def test_current_v3_large_root_projects_while_v4_rejects_before_node_513(
+def test_explicit_v3_large_root_projects_while_v4_rejects_before_node_513(
     tmp_path: Path,
     workflow_writer,
 ) -> None:
-    """Catch Phase 4 closure bounds leaking into current v3 compilation."""
+    """Keep the v3 projection available while current v4 enforces its bound."""
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
     from plugins.workflow.topology import project_topology
 
@@ -78,10 +78,10 @@ def test_current_v3_large_root_projects_while_v4_rejects_before_node_513(
     )
     catalog = WorkflowCatalogSnapshot.capture((source,))
 
-    current = compile_workflow(source, catalog)
-    projection = project_topology(current.package.definition)
+    v3_compilation = compile_workflow(source, catalog, normalizer_version=3)
+    projection = project_topology(v3_compilation.package.definition)
 
-    assert current.package.language.normalizer_version == 3
+    assert v3_compilation.package.language.normalizer_version == 3
     assert projection.node_count == 513
 
     bomb_source = replace(

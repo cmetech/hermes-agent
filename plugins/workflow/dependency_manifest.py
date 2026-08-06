@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, fields, is_dataclass
@@ -14,6 +15,7 @@ from typing import Iterable, Mapping
 
 import yaml
 
+from agent.structured_output import canonical_json_bytes
 from plugins.workflow.models import (
     WorkflowNodeOrigin,
     WorkflowPackage,
@@ -196,12 +198,49 @@ def _bounded_sequence(
 
 
 def _canonical_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    output = bytearray()
+
+    def append(data: bytes) -> None:
+        if len(output) + len(data) > WORKFLOW_MANIFEST_MAX_TOTAL_BYTES:
+            raise ValueError("workflow manifest exceeds its exact byte bound")
+        output.extend(data)
+
+    def encode(item: object) -> None:
+        if isinstance(item, float) and not math.isfinite(item):
+            if math.isnan(item):
+                append(b"NaN")
+            elif item < 0:
+                append(b"-Infinity")
+            else:
+                append(b"Infinity")
+            return
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise TypeError("JSON object keys must be strings")
+            append(b"{")
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    append(b",")
+                encode(key)
+                append(b":")
+                encode(item[key])
+            append(b"}")
+            return
+        if isinstance(item, list | tuple):
+            append(b"[")
+            for index, child in enumerate(item):
+                if index:
+                    append(b",")
+                encode(child)
+            append(b"]")
+            return
+        remaining = WORKFLOW_MANIFEST_MAX_TOTAL_BYTES - len(output)
+        if remaining <= 0:
+            raise ValueError("workflow manifest exceeds its exact byte bound")
+        append(canonical_json_bytes(item, max_bytes=remaining))
+
+    encode(value)
+    return bytes(output)
 
 
 def _logical_graph_value(

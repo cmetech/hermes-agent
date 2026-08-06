@@ -172,6 +172,8 @@ class _Store:
 def test_api_admission_seals_resolved_profile_execution_authority(
     tmp_path, workflow_writer
 ) -> None:
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
     home = tmp_path / "profile"
     path = workflow_writer(
         home / "workflows",
@@ -200,12 +202,23 @@ def test_api_admission_seals_resolved_profile_execution_authority(
         }),
         encoding="utf-8",
     )
-    package = load_workflow(path)
+    compilation = resolve_workflow_catalog_compilation(
+        path.stem,
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     binding = production_workflow_runner_binding()
     context = background_execution_context(binding, requires_ai=False)
-    _compatibility, risk = assess_package_execution(package, context)
+    _compatibility, risk = assess_package_execution(
+        package,
+        context,
+        compilation=compilation,
+    )
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="test",
         risk_digest=risk.risk_digest,
     )

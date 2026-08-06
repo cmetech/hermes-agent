@@ -36,6 +36,15 @@ def _codes(exc: pytest.ExceptionInfo[WorkflowValidationError]) -> list[str]:
     return [issue.code for issue in exc.value.issues]
 
 
+def _load_v3(path: Path):
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
+
+
 def test_v3_reference_iterator_uses_the_exact_ascii_grammar() -> None:
     assert hasattr(language_schema, "iter_output_references")
     template = (
@@ -131,11 +140,14 @@ def test_v2_identifier_acceptance_is_unchanged(workflow_writer, tmp_path: Path) 
 
 def test_v3_generated_contract_uses_the_same_ascii_reference_grammar() -> None:
     profile = language_schema.WorkflowLanguageProfile.ARCHON_2026_07
-    definition = definition_json_schema(profile)
+    definition = definition_json_schema(profile, normalizer_version=3)
     node_id = definition["properties"]["nodes"]["items"]["properties"]["id"]
     rules = {
         item["id"]: item
-        for item in workflow_authoring_contract(profile)["semantic_rules"]
+        for item in workflow_authoring_contract(
+            profile,
+            normalizer_version=3,
+        )["semantic_rules"]
     }
     references = rules["strict-output-reference"]
 
@@ -729,7 +741,7 @@ def test_authenticated_command_body_is_scanned_before_snapshot_promotion(
     (tmp_path / "commands" / "consume.md").write_text(
         "consume $producer.output\n", encoding="utf-8"
     )
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -753,7 +765,7 @@ def test_authenticated_command_body_accepts_a_direct_dependency(
     (tmp_path / "commands" / "consume.md").write_text(
         "consume $producer.output\n", encoding="utf-8"
     )
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -778,7 +790,7 @@ def test_authenticated_command_body_rejects_malformed_hyphen_continuation(
     (tmp_path / "commands" / "consume.md").write_text(
         "consume $producer.output-field\n", encoding="utf-8"
     )
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -806,7 +818,7 @@ def test_recognized_reference_in_authenticated_named_script_is_blocking(
     scripts.mkdir()
     script = scripts / "consume.py"
     script.write_bytes(b"print('$producer.output')\n")
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -836,7 +848,7 @@ def test_named_script_keeps_ordinary_dollar_syntax_and_reference_free_bytes(
     scripts.mkdir()
     script = scripts / "consume.py"
     script.write_bytes(b"print('$HOME', '$1', '${VALUE}')\n")
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -864,7 +876,7 @@ def test_named_script_scan_never_loses_a_valid_reference_around_other_bytes(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     (scripts / "consume.py").write_bytes(body)
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
@@ -964,7 +976,7 @@ def test_v3_invalid_authenticated_command_has_a_bounded_stable_error(
 ) -> None:
     (tmp_path / "commands").mkdir()
     (tmp_path / "commands" / "consume.md").write_bytes(body)
-    package = load_workflow(
+    package = _load_v3(
         _archon(
             workflow_writer,
             tmp_path,
