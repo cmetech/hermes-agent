@@ -14,6 +14,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
@@ -76,6 +77,14 @@ class _CountedLoopRunner:
         )
 
 
+class _LeaseClock:
+    def __init__(self, sample: LeaseClockSample) -> None:
+        self.sample = sample
+
+    def __call__(self) -> LeaseClockSample:
+        return self.sample
+
+
 def _phase4_signal_run(
     tmp_path,
     workflow_writer,
@@ -83,6 +92,8 @@ def _phase4_signal_run(
     downstream: bool = False,
     loop_overrides: dict[str, object] | None = None,
     node_overrides: dict[str, object] | None = None,
+    lease_clock=None,
+    admission_overrides: dict[str, object] | None = None,
 ):
     loop = {
         "prompt": "Refine",
@@ -125,7 +136,11 @@ def _phase4_signal_run(
         normalizer_version=4,
     )
     home = tmp_path / "signal-crash-home"
-    store = RunStore(home)
+    store = (
+        RunStore(home, lease_clock=lease_clock)
+        if lease_clock is not None
+        else RunStore(home)
+    )
     prepared = store.prepare_run_snapshot(
         compilation.package,
         compilation=compilation,
@@ -134,16 +149,18 @@ def _phase4_signal_run(
             compilation.covered_relative_paths,
         ),
     )
+    admission = {
+        "workflow_name": "signal-crash",
+        "definition_digest": prepared.definition_digest,
+        "policy_digest": prepared.policy_digest,
+        "input_manifest_digest": prepared.input_manifest_digest,
+        "trigger_source": "cli",
+        "idempotency_key": "signal-crash",
+        "concurrency_key": "signal-crash",
+    }
+    admission.update(admission_overrides or {})
     admitted = store.start_run(
-        RunAdmissionRequest(
-            workflow_name="signal-crash",
-            definition_digest=prepared.definition_digest,
-            policy_digest=prepared.policy_digest,
-            input_manifest_digest=prepared.input_manifest_digest,
-            trigger_source="cli",
-            idempotency_key="signal-crash",
-            concurrency_key="signal-crash",
-        ),
+        RunAdmissionRequest(**admission),
         immutable_snapshot=prepared,
     )
     assert admitted.run_id is not None
@@ -181,6 +198,60 @@ def _expired_loop_recovery_scheduler(
         utcnow=lambda: expired_utc,
         monotonic=lambda: expired_monotonic,
     )
+
+
+def _recorded_loop_recovery_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+):
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated loss before recovery takeover")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="before recovery takeover"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    recorded_claim = store.load_run(run_id)["nodes"]["refine"]["claim"]
+    first_now = LeaseClockSample(
+        datetime.fromisoformat(recorded_claim["lease_expires_at"])
+        + timedelta(seconds=1),
+        float(recorded_claim["heartbeat_monotonic"])
+        + float(recorded_claim["lease_seconds"])
+        + 1.0,
+        "recorded-loop-recovery-boot",
+    )
+    stale = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-a",
+        now=first_now,
+        lease_seconds=1,
+    )
+    assert stale is not None
+    winner_now = LeaseClockSample(
+        first_now.utc_now + timedelta(seconds=2),
+        first_now.monotonic_now + 2.0,
+        first_now.boot_id,
+    )
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-b",
+        now=winner_now,
+        lease_seconds=30,
+    )
+    assert winner is not None
+    return store, run_id, stale, winner, winner_now
 
 
 @pytest.mark.parametrize(
@@ -364,6 +435,239 @@ def test_concurrent_restart_publishes_recorded_loop_decision_once(
     assert len(runner.requests) == 1
     events = RunStore(home).tail_events(run_id)
     assert sum(event["event_type"] == "node_succeeded" for event in events) == 1
+
+
+def test_scheduler_recovers_recorded_decision_across_claim_expiry_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    node = recorded["nodes"]["refine"]
+    claim = dict(node["claim"])
+    decision = dict(node["loop_state"]["_pending_loop_decision"])
+    expired_at = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    expired_monotonic = (
+        float(claim["heartbeat_monotonic"])
+        + float(claim["lease_seconds"])
+        + 1
+    )
+
+    assert store.expire_stale_claims(
+        run_id,
+        now=expired_at,
+        monotonic_now=expired_monotonic,
+    ) == ()
+    preserved = store.load_run(run_id)
+    assert preserved["status"] == "running"
+    assert preserved["nodes"]["refine"]["claim"] == claim
+    assert (
+        preserved["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+        == decision
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("expired recorded decision replayed the loop provider")
+
+    recovered = RunScheduler(
+        RunStore(home),
+        agent_runner=NoReplayRunner(),
+        utcnow=lambda: expired_at,
+        monotonic=lambda: expired_monotonic,
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"] == (
+        claim["attempt_id"]
+    )
+
+
+def test_foreground_adoption_routes_recorded_decision_through_recovery_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    started_at = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        lease_clock=clock,
+        admission_overrides={
+            "execution_mode": "foreground",
+            "foreground_owner_id": "foreground-loop-owner",
+            "foreground_lease_seconds": 1,
+        },
+    )
+    foreground = store.load_run(run_id)
+    foreground_epoch = int(foreground["foreground_epoch"])
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated foreground loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="foreground loss"):
+        RunScheduler(
+            store,
+            owner_id="foreground-loop-worker",
+            execution_owner_id="foreground-loop-owner",
+            execution_owner_epoch=foreground_epoch,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+            utcnow=lambda: started_at,
+            monotonic=lambda: 100.0,
+        ).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    claim = dict(recorded["nodes"]["refine"]["claim"])
+    decision = dict(
+        recorded["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+    )
+    adopted_at = datetime.fromisoformat(
+        str(recorded["foreground_lease_expires_at"])
+    ) + timedelta(seconds=1)
+    adopted_monotonic = (
+        float(recorded["foreground_heartbeat_monotonic"])
+        + float(recorded["foreground_lease_seconds"])
+        + 1.0
+    )
+    clock.sample = LeaseClockSample(
+        adopted_at,
+        adopted_monotonic,
+        "boot-a",
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="recorded-loop-adopter",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-adopter-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database, clock=clock).try_acquire(
+        identity,
+        now=adopted_at,
+        lease_seconds=30,
+    )
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+
+    adopted = store.adopt_expired_foreground(run_id, fence, adopted_at)
+
+    assert adopted["execution_mode"] == "background"
+    assert adopted["status"] == "running"
+    assert adopted["nodes"]["refine"]["claim"]["attempt_id"] == claim[
+        "attempt_id"
+    ]
+    assert (
+        adopted["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+        == decision
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("foreground adoption replayed the recorded loop provider")
+
+    recovered = RunScheduler(
+        store,
+        execution_fence=fence,
+        agent_runner=NoReplayRunner(),
+        utcnow=lambda: adopted_at,
+        monotonic=lambda: adopted_monotonic,
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"] == claim[
+        "attempt_id"
+    ]
+
+
+def test_stale_recorded_loop_recoverer_cannot_schedule_retry_after_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    store, run_id, stale, winner, winner_now = _recorded_loop_recovery_takeover(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+
+    with pytest.raises(RuntimeError, match="stale node completion"):
+        store.schedule_retry(
+            stale.claim,
+            next_attempt_at=winner_now.utc_now + timedelta(seconds=30),
+            error_code="provider_error",
+        )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    with store._connect() as connection:
+        worker = connection.execute(
+            "SELECT owner_id, lease_expires_at FROM worker_claims "
+            "WHERE attempt_id=?",
+            (winner.claim.attempt_id,),
+        ).fetchone()
+    assert worker is not None
+    assert worker["owner_id"] == winner.claim.owner_id
+    assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
+
+
+def test_stale_recorded_loop_recoverer_cannot_block_cleanup_after_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    store, run_id, stale, winner, _ = _recorded_loop_recovery_takeover(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+
+    with pytest.raises(RuntimeError, match="stale cleanup failure"):
+        store.block_cleanup_failed(
+            stale.claim,
+            error_message="stale recoverer cleanup failed",
+        )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    with store._connect() as connection:
+        worker = connection.execute(
+            "SELECT owner_id, lease_expires_at FROM worker_claims "
+            "WHERE attempt_id=?",
+            (winner.claim.attempt_id,),
+        ).fetchone()
+    assert worker is not None
+    assert worker["owner_id"] == winner.claim.owner_id
+    assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
 
 
 def test_fresh_recorded_loop_decision_cannot_be_taken_over_from_live_executor(

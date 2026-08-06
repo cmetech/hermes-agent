@@ -221,6 +221,70 @@ history, and public evidence.
   payloads.
 - No unresolved concerns remain for Task 9.
 
+## Review convergence: fix round 3 of 5
+
+Status: DONE
+
+The third external review found two ownership-boundary gaps. Both were reproduced
+through real scheduler/store transitions before production edits.
+
+### Recorded decisions survive generic lease recovery
+
+Generic stale-claim expiry now leaves a claim carrying a private
+`_pending_loop_decision` intact. The scheduler can therefore acquire that same
+expired attempt through the existing transactional recorded-decision recovery CAS
+instead of replaying the provider or losing the recorded outcome.
+
+Expired foreground adoption likewise recognizes the recorded decision. In the
+same fenced adoption transaction it preserves the attempt and decision, compares
+and expires the durable worker-claim row, and excludes that attempt from generic
+ready/pause reconciliation and claim release. The background scheduler then uses
+the existing recovery CAS; no parallel recovery state machine was added.
+
+### Terminal mutations are owner-fenced
+
+`schedule_retry()` and `block_cleanup_failed()` now compare both the immutable
+attempt ID and the active claim owner. A recoverer that loses its transferred lease
+to another recoverer cannot schedule a retry, set cleanup failure, append an event,
+or release/overwrite the winner's worker claim. Legacy and non-recovery callers
+retain their existing path when both fields match.
+
+### Fix-round TDD evidence
+
+1. Generic expiry boundary:
+   - RED: `expire_stale_claims()` returned `('refine',)` and removed the recorded
+     decision's claim.
+   - GREEN: expiry returns no generic work, preserves the exact claim/decision, and
+     the real scheduler completes the original attempt with provider replay
+     forbidden.
+2. Foreground adoption boundary:
+   - RED: authentic expired-owner adoption removed the claim (`KeyError: 'claim'`).
+   - GREEN: fenced adoption preserves the claim/decision, atomically expires the
+     worker row, and background recovery completes the original attempt with zero
+     provider calls.
+3. Stale retry writer:
+   - RED: recoverer A did not raise after expired recoverer B took ownership.
+   - GREEN: A is rejected as `stale node completion`; the projection, event journal,
+     and B's worker owner/lease remain unchanged.
+4. Stale cleanup-failure writer:
+   - RED: recoverer A did not raise after B took ownership.
+   - GREEN: A is rejected as `stale cleanup failure`; the projection, event journal,
+     and B's worker owner/lease remain unchanged.
+
+### Fix-round final verification
+
+- Complete crash-recovery file: 52 passed, 0 failed.
+- Mandatory Task 9 eight-file gate: 224 passed, 0 failed.
+  - v4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 52; shutdown recovery 5; parallel scheduler 19; evidence API 29.
+- Required Task 8 broad action/store gate: 74 passed, 0 failed.
+- Combined explicit v1-v3 compatibility gates: 13 passed, 0 failed.
+- Ruff on all touched Python files: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+- Normalizer v4 activation, Task 10 diagnostics, and security-review scope remain
+  untouched.
+
 ## Review convergence: fix round 1 of 5
 
 Status: DONE

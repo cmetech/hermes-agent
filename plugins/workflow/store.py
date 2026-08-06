@@ -9129,6 +9129,38 @@ class RunStore:
                 releasable_attempts: list[str] = []
                 for node_id, node, attempt, attempt_id in claimed_attempts:
                     claim = node["claim"]
+                    loop_state = node.get("loop_state")
+                    if (
+                        isinstance(loop_state, Mapping)
+                        and loop_state.get("_pending_loop_decision") is not None
+                    ):
+                        previous_lease_expires_at = claim.get("lease_expires_at")
+                        owner_id = claim.get("owner_id")
+                        if not isinstance(previous_lease_expires_at, str) or not isinstance(
+                            owner_id, str
+                        ):
+                            raise ForegroundExecutionConflict(
+                                "foreground owner conflict: recorded loop claim is malformed"
+                            )
+                        updated_claim = connection.execute(
+                            "UPDATE worker_claims SET lease_expires_at=? "
+                            "WHERE attempt_id=? AND run_id=? AND node_id=? "
+                            "AND owner_id=? AND lease_expires_at=?",
+                            (
+                                instant.isoformat(),
+                                attempt_id,
+                                run_id,
+                                node_id,
+                                owner_id,
+                                previous_lease_expires_at,
+                            ),
+                        ).rowcount
+                        if updated_claim != 1:
+                            raise ForegroundExecutionConflict(
+                                "foreground owner conflict: recorded loop claim changed"
+                            )
+                        claim["lease_expires_at"] = instant.isoformat()
+                        continue
                     observation = self._observe_attempt(attempt)
                     effect_classification = str(
                         attempt.get(
@@ -13554,7 +13586,10 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if (
+                active.get("attempt_id") != claim.attempt_id
+                or active.get("owner_id") != claim.owner_id
+            ):
                 raise RuntimeError("stale cleanup failure")
             safe_metadata = None
             if metadata is not None:
@@ -14215,7 +14250,11 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
-            if node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+            active = node.get("claim", {})
+            if (
+                active.get("attempt_id") != claim.attempt_id
+                or active.get("owner_id") != claim.owner_id
+            ):
                 raise RuntimeError("stale node completion")
             if projection["status"] in {"cancelled", "abandoned", "interrupted"}:
                 raise RuntimeError("stale completion for terminal run")
@@ -14495,6 +14534,12 @@ class RunStore:
                     datetime.fromisoformat(claim["lease_expires_at"]) > instant
                     and monotonic_elapsed < lease_seconds
                     and not clock_gap
+                ):
+                    continue
+                loop_state = node.get("loop_state")
+                if (
+                    isinstance(loop_state, Mapping)
+                    and loop_state.get("_pending_loop_decision") is not None
                 ):
                     continue
                 attempt_id = claim["attempt_id"]
