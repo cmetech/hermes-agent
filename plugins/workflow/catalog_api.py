@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, NotRequired, TypedDict
 
-from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.compilation import (
+    WorkflowCatalogSnapshot,
+    WorkflowCompilation,
+    compile_workflow,
+)
 from plugins.workflow.cli import (
     WorkflowDefinitionProjectionCapacityError,
     show_package,
@@ -280,9 +284,12 @@ def _catalog_candidates(
     return candidates[:CATALOG_LIMIT], len(candidates) > CATALOG_LIMIT
 
 
-def _discover_catalog(
-    workdir: Path, hermes_home: Path
-) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
+def _discover_catalog_compilations(
+    workdir: Path,
+    hermes_home: Path,
+    *,
+    normalizer_version: int | None = None,
+) -> tuple[tuple[WorkflowCompilation | InvalidCatalogEntry, ...], bool]:
     invalid: list[InvalidCatalogEntry] = []
     candidates, truncated = _catalog_candidates(workdir, hermes_home)
     definition_budget = _DefinitionReadBudget()
@@ -331,10 +338,14 @@ def _discover_catalog(
 
     raw_snapshot = WorkflowCatalogSnapshot.capture(source_documents)
     compiled_sources: list[WorkflowSourceDocument] = []
-    compiled_by_source: dict[tuple[str, int, str], WorkflowPackage] = {}
+    compiled_by_source: dict[tuple[str, int, str], WorkflowCompilation] = {}
     for source_document in source_documents:
         try:
-            compiled = compile_workflow(source_document, raw_snapshot)
+            compiled = compile_workflow(
+                source_document,
+                raw_snapshot,
+                normalizer_version=normalizer_version,
+            )
         except (OSError, UnicodeError, WorkflowValidationError, ValueError):
             invalid.append(_error_entry(source_document.name, "invalid_definition"))
             continue
@@ -353,7 +364,7 @@ def _discover_catalog(
                 source_document.precedence,
                 str(source_document.workflow_path),
             )
-        ] = compiled.package
+        ] = compiled
 
     selected_snapshot = WorkflowCatalogSnapshot.capture(compiled_sources)
     selected = [
@@ -365,8 +376,8 @@ def _discover_catalog(
             sorted(
                 [*selected, *invalid],
                 key=lambda item: (
-                    item.definition.name
-                    if isinstance(item, WorkflowPackage)
+                    item.package.definition.name
+                    if isinstance(item, WorkflowCompilation)
                     else item["name"]
                 ),
             )
@@ -375,27 +386,45 @@ def _discover_catalog(
     )
 
 
-def resolve_workflow_catalog_package(
+def _discover_catalog(
+    workdir: Path, hermes_home: Path
+) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
+    discovered, truncated = _discover_catalog_compilations(workdir, hermes_home)
+    return (
+        tuple(
+            item.package if isinstance(item, WorkflowCompilation) else item
+            for item in discovered
+        ),
+        truncated,
+    )
+
+
+def resolve_workflow_catalog_compilation(
     name: str,
     *,
     hermes_home: str | Path,
     workdir: str | Path,
     catalog_source: Literal["project", "profile"] | None = None,
-) -> WorkflowPackage | None:
-    """Resolve one runnable catalog entry with list/detail failure isolation."""
+    normalizer_version: int | None = None,
+) -> WorkflowCompilation | None:
+    """Resolve and compile one catalog closure exactly once for admission."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
         return None
-    discovered, _truncated = _discover_catalog(
+    discovered, _truncated = _discover_catalog_compilations(
         Path(workdir).expanduser().resolve(),
         Path(hermes_home).expanduser().resolve(),
+        normalizer_version=normalizer_version,
     )
     for item in discovered:
-        if isinstance(item, WorkflowPackage) and item.definition.name == name:
-            if catalog_source is not None and item.source != catalog_source:
+        if (
+            isinstance(item, WorkflowCompilation)
+            and item.package.definition.name == name
+        ):
+            if catalog_source is not None and item.package.source != catalog_source:
                 return None
             qualify_workflow_catalog_package(
-                item,
-                compatibility=assess_compatibility(item),
+                item.package,
+                compatibility=assess_compatibility(item.package),
             )
             return item
         if isinstance(item, dict) and item.get("name") == name:
@@ -407,6 +436,23 @@ def resolve_workflow_catalog_package(
                 "workflow catalog entry is invalid"
             )
     return None
+
+
+def resolve_workflow_catalog_package(
+    name: str,
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    catalog_source: Literal["project", "profile"] | None = None,
+) -> WorkflowPackage | None:
+    """Resolve one runnable catalog entry with list/detail failure isolation."""
+    compilation = resolve_workflow_catalog_compilation(
+        name,
+        hermes_home=hermes_home,
+        workdir=workdir,
+        catalog_source=catalog_source,
+    )
+    return compilation.package if compilation is not None else None
 
 
 def _input_projection(
@@ -1139,6 +1185,7 @@ __all__ = [
     "build_workflow_detail",
     "desktop_input_name_is_representable",
     "qualify_workflow_catalog_package",
+    "resolve_workflow_catalog_compilation",
     "resolve_workflow_catalog_package",
     "workflow_catalog_run_support",
 ]

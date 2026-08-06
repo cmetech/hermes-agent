@@ -95,18 +95,29 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
-    from plugins.workflow.cli import _resolve, _runtime_config, _store
+    from plugins.workflow.cli import (
+        _admission_compilation,
+        _admission_package_digest,
+        _resolve_compilation,
+        _runtime_config,
+        _store,
+    )
     from plugins.workflow.coordinator_store import CoordinatorStore
 
     command_args = argparse.Namespace(
         hermes_home=str(hermes_home), workdir=str(workdir), name=args.name
     )
-    package = _resolve(command_args, args.name)
+    compilation = _resolve_compilation(command_args, args.name)
+    package = compilation.package
     runtime = _runtime_config(hermes_home, sidecar=package.sidecar)
-    digest = compute_package_digest(package)
+    digest = _admission_package_digest(compilation)
     compatibility = assess_compatibility(package)
     require_runnable(compatibility)
-    risk = build_risk_summary(package, compatibility)
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        compilation=_admission_compilation(compilation),
+    )
     if WorkflowTrustStore(hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
@@ -120,7 +131,11 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
         raise RuntimeError("background execution requires a healthy coordinator")
     prepared = store.prepare_run_snapshot(
         package,
+        compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
+        trusted_package_digest=(
+            digest if _admission_compilation(compilation) is not None else None
+        ),
         execution_limits=RunExecutionLimits.resolve(runtime),
     )
     provenance = gateway_trigger_provenance(

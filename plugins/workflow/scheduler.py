@@ -494,6 +494,333 @@ def evaluate_condition(expression: str, outputs: Mapping[str, object]) -> bool:
     )
 
 
+def load_snapshot_format2(
+    snapshot_root: Path,
+    projection: Mapping[str, object],
+    resources: Mapping[str, object],
+    authenticated_bytes: Mapping[str, bytes],
+) -> WorkflowPackage:
+    """Load one exact format-2 execution package from authenticated bytes only."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot
+    from plugins.workflow.dependency_manifest import (
+        WorkflowDependencyManifest,
+        composite_workflow_digest,
+        digest_expanded_compilation,
+        digest_node_origins,
+    )
+    from plugins.workflow.includes import collect_include_edges, expand_workflow_source
+    from plugins.workflow.models import WorkflowNodeOrigin
+    from plugins.workflow.schema import (
+        _compile_workflow_source_document,
+        parse_workflow_source_bytes,
+    )
+
+    def mismatch(message: str, cause: BaseException | None = None):
+        error = WorkflowLanguageCompatibilityError(
+            "workflow_snapshot_integrity_mismatch",
+            message,
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    if projection.get("snapshot_format_version") != 2:
+        mismatch("workflow snapshot format identity is not version 2")
+    definition_bytes = authenticated_bytes.get("definition.yaml")
+    policy_bytes = authenticated_bytes.get("policy.yaml")
+    manifest_bytes = authenticated_bytes.get("dependencies.json")
+    if not all(
+        isinstance(value, bytes)
+        for value in (definition_bytes, policy_bytes, manifest_bytes)
+    ):
+        mismatch("format-2 workflow authorities are incomplete")
+    assert isinstance(definition_bytes, bytes)
+    assert isinstance(policy_bytes, bytes)
+    assert isinstance(manifest_bytes, bytes)
+
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    if (
+        resources.get("snapshot_format_version") != 2
+        or resources.get("dependency_manifest_digest") != manifest_digest
+        or projection.get("dependency_manifest_digest") != manifest_digest
+    ):
+        mismatch("dependency manifest identity changed")
+    try:
+        manifest_raw = json.loads(manifest_bytes)
+        manifest = WorkflowDependencyManifest.from_dict(manifest_raw)
+    except (UnicodeError, ValueError) as exc:
+        mismatch("dependency manifest is malformed", exc)
+    if manifest.canonical_bytes() != manifest_bytes:
+        mismatch("dependency manifest is not canonical")
+    if (
+        hashlib.sha256(policy_bytes).hexdigest()
+        != manifest.active_root_policy_digest
+    ):
+        mismatch("active root policy identity changed")
+    composite_digest = composite_workflow_digest(manifest)
+    if projection.get("definition_digest") != composite_digest:
+        mismatch("composite workflow identity changed")
+
+    bindings_by_package: dict[str, dict[str, list[object]]] = {}
+    for binding in manifest.resources:
+        sealed = authenticated_bytes.get(binding.snapshot_path)
+        if (
+            sealed is None
+            or len(sealed) != binding.compiled_byte_size
+            or hashlib.sha256(sealed).hexdigest() != binding.compiled_digest
+        ):
+            mismatch("sealed workflow resource identity changed")
+        bindings_by_package.setdefault(binding.package_key, {}).setdefault(
+            binding.resource_kind,
+            [],
+        ).append(binding)
+
+    records = (manifest.root, *manifest.dependencies)
+
+    def source_from_record(record):
+        package_bindings = bindings_by_package.get(record.package_key, {})
+        definitions = package_bindings.get("definition", [])
+        sidecars = package_bindings.get("sidecar", [])
+        if len(definitions) != 1 or len(sidecars) > 1:
+            mismatch("sealed package definition authority is ambiguous")
+        definition_binding = definitions[0]
+        encoded_definition = authenticated_bytes[definition_binding.snapshot_path]
+        if hashlib.sha256(encoded_definition).hexdigest() != record.definition_digest:
+            mismatch("sealed origin definition identity changed")
+        encoded_sidecar = None
+        if record.sidecar_status != "absent":
+            if len(sidecars) != 1:
+                mismatch("sealed package sidecar authority is missing")
+            sidecar_binding = sidecars[0]
+            encoded_sidecar = authenticated_bytes[sidecar_binding.snapshot_path]
+            if (
+                record.sidecar_digest is None
+                or hashlib.sha256(encoded_sidecar).hexdigest()
+                != record.sidecar_digest
+            ):
+                mismatch("sealed origin sidecar identity changed")
+        elif sidecars:
+            mismatch("absent package sidecar has sealed authority")
+        try:
+            source = parse_workflow_source_bytes(
+                snapshot_root / definition_binding.snapshot_path,
+                workflow_bytes=encoded_definition,
+                sidecar_bytes=encoded_sidecar,
+                source=record.catalog_source,
+                precedence=record.precedence,
+            )
+        except (OSError, ValueError, WorkflowValidationError) as exc:
+            mismatch("sealed origin package is malformed", exc)
+        if (
+            source.name != record.workflow_name
+            or source.definition_location != record.definition_location
+            or source.sidecar_location != record.sidecar_location
+        ):
+            mismatch("sealed origin package identity changed")
+        return source
+
+    sealed_sources = tuple(source_from_record(record) for record in records)
+    root_source = sealed_sources[0]
+    catalog = WorkflowCatalogSnapshot.capture(sealed_sources)
+    try:
+        expanded = expand_workflow_source(root_source, catalog)
+        expanded_dependency_keys = {
+            f"{source.source}:{source.name}" for source in expanded.dependencies
+        }
+        manifest_dependency_keys = {
+            record.package_key for record in manifest.dependencies
+        }
+        if expanded_dependency_keys != manifest_dependency_keys:
+            mismatch("sealed dependency closure identity changed")
+        rebuilt_edges = tuple(
+            sorted(
+                (dict(edge) for edge in collect_include_edges(root_source, catalog)),
+                key=lambda item: (
+                    tuple(item["include_instance_path"]),
+                    item["source_package_key"],
+                    item["source_node_id"],
+                    item["target_package_key"],
+                ),
+            )
+        )
+        if rebuilt_edges != tuple(manifest.to_dict()["include_edges"]):
+            mismatch("sealed include-edge identity changed")
+        identity_source = replace(
+            root_source,
+            nodes=expanded.nodes,
+            definition_bytes=expanded.canonical_definition_bytes,
+        )
+        identity_package = _compile_workflow_source_document(
+            identity_source,
+            normalizer_version=4,
+        )
+    except WorkflowLanguageCompatibilityError:
+        raise
+    except (KeyError, ValueError, WorkflowValidationError) as exc:
+        mismatch("sealed dependency closure cannot be reconstructed", exc)
+
+    manifest_origins = tuple(
+        sorted(
+            (WorkflowNodeOrigin(**dict(raw)) for raw in manifest.node_origins),
+            key=lambda item: item.expanded_node_id,
+        )
+    )
+    origins_by_id = {
+        origin.expanded_node_id: origin for origin in manifest_origins
+    }
+    identity_origins = tuple(sorted(
+        (
+        node.origin
+        for node in identity_package.definition.nodes
+        if node.origin is not None
+        ),
+        key=lambda item: item.expanded_node_id,
+    ))
+    if (
+        set(origins_by_id) != {node.id for node in identity_package.definition.nodes}
+        or identity_origins != manifest_origins
+        or digest_node_origins(identity_origins)
+        != manifest.node_origins_digest
+        or digest_expanded_compilation(definition_bytes, identity_package)
+        != manifest.expanded_definition_digest
+    ):
+        mismatch("expanded workflow package identity changed")
+
+    language_snapshot = read_language_snapshot(resources.get("language"))
+    if language_snapshot is None or language_snapshot.normalizer_version != 4:
+        mismatch("format-2 language identity is missing")
+    verify_language_snapshot(
+        identity_package,
+        composite_digest,
+        language_snapshot,
+    )
+
+    try:
+        runtime_source = parse_workflow_source_bytes(
+            snapshot_root / "definition.yaml",
+            workflow_bytes=definition_bytes,
+            sidecar_bytes=policy_bytes,
+            source=manifest.root.catalog_source,
+            precedence=manifest.root.precedence,
+        )
+        runtime_nodes = []
+        for node in runtime_source.nodes:
+            origin = origins_by_id.get(node.id)
+            if origin is None:
+                mismatch("expanded workflow node origin is missing")
+            runtime_nodes.append(replace(
+                node,
+                source_index=origin.source_index,
+                source_line=origin.source_line,
+                origin=origin,
+            ))
+        runtime_source = replace(runtime_source, nodes=tuple(runtime_nodes))
+        runtime_package = _compile_workflow_source_document(
+            runtime_source,
+            normalizer_version=4,
+        )
+    except WorkflowLanguageCompatibilityError:
+        raise
+    except (KeyError, ValueError, WorkflowValidationError) as exc:
+        mismatch("expanded workflow definition is malformed", exc)
+
+    def restore_definition(definition):
+        return replace(
+            definition,
+            nodes=tuple(
+                replace(
+                    node,
+                    source_index=origins_by_id[node.id].source_index,
+                    source_line=origins_by_id[node.id].source_line,
+                    origin=origins_by_id[node.id],
+                )
+                for node in definition.nodes
+            ),
+        )
+
+    runtime_package = replace(
+        runtime_package,
+        source_definition=restore_definition(runtime_package.source_definition),
+        definition=restore_definition(runtime_package.definition),
+        root=snapshot_root,
+        workflow_path=snapshot_root / "definition.yaml",
+        sidecar_path=snapshot_root / "policy.yaml",
+        language=identity_package.language,
+        compatibility_findings=identity_package.compatibility_findings,
+        validation_issues=identity_package.validation_issues,
+    )
+    if dict(runtime_package.sidecar) != dict(identity_package.sidecar):
+        mismatch("active root policy expansion changed")
+
+    runtime_by_id = {node.id: node for node in runtime_package.definition.nodes}
+    expected_by_id = {
+        node.id: node for node in identity_package.definition.nodes
+    }
+    for binding in manifest.resources:
+        if binding.node_id is None:
+            continue
+        node = runtime_by_id.get(binding.node_id)
+        if node is None or node.origin is None or node.origin.package_key != binding.package_key:
+            mismatch("resource binding origin changed")
+        expected = expected_by_id.get(binding.node_id)
+        if expected is None:
+            mismatch("resource binding node changed")
+        if binding.resource_kind == "mcp_resource":
+            mcp_bindings = [
+                item
+                for item in manifest.resources
+                if item.node_id == binding.node_id
+                and item.package_key == binding.package_key
+                and item.resource_kind == "mcp"
+            ]
+            if len(mcp_bindings) != 1 or (
+                binding.snapshot_path.encode("utf-8")
+                not in authenticated_bytes[mcp_bindings[0].snapshot_path]
+            ):
+                mismatch("local MCP resource binding changed")
+            continue
+        if binding.resource_kind == "command":
+            bound = node.value == binding.snapshot_path
+            expected = replace(expected, value=binding.snapshot_path)
+        elif binding.resource_kind == "named_script":
+            bound = node.value == binding.snapshot_path
+            expected = replace(expected, value=binding.snapshot_path)
+        elif binding.resource_kind == "loop_command":
+            bound = (
+                isinstance(node.value, Mapping)
+                and node.value.get("command") == binding.snapshot_path
+            )
+            expected = replace(
+                expected,
+                value={**dict(expected.value), "command": binding.snapshot_path},
+            )
+        elif binding.resource_kind == "mcp":
+            mcp = node.options.get("mcp")
+            bound = mcp == binding.snapshot_path or (
+                isinstance(mcp, tuple) and binding.snapshot_path in mcp
+            )
+            expected_mcp = expected.options.get("mcp")
+            if isinstance(expected_mcp, tuple):
+                expected_mcp = tuple(
+                    binding.snapshot_path if item == binding.source_relative_path else item
+                    for item in expected_mcp
+                )
+            else:
+                expected_mcp = binding.snapshot_path
+            expected = replace(
+                expected,
+                options={**dict(expected.options), "mcp": expected_mcp},
+            )
+        else:
+            continue
+        if not bound:
+            mismatch("expanded workflow resource binding changed")
+        expected_by_id[binding.node_id] = expected
+    if runtime_by_id != expected_by_id:
+        mismatch("bound runtime graph differs from sealed logical identity")
+    return runtime_package
+
+
 class RunScheduler:
     def __init__(
         self,
@@ -1864,16 +2191,26 @@ class RunScheduler:
                 directly_verified_paths=legacy_direct_paths,
             )
 
-        package = load_workflow_snapshot(
-            definition,
-            workflow_bytes=definition_bytes,
-            sidecar_bytes=policy_bytes if policy.is_file() else None,
-            normalizer_version=(
-                snapshot.normalizer_version
-                if snapshot is not None
-                else WORKFLOW_NORMALIZER_VERSION
-            ),
-        )
+        if projection.get("snapshot_format_version") == 2:
+            if verified_sealed_bytes is None:
+                raise integrity_error("format-2 workflow bytes are missing")
+            package = load_snapshot_format2(
+                run_directory,
+                projection,
+                resources,
+                verified_sealed_bytes,
+            )
+        else:
+            package = load_workflow_snapshot(
+                definition,
+                workflow_bytes=definition_bytes,
+                sidecar_bytes=policy_bytes if policy.is_file() else None,
+                normalizer_version=(
+                    snapshot.normalizer_version
+                    if snapshot is not None
+                    else WORKFLOW_NORMALIZER_VERSION
+                ),
+            )
         if snapshot is None and (
             package.language.effective_profile
             is not WorkflowLanguageProfile.HERMES_LEGACY

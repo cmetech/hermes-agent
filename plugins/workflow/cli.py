@@ -17,7 +17,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MethodType
-from typing import AbstractSet, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -31,6 +31,7 @@ from hermes_constants import get_hermes_home
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     language_projection,
+    supports_phase4_semantics,
 )
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
@@ -79,7 +80,11 @@ from plugins.workflow.projection_limits import (
     WORKFLOW_DEFINITION_MAX_EDGES,
     WORKFLOW_DEFINITION_MAX_NODES,
 )
-from plugins.workflow.schema import load_workflow, validate_package
+from plugins.workflow.schema import (
+    load_workflow,
+    parse_workflow_source_bytes,
+    validate_package,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sanitize import (
     projection_key_is_secret,
@@ -96,11 +101,15 @@ from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
     WorkflowTrustError,
     WorkflowTrustStore,
+    WorkflowPackageDigest,
     build_risk_summary,
     compute_package_digest,
     preflight_execution,
 )
 from tools.managed_process import ProcessResourceLimits
+
+if TYPE_CHECKING:
+    from plugins.workflow.compilation import WorkflowCompilation
 
 
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
@@ -850,6 +859,74 @@ def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
         f"workflow not found: {name}",
         details={"candidates": candidates},
     )
+
+
+def _resolve_compilation(args: argparse.Namespace, name: str) -> WorkflowCompilation:
+    """Resolve one admission target as a single immutable compilation."""
+    from plugins.workflow.compilation import (
+        WorkflowCatalogSnapshot,
+        compile_workflow,
+    )
+
+    candidate = Path(name).expanduser()
+    if candidate.is_file():
+        workflow_path = candidate.resolve()
+        sidecar_path = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        sidecar_bytes = sidecar_path.read_bytes() if sidecar_path.is_file() else None
+        source = parse_workflow_source_bytes(
+            workflow_path,
+            workflow_bytes=workflow_path.read_bytes(),
+            sidecar_bytes=sidecar_bytes,
+            source="explicit",
+            precedence=0,
+        )
+        return compile_workflow(source, WorkflowCatalogSnapshot.capture((source,)))
+
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
+    compilation = resolve_workflow_catalog_compilation(
+        name,
+        hermes_home=args.hermes_home,
+        workdir=args.workdir,
+    )
+    if compilation is not None:
+        return compilation
+    packages = _discover(args)
+    candidates = [
+        {
+            "id": package.definition.name,
+            "kind": "workflow",
+            "label": package.definition.name,
+        }
+        for package in sorted(packages, key=lambda item: item.definition.name)[:10]
+    ]
+    raise WorkflowNotFound(
+        f"workflow not found: {name}",
+        details={"candidates": candidates},
+    )
+
+
+def _admission_compilation(
+    compilation: WorkflowCompilation,
+) -> WorkflowCompilation | None:
+    package = compilation.package
+    if supports_phase4_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        return compilation
+    return None
+
+
+def _admission_package_digest(
+    compilation: WorkflowCompilation,
+) -> WorkflowPackageDigest:
+    if _admission_compilation(compilation) is not None:
+        return WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        )
+    return compute_package_digest(compilation.package)
 
 
 def _cron_jobs() -> Iterable[Mapping[str, object]]:
@@ -1783,12 +1860,17 @@ def _scheduler(
 def _cmd_run(
     args: argparse.Namespace, *, agent_runner=None, profile_name="default"
 ) -> int:
-    package = _resolve(args, args.name)
+    compilation = _resolve_compilation(args, args.name)
+    package = compilation.package
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
-    digest = compute_package_digest(package)
+    digest = _admission_package_digest(compilation)
     compatibility = assess_compatibility(package)
     require_runnable(compatibility)
-    risk = build_risk_summary(package, compatibility)
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        compilation=_admission_compilation(compilation),
+    )
     if (
         WorkflowTrustStore(args.hermes_home).check(
             digest.sha256, risk_digest=risk.risk_digest
@@ -1825,7 +1907,11 @@ def _cmd_run(
     )
     prepared = store.prepare_run_snapshot(
         package,
+        compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
+        trusted_package_digest=(
+            digest if _admission_compilation(compilation) is not None else None
+        ),
         execution_limits=RunExecutionLimits.resolve(runtime),
     )
     intent_key = args.idempotency_key or secrets.token_urlsafe(24)

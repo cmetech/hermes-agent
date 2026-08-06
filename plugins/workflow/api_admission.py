@@ -24,6 +24,7 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowValidationError,
 )
+from plugins.workflow.language import supports_phase4_semantics
 from plugins.workflow.compat import (
     WorkflowCompatibilityBlockedError,
     require_runnable,
@@ -47,6 +48,7 @@ from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     WorkflowTrustStore,
+    WorkflowPackageDigest,
     build_risk_summary,
     compute_package_digest,
     preflight_execution,
@@ -161,7 +163,7 @@ def validate_declared_api_values(
     return normalized
 
 
-def _catalog_package(
+def _catalog_compilation(
     workflow_name: str,
     *,
     hermes_home: Path,
@@ -174,11 +176,11 @@ def _catalog_package(
         WorkflowCatalogCapacityError,
         WorkflowCatalogInvalidDefinitionError,
         WorkflowCatalogUnavailableError,
-        resolve_workflow_catalog_package,
+        resolve_workflow_catalog_compilation,
     )
 
     try:
-        return resolve_workflow_catalog_package(
+        return resolve_workflow_catalog_compilation(
             workflow_name,
             hermes_home=hermes_home,
             workdir=workdir,
@@ -261,18 +263,29 @@ def start_api_run(
                 "workflow_showcase_verification_failed", status_code=409
             ) from exc
         package = verified_showcase.package
+        compilation = verified_showcase.compilation
     else:
         if catalog_source not in {None, "project", "profile"}:
             raise ApiAdmissionError("workflow_catalog_source_invalid", status_code=422)
-        package = _catalog_package(
+        compilation = _catalog_compilation(
             workflow_name,
             hermes_home=home,
             workdir=Path(workdir).resolve(),
             user_home=Path(user_home).resolve(),
             catalog_source=catalog_source,
         )
-        if package is None:
+        if compilation is None:
             raise ApiAdmissionError("workflow_not_found", status_code=404)
+        package = compilation.package
+
+    phase4_compilation = (
+        compilation
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
 
     run_support = workflow_catalog_run_support(
         package,
@@ -337,14 +350,26 @@ def start_api_run(
         requires_ai=(scenario.requires_ai if scenario is not None else None),
     )
     try:
-        package_digest = compute_package_digest(
-            package, read_budget=resource_budget
+        package_digest = (
+            WorkflowPackageDigest(
+                compilation.composite_digest,
+                compilation.covered_relative_paths,
+            )
+            if phase4_compilation is not None
+            else compute_package_digest(package, read_budget=resource_budget)
         )
         compatibility, risk = assess_package_execution(
             package,
             execution_context,
             read_budget=resource_budget,
         )
+        if phase4_compilation is not None:
+            risk = build_risk_summary(
+                package,
+                compatibility,
+                read_budget=resource_budget,
+                compilation=phase4_compilation,
+            )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(
             "workflow_catalog_capacity", status_code=503, retryable=True
@@ -444,6 +469,7 @@ def start_api_run(
         )
         prepared = store.prepare_run_snapshot(
             package,
+            compilation=phase4_compilation,
             values=values or None,
             verified_inputs=verified_inputs or None,
             resource_read_budget=resource_budget,

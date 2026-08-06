@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import shutil
 
 import yaml
 
@@ -18,6 +20,53 @@ from plugins.workflow.showcase import (
 )
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary
+
+
+def test_showcase_compiles_while_materialized_bundle_context_is_alive(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch resource-package paths being reopened after as_file cleanup."""
+    materialized = tmp_path / "materialized"
+    workflow_writer(
+        materialized / "packages/first",
+        name="materialized-first",
+        filename="workflow.yaml",
+    )
+    workflow_writer(
+        materialized / "packages/second",
+        name="materialized-second",
+        filename="workflow.yaml",
+    )
+    base = showcase_module.load_showcase_catalog()["resilience"]
+    first = replace(
+        base,
+        id="materialized-first",
+        workflow_path="packages/first/workflow.yaml",
+    )
+    second = replace(
+        base,
+        id="materialized-second",
+        workflow_path="packages/second/workflow.yaml",
+    )
+
+    @contextmanager
+    def materialized_bundle(_explicit=None):
+        try:
+            yield materialized
+        finally:
+            shutil.rmtree(materialized)
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_showcase_catalog",
+        lambda: {first.id: first, second.id: second},
+    )
+    monkeypatch.setattr(showcase_module, "_bundle_path", materialized_bundle)
+
+    compilation = showcase_module._scenario_compilation(first)
+
+    assert compilation.package.definition.name == "materialized-first"
+    assert not materialized.exists()
 
 
 def test_scheduling_requires_confirmation_and_preserves_unrelated_jobs(
@@ -110,7 +159,11 @@ def test_showcase_admission_seals_resolved_profile_execution_authority(
         "load_showcase_catalog",
         lambda: {scenario.id: scenario},
     )
-    monkeypatch.setattr(showcase_module, "_scenario_package", lambda _scenario: package)
+    monkeypatch.setattr(
+        showcase_module,
+        "_scenario_package",
+        lambda _scenario, **_kwargs: package,
+    )
     monkeypatch.setattr(
         showcase_module,
         "preflight_showcase",

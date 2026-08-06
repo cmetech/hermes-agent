@@ -324,3 +324,121 @@ def test_sealed_aggregate_authority_rejects_changed_identity_and_cache_miss(
         budget.read(resource)
     with pytest.raises(WorkflowResourceCacheMissError):
         budget.read(tmp_path / "missing.txt")
+
+
+def test_admitted_closure_completes_after_every_live_origin_is_deleted(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Independently gate recovery against accidental live-package fallback."""
+    import shutil
+
+    from plugins.workflow.admission import RunAdmissionRequest
+    from plugins.workflow.scheduler import RunScheduler
+    from plugins.workflow.store import RunStore
+    from plugins.workflow.trust import WorkflowPackageDigest
+
+    root_path = workflow_writer(
+        tmp_path / "root/workflows",
+        name="defensive-root",
+        filename="defensive-root.yaml",
+        nodes=[{"id": "child", "include": "defensive-child"}],
+    )
+    root_policy = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name("defensive-root.hermes.yaml").write_bytes(root_policy)
+    child_path = workflow_writer(
+        tmp_path / "child/workflows",
+        name="defensive-child",
+        filename="defensive-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    compilation = _compile(
+        _parse(root_path, sidecar=root_policy, source="project", precedence=1),
+        _parse(child_path, sidecar=None, source="profile", precedence=2),
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="defensive-root",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="defensive-no-live-read",
+            concurrency_key="defensive-root",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    shutil.rmtree(root_path.parent.parent)
+    shutil.rmtree(child_path.parent.parent)
+
+    result = RunScheduler(RunStore(tmp_path / "home")).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+
+
+def test_future_compilation_changes_when_dependency_precedence_is_shadowed(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Independently gate complete-closure identity on catalog precedence."""
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    root_path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="defensive-shadow-root",
+        filename="defensive-shadow-root.yaml",
+        nodes=[{"id": "child", "include": "defensive-shadow-child"}],
+    )
+    root_path.with_name("defensive-shadow-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="defensive-shadow-child",
+        filename="defensive-shadow-child.yaml",
+        nodes=[{"id": "execute", "bash": "printf profile"}],
+    )
+    before = resolve_workflow_catalog_compilation(
+        "defensive-shadow-root",
+        hermes_home=home,
+        workdir=workdir,
+        normalizer_version=4,
+    )
+    assert before is not None
+
+    workflow_writer(
+        workdir / ".hermes/workflows",
+        name="defensive-shadow-child",
+        filename="defensive-shadow-child.yaml",
+        nodes=[{"id": "execute", "bash": "printf project"}],
+    )
+    after = resolve_workflow_catalog_compilation(
+        "defensive-shadow-root",
+        hermes_home=home,
+        workdir=workdir,
+        normalizer_version=4,
+    )
+    assert after is not None
+
+    assert before.composite_digest != after.composite_digest
+    assert (
+        before.dependency_manifest.dependencies[0].catalog_source,
+        before.dependency_manifest.dependencies[0].precedence,
+    ) == ("profile", 2)
+    assert (
+        after.dependency_manifest.dependencies[0].catalog_source,
+        after.dependency_manifest.dependencies[0].precedence,
+    ) == ("project", 1)

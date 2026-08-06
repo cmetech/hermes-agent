@@ -25,7 +25,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import AbstractSet, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -36,7 +36,11 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.language import make_language_snapshot, supports_phase3_semantics
+from plugins.workflow.language import (
+    make_language_snapshot,
+    supports_phase3_semantics,
+    supports_phase4_semantics,
+)
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
@@ -100,6 +104,9 @@ from plugins.workflow.trust import (
     compute_package_digest,
 )
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
+
+if TYPE_CHECKING:
+    from plugins.workflow.compilation import WorkflowCompilation
 
 
 def _language_has_phase3_semantics(language: object) -> bool:
@@ -5435,6 +5442,7 @@ class RunStore:
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
         execution_limits: RunExecutionLimits | None = None,
+        compilation: WorkflowCompilation | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -5457,9 +5465,43 @@ class RunStore:
                     store_limit=self.max_input_bytes,
                 )
 
-            package_digest = trusted_package_digest or compute_package_digest(
-                package, read_budget=resource_read_budget
-            )
+            dependency_manifest_digest = None
+            snapshot_format_version = 1
+            if compilation is not None:
+                from plugins.workflow.compilation import WorkflowCompilation
+
+                if not isinstance(compilation, WorkflowCompilation):
+                    raise InputSnapshotError(
+                        "workflow compilation must be immutable and exact"
+                    )
+                if package is not compilation.package:
+                    raise InputSnapshotError(
+                        "workflow package differs from its admitted compilation"
+                    )
+                if not supports_phase4_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                ):
+                    raise InputSnapshotError(
+                        "format-2 snapshots require explicit v4 semantics"
+                    )
+                expected_package_digest = WorkflowPackageDigest(
+                    compilation.composite_digest,
+                    compilation.covered_relative_paths,
+                )
+                if (
+                    trusted_package_digest is not None
+                    and trusted_package_digest != expected_package_digest
+                ):
+                    raise InputSnapshotError(
+                        "trusted workflow identity differs from its compilation"
+                    )
+                package_digest = expected_package_digest
+                snapshot_format_version = 2
+            else:
+                package_digest = trusted_package_digest or compute_package_digest(
+                    package, read_budget=resource_read_budget
+                )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
             phase3_execution_semantics = None
             if supports_phase3_semantics(
@@ -5479,32 +5521,45 @@ class RunStore:
                     return path.read_bytes()
                 return resource_read_budget.read_cached(path)
 
-            definition_data = read_package_file(package.workflow_path)
-            (staging / "definition.yaml").write_bytes(definition_data)
-            policy_data = b"{}\n"
-            if package.sidecar_path is not None:
-                policy_data = read_package_file(package.sidecar_path)
+            if compilation is not None:
+                definition_data = compilation.definition_bytes
+                policy_data = compilation.active_policy_bytes
+                (staging / "definition.yaml").write_bytes(definition_data)
                 (staging / "policy.yaml").write_bytes(policy_data)
-            package_root = Path(os.path.abspath(package.root))
-            workflow_relative = (
-                Path(os.path.abspath(package.workflow_path))
-                .relative_to(package_root)
-                .as_posix()
-            )
-            sidecar_relative = (
-                Path(os.path.abspath(package.sidecar_path))
-                .relative_to(package_root)
-                .as_posix()
-                if package.sidecar_path is not None
-                else None
-            )
-            for relative in package_digest.covered_relative_paths:
-                if relative in {workflow_relative, sidecar_relative}:
-                    continue
-                source = package.root / relative
-                target = staging / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(read_package_file(source))
+                dependencies_data = compilation.dependency_manifest.canonical_bytes()
+                dependency_manifest_digest = _sha256(dependencies_data)
+                (staging / "dependencies.json").write_bytes(dependencies_data)
+                for relative, data in compilation.sealed_files.items():
+                    target = staging / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+            else:
+                definition_data = read_package_file(package.workflow_path)
+                (staging / "definition.yaml").write_bytes(definition_data)
+                policy_data = b"{}\n"
+                if package.sidecar_path is not None:
+                    policy_data = read_package_file(package.sidecar_path)
+                    (staging / "policy.yaml").write_bytes(policy_data)
+                package_root = Path(os.path.abspath(package.root))
+                workflow_relative = (
+                    Path(os.path.abspath(package.workflow_path))
+                    .relative_to(package_root)
+                    .as_posix()
+                )
+                sidecar_relative = (
+                    Path(os.path.abspath(package.sidecar_path))
+                    .relative_to(package_root)
+                    .as_posix()
+                    if package.sidecar_path is not None
+                    else None
+                )
+                for relative in package_digest.covered_relative_paths:
+                    if relative in {workflow_relative, sidecar_relative}:
+                        continue
+                    source = package.root / relative
+                    target = staging / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(read_package_file(source))
             node_skill_digests: dict[str, str] = {}
             node_agent_skill_digests: dict[str, str] = {}
             for node in package.definition.nodes:
@@ -5683,6 +5738,11 @@ class RunStore:
                 "language": language,
                 "sealed_paths": sealed_paths,
             }
+            if dependency_manifest_digest is not None:
+                snapshot_resources["snapshot_format_version"] = 2
+                snapshot_resources["dependency_manifest_digest"] = (
+                    dependency_manifest_digest
+                )
             if phase3_execution_semantics is not None:
                 snapshot_resources["phase3_execution_semantics"] = (
                     phase3_execution_semantics
@@ -5732,6 +5792,8 @@ class RunStore:
                 ),
                 language=language,
                 sealed_snapshot_digest=snapshot_digest,
+                snapshot_format_version=snapshot_format_version,
+                dependency_manifest_digest=dependency_manifest_digest,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -5966,6 +6028,8 @@ class RunStore:
             snapshot.outward_action_nodes,
             dict(snapshot.language) if snapshot.language is not None else None,
             snapshot.sealed_snapshot_digest,
+            snapshot.snapshot_format_version,
+            snapshot.dependency_manifest_digest,
         )
 
     @staticmethod
@@ -6470,7 +6534,7 @@ class RunStore:
             "run_id": run_id,
             "workflow": request.workflow_name,
             "workflow_version": snapshot.workflow_version,
-            "snapshot_format_version": 1,
+            "snapshot_format_version": snapshot.snapshot_format_version,
             "definition_digest": request.definition_digest,
             "policy_digest": request.policy_digest,
             "input_manifest_digest": request.input_manifest_digest,
@@ -6519,6 +6583,17 @@ class RunStore:
             "last_error": None,
             "pending_interaction": None,
         }
+        if snapshot.snapshot_format_version == 2:
+            if snapshot.dependency_manifest_digest is None:
+                raise InputSnapshotError(
+                    "format-2 snapshot is missing dependency manifest identity"
+                )
+            projection["dependency_manifest_digest"] = (
+                snapshot.dependency_manifest_digest
+            )
+            projection["expanded_nodes"] = [
+                str(node["id"]) for node in snapshot.nodes
+            ]
         event = {
             "sequence": 1,
             "timestamp": now,

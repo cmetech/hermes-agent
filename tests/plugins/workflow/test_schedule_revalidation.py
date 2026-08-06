@@ -33,7 +33,11 @@ from plugins.workflow.scheduler import RunScheduler
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
-from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
 import plugins.workflow.showcase as showcase_module
 import plugins.workflow.runner_binding as runner_binding_module
 import plugins.workflow.scheduled_revalidation as scheduled_revalidation_module
@@ -2558,3 +2562,106 @@ def test_scheduled_project_revalidates_exact_admission_source_not_current_cwd(
     assert result["run_metadata"]["catalog_source_relative"] == (
         "exact-project-source.yaml"
     )
+
+
+def test_phase4_scheduled_revalidation_blocks_dependency_precedence_shadow(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    """Catch a later occurrence silently selecting a higher-precedence child."""
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+    from types import MappingProxyType
+
+    import plugins.workflow.language as language_module
+    from plugins.workflow.models import WorkflowLanguageProfile
+
+    monkeypatch.setattr(
+        language_module,
+        "CURRENT_NORMALIZER_BY_PROFILE",
+        MappingProxyType({
+            WorkflowLanguageProfile.HERMES_LEGACY: 2,
+            WorkflowLanguageProfile.ARCHON_2026_07: 4,
+        }),
+    )
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    root_path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="scheduled-phase4-root",
+        filename="scheduled-phase4-root.yaml",
+        nodes=[{"id": "child", "include": "scheduled-phase4-child"}],
+    )
+    root_path.with_name("scheduled-phase4-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "limits:\n  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="scheduled-phase4-child",
+        filename="scheduled-phase4-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    compilation = resolve_workflow_catalog_compilation(
+        "scheduled-phase4-root",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="project",
+        normalizer_version=4,
+    )
+    assert compilation is not None
+    binding = _binding()
+    context = background_execution_context(binding, requires_ai=None)
+    compatibility, _legacy_risk = assess_package_execution(
+        compilation.package,
+        context,
+    )
+    risk = build_risk_summary(
+        compilation.package,
+        compatibility,
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=workdir,
+        user_home=home.parent,
+        workflow_name="scheduled-phase4-root",
+        values={},
+        idempotency_key="scheduled-phase4-shadow",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="project",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    run_id = str(admitted["run_id"])
+    assert store.load_run(run_id)["snapshot_format_version"] == 2
+
+    workflow_writer(
+        workdir / ".hermes/workflows",
+        name="scheduled-phase4-child",
+        filename="scheduled-phase4-child.yaml",
+        nodes=[{"id": "execute", "bash": "printf shadow"}],
+    )
+
+    failed = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "schedule_revalidation_failed"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0

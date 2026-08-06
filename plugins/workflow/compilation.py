@@ -251,6 +251,9 @@ def compile_workflow(
     from plugins.workflow.dependency_manifest import seal_workflow_compilation
     from plugins.workflow.includes import collect_include_edges
 
+    active_policy_bytes = (
+        root.sidecar_bytes if root.sidecar_bytes is not None else b"{}\n"
+    )
     (
         dependency_manifest,
         sealed_files,
@@ -268,7 +271,7 @@ def compile_workflow(
             ),
             package=package,
             definition_bytes=definition_bytes,
-            active_policy_bytes=root.sidecar_bytes or b"",
+            active_policy_bytes=active_policy_bytes,
             bind_executable_resources=supports_phase4_semantics(
                 selection.effective_profile,
                 selected_version,
@@ -278,7 +281,7 @@ def compile_workflow(
     compiled = WorkflowCompilation(
         package=package,
         definition_bytes=bound_definition_bytes,
-        active_policy_bytes=root.sidecar_bytes or b"",
+        active_policy_bytes=active_policy_bytes,
         dependency_manifest=dependency_manifest,
         sealed_files=sealed_files,
         composite_digest=composite_digest,

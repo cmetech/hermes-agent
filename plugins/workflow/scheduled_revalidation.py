@@ -12,11 +12,12 @@ from typing import Iterable, Mapping
 
 from plugins.workflow.catalog_api import (
     CATALOG_MAX_TRUST_STORE_BYTES,
-    resolve_workflow_catalog_package,
+    resolve_workflow_catalog_compilation,
 )
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     read_language_snapshot,
+    supports_phase4_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.runner_binding import (
@@ -31,6 +32,7 @@ from plugins.workflow.trust import (
     WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
+    build_risk_summary,
     compute_package_digest,
 )
 
@@ -409,7 +411,7 @@ def verify_sealed_snapshot(
         raise ScheduledRunRevalidationError("sealed snapshot identity changed")
 
 
-def _load_exact_catalog_package(
+def _load_exact_catalog_compilation(
     run: Mapping[str, object],
     *,
     hermes_home: Path,
@@ -450,23 +452,29 @@ def _load_exact_catalog_package(
             exact_workdir = root.parent.parent
         else:
             exact_workdir = root
-        package = resolve_workflow_catalog_package(
+        sealed_language = read_language_snapshot(run.get("language"))
+        compilation = resolve_workflow_catalog_compilation(
             str(run.get("workflow") or ""),
             hermes_home=hermes_home,
             workdir=exact_workdir,
             catalog_source=source,
+            normalizer_version=(
+                sealed_language.normalizer_version
+                if sealed_language is not None
+                else None
+            ),
         )
     except ScheduledRunRevalidationError:
         raise
     except (OSError, UnicodeError, ValueError) as exc:
         raise ScheduledRunRevalidationError("catalog source is unavailable") from exc
     if (
-        package is None
-        or package.definition.name != str(run.get("workflow") or "")
-        or package.workflow_path.resolve(strict=True) != workflow_path
+        compilation is None
+        or compilation.package.definition.name != str(run.get("workflow") or "")
+        or compilation.package.workflow_path.resolve(strict=True) != workflow_path
     ):
         raise ScheduledRunRevalidationError("catalog workflow identity changed")
-    return package
+    return compilation
 
 
 def revalidate_scheduled_run(
@@ -529,6 +537,16 @@ def revalidate_scheduled_run(
                 execution_capability_context,
                 read_budget=budget,
             )
+            if supports_phase4_semantics(
+                verified.package.language.effective_profile,
+                verified.package.language.normalizer_version,
+            ):
+                risk = build_risk_summary(
+                    verified.package,
+                    compatibility,
+                    read_budget=budget,
+                    compilation=verified.compilation,
+                )
         except ScheduledRunRevalidationError:
             raise
         except Exception as exc:
@@ -549,20 +567,36 @@ def revalidate_scheduled_run(
             raise ScheduledRunRevalidationError("showcase identity changed")
     elif source in {"project", "profile"}:
         try:
-            package = _load_exact_catalog_package(
+            compilation = _load_exact_catalog_compilation(
                 run,
                 hermes_home=Path(hermes_home),
             )
+            package = compilation.package
             if execution_identity != execution_capability_context.identity_digest_for(
                 package
             ):
                 raise ScheduledRunRevalidationError("execution capability changed")
-            live_digest = compute_package_digest(package, read_budget=budget).sha256
+            phase4 = supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            live_digest = (
+                compilation.composite_digest
+                if phase4
+                else compute_package_digest(package, read_budget=budget).sha256
+            )
             compatibility, risk = assess_package_execution(
                 package,
                 execution_capability_context,
                 read_budget=budget,
             )
+            if phase4:
+                risk = build_risk_summary(
+                    package,
+                    compatibility,
+                    read_budget=budget,
+                    compilation=compilation,
+                )
             trust = WorkflowTrustStore(Path(hermes_home)).snapshot_read_only(
                 max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
             )
