@@ -32,7 +32,6 @@ from plugins.workflow.trust import (
     WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
-    build_risk_summary,
     compute_package_digest,
 )
 
@@ -536,17 +535,15 @@ def revalidate_scheduled_run(
                 verified.package,
                 execution_capability_context,
                 read_budget=budget,
+                compilation=(
+                    verified.compilation
+                    if supports_phase4_semantics(
+                        verified.package.language.effective_profile,
+                        verified.package.language.normalizer_version,
+                    )
+                    else None
+                ),
             )
-            if supports_phase4_semantics(
-                verified.package.language.effective_profile,
-                verified.package.language.normalizer_version,
-            ):
-                risk = build_risk_summary(
-                    verified.package,
-                    compatibility,
-                    read_budget=budget,
-                    compilation=verified.compilation,
-                )
         except ScheduledRunRevalidationError:
             raise
         except Exception as exc:
@@ -589,14 +586,8 @@ def revalidate_scheduled_run(
                 package,
                 execution_capability_context,
                 read_budget=budget,
+                compilation=compilation if phase4 else None,
             )
-            if phase4:
-                risk = build_risk_summary(
-                    package,
-                    compatibility,
-                    read_budget=budget,
-                    compilation=compilation,
-                )
             trust = WorkflowTrustStore(Path(hermes_home)).snapshot_read_only(
                 max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
             )

@@ -49,7 +49,6 @@ from plugins.workflow.trust import (
     WorkflowTrustError,
     WorkflowTrustStore,
     WorkflowPackageDigest,
-    build_risk_summary,
     compute_package_digest,
     preflight_execution,
 )
@@ -362,14 +361,8 @@ def start_api_run(
             package,
             execution_context,
             read_budget=resource_budget,
+            compilation=phase4_compilation,
         )
-        if phase4_compilation is not None:
-            risk = build_risk_summary(
-                package,
-                compatibility,
-                read_budget=resource_budget,
-                compilation=phase4_compilation,
-            )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(
             "workflow_catalog_capacity", status_code=503, retryable=True

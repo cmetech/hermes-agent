@@ -863,10 +863,7 @@ def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
 
 def _resolve_compilation(args: argparse.Namespace, name: str) -> WorkflowCompilation:
     """Resolve one admission target as a single immutable compilation."""
-    from plugins.workflow.compilation import (
-        WorkflowCatalogSnapshot,
-        compile_workflow,
-    )
+    from plugins.workflow.compilation import compile_workflow
 
     candidate = Path(name).expanduser()
     if candidate.is_file():
@@ -880,7 +877,14 @@ def _resolve_compilation(args: argparse.Namespace, name: str) -> WorkflowCompila
             source="explicit",
             precedence=0,
         )
-        return compile_workflow(source, WorkflowCatalogSnapshot.capture((source,)))
+        from plugins.workflow.catalog_api import capture_workflow_catalog_snapshot
+
+        catalog = capture_workflow_catalog_snapshot(
+            workdir=Path(args.workdir),
+            hermes_home=Path(args.hermes_home),
+            additional_sources=(source,),
+        )
+        return compile_workflow(source, catalog)
 
     from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
 

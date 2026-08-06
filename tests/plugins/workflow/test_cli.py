@@ -14,7 +14,7 @@ import yaml
 
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.cli import _runtime_config, register_cli
+from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow import machine_contract
 from plugins.workflow.models import ExecutionFence, ValidationIssue
@@ -33,6 +33,58 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     register_cli(parser)
     return parser
+
+
+def test_explicit_phase4_path_resolves_includes_from_bounded_catalog(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    """An explicit root still compiles against the project/profile source closure."""
+    from types import MappingProxyType
+
+    import plugins.workflow.language as language_module
+
+    monkeypatch.setattr(
+        language_module,
+        "CURRENT_NORMALIZER_BY_PROFILE",
+        MappingProxyType({
+            WorkflowLanguageProfile.HERMES_LEGACY: 2,
+            WorkflowLanguageProfile.ARCHON_2026_07: 4,
+        }),
+    )
+    workdir = tmp_path / "project"
+    home = tmp_path / "home"
+    root = workflow_writer(
+        tmp_path / "explicit",
+        name="explicit-phase4-root",
+        filename="explicit-phase4-root.yaml",
+        nodes=[{"id": "child", "include": "explicit-phase4-child"}],
+    )
+    root.with_name("explicit-phase4-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="explicit-phase4-child",
+        filename="explicit-phase4-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+
+    compilation = _resolve_compilation(
+        argparse.Namespace(workdir=workdir, hermes_home=home),
+        str(root),
+    )
+
+    assert compilation.package.definition.name == "explicit-phase4-root"
+    assert [node.id for node in compilation.package.definition.nodes] == [
+        "child__execute"
+    ]
+    assert [
+        dependency.workflow_name
+        for dependency in compilation.dependency_manifest.dependencies
+    ] == ["explicit-phase4-child"]
 
 
 def _json_result(capsys):

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -31,9 +32,136 @@ from plugins.workflow.store import (
 )
 from plugins.workflow.trust import (
     WorkflowTrustStore,
+    build_risk_summary,
     compute_package_digest,
 )
 import yaml
+
+
+def test_api_v4_admission_assesses_child_executable_resources_from_compilation(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch API risk assessment reopening the root for child-owned resources."""
+    import plugins.workflow.language as language_module
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+    from plugins.workflow.compat import assess_compatibility
+    from plugins.workflow.models import WorkflowLanguageProfile
+
+    monkeypatch.setattr(
+        language_module,
+        "CURRENT_NORMALIZER_BY_PROFILE",
+        MappingProxyType({
+            WorkflowLanguageProfile.HERMES_LEGACY: 2,
+            WorkflowLanguageProfile.ARCHON_2026_07: 4,
+        }),
+    )
+    home = tmp_path / "profile"
+    workdir = tmp_path / "project"
+    root = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="api-child-resource-root",
+        filename="api-child-resource-root.yaml",
+        nodes=[{"id": "child", "include": "api-child-resource"}],
+    )
+    root.with_name("api-child-resource-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    child = workflow_writer(
+        home / "workflows",
+        name="api-child-resource",
+        filename="api-child-resource.yaml",
+        nodes=[
+            {
+                "id": "execute",
+                "script": "child.py",
+                "runtime": "uv",
+            }
+        ],
+    )
+    scripts = child.parent.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "child.py").write_text("print('child')\n", encoding="utf-8")
+    compilation = resolve_workflow_catalog_compilation(
+        "api-child-resource-root",
+        hermes_home=home,
+        workdir=workdir,
+        normalizer_version=4,
+    )
+    assert compilation is not None
+    binding = production_workflow_runner_binding()
+    context = background_execution_context(binding, requires_ai=False)
+    compatibility = assess_compatibility(
+        compilation.package,
+        mcp_available=context.mcp_available,
+        structured_output_decisions=context.structured_output_decisions(
+            compilation.package
+        ),
+    )
+    risk = build_risk_summary(
+        compilation.package,
+        compatibility,
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="api-child-resource-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    acquired = CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="api-child-resource-test",
+            host_kind="web",
+            host_instance_id="api-child-resource-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+    import plugins.workflow.trust as trust_module
+
+    risk_builds = 0
+    original_build_risk_summary = trust_module.build_risk_summary
+
+    def counting_build_risk_summary(*args, **kwargs):
+        nonlocal risk_builds
+        risk_builds += 1
+        return original_build_risk_summary(*args, **kwargs)
+
+    monkeypatch.setattr(
+        trust_module,
+        "build_risk_summary",
+        counting_build_risk_summary,
+    )
+
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=workdir,
+        user_home=tmp_path,
+        workflow_name="api-child-resource-root",
+        values={},
+        idempotency_key="api-child-resource",
+        concurrency_policy="queue",
+        authority=ApiAdmissionAuthority(
+            principal="api-child-resource-test",
+            namespace="api-child-resource-test",
+            operator_scope=None,
+            source_instance="desktop:api-child-resource-test",
+            assurance="local_admin_claim",
+            trigger_source="desktop",
+        ),
+        catalog_source="project",
+        runner_binding=binding,
+    )
+
+    run = store.load_run(str(admitted["run_id"]))
+    assert risk_builds == 1
+    assert run["snapshot_format_version"] == 2
+    assert run["definition_digest"] == compilation.composite_digest
 
 
 class _Store:

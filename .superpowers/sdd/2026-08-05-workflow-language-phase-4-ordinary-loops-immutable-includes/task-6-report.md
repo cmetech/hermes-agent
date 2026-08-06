@@ -173,3 +173,92 @@ Additional verification:
   except for the confirmed unrelated baseline failures above.
 - No Task 7 loop semantics, activation, core tools, prompt/tool schema changes,
   telemetry, or security-review work was added.
+
+## Fix round 1
+
+### Status
+
+DONE_WITH_CONCERNS
+
+All three important review findings are fixed with authentic regressions. The
+only remaining concerns are the same unrelated baseline failures already
+documented above: five packaged-schema temporary-home isolation cases and two
+catalog error-classification expectations.
+
+### TDD chronology
+
+1. API dependency-resource admission:
+   `scripts/run_tests.sh tests/plugins/workflow/test_api_runtime.py -k v4_admission_assesses_child_executable`
+   first produced **0 passed, 1 failed**. `start_api_run()` raised
+   `workflow_invalid_definition` because the initial root-only risk pass looked
+   for a profile child's `child.py` beneath the project root. After the shared
+   assessment accepted the compilation and API admission removed its second
+   risk build, the same command produced **1 passed, 0 failed**.
+2. Scheduled dependency-resource revalidation:
+   `scripts/run_tests.sh tests/plugins/workflow/test_schedule_revalidation.py -k unchanged_scheduled_revalidation_assesses_child_resources`
+   first produced **0 passed, 1 failed**. An unchanged admitted closure failed
+   at fire time with `schedule_revalidation_failed`. After revalidation passed
+   the compilation into the one shared assessment, the same command produced
+   **1 passed, 0 failed**. The API and scheduled regressions now also count the
+   risk builder and assert exactly one build per path.
+3. Explicit-path include resolution:
+   `scripts/run_tests.sh tests/plugins/workflow/test_cli.py -k explicit_phase4_path_resolves_includes`
+   first produced **0 passed, 1 failed** with
+   `include_not_found: explicit-phase4-root -> explicit-phase4-child`. After
+   explicit roots were compiled against the bounded project/profile source
+   snapshot with explicit precedence 0, the same command produced
+   **1 passed, 0 failed**.
+4. Real showcase admission under temporary materialization:
+   `scripts/run_tests.sh tests/plugins/workflow/test_showcase_schedule_e2e.py -k prepares_admission_while_materialized`
+   first produced **0 passed, 1 failed** with `FileNotFoundError` from
+   `_tree_digest(package.root)` after the bundle context exited. After keeping
+   compilation, distribution-risk verification, and immutable snapshot
+   preparation inside the materialization context, the same command produced
+   **1 passed, 0 failed**.
+
+### Implementation
+
+- `assess_package_execution()` now accepts an optional immutable
+  `WorkflowCompilation` and passes it to its single risk-summary construction.
+  API admission and both scheduled revalidation branches supply that
+  compilation directly; their later replacement risk builds were removed.
+- Catalog discovery now factors its bounded project/profile reads into a
+  shared immutable source-snapshot helper. Explicit paths add their parsed root
+  at precedence 0 and compile against that same catalog closure. A real
+  authenticated Gateway regression proves the shared CLI/Gateway resolver
+  seals a profile include as format 2.
+- `_scenario_compilation()` is now a context manager. `run_showcase()` keeps
+  the context alive through tree hashing, risk construction, fixture handling,
+  and `prepare_run_snapshot()`; only in-memory and sealed values escape into
+  final admission.
+
+### Verification
+
+Focused regressions:
+
+- API exact compilation-aware risk build: **1 passed, 0 failed**.
+- Scheduled exact compilation-aware risk build: **1 passed, 0 failed**.
+- Explicit CLI path with profile include: **1 passed, 0 failed**.
+- Authenticated Gateway explicit path with profile include: **1 passed, 0 failed**.
+- Real showcase admission under deleting materialization: **1 passed, 0 failed**.
+
+Required gates after the fixes:
+
+1. Snapshot + language: **106 passed, 0 failed**.
+2. Snapshot + crash + shutdown: **44 passed, 0 failed**.
+3. CLI/API/authenticated command/Gateway notification/scheduled/showcase:
+   **169 passed, 5 failed**. The five failures are the already-confirmed
+   packaged-schema temporary-home baseline cases.
+4. Snapshot + scheduled revalidation + scheduled runs: **126 passed, 0 failed**
+   (10 + 69 + 47; the scheduled-run file took 90 seconds under the harness).
+5. Snapshot + defensive invariants + scheduled revalidation + crash recovery:
+   **118 passed, 0 failed**.
+
+Additional catalog/showcase verification remained **135 passed, 2 failed**;
+both failures are the already-confirmed baseline catalog error-classification
+expectations. Ruff on every changed Python file and `git diff --check` passed.
+
+### Scope audit
+
+No Task 7 ordinary-loop semantics, v4 activation, security-review work, core
+tool or prompt-schema changes, telemetry, or unrelated cleanup was added.

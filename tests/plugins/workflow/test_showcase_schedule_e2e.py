@@ -22,35 +22,32 @@ from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary
 
 
-def test_showcase_compiles_while_materialized_bundle_context_is_alive(
+def test_run_showcase_prepares_admission_while_materialized_bundle_is_alive(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
-    """Catch resource-package paths being reopened after as_file cleanup."""
-    materialized = tmp_path / "materialized"
-    workflow_writer(
-        materialized / "packages/first",
-        name="materialized-first",
+    """Real admission must finish every live package read before as_file cleanup."""
+    template = tmp_path / "template"
+    workflow = workflow_writer(
+        template / "packages/materialized/workflows",
+        name="materialized-admission",
         filename="workflow.yaml",
-    )
-    workflow_writer(
-        materialized / "packages/second",
-        name="materialized-second",
-        filename="workflow.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
     )
     base = showcase_module.load_showcase_catalog()["resilience"]
-    first = replace(
+    scenario = replace(
         base,
-        id="materialized-first",
-        workflow_path="packages/first/workflow.yaml",
+        id="materialized-admission",
+        workflow_path="packages/materialized/workflows/workflow.yaml",
+        package_digest=showcase_module._tree_digest(workflow.parent.parent),
+        capability_claims=(),
     )
-    second = replace(
-        base,
-        id="materialized-second",
-        workflow_path="packages/second/workflow.yaml",
-    )
+    materializations = []
 
     @contextmanager
     def materialized_bundle(_explicit=None):
+        materialized = tmp_path / f"materialized-{len(materializations)}"
+        shutil.copytree(template, materialized)
+        materializations.append(materialized)
         try:
             yield materialized
         finally:
@@ -59,14 +56,31 @@ def test_showcase_compiles_while_materialized_bundle_context_is_alive(
     monkeypatch.setattr(
         showcase_module,
         "load_showcase_catalog",
-        lambda: {first.id: first, second.id: second},
+        lambda: {scenario.id: scenario},
     )
     monkeypatch.setattr(showcase_module, "_bundle_path", materialized_bundle)
+    monkeypatch.setattr(
+        showcase_module,
+        "preflight_showcase",
+        lambda *_args, **_kwargs: {"bundle_digest": "b" * 64},
+    )
 
-    compilation = showcase_module._scenario_compilation(first)
+    started = run_showcase(
+        scenario.id,
+        hermes_home=tmp_path / "home",
+        no_wait=True,
+        idempotency_key="materialized-admission",
+    )
 
-    assert compilation.package.definition.name == "materialized-first"
-    assert not materialized.exists()
+    assert started["run_id"]
+    assert materializations
+    assert all(not materialized.exists() for materialized in materializations)
+    assert (
+        RunStore(tmp_path / "home")
+        .run_directory(str(started["run_id"]))
+        .joinpath("definition.yaml")
+        .is_file()
+    )
 
 
 def test_scheduling_requires_confirmation_and_preserves_unrelated_jobs(

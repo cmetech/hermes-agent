@@ -2665,3 +2665,113 @@ def test_phase4_scheduled_revalidation_blocks_dependency_precedence_shadow(
             "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
             (run_id,),
         ).fetchone()[0] == 0
+
+
+def test_phase4_unchanged_scheduled_revalidation_assesses_child_resources(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    """Fire-time risk assessment must use the admitted dependency compilation."""
+    from types import MappingProxyType
+
+    import plugins.workflow.language as language_module
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+    from plugins.workflow.models import WorkflowLanguageProfile
+
+    monkeypatch.setattr(
+        language_module,
+        "CURRENT_NORMALIZER_BY_PROFILE",
+        MappingProxyType({
+            WorkflowLanguageProfile.HERMES_LEGACY: 2,
+            WorkflowLanguageProfile.ARCHON_2026_07: 4,
+        }),
+    )
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    root = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="scheduled-child-resource-root",
+        filename="scheduled-child-resource-root.yaml",
+        nodes=[{"id": "child", "include": "scheduled-child-resource"}],
+    )
+    root.with_name("scheduled-child-resource-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    child = workflow_writer(
+        home / "workflows",
+        name="scheduled-child-resource",
+        filename="scheduled-child-resource.yaml",
+        nodes=[{"id": "execute", "script": "child.py", "runtime": "uv"}],
+    )
+    scripts = child.parent.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "child.py").write_text("print('child')\n", encoding="utf-8")
+    compilation = resolve_workflow_catalog_compilation(
+        "scheduled-child-resource-root",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="project",
+        normalizer_version=4,
+    )
+    assert compilation is not None
+    binding = _binding()
+    context = background_execution_context(binding, requires_ai=False)
+    _compatibility, risk = assess_package_execution(
+        compilation.package,
+        context,
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=workdir,
+        user_home=home.parent,
+        workflow_name="scheduled-child-resource-root",
+        values={},
+        idempotency_key="scheduled-child-resource",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="project",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    import plugins.workflow.trust as trust_module
+
+    risk_builds = 0
+    original_build_risk_summary = trust_module.build_risk_summary
+
+    def counting_build_risk_summary(*args, **kwargs):
+        nonlocal risk_builds
+        risk_builds += 1
+        return original_build_risk_summary(*args, **kwargs)
+
+    monkeypatch.setattr(
+        trust_module,
+        "build_risk_summary",
+        counting_build_risk_summary,
+    )
+
+    completed = _advance_with_binding(
+        store,
+        str(admitted["run_id"]),
+        due,
+        identity,
+        epoch,
+        binding,
+    )
+
+    assert completed.get("last_error") is None, completed.get("last_error")
+    assert risk_builds == 1
+    assert completed["status"] == "succeeded"

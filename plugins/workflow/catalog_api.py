@@ -284,12 +284,15 @@ def _catalog_candidates(
     return candidates[:CATALOG_LIMIT], len(candidates) > CATALOG_LIMIT
 
 
-def _discover_catalog_compilations(
+def _capture_catalog_source_documents(
     workdir: Path,
     hermes_home: Path,
-    *,
-    normalizer_version: int | None = None,
-) -> tuple[tuple[WorkflowCompilation | InvalidCatalogEntry, ...], bool]:
+) -> tuple[
+    tuple[WorkflowSourceDocument, ...],
+    tuple[InvalidCatalogEntry, ...],
+    bool,
+]:
+    """Read one bounded, immutable project/profile source view."""
     invalid: list[InvalidCatalogEntry] = []
     candidates, truncated = _catalog_candidates(workdir, hermes_home)
     definition_budget = _DefinitionReadBudget()
@@ -335,6 +338,34 @@ def _discover_catalog_compilations(
             _error_entry(name, "invalid_definition") for name in sorted(duplicate_names)
         )
         source_documents.extend(level.values())
+
+    return tuple(source_documents), tuple(invalid), truncated
+
+
+def capture_workflow_catalog_snapshot(
+    *,
+    workdir: Path,
+    hermes_home: Path,
+    additional_sources: tuple[WorkflowSourceDocument, ...] = (),
+) -> WorkflowCatalogSnapshot:
+    """Capture the bounded project/profile catalog plus admission-local sources."""
+    source_documents, _invalid, _truncated = _capture_catalog_source_documents(
+        workdir,
+        hermes_home,
+    )
+    return WorkflowCatalogSnapshot.capture((*source_documents, *additional_sources))
+
+
+def _discover_catalog_compilations(
+    workdir: Path,
+    hermes_home: Path,
+    *,
+    normalizer_version: int | None = None,
+) -> tuple[tuple[WorkflowCompilation | InvalidCatalogEntry, ...], bool]:
+    source_documents, invalid_documents, truncated = (
+        _capture_catalog_source_documents(workdir, hermes_home)
+    )
+    invalid = list(invalid_documents)
 
     raw_snapshot = WorkflowCatalogSnapshot.capture(source_documents)
     compiled_sources: list[WorkflowSourceDocument] = []
@@ -1183,6 +1214,7 @@ __all__ = [
     "WorkflowShowcaseVerificationError",
     "build_workflow_catalog",
     "build_workflow_detail",
+    "capture_workflow_catalog_snapshot",
     "desktop_input_name_is_representable",
     "qualify_workflow_catalog_package",
     "resolve_workflow_catalog_compilation",

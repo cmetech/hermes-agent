@@ -713,14 +713,18 @@ def _compile_showcase_package(
     return compile_workflow(root, WorkflowCatalogSnapshot.capture(sources))
 
 
-def _scenario_compilation(scenario: ShowcaseScenario) -> WorkflowCompilation:
+@contextmanager
+def _scenario_compilation(
+    scenario: ShowcaseScenario,
+) -> Iterator[WorkflowCompilation]:
+    """Keep materialized distribution paths alive through admission preparation."""
     catalog = load_showcase_catalog()
     with _bundle_path() as root:
         packages_by_id = {
             candidate_id: _scenario_package(candidate, bundle_root=root)
             for candidate_id, candidate in catalog.items()
         }
-        return _compile_showcase_package(
+        yield _compile_showcase_package(
             packages_by_id[scenario.id],
             catalog_packages=tuple(packages_by_id.values()),
         )
@@ -1175,21 +1179,11 @@ def run_showcase(
         return _schedule_showcase(scenario, home=home, schedule_at=schedule_at, token=confirmation_token)
     if showcase_id == "laptop-diagnostic" and not (symptom and symptom.strip()):
         return {"status": "input_required", "reason_code": "showcase_input_required", "required_input": "symptom", "run_id": None}
-    compilation = _scenario_compilation(scenario)
-    package = compilation.package
-    risk = _verified_distribution_risk(
-        scenario,
-        package,
-        compilation=compilation,
-    )
-    store, config = _store(home, package)
     fixture_dir: Path | None = None
-    try:
-        inputs = None
-        if showcase_id == "laptop-diagnostic":
-            fixture_dir, fixture = _stage_fixture(home)
-            inputs = {"evidence": fixture}
-        prepared = store.prepare_run_snapshot(
+    with _scenario_compilation(scenario) as compilation:
+        package = compilation.package
+        risk = _verified_distribution_risk(
+            scenario,
             package,
             compilation=(
                 compilation
@@ -1199,13 +1193,30 @@ def run_showcase(
                 )
                 else None
             ),
-            inputs=inputs,
-            values={"arguments": symptom or ""},
-            execution_limits=RunExecutionLimits.resolve(config),
         )
-    finally:
-        if fixture_dir is not None:
-            shutil.rmtree(fixture_dir, ignore_errors=True)
+        store, config = _store(home, package)
+        try:
+            inputs = None
+            if showcase_id == "laptop-diagnostic":
+                fixture_dir, fixture = _stage_fixture(home)
+                inputs = {"evidence": fixture}
+            prepared = store.prepare_run_snapshot(
+                package,
+                compilation=(
+                    compilation
+                    if supports_phase4_semantics(
+                        package.language.effective_profile,
+                        package.language.normalizer_version,
+                    )
+                    else None
+                ),
+                inputs=inputs,
+                values={"arguments": symptom or ""},
+                execution_limits=RunExecutionLimits.resolve(config),
+            )
+        finally:
+            if fixture_dir is not None:
+                shutil.rmtree(fixture_dir, ignore_errors=True)
     intent_key = idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name, definition_digest=prepared.definition_digest,
