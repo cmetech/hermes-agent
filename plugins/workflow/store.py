@@ -206,6 +206,18 @@ class NodeClaim:
     execution_fence: ExecutionFence | None = None
 
 
+def _active_claim_matches(
+    active: object,
+    claim: NodeClaim,
+) -> bool:
+    """Return whether *claim* owns the exact active attempt authority."""
+    return (
+        isinstance(active, Mapping)
+        and active.get("attempt_id") == claim.attempt_id
+        and active.get("owner_id") == claim.owner_id
+    )
+
+
 @dataclass(frozen=True)
 class ArtifactRef:
     relative_path: str
@@ -10161,10 +10173,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
                 return False
             attempt = node.get("attempts", [])[-1]
             if (
@@ -10219,7 +10228,7 @@ class RunStore:
                 raise RuntimeError("stale node start for terminal run")
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale node claim")
             node["state"] = "running"
             node["attempts"][-1]["state"] = "running"
@@ -10259,7 +10268,7 @@ class RunStore:
                 active = node.get("claim", {})
                 if (
                     projection.get("status") != "running"
-                    or active.get("attempt_id") != claim.attempt_id
+                    or not _active_claim_matches(active, claim)
                     or selection.key.workflow != projection.get("workflow")
                     or selection.key.scope
                     != str(projection.get("operator_scope_digest") or "local")
@@ -10377,7 +10386,7 @@ class RunStore:
                 active = node.get("claim", {})
                 if (
                     projection.get("status") != "running"
-                    or active.get("attempt_id") != claim.attempt_id
+                    or not _active_claim_matches(active, claim)
                 ):
                     return False
                 recoveries = node.get("session_recoveries")
@@ -10444,10 +10453,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if (
-                    active.get("attempt_id") != claim.attempt_id
-                    or active.get("owner_id") != claim.owner_id
-                ):
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10518,10 +10524,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if (
-                    active.get("attempt_id") != claim.attempt_id
-                    or active.get("owner_id") != claim.owner_id
-                ):
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10581,8 +10584,7 @@ class RunStore:
                 if (
                     projection["status"] != "running"
                     or projection.get("desired_status") is not None
-                    or active.get("attempt_id") != claim.attempt_id
-                    or active.get("owner_id") != claim.owner_id
+                    or not _active_claim_matches(active, claim)
                 ):
                     return False
                 serialized = {
@@ -10654,8 +10656,14 @@ class RunStore:
                 ):
                     return False
                 event_type = "process_reaped" if cleaned else "cleanup_failed"
-                active_attempt = active.get("attempt_id") == claim.attempt_id
-                if active_attempt and cleaned:
+                active_attempt = (
+                    isinstance(active, Mapping)
+                    and active.get("attempt_id") == claim.attempt_id
+                )
+                if active_attempt and not _active_claim_matches(active, claim):
+                    return False
+                active_authority = _active_claim_matches(active, claim)
+                if active_authority and cleaned:
                     active.pop("process_identity", None)
                 attempt["process_stop"] = {
                     "recorded_at": _utc_now(),
@@ -10680,11 +10688,13 @@ class RunStore:
                     attempt_id=claim.attempt_id,
                     defer_notification=fence_connection is not None,
                     terminal_reserve_attempt_id=(
-                        claim.attempt_id if cleaned and not active_attempt else None
+                        claim.attempt_id
+                        if cleaned and not active_authority
+                        else None
                     ),
                     reserve_connection=fence_connection,
                 )
-                if cleaned and not active_attempt:
+                if cleaned and not active_authority:
                     with (
                         nullcontext(fence_connection)
                         if fence_connection is not None
@@ -10730,7 +10740,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10808,7 +10818,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10880,7 +10890,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10949,7 +10959,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -12056,10 +12066,12 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
+                if (
+                    isinstance(active, Mapping)
+                    and active.get("attempt_id") == claim.attempt_id
+                ):
+                    raise RuntimeError("stale node completion")
                 stale_attempt = next(
                     (
                         candidate
@@ -12722,10 +12734,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale loop iteration")
             safe_state = dict(_sanitize(dict(loop_state)))
             language = projection.get("language")
@@ -12823,10 +12832,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
                 raise StaleLoopDecisionError("stale loop decision")
             current = node.get("loop_state")
             if not isinstance(current, Mapping):
@@ -13274,9 +13280,7 @@ class RunStore:
             active = node.get("claim")
             current_state = node.get("loop_state")
             if (
-                not isinstance(active, Mapping)
-                or active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
+                not _active_claim_matches(active, claim)
                 or not isinstance(current_state, Mapping)
                 or current_state.get("_pending_loop_decision")
                 != authority.decision
@@ -13356,9 +13360,7 @@ class RunStore:
             active = node.get("claim")
             loop_state = node.get("loop_state")
             if (
-                not isinstance(active, dict)
-                or active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
+                not _active_claim_matches(active, claim)
                 or not isinstance(loop_state, Mapping)
                 or loop_state.get("_pending_loop_decision")
                 != authority.decision
@@ -13593,10 +13595,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale cleanup failure")
             safe_metadata = None
             if metadata is not None:
@@ -14258,10 +14257,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if (
-                active.get("attempt_id") != claim.attempt_id
-                or active.get("owner_id") != claim.owner_id
-            ):
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale node completion")
             if projection["status"] in {"cancelled", "abandoned", "interrupted"}:
                 raise RuntimeError("stale completion for terminal run")
@@ -14423,10 +14419,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"].get(claim.node_id)
                 active = node.get("claim", {}) if node else {}
-                if (
-                    active.get("attempt_id") != claim.attempt_id
-                    or active.get("owner_id") != claim.owner_id
-                ):
+                if not _active_claim_matches(active, claim):
                     return False
                 heartbeat_at = datetime.fromisoformat(active["heartbeat_at"])
                 utc_elapsed = (instant - heartbeat_at).total_seconds()
@@ -15082,7 +15075,7 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"].get(claim.node_id)
-            if not node or node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+            if not node or not _active_claim_matches(node.get("claim"), claim):
                 return False
             active = node["claim"]
             attempt = next(
@@ -16449,7 +16442,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale action grant consumer")
             digest = node.pop("action_grant", None)
             if digest is None:

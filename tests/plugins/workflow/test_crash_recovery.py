@@ -18,6 +18,10 @@ from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    PersistentSessionRecoverySelection,
+)
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
@@ -266,6 +270,183 @@ def _worker_claim_record(
             (attempt_id,),
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _active_claim_authority_snapshot(
+    store: RunStore,
+    run_id: str,
+    attempt_id: str,
+) -> dict[str, object]:
+    with store._connect() as connection:
+        private_session_rows = connection.execute(
+            "SELECT attempt_id, run_id, authority_json, authority_sha256, "
+            "created_at FROM session_recovery_selection_authority "
+            "WHERE run_id=? ORDER BY attempt_id",
+            (run_id,),
+        ).fetchall()
+    return {
+        "projection": store.load_run(run_id),
+        "events": store.tail_events(run_id),
+        "worker_claim": _worker_claim_record(store, attempt_id),
+        "private_session_authority": tuple(
+            dict(row) for row in private_session_rows
+        ),
+    }
+
+
+def _transferred_active_claim_fixture(
+    tmp_path,
+    workflow_writer,
+    *,
+    session_selected: bool,
+    predicate_pending: bool = False,
+):
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    action_digest = "a" * 64
+    approval_claim = store.claim_node(
+        run_id,
+        "refine",
+        "action-approval-seed",
+    )
+    assert approval_claim is not None
+    store.mark_node_started(approval_claim)
+    store.complete_node(
+        approval_claim,
+        status="paused",
+        metadata={
+            "pending_interaction": {
+                "kind": "approval",
+                "action_digest": action_digest,
+            }
+        },
+    )
+    paused = store.load_run(run_id)
+    store.approve_run(
+        run_id,
+        expected_state_version=int(paused["state_version"]),
+        interaction_id=action_digest,
+    )
+
+    claimed_at = datetime(2026, 8, 6, 14, 0, tzinfo=timezone.utc)
+    stale = store.claim_node(
+        run_id,
+        "refine",
+        "active-authority-owner-a",
+        lease_seconds=1,
+        now=claimed_at,
+        monotonic_now=300.0,
+        executor_id="loop",
+    )
+    assert stale is not None
+    assert store.load_run(run_id)["nodes"]["refine"]["action_grant"] == (
+        action_digest
+    )
+    store.mark_node_started(stale)
+    selection = PersistentSessionRecoverySelection(
+        key=NodeSessionKey(
+            "signal-crash",
+            "refine",
+            "local",
+            "fake-provider",
+            "default",
+        ),
+        expected_generation=0,
+        missing_session_id="missing-session",
+        cache_fingerprint="b" * 64,
+        run_id=run_id,
+        attempt_id=stale.attempt_id,
+    )
+    if session_selected:
+        assert store.record_persistent_session_recovery_selection(stale, selection)
+    executor_nonce = "transferred-provider"
+    assert store.record_spawn_intent(stale, executor_nonce=executor_nonce)
+    process = ProcessIdentity(
+        pid=999_991,
+        start_time=12345.0,
+        group_id=999_991,
+    )
+    assert store.record_process_started(stale, process)
+    assert store.record_provider_dispatch(stale, executor_nonce=executor_nonce)
+    assert store.record_provider_start_delivered(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_provider_execute_received(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_provider_execute_released(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_process_stopped(stale, process, cleaned=True)
+
+    output = b"draft"
+    relative_path = f"nodes/refine/{stale.attempt_id}/iterations/0001.md"
+    output_path = store.run_directory(run_id) / relative_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(output)
+    artifact = ArtifactRef(
+        relative_path=relative_path,
+        media_type="text/plain",
+        size_bytes=len(output),
+        sha256=hashlib.sha256(output).hexdigest(),
+    )
+    pending_decision = (
+        {
+            "kind": "until_bash_pending",
+            "iteration": 1,
+            "until_bash_sha256": "c" * 64,
+        }
+        if predicate_pending
+        else {
+            "kind": "signal_success",
+            "iteration": 1,
+        }
+    )
+    loop_state = {
+        "iteration": 1,
+        "max_iterations": 2,
+        "fresh_context": False,
+        "output_artifact": artifact.relative_path,
+        "output_size_bytes": artifact.size_bytes,
+        "output_sha256": artifact.sha256,
+        "_pending_loop_decision": pending_decision,
+    }
+    store.record_loop_iteration(
+        stale,
+        artifacts=(artifact,),
+        loop_state=loop_state,
+    )
+    winner_now = LeaseClockSample(
+        claimed_at + timedelta(seconds=2),
+        302.0,
+        "active-authority-takeover-boot",
+    )
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="active-authority-owner-b",
+        now=winner_now,
+        lease_seconds=30,
+    )
+    assert winner is not None
+    return {
+        "store": store,
+        "run_id": run_id,
+        "stale": stale,
+        "winner": winner.claim,
+        "selection": selection,
+        "executor_nonce": executor_nonce,
+        "process": process,
+        "winner_now": winner_now,
+        "action_digest": action_digest,
+        "artifact": artifact,
+        "loop_state": loop_state,
+    }
 
 
 @pytest.mark.parametrize(
@@ -793,6 +974,168 @@ def test_stale_fenced_executor_cannot_release_recorded_loop_recovery_winner(
     assert worker_after == worker_before
     assert worker_after["owner_id"] == winner.claim.owner_id
     assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "stale_raises", "winner_result"),
+    [
+        ("release_before_execution", False, False),
+        ("mark_started", True, None),
+        ("session_selection", False, True),
+        ("session_outcome", False, True),
+        ("spawn_intent", False, False),
+        ("spawn_failed", False, False),
+        ("process_started", False, True),
+        ("process_stopped", False, True),
+        ("provider_dispatch", False, True),
+        ("provider_start_delivered", False, True),
+        ("provider_execute_received", False, True),
+        ("provider_execute_released", False, True),
+        ("complete_node", True, None),
+        ("loop_iteration", True, None),
+        ("loop_decision", True, None),
+        ("block_cleanup_failed", True, None),
+        ("schedule_retry", True, None),
+        ("renew_claim", False, True),
+        ("release_or_expire", False, True),
+        ("consume_action_grant", True, "action_digest"),
+    ],
+)
+def test_transferred_claim_rejects_every_stale_active_authority_helper(
+    tmp_path,
+    workflow_writer,
+    case: str,
+    stale_raises: bool,
+    winner_result: object,
+) -> None:
+    context = _transferred_active_claim_fixture(
+        tmp_path,
+        workflow_writer,
+        session_selected=case == "session_outcome",
+        predicate_pending=case == "loop_decision",
+    )
+    store = context["store"]
+    run_id = context["run_id"]
+    stale = context["stale"]
+    winner = context["winner"]
+
+    def invoke(claim):
+        if case == "release_before_execution":
+            return store.release_claim_before_execution(claim)
+        if case == "mark_started":
+            return store.mark_node_started(claim)
+        if case == "session_selection":
+            return store.record_persistent_session_recovery_selection(
+                claim,
+                context["selection"],
+            )
+        if case == "session_outcome":
+            return store.record_persistent_session_recovery_outcome(
+                claim,
+                outcome="fresh_execution_failed",
+            )
+        if case == "spawn_intent":
+            return store.record_spawn_intent(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "spawn_failed":
+            return store.record_spawn_failed(
+                claim,
+                executor_nonce=context["executor_nonce"],
+                error_code="injected_spawn_failure",
+            )
+        if case == "process_started":
+            return store.record_process_started(claim, context["process"])
+        if case == "process_stopped":
+            return store.record_process_stopped(
+                claim,
+                context["process"],
+                cleaned=True,
+            )
+        if case == "provider_dispatch":
+            return store.record_provider_dispatch(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_start_delivered":
+            return store.record_provider_start_delivered(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_execute_received":
+            return store.record_provider_execute_received(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_execute_released":
+            return store.record_provider_execute_released(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "complete_node":
+            return store.complete_node(claim, status="succeeded")
+        if case == "loop_iteration":
+            return store.record_loop_iteration(
+                claim,
+                artifacts=(context["artifact"],),
+                loop_state=context["loop_state"],
+            )
+        if case == "loop_decision":
+            decided = dict(context["loop_state"])
+            decided["_pending_loop_decision"] = {
+                "kind": "until_bash_success",
+                "iteration": 1,
+            }
+            return store.record_loop_decision(claim, loop_state=decided)
+        if case == "block_cleanup_failed":
+            return store.block_cleanup_failed(
+                claim,
+                error_message="injected cleanup failure",
+            )
+        if case == "schedule_retry":
+            return store.schedule_retry(
+                claim,
+                next_attempt_at=context["winner_now"].utc_now
+                + timedelta(seconds=30),
+                error_code="provider_error",
+            )
+        if case == "renew_claim":
+            winner_now = context["winner_now"]
+            return store.renew_claim(
+                claim,
+                now=winner_now.utc_now + timedelta(seconds=6),
+                monotonic_now=winner_now.monotonic_now + 6.0,
+                lease_seconds=30,
+                heartbeat_interval_seconds=5,
+            )
+        if case == "release_or_expire":
+            return store.release_or_expire_claim(claim)
+        if case == "consume_action_grant":
+            return store.consume_action_grant(claim)
+        raise AssertionError(f"unhandled active authority case: {case}")
+
+    before = _active_claim_authority_snapshot(
+        store,
+        run_id,
+        stale.attempt_id,
+    )
+    if stale_raises:
+        with pytest.raises(RuntimeError, match="stale"):
+            invoke(stale)
+    else:
+        assert invoke(stale) is False
+    assert _active_claim_authority_snapshot(
+        store,
+        run_id,
+        stale.attempt_id,
+    ) == before
+
+    result = invoke(winner)
+    if winner_result == "action_digest":
+        assert result == context["action_digest"]
+    else:
+        assert result == winner_result
 
 
 def test_fresh_recorded_loop_decision_cannot_be_taken_over_from_live_executor(

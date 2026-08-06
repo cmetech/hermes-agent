@@ -221,6 +221,136 @@ history, and public evidence.
   payloads.
 - No unresolved concerns remain for Task 9.
 
+## Review convergence: fix round 5 of 5
+
+Status: DONE
+
+The final external review found that same-attempt recovery transferred ownership,
+but several public active-claim mutations still authenticated only the immutable
+attempt ID. The invariant was reproduced across the complete public `NodeClaim`
+mutation surface before the remaining production guards were changed.
+
+### One exact active-claim authority guard
+
+`_active_claim_matches()` now defines active authority once: both the attempt ID
+and owner ID must match the current projected claim. Every public active-claim
+mutation uses that guard before success, including persistent-session selection
+and outcome, all provider-boundary transitions, action-grant consumption, claim
+release/expiry, loop transitions, retries, cleanup failure, completion, renewal,
+and process lifecycle mutations.
+
+Provider transitions perform this check before their idempotent-state returns. A
+released provider dispatch therefore cannot return success to stale owner A after
+same-attempt recovery transfers authority to owner B. A stale same-attempt
+`complete_node()` call likewise cannot append its historical stale-completion audit
+to B's projection. The different-attempt stale-completion audit remains unchanged
+and is covered by the existing crash-recovery regression.
+
+`record_process_stopped()` retains its deliberate cleanup exception. An immutable
+old attempt with no active same-attempt claim may still record identity-matched
+cleanup after lease expiry and release its old worker row. If that exact attempt is
+active under a transferred owner, the stale owner is rejected before projection,
+journal, recovery history, or worker-row mutation.
+
+### Exhaustive `NodeClaim` mutation audit
+
+The deterministic transfer matrix covers all 20 public store mutations whose
+signature directly accepts `NodeClaim`:
+
+1. `release_claim_before_execution`
+2. `mark_node_started`
+3. `record_persistent_session_recovery_selection`
+4. `record_persistent_session_recovery_outcome`
+5. `record_spawn_intent`
+6. `record_spawn_failed`
+7. `record_process_started`
+8. `record_process_stopped`
+9. `record_provider_dispatch`
+10. `record_provider_start_delivered`
+11. `record_provider_execute_received`
+12. `record_provider_execute_released`
+13. `complete_node`
+14. `record_loop_iteration`
+15. `record_loop_decision`
+16. `block_cleanup_failed`
+17. `schedule_retry`
+18. `renew_claim`
+19. `release_or_expire_claim`
+20. `consume_action_grant`
+
+For each case the fixture creates a real phase-4 run, action grant, persistent
+session authority where required, spawn/process/provider lifecycle, journaled loop
+iteration, and transactional same-attempt transfer A to B. Stale A is rejected and
+the exact projection, event journal, B claim owner/lease/recovery history, worker
+row, provider/action state, and private session-authority row remain byte-for-byte
+equivalent. The case then proves B succeeds where the current state permits it.
+
+The remaining methods that directly accept `NodeClaim` are non-public helpers and
+do not form independent active-claim mutations: `_assert_claim_execution_fence`
+validates the coordinator fence, `_terminal_completion_guard` translates terminal
+reserve exhaustion, and `_bound_loop_decision` / `_validated_bound_loop_decision`
+canonicalize authenticated values without store I/O. The two public
+`RecordedLoopDecision` transitions carry a nested claim rather than accepting one
+directly; `resume_recorded_loop_continuation` and
+`prepare_recorded_loop_predicate_recovery` also use the same exact active-claim
+guard and remain covered by the mandatory recovery suite.
+
+### Fix-round TDD evidence
+
+1. Reviewer-listed and direct-sibling matrix:
+   - RED: 5 passed, 10 failed. Mark-start, both persistent-session paths,
+     process-stop, all four provider transitions, release/expiry, and action-grant
+     consumption accepted stale A or mutated B's authority.
+   - GREEN: 15 passed, 0 failed after centralizing attempt-plus-owner checks.
+2. Exhaustive public mutation extension:
+   - RED: 19 passed, 1 failed. Same-attempt stale `complete_node()` rejected but
+     appended a stale-completion event and changed B's projection.
+   - GREEN: all 20 public mutations reject stale A without changing B, and the
+     winning owner succeeds where appropriate.
+3. Post-expiry process cleanup controls:
+   - `test_expired_outward_attempt_preserves_identity_and_requires_reconciliation`
+     and
+     `test_live_replay_safe_attempt_cannot_resume_until_termination_is_proven`
+     both pass, proving identity-matched cleanup remains available after genuine
+     claim expiry.
+
+Every Python test command used `scripts/run_tests.sh`.
+
+### Fix-round final verification
+
+- Exhaustive transferred-owner matrix: 20 passed, 0 failed.
+- Post-expiry cleanup controls: 2 passed, 0 failed.
+- Complete crash/shutdown/parallel recovery gate: 98 passed, 0 failed.
+  - Crash recovery 74; shutdown recovery 5; parallel scheduler 19.
+- Mandatory Task 9 eight-file gate: 246 passed, 0 failed.
+  - V4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 74; shutdown recovery 5; parallel scheduler 19; evidence API 29.
+- Required Task 8 broad action/store gate: 74 passed, 0 failed.
+- Persistent-session/provider gate: 143 passed, 0 failed with the one known
+  unrelated baseline case excluded. The excluded
+  `test_recomputed_contiguous_pre_activation_order_damage_is_value_safe[prefix-delete]`
+  fails identically on this branch and current `base`: both report
+  `projection is ahead of its journal` where the test expects
+  `private session journal order is invalid`.
+- Action-grant/approval suite: 19 passed, 0 failed as part of the Task 8 gate.
+- Combined explicit v1-v3 compatibility gates: 13 passed, 0 failed.
+- Ruff on all touched Python files: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+- Normalizer v4 activation, Task 10 diagnostics, and security-review scope remain
+  untouched.
+
+## Final self-review and concerns
+
+- Active-claim success can no longer be inferred from attempt identity alone; the
+  current projected owner is required uniformly.
+- Idempotent provider states are checked only after active authority, so they do not
+  leak false success to a superseded owner.
+- The post-expiry cleanup exception is limited to immutable identity-matched old
+  attempts and cannot cross a same-attempt ownership transfer.
+- No unresolved Task 9 concerns remain. The only non-green test is independently
+  reproduced on current `base` and is outside this fix-round invariant.
+
 ## Review convergence: fix round 4 of 5
 
 Status: DONE
