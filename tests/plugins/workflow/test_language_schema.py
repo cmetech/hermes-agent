@@ -83,6 +83,28 @@ def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
     loop_paths = {item["field_path"] for item in loop_kind["fields"]}
     assert "nodes[].loop.command" not in loop_paths
     assert "nodes[].loop.signal_completes" not in loop_paths
+    assert schema == definition_json_schema(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
+    )
+    assert contract["node_kinds"] == language_schema.node_kind_descriptors(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
+    )
+
+    legacy_schema = definition_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+    legacy_kinds = language_schema.node_kind_descriptors(
+        WorkflowLanguageProfile.HERMES_LEGACY
+    )
+    for normalizer_version in (1, 2):
+        assert legacy_schema == definition_json_schema(
+            WorkflowLanguageProfile.HERMES_LEGACY,
+            normalizer_version=normalizer_version,
+        )
+        assert legacy_kinds == language_schema.node_kind_descriptors(
+            WorkflowLanguageProfile.HERMES_LEGACY,
+            normalizer_version=normalizer_version,
+        )
 
 
 def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
@@ -1416,6 +1438,56 @@ def test_explicit_v4_loop_schema_matches_admission_validation(
         WorkflowLanguageProfile.ARCHON_2026_07,
         normalizer_version=4,
     ) == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        pytest.param("prompt", "   ", False, id="prompt-whitespace"),
+        pytest.param("prompt", "Refine", True, id="prompt-valid"),
+        pytest.param("command", "   ", False, id="command-whitespace"),
+        pytest.param("command", "refine", True, id="command-valid"),
+        pytest.param("until", "   ", False, id="until-whitespace"),
+        pytest.param("until", "DONE", True, id="until-valid"),
+    ],
+)
+def test_explicit_v4_loop_text_schema_matches_admission(
+    tmp_path,
+    field,
+    value,
+    expected,
+):
+    loop = {
+        "prompt": "Refine",
+        "until": "DONE",
+        "max_iterations": 2,
+    }
+    if field == "command":
+        loop.pop("prompt")
+    loop[field] = value
+    document = _workflow({"id": "n", "loop": loop})
+    schema = definition_json_schema(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+    schema_valid = not list(Draft202012Validator(schema).iter_errors(document))
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    commands.joinpath("refine.md").write_text("Refine safely.\n", encoding="utf-8")
+
+    try:
+        load_workflow_snapshot(
+            tmp_path / "workflow.yaml",
+            workflow_bytes=yaml.safe_dump(document, sort_keys=False).encode(),
+            sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+            normalizer_version=4,
+        )
+    except WorkflowValidationError:
+        loader_valid = False
+    else:
+        loader_valid = True
+
+    assert (schema_valid, loader_valid) == (expected, expected)
 
 
 @pytest.mark.parametrize(

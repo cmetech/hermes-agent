@@ -1921,6 +1921,9 @@ def _loop_specs(
     specs = _specs("loop")
     if supports_phase4_semantics(profile, version):
         phase4_shapes = {
+            "prompt": ("string", "nonblank_string"),
+            "command": ("string", "nonblank_string"),
+            "until": ("string", "nonblank_string"),
             "interactive": ("boolean", "boolean"),
             "gate_message": ("string", "nonblank_string"),
         }

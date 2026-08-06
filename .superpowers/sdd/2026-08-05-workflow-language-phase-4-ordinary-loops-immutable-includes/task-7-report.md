@@ -306,3 +306,51 @@ tool, telemetry, or Task 8 path changed.
 Confirmed staged-v4 adds only the two requested loader-validated paths, current v3
 retains its exact pre-fix rule projection, and legacy rules remain unchanged. No known
 concern remains from this convergence finding.
+
+## Fix round 4
+
+### Convergence finding resolved
+
+The staged explicit-v4 JSON Schema now uses the existing phase-aware
+`nonblank_string` shape for exactly `loop.prompt`, `loop.command`, and `loop.until`.
+This makes schema validation match loader admission: whitespace-only values are
+rejected, while valid nonblank text remains accepted.
+
+The default Archon schema and contract remain exactly equal to explicit v3. Legacy
+default, explicit-v1, and explicit-v2 schemas and node-kind descriptors also remain
+exactly equal. No identity, sealing, snapshot, runtime, activation, interaction, UI,
+tool, telemetry, security-review, or Task 8 path changed.
+
+### Authentic RED-GREEN evidence
+
+- RED:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k explicit_v4_loop_text_schema_matches_admission`
+  produced **3 passed, 3 failed**. The schema admitted whitespace-only values for
+  `prompt`, `command`, and `until`, while the loader rejected all three.
+- GREEN: the same command produced **6 passed, 0 failed** after assigning the
+  Phase 4-only nonblank shapes. The three whitespace cases now produce
+  `(schema_valid, loader_valid) == (False, False)`, and the three nonblank cases
+  produce `(True, True)`.
+- Preservation matrix:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k 'explicit_v4_loop_text_schema_matches_admission or phase4_loop_inventory_is_staged_without_changing_current_v3_schema'`
+  produced **7 passed, 0 failed**, including exact default-v3 and legacy-v1/v2
+  schema/descriptor equality.
+
+### Fix-round verification
+
+- Complete language-schema plus strict-output-reference suites: **762 passed, 0 failed**.
+- Task 7 schema/loop-executor gate: **685 passed, 0 failed**.
+- Task 7 manifest/security-boundary gate: **93 passed, 0 failed**.
+- Task 7 language/format-2 snapshot gate: **145 passed, 0 failed**.
+- Focused v1-v3 source/snapshot matrix: **72 passed, 0 failed**.
+- `.venv/bin/ruff check plugins/workflow/language_schema.py tests/plugins/workflow/test_language_schema.py`: **all checks passed**.
+- `git diff --check`: passed with no whitespace errors.
+
+### Fix-round files and self-review
+
+- `plugins/workflow/language_schema.py`
+- `tests/plugins/workflow/test_language_schema.py`
+
+Confirmed the v4 schema/loader parity delta is limited to the three requested loop
+text fields and all older authoring projections remain unchanged. No known concern
+remains from this convergence finding.
