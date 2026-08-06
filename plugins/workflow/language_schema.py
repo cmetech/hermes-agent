@@ -970,7 +970,7 @@ def _widget_for(scope: str, yaml_name: str, shape: str) -> str:
 def _section_for(scope: str, yaml_name: str) -> str:
     if scope == "definition" and yaml_name in {"name", "description", "tags"}:
         return "General"
-    if scope == "node" and yaml_name in {"id", *NODE_TYPES}:
+    if scope == "node" and yaml_name in {"id", *SOURCE_NODE_TYPES}:
         return "General"
     if scope in {"retry", "loop", "approval", "approval_reject"} or yaml_name in {
         "depends_on",
@@ -1290,7 +1290,20 @@ def _field(
     )
 
 
-NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
+EXECUTABLE_NODE_TYPES = (
+    "command",
+    "prompt",
+    "bash",
+    "script",
+    "loop",
+    "approval",
+    "cancel",
+)
+COMPILE_DIRECTIVE_TYPES = ("include",)
+SOURCE_NODE_TYPES = (*EXECUTABLE_NODE_TYPES, *COMPILE_DIRECTIVE_TYPES)
+# Backward-compatible public inventory consumed by schedulers and compatibility
+# checks. Compile directives must never enter this executable-kind tuple.
+NODE_TYPES = EXECUTABLE_NODE_TYPES
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
 _AI_EXTENSION_NODE_OPTIONS = (
@@ -1335,8 +1348,8 @@ _NODE_FIELDS = (
         "id",
         "string",
         "nonempty_string",
-        node_types=NODE_TYPES,
-        required_node_types=NODE_TYPES,
+        node_types=SOURCE_NODE_TYPES,
+        required_node_types=SOURCE_NODE_TYPES,
         pattern=r"^[^\s/\\]+$",
     ),
     *(
@@ -1355,7 +1368,7 @@ _NODE_FIELDS = (
         "depends_on",
         "array",
         "string_list",
-        node_types=NODE_TYPES,
+        node_types=SOURCE_NODE_TYPES,
         default_value=(),
     ),
     _field("node", "when", "string", "nonempty_string", node_types=NODE_TYPES),
@@ -1364,7 +1377,7 @@ _NODE_FIELDS = (
         "trigger_rule",
         "string",
         "trigger_rule",
-        node_types=NODE_TYPES,
+        node_types=SOURCE_NODE_TYPES,
         default_value="all_success",
     ),
     _field("node", "context", "string", "context", node_types=NODE_TYPES),
@@ -1561,6 +1574,24 @@ _NODE_FIELDS = (
 )
 
 
+# Compile-only source directives are intentionally excluded from FIELD_INVENTORY,
+# whose node entries describe scheduler-executable kinds and compatibility.
+SOURCE_DIRECTIVE_INVENTORY = (
+    _field(
+        "node",
+        "include",
+        "string",
+        "include_payload",
+        node_types=("include",),
+        required_node_types=("include",),
+        phase=4,
+        examples=("reusable-checks",),
+        pattern=r"^[^\s/\\:$?#{}`()]+$",
+        max_length=128,
+    ),
+)
+
+
 _RETRY_FIELDS = (
     _field(
         "retry",
@@ -1742,7 +1773,9 @@ def definition_field_names() -> frozenset[str]:
 
 
 def common_node_field_names() -> frozenset[str]:
-    return _field_names("node")
+    return _field_names("node") | frozenset(
+        spec.yaml_name for spec in SOURCE_DIRECTIVE_INVENTORY
+    )
 
 
 def field_max_length(scope: str, yaml_name: str) -> int | None:
@@ -1857,7 +1890,10 @@ def _editor_status(status: str) -> str:
 
 
 def _field_order(spec: WorkflowFieldSpec) -> int:
-    return FIELD_INVENTORY.index(spec) + 1
+    try:
+        return FIELD_INVENTORY.index(spec) + 1
+    except ValueError:
+        return len(FIELD_INVENTORY) + SOURCE_DIRECTIVE_INVENTORY.index(spec) + 1
 
 
 def _field_unit(
@@ -2139,10 +2175,10 @@ def _object_schema(
 
 
 def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
-    specs = _specs("node")
+    specs = (*_specs("node"), *SOURCE_DIRECTIVE_INVENTORY)
     union_properties = {spec.yaml_name: _field_schema(spec, profile) for spec in specs}
     variants = []
-    for node_type in NODE_TYPES:
+    for node_type in SOURCE_NODE_TYPES:
         properties = {
             spec.yaml_name: True
             for spec in specs

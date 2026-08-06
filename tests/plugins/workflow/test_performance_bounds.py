@@ -23,10 +23,210 @@ from plugins.workflow.language_schema import (
     iter_output_reference_candidate_spans,
     iter_when_output_references,
 )
-from plugins.workflow.models import ExecutionFence
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.includes import expand_workflow_source
+from plugins.workflow.models import (
+    ExecutionFence,
+    WorkflowCompilationLimits,
+    WorkflowValidationError,
+)
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.store import RunStore
 from plugins.workflow.topology import project_topology
+
+
+def _include_source(path, *, sidecar_bytes=None):
+    return parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar_bytes,
+        source="project",
+        precedence=1,
+    )
+
+
+def _limits(**changes):
+    values = {
+        "max_include_depth": 3,
+        "max_dependencies": 64,
+        "max_nodes": 512,
+        "max_edges": 4096,
+        "max_source_bytes": 2 * 1024 * 1024,
+        "max_expanded_bytes": 2 * 1024 * 1024,
+    }
+    values.update(changes)
+    return WorkflowCompilationLimits(**values)
+
+
+def test_include_depth_and_dependency_bounds_accept_exactly_the_boundary(
+    tmp_path, workflow_writer
+) -> None:
+    root_path = workflow_writer(
+        tmp_path / "root",
+        name="root",
+        nodes=[
+            {"id": "left", "include": "one"},
+            {"id": "right", "include": "other", "depends_on": ["left"]},
+        ],
+    )
+    one_path = workflow_writer(
+        tmp_path / "one",
+        name="one",
+        nodes=[{"id": "next", "include": "two"}],
+    )
+    two_path = workflow_writer(
+        tmp_path / "two",
+        name="two",
+        nodes=[{"id": "next", "include": "three"}],
+    )
+    three_path = workflow_writer(
+        tmp_path / "three",
+        name="three",
+        nodes=[{"id": "done", "bash": "true"}],
+    )
+    other_path = workflow_writer(
+        tmp_path / "other",
+        name="other",
+        nodes=[{"id": "done", "bash": "true"}],
+    )
+    sources = tuple(
+        _include_source(path)
+        for path in (root_path, one_path, two_path, three_path, other_path)
+    )
+    root = sources[0]
+    catalog = WorkflowCatalogSnapshot.capture(sources)
+
+    assert len(expand_workflow_source(root, catalog, _limits()).dependencies) == 4
+    with pytest.raises(WorkflowValidationError) as depth:
+        expand_workflow_source(root, catalog, _limits(max_include_depth=2))
+    assert depth.value.issues[0].code == "include_depth_exceeded"
+    with pytest.raises(WorkflowValidationError) as dependencies:
+        expand_workflow_source(root, catalog, _limits(max_dependencies=3))
+    assert dependencies.value.issues[0].code == "include_dependency_limit"
+
+
+def test_include_node_and_edge_bounds_accept_exactly_the_boundary(
+    tmp_path, workflow_writer
+) -> None:
+    root_path = workflow_writer(
+        tmp_path / "root",
+        name="root",
+        nodes=[
+            {"id": "build", "bash": "true"},
+            {"id": "child", "include": "child", "depends_on": ["build"]},
+            {"id": "publish", "bash": "true", "depends_on": ["child"]},
+        ],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child",
+        name="child",
+        nodes=[
+            {"id": "first", "bash": "true"},
+            {"id": "second", "bash": "true", "depends_on": ["first"]},
+        ],
+    )
+    root, child = _include_source(root_path), _include_source(child_path)
+    catalog = WorkflowCatalogSnapshot.capture((root, child))
+
+    expanded = expand_workflow_source(
+        root,
+        catalog,
+        _limits(max_nodes=4, max_edges=3),
+    )
+    assert len(expanded.nodes) == 4
+    assert sum(len(node.depends_on) for node in expanded.nodes) == 3
+    with pytest.raises(WorkflowValidationError) as nodes:
+        expand_workflow_source(root, catalog, _limits(max_nodes=3))
+    assert nodes.value.issues[0].code == "include_expansion_limit"
+    with pytest.raises(WorkflowValidationError) as edges:
+        expand_workflow_source(root, catalog, _limits(max_edges=2))
+    assert edges.value.issues[0].code == "include_expansion_limit"
+
+
+def test_include_source_and_canonical_byte_bounds_accept_exactly_the_boundary(
+    tmp_path, workflow_writer
+) -> None:
+    root_path = workflow_writer(
+        tmp_path / "root",
+        name="root",
+        nodes=[{"id": "checks", "include": "child"}],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child",
+        name="child",
+        nodes=[{"id": "lint", "bash": "true"}],
+    )
+    root, child = _include_source(root_path), _include_source(child_path)
+    catalog = WorkflowCatalogSnapshot.capture((root, child))
+    selected_source_bytes = len(root_path.read_bytes()) + len(child_path.read_bytes())
+    canonical_definition = (
+        b'{"description":"Portable workflow fixture","name":"root",'
+        b'"nodes":[{"bash":"true","id":"checks__lint"}]}'
+    )
+
+    expanded = expand_workflow_source(
+        root,
+        catalog,
+        _limits(
+            max_source_bytes=selected_source_bytes,
+            max_expanded_bytes=len(canonical_definition),
+        ),
+    )
+    assert expanded.source_bytes == selected_source_bytes
+    assert expanded.canonical_definition_bytes == canonical_definition
+    with pytest.raises(WorkflowValidationError) as sources:
+        expand_workflow_source(
+            root,
+            catalog,
+            _limits(max_source_bytes=selected_source_bytes - 1),
+        )
+    assert sources.value.issues[0].code == "include_expansion_limit"
+    with pytest.raises(WorkflowValidationError) as canonical:
+        expand_workflow_source(
+            root,
+            catalog,
+            _limits(max_expanded_bytes=len(canonical_definition) - 1),
+        )
+    assert canonical.value.issues[0].code == "include_expansion_limit"
+
+
+def test_v4_compilation_applies_closure_node_bound_to_a_no_include_root(
+    tmp_path, workflow_writer
+) -> None:
+    accepted_path = workflow_writer(
+        tmp_path / "accepted-root",
+        name="accepted-root",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(512)
+        ],
+    )
+    rejected_path = workflow_writer(
+        tmp_path / "rejected-root",
+        name="rejected-root",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    accepted = _include_source(accepted_path, sidecar_bytes=sidecar)
+    rejected = _include_source(rejected_path, sidecar_bytes=sidecar)
+
+    compiled = compile_workflow(
+        accepted,
+        WorkflowCatalogSnapshot.capture((accepted,)),
+        normalizer_version=4,
+    )
+    assert len(compiled.package.definition.nodes) == 512
+    assert compiled.definition_bytes == accepted.definition_bytes
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_workflow(
+            rejected,
+            WorkflowCatalogSnapshot.capture((rejected,)),
+            normalizer_version=4,
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
 
 
 class _SliceAccountingText(str):

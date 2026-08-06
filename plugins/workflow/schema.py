@@ -32,10 +32,12 @@ from plugins.workflow.language import (
     resolve_language_profile,
     select_normalizer_version,
     supports_phase3_semantics,
+    supports_phase4_semantics,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
+    SOURCE_NODE_TYPES,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
     agent_field_names,
@@ -140,6 +142,7 @@ _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
+_LITERAL_INCLUDE_NAME = re.compile(r"^[^\s/\\:$?#{}`()]+$")
 
 
 def _issue(
@@ -228,9 +231,9 @@ def is_inline_script(value: str) -> bool:
     return bool(_INLINE_SCRIPT_METACHAR.search(value))
 
 
-def _validate_identifier(value: Any, path: str) -> str:
+def _validate_identifier(value: Any, path: str, *, max_length: int = 128) -> str:
     identifier = _string(value, path)
-    if len(identifier) > 128 or _CONTROL_OR_ANSI.search(identifier):
+    if len(identifier) > max_length or _CONTROL_OR_ANSI.search(identifier):
         _fail(
             path,
             "invalid_identifier",
@@ -595,7 +598,12 @@ def _normalize_node(
             f"{path} has unknown execution field: {unknown[0]}",
             line=lines.get(unknown[0]),
         )
-    node_id = _validate_identifier(node.get("id"), f"{path}.id")
+    expanded_id_limit = (
+        518 if supports_phase4_semantics(profile, normalizer_version) else 128
+    )
+    node_id = _validate_identifier(
+        node.get("id"), f"{path}.id", max_length=expanded_id_limit
+    )
     present_types = [field for field in NODE_TYPES if field in node]
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
@@ -1430,12 +1438,37 @@ def _source_node(
             line=lines.get(unknown[0]),
         )
     node_id = _validate_identifier(node.get("id"), f"{path}.id")
-    present_types = [field for field in NODE_TYPES if field in node]
+    present_types = [field for field in SOURCE_NODE_TYPES if field in node]
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
-    _validate_node_type(node, node_type, path)
-    _validate_declared_options(node, path)
+    if node_type == "include":
+        invalid_fields = sorted(
+            set(node) - {"id", "include", "depends_on", "trigger_rule"}
+        )
+        if invalid_fields:
+            field = invalid_fields[0]
+            _fail(
+                f"{path}.{field}",
+                "invalid_type_field",
+                f"{path}.{field} is not structurally valid for include directives",
+                line=lines.get(field),
+            )
+        include_target = _string(node["include"], f"{path}.include")
+        if (
+            len(include_target) > 128
+            or _CONTROL_OR_ANSI.search(include_target)
+            or not _LITERAL_INCLUDE_NAME.fullmatch(include_target)
+        ):
+            _fail(
+                f"{path}.include",
+                "invalid_include_target",
+                f"{path}.include must be one literal portable workflow name",
+                line=lines.get("include"),
+            )
+    else:
+        _validate_node_type(node, node_type, path)
+        _validate_declared_options(node, path)
     depends = node.get("depends_on", [])
     if not isinstance(depends, list) or any(
         not isinstance(item, str) or not item for item in depends

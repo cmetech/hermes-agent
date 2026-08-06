@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from plugins.workflow.models import WorkflowPackage, WorkflowSourceDocument
@@ -142,7 +142,7 @@ def compile_workflow(
     catalog: WorkflowCatalogSnapshot,
     normalizer_version: int | None = None,
 ) -> WorkflowCompilation:
-    """Compile one no-include root from a single immutable catalog snapshot."""
+    """Compile one bounded root closure from an immutable catalog snapshot."""
     if not isinstance(root, WorkflowSourceDocument):
         raise ValueError("root must be a workflow source document")
     if not isinstance(catalog, WorkflowCatalogSnapshot):
@@ -167,13 +167,35 @@ def compile_workflow(
 
     from plugins.workflow.schema import _compile_workflow_source_document
 
+    source_to_compile = root
+    definition_bytes = root.definition_bytes
+    has_includes = any(node.node_type == "include" for node in root.nodes)
+    from plugins.workflow.includes import expand_workflow_source
+    from plugins.workflow.language import (
+        resolve_language_profile,
+        select_normalizer_version,
+        supports_phase4_semantics,
+    )
+
+    selection = resolve_language_profile(root.sidecar)
+    selected_version = select_normalizer_version(selection, normalizer_version)
+    if supports_phase4_semantics(selection.effective_profile, selected_version):
+        expanded = expand_workflow_source(root, catalog)
+        if has_includes:
+            definition_bytes = expanded.canonical_definition_bytes
+            source_to_compile = replace(
+                root,
+                nodes=expanded.nodes,
+                definition_bytes=definition_bytes,
+            )
+
     package = _compile_workflow_source_document(
-        root,
+        source_to_compile,
         normalizer_version=normalizer_version,
     )
     compiled = WorkflowCompilation(
         package=package,
-        definition_bytes=root.definition_bytes,
+        definition_bytes=definition_bytes,
         active_policy_bytes=root.sidecar_bytes or b"",
     )
     if COMPILED_ROOT_CACHE_MAX_ENTRIES > 0:

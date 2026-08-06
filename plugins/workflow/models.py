@@ -110,6 +110,7 @@ class WorkflowNode:
 
 _WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
 _WORKFLOW_SOURCE_NAME_MAX_CHARS = 128
+_WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS = (4 * _WORKFLOW_SOURCE_NAME_MAX_CHARS) + 6
 
 
 def _bounded_source_text(value: object, field_name: str, *, limit: int) -> str:
@@ -152,7 +153,7 @@ class WorkflowSourceNode:
 
     def __post_init__(self) -> None:
         _bounded_source_text(
-            self.id, "source node id", limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS
+            self.id, "source node id", limit=_WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS
         )
         _bounded_source_text(
             self.node_type,
@@ -240,6 +241,80 @@ class WorkflowSourceDocument:
                 "sidecar_location",
                 _logical_source_location(self.sidecar_location, "sidecar_location"),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowCompilationLimits:
+    """Hard bounds applied to one root's complete include closure."""
+
+    max_include_depth: int
+    max_dependencies: int
+    max_nodes: int
+    max_edges: int
+    max_source_bytes: int
+    max_expanded_bytes: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_include_depth",
+            "max_dependencies",
+            "max_nodes",
+            "max_edges",
+            "max_source_bytes",
+            "max_expanded_bytes",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowIncludeAlias:
+    """Resolved entry and sink identity for one include instance."""
+
+    entries: tuple[str, ...]
+    sinks: tuple[str, ...]
+    first_sink: str
+
+    def __post_init__(self) -> None:
+        entries = tuple(self.entries)
+        sinks = tuple(self.sinks)
+        if not entries or not sinks or self.first_sink != sinks[0]:
+            raise ValueError("include aliases require ordered entries and sinks")
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "sinks", sinks)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpandedWorkflowSource:
+    """One bounded flattened raw graph compiled under root authority."""
+
+    nodes: tuple[WorkflowSourceNode, ...]
+    include_aliases: Mapping[str, WorkflowIncludeAlias]
+    dependencies: tuple[WorkflowSourceDocument, ...]
+    source_bytes: int
+    canonical_definition_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.source_bytes, bool)
+            or not isinstance(self.source_bytes, int)
+            or self.source_bytes < 0
+        ):
+            raise ValueError("source_bytes must be a non-negative integer")
+        if not isinstance(self.canonical_definition_bytes, bytes):
+            raise ValueError("canonical_definition_bytes must be immutable bytes")
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(
+            self,
+            "include_aliases",
+            MappingProxyType(dict(self.include_aliases)),
+        )
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
+
+    @property
+    def expanded_bytes(self) -> int:
+        return len(self.canonical_definition_bytes)
 
 
 @dataclass(frozen=True, slots=True)
