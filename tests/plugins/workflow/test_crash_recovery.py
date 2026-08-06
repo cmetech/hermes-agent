@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -74,17 +75,27 @@ class _CountedLoopRunner:
         )
 
 
-def _phase4_signal_run(tmp_path, workflow_writer, *, downstream: bool = False):
+def _phase4_signal_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    downstream: bool = False,
+    loop_overrides: dict[str, object] | None = None,
+    node_overrides: dict[str, object] | None = None,
+):
+    loop = {
+        "prompt": "Refine",
+        "until": "DONE",
+        "max_iterations": 2,
+        "interactive": True,
+        "gate_message": "Accept or refine",
+    }
+    loop.update(loop_overrides or {})
     nodes = [
         {
             "id": "refine",
-            "loop": {
-                "prompt": "Refine",
-                "until": "DONE",
-                "max_iterations": 2,
-                "interactive": True,
-                "gate_message": "Accept or refine",
-            },
+            "loop": loop,
+            **(node_overrides or {}),
         }
     ]
     if downstream:
@@ -136,6 +147,312 @@ def _phase4_signal_run(tmp_path, workflow_writer, *, downstream: bool = False):
     )
     assert admitted.run_id is not None
     return home, store, admitted.run_id
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "response",
+        "loop_overrides",
+        "expected_status",
+        "pending_type",
+    ),
+    [
+        (
+            "signal-immediate",
+            "draft <promise>DONE</promise>",
+            {"signal_completes": True},
+            "succeeded",
+            None,
+        ),
+        (
+            "signal-confirmation",
+            "draft <promise>DONE</promise>",
+            {},
+            "paused",
+            "loop_signal_confirmation",
+        ),
+        ("ordinary-input", "draft", {}, "paused", "loop_input"),
+        (
+            "until-bash",
+            "draft",
+            {"until_bash": "exit 0"},
+            "succeeded",
+            None,
+        ),
+        (
+            "until-bash-input",
+            "draft",
+            {"until_bash": "exit 1"},
+            "paused",
+            "loop_input",
+        ),
+        (
+            "hard-limit",
+            "draft",
+            {"max_iterations": 1},
+            "failed",
+            None,
+        ),
+    ],
+)
+def test_restart_publishes_every_recorded_v4_loop_decision_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    case: str,
+    response: str,
+    loop_overrides: dict[str, object],
+    expected_status: str,
+    pending_type: str | None,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path / case,
+        workflow_writer,
+        loop_overrides=loop_overrides,
+    )
+    runner = _CountedLoopRunner(response)
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_iteration_record,
+    )
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+    assert len(runner.requests) == 1
+    assert len(store.load_run(run_id)["artifacts"]) == 1
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("restart replayed a recorded loop provider result")
+
+    restarted = RunStore(home)
+    recovered = RunScheduler(
+        restarted,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert recovered["status"] == expected_status
+    assert len(recovered["artifacts"]) == 1
+    pending = recovered["nodes"]["refine"].get("pending_interaction")
+    if pending_type is None:
+        assert pending is None
+    else:
+        assert pending["type"] == pending_type
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize("mutation", ("foreign_attempt", "extra_field"))
+def test_restart_rejects_malformed_or_foreign_loop_decision_authority(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path / mutation,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    run_path = store.run_directory(run_id) / "run.json"
+    projection = json.loads(run_path.read_text())
+    decision = projection["nodes"]["refine"]["loop_state"][
+        "_pending_loop_decision"
+    ]
+    if mutation == "foreign_attempt":
+        decision["attempt_id"] = "foreign-attempt"
+    else:
+        decision["unexpected"] = True
+    run_path.write_text(json.dumps(projection), encoding="utf-8")
+
+    with pytest.raises(JournalRecoveryError, match="journaled loop decision"):
+        RunStore(home).recorded_loop_decision(run_id)
+
+
+def test_concurrent_restart_publishes_recorded_loop_decision_once(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("concurrent recovery replayed the loop provider")
+
+    def recover() -> str:
+        recovered = RunScheduler(
+            RunStore(home),
+            agent_runner=NoReplayRunner(),
+        ).advance(run_id)
+        return str(recovered["status"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = tuple(pool.map(lambda _: recover(), range(2)))
+
+    assert statuses == ("succeeded", "succeeded")
+    assert len(runner.requests) == 1
+    events = RunStore(home).tail_events(run_id)
+    assert sum(event["event_type"] == "node_succeeded" for event in events) == 1
+
+
+def test_restart_preserves_typed_loop_publication_attempt_authority(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        node_overrides={"output_type": "LoopReport"},
+    )
+    runner = _CountedLoopRunner("typed <promise>DONE</promise>")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    recovery_runner = _CountedLoopRunner("must not run")
+    recovered = RunScheduler(
+        RunStore(home),
+        agent_runner=recovery_runner,
+    ).advance(run_id)
+
+    attempt_id = recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"]
+    publication = next(
+        artifact
+        for artifact in recovered["artifacts"]
+        if artifact.get("publication_id")
+    )
+    assert recovered["status"] == "succeeded"
+    assert publication["attempt_id"] == attempt_id
+    assert publication["output_type"] == "LoopReport"
+    assert recovery_runner.requests == []
+
+
+def test_restart_continues_after_recorded_noninteractive_iteration_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"interactive": False, "signal_completes": True},
+    )
+    first = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=first).advance(run_id)
+
+    second = _CountedLoopRunner("refined <promise>DONE</promise>")
+    scheduler = RunScheduler(RunStore(home), agent_runner=second)
+    recovered = scheduler.advance(run_id)
+
+    assert recovered["status"] == "running"
+    assert recovered["nodes"]["refine"]["state"] == "ready"
+    assert len(second.requests) == 0
+
+    completed = scheduler.advance(run_id)
+
+    assert completed["status"] == "succeeded"
+    assert len(first.requests) == 1
+    assert len(second.requests) == 1
+
+
+@pytest.mark.parametrize("crash_after_final_decision", (False, True))
+def test_restart_reconciles_until_bash_crash_window_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    crash_after_final_decision: bool,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/predicate-count"',
+        },
+    )
+    runner = _CountedLoopRunner("draft")
+    original_decision = store.record_loop_decision
+
+    def crash_at_decision(*args, **kwargs):
+        if crash_after_final_decision:
+            original_decision(*args, **kwargs)
+        raise SystemExit("simulated process loss around predicate decision")
+
+    monkeypatch.setattr(store, "record_loop_decision", crash_at_decision)
+    with pytest.raises(SystemExit, match="around predicate decision"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    counter = store.run_directory(run_id) / "artifacts" / "predicate-count"
+    assert counter.read_bytes() == b"x"
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("predicate recovery replayed the loop provider")
+
+    restarted = RunStore(home)
+    recovered = RunScheduler(
+        restarted,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert counter.read_bytes() == (b"x" if crash_after_final_decision else b"xx")
+    assert len(runner.requests) == 1
+    recovery_events = [
+        event
+        for event in restarted.tail_events(run_id)
+        if event["event_type"] == "loop_predicate_recovery_prepared"
+    ]
+    assert len(recovery_events) == (0 if crash_after_final_decision else 1)
 
 
 def test_restart_publishes_journaled_loop_signal_without_provider_replay(

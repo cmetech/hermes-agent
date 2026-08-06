@@ -188,6 +188,62 @@ def test_counted_provider_signal_outcomes_follow_sealed_loop_semantics(
         assert store.get_run_status(run_id)["status"] == "succeeded"
 
 
+@pytest.mark.parametrize(
+    ("version", "signal_completes", "expected_status", "expected_output"),
+    [
+        (3, None, "succeeded", b"draft\nDONE"),
+        (4, True, "succeeded", b"draft"),
+        (4, None, "paused", b"draft"),
+    ],
+)
+def test_plain_signal_cleanup_is_v4_only(
+    tmp_path: Path,
+    version: int,
+    signal_completes: bool | None,
+    expected_status: str,
+    expected_output: bytes,
+) -> None:
+    loop: dict[str, object] = {
+        "prompt": "Refine",
+        "until": "DONE",
+        "max_iterations": 2,
+        "interactive": True,
+        "gate_message": "Accept or refine",
+    }
+    if signal_completes is not None:
+        loop["signal_completes"] = signal_completes
+    workflow = _write_loop(
+        tmp_path / f"plain-v{version}-{signal_completes}",
+        loop,
+        workflow_interactive=True,
+    )
+    if version < 4:
+        workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+            "language_compatibility: archon-2026-07\n",
+            encoding="utf-8",
+        )
+    compilation = _compile_version(workflow, version)
+    store, run_id = _admit_compilation(
+        tmp_path / f"admitted-plain-v{version}-{signal_completes}",
+        compilation,
+        key=f"plain-v{version}-{signal_completes}",
+    )
+
+    outcome = RunScheduler(
+        store,
+        agent_runner=_CountedAgentRunner("draft\nDONE"),
+    ).advance(run_id)
+
+    assert outcome["status"] == expected_status
+    artifact = outcome["artifacts"][-1]
+    output = (
+        store.run_directory(run_id) / artifact["relative_path"]
+    ).read_bytes()
+    assert output == expected_output
+    assert artifact["size_bytes"] == len(expected_output)
+    assert artifact["sha256"] == hashlib.sha256(expected_output).hexdigest()
+
+
 def test_v4_loop_executes_only_its_authenticated_command_body(
     tmp_path: Path,
 ) -> None:
@@ -317,6 +373,77 @@ def test_v4_feedback_resume_authenticates_prior_output_and_consumes_input_once(
         interaction_id=second_pending["interaction_id"],
     )
     assert len(second_runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("first_response", "pending_type"),
+    [
+        ("draft", "loop_input"),
+        ("draft <promise>DONE</promise>", "loop_signal_confirmation"),
+    ],
+)
+@pytest.mark.parametrize("mutation", ["tamper", "symlink"])
+def test_v4_feedback_artifact_is_authenticated_before_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+    first_response: str,
+    pending_type: str,
+    mutation: str,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / f"{pending_type}-{mutation}",
+            {
+                "prompt": "Feedback=<$LOOP_USER_INPUT>",
+                "until": "DONE",
+                "max_iterations": 3,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / f"admitted-{pending_type}-{mutation}",
+        compilation,
+        key=f"feedback-auth-{pending_type}-{mutation}",
+    )
+    paused = RunScheduler(
+        store,
+        agent_runner=_CountedAgentRunner(first_response),
+    ).advance(run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == pending_type
+    ready = store.provide_loop_input(
+        run_id,
+        "trusted feedback",
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    relative = ready["nodes"]["refine"]["loop_user_input_artifact"]
+    input_path = store.run_directory(run_id) / relative
+    runner = _CountedAgentRunner("provider must not run")
+    scheduler = RunScheduler(store, agent_runner=runner)
+    if mutation == "tamper":
+        input_path.write_text("mutated feedback", encoding="utf-8")
+    else:
+        alias = input_path.with_name("same-content-alias.txt")
+        alias.write_bytes(input_path.read_bytes())
+        original_variables = scheduler._variables
+
+        def swap_after_snapshot_verification(*args, **kwargs):
+            variables = original_variables(*args, **kwargs)
+            input_path.unlink()
+            input_path.symlink_to(alias)
+            return variables
+
+        monkeypatch.setattr(scheduler, "_variables", swap_after_snapshot_verification)
+
+    outcome = scheduler.advance(run_id)
+
+    assert outcome["status"] == "failed"
+    assert outcome["last_error"]["code"] == "loop_input_invalid"
+    assert runner.requests == []
 
 
 @pytest.mark.parametrize(

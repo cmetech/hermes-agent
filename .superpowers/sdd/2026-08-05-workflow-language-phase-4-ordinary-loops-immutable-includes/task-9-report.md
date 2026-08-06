@@ -147,3 +147,103 @@ Every Python test command used `scripts/run_tests.sh`.
   evidence. Public event views strip recovery projections and expose only bounded
   payloads.
 - No unresolved concerns remain for Task 9.
+
+## Review convergence: fix round 1 of 5
+
+Status: DONE
+
+The first external review found four correctness gaps. All four were reproduced
+before production edits and closed without activating normalizer v4 or entering
+Task 10/security-review scope.
+
+### Durable post-iteration decisions
+
+Every v4 iteration now records one strict private `_pending_loop_decision` before
+the executor publishes, pauses, fails, or continues. The store canonicalizes an
+exact per-kind shape and binds it to run node, active attempt, iteration, cleaned
+artifact path, byte size, and SHA-256. Recovery rejects malformed, foreign, or
+ambiguous authority and authenticates the artifact again through the bounded
+descriptor-relative no-follow reader.
+
+Final signal success, signal confirmation, ordinary input, `until_bash` success or
+failure, and hard-limit failure publish through the original winning attempt. This
+includes the normal typed-output publication path; recovery does not synthesize a
+new publication authority. A recorded noninteractive continuation releases the
+old attempt and begins only the next provider iteration. Concurrent final
+reconciliation is compare-and-set/idempotent and produces one node terminal event.
+
+`until_bash` is the one deliberately documented crash window: after the provider
+iteration is durable but before the predicate outcome is durable, recovery may
+re-evaluate the sealed predicate. It first proves any earlier predicate process is
+stopped, archives bounded process evidence, and retains the existing timeout,
+resource, cancellation, no-follow input, and process-lifecycle controls. The final
+predicate outcome is CAS-journaled before publication. Once that final marker is
+durable, recovery never executes the predicate again. This is not a claim of
+exactly-once shell execution.
+
+### Authenticated feedback input
+
+V4 loop feedback is now accepted by the provider only when exactly one projected
+`text/plain` input descriptor matches the node, path, null attempt ownership,
+bounded byte size, and SHA-256. The scheduler opens the relative path no-follow,
+checks size and digest, and decodes UTF-8 before dispatch. Tampering or a symlink
+fails `loop_input_invalid` with zero additional provider attempts. This applies to
+ordinary loop input and signal-confirmation feedback.
+
+### Marker cleanup and attempt ownership
+
+V4 strips both tagged and plain terminal signals from the retained artifact; v1-v3
+plain-signal bytes remain unchanged. Pending signal approval now accepts only the
+exact active attempt path, including the safe nested iteration path. A same-node
+artifact from another attempt is rejected before acceptance.
+
+### Adjacent Task 8 regression restored
+
+The combined Task 8 action/store gate exposed two deterministic regressions caused
+by the feature branch's new all-terminal fast path applying to generic workflow
+approvals. Both exact tests passed on current `base` (1/1 each), proving the base
+contracts. The fast path is now restricted to
+`loop_signal_confirmation`; generic approval continuation and capacity queuing use
+their pre-feature path again.
+
+### Fix-round TDD evidence
+
+1. Plain-signal compatibility:
+   - RED: 1 passed, 2 failed; both v4 artifacts retained `DONE`.
+   - GREEN: 3 passed, 0 failed; v3 remains byte-identical and both v4 paths strip
+     the marker.
+2. Exact attempt ownership:
+   - RED: 0 passed, 1 failed; a same-node foreign-attempt result was accepted.
+   - GREEN: the focused foreign-attempt test and authentic-result control both
+     pass, as does the three-case real nested runtime matrix.
+3. Feedback descriptor authentication:
+   - RED: 0 passed, 4 failed; ordinary/signal feedback, each tampered/symlinked,
+     reached the provider.
+   - GREEN: 4 passed, 0 failed with provider dispatch forbidden.
+4. All recorded v4 outcomes:
+   - RED: 1 passed, 3 failed; only signal confirmation recovered. Immediate signal,
+     ordinary input, and `until_bash` remained running after restart.
+   - GREEN: the expanded six-outcome matrix passes, including hard limit and a
+     false `until_bash` followed by ordinary input.
+5. Recovery hardening:
+   - Malformed/foreign authority, concurrent publication, typed publication,
+     noninteractive continuation, and both sides of the `until_bash` final-decision
+     crash window pass. Before-final recovery visibly re-evaluates once; after-final
+     recovery does not.
+6. Task 8 regression RED/GREEN:
+   - Feature worktree RED: combined gate 89 passed, 2 failed; each exact node also
+     failed 0/1 independently.
+   - Current `base` read-only reproduction: each exact node passed 1/1.
+   - GREEN after the loop-signal-only guard: each exact node passed 1/1 and the
+     combined gate passed 91/91.
+
+### Fix-round final verification
+
+- Mandatory Task 9 eight-file gate: 216 passed, 0 failed.
+  - v4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 44; shutdown recovery 5; parallel scheduler 19; evidence API 29.
+- Combined Task 8 action/store gate: 91 passed, 0 failed.
+- Explicit v1-v3 compatibility subset: 7 passed, 0 failed.
+- Ruff on every touched Python file: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.

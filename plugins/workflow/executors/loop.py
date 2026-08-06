@@ -40,7 +40,12 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
     )
 
 
-def _clean_completion(output: str, signal: str) -> tuple[bool, str]:
+def _clean_completion(
+    output: str,
+    signal: str,
+    *,
+    strip_plain: bool = False,
+) -> tuple[bool, str]:
     tag = re.compile(
         rf"<\s*promise\s*>\s*{re.escape(signal)}\s*<\s*/\s*promise\s*>",
         re.IGNORECASE,
@@ -50,7 +55,8 @@ def _clean_completion(output: str, signal: str) -> tuple[bool, str]:
     if tagged:
         return True, cleaned
     plain = re.compile(rf"(?:^|\n)\s*{re.escape(signal)}\s*[.!?]*\s*$", re.IGNORECASE)
-    return plain.search(output) is not None, output.rstrip()
+    matched = plain.search(output) is not None
+    return matched, plain.sub("", output).rstrip() if matched and strip_plain else output.rstrip()
 
 
 class LoopExecutor:
@@ -319,7 +325,11 @@ class LoopExecutor:
                 )
             output_path = context.run_directory / result.artifacts[-1].relative_path
             output = output_path.read_text(encoding="utf-8")
-            completed, cleaned = _clean_completion(output, signal)
+            completed, cleaned = _clean_completion(
+                output,
+                signal,
+                strip_plain=phase4,
+            )
             if cleaned != output:
                 output_path.write_text(cleaned, encoding="utf-8")
                 artifacts[-1] = _artifact(
@@ -344,14 +354,67 @@ class LoopExecutor:
                     result_artifact=result_artifact.relative_path,
                     result_sha256=result_artifact.sha256,
                 )
+            message = str(loop.get("gate_message", ""))
+            input_interaction = None
+            if (
+                phase4
+                and not completed
+                and not (isinstance(until_bash_template, str) and until_bash_template)
+                and iteration < maximum
+                and effective_interactive
+            ):
+                identity = hashlib.sha256(
+                    f"{context.run_id}\0{context.node.id}\0{iteration}\0{message}".encode()
+                ).hexdigest()
+                input_interaction = {
+                    "type": "loop_input",
+                    "interaction_id": identity,
+                    "message": message,
+                    "iteration": iteration,
+                }
+            pending_decision = None
+            if phase4:
+                if completed and signal_completes:
+                    pending_decision = {
+                        "kind": "signal_success",
+                        "iteration": iteration,
+                    }
+                elif pending_confirmation is not None:
+                    pending_decision = {
+                        "kind": "signal_confirmation",
+                        "iteration": iteration,
+                        "pending_interaction": pending_confirmation.to_dict(),
+                    }
+                elif isinstance(until_bash_template, str) and until_bash_template:
+                    pending_decision = {
+                        "kind": "until_bash_pending",
+                        "iteration": iteration,
+                        "until_bash_sha256": hashlib.sha256(
+                            until_bash_template.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                elif iteration == maximum:
+                    pending_decision = {
+                        "kind": "hard_limit",
+                        "iteration": iteration,
+                    }
+                elif input_interaction is not None:
+                    pending_decision = {
+                        "kind": "ordinary_input",
+                        "iteration": iteration,
+                        "pending_interaction": input_interaction,
+                    }
+                else:
+                    pending_decision = {
+                        "kind": "continue",
+                        "iteration": iteration,
+                    }
             if context.record_iteration is not None:
                 journal_state = state
-                if pending_confirmation is not None:
+                if pending_decision is not None:
                     journal_state = {
                         **state,
-                        "_pending_signal_confirmation": (
-                            pending_confirmation.to_dict()
-                        ),
+                        "_pending_loop_decision": pending_decision,
                     }
                 context.record_iteration(
                     tuple(iteration_artifacts), journal_state
@@ -397,10 +460,32 @@ class LoopExecutor:
                 )
                 if check.status == "succeeded":
                     state["completed_by"] = "until_bash"
+                    if phase4 and context.record_loop_decision is not None:
+                        context.record_loop_decision({
+                            **state,
+                            "_pending_loop_decision": {
+                                "kind": "until_bash_success",
+                                "iteration": iteration,
+                            },
+                        })
                     return NodeExecutionResult(
                         "succeeded", tuple(artifacts), metadata={"loop_state": state}
                     )
                 if check.error_code != "process_exit":
+                    if phase4 and context.record_loop_decision is not None:
+                        context.record_loop_decision({
+                            **state,
+                            "_pending_loop_decision": {
+                                "kind": "until_bash_failure",
+                                "iteration": iteration,
+                                "status": check.status,
+                                "error_code": check.error_code,
+                                "error_message": check.error_message,
+                                "archon_terminal_failure": (
+                                    check.metadata.get("archon_terminal_failure") is True
+                                ),
+                            },
+                        })
                     return replace(
                         check,
                         artifacts=tuple(artifacts),
@@ -410,9 +495,21 @@ class LoopExecutor:
                 cancelled = self._cancelled(context)
                 return replace(cancelled, artifacts=tuple(artifacts))
             if iteration == maximum:
+                if (
+                    phase4
+                    and isinstance(until_bash_template, str)
+                    and until_bash_template
+                    and context.record_loop_decision is not None
+                ):
+                    context.record_loop_decision({
+                        **state,
+                        "_pending_loop_decision": {
+                            "kind": "hard_limit",
+                            "iteration": iteration,
+                        },
+                    })
                 break
             if effective_interactive:
-                message = str(loop.get("gate_message", ""))
                 identity = hashlib.sha256(
                     f"{context.run_id}\0{context.node.id}\0{iteration}\0{message}".encode()
                 ).hexdigest()
@@ -422,6 +519,20 @@ class LoopExecutor:
                     "message": message,
                     "iteration": iteration,
                 }
+                if (
+                    phase4
+                    and isinstance(until_bash_template, str)
+                    and until_bash_template
+                    and context.record_loop_decision is not None
+                ):
+                    context.record_loop_decision({
+                        **state,
+                        "_pending_loop_decision": {
+                            "kind": "ordinary_input",
+                            "iteration": iteration,
+                            "pending_interaction": interaction,
+                        },
+                    })
                 return NodeExecutionResult(
                     "paused",
                     tuple(artifacts),
@@ -430,6 +541,19 @@ class LoopExecutor:
                         "loop_state": state,
                     },
                 )
+            if (
+                phase4
+                and isinstance(until_bash_template, str)
+                and until_bash_template
+                and context.record_loop_decision is not None
+            ):
+                context.record_loop_decision({
+                    **state,
+                    "_pending_loop_decision": {
+                        "kind": "continue",
+                        "iteration": iteration,
+                    },
+                })
             resumed = False
 
         return NodeExecutionResult(

@@ -65,6 +65,7 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
+    freeze_value,
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -81,6 +82,7 @@ from plugins.workflow.output_resolution import (
     resolve_node_output,
     resolve_output_reference,
     resolved_output_publication_identity,
+    _read_descriptor_relative,
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import (
@@ -114,6 +116,10 @@ _CLAUSE = re.compile(
     re.UNICODE,
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class LoopInputIntegrityError(ValueError):
+    """A durable loop input no longer matches its projected identity."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1030,6 +1036,278 @@ class RunScheduler:
         )
         return True
 
+    def _reconcile_recorded_loop_decision(self, run_id: str) -> bool:
+        """Publish one authenticated v4 decision without replaying its provider."""
+        authority = self.store.recorded_loop_decision(run_id)
+        if authority is None:
+            return self.store.reconcile_recorded_loop_signal(run_id)
+        projection = self.store.load_run(run_id)
+        prepared = self._prepare_run_package(
+            run_id,
+            None,
+            expected_state_version=int(projection.get("state_version", -1)),
+        )
+        if prepared is None:
+            return True
+        (
+            package,
+            execution_limits,
+            sealed_resource_paths,
+            sealed_resource_bytes,
+            execution_semantics,
+        ) = prepared
+        node = next(
+            (
+                candidate
+                for candidate in package.definition.nodes
+                if candidate.id == authority.claim.node_id
+            ),
+            None,
+        )
+        if node is None or node.node_type != "loop" or not isinstance(
+            node.value, Mapping
+        ):
+            raise ArchonOutputIntegrityError(
+                "journaled loop decision has no sealed loop definition"
+            )
+        decision = authority.decision
+        kind = decision["kind"]
+        if kind == "until_bash_pending":
+            if not self.store.prepare_recorded_loop_predicate_recovery(authority):
+                return self._reconcile_recorded_loop_decision(run_id)
+            until_bash = node.value.get("until_bash")
+            if (
+                not isinstance(until_bash, str)
+                or not until_bash
+                or not hmac.compare_digest(
+                    hashlib.sha256(until_bash.encode("utf-8")).hexdigest(),
+                    str(decision["until_bash_sha256"]),
+                )
+            ):
+                raise ArchonOutputIntegrityError(
+                    "journaled loop predicate changed from its sealed definition"
+                )
+            data = _read_descriptor_relative(
+                self.store.run_directory(run_id),
+                authority.artifact.relative_path,
+                size_bytes=authority.artifact.size_bytes,
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(data).hexdigest(), authority.artifact.sha256
+            ):
+                raise ArchonOutputIntegrityError(
+                    "journaled loop predicate input digest changed"
+                )
+            variables = self._variables(
+                projection,
+                self.store.run_directory(run_id),
+                sealed_resource_paths=sealed_resource_paths,
+                sealed_resource_bytes=sealed_resource_bytes,
+                output_node_ids=node.depends_on,
+            )
+            variables = replace(
+                variables,
+                loop_prev_output=data.decode("utf-8"),
+            )
+            bash_node = WorkflowNode(
+                id=node.id,
+                node_type="bash",
+                value=until_bash,
+                depends_on=node.depends_on,
+                source_index=node.source_index,
+                source_line=node.source_line,
+                options=freeze_value({}),
+            )
+            check = BashExecutor().execute(
+                NodeExecutionContext(
+                    run_id=run_id,
+                    run_directory=self.store.run_directory(run_id),
+                    node=bash_node,
+                    attempt_id=(
+                        f"{authority.claim.attempt_id}/until-recovery-"
+                        f"{decision['iteration']:04d}-{uuid.uuid4().hex}"
+                    ),
+                    timeout_seconds=self._node_timeout(
+                        node, execution_limits, execution_semantics
+                    ),
+                    is_cancelled=lambda: self._cancelled(run_id),
+                    workflow_name=package.definition.name,
+                    workflow_options=package.definition.options,
+                    variable_context=variables,
+                    output_resolver=variables.output_reference,
+                    predecessor_results={},
+                    node_state={},
+                    execution_limits=execution_limits,
+                    resource_limits=ProcessResourceLimits(
+                        max_rss_bytes=execution_limits.process_tree_rss_bytes,
+                        max_cpu_seconds=execution_limits.process_tree_cpu_seconds,
+                        max_descendants=execution_limits.max_descendants,
+                    ),
+                    deadline_budget=self._attempt_deadline_budget(
+                        node, execution_limits, execution_semantics
+                    ),
+                    sealed_attempt_timeout=(execution_semantics is not None),
+                    cancellation_reason=lambda: self._cancellation_reason(run_id),
+                    spawn_intent=lambda nonce: self.store.record_spawn_intent(
+                        authority.claim, executor_nonce=nonce
+                    ),
+                    spawn_failed=lambda nonce, code: self.store.record_spawn_failed(
+                        authority.claim,
+                        executor_nonce=nonce,
+                        error_code=code,
+                    ),
+                    process_started=lambda identity: self.store.record_process_started(
+                        authority.claim, identity
+                    ),
+                    process_stopped=lambda identity, cleaned: (
+                        self.store.record_process_stopped(
+                            authority.claim, identity, cleaned=cleaned
+                        )
+                    ),
+                    sealed_resource_paths=sealed_resource_paths,
+                    sealed_resource_bytes=sealed_resource_bytes,
+                    language_profile=package.language.effective_profile,
+                    normalizer_version=package.language.normalizer_version,
+                    monotonic=self._monotonic,
+                    termination_policy=TerminationPolicy(
+                        cooperative_grace_seconds=(
+                            execution_limits.cooperative_shutdown_seconds
+                        ),
+                        term_grace_seconds=execution_limits.term_grace_seconds,
+                        kill_grace_seconds=execution_limits.kill_reap_grace_seconds,
+                        wait_timeout_seconds=execution_limits.kill_reap_grace_seconds,
+                    ),
+                )
+            )
+            loop_semantics = package.language.node_semantics[node.id]["loop"]
+            iteration = int(decision["iteration"])
+            maximum = int(authority.loop_state["max_iterations"])
+            if check.status == "succeeded":
+                final = {"kind": "until_bash_success", "iteration": iteration}
+            elif check.error_code != "process_exit":
+                final = {
+                    "kind": "until_bash_failure",
+                    "iteration": iteration,
+                    "status": check.status,
+                    "error_code": check.error_code,
+                    "error_message": check.error_message,
+                    "archon_terminal_failure": (
+                        check.metadata.get("archon_terminal_failure") is True
+                    ),
+                }
+            elif iteration == maximum:
+                final = {"kind": "hard_limit", "iteration": iteration}
+            elif bool(loop_semantics["effective_interactive"]):
+                message = str(node.value.get("gate_message", ""))
+                final = {
+                    "kind": "ordinary_input",
+                    "iteration": iteration,
+                    "pending_interaction": {
+                        "type": "loop_input",
+                        "interaction_id": hashlib.sha256(
+                            f"{run_id}\0{node.id}\0{iteration}\0{message}".encode()
+                        ).hexdigest(),
+                        "message": message,
+                        "iteration": iteration,
+                    },
+                }
+            else:
+                final = {"kind": "continue", "iteration": iteration}
+            try:
+                self.store.record_loop_decision(
+                    authority.claim,
+                    loop_state={
+                        **{
+                            key: value
+                            for key, value in authority.loop_state.items()
+                            if key != "_pending_loop_decision"
+                        },
+                        "_pending_loop_decision": final,
+                    },
+                )
+            except RuntimeError:
+                pass
+            return self._reconcile_recorded_loop_decision(run_id)
+
+        clean_state = dict(authority.loop_state)
+        clean_state.pop("_pending_loop_decision", None)
+        if kind == "continue":
+            return self.store.resume_recorded_loop_continuation(authority) or (
+                self.store.recorded_loop_decision(run_id) is None
+            )
+        pending_interaction = decision.get("pending_interaction")
+        if kind == "signal_success":
+            clean_state["completed_by"] = "signal"
+            result = NodeExecutionResult(
+                "succeeded",
+                (authority.artifact,),
+                metadata={"loop_state": clean_state},
+            )
+        elif kind == "until_bash_success":
+            clean_state["completed_by"] = "until_bash"
+            result = NodeExecutionResult(
+                "succeeded",
+                (authority.artifact,),
+                metadata={"loop_state": clean_state},
+            )
+        elif kind in {"signal_confirmation", "ordinary_input"}:
+            if kind == "signal_confirmation":
+                clean_state["completed_by"] = "signal_pending_confirmation"
+            result = NodeExecutionResult(
+                "paused",
+                (authority.artifact,),
+                metadata={
+                    "loop_state": clean_state,
+                    "pending_interaction": pending_interaction,
+                },
+            )
+        elif kind == "hard_limit":
+            result = NodeExecutionResult(
+                "failed",
+                (authority.artifact,),
+                "loop_max_iterations",
+                f"loop reached its hard limit of {clean_state['max_iterations']} iterations",
+                {
+                    "loop_state": clean_state,
+                    "archon_terminal_failure": True,
+                },
+            )
+        elif kind == "until_bash_failure":
+            result = NodeExecutionResult(
+                str(decision["status"]),
+                (authority.artifact,),
+                str(decision["error_code"]),
+                (
+                    str(decision["error_message"])
+                    if decision["error_message"] is not None
+                    else None
+                ),
+                {
+                    "loop_state": clean_state,
+                    "archon_terminal_failure": decision[
+                        "archon_terminal_failure"
+                    ],
+                },
+            )
+        else:
+            raise ArchonOutputIntegrityError("unsupported journaled loop decision")
+        try:
+            self._persist_result(
+                authority.claim,
+                node,
+                result,
+                execution_limits,
+                language_profile=package.language.effective_profile,
+                execution_semantics=execution_semantics,
+                outward_action=(
+                    node.id in package.sidecar.get("outward_action_nodes", ())
+                ),
+            )
+        except RuntimeError as exc:
+            if "stale node completion" not in str(exc):
+                raise
+        return self.store.recorded_loop_decision(run_id) is None
+
     def _renew_execution_owner(self, run_id: str) -> bool:
         if self.execution_fence is not None:
             try:
@@ -1087,6 +1365,59 @@ class RunScheduler:
         if len(data) > limit:
             raise ValueError(f"workflow value exceeds {limit} bytes: {path}")
         return data.decode("utf-8")
+
+    def _authenticated_loop_input(
+        self,
+        run_id: str,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        relative_path: str,
+    ) -> str:
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, Mapping)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") is None
+            and artifact.get("relative_path") == relative_path
+            and artifact.get("media_type") == "text/plain"
+        ]
+        if len(matches) != 1:
+            raise LoopInputIntegrityError(
+                "loop input artifact identity is ambiguous"
+            )
+        size_bytes = matches[0].get("size_bytes")
+        digest = matches[0].get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= self.store.max_input_bytes
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise LoopInputIntegrityError("loop input artifact identity is invalid")
+        try:
+            content = _read_descriptor_relative(
+                self.store.run_directory(run_id),
+                relative_path,
+                size_bytes=size_bytes,
+            )
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                raise LoopInputIntegrityError("loop input artifact digest changed")
+            return content.decode("utf-8")
+        except LoopInputIntegrityError:
+            raise
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise LoopInputIntegrityError(
+                "loop input artifact is unavailable"
+            ) from exc
 
     def _output_values(
         self,
@@ -3479,10 +3810,23 @@ class RunScheduler:
                         "loop_user_input_artifact"
                     )
                     if node.node_type == "loop" and isinstance(loop_input, str):
+                        phase4_loop = supports_phase4_semantics(
+                            package.language.effective_profile,
+                            package.language.normalizer_version,
+                        )
                         variables = replace(
                             variables,
-                            loop_user_input=self._read_text(
-                                self.store.run_directory(run_id) / loop_input
+                            loop_user_input=(
+                                self._authenticated_loop_input(
+                                    run_id,
+                                    projection,
+                                    node_id=node.id,
+                                    relative_path=loop_input,
+                                )
+                                if phase4_loop
+                                else self._read_text(
+                                    self.store.run_directory(run_id) / loop_input
+                                )
                             ),
                         )
                     if not self._renew_execution_owner(run_id):
@@ -3592,6 +3936,12 @@ class RunScheduler:
                                     loop_state=state,
                                 )
                             ),
+                            record_loop_decision=lambda state: (
+                                self.store.record_loop_decision(
+                                    claim,
+                                    loop_state=state,
+                                )
+                            ),
                             spawn_intent=lambda executor_nonce: (
                                 self.store.record_spawn_intent(
                                     claim, executor_nonce=executor_nonce
@@ -3673,6 +4023,16 @@ class RunScheduler:
                         error_code="structured_output_capability_drift",
                         error_message=str(exc),
                         metadata={"archon_terminal_failure": True},
+                    )
+                except LoopInputIntegrityError as exc:
+                    result = NodeExecutionResult(
+                        "failed",
+                        error_code="loop_input_invalid",
+                        error_message=str(exc),
+                        metadata={
+                            "archon_terminal_failure": True,
+                            "additional_provider_attempts": 0,
+                        },
                     )
                 except WorkflowOutputReferenceError as exc:
                     result = NodeExecutionResult(
@@ -4074,7 +4434,7 @@ class RunScheduler:
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
         self._reconcile_session_registry_update(run_id)
-        if self.store.reconcile_recorded_loop_signal(run_id):
+        if self._reconcile_recorded_loop_decision(run_id):
             return self.store.load_run(run_id)
         if max_nodes is None:
             advanced = self.advance_all([run_id])
@@ -4312,7 +4672,7 @@ class RunScheduler:
         pending_run_ids = []
         for run_id in run_ids:
             self._reconcile_session_registry_update(run_id)
-            if self.store.reconcile_recorded_loop_signal(run_id):
+            if self._reconcile_recorded_loop_decision(run_id):
                 recovered_loop_signals[run_id] = self.store.load_run(run_id)
             else:
                 pending_run_ids.append(run_id)

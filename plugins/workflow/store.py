@@ -210,6 +210,16 @@ class ArtifactRef:
     sha256: str
 
 
+@dataclass(frozen=True)
+class RecordedLoopDecision:
+    """Authenticated private authority for one un-published loop outcome."""
+
+    claim: NodeClaim
+    loop_state: Mapping[str, object]
+    decision: Mapping[str, object]
+    artifact: ArtifactRef
+
+
 def _session_registry_candidate_payload(
     candidate: SessionRegistryUpdateCandidate,
     *,
@@ -12688,23 +12698,14 @@ class RunStore:
                     raise ValueError(
                         "phase 4 loop iteration output identity is inconsistent"
                     )
-                pending_signal = safe_state.get(
-                    "_pending_signal_confirmation"
-                )
-                if pending_signal is not None:
-                    confirmation = self._loop_signal_confirmation(
-                        pending_signal,
-                        run_id=claim.run_id,
-                        node_id=claim.node_id,
+                decision = safe_state.get("_pending_loop_decision")
+                safe_state["_pending_loop_decision"] = (
+                    self._bound_loop_decision(
+                        claim,
+                        safe_state,
+                        decision,
                     )
-                    if (
-                        confirmation.result_artifact != output_path
-                        or confirmation.result_sha256 != output_digest
-                        or confirmation.iteration != safe_state.get("iteration")
-                    ):
-                        raise ValueError(
-                            "phase 4 loop signal transition is inconsistent"
-                        )
+                )
             node["loop_state"] = safe_state
             if phase4:
                 node.pop("loop_user_input_artifact", None)
@@ -12738,6 +12739,339 @@ class RunStore:
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
             )
+
+    def record_loop_decision(
+        self,
+        claim: NodeClaim,
+        *,
+        loop_state: Mapping[str, object],
+        now: LeaseClockSample | None = None,
+    ) -> None:
+        """CAS-journal the outcome of one previously recorded v4 predicate."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale loop decision")
+            current = node.get("loop_state")
+            if not isinstance(current, Mapping):
+                raise RuntimeError("recorded loop iteration is missing")
+            current_decision = self._validated_bound_loop_decision(
+                current.get("_pending_loop_decision"),
+                claim=claim,
+                loop_state=current,
+            )
+            if current_decision["kind"] != "until_bash_pending":
+                raise RuntimeError("recorded loop predicate is no longer pending")
+            safe_state = dict(_sanitize(dict(loop_state)))
+            for key in (
+                "iteration",
+                "max_iterations",
+                "fresh_context",
+                "output_artifact",
+                "output_size_bytes",
+                "output_sha256",
+            ):
+                if safe_state.get(key) != current.get(key):
+                    raise ValueError("recorded loop decision changed iteration identity")
+            decision = self._bound_loop_decision(
+                claim,
+                safe_state,
+                safe_state.get("_pending_loop_decision"),
+            )
+            if decision["kind"] == "until_bash_pending":
+                raise ValueError("recorded loop predicate outcome is still pending")
+            safe_state["_pending_loop_decision"] = decision
+            node["loop_state"] = safe_state
+            self._append_locked(
+                directory,
+                projection,
+                "loop_decision_recorded",
+                {
+                    "iteration": safe_state["iteration"],
+                    "kind": decision["kind"],
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
+            )
+
+    def recorded_loop_decision(self, run_id: str) -> RecordedLoopDecision | None:
+        """Authenticate one v4 decision recorded before terminal publication."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if not (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            ):
+                return None
+            candidates = []
+            for node_id, node in projection.get("nodes", {}).items():
+                loop_state = node.get("loop_state") if isinstance(node, dict) else None
+                decision = (
+                    loop_state.get("_pending_loop_decision")
+                    if isinstance(loop_state, Mapping)
+                    else None
+                )
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if decision is not None and isinstance(claim, Mapping):
+                    candidates.append((node_id, node, loop_state, claim, decision))
+            if not candidates:
+                return None
+            if len(candidates) != 1:
+                raise JournalRecoveryError(
+                    "multiple loop decisions require recovery"
+                )
+            node_id, node, loop_state, raw_claim, raw_decision = candidates[0]
+            attempt_id = raw_claim.get("attempt_id")
+            owner_id = raw_claim.get("owner_id")
+            lease_expires_at = raw_claim.get("lease_expires_at")
+            if (
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or not isinstance(owner_id, str)
+                or not owner_id
+                or not isinstance(lease_expires_at, str)
+            ):
+                raise JournalRecoveryError("journaled loop claim is malformed")
+            try:
+                claim = NodeClaim(
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    owner_id=owner_id,
+                    lease_expires_at=datetime.fromisoformat(lease_expires_at),
+                )
+            except ValueError as exc:
+                raise JournalRecoveryError("journaled loop lease is malformed") from exc
+            decision = self._validated_bound_loop_decision(
+                raw_decision,
+                claim=claim,
+                loop_state=loop_state,
+            )
+            confirmation = LoopSignalConfirmation.create(
+                run_id=run_id,
+                node_id=node_id,
+                message="Recorded loop decision",
+                iteration=int(decision["iteration"]),
+                max_iterations=int(loop_state.get("max_iterations", 0)),
+                result_artifact=str(decision["output_artifact"]),
+                result_sha256=str(decision["output_sha256"]),
+            )
+            self._verify_pending_loop_result(
+                directory,
+                projection,
+                node_id=node_id,
+                node=node,
+                confirmation=confirmation,
+            )
+            matches = [
+                entry
+                for entry in projection.get("artifacts", ())
+                if isinstance(entry, Mapping)
+                and entry.get("node_id") == node_id
+                and entry.get("attempt_id") == attempt_id
+                and entry.get("relative_path") == decision["output_artifact"]
+                and entry.get("size_bytes") == decision["output_size_bytes"]
+                and entry.get("sha256") == decision["output_sha256"]
+                and isinstance(entry.get("media_type"), str)
+            ]
+            if len(matches) != 1:
+                raise JournalRecoveryError(
+                    "journaled loop artifact identity is ambiguous"
+                )
+            artifact = ArtifactRef(
+                relative_path=str(matches[0]["relative_path"]),
+                media_type=str(matches[0]["media_type"]),
+                size_bytes=int(matches[0]["size_bytes"]),
+                sha256=str(matches[0]["sha256"]),
+            )
+            return RecordedLoopDecision(
+                claim=claim,
+                loop_state=dict(loop_state),
+                decision=decision,
+                artifact=artifact,
+            )
+
+    def resume_recorded_loop_continuation(
+        self,
+        authority: RecordedLoopDecision,
+    ) -> bool:
+        """CAS-release a recorded continuation for its next provider iteration."""
+        claim = authority.claim
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection.get("nodes", {}).get(claim.node_id)
+            if not isinstance(node, dict):
+                return False
+            active = node.get("claim")
+            current_state = node.get("loop_state")
+            if (
+                not isinstance(active, Mapping)
+                or active.get("attempt_id") != claim.attempt_id
+                or not isinstance(current_state, Mapping)
+                or current_state.get("_pending_loop_decision")
+                != authority.decision
+                or authority.decision.get("kind") != "continue"
+            ):
+                return False
+            clean_state = dict(current_state)
+            clean_state.pop("_pending_loop_decision", None)
+            node["loop_state"] = clean_state
+            node.pop("claim", None)
+            node["state"] = "ready"
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(node.get("attempts", []))
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop continuation attempt is missing"
+                )
+            attempt.update({
+                "state": "interrupted",
+                "error_code": "recorded_loop_continuation",
+                "error_message": None,
+                "completed_at": _utc_now(),
+                "metadata": {"loop_state": clean_state},
+            })
+            self._append_locked(
+                directory,
+                projection,
+                "loop_continuation_recovered",
+                {"iteration": authority.decision["iteration"]},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
+            )
+            with self._connect() as connection:
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(
+                    claim.attempt_id, connection=connection
+                )
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (claim.attempt_id,),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=claim.run_id,
+                    reason_code="loop_continuation_recovered",
+                )
+            self._notify_coordinator()
+            return True
+
+    def prepare_recorded_loop_predicate_recovery(
+        self,
+        authority: RecordedLoopDecision,
+    ) -> bool:
+        """Prove any prior predicate process stopped before a bounded re-evaluation."""
+        claim = authority.claim
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection.get("nodes", {}).get(claim.node_id)
+            if not isinstance(node, dict):
+                return False
+            active = node.get("claim")
+            loop_state = node.get("loop_state")
+            if (
+                not isinstance(active, dict)
+                or active.get("attempt_id") != claim.attempt_id
+                or not isinstance(loop_state, Mapping)
+                or loop_state.get("_pending_loop_decision")
+                != authority.decision
+                or authority.decision.get("kind") != "until_bash_pending"
+            ):
+                return False
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(node.get("attempts", []))
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop predicate attempt is missing"
+                )
+            spawn = attempt.get("spawn")
+            if not isinstance(spawn, Mapping):
+                return True
+            process_identity = attempt.get("process_identity")
+            process_stop = attempt.get("process_stop")
+            stopped = (
+                isinstance(process_stop, Mapping)
+                and process_stop.get("cleaned") is True
+            ) or self._observe_attempt(attempt) == "known_stopped"
+            spawn_failed = (
+                spawn.get("state") == "failed" and process_identity is None
+            )
+            if not stopped and not spawn_failed:
+                raise JournalRecoveryError(
+                    "journaled loop predicate process outcome is unresolved"
+                )
+            history = attempt.setdefault("loop_predicate_recoveries", [])
+            if not isinstance(history, list) or len(history) >= 8:
+                raise JournalRecoveryError(
+                    "journaled loop predicate recovery bound is exhausted"
+                )
+            history.append({
+                "spawn": dict(_sanitize(dict(spawn))),
+                "process_identity": _sanitize(process_identity),
+                "process_stop": _sanitize(process_stop),
+                "observation": (
+                    "spawn_failed" if spawn_failed else "known_stopped"
+                ),
+            })
+            for key in (
+                "spawn",
+                "process_identity",
+                "process_started_at",
+                "process_stop",
+            ):
+                attempt.pop(key, None)
+                active.pop(key, None)
+            self._append_locked(
+                directory,
+                projection,
+                "loop_predicate_recovery_prepared",
+                {
+                    "iteration": authority.decision["iteration"],
+                    "recovery_count": len(history),
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return True
 
     def reconcile_recorded_loop_signal(self, run_id: str) -> bool:
         """Publish one journaled v4 signal decision without provider replay."""
@@ -14987,6 +15321,165 @@ class RunStore:
             node_id=node_id,
         )
 
+    @classmethod
+    def _bound_loop_decision(
+        cls,
+        claim: NodeClaim,
+        loop_state: Mapping[str, object],
+        raw: object,
+    ) -> dict[str, object]:
+        if not isinstance(raw, Mapping):
+            raise ValueError("phase 4 loop decision is missing")
+        kind = raw.get("kind")
+        iteration = raw.get("iteration")
+        if (
+            not isinstance(kind, str)
+            or isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or iteration < 1
+            or iteration != loop_state.get("iteration")
+        ):
+            raise ValueError("phase 4 loop decision identity is invalid")
+        common = {"kind", "iteration"}
+        allowed = {
+            "signal_success": common,
+            "signal_confirmation": common | {"pending_interaction"},
+            "ordinary_input": common | {"pending_interaction"},
+            "until_bash_pending": common | {"until_bash_sha256"},
+            "until_bash_success": common,
+            "until_bash_failure": common
+            | {
+                "status",
+                "error_code",
+                "error_message",
+                "archon_terminal_failure",
+            },
+            "continue": common,
+            "hard_limit": common,
+        }
+        expected_keys = allowed.get(kind)
+        if expected_keys is None or set(raw) != expected_keys:
+            raise ValueError("phase 4 loop decision shape is invalid")
+        decision: dict[str, object] = {"kind": kind, "iteration": iteration}
+        if kind == "signal_confirmation":
+            confirmation = cls._loop_signal_confirmation(
+                raw.get("pending_interaction"),
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+            )
+            if (
+                confirmation.iteration != iteration
+                or confirmation.result_artifact != loop_state.get("output_artifact")
+                or confirmation.result_sha256 != loop_state.get("output_sha256")
+            ):
+                raise ValueError("phase 4 loop confirmation identity is invalid")
+            decision["pending_interaction"] = confirmation.to_dict()
+        elif kind == "ordinary_input":
+            interaction = raw.get("pending_interaction")
+            if not isinstance(interaction, Mapping) or set(interaction) != {
+                "type",
+                "interaction_id",
+                "message",
+                "iteration",
+            }:
+                raise ValueError("phase 4 loop input decision is malformed")
+            message = interaction.get("message")
+            interaction_id = interaction.get("interaction_id")
+            if (
+                interaction.get("type") != "loop_input"
+                or interaction.get("iteration") != iteration
+                or not isinstance(message, str)
+                or len(message) > 64_000
+                or not isinstance(interaction_id, str)
+                or _SHA256_PATTERN.fullmatch(interaction_id) is None
+                or not hmac.compare_digest(
+                    interaction_id,
+                    _sha256(
+                        f"{claim.run_id}\0{claim.node_id}\0{iteration}\0{message}".encode()
+                    ),
+                )
+            ):
+                raise ValueError("phase 4 loop input decision identity is invalid")
+            decision["pending_interaction"] = dict(interaction)
+        elif kind == "until_bash_pending":
+            digest = raw.get("until_bash_sha256")
+            if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError("phase 4 loop predicate identity is invalid")
+            decision["until_bash_sha256"] = digest
+        elif kind == "until_bash_failure":
+            status = raw.get("status")
+            error_code = raw.get("error_code")
+            error_message = raw.get("error_message")
+            terminal = raw.get("archon_terminal_failure")
+            if (
+                status not in {"failed", "cancelled", "interrupted"}
+                or
+                not isinstance(error_code, str)
+                or not error_code
+                or len(error_code) > 256
+                or (error_message is not None and not isinstance(error_message, str))
+                or not isinstance(terminal, bool)
+            ):
+                raise ValueError("phase 4 loop predicate failure is malformed")
+            safe_message = _sanitize_diagnostic(error_message)
+            if safe_message != error_message:
+                raise ValueError("phase 4 loop predicate failure is not canonical")
+            decision.update({
+                "status": status,
+                "error_code": error_code,
+                "error_message": safe_message,
+                "archon_terminal_failure": terminal,
+            })
+        output_path = loop_state.get("output_artifact")
+        output_size = loop_state.get("output_size_bytes")
+        output_digest = loop_state.get("output_sha256")
+        if (
+            not isinstance(output_path, str)
+            or not output_path
+            or isinstance(output_size, bool)
+            or not isinstance(output_size, int)
+            or output_size < 0
+            or not isinstance(output_digest, str)
+            or _SHA256_PATTERN.fullmatch(output_digest) is None
+        ):
+            raise ValueError("phase 4 loop output identity is invalid")
+        decision.update({
+            "node_id": claim.node_id,
+            "attempt_id": claim.attempt_id,
+            "output_artifact": output_path,
+            "output_size_bytes": output_size,
+            "output_sha256": output_digest,
+        })
+        return decision
+
+    @classmethod
+    def _validated_bound_loop_decision(
+        cls,
+        raw: object,
+        *,
+        claim: NodeClaim,
+        loop_state: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(raw, Mapping):
+            raise JournalRecoveryError("journaled loop decision is malformed")
+        binding_keys = {
+            "node_id",
+            "attempt_id",
+            "output_artifact",
+            "output_size_bytes",
+            "output_sha256",
+        }
+        if not binding_keys.issubset(raw):
+            raise JournalRecoveryError("journaled loop decision binding is missing")
+        unbound = {key: value for key, value in raw.items() if key not in binding_keys}
+        try:
+            canonical = cls._bound_loop_decision(claim, loop_state, unbound)
+        except ValueError as exc:
+            raise JournalRecoveryError("journaled loop decision is invalid") from exc
+        if dict(raw) != canonical:
+            raise JournalRecoveryError("journaled loop decision binding changed")
+        return canonical
+
     @staticmethod
     def _verify_pending_loop_result(
         directory: Path,
@@ -15004,12 +15497,24 @@ class RunStore:
             raise ValueError("loop signal result attempt is malformed")
         relative = PurePosixPath(confirmation.result_artifact)
         owned_prefixes = {
-            ("nodes", node_id),
-            ("nodes", _safe_component("node", node_id)),
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component(
+                    "attempt",
+                    f"{attempt_id}/iteration-{confirmation.iteration:04d}",
+                ),
+            ),
         }
         if (
             len(relative.parts) <= 3
-            or relative.parts[:2] not in owned_prefixes
+            or relative.parts[:3] not in owned_prefixes
         ):
             raise ValueError("loop signal result is not owned by the paused attempt")
         matches = [
@@ -15398,13 +15903,18 @@ class RunStore:
                     for candidate in projection["nodes"].values()
                 }
                 terminal_status = None
-                if states and states <= {
-                    "succeeded",
-                    "failed",
-                    "skipped",
-                    "cancelled",
-                    "interrupted",
-                }:
+                if (
+                    pending_type == "loop_signal_confirmation"
+                    and states
+                    and states
+                    <= {
+                        "succeeded",
+                        "failed",
+                        "skipped",
+                        "cancelled",
+                        "interrupted",
+                    }
+                ):
                     terminal_status = (
                         "failed" if "failed" in states else "succeeded"
                     )

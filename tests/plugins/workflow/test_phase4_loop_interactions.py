@@ -49,6 +49,7 @@ def _pause_signal(
     max_iterations: int = 3,
     result: bytes = b"cleaned result\n",
     pending_mutation=None,
+    path_attempt_id: str | None = None,
 ):
     workflow = workflow_writer(
         tmp_path / key / "workflows",
@@ -98,7 +99,7 @@ def _pause_signal(
     relative = (
         Path("nodes")
         / "refine"
-        / claim.attempt_id
+        / (path_attempt_id or claim.attempt_id)
         / f"iteration-{iteration:04d}"
         / "output.txt"
     )
@@ -295,6 +296,28 @@ def test_signal_approval_rejects_result_tampering_without_mutation(
     result_path.write_bytes(b"tampered\n")
 
     with pytest.raises(ValueError, match="result"):
+        store.approve_run(
+            run_id,
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+        )
+
+    assert store.load_run(run_id)["state_version"] == paused["state_version"]
+
+
+def test_signal_approval_rejects_same_node_result_from_wrong_attempt(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    store, run_id, pending, _result_path = _pause_signal(
+        tmp_path,
+        workflow_writer,
+        key="wrong-attempt",
+        path_attempt_id="substituted-attempt",
+    )
+    paused = store.load_run(run_id)
+
+    with pytest.raises(ValueError, match="owned by the paused attempt"):
         store.approve_run(
             run_id,
             expected_state_version=paused["state_version"],
