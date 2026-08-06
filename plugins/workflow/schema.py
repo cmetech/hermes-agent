@@ -65,6 +65,8 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowLanguageProfile,
     WorkflowRuntimeConfig,
+    WorkflowSourceDocument,
+    WorkflowSourceNode,
     WorkflowValidationError,
     freeze_value,
 )
@@ -1356,17 +1358,6 @@ def _validate_sidecar_node_references(
             )
 
 
-def _load_sidecar(path: Path) -> tuple[Path | None, Mapping[str, Any]]:
-    sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
-    if not sidecar_path.is_file():
-        return None, freeze_value({})
-    try:
-        data = sidecar_path.read_bytes()
-    except OSError as exc:
-        _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
-    return _parse_sidecar(sidecar_path, data)
-
-
 def _package_root(path: Path) -> Path:
     for parent in path.parents:
         if parent.name == "workflows":
@@ -1409,26 +1400,124 @@ def _validate_workflow_options(document: Mapping[str, Any]) -> None:
         _mapping(document["sandbox"], "sandbox")
 
 
-_READ_SIDECAR_FROM_DISK = object()
+def _source_node(
+    raw: Any,
+    index: int,
+    lines: dict[str, int],
+) -> WorkflowSourceNode:
+    """Parse one authored node without consulting its sidecar language profile."""
+    path = f"nodes[{index}]"
+    node = _mapping(raw, path)
+    if "kind" in node:
+        legacy_kind = node.get("kind")
+        replacement = (
+            f"replace `kind: {legacy_kind}` with the `{legacy_kind}: ...` node field"
+            if isinstance(legacy_kind, str) and legacy_kind
+            else "replace the legacy `kind` field with one supported node-type field"
+        )
+        _fail(
+            f"{path}.kind",
+            "legacy_kind_schema",
+            f"legacy workflow node schema is unsupported; {replacement}",
+            line=lines.get("kind"),
+        )
+    unknown = sorted(set(node) - COMMON_NODE_FIELDS)
+    if unknown:
+        _fail(
+            path,
+            "unknown_node_field",
+            f"{path} has unknown execution field: {unknown[0]}",
+            line=lines.get(unknown[0]),
+        )
+    node_id = _validate_identifier(node.get("id"), f"{path}.id")
+    present_types = [field for field in NODE_TYPES if field in node]
+    if len(present_types) != 1:
+        _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
+    node_type = present_types[0]
+    _validate_node_type(node, node_type, path)
+    _validate_declared_options(node, path)
+    depends = node.get("depends_on", [])
+    if not isinstance(depends, list) or any(
+        not isinstance(item, str) or not item for item in depends
+    ):
+        _fail(
+            f"{path}.depends_on",
+            "invalid_dependencies",
+            f"{path}.depends_on must be a list of identifiers",
+        )
+    for dependency in depends:
+        _validate_identifier(dependency, f"{path}.depends_on")
+    trigger = node.get("trigger_rule", "all_success")
+    if trigger not in TRIGGER_RULES:
+        _fail(
+            f"{path}.trigger_rule",
+            "invalid_trigger_rule",
+            f"{path}.trigger_rule is invalid",
+        )
+    if "context" in node and node["context"] not in CONTEXT_VALUES:
+        _fail(
+            f"{path}.context",
+            "invalid_context",
+            f"{path}.context must be fresh or shared",
+        )
+    if "hooks" in node:
+        _validate_hook_fields(node["hooks"], f"{path}.hooks")
+    if "when" in node:
+        _string(node["when"], f"{path}.when")
+    options = {
+        key: value
+        for key, value in node.items()
+        if key not in {"id", node_type, "depends_on"}
+    }
+    return WorkflowSourceNode(
+        id=node_id,
+        node_type=node_type,
+        value=node[node_type],
+        depends_on=tuple(depends),
+        source_index=index,
+        source_line=lines.get("id"),
+        options=options,
+        field_lines=lines,
+    )
 
 
-def _load_workflow_bytes(
-    workflow_path: Path,
-    data: bytes,
+def _logical_source_location(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def parse_workflow_source_bytes(
+    path: str | Path,
     *,
-    sidecar_bytes: bytes | None | object,
-    source: str,
-    precedence: int,
-    normalizer_version: int | None = None,
-) -> WorkflowPackage:
-    if len(data) > MAX_WORKFLOW_DOCUMENT_BYTES:
+    workflow_bytes: bytes,
+    sidecar_bytes: bytes | None,
+    source: str = "explicit",
+    precedence: int = 0,
+) -> WorkflowSourceDocument:
+    """Parse bounded authenticated bytes without selecting language authority."""
+    workflow_path = Path(path).expanduser().absolute()
+    if workflow_path.suffix.lower() not in {".yaml", ".yml"}:
+        _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
+    if not isinstance(workflow_bytes, bytes):
+        _fail("document", "invalid_yaml", "workflow definition must be bytes")
+    if len(workflow_bytes) > MAX_WORKFLOW_DOCUMENT_BYTES:
         _fail(
             "path",
             "workflow_too_large",
             "workflow YAML exceeds the 2 MiB validation limit",
         )
+    if sidecar_bytes is not None and not isinstance(sidecar_bytes, bytes):
+        _fail("sidecar", "invalid_sidecar", "workflow sidecar must be bytes")
+    if sidecar_bytes is not None and len(sidecar_bytes) > MAX_WORKFLOW_DOCUMENT_BYTES:
+        _fail(
+            "sidecar",
+            "invalid_sidecar",
+            "workflow sidecar exceeds the 2 MiB validation limit",
+        )
     try:
-        text = data.decode("utf-8")
+        text = workflow_bytes.decode("utf-8")
         raw = yaml.load(text, Loader=_WorkflowSafeLoader)
     except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("document", "invalid_yaml", f"invalid workflow YAML: {exc}")
@@ -1448,50 +1537,6 @@ def _load_workflow_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
-    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
-        sidecar_path, sidecar = _load_sidecar(workflow_path)
-    elif sidecar_bytes is None:
-        sidecar_path, sidecar = None, freeze_value({})
-    else:
-        assert isinstance(sidecar_bytes, bytes)
-        sidecar_path, sidecar = _parse_sidecar(
-            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
-            sidecar_bytes,
-        )
-    try:
-        selection = resolve_language_profile(sidecar)
-    except WorkflowLanguageCompatibilityError as exc:
-        _fail("sidecar.language_compatibility", exc.code, str(exc))
-    selected_normalizer_version = select_normalizer_version(
-        selection, normalizer_version
-    )
-    unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
-    if (
-        unknown_top
-        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
-    ):
-        raise WorkflowValidationError(
-            tuple(
-                ValidationIssue(
-                    path=field,
-                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
-                    message=f"Archon profile does not support top-level field: {field}",
-                    source_line=top_lines.get(field),
-                )
-                for field in unknown_top
-            )
-        )
-    issues = tuple(
-        ValidationIssue(
-            path=field,
-            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
-            message=f"unknown top-level field: {field}",
-            severity="warning",
-            blocking=False,
-            source_line=top_lines.get(field),
-        )
-        for field in unknown_top
-    )
     name = _validate_identifier(document.get("name"), "name")
     if not _SAFE_NAME.fullmatch(name):
         _fail(
@@ -1505,30 +1550,133 @@ def _load_workflow_bytes(
     if not isinstance(raw_nodes, list) or not raw_nodes:
         _fail("nodes", "invalid_nodes", "nodes must be a non-empty list")
     nodes = tuple(
-        _normalize_node(
+        _source_node(
             node,
             index,
             node_lines[index] if index < len(node_lines) else {},
-            profile=selection.effective_profile,
-            normalizer_version=selected_normalizer_version,
         )
         for index, node in enumerate(raw_nodes)
     )
-    archon_v3 = supports_phase3_semantics(
-        selection.effective_profile, selected_normalizer_version
+    sidecar_path = (
+        workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        if sidecar_bytes is not None
+        else None
     )
-    _validate_graph(nodes, strict_output_references=archon_v3)
+    if sidecar_bytes is None:
+        sidecar = freeze_value({})
+    else:
+        _, sidecar = _parse_sidecar(sidecar_path, sidecar_bytes)
+    root = _package_root(workflow_path)
     options = {
         key: value
         for key, value in document.items()
         if key not in {"name", "description", "nodes"}
     }
-    definition = WorkflowDefinition(
+    return WorkflowSourceDocument(
         name=name,
         description=description,
         nodes=nodes,
         options=freeze_value(options),
-        source_path=workflow_path,
+        root=root,
+        workflow_path=workflow_path,
+        sidecar_path=sidecar_path,
+        sidecar=sidecar,
+        source=source,
+        precedence=precedence,
+        definition_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        definition_location=_logical_source_location(workflow_path, root),
+        sidecar_location=(
+            _logical_source_location(sidecar_path, root)
+            if sidecar_path is not None
+            else None
+        ),
+        field_lines=top_lines,
+    )
+
+
+def _thaw_source_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_source_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_source_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_source_value(item) for item in value}
+    return value
+
+
+def _source_node_mapping(node: WorkflowSourceNode) -> Mapping[str, Any]:
+    raw: dict[str, Any] = {
+        "id": node.id,
+        node.node_type: _thaw_source_value(node.value),
+    }
+    if node.depends_on:
+        raw["depends_on"] = list(node.depends_on)
+    raw.update(_thaw_source_value(node.options))
+    return raw
+
+
+def _compile_workflow_source_document(
+    source_document: WorkflowSourceDocument,
+    *,
+    normalizer_version: int | None = None,
+) -> WorkflowPackage:
+    """Apply root language/default/policy authority to one parsed source graph."""
+    sidecar = source_document.sidecar
+    try:
+        selection = resolve_language_profile(sidecar)
+    except WorkflowLanguageCompatibilityError as exc:
+        _fail("sidecar.language_compatibility", exc.code, str(exc))
+    selected_normalizer_version = select_normalizer_version(
+        selection, normalizer_version
+    )
+    unknown_top = sorted(set(source_document.options) - TOP_LEVEL_FIELDS)
+    if (
+        unknown_top
+        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowValidationError(
+            tuple(
+                ValidationIssue(
+                    path=field,
+                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+                    message=f"Archon profile does not support top-level field: {field}",
+                    source_line=source_document.field_lines.get(field),
+                )
+                for field in unknown_top
+            )
+        )
+    issues = tuple(
+        ValidationIssue(
+            path=field,
+            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
+            message=f"unknown top-level field: {field}",
+            severity="warning",
+            blocking=False,
+            source_line=source_document.field_lines.get(field),
+        )
+        for field in unknown_top
+    )
+    nodes = tuple(
+        _normalize_node(
+            _source_node_mapping(node),
+            node.source_index,
+            dict(node.field_lines),
+            profile=selection.effective_profile,
+            normalizer_version=selected_normalizer_version,
+        )
+        for node in source_document.nodes
+    )
+    archon_v3 = supports_phase3_semantics(
+        selection.effective_profile, selected_normalizer_version
+    )
+    _validate_graph(nodes, strict_output_references=archon_v3)
+    definition = WorkflowDefinition(
+        name=source_document.name,
+        description=source_document.description,
+        nodes=nodes,
+        options=source_document.options,
+        source_path=source_document.workflow_path,
     )
     node_ids = frozenset(node.id for node in nodes)
     _validate_sidecar_node_references(sidecar, node_ids)
@@ -1561,12 +1709,12 @@ def _load_workflow_bytes(
     return WorkflowPackage(
         source_definition=definition,
         definition=normalized.definition,
-        root=_package_root(workflow_path),
-        workflow_path=workflow_path,
-        sidecar_path=sidecar_path,
+        root=source_document.root,
+        workflow_path=source_document.workflow_path,
+        sidecar_path=source_document.sidecar_path,
         sidecar=sidecar,
-        source=source,
-        precedence=precedence,
+        source=source_document.source,
+        precedence=source_document.precedence,
         language=normalized.metadata,
         compatibility_findings=language_compatibility_findings(
             definition, normalized.metadata
@@ -1585,13 +1733,23 @@ def load_workflow(
         ".yml",
     }:
         _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
-    return _load_workflow_bytes(
+    workflow_bytes = workflow_path.read_bytes()
+    sidecar_path = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+    try:
+        sidecar_bytes = sidecar_path.read_bytes() if sidecar_path.is_file() else None
+    except OSError as exc:
+        _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
+    source_document = parse_workflow_source_bytes(
         workflow_path,
-        workflow_path.read_bytes(),
-        sidecar_bytes=_READ_SIDECAR_FROM_DISK,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
     )
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    catalog = WorkflowCatalogSnapshot.capture((source_document,))
+    return compile_workflow(source_document, catalog).package
 
 
 def load_workflow_snapshot(
@@ -1607,14 +1765,21 @@ def load_workflow_snapshot(
     workflow_path = Path(path).expanduser().absolute()
     if workflow_path.suffix.lower() not in {".yaml", ".yml"}:
         _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
-    return _load_workflow_bytes(
+    source_document = parse_workflow_source_bytes(
         workflow_path,
-        workflow_bytes,
+        workflow_bytes=workflow_bytes,
         sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
-        normalizer_version=normalizer_version,
     )
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    catalog = WorkflowCatalogSnapshot.capture((source_document,))
+    return compile_workflow(
+        source_document,
+        catalog,
+        normalizer_version=normalizer_version,
+    ).package
 
 
 def validate_package(package: WorkflowPackage) -> tuple[ValidationIssue, ...]:

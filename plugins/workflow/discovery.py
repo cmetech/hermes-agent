@@ -5,19 +5,18 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowPackage,
+    WorkflowSourceDocument,
     WorkflowValidationError,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import parse_workflow_source_bytes
 
 _PARSE_CACHE: dict[
     tuple[str, str, int],
-    tuple[
-        tuple[tuple[int, int, str], tuple[bool, int, int, str]],
-        WorkflowPackage,
-    ],
+    tuple[tuple[str, str | None], WorkflowSourceDocument],
 ] = {}
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
 
@@ -49,30 +48,33 @@ def _yaml_paths(
     return tuple(sorted(paths, key=lambda item: item.resolve().as_posix()))
 
 
-def _load_cached(path: Path, *, source: str, precedence: int) -> WorkflowPackage:
+def _load_cached(
+    path: Path, *, source: str, precedence: int
+) -> WorkflowSourceDocument:
     resolved = path.resolve(strict=True)
-    stat = resolved.stat()
-    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-    workflow_identity = (stat.st_size, stat.st_mtime_ns, digest)
+    workflow_bytes = resolved.read_bytes()
+    workflow_digest = hashlib.sha256(workflow_bytes).hexdigest()
     companion = resolved.with_name(f"{resolved.stem}.hermes.yaml")
     if companion.is_file():
-        companion_stat = companion.stat()
-        companion_identity = (
-            True,
-            companion_stat.st_size,
-            companion_stat.st_mtime_ns,
-            hashlib.sha256(companion.read_bytes()).hexdigest(),
-        )
+        sidecar_bytes = companion.read_bytes()
+        sidecar_digest = hashlib.sha256(sidecar_bytes).hexdigest()
     else:
-        companion_identity = (False, 0, 0, "")
-    signature = (workflow_identity, companion_identity)
+        sidecar_bytes = None
+        sidecar_digest = None
+    signature = (workflow_digest, sidecar_digest)
     key = (str(resolved), source, precedence)
     cached = _PARSE_CACHE.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    package = load_workflow(resolved, source=source, precedence=precedence)
-    _PARSE_CACHE[key] = (signature, package)
-    return package
+    source_document = parse_workflow_source_bytes(
+        resolved,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        source=source,
+        precedence=precedence,
+    )
+    _PARSE_CACHE[key] = (signature, source_document)
+    return source_document
 
 
 def discover_workflows(
@@ -93,7 +95,7 @@ def discover_workflows(
         ("project", 1, Path(workdir).expanduser() / ".hermes" / "workflows"),
         ("profile", 2, Path(hermes_home).expanduser() / "workflows"),
     ])
-    selected: dict[str, WorkflowPackage] = {}
+    source_documents: list[WorkflowSourceDocument] = []
     for source, precedence, location in locations:
         scan_location = location
         if (
@@ -102,24 +104,44 @@ def discover_workflows(
             and (location / "workflows").is_dir()
         ):
             scan_location = location / "workflows"
-        level: dict[str, WorkflowPackage] = {}
         for path in _yaml_paths(
             scan_location,
             excluded_top_level=(
                 _PROFILE_STATE_DIRECTORIES if source == "profile" else frozenset()
             ),
         ):
-            package = _load_cached(path, source=source, precedence=precedence)
-            name = package.definition.name
-            if name in level:
-                raise WorkflowValidationError(
-                    ValidationIssue(
-                        path=str(path),
-                        code="duplicate_workflow_name",
-                        message=f"duplicate workflow name at {source} precedence: {name}",
-                    )
-                )
-            level[name] = package
-        for name, package in level.items():
-            selected.setdefault(name, package)
-    return tuple(selected[name] for name in sorted(selected))
+            source_documents.append(
+                _load_cached(path, source=source, precedence=precedence)
+            )
+    snapshot = WorkflowCatalogSnapshot.capture(source_documents)
+    if snapshot.ambiguous_names:
+        name = min(snapshot.ambiguous_names)
+        winning_precedence = min(
+            source_document.precedence
+            for source_document in source_documents
+            if source_document.name == name
+        )
+        duplicates = [
+            source_document
+            for source_document in source_documents
+            if source_document.name == name
+            and source_document.precedence == winning_precedence
+        ]
+        raise WorkflowValidationError(
+            ValidationIssue(
+                path=str(duplicates[1].workflow_path),
+                code="duplicate_workflow_name",
+                message=(
+                    f"duplicate workflow name at {duplicates[0].source} "
+                    f"precedence: {name}"
+                ),
+            )
+        )
+    compiled_by_path = {
+        source_document.workflow_path: compile_workflow(source_document, snapshot).package
+        for source_document in source_documents
+    }
+    return tuple(
+        compiled_by_path[snapshot.selected[name].workflow_path]
+        for name in sorted(snapshot.selected)
+    )

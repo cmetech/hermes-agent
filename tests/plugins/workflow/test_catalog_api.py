@@ -1880,19 +1880,22 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
     workflow_writer(home / "workflows", name="placeholder", filename="long.yaml")
     import plugins.workflow.catalog_api as catalog_api
 
-    original_load = catalog_api.load_workflow
+    original_compile = catalog_api.compile_workflow
     long_name = "x" * 129
 
-    def long_name_load(path, **kwargs):
-        package = original_load(path, **kwargs)
-        if Path(path).name == "long.yaml":
+    def long_name_compile(source, *args, **kwargs):
+        compiled = original_compile(source, *args, **kwargs)
+        if source.workflow_path.name == "long.yaml":
             return replace(
-                package,
-                definition=replace(package.definition, name=long_name),
+                compiled,
+                package=replace(
+                    compiled.package,
+                    definition=replace(compiled.package.definition, name=long_name),
+                ),
             )
-        return package
+        return compiled
 
-    monkeypatch.setattr(catalog_api, "load_workflow", long_name_load)
+    monkeypatch.setattr(catalog_api, "compile_workflow", long_name_compile)
 
     response = _catalog_get(_module().router, token=_reader())
 
@@ -1983,22 +1986,22 @@ def test_workflow_catalog_caps_items_and_reports_truncation(
         workflow_writer(home / "workflows", name=name, filename=f"{name}.yaml")
     import plugins.workflow.catalog_api as catalog_api
 
-    original_load = catalog_api.load_workflow
+    original_parse = catalog_api.parse_workflow_source_bytes
     original_read = catalog_api.WorkflowTrustStore._read
     loaded = 0
     trust_reads = 0
 
-    def counted_load(*args, **kwargs):
+    def counted_parse(*args, **kwargs):
         nonlocal loaded
         loaded += 1
-        return original_load(*args, **kwargs)
+        return original_parse(*args, **kwargs)
 
     def counted_read(*args, **kwargs):
         nonlocal trust_reads
         trust_reads += 1
         return original_read(*args, **kwargs)
 
-    monkeypatch.setattr(catalog_api, "load_workflow", counted_load)
+    monkeypatch.setattr(catalog_api, "parse_workflow_source_bytes", counted_parse)
     monkeypatch.setattr(catalog_api.WorkflowTrustStore, "_read", counted_read)
 
     response = _catalog_get(_module().router, token=_reader())

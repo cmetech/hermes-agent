@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -106,6 +106,206 @@ class WorkflowNode:
     source_index: int
     source_line: int | None
     options: Mapping[str, Any]
+
+
+_WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
+_WORKFLOW_SOURCE_NAME_MAX_CHARS = 128
+
+
+def _bounded_source_text(value: object, field_name: str, *, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ValueError(f"{field_name} must be bounded non-empty text")
+    return value
+
+
+def _logical_source_location(value: object, field_name: str) -> str:
+    location = _bounded_source_text(
+        value,
+        field_name,
+        limit=_WORKFLOW_SOURCE_METADATA_MAX_CHARS,
+    )
+    candidate = PurePosixPath(location)
+    if (
+        candidate.is_absolute()
+        or ".." in candidate.parts
+        or location.startswith("~")
+        or "\\" in location
+    ):
+        raise ValueError(f"{field_name} must be a contained logical location")
+    return candidate.as_posix()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSourceNode:
+    """One immutable authored node captured before profile normalization."""
+
+    id: str
+    node_type: str
+    value: Any
+    depends_on: tuple[str, ...]
+    source_index: int
+    source_line: int | None
+    options: Mapping[str, Any]
+    field_lines: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        _bounded_source_text(
+            self.id, "source node id", limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS
+        )
+        _bounded_source_text(
+            self.node_type,
+            "source node type",
+            limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+        )
+        if (
+            isinstance(self.source_index, bool)
+            or not isinstance(self.source_index, int)
+            or self.source_index < 0
+        ):
+            raise ValueError("source_index must be a non-negative integer")
+        if self.source_line is not None and (
+            isinstance(self.source_line, bool)
+            or not isinstance(self.source_line, int)
+            or self.source_line <= 0
+        ):
+            raise ValueError("source_line must be a positive integer when present")
+        object.__setattr__(self, "value", freeze_value(self.value))
+        object.__setattr__(self, "depends_on", tuple(self.depends_on))
+        object.__setattr__(self, "options", freeze_value(self.options))
+        object.__setattr__(self, "field_lines", freeze_value(self.field_lines))
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSourceDocument:
+    """Bounded authenticated source bytes with no active language authority."""
+
+    name: str
+    description: str
+    nodes: tuple[WorkflowSourceNode, ...]
+    options: Mapping[str, Any]
+    root: Path
+    workflow_path: Path
+    sidecar_path: Path | None
+    sidecar: Mapping[str, Any]
+    source: str
+    precedence: int
+    definition_bytes: bytes
+    sidecar_bytes: bytes | None
+    definition_location: str
+    sidecar_location: str | None
+    field_lines: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        _bounded_source_text(
+            self.name, "workflow source name", limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS
+        )
+        _bounded_source_text(
+            self.description,
+            "workflow source description",
+            limit=2 * 1024 * 1024,
+        )
+        _bounded_source_text(
+            self.source,
+            "workflow catalog source",
+            limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+        )
+        if (
+            isinstance(self.precedence, bool)
+            or not isinstance(self.precedence, int)
+            or not 0 <= self.precedence <= 2**31 - 1
+        ):
+            raise ValueError("workflow precedence must be a bounded non-negative integer")
+        if not isinstance(self.definition_bytes, bytes):
+            raise ValueError("definition_bytes must be immutable bytes")
+        if self.sidecar_bytes is not None and not isinstance(self.sidecar_bytes, bytes):
+            raise ValueError("sidecar_bytes must be immutable bytes when present")
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(self, "options", freeze_value(self.options))
+        object.__setattr__(self, "sidecar", freeze_value(self.sidecar))
+        object.__setattr__(self, "field_lines", freeze_value(self.field_lines))
+        object.__setattr__(
+            self,
+            "definition_location",
+            _logical_source_location(
+                self.definition_location, "definition_location"
+            ),
+        )
+        if self.sidecar_location is not None:
+            object.__setattr__(
+                self,
+                "sidecar_location",
+                _logical_source_location(self.sidecar_location, "sidecar_location"),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowNodeOrigin:
+    """Bounded logical provenance for one future expanded workflow node."""
+
+    include_instance_path: tuple[str, ...]
+    package_key: str
+    workflow_name: str
+    catalog_source: str
+    precedence: int
+    definition_location: str
+    source_index: int
+    source_line: int | None
+    expanded_node_id: str
+
+    def __post_init__(self) -> None:
+        if len(self.include_instance_path) > 3:
+            raise ValueError("include_instance_path exceeds the bounded include depth")
+        for item in self.include_instance_path:
+            _bounded_source_text(
+                item,
+                "include instance id",
+                limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+            )
+        for field_name in (
+            "package_key",
+            "workflow_name",
+            "catalog_source",
+            "expanded_node_id",
+        ):
+            _bounded_source_text(
+                getattr(self, field_name),
+                field_name,
+                limit=_WORKFLOW_SOURCE_METADATA_MAX_CHARS,
+            )
+        if (
+            isinstance(self.precedence, bool)
+            or not isinstance(self.precedence, int)
+            or not 0 <= self.precedence <= 2**31 - 1
+        ):
+            raise ValueError("origin precedence must be a bounded non-negative integer")
+        if (
+            isinstance(self.source_index, bool)
+            or not isinstance(self.source_index, int)
+            or self.source_index < 0
+        ):
+            raise ValueError("origin source_index must be a non-negative integer")
+        if self.source_line is not None and (
+            isinstance(self.source_line, bool)
+            or not isinstance(self.source_line, int)
+            or self.source_line <= 0
+        ):
+            raise ValueError("origin source_line must be positive when present")
+        object.__setattr__(
+            self,
+            "include_instance_path",
+            tuple(self.include_instance_path),
+        )
+        object.__setattr__(
+            self,
+            "definition_location",
+            _logical_source_location(
+                self.definition_location, "origin definition_location"
+            ),
+        )
 
 
 @dataclass(frozen=True)

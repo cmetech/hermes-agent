@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, NotRequired, TypedDict
 
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.cli import (
     WorkflowDefinitionProjectionCapacityError,
     show_package,
@@ -24,7 +25,11 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.language import language_projection
-from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.models import (
+    WorkflowPackage,
+    WorkflowSourceDocument,
+    WorkflowValidationError,
+)
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
@@ -32,7 +37,7 @@ from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import parse_workflow_source_bytes
 from plugins.workflow.sanitize import (
     sanitize_projection,
     sanitize_text,
@@ -278,27 +283,38 @@ def _catalog_candidates(
 def _discover_catalog(
     workdir: Path, hermes_home: Path
 ) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
-    selected: dict[str, WorkflowPackage] = {}
     invalid: list[InvalidCatalogEntry] = []
     candidates, truncated = _catalog_candidates(workdir, hermes_home)
     definition_budget = _DefinitionReadBudget()
     by_location: dict[tuple[str, int], list[Path]] = {}
     for source, precedence, path in candidates:
         by_location.setdefault((source, precedence), []).append(path)
+    source_documents: list[WorkflowSourceDocument] = []
     for (source, precedence), paths in by_location.items():
-        level: dict[str, WorkflowPackage] = {}
+        level: dict[str, WorkflowSourceDocument] = {}
         duplicate_names: set[str] = set()
         for path in paths:
             try:
                 definition_budget.reserve(path)
-                package = load_workflow(path, source=source, precedence=precedence)
+                workflow_bytes = path.read_bytes()
+                sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
+                sidecar_bytes = (
+                    sidecar_path.read_bytes() if sidecar_path.is_file() else None
+                )
+                source_document = parse_workflow_source_bytes(
+                    path,
+                    workflow_bytes=workflow_bytes,
+                    sidecar_bytes=sidecar_bytes,
+                    source=source,
+                    precedence=precedence,
+                )
             except WorkflowResourceCapacityError:
                 invalid.append(_error_entry(path.stem, "catalog_capacity"))
                 continue
             except (OSError, UnicodeError, WorkflowValidationError, ValueError):
                 invalid.append(_error_entry(path.stem, "invalid_definition"))
                 continue
-            name = package.definition.name
+            name = source_document.name
             if not name.strip() or len(name) > 128:
                 invalid.append(_error_entry(name, "invalid_definition"))
                 continue
@@ -307,16 +323,47 @@ def _discover_catalog(
                 level.pop(name, None)
                 continue
             if name not in duplicate_names:
-                level[name] = package
+                level[name] = source_document
         invalid.extend(
             _error_entry(name, "invalid_definition") for name in sorted(duplicate_names)
         )
-        for name, package in level.items():
-            selected.setdefault(name, package)
+        source_documents.extend(level.values())
+
+    raw_snapshot = WorkflowCatalogSnapshot.capture(source_documents)
+    compiled_sources: list[WorkflowSourceDocument] = []
+    compiled_by_source: dict[tuple[str, int, str], WorkflowPackage] = {}
+    for source_document in source_documents:
+        try:
+            compiled = compile_workflow(source_document, raw_snapshot)
+        except (OSError, UnicodeError, WorkflowValidationError, ValueError):
+            invalid.append(_error_entry(source_document.name, "invalid_definition"))
+            continue
+        compiled_name = compiled.package.definition.name
+        if (
+            not compiled_name.strip()
+            or len(compiled_name) > 128
+            or compiled_name != source_document.name
+        ):
+            invalid.append(_error_entry(compiled_name, "invalid_definition"))
+            continue
+        compiled_sources.append(source_document)
+        compiled_by_source[
+            (
+                source_document.source,
+                source_document.precedence,
+                str(source_document.workflow_path),
+            )
+        ] = compiled.package
+
+    selected_snapshot = WorkflowCatalogSnapshot.capture(compiled_sources)
+    selected = [
+        compiled_by_source[(source.source, source.precedence, str(source.workflow_path))]
+        for source in selected_snapshot.selected.values()
+    ]
     return (
         tuple(
             sorted(
-                [*selected.values(), *invalid],
+                [*selected, *invalid],
                 key=lambda item: (
                     item.definition.name
                     if isinstance(item, WorkflowPackage)
