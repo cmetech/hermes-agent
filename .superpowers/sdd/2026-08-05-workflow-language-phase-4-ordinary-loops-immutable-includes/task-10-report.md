@@ -174,3 +174,14 @@ out-of-scope tests or weakening Task 9 invariants. Exact-base reproduction estab
 that their remaining failures are not caused by Task 10 or this fix round. The
 pre-existing concerns documented above remain unchanged; no test was weakened or
 edited merely to force a green aggregate result.
+
+### Fix round 1 evidence correction
+
+The focused RED/GREEN sequence above directly invoked `.venv/bin/python -m pytest`,
+which deviated from the required process that every Python test run use
+`scripts/run_tests.sh`. This was a process-only deviation: the unchanged current
+implementation and tests were rerun through the compliant command
+`scripts/run_tests.sh tests/plugins/workflow/test_phase4_surfaces.py tests/plugins/workflow/test_phase4_defensive_invariants.py`,
+which exited successfully with 18 passed / 0 failed. No production or test changes
+were needed for the compliant rerun; this correction changes only the evidence
+record.
