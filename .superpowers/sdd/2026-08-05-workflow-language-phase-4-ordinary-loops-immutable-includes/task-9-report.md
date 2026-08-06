@@ -220,6 +220,14 @@ history, and public evidence.
   evidence. Public event views strip recovery projections and expose only bounded
   payloads.
 - No unresolved concerns remain for Task 9.
+- ## Integrity exception round 7 (integrity-only)
+- `RunStore._decide_run` now calls `RunScheduler._load_verified_run_package(run_id)`
+  before an approved `loop_signal_confirmation` can publish a typed loop output.
+  This re-validates the full format-2 sealed closure (`definition.yaml`,
+  `resources.json`, optional `policy.yaml`, and sealed-tree digests) before any
+  promotion step.
+- Net effect: tampering with sealed-closure content while preserving loop metadata
+  (id/output_type) cannot reach typed output publication on approval.
 
 ## Review convergence: fix round 5 of 5
 

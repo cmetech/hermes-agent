@@ -16353,11 +16353,13 @@ class RunStore:
             for node in preliminary.get("nodes", {}).values()
         )
         definitions = None
-        if not has_signal_confirmation:
-            from plugins.workflow.scheduler import RunScheduler
+        from plugins.workflow.scheduler import RunScheduler
 
+        if not has_signal_confirmation:
             package = RunScheduler(self)._load_run_package(run_id)
             definitions = {node.id: node for node in package.definition.nodes}
+        else:
+            RunScheduler(self)._load_verified_run_package(run_id)
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),
