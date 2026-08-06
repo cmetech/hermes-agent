@@ -58,6 +58,7 @@ from plugins.workflow.lease_clock import (
 from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
+    LoopSignalConfirmation,
     RunExecutionLimits,
     TerminalJournalReserve,
     WorkflowLanguageProfile,
@@ -1915,7 +1916,9 @@ def _journaled_typed_publications(
         and language.get("effective_profile") == "archon-2026-07"
     )
     structured_outputs = language.get("structured_outputs") if archon else None
-    if archon and not isinstance(structured_outputs, Mapping):
+    if archon and language.get("normalizer_version") == 1:
+        structured_outputs = {}
+    elif archon and not isinstance(structured_outputs, Mapping):
         raise JournalRecoveryError(
             "typed publication language authority is invalid"
         )
@@ -7231,6 +7234,29 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
+            pending_interaction = node.get("pending_interaction")
+            if (
+                isinstance(pending_interaction, Mapping)
+                and pending_interaction.get("type")
+                == "loop_signal_confirmation"
+            ):
+                try:
+                    confirmation = self._loop_signal_confirmation(
+                        pending_interaction,
+                        run_id=run_id,
+                        node_id=node_id,
+                    )
+                except ValueError:
+                    return False
+                loop_state = node.get("loop_state")
+                if (
+                    node.get("state") != "paused"
+                    or not node["attempts"]
+                    or node["attempts"][-1].get("state") != "paused"
+                    or not isinstance(loop_state, Mapping)
+                    or loop_state.get("iteration") != confirmation.iteration
+                ):
+                    return False
         next_registry_update_at = value.get("next_registry_update_at")
         try:
             pending = _pending_session_registry_payloads(value)
@@ -9470,16 +9496,27 @@ class RunStore:
             and node.get("state") == "waiting_retry"
             and isinstance(node.get("next_attempt_at"), str)
         ]
-        pending_interaction = next(
+        pending_entry = next(
             (
-                {**pending, "node_id": node.get("id")}
-                if isinstance(pending, dict)
-                else {"type": pending, "node_id": node.get("id")}
+                (pending, node.get("id"))
                 for node in node_values
                 if isinstance(node, dict)
                 and (pending := node.get("pending_interaction")) is not None
             ),
             None,
+        )
+        pending_for_actions = pending_entry[0] if pending_entry is not None else None
+        pending_interaction = (
+            {
+                **(
+                    pending_for_actions
+                    if isinstance(pending_for_actions, dict)
+                    else {"type": pending_for_actions}
+                ),
+                "node_id": pending_entry[1],
+            }
+            if pending_entry is not None
+            else None
         )
         current_nodes = [
             node["id"]
@@ -9619,7 +9656,15 @@ class RunStore:
             "pending_interaction": pending_interaction,
             "next_actions": available_actions(
                 status,
-                pending_interaction,
+                (
+                    pending_for_actions
+                    if isinstance(pending_for_actions, Mapping)
+                    else (
+                        {"type": pending_for_actions}
+                        if pending_for_actions is not None
+                        else None
+                    )
+                ),
                 health=health,
                 archived=bool(run.get("archived_at")),
                 can_resume=blocking_reason != "foreground_owner_unavailable",
@@ -11917,6 +11962,32 @@ class RunStore:
         }:
             raise ValueError(f"invalid node completion state: {status}")
         artifacts = tuple(artifacts)
+        pending_candidate = (metadata or {}).get("pending_interaction")
+        if (
+            isinstance(pending_candidate, Mapping)
+            and pending_candidate.get("type") == "loop_signal_confirmation"
+        ):
+            if status != "paused":
+                raise ValueError("loop signal confirmation requires a paused node")
+            confirmation = self._loop_signal_confirmation(
+                pending_candidate,
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+            )
+            loop_state = (metadata or {}).get("loop_state")
+            if (
+                not isinstance(loop_state, Mapping)
+                or loop_state.get("iteration") != confirmation.iteration
+            ):
+                raise ValueError("loop signal iteration state is inconsistent")
+            matches = [
+                artifact
+                for artifact in artifacts
+                if artifact.relative_path == confirmation.result_artifact
+                and artifact.sha256 == confirmation.result_sha256
+            ]
+            if len(matches) != 1:
+                raise ValueError("loop signal result artifact identity is missing")
         directory = self.run_directory(claim.run_id)
         with (
             self._terminal_completion_guard(claim),
@@ -14695,6 +14766,81 @@ class RunStore:
         value = pending.get("interaction_id") or pending.get("action_digest")
         return str(value) if isinstance(value, str) and value else None
 
+    @staticmethod
+    def _loop_signal_confirmation(
+        pending: object,
+        *,
+        run_id: str,
+        node_id: str,
+    ) -> LoopSignalConfirmation:
+        if not isinstance(pending, Mapping):
+            raise ValueError("loop signal confirmation is malformed")
+        return LoopSignalConfirmation.from_mapping(
+            pending,
+            run_id=run_id,
+            node_id=node_id,
+        )
+
+    @staticmethod
+    def _verify_pending_loop_result(
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        node: Mapping[str, object],
+        confirmation: LoopSignalConfirmation,
+    ) -> None:
+        attempts = node.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ValueError("loop signal result attempt is missing")
+        attempt_id = attempts[-1].get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("loop signal result attempt is malformed")
+        relative = PurePosixPath(confirmation.result_artifact)
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+        }
+        if len(relative.parts) <= 3 or relative.parts[:3] not in owned_prefixes:
+            raise ValueError("loop signal result is not owned by the paused attempt")
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, Mapping)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") == attempt_id
+            and artifact.get("relative_path") == confirmation.result_artifact
+            and artifact.get("sha256") == confirmation.result_sha256
+        ]
+        if len(matches) != 1:
+            raise ValueError("loop signal result artifact identity is ambiguous")
+        size_bytes = matches[0].get("size_bytes")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise ValueError("loop signal result artifact size is invalid")
+        try:
+            content = _read_descriptor_relative(
+                directory,
+                confirmation.result_artifact,
+                size_bytes=size_bytes,
+            )
+        except (OSError, ArchonOutputIntegrityError, ArchonOutputUnavailableError) as exc:
+            raise ValueError("loop signal result artifact is unavailable") from exc
+        if (
+            len(content) != size_bytes
+            or not hmac.compare_digest(
+                _sha256(content), confirmation.result_sha256
+            )
+        ):
+            raise ValueError("loop signal result artifact digest changed")
+
     def _already_decided(
         self,
         projection: Mapping[str, object],
@@ -14786,10 +14932,32 @@ class RunStore:
         if len(response.encode("utf-8")) > min(self.max_input_bytes, 64 * 1024):
             raise InputSnapshotError("approval response exceeds the configured limit")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        from plugins.workflow.schema import load_workflow
+        preliminary = json.loads((directory / "run.json").read_text())
+        has_signal_confirmation = any(
+            isinstance(node, Mapping)
+            and (
+                (
+                    node.get("state") == "paused"
+                    and isinstance(node.get("pending_interaction"), Mapping)
+                    and node["pending_interaction"].get("type")
+                    == "loop_signal_confirmation"
+                )
+                or (
+                    isinstance(node.get("approval_last_decision"), Mapping)
+                    and node["approval_last_decision"].get("type")
+                    == "loop_signal_confirmation"
+                    and node["approval_last_decision"].get("interaction_id")
+                    == interaction_id
+                )
+            )
+            for node in preliminary.get("nodes", {}).values()
+        )
+        definitions = None
+        if not has_signal_confirmation:
+            from plugins.workflow.scheduler import RunScheduler
 
-        package = load_workflow(directory / "definition.yaml")
-        definitions = {node.id: node for node in package.definition.nodes}
+            package = RunScheduler(self)._load_run_package(run_id)
+            definitions = {node.id: node for node in package.definition.nodes}
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),
@@ -14820,17 +14988,43 @@ class RunStore:
             assert resolved_id is not None
             pending = node["pending_interaction"]
             pending_type = str(pending.get("type") or pending.get("kind") or "")
+            confirmation = None
+            if pending_type == "loop_signal_confirmation":
+                if decision != "approved":
+                    raise ValueError("loop signal confirmation is not rejectable")
+                if expected_state_version is None:
+                    raise ValueError(
+                        "expected state version is required for loop signal confirmation"
+                    )
+                confirmation = self._loop_signal_confirmation(
+                    pending,
+                    run_id=run_id,
+                    node_id=node_id,
+                )
+                self._verify_pending_loop_result(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    confirmation=confirmation,
+                )
+            elif definitions is None:
+                raise WorkflowConflict("pending interaction changed during decision")
             safe_response = (_sanitize_diagnostic(response.strip()) or "")[:64_000]
             record = {
                 "decision": decision,
                 "interaction_id": resolved_id,
             }
+            if pending_type == "loop_signal_confirmation":
+                record["type"] = pending_type
             node["approval_last_decision"] = record
             node.pop("pending_interaction", None)
             event_payload: dict[str, object] = {
                 "decision": decision,
                 "interaction_id": resolved_id,
             }
+            if pending_type == "loop_signal_confirmation" and safe_response:
+                event_payload["comment"] = safe_response
             if actor:
                 event_payload["actor"] = _sanitize_diagnostic(actor)
             if channel:
@@ -14925,9 +15119,15 @@ class RunStore:
                 elif pending_type == "approval":
                     node["state"] = "ready"
                     node["action_grant"] = resolved_id
+                elif pending_type == "loop_signal_confirmation":
+                    assert confirmation is not None
+                    node["state"] = "succeeded"
+                    if node.get("attempts"):
+                        node["attempts"][-1]["state"] = "succeeded"
                 else:
                     raise ValueError("pending interaction is not approvable")
             else:
+                assert definitions is not None
                 definition = definitions[node_id]
                 approval = (
                     definition.value if definition.node_type == "approval" else {}
@@ -14956,7 +15156,11 @@ class RunStore:
             self._append_locked(
                 directory,
                 projection,
-                f"interaction_{decision}",
+                (
+                    "loop_signal_accepted"
+                    if pending_type == "loop_signal_confirmation"
+                    else f"interaction_{decision}"
+                ),
                 event_payload,
                 node_id=node_id,
             )
@@ -15056,13 +15260,30 @@ class RunStore:
                 for node_id, node in projection["nodes"].items()
                 if node.get("state") == "paused"
                 and isinstance(node.get("pending_interaction"), dict)
-                and node["pending_interaction"].get("type") == "loop_input"
+                and node["pending_interaction"].get("type")
+                in {"loop_input", "loop_signal_confirmation"}
                 and self._interaction_identity(node) == interaction_id
             ]
             if len(candidates) != 1:
                 raise ValueError("run does not have exactly one pending loop input")
             node_id, node = candidates[0]
-            generation = int(node.get("loop_state", {}).get("iteration", 0))
+            pending = node["pending_interaction"]
+            pending_type = str(pending.get("type") or "")
+            if pending_type == "loop_signal_confirmation":
+                confirmation = self._loop_signal_confirmation(
+                    pending,
+                    run_id=run_id,
+                    node_id=node_id,
+                )
+                if not user_input.strip():
+                    raise ValueError("loop signal feedback must not be empty")
+                if confirmation.iteration >= confirmation.max_iterations:
+                    raise ValueError(
+                        "loop signal feedback is unavailable on the final iteration"
+                    )
+                generation = confirmation.iteration
+            else:
+                generation = int(node.get("loop_state", {}).get("iteration", 0))
             relative = (
                 Path("nodes")
                 / node_id
@@ -15083,6 +15304,12 @@ class RunStore:
             node["state"] = "ready"
             node.pop("pending_interaction", None)
             node["loop_user_input_artifact"] = relative.as_posix()
+            if pending_type == "loop_signal_confirmation":
+                node["approval_last_decision"] = {
+                    "decision": "feedback",
+                    "interaction_id": interaction_id,
+                    "type": pending_type,
+                }
             event_payload: dict[str, object] = {
                 "artifact": artifact,
                 "iteration": generation,
@@ -15095,7 +15322,11 @@ class RunStore:
             self._append_locked(
                 directory,
                 projection,
-                "loop_input_provided",
+                (
+                    "loop_feedback_provided"
+                    if pending_type == "loop_signal_confirmation"
+                    else "loop_input_provided"
+                ),
                 event_payload,
                 node_id=node_id,
             )

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+import threading
 
 import pytest
 import yaml
 
 from plugins.workflow.dependency_manifest import WorkflowDependencyManifest
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.machine_contract import WorkflowConflict
+from plugins.workflow.models import LoopSignalConfirmation, WorkflowValidationError
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.store import ArtifactRef, RunStore
 
 
 def _parse(path: Path, *, sidecar: bytes | None, source: str, precedence: int):
@@ -53,6 +59,70 @@ def _root_command_compilation(tmp_path: Path, workflow_writer):
         precedence=1,
     )
     return _compile(source), source, command
+
+
+def _defensive_signal_pause(
+    tmp_path: Path,
+    workflow_writer,
+    *,
+    key: str,
+    iteration: int = 1,
+    maximum: int = 2,
+):
+    store = RunStore(tmp_path / "signal-home", max_executing_runs=20)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / key,
+            name=f"defensive-{key}",
+            nodes=[{"id": "refine", "bash": "true"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=package.definition.name,
+            concurrency_policy="allow",
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "refine", f"worker-{key}")
+    assert claim is not None
+    store.mark_node_started(claim)
+    result = b"defensive cleaned result\n"
+    digest = hashlib.sha256(result).hexdigest()
+    relative = (
+        Path("nodes") / "refine" / claim.attempt_id / "iteration-output.txt"
+    )
+    path = store.run_directory(admitted.run_id) / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(result)
+    pending = LoopSignalConfirmation.create(
+        run_id=admitted.run_id,
+        node_id="refine",
+        message="Accept or refine",
+        iteration=iteration,
+        max_iterations=maximum,
+        result_artifact=relative.as_posix(),
+        result_sha256=digest,
+    ).to_dict()
+    store.complete_node(
+        claim,
+        status="paused",
+        artifacts=(
+            ArtifactRef(relative.as_posix(), "text/plain", len(result), digest),
+        ),
+        metadata={
+            "pending_interaction": pending,
+            "loop_state": {"iteration": iteration},
+        },
+    )
+    return store, admitted.run_id, pending
 
 
 def test_compilation_rejects_swapped_definition_bytes(
@@ -442,3 +512,110 @@ def test_future_compilation_changes_when_dependency_precedence_is_shadowed(
         after.dependency_manifest.dependencies[0].catalog_source,
         after.dependency_manifest.dependencies[0].precedence,
     ) == ("project", 1)
+
+
+def test_signal_stale_and_cross_run_decisions_leave_defensive_state_unchanged(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    store, first_run, first_pending = _defensive_signal_pause(
+        tmp_path,
+        workflow_writer,
+        key="stale-first",
+    )
+    store, _second_run, second_pending = _defensive_signal_pause(
+        tmp_path,
+        workflow_writer,
+        key="stale-second",
+    )
+    first = store.load_run(first_run)
+
+    with pytest.raises(WorkflowConflict):
+        store.provide_loop_input(
+            first_run,
+            "stale",
+            expected_state_version=first["state_version"] - 1,
+            interaction_id=first_pending["interaction_id"],
+        )
+    with pytest.raises(ValueError):
+        store.provide_loop_input(
+            first_run,
+            "cross-run",
+            expected_state_version=first["state_version"],
+            interaction_id=second_pending["interaction_id"],
+        )
+
+    current = store.load_run(first_run)
+    assert current["state_version"] == first["state_version"]
+    assert current["nodes"]["refine"]["pending_interaction"] == first_pending
+
+
+def test_final_signal_feedback_is_defensively_rejected_without_mutation(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    store, run_id, pending = _defensive_signal_pause(
+        tmp_path,
+        workflow_writer,
+        key="final-feedback",
+        iteration=2,
+        maximum=2,
+    )
+    paused = store.load_run(run_id)
+
+    with pytest.raises(ValueError, match="final iteration"):
+        store.provide_loop_input(
+            run_id,
+            "try again",
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+        )
+
+    assert store.load_run(run_id)["state_version"] == paused["state_version"]
+
+
+def test_concurrent_signal_decisions_have_one_defensive_winner(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    store, run_id, pending = _defensive_signal_pause(
+        tmp_path,
+        workflow_writer,
+        key="concurrent",
+    )
+    paused = store.load_run(run_id)
+    barrier = threading.Barrier(3)
+
+    def approve() -> str:
+        barrier.wait()
+        return store.approve_run(
+            run_id,
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+        ).outcome
+
+    def feedback() -> str:
+        barrier.wait()
+        try:
+            store.provide_loop_input(
+                run_id,
+                "continue",
+                expected_state_version=paused["state_version"],
+                interaction_id=pending["interaction_id"],
+            )
+        except WorkflowConflict:
+            return "conflict"
+        return "applied"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(approve), pool.submit(feedback)]
+        barrier.wait()
+        outcomes = [future.result(timeout=10) for future in futures]
+
+    assert outcomes.count("applied") == 1
+    events = store.tail_events(run_id, limit=30)
+    assert sum(
+        event["event_type"]
+        in {"loop_signal_accepted", "loop_feedback_provided"}
+        for event in events
+    ) == 1

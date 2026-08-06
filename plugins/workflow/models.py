@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+import hashlib
+import hmac
 import math
 from pathlib import Path, PurePosixPath
+import re
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -526,6 +529,178 @@ class ApprovalDecision:
     outcome: str
     interaction_id: str
     state_version: int
+
+
+_LOOP_SIGNAL_FIELDS = frozenset({
+    "type",
+    "interaction_id",
+    "message",
+    "iteration",
+    "max_iterations",
+    "result_artifact",
+    "result_sha256",
+})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+LOOP_SIGNAL_MESSAGE_MAX_BYTES = 16_384
+LOOP_SIGNAL_ARTIFACT_PATH_MAX_BYTES = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class LoopSignalConfirmation:
+    """Exact durable contract for accepting or refining one loop result."""
+
+    interaction_id: str
+    message: str
+    iteration: int
+    max_iterations: int
+    result_artifact: str
+    result_sha256: str
+
+    @staticmethod
+    def identity(
+        *,
+        run_id: str,
+        node_id: str,
+        iteration: int,
+        result_sha256: str,
+        message: str,
+    ) -> str:
+        """Bind immutable logical state without host or artifact path state."""
+        values = (run_id, node_id, str(iteration), result_sha256, message)
+        digest = hashlib.sha256(b"hermes.workflow.loop-signal.v1\0")
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("loop signal identity fields must be text")
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("loop signal identity must be valid UTF-8") from exc
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        node_id: str,
+        message: str,
+        iteration: int,
+        max_iterations: int,
+        result_artifact: str,
+        result_sha256: str,
+    ) -> "LoopSignalConfirmation":
+        interaction_id = cls.identity(
+            run_id=run_id,
+            node_id=node_id,
+            iteration=iteration,
+            result_sha256=result_sha256,
+            message=message,
+        )
+        return cls.from_mapping(
+            {
+                "type": "loop_signal_confirmation",
+                "interaction_id": interaction_id,
+                "message": message,
+                "iteration": iteration,
+                "max_iterations": max_iterations,
+                "result_artifact": result_artifact,
+                "result_sha256": result_sha256,
+            },
+            run_id=run_id,
+            node_id=node_id,
+        )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, object],
+        *,
+        run_id: str | None = None,
+        node_id: str | None = None,
+    ) -> "LoopSignalConfirmation":
+        if not isinstance(value, Mapping) or set(value) != _LOOP_SIGNAL_FIELDS:
+            raise ValueError("loop signal confirmation must have an exact field set")
+        if value.get("type") != "loop_signal_confirmation":
+            raise ValueError("loop signal confirmation type is invalid")
+        interaction_id = value.get("interaction_id")
+        result_sha256 = value.get("result_sha256")
+        if (
+            not isinstance(interaction_id, str)
+            or _SHA256_HEX.fullmatch(interaction_id) is None
+            or not isinstance(result_sha256, str)
+            or _SHA256_HEX.fullmatch(result_sha256) is None
+        ):
+            raise ValueError("loop signal confirmation digest is invalid")
+        message = value.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("loop signal confirmation message is required")
+        try:
+            message_bytes = message.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("loop signal confirmation message must be valid UTF-8") from exc
+        if len(message_bytes) > LOOP_SIGNAL_MESSAGE_MAX_BYTES:
+            raise ValueError("loop signal confirmation message is too large")
+        iteration = value.get("iteration")
+        maximum = value.get("max_iterations")
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or isinstance(maximum, bool)
+            or not isinstance(maximum, int)
+            or not 1 <= iteration <= maximum <= 100
+        ):
+            raise ValueError("loop signal confirmation iteration is invalid")
+        result_artifact = value.get("result_artifact")
+        if not isinstance(result_artifact, str) or not result_artifact:
+            raise ValueError("loop signal result artifact is required")
+        try:
+            artifact_bytes = result_artifact.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("loop signal result path must be valid UTF-8") from exc
+        relative = PurePosixPath(result_artifact)
+        if (
+            len(artifact_bytes) > LOOP_SIGNAL_ARTIFACT_PATH_MAX_BYTES
+            or "\\" in result_artifact
+            or "\x00" in result_artifact
+            or relative.is_absolute()
+            or relative.as_posix() != result_artifact
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("loop signal result artifact path is unsafe")
+        if (run_id is None) is not (node_id is None):
+            raise ValueError("loop signal identity context is incomplete")
+        if run_id is not None and node_id is not None:
+            expected = cls.identity(
+                run_id=run_id,
+                node_id=node_id,
+                iteration=iteration,
+                result_sha256=result_sha256,
+                message=message,
+            )
+            if not hmac.compare_digest(interaction_id, expected):
+                raise ValueError("loop signal confirmation identity is invalid")
+        return cls(
+            interaction_id=interaction_id,
+            message=message,
+            iteration=iteration,
+            max_iterations=maximum,
+            result_artifact=result_artifact,
+            result_sha256=result_sha256,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": "loop_signal_confirmation",
+            "interaction_id": self.interaction_id,
+            "message": self.message,
+            "iteration": self.iteration,
+            "max_iterations": self.max_iterations,
+            "result_artifact": self.result_artifact,
+            "result_sha256": self.result_sha256,
+        }
 
 
 def _bounded_seconds(value: float, name: str) -> float:
