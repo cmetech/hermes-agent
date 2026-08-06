@@ -109,6 +109,7 @@ def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
     [
         pytest.param(definition_json_schema, id="definition-schema"),
         pytest.param(language_schema.node_kind_descriptors, id="node-kinds"),
+        pytest.param(language_schema.semantic_rule_descriptors, id="semantic-rules"),
         pytest.param(workflow_authoring_contract, id="authoring-contract"),
     ],
 )
@@ -519,6 +520,50 @@ def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(pro
     assert "pattern" not in conditions["parameters"]
     assert "syntax" not in conditions["parameters"]
     assert isinstance(conditions["parameters"]["expression_pattern"], str)
+
+
+def test_strict_output_rule_adds_only_v4_loop_template_paths():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    current_rule_list = workflow_authoring_contract(profile)["semantic_rules"]
+    current_rules = {
+        item["id"]: item
+        for item in current_rule_list
+    }
+    staged_rules = {
+        item["id"]: item
+        for item in workflow_authoring_contract(
+            profile,
+            normalizer_version=4,
+        )["semantic_rules"]
+    }
+    current_paths = set(current_rules["strict-output-reference"]["field_paths"])
+    staged_paths = set(staged_rules["strict-output-reference"]["field_paths"])
+
+    assert staged_paths - current_paths == {
+        "nodes[].loop.command",
+        "nodes[].loop.gate_message",
+    }
+    assert {
+        "nodes[].loop.command",
+        "nodes[].loop.gate_message",
+    }.isdisjoint(current_paths)
+    assert language_schema.semantic_rule_descriptors(profile) == current_rule_list
+    assert language_schema.semantic_rule_descriptors(
+        profile,
+        normalizer_version=3,
+    ) == current_rule_list
+
+    legacy_default = language_schema.semantic_rule_descriptors(
+        WorkflowLanguageProfile.HERMES_LEGACY
+    )
+    assert language_schema.semantic_rule_descriptors(
+        WorkflowLanguageProfile.HERMES_LEGACY,
+        normalizer_version=1,
+    ) == legacy_default
+    assert language_schema.semantic_rule_descriptors(
+        WorkflowLanguageProfile.HERMES_LEGACY,
+        normalizer_version=2,
+    ) == legacy_default
 
 
 def test_condition_contract_publishes_ecmascript_unicode_grammar():

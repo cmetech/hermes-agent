@@ -2669,10 +2669,14 @@ def node_kind_descriptors(
 
 def semantic_rule_descriptors(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> list[dict[str, object]]:
     """Publish only semantic rules enforced by the current workflow loader."""
     selected = _profile(profile)
-    archon_v3 = selected is WorkflowLanguageProfile.ARCHON_2026_07
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
+    archon_v3 = supports_phase3_semantics(selected, selected_version)
+    phase4 = supports_phase4_semantics(selected, selected_version)
     definition_applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
@@ -2797,6 +2801,14 @@ def semantic_rule_descriptors(
                         "nodes[].script",
                         "nodes[].command",
                         "nodes[].loop.prompt",
+                        *(
+                            [
+                                "nodes[].loop.command",
+                                "nodes[].loop.gate_message",
+                            ]
+                            if phase4
+                            else []
+                        ),
                         "nodes[].loop.until_bash",
                         "nodes[].approval.message",
                         "nodes[].approval.on_reject.prompt",
@@ -3052,7 +3064,10 @@ def workflow_authoring_contract(
         ),
         "sidecar_schema": sidecar_json_schema(selected),
         "node_kinds": node_kinds,
-        "semantic_rules": semantic_rule_descriptors(selected),
+        "semantic_rules": semantic_rule_descriptors(
+            selected,
+            normalizer_version=selected_version,
+        ),
         "compatibility_codes": compatibility_code_catalog(selected),
         "documentation": contract_documentation(selected),
         "limits": {

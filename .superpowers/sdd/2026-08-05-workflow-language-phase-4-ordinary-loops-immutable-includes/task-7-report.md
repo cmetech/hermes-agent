@@ -252,3 +252,57 @@ interaction, UI, tool, telemetry, or Task 8 path changed.
 Confirmed every public versioned projection rejects the impossible pair with the
 same `workflow_normalizer_version_unsupported` compatibility error used by admission.
 No known concern remains from this convergence finding.
+
+## Fix round 3
+
+### Convergence finding resolved
+
+`semantic_rule_descriptors()` is now version-aware through the same
+`_authoring_normalizer_version()` authority as schema, node-kind, and full-contract
+projection. `workflow_authoring_contract()` passes its already-selected version into
+the rule projection, so one explicit-v4 contract is internally consistent.
+
+The inherited Archon strict-output-reference rule adds exactly
+`nodes[].loop.command` and `nodes[].loop.gate_message` when Phase 4 semantics are
+selected. Current Archon v3 adds neither. Default Archon rules and explicit-v3 rules
+are exactly equal to the current contract rule list, while legacy v1, v2, and default
+rule descriptors remain exactly equal. Direct semantic-rule projection also rejects
+impossible profile/version pairs through the shared authoritative selector.
+
+No normalizer activation, identity, sealing, snapshot, runtime, interaction, UI,
+tool, telemetry, or Task 8 path changed.
+
+### Authentic RED-GREEN evidence
+
+- RED:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k strict_output_rule_adds_only_v4_loop_template_paths`
+  produced **0 passed, 1 failed** because staged-v4 minus current-v3 strict-reference
+  paths was empty.
+- GREEN: the same command produced **1 passed, 0 failed** after versioning the rule
+  projection and adding the Phase 4-only path delta.
+- Focused contract/loader parity:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_strict_output_references.py tests/plugins/workflow/test_phase4_references.py tests/plugins/workflow/test_phase4_loops.py -q -k 'strict_output_rule_adds_only_v4_loop_template_paths or versioned_authoring_projections_reject_impossible_profile_pair or v3_generated_contract_uses_the_same_ascii_reference_grammar or included_nodes_rewrite_every_inline_reference_surface or rewritten_extension_templates_reuse_final_typed_path_validation or included_loop_command_uses_child_origin_and_rewritten_sealed_body'`
+  produced **11 passed, 0 failed**. This covers the exact current-v3 rule, the staged
+  rule delta, gate-message reference rewrite/typed validation, and authenticated
+  loop-command rewrite/validation.
+- Final current-v3 equality check plus exact strict-reference path check produced
+  **2 passed, 0 failed**.
+
+### Fix-round verification
+
+- Complete language-schema plus strict-output-reference suites: **756 passed, 0 failed**.
+- Task 7 schema/loop-executor gate: **679 passed, 0 failed**.
+- Task 7 manifest/security-boundary gate: **93 passed, 0 failed**.
+- Task 7 language/format-2 snapshot gate: **145 passed, 0 failed**.
+- Focused v1-v3 source/snapshot matrix: **72 passed, 0 failed**.
+- `.venv/bin/ruff check plugins/workflow/language_schema.py tests/plugins/workflow/test_language_schema.py`: **all checks passed**.
+- `git diff --check`: passed with no whitespace errors.
+
+### Fix-round files and self-review
+
+- `plugins/workflow/language_schema.py`
+- `tests/plugins/workflow/test_language_schema.py`
+
+Confirmed staged-v4 adds only the two requested loader-validated paths, current v3
+retains its exact pre-fix rule projection, and legacy rules remain unchanged. No known
+concern remains from this convergence finding.
