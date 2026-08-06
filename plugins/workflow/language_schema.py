@@ -14,6 +14,8 @@ from typing import Any
 from plugins.workflow.language import (
     CURRENT_NORMALIZER_BY_PROFILE,
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
+    SUPPORTED_NORMALIZER_VERSIONS,
+    supports_phase3_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -141,6 +143,20 @@ _ARCHON_V3_WHEN_NUMBER = re.compile(
 _REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
 
 
+def _require_strict_reference_semantics(normalizer_version: int) -> None:
+    if (
+        isinstance(normalizer_version, bool)
+        or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
+        or not supports_phase3_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    ):
+        raise ValueError(
+            "strict output references require inherited Phase 3 semantics"
+        )
+
+
 def is_reference_safe_node_id(value: str) -> bool:
     """Return whether a node ID is addressable by the Archon v3 grammar."""
     return bool(_ARCHON_V3_NODE_ID.fullmatch(value))
@@ -184,8 +200,7 @@ def iter_output_reference_candidate_spans(
     normalizer_version: int,
 ) -> Iterator[tuple[int, int]]:
     """Yield reference-like dollar ranges without rejecting their grammar."""
-    if normalizer_version < 3:
-        raise ValueError("strict output references require normalizer version 3 or newer")
+    _require_strict_reference_semantics(normalizer_version)
     position = 0
     while True:
         start = template.find("$", position)
@@ -206,8 +221,7 @@ def iter_output_references_in_spans(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Apply the strict grammar only to lexically admitted candidate spans."""
-    if normalizer_version < 3:
-        raise ValueError("strict output references require normalizer version 3 or newer")
+    _require_strict_reference_semantics(normalizer_version)
     previous_end = 0
     for start, end in spans:
         if start < previous_end or start < 0 or end <= start or end > len(template):
@@ -280,8 +294,7 @@ def iter_output_references(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Iterate references with the single ASCII grammar used by Archon v3."""
-    if normalizer_version < 3:
-        raise ValueError("strict output references require normalizer version 3 or newer")
+    _require_strict_reference_semantics(normalizer_version)
     position = 0
     while True:
         start = template.find("$", position)
@@ -302,8 +315,7 @@ def contains_output_reference(
     normalizer_version: int,
 ) -> bool:
     """Find any complete v3 reference despite other malformed candidates."""
-    if normalizer_version < 3:
-        raise ValueError("strict output references require normalizer version 3 or newer")
+    _require_strict_reference_semantics(normalizer_version)
     position = 0
     while True:
         start = template.find("$", position)
@@ -320,8 +332,7 @@ def iter_when_output_references(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Yield only v3 condition operands; quoted RHS text stays literal."""
-    if normalizer_version < 3:
-        raise ValueError("strict output references require normalizer version 3 or newer")
+    _require_strict_reference_semantics(normalizer_version)
     position = 0
     while position < len(expression) and expression[position].isspace():
         position += 1

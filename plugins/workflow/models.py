@@ -106,6 +106,7 @@ class WorkflowNode:
     source_index: int
     source_line: int | None
     options: Mapping[str, Any]
+    origin: WorkflowNodeOrigin | None = None
 
 
 _WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
@@ -150,6 +151,7 @@ class WorkflowSourceNode:
     field_lines: Mapping[str, int] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    origin: WorkflowNodeOrigin | None = None
 
     def __post_init__(self) -> None:
         _bounded_source_text(
@@ -176,6 +178,11 @@ class WorkflowSourceNode:
         object.__setattr__(self, "depends_on", tuple(self.depends_on))
         object.__setattr__(self, "options", freeze_value(self.options))
         object.__setattr__(self, "field_lines", freeze_value(self.field_lines))
+        if self.origin is not None and not isinstance(
+            self.origin,
+            WorkflowNodeOrigin,
+        ):
+            raise ValueError("source node origin must be workflow provenance")
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import deque
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 import math
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -64,6 +65,7 @@ from plugins.workflow.models import (
     ValidationIssue,
     WorkflowDefinition,
     WorkflowNode,
+    WorkflowNodeOrigin,
     WorkflowPackage,
     WorkflowLanguageProfile,
     WorkflowRuntimeConfig,
@@ -574,6 +576,7 @@ def _normalize_node(
     *,
     profile: WorkflowLanguageProfile,
     normalizer_version: int,
+    origin: WorkflowNodeOrigin | None = None,
 ) -> WorkflowNode:
     path = f"nodes[{index}]"
     node = _mapping(raw, path)
@@ -694,6 +697,7 @@ def _normalize_node(
         source_index=index,
         source_line=lines.get("id"),
         options=freeze_value(options),
+        origin=origin,
     )
 
 
@@ -1094,28 +1098,38 @@ def _validate_v3_static_output_references(
     structured_outputs: Mapping[str, object],
     *,
     command_bodies: Mapping[str, str] | None = None,
+    normalizer_version: int = 3,
 ) -> None:
     """Enforce the closed v3 grammar and direct-dependency reference rule."""
     issues: list[ValidationIssue] = []
+    phase4_templates = supports_phase4_semantics(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version,
+    )
     for node in nodes:
         for surface_path, template in _interpolated_node_templates(
-            node, command_bodies=command_bodies
+            node,
+            command_bodies=command_bodies,
+            include_phase4_templates=phase4_templates,
         ):
             try:
                 if surface_path.endswith(".when"):
                     references = tuple(
                         iter_when_output_references(
                             template,
-                            normalizer_version=3,
+                            normalizer_version=normalizer_version,
                         )
                     )
-                elif surface_path.endswith(".bash"):
-                    references = bash_output_references(template)
+                elif surface_path.endswith((".bash", ".until_bash")):
+                    references = bash_output_references(
+                        template,
+                        normalizer_version=normalizer_version,
+                    )
                 else:
                     references = tuple(
                         iter_output_references(
                             template,
-                            normalizer_version=3,
+                            normalizer_version=normalizer_version,
                         )
                     )
             except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
@@ -1176,9 +1190,17 @@ def _interpolated_node_templates(
     node: WorkflowNode,
     *,
     command_bodies: Mapping[str, str] | None,
+    include_phase4_templates: bool = False,
 ) -> Iterable[tuple[str, str]]:
     """Yield only fields rendered by the Phase 2 runtime variable adapter."""
-    prefix = f"nodes[{node.source_index}]"
+    if node.origin is not None and node.origin.include_instance_path:
+        instance = "/".join(node.origin.include_instance_path)
+        prefix = (
+            f"include[{instance}]/{node.origin.definition_location}:"
+            f"nodes[{node.origin.source_index}]"
+        )
+    else:
+        prefix = f"nodes[{node.source_index}]"
     when = node.options.get("when")
     if isinstance(when, str):
         yield f"{prefix}.when", when
@@ -1195,6 +1217,9 @@ def _interpolated_node_templates(
             value = node.value.get(field)
             if isinstance(value, str):
                 yield f"{prefix}.loop.{field}", value
+        gate_message = node.value.get("gate_message")
+        if include_phase4_templates and isinstance(gate_message, str):
+            yield f"{prefix}.loop.gate_message", gate_message
     elif node.node_type == "approval" and isinstance(node.value, Mapping):
         message = node.value.get("message")
         if isinstance(message, str):
@@ -1208,6 +1233,49 @@ def _interpolated_node_templates(
         body = command_bodies.get(node.id)
         if isinstance(body, str):
             yield f"{prefix}.command", body
+    if not include_phase4_templates:
+        return
+    system_prompt = node.options.get("systemPrompt")
+    if isinstance(system_prompt, str):
+        yield f"{prefix}.systemPrompt", system_prompt
+    agents = node.options.get("agents")
+    if isinstance(agents, Mapping):
+        for agent_id, raw_agent in agents.items():
+            if not isinstance(raw_agent, Mapping):
+                continue
+            for field in ("description", "prompt"):
+                template = raw_agent.get(field)
+                if isinstance(template, str):
+                    yield f"{prefix}.agents.{agent_id}.{field}", template
+    hooks = node.options.get("hooks")
+    if isinstance(hooks, Mapping):
+        for event, entries in hooks.items():
+            if not isinstance(entries, tuple | list):
+                continue
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, Mapping):
+                    continue
+                response = entry.get("response")
+                if not isinstance(response, Mapping):
+                    continue
+                for field in ("systemMessage", "stopReason"):
+                    template = response.get(field)
+                    if isinstance(template, str):
+                        yield (
+                            f"{prefix}.hooks.{event}[{index}].response.{field}",
+                            template,
+                        )
+                specific = response.get("hookSpecificOutput")
+                if not isinstance(specific, Mapping):
+                    continue
+                for field in ("permissionDecisionReason", "additionalContext"):
+                    template = specific.get(field)
+                    if isinstance(template, str):
+                        yield (
+                            f"{prefix}.hooks.{event}[{index}].response."
+                            f"hookSpecificOutput.{field}",
+                            template,
+                        )
 
 
 def validate_authenticated_command_references(
@@ -1238,13 +1306,17 @@ def validate_authenticated_resource_references(
             package.definition.nodes,
             package.language.structured_outputs,
             command_bodies=command_bodies,
+            normalizer_version=package.language.normalizer_version,
         )
         issues: list[ValidationIssue] = []
         for node in package.definition.nodes:
             body = named_script_bodies.get(node.id)
             if body is None:
                 continue
-            if contains_output_reference(body, normalizer_version=3):
+            if contains_output_reference(
+                body,
+                normalizer_version=package.language.normalizer_version,
+            ):
                 issues.append(
                     _issue(
                         f"nodes[{node.source_index}].script",
@@ -1364,6 +1436,43 @@ def _validate_sidecar_node_references(
                 "unknown_sidecar_node",
                 f"outward_action_nodes references unknown node: {node_id}",
             )
+
+
+def _expand_root_sidecar_node_references(
+    sidecar: Mapping[str, Any],
+    nodes: tuple[WorkflowNode, ...],
+) -> Mapping[str, Any]:
+    """Resolve only root-authored executable and include IDs into final nodes."""
+    root_node_ids = {
+        node.id
+        for node in nodes
+        if node.origin is None or not node.origin.include_instance_path
+    }
+    include_instances: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.origin is None or not node.origin.include_instance_path:
+            continue
+        include_instances.setdefault(
+            node.origin.include_instance_path[0],
+            [],
+        ).append(node.id)
+    expanded: list[str] = []
+    for authored_id in sidecar.get("outward_action_nodes", ()):
+        if authored_id in root_node_ids:
+            expanded.append(authored_id)
+            continue
+        instance_nodes = include_instances.get(authored_id)
+        if instance_nodes is None:
+            _fail(
+                "sidecar.outward_action_nodes",
+                "unknown_sidecar_node",
+                f"outward_action_nodes references unknown node: {authored_id}",
+            )
+        expanded.extend(instance_nodes)
+    rewritten = dict(sidecar)
+    if "outward_action_nodes" in sidecar:
+        rewritten["outward_action_nodes"] = list(dict.fromkeys(expanded))
+    return freeze_value(rewritten)
 
 
 def _package_root(path: Path) -> Path:
@@ -1604,6 +1713,24 @@ def parse_workflow_source_bytes(
         for index, node in enumerate(raw_nodes)
     )
     root = _package_root(workflow_path)
+    definition_location = _logical_source_location(workflow_path, root)
+    nodes = tuple(
+        replace(
+            node,
+            origin=WorkflowNodeOrigin(
+                include_instance_path=(),
+                package_key=f"{source}:{name}",
+                workflow_name=name,
+                catalog_source=source,
+                precedence=precedence,
+                definition_location=definition_location,
+                source_index=node.source_index,
+                source_line=node.source_line,
+                expanded_node_id=node.id,
+            ),
+        )
+        for node in nodes
+    )
     options = {
         key: value
         for key, value in document.items()
@@ -1622,7 +1749,7 @@ def parse_workflow_source_bytes(
         precedence=precedence,
         definition_bytes=workflow_bytes,
         sidecar_bytes=sidecar_bytes,
-        definition_location=_logical_source_location(workflow_path, root),
+        definition_location=definition_location,
         sidecar_location=(
             _logical_source_location(sidecar_path, root)
             if sidecar_path is not None
@@ -1701,6 +1828,7 @@ def _compile_workflow_source_document(
             dict(node.field_lines),
             profile=selection.effective_profile,
             normalizer_version=selected_normalizer_version,
+            origin=node.origin,
         )
         for node in source_document.nodes
     )
@@ -1715,6 +1843,11 @@ def _compile_workflow_source_document(
         options=source_document.options,
         source_path=source_document.workflow_path,
     )
+    if supports_phase4_semantics(
+        selection.effective_profile,
+        selected_normalizer_version,
+    ):
+        sidecar = _expand_root_sidecar_node_references(sidecar, nodes)
     node_ids = frozenset(node.id for node in nodes)
     _validate_sidecar_node_references(sidecar, node_ids)
     try:
@@ -1737,7 +1870,9 @@ def _compile_workflow_source_document(
         )
     if archon_v3:
         _validate_v3_static_output_references(
-            normalized.definition.nodes, normalized.metadata.structured_outputs
+            normalized.definition.nodes,
+            normalized.metadata.structured_outputs,
+            normalizer_version=selected_normalizer_version,
         )
     else:
         _validate_structured_output_field_references(

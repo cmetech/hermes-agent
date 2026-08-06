@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
 from agent.structured_output import canonical_json_bytes
+from plugins.workflow.bash_rendering import BashRenderingError, bash_output_references
+from plugins.workflow.language_schema import (
+    OutputReferenceToken,
+    WorkflowReferenceSyntaxError,
+    iter_output_references,
+    iter_when_output_references,
+)
 from plugins.workflow.models import (
     ExpandedWorkflowSource,
     ValidationIssue,
     WorkflowCompilationLimits,
     WorkflowIncludeAlias,
+    WorkflowNodeOrigin,
     WorkflowSourceDocument,
     WorkflowSourceNode,
     WorkflowValidationError,
@@ -48,6 +56,36 @@ def _issue(
             code=code,
             message=message,
             source_line=source_line,
+        )
+    )
+
+
+def _reference_issue(
+    code: str,
+    message: str,
+    *,
+    node: WorkflowSourceNode,
+    field: str,
+) -> WorkflowValidationError:
+    if node.origin is not None and node.origin.include_instance_path:
+        instance = "/".join(node.origin.include_instance_path)
+        path = (
+            f"include[{instance}]/{node.origin.definition_location}:"
+            f"nodes[{node.origin.source_index}].{field}"
+        )
+    else:
+        path = f"nodes[{node.source_index}].{field}"
+    top_field = field.split(".", 1)[0]
+    line = node.field_lines.get(
+        field,
+        node.field_lines.get(top_field, node.source_line),
+    )
+    return WorkflowValidationError(
+        ValidationIssue(
+            path=path,
+            code=code,
+            message=message,
+            source_line=line,
         )
     )
 
@@ -93,8 +131,262 @@ def _qualified(namespace: tuple[str, ...], node_id: str) -> str:
     return "__".join((*namespace, node_id))
 
 
+def _expanded_origin(
+    source: WorkflowSourceDocument,
+    node: WorkflowSourceNode,
+    namespace: tuple[str, ...],
+    expanded_node_id: str,
+) -> WorkflowNodeOrigin:
+    return WorkflowNodeOrigin(
+        include_instance_path=namespace,
+        package_key=_package_key(source),
+        workflow_name=source.name,
+        catalog_source=source.source,
+        precedence=source.precedence,
+        definition_location=source.definition_location,
+        source_index=node.source_index,
+        source_line=node.source_line,
+        expanded_node_id=expanded_node_id,
+    )
+
+
 def _dedupe(values) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def rewrite_reference_tokens(
+    template: str,
+    tokens: Iterable[OutputReferenceToken],
+    rename_node: Callable[[str], str],
+) -> str:
+    """Rewrite parsed output references without rescanning replacements."""
+    rewritten = template
+    for token in reversed(tuple(tokens)):
+        replacement = f"${rename_node(token.node_id)}.output"
+        if token.path:
+            replacement += "." + ".".join(token.path)
+        rewritten = rewritten[: token.start] + replacement + rewritten[token.end :]
+    return rewritten
+
+
+def _rewrite_text(
+    template: str,
+    rename_node: Callable[[str], str],
+    *,
+    bash: bool = False,
+    when: bool = False,
+) -> str:
+    if bash:
+        tokens = bash_output_references(template, normalizer_version=4)
+    elif when:
+        tokens = tuple(
+            iter_when_output_references(template, normalizer_version=4)
+        )
+    else:
+        tokens = tuple(iter_output_references(template, normalizer_version=4))
+    return rewrite_reference_tokens(template, tokens, rename_node)
+
+
+def _rewrite_agents(
+    value: Any,
+    rewrite_field: Callable[[str, str], str],
+) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    rewritten: dict[str, Any] = {}
+    for agent_id, raw_agent in value.items():
+        if not isinstance(raw_agent, Mapping):
+            rewritten[str(agent_id)] = _thaw(raw_agent)
+            continue
+        agent = _thaw(raw_agent)
+        for field in ("description", "prompt"):
+            template = agent.get(field)
+            if isinstance(template, str):
+                agent[field] = rewrite_field(
+                    template,
+                    f"agents.{agent_id}.{field}",
+                )
+        rewritten[str(agent_id)] = agent
+    return rewritten
+
+
+def _rewrite_hooks(
+    value: Any,
+    rewrite_field: Callable[[str, str], str],
+) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    rewritten = _thaw(value)
+    for event, entries in rewritten.items():
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            response = entry.get("response")
+            if not isinstance(response, dict):
+                continue
+            for field in ("systemMessage", "stopReason"):
+                template = response.get(field)
+                if isinstance(template, str):
+                    response[field] = rewrite_field(
+                        template,
+                        f"hooks.{event}[{index}].response.{field}",
+                    )
+            specific = response.get("hookSpecificOutput")
+            if not isinstance(specific, dict):
+                continue
+            for field in ("permissionDecisionReason", "additionalContext"):
+                template = specific.get(field)
+                if isinstance(template, str):
+                    specific[field] = rewrite_field(
+                        template,
+                        f"hooks.{event}[{index}].response."
+                        f"hookSpecificOutput.{field}",
+                    )
+    return rewritten
+
+
+def rewrite_expanded_node(
+    node: WorkflowSourceNode,
+    namespace: tuple[str, ...],
+    include_aliases: Mapping[str, WorkflowIncludeAlias],
+) -> WorkflowSourceNode:
+    """Rewrite one executable node using its complete include-instance namespace."""
+    if not isinstance(node, WorkflowSourceNode):
+        raise ValueError("node must be a workflow source node")
+
+    def rename_node(node_id: str) -> str:
+        qualified = _qualified(namespace, node_id)
+        alias = include_aliases.get(qualified)
+        local_node_ids = getattr(include_aliases, "local_node_ids", None)
+        if namespace and local_node_ids is not None and node_id not in local_node_ids:
+            raise _IncludeReferenceInvalid(
+                f"output reference escapes include instance: {node_id}"
+            )
+        return alias.first_sink if alias is not None else qualified
+
+    def rewrite_field(
+        template: str,
+        field: str,
+        *,
+        bash: bool = False,
+        when: bool = False,
+    ) -> str:
+        try:
+            return _rewrite_text(
+                template,
+                rename_node,
+                bash=bash,
+                when=when,
+            )
+        except WorkflowReferenceSyntaxError as exc:
+            start = exc.start if exc.start is not None else 0
+            local_alias_ids = getattr(include_aliases, "local_alias_ids", ())
+            if any(
+                template.startswith(f"${alias_id}.", start)
+                and not template.startswith(f"${alias_id}.output", start)
+                for alias_id in local_alias_ids
+            ):
+                raise _reference_issue(
+                    "include_reference_invalid",
+                    "include output references cannot address a deep child",
+                    node=node,
+                    field=field,
+                ) from exc
+            raise _reference_issue(
+                exc.code,
+                str(exc),
+                node=node,
+                field=field,
+            ) from exc
+        except _IncludeReferenceInvalid as exc:
+            raise _reference_issue(
+                "include_reference_invalid",
+                str(exc),
+                node=node,
+                field=field,
+            ) from exc
+        except BashRenderingError as exc:
+            raise _reference_issue(
+                exc.code,
+                str(exc),
+                node=node,
+                field=field,
+            ) from exc
+
+    value = _thaw(node.value)
+    if node.node_type == "prompt" and isinstance(value, str):
+        value = rewrite_field(value, "prompt")
+    elif node.node_type == "bash" and isinstance(value, str):
+        value = rewrite_field(value, "bash", bash=True)
+    elif node.node_type == "script" and isinstance(value, str) and "$" in value:
+        value = rewrite_field(value, "script")
+    elif node.node_type == "loop" and isinstance(value, dict):
+        for field in ("prompt", "gate_message"):
+            template = value.get(field)
+            if isinstance(template, str):
+                value[field] = rewrite_field(template, f"loop.{field}")
+        until_bash = value.get("until_bash")
+        if isinstance(until_bash, str):
+            value["until_bash"] = rewrite_field(
+                until_bash,
+                "loop.until_bash",
+                bash=True,
+            )
+    elif node.node_type == "approval" and isinstance(value, dict):
+        message = value.get("message")
+        if isinstance(message, str):
+            value["message"] = rewrite_field(message, "approval.message")
+        on_reject = value.get("on_reject")
+        if isinstance(on_reject, dict):
+            prompt = on_reject.get("prompt")
+            if isinstance(prompt, str):
+                on_reject["prompt"] = rewrite_field(
+                    prompt,
+                    "approval.on_reject.prompt",
+                )
+
+    options = _thaw(node.options)
+    when = options.get("when")
+    if isinstance(when, str):
+        options["when"] = rewrite_field(when, "when", when=True)
+    system_prompt = options.get("systemPrompt")
+    if isinstance(system_prompt, str):
+        options["systemPrompt"] = rewrite_field(system_prompt, "systemPrompt")
+    if "agents" in options:
+        options["agents"] = _rewrite_agents(options["agents"], rewrite_field)
+    if "hooks" in options:
+        options["hooks"] = _rewrite_hooks(options["hooks"], rewrite_field)
+    return replace(node, value=value, options=options)
+
+
+class _IncludeReferenceInvalid(ValueError):
+    pass
+
+
+class _InstanceReferenceAliases(Mapping[str, WorkflowIncludeAlias]):
+    """Internal alias view that also bounds legal child-local identifiers."""
+
+    def __init__(
+        self,
+        aliases: Mapping[str, WorkflowIncludeAlias],
+        *,
+        local_node_ids: Iterable[str],
+        local_alias_ids: Iterable[str],
+    ) -> None:
+        self._aliases = dict(aliases)
+        self.local_node_ids = frozenset(local_node_ids)
+        self.local_alias_ids = frozenset(local_alias_ids)
+
+    def __getitem__(self, key: str) -> WorkflowIncludeAlias:
+        return self._aliases[key]
+
+    def __iter__(self):
+        return iter(self._aliases)
+
+    def __len__(self) -> int:
+        return len(self._aliases)
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,10 +628,17 @@ def _expand_instance(
                 field="id",
             )
         if authored.node_type != "include":
+            expanded_id = _qualified(namespace, authored.id)
             expanded = replace(
                 authored,
-                id=_qualified(namespace, authored.id),
+                id=expanded_id,
                 depends_on=(),
+                origin=_expanded_origin(
+                    source,
+                    authored,
+                    namespace,
+                    expanded_id,
+                ),
             )
             state.reserve_node(expanded)
             nodes.append(expanded)
@@ -409,12 +708,31 @@ def _expand_instance(
         included.append((authored, child_instance))
         local_targets[authored.id] = child_instance.sinks
 
+    instance_alias_values = dict(state.aliases)
+    local_alias_ids: list[str] = []
+    for authored, child_instance in included:
+        local_alias_ids.append(authored.id)
+        instance_alias_values[_qualified(namespace, authored.id)] = WorkflowIncludeAlias(
+            entries=child_instance.entries,
+            sinks=child_instance.sinks,
+            first_sink=child_instance.sinks[0],
+        )
+    instance_aliases = _InstanceReferenceAliases(
+        instance_alias_values,
+        local_node_ids=local_targets,
+        local_alias_ids=local_alias_ids,
+    )
+
     for authored_id, expanded in direct_nodes.items():
         authored = source.nodes[expanded.source_index]
         dependencies = _resolve_dependencies(
             authored.depends_on, local_targets, namespace
         )
-        replacement = replace(expanded, depends_on=dependencies)
+        replacement = rewrite_expanded_node(
+            replace(expanded, depends_on=dependencies),
+            namespace,
+            instance_aliases,
+        )
         state.replace_node(replacement)
         _replace_instance_node(nodes, replacement)
         direct_nodes[authored_id] = replacement

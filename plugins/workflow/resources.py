@@ -805,12 +805,19 @@ class StrictSubstitutionRenderer:
         resolver = self.output_resolver or self.variables.output_reference
         return resolver(node_id, path).rendered_text
 
-    @staticmethod
-    def _references(template: str, *, bash_contexts: bool = False):
+    def _references(self, template: str, *, bash_contexts: bool = False):
         try:
             if bash_contexts:
-                return bash_output_references(template)
-            return tuple(iter_output_references(template, normalizer_version=3))
+                return bash_output_references(
+                    template,
+                    normalizer_version=self.variables.normalizer_version,
+                )
+            return tuple(
+                iter_output_references(
+                    template,
+                    normalizer_version=self.variables.normalizer_version,
+                )
+            )
         except WorkflowReferenceSyntaxError as exc:
             candidate = (
                 _REFERENCE_NODE_CANDIDATE.match(template, exc.start)
