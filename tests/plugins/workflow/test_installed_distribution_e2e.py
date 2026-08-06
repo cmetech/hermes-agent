@@ -13,6 +13,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
+
+
+def _version_selection_from_guidance(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    marked = text.split(VERSION_SELECTION_MARKER, maxsplit=1)[1]
+    payload = marked.split("```json", maxsplit=1)[1].split("```", maxsplit=1)[0]
+    return json.loads(payload)
 
 
 @pytest.mark.integration
@@ -216,6 +224,10 @@ from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
+    SUPPORTED_NORMALIZER_VERSIONS,
+)
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import parse_workflow_source_bytes, validate_package
@@ -330,6 +342,18 @@ explicit_contract = workflow_authoring_contract(
     normalizer_version=4,
 )
 print(json.dumps({
+    "current_normalizer_by_profile": {
+        profile.value: version
+        for profile, version in CURRENT_NORMALIZER_BY_PROFILE.items()
+    },
+    "supported_normalizer_versions": sorted(SUPPORTED_NORMALIZER_VERSIONS),
+    "reader_contract_versions": [
+        workflow_authoring_contract(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=version,
+        )["normalizer_version"]
+        for version in sorted(SUPPORTED_NORMALIZER_VERSIONS)
+    ],
     "default_normalizer": default_contract["normalizer_version"],
     "explicit_normalizer": explicit_contract["normalizer_version"],
     "phase4_codes": sorted(
@@ -374,6 +398,22 @@ print(json.dumps({
     )
     assert phase4_probe.returncode == 0, phase4_probe.stderr
     phase4_result = json.loads(phase4_probe.stdout)
+    installed_version_selection = {
+        "current_normalizer_by_profile": phase4_result[
+            "current_normalizer_by_profile"
+        ],
+        "supported_normalizer_versions": phase4_result[
+            "supported_normalizer_versions"
+        ],
+    }
+    assert phase4_result["reader_contract_versions"] == installed_version_selection[
+        "supported_normalizer_versions"
+    ]
+    installed_references = site / "skills" / "software-development" / "workflow-builder" / "references"
+    for reference_name in ("portable-schema.md", "authoring-checklist.md"):
+        assert _version_selection_from_guidance(
+            installed_references / reference_name
+        ) == installed_version_selection
     assert phase4_result["default_normalizer"] == 4
     assert phase4_result["explicit_normalizer"] == 4
     assert {

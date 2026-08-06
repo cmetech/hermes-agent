@@ -1,16 +1,38 @@
-# Workflow language Phase 4 pre-activation validation
+# Workflow language Phase 4 validation and activation
 
 Date: 2026-08-06
 
-Status: **PASS_AFTER_FIX; SDD/CONTROLLER FOLLOW-UPS FIXED; PRE-ACTIVATION PIN
-CONFIRMED**
+Status: **PASS_AFTER_FIX; FEATURE-BRANCH ACTIVATION COMPLETE; BASE INTEGRATION
+NOT PERFORMED**
 
-This document records Task 13 verification for ordinary loops and immutable
-compile-time includes before activation. It does not activate the language. The
-current `archon-2026-07` normalizer remains v3; v4 is available only when explicitly
-selected.
+This document records both the historical Task 13 pre-activation validation and
+the completed Task 14 feature-branch activation. New/default
+`archon-2026-07` admissions now use normalizer v4, `hermes-legacy` remains v2,
+and explicit or sealed v1-v3 compatibility remains supported. No push, merge,
+rebase, publication, `base` integration, or worktree cleanup was performed.
 
 ## Result summary
+
+- Phase 4 is active on the feature branch at activation commit
+  `7bf55d5d680faea8d82474c1d3e2a3dd8f69a096`; current Archon selects v4,
+  current legacy selects v2, and sealed readers support v1-v4.
+- The exact final Phase 4 gate passes 225/225, the activation migration set
+  passes 536/536, and the fresh installed-wheel integration passes 1/1.
+- The final full no-retry run has only the exact 27 baseline failures across 16
+  files plus the same four Anthropic setup errors. Its 32,343 passes and 688.4s
+  wall time are explicitly reconstructed/measured as described below, not
+  presented as a captured runner-summary line.
+- The historical Task 13 defensive, distribution, Desktop, functional-review,
+  and bounded security conclusions remain valid and are retained below.
+- Activation is complete only on the feature branch. No `base` integration or
+  remote/release operation was performed.
+
+## Historical Task 13 pre-activation evidence
+
+The following Task 13 sections preserve the evidence captured while Archon
+still selected v3 and v4 required explicit selection. Their pre-activation
+statements are historical observations, superseded for current/default
+admission by the Task 14 activation evidence later in this document.
 
 - The mandatory defensive gate passes with file retries disabled: 5 files, 163
   passed, 0 failed in 33.2s.
@@ -32,7 +54,7 @@ selected.
   it, and the same reviewer's scoped re-review passed with no new Critical, High, or
   Medium finding.
 
-## Mandatory defensive invariants
+### Mandatory defensive invariants
 
 Command:
 
@@ -65,7 +87,7 @@ retries disabled. Per-file
 results were 29 security-boundary tests, 33 performance-bound tests, 3 approval-race
 tests, 74 crash-recovery tests, and 24 Phase 4 defensive-invariant tests.
 
-## Bounded security review finding and fix
+### Bounded security review finding and fix
 
 The independent bounded review completed with result **`FINDINGS`** and one blocking
 Medium finding. Catalog enumeration already excludes static workflow-definition
@@ -100,7 +122,7 @@ scoped fix re-review and returned **PASS** with no new Critical, High, or Medium
 finding. The final bounded-review result is therefore **PASS_AFTER_FIX**. The platform
 gate was not triggered, and no second independent security attempt was used.
 
-## SDD fix round 1
+### SDD fix round 1
 
 The post-convergence SDD review reported two independent Important findings. Both were
 reproduced before production/test-harness changes and fixed without activating v4.
@@ -125,7 +147,7 @@ mandatory Step 1 163/163, and defensive/catalog/security-boundary 130/130, all w
 retries disabled. Step 4 remained 1,059/1,059. Ruff passed the three Python files
 touched in the round.
 
-## Controller full-suite follow-up (fix round 2)
+### Controller full-suite follow-up (fix round 2)
 
 The controller's full Python run after SDD fix round 1 reported 32,338 passed and 28
 failed, plus the known Anthropic collection error. One failure was additional and
@@ -143,7 +165,7 @@ require `agent_ready` before popping the session. The no-retry complete-file GRE
 gateway production behavior changed. A second full Python run was not required for
 this bounded controller follow-up.
 
-## Mandatory defects repaired during the gate
+### Mandatory defects repaired during the gate
 
 The full and focused gates exposed compatibility defects caused by the staged Phase 4
 implementation. Each was narrowed against current branch behavior and, where the
@@ -180,7 +202,7 @@ Focused evidence included:
 - all nine previously branch-implicated files together, retries disabled: 480 passed,
   0 failed in 69.6s.
 
-## Full Python base gate
+### Full Python base gate
 
 Command:
 
@@ -222,7 +244,7 @@ files and the same collection error. The final branch failures were:
 imported a stale managed-install `hermes_constants.py` that lacks
 `get_process_hermes_home`. Exact `base` reproduces the same import error.
 
-## Desktop gates and base attribution
+### Desktop gates and base attribution
 
 Commands:
 
@@ -248,7 +270,7 @@ cd apps/desktop && npm run lint
 Vitest emitted the existing Vite native-config-loader warning and jsdom canvas/React
 `act(...)` warnings. No dependency or lockfile was changed.
 
-## Distribution, schema, merge, and customization gate
+### Distribution, schema, merge, and customization gate
 
 Command:
 
@@ -263,7 +285,7 @@ fresh-installed-environment case in `test_installed_distribution_e2e.py` is excl
 by the repository's default marker policy; the required unmarked distribution file
 completed normally.
 
-## Static checks and activation pin
+### Historical static checks and pre-activation pin
 
 Ruff command covered all twelve Python files modified during Task 13 and passed with
 `All checks passed!`. `git diff --check` also passed.
@@ -279,10 +301,10 @@ explicit_contract_bytes=239878
 draft_2020_12_schemas=valid
 ```
 
-Therefore Phase 4 remains pre-activation. Ordinary Archon authoring still selects v3;
-Task 14 activation has not been performed.
+At the end of Task 13, Phase 4 remained pre-activation: ordinary Archon authoring
+selected v3 and Task 14 had not yet been performed.
 
-## Review status and exclusions
+### Historical review status and exclusions
 
 - Functional adversarial review: **PASS**. Independent evidence was 545 passed, 0
   failed with a clean review diff and no Critical, High, Medium, or Low finding. Scope
@@ -293,11 +315,12 @@ Task 14 activation has not been performed.
   catalog-sidecar containment/TOCTOU issue. After strict RED/GREEN repair, the same
   reviewer's scoped re-review passed with no new Critical, High, or Medium finding;
   mandatory Step 1 remained 161/161 and full catalog remained 77/77.
-- Phase 4 activation: excluded and not performed.
+- Phase 4 activation: excluded from Task 13 and not performed in that task.
 - Push, merge, and publication: excluded and not performed.
 
-Task 13 review convergence is complete. This remains a pre-activation result: Task 14,
-push, merge, rebase, publication, and worktree cleanup are not authorized here.
+Task 13 review convergence was complete as a pre-activation result. Task 14 and
+all push, merge, rebase, publication, and cleanup operations were excluded from
+that historical task.
 
 ## Task 14 activation evidence — 2026-08-06
 
@@ -381,3 +404,13 @@ runner-reported duration is invented.
 The Task 13 functional review remains clean and its bounded defensive security result
 remains **PASS_AFTER_FIX**. Activation did not introduce a new security finding or
 weaken the repaired catalog-sidecar boundary.
+
+## Conclusion
+
+Phase 4 activation is complete and verified on the feature branch: new/default
+Archon admissions use v4, legacy remains v2, and explicit or sealed v1-v3
+snapshots remain compatible. The exact activation, migration, installed-wheel,
+and baseline-attributed full-suite evidence above supports that conclusion.
+Task 13's pre-activation observations remain preserved as historical evidence;
+they no longer describe the current profile default. No `base` integration,
+push, merge, rebase, publication, release, or worktree cleanup was performed.

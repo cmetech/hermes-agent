@@ -13,8 +13,10 @@ responses, and old-snapshot execution follow the same version authority.
 Activation implementation commit:
 `7bf55d5d680faea8d82474c1d3e2a3dd8f69a096`
 (`feat(workflow): activate phase 4 language semantics`). The documentation commit is
-`docs(workflow): record phase 4 activation evidence`, the commit containing this
-report.
+`2e7e11bc4d05e5e93d37cc84162cda054432f960`
+(`docs(workflow): record phase 4 activation evidence`). The bounded SDD review
+reconciliation is the later `docs(workflow): reconcile phase 4 activation guidance`
+commit containing the updated report.
 
 No push, merge, rebase, publication, `base` integration, branch deletion, or worktree
 cleanup was performed.
@@ -64,7 +66,80 @@ Evidence files:
 - this report
 - the Phase 3 `continue.md` and `progress.md` supersession notes
 
+Review-reconciliation guidance and relationship tests:
+
+- `website/docs/user-guide/features/workflows.md`
+- `website/docs/user-guide/features/workflow-yaml-reference.md`
+- `skills/software-development/workflow-builder/references/portable-schema.md`
+- `skills/software-development/workflow-builder/references/authoring-checklist.md`
+- `docs/upstream-customizations/workflow-orchestration.yaml`
+- `tests/agent/test_workflow_builder_skill.py`
+- `tests/plugins/workflow/test_installed_distribution_e2e.py`
+- `tests/scripts/test_check_upstream_customizations.py`
+
 The current Phase 4 `progress.md` ledger was deliberately not modified.
+
+## SDD review fix round 1
+
+The independent post-activation review returned **NOT CONVERGED** with zero
+Critical, two Important, and zero Minor findings:
+
+1. Four live website/installed-skill references and the workflow customization
+   ledger still described v4 as staged while current/default Archon admission
+   already selected v4.
+2. The validation artifact appended correct activation evidence beneath a
+   pre-activation title, status, summary, and conclusion, leaving the document's
+   apparent current state contradictory.
+
+Strict relationship TDD preceded every live documentation/ledger edit. The
+source-guidance/customization RED command was:
+
+```text
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_workflow_builder_skill.py::test_operator_guidance_matches_generated_normalizer_selection tests/scripts/test_check_upstream_customizations.py::test_phase4_customization_current_state_matches_runtime_contract
+```
+
+It produced 2 files, 0 passed, and 2 failed in 0.5s: the four live guides had
+no structured current-version declaration and the ledger had no runtime-linked
+current-state invariant. The installed-wheel RED command was:
+
+```text
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_installed_distribution_e2e.py::test_extracted_wheel_registers_workflow_cli_from_a_clean_home -m integration
+```
+
+It produced 1 file, 0 passed, and 1 failed in 4.4s because the installed
+workflow-builder reference lacked that declaration; the installed runtime
+probe itself had already selected v4.
+
+After reconciliation, the two focused source/ledger relationships passed 2/2
+in 0.5s. The fresh installed-wheel relationship passed 1/1 in 8.7s, then
+passed again with explicit installed v1-v4 authoring-contract retrieval at 1/1
+in 8.2s. The complete relevant authoring/customization/distribution gate was:
+
+```text
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/agent/test_workflow_builder_skill.py tests/scripts/test_check_upstream_customizations.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py
+```
+
+It passed 283/283 across 4 files in 83.4s: 6 workflow-builder, 275 upstream-
+customization, 1 unmarked installed-distribution, and 2 showcase-distribution
+tests. A final-byte rerun after the ledger wording was reconciled passed the
+same 283/283 in 79.5s. The exact Task 14 four-file activation gate passed
+766/766 in 13.8s.
+
+The live guides now expose one parseable, operator-visible version relationship:
+current/default Archon v4, current legacy v2, and supported explicit/sealed
+readers v1-v4. Tests compare that declaration to both
+`CURRENT_NORMALIZER_BY_PROFILE` and generated authoring contracts, including
+the copied references inside a newly built wheel. The customization entry owns
+the selection authority and records the same relationship while retaining the
+original staged-publication commit subject and historical merge provenance.
+
+The validation document now leads with completed feature-branch activation,
+nests the Task 13 body under an explicit historical pre-activation heading, and
+ends with the current conclusion and the unchanged no-integration/no-remote
+boundary. No production code or security boundary changed, so no additional
+security review or full Python rerun was required. Ruff passed all three changed
+Python test files; `git diff --check`, YAML parsing, the one-marker-per-guide
+check, and the current-Phase-4-progress-ledger exclusion check all passed.
 
 ## Strict TDD evidence
 
@@ -135,4 +210,15 @@ Task 13's functional review remains clean and the bounded security conclusion re
   v4 rather than silently rewriting old contracts.
 - No new core model tool, environment variable, prompt mutation, telemetry, generated
   build output, or unrelated product surface was added.
-- No remote or integration operation was performed.
+- No remote or `base`-integration operation was performed.
+- Every live operator guide and installed reference derives its asserted versions
+  from the same runtime/generated-contract relationship; no prose snapshot test
+  stands in for that contract.
+- The customization entry's current-state invariant, merge guidance, and removal
+  condition agree with runtime while preserving the original staged-publication
+  provenance.
+- The validation title, status, top summary, historical Task 13 labeling, and final
+  conclusion now agree on feature-branch activation and explicitly deny `base`
+  integration, push, merge, rebase, publication, release, and cleanup.
+- No production code, dependency, lockfile, security surface, remote state, or current
+  Phase 4 progress ledger was changed during the review fix.

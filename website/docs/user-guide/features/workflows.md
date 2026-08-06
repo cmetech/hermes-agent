@@ -17,8 +17,8 @@ backend; keep workflow directories shared with older runtimes unversioned until
 every consumer recognizes the declaration.
 
 See the [Workflow YAML reference](./workflow-yaml-reference) for the generated
-schema commands, complete field inventory, current Phase 3 status, staged
-explicit-v4 examples, and migration steps.
+schema commands, complete field inventory, current Phase 4 status, sealed
+compatibility guidance, and migration steps.
 
 The portable graph has seven node kinds: `command`, `prompt`, `bash`, `script`,
 `loop`, `approval`, and `cancel`. MCP and skills are existing per-node options
@@ -26,20 +26,30 @@ on `command` and `prompt`, not extra node kinds. Script nodes already support
 the documented `uv` and `bun` runtimes; structured data does not add another
 script or extension node type.
 
-### Staged Phase 4 operation
+### Phase 4 operation
 
-The installed backend can generate and exercise normalizer v4 explicitly, but
-the current `archon-2026-07` default remains v3. Standard schema, discovery,
-validate, trust, and new CLI/Desktop admissions therefore stay on v3 until the
-separate activation change. The presence of a root include or an Archon
-companion does not opt a package into v4.
+New and default `archon-2026-07` admissions use normalizer v4. Current
+`hermes-legacy` admissions use v2. Explicit and already sealed v1, v2, and v3
+packages remain supported compatibility inputs; their pinned semantics do not
+move when the default changes.
 
-The staged v4 contract adds compile-only package includes and confirmed
+<!-- workflow-language-version-selection -->
+```json
+{
+  "current_normalizer_by_profile": {
+    "hermes-legacy": 2,
+    "archon-2026-07": 4
+  },
+  "supported_normalizer_versions": [1, 2, 3, 4]
+}
+```
+
+The current v4 contract adds compile-only package includes and confirmed
 ordinary-loop signals. The root companion remains the only policy authority;
 authenticated child companions are ignored. Included named resources are
 sealed from their logical child package, and the admitted composite digest
 covers the root, every selected dependency, and their resources. An explicit
-v4 integration must validate and diagnose that composite package, review and
+version selection must validate and diagnose that composite package, review and
 trust that exact digest, and admit the resulting immutable compilation—not
 reload a child independently.
 
@@ -56,7 +66,7 @@ Resume verifies the pinned normalizer, composite dependency manifest, and
 sealed resource origins before execution. The original root and child source
 trees may be unavailable after admission without changing the run; any missing
 or changed snapshot byte fails closed. Diagnose include failures by their
-stable generated codes and bounded logical paths. The staged contract does not
+stable generated codes and bounded logical paths. The v4 contract does not
 provide live child workflows, include parameters, or loop groups.
 
 ## Browse the catalog

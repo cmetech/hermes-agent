@@ -44,6 +44,24 @@ because older strict companion parsers reject the new field. An explicit
 `hermes-legacy` declaration is suitable only when every reader recognizes
 `language_compatibility`.
 
+### Current normalizer selection
+
+New and default `archon-2026-07` contracts and admissions use normalizer v4.
+Current `hermes-legacy` contracts use v2. Explicit and sealed v1, v2, and v3
+remain supported compatibility inputs, and resume preserves their pinned
+semantics.
+
+<!-- workflow-language-version-selection -->
+```json
+{
+  "current_normalizer_by_profile": {
+    "hermes-legacy": 2,
+    "archon-2026-07": 4
+  },
+  "supported_normalizer_versions": [1, 2, 3, 4]
+}
+```
+
 Phase 3 supports Archon AI `output_format` and `output_type`. `output_format`
 is normalized as bounded Draft 2020-12 JSON Schema when the package loads, and
 direct `$node.output.field` condition references are rejected only when every
@@ -91,12 +109,11 @@ to one declared inventory field: `workflow_language_profile_unsupported`,
 and Archon `archon_unknown_top_level_field`. Preserve those codes when
 reporting validation failures; do not collapse them to a generic parse error.
 
-### Staged normalizer v4
+### Normalizer v4
 
-Normal authoring contracts and new Archon admissions still select normalizer
-v3. Normalizer v4 is not the current Archon default. It is a staged, explicit contract; do not claim that
-`language_compatibility: archon-2026-07` activates it. An installed integration
-or contract test can retrieve its authoritative inventory with:
+Normal authoring contracts and new Archon admissions select normalizer v4. An
+installed integration or contract test retrieves its authoritative inventory
+with the ordinary default call:
 
 ```python
 from plugins.workflow.language_schema import workflow_authoring_contract
@@ -104,13 +121,13 @@ from plugins.workflow.models import WorkflowLanguageProfile
 
 contract = workflow_authoring_contract(
     WorkflowLanguageProfile.ARCHON_2026_07,
-    normalizer_version=4,
 )
 ```
 
-Use v4 only when the caller can explicitly compile, validate, trust, and admit
-that version while pinning it in the immutable run snapshot. Standard end-user
-CLI admission remains v3 until activation.
+Compile, validate, trust, and admit that exact contract, and pin v4 in the
+immutable run snapshot. Pass `normalizer_version=1`, `2`, or `3` only to read or
+operate an explicit historical contract; those selections retain compatibility
+and do not change the current Archon default.
 
 V4 adds `include` as a compile-only source directive. It is not executable and
 its only fields are `id`, literal `include`, optional `depends_on`, and optional
@@ -273,7 +290,7 @@ warning/fresh behavior. Use `workflow doctor`, generated
 `compatibility_codes`, and Run Inspector recovery evidence as the operator
 authority.
 
-MCP and skills remain options, not node kinds. Explicit v4 adds compile-only
+MCP and skills remain options, not node kinds. V4 adds compile-only
 includes and the sealed ordinary-loop contract above; it adds no executable
 node kind. Do not synthesize runtime child workflows, include parameters,
 `loop_group`, Phase 5 `maxBudgetUsd`, sandbox, or provider-portability

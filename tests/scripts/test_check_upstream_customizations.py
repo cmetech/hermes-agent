@@ -15,11 +15,21 @@ import pytest
 import yaml
 
 import scripts.check_upstream_customizations as customization_checker
+from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
+    SUPPORTED_NORMALIZER_VERSIONS,
+)
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
 from scripts.check_upstream_customizations import (
     classify_upstream_overlap,
     load_and_validate_manifest,
     validate_diff_coverage,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+NORMALIZER_INVARIANT_PREFIX = "current normalizer contract: "
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -71,6 +81,45 @@ _EXPECTED_PARSER_VERSIONS = {
     "remark-parse": "11.0.0",
     "micromark": "4.0.2",
 }
+
+
+def test_phase4_customization_current_state_matches_runtime_contract() -> None:
+    manifest = yaml.safe_load(
+        (
+            REPO_ROOT / "docs" / "upstream-customizations" / "workflow-orchestration.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["upstream_changes"]
+        if item["id"] == "workflow-phase4-language-contracts"
+    )
+    encoded = next(
+        invariant.removeprefix(NORMALIZER_INVARIANT_PREFIX)
+        for invariant in entry["owned_invariants"]
+        if invariant.startswith(NORMALIZER_INVARIANT_PREFIX)
+    )
+    declared = json.loads(encoded)
+    expected_current = {
+        profile.value: version
+        for profile, version in CURRENT_NORMALIZER_BY_PROFILE.items()
+    }
+
+    assert declared == {
+        "current_normalizer_by_profile": expected_current,
+        "supported_normalizer_versions": sorted(SUPPORTED_NORMALIZER_VERSIONS),
+    }
+    assert {
+        profile.value: workflow_authoring_contract(profile)["normalizer_version"]
+        for profile in CURRENT_NORMALIZER_BY_PROFILE
+    } == expected_current
+    assert [
+        workflow_authoring_contract(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=version,
+        )["normalizer_version"]
+        for version in sorted(SUPPORTED_NORMALIZER_VERSIONS)
+    ] == sorted(SUPPORTED_NORMALIZER_VERSIONS)
 
 
 def _parser_request(

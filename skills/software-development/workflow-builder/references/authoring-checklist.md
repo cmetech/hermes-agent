@@ -1,5 +1,20 @@
 # Authoring checklist
 
+Current/default Archon authoring and admission use normalizer v4; current
+legacy uses v2. Explicit and sealed v1-v3 contracts remain compatible and keep
+their pinned semantics.
+
+<!-- workflow-language-version-selection -->
+```json
+{
+  "current_normalizer_by_profile": {
+    "hermes-legacy": 2,
+    "archon-2026-07": 4
+  },
+  "supported_normalizer_versions": [1, 2, 3, 4]
+}
+```
+
 Before writing files:
 
 - Resolve the branded executable and replace every `PRODUCT_CLI` placeholder.
@@ -20,7 +35,8 @@ Before writing files:
   blocking contract evidence are shown.
 - Describe contract phase numbers only as enforcement-phase metadata, never as
   delivery dates, availability promises, or schedules.
-- Archon timeout and retry fields are supported in normalizer v3: author
+- Archon timeout and retry fields are supported: they were introduced in v3 and
+  are inherited by current v4. Author
   timeout values in milliseconds, remember the omitted Bash/script 120,000 ms
   default, and count `retry.max_attempts` as retries after the initial attempt.
   Legacy timeout values remain seconds and legacy attempts remain totals.
@@ -30,14 +46,12 @@ Before writing files:
   safe token contexts. Larger values are contents, never pathnames.
 - Only a confirmed missing cross-run session may start fresh. Same-run missing
   context and session-store errors must remain failures.
-- MCP and skills remain node options. Normalizer v4 is not the current Archon
-  default. `include` is a compile-only directive in staged v4, not an executable
-  node kind; ordinary admissions and generated contracts remain v3 until
-  activation.
-- Use explicit v4 only when the calling integration can request
-  `normalizer_version=4`, compile and admit that exact version, and preserve it
-  in the sealed run snapshot. Never imply that the Archon companion activates
-  v4 by itself.
+- MCP and skills remain node options. `include` is a compile-only v4 directive,
+  not an executable node kind; ordinary new Archon admissions and generated
+  contracts use v4.
+- Compile and admit the generated v4 contract and preserve it in the sealed run
+  snapshot. Use explicit v1-v3 only for compatibility with an intentionally
+  selected or already sealed historical contract.
 - Give an include only `id`, literal `include`, optional `depends_on`, and
   optional `trigger_rule`. Do not add runtime fields, `with`, URLs, paths,
   expressions, or a `loop_group`.
@@ -66,7 +80,7 @@ Before offering execution or scheduling:
 
 - Portable YAML and the companion match the selected generated schemas, with
   no blocking annotations or findings ignored.
-- For explicit v4, review the composite root-plus-dependency digest, stable
+- For v4, review the composite root-plus-dependency digest, stable
   include diagnostics, bounded logical origins, and all warnings before trust.
   Source deletion after admission is safe only because execution and resume
   verify the immutable dependency manifest and sealed resource bindings.
@@ -86,7 +100,7 @@ Before offering execution or scheduling:
 - Resource ceilings cover workers, parallel nodes, lifecycle seconds, total
   attempts, descendants, CPU, memory, and admission capacity.
 - Hermes `limits` and `resource_limits` are execution policy. They intersect
-  Archon v3 timeout/retry requests and do not imply budget or sandbox support.
+  Archon v3-v4 timeout/retry requests and do not imply budget or sandbox support.
 - Run `PRODUCT_CLI workflow validate PACKAGE --json`, then
   `PRODUCT_CLI workflow doctor PACKAGE --compat-report --json`. Doctor remains
   model-free, network-free, and MCP-connection-free.
