@@ -887,12 +887,14 @@ def test_catalog_rejects_external_sidecar_before_phase4_authentication(
     assert "DEFENSIVE_EXTERNAL_CHILD_SECRET" not in str(exc.value)
 
 
+@pytest.mark.parametrize("read_mode", ["descriptor_relative", "fallback"])
 @pytest.mark.parametrize("replaced_name", ["definition", "sidecar"])
 def test_catalog_rejects_definition_or_sidecar_replaced_during_capture(
     tmp_path: Path,
     monkeypatch,
     workflow_writer,
     replaced_name: str,
+    read_mode: str,
 ) -> None:
     """Catch a regular catalog candidate becoming an external symlink mid-read."""
     import os
@@ -916,22 +918,53 @@ def test_catalog_rejects_definition_or_sidecar_replaced_during_capture(
     )
     target = workflow_path if replaced_name == "definition" else sidecar_path
     external = tmp_path / f"outside-replaced-{target.name}"
-    external.write_bytes(target.read_bytes())
+    external.write_bytes(b"DEFENSIVE_EXTERNAL_CATALOG_CONTENT\n")
+    symlink_probe = tmp_path / "catalog-symlink-probe"
+    try:
+        symlink_probe.symlink_to(external)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    symlink_probe.unlink()
     original_open = os.open
+    original_close = os.close
     replaced = False
+    opened_descriptors: set[int] = set()
 
-    def replace_before_descriptor_open(path, flags, *args, **kwargs):
+    descriptor_relative_supported = (
+        os.name != "nt"
+        and hasattr(os, "O_NOFOLLOW")
+        and os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+    )
+    if read_mode == "descriptor_relative" and not descriptor_relative_supported:
+        pytest.skip("descriptor-relative no-follow reads unavailable")
+    if read_mode == "fallback":
+        monkeypatch.setattr(catalog_api.os, "supports_dir_fd", set())
+        monkeypatch.setattr(catalog_api.os, "O_NOFOLLOW", 0, raising=False)
+
+    def replace_before_catalog_open(path, flags, *args, **kwargs):
         nonlocal replaced
-        if not replaced and kwargs.get("dir_fd") is not None and path == target.name:
+        descriptor_target = (
+            kwargs.get("dir_fd") is not None and path == target.name
+        )
+        fallback_target = (
+            kwargs.get("dir_fd") is None
+            and Path(os.path.abspath(path)) == Path(os.path.abspath(target))
+        )
+        if not replaced and (descriptor_target or fallback_target):
             replaced = True
             target.unlink()
-            try:
-                target.symlink_to(external)
-            except OSError:
-                pytest.skip("symlinks unavailable")
-        return original_open(path, flags, *args, **kwargs)
+            target.symlink_to(external)
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened_descriptors.add(descriptor)
+        return descriptor
 
-    monkeypatch.setattr(catalog_api.os, "open", replace_before_descriptor_open)
+    def track_catalog_close(descriptor):
+        opened_descriptors.discard(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(catalog_api.os, "open", replace_before_catalog_open)
+    monkeypatch.setattr(catalog_api.os, "close", track_catalog_close)
 
     with pytest.raises(catalog_api.WorkflowCatalogInvalidDefinitionError) as exc:
         catalog_api.resolve_workflow_catalog_compilation(
@@ -942,7 +975,9 @@ def test_catalog_rejects_definition_or_sidecar_replaced_during_capture(
         )
 
     assert replaced is True
+    assert opened_descriptors == set()
     assert str(external) not in str(exc.value)
+    assert "DEFENSIVE_EXTERNAL_CATALOG_CONTENT" not in str(exc.value)
 
 
 def test_signal_stale_and_cross_run_decisions_leave_defensive_state_unchanged(

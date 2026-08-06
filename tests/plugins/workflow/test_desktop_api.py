@@ -2905,6 +2905,58 @@ def test_post_runs_discards_snapshot_that_does_not_match_trusted_package(
     assert list(store.staging_root.iterdir()) == []
 
 
+def test_post_runs_maps_final_authenticated_resource_change_to_conflict(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch a final live-identity race escaping API admission as HTTP 500."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    resource = commands / "identity-race.md"
+    resource.write_text("TRUSTED_RESOURCE", encoding="utf-8")
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-final-identity-race",
+        nodes=[{"id": "identity-race", "command": "identity-race"}],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_package_execution
+
+    def mutate_after_assessment(package, context, *, read_budget=None, compilation=None):
+        assessment = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+            compilation=compilation,
+        )
+        resource.write_text("CHANGED_RESOURCE_WITH_NEW_SIZE", encoding="utf-8")
+        return assessment
+
+    monkeypatch.setattr(
+        api_admission_module,
+        "assess_package_execution",
+        mutate_after_assessment,
+    )
+    response = TestClient(_app(_router()), raise_server_exceptions=False).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-final-identity-race",
+            "values": {},
+            "idempotency_key": "api-final-identity-race",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "workflow_package_changed", "retryable": False}
+    }
+    _assert_no_admission_residue(store)
+
+
 def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

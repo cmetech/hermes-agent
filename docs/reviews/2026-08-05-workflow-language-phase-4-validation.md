@@ -2,7 +2,8 @@
 
 Date: 2026-08-06
 
-Status: **PASS_AFTER_FIX; PRE-ACTIVATION PIN CONFIRMED**
+Status: **PASS_AFTER_FIX; SDD IMPORTANT FINDINGS FIXED; PRE-ACTIVATION PIN
+CONFIRMED**
 
 This document records Task 13 verification for ordinary loops and immutable
 compile-time includes before activation. It does not activate the language. The
@@ -11,12 +12,12 @@ selected.
 
 ## Result summary
 
-- The mandatory defensive gate passes with file retries disabled: 5 files, 161
-  passed, 0 failed in 33.0s.
+- The mandatory defensive gate passes with file retries disabled: 5 files, 163
+  passed, 0 failed in 33.2s.
 - The repaired branch-only regression set passes with file retries disabled: 9 files,
   480 passed, 0 failed in 69.6s.
 - The distribution/schema/merge/customization gate passes: 7 files, 1,059 passed,
-  0 failed in 99.3s.
+  0 failed in 98.9s.
 - Desktop typechecking passes. The three Vitest failures and four ESLint errors are
   reproduced exactly on clean `base`; the branch adds nine passing Desktop tests and
   no lint diagnostic.
@@ -59,9 +60,10 @@ The defensive module now additionally proves:
 - existing containment, digest, stale-action, replay, bounds, and redaction cases stay
   green.
 
-Final result: 5 files, 161 passed, 0 failed in 33.0s, with retries disabled. Per-file
+Final result after SDD fix round 1: 5 files, 163 passed, 0 failed in 33.2s, with
+retries disabled. Per-file
 results were 29 security-boundary tests, 33 performance-bound tests, 3 approval-race
-tests, 74 crash-recovery tests, and 22 Phase 4 defensive-invariant tests.
+tests, 74 crash-recovery tests, and 24 Phase 4 defensive-invariant tests.
 
 ## Bounded security review finding and fix
 
@@ -97,6 +99,31 @@ gate (128 passed), all with retries disabled. The same reviewer then performed t
 scoped fix re-review and returned **PASS** with no new Critical, High, or Medium
 finding. The final bounded-review result is therefore **PASS_AFTER_FIX**. The platform
 gate was not triggered, and no second independent security attempt was used.
+
+## SDD fix round 1
+
+The post-convergence SDD review reported two independent Important findings. Both were
+reproduced before production/test-harness changes and fixed without activating v4.
+
+1. Final API admission identity errors were untranslated. A real Desktop/API
+   regression mutated an authenticated command resource after risk assessment but
+   before `seal_authenticated_snapshot()`. RED was 0 passed / 1 failed because the
+   endpoint returned HTTP 500 instead of stable 409. Admission now translates only
+   the final seal's `OSError` to non-retryable `workflow_package_changed` 409;
+   capacity, compatibility, and storage error handling are unchanged. GREEN was 1/1,
+   and the relationship asserts no persisted run or staging snapshot.
+2. The catalog replacement regression intercepted only descriptor-relative
+   `os.open(..., dir_fd=...)`, leaving the Windows/fallback path unexercised. Forced
+   fallback RED was 0 passed / 2 failed because definition and sidecar replacements
+   did not trigger the hook. The test now covers descriptor-relative and absolute
+   fallback candidates, forces fallback without `O_NOFOLLOW`, tracks descriptor
+   closure, and asserts external paths/content stay redacted. GREEN was 4/4 across
+   definition/sidecar and both read modes. No catalog production seam was required.
+
+Post-fix-round evidence: full Desktop API 158/158, full catalog API 77/77, exact
+mandatory Step 1 163/163, and defensive/catalog/security-boundary 130/130, all with
+retries disabled. Step 4 remained 1,059/1,059. Ruff passed the three Python files
+touched in the round.
 
 ## Mandatory defects repaired during the gate
 
@@ -211,7 +238,7 @@ Command:
 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py tests/scripts/test_check_upstream_customizations.py tests/scripts/test_workflow_merge_gate.py tests/scripts/test_workflow_upstream_merge.py tests/test_desktop_workflow_test_gate.py
 ```
 
-Result: 7 files, 1,059 passed, 0 failed in 99.3s. This includes 628 language-schema,
+Result: 7 files, 1,059 passed, 0 failed in 98.9s. This includes 628 language-schema,
 49 workflow-merge-gate, 274 upstream-customization, 104 workflow-upstream-merge, 2
 showcase-distribution, and 2 Desktop-workflow-gate tests. The integration-marked
 fresh-installed-environment case in `test_installed_distribution_e2e.py` is excluded

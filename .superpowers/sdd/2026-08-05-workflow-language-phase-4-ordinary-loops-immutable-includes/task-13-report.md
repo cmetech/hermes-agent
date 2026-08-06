@@ -1,6 +1,6 @@
 # Task 13 report: Defensive, distribution, and base verification gates
 
-Status: **PASS_AFTER_FIX; PRE-ACTIVATION VERIFICATION COMPLETE**
+Status: **PASS_AFTER_FIX; SDD IMPORTANT FINDINGS FIXED; PRE-ACTIVATION**
 
 ## Outcome
 
@@ -105,11 +105,25 @@ regressions, and these two evidence documents.
    - combined focused GREEN: 4 passed / 0 failed in 0.4s;
    - full catalog API: 77 passed; Phase 4 defensive/catalog/security boundary: 128
      passed; exact Step 1: 161 passed, all with retries disabled.
+10. SDD Important admission identity race:
+    - a real Desktop/API regression changed an authenticated command resource after
+      assessment but before the final seal;
+    - RED 0/1: HTTP 500 escaped instead of stable `workflow_package_changed` 409;
+    - admission now translates only the final seal's `OSError`, leaving capacity,
+      compatibility, and storage mappings untouched;
+    - GREEN 1/1 asserts 409 and no run/staging residue; full Desktop API passed 158.
+11. SDD Important fallback coverage gap:
+    - forced fallback RED 0/2 showed the descriptor-only replacement hook never ran
+      for either definition or sidecar;
+    - the relationship now covers relative descriptor and absolute fallback opens,
+      disables `O_NOFOLLOW` in the forced fallback case, tracks all opened descriptors
+      to closure, and verifies external path/content redaction;
+    - GREEN 4/4; no catalog production refactor was needed; full catalog remained 77.
 
 ## Final deterministic verification
 
-- Exact mandatory defensive Step 1, retries disabled: 5 files, 161 passed / 0 failed
-  in 33.0s.
+- Exact mandatory defensive Step 1 after SDD fix round 1, retries disabled: 5 files,
+  163 passed / 0 failed in 33.2s.
 - Post-fix full Python gate, retries disabled: 2,776 files discovered; 32,338 tests
   passed and 27 failed across 16 files in 673.0s, plus four collection errors in one
   additional file. Every failing test and collection case exactly matches the prior
@@ -123,7 +137,9 @@ regressions, and these two evidence documents.
 - Desktop ESLint branch: 4 errors / 144 warnings. Exact `base` has the same four errors
   and 144 warnings.
 - Exact distribution/schema/merge/customization Step 4: 7 files, 1,059 passed /
-  0 failed in 99.3s.
+  0 failed in 98.9s.
+- SDD focused/full gates: admission race 1/1, descriptor/fallback replacements 4/4,
+  Desktop API 158/158, catalog API 77/77, and defensive/catalog/security 130/130.
 - Ruff on every Task 13 Python edit: passed.
 - Direct pin/schema probe: current Archon 3, latest/explicit 4, both generated schemas
   valid Draft 2020-12, explicit envelope 239,878 bytes.
