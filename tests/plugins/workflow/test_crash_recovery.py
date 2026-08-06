@@ -7,18 +7,21 @@ import os
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
     RunStore,
     TypedPublicationCandidate,
 )
+from plugins.workflow.trust import WorkflowPackageDigest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -50,6 +53,173 @@ def _run(store, package, *, idempotency_key="crash"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+class _CountedLoopRunner:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.requests = []
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        return PluginAgentRunResult(
+            final_response=self.response,
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
+def _phase4_signal_run(tmp_path, workflow_writer, *, downstream: bool = False):
+    nodes = [
+        {
+            "id": "refine",
+            "loop": {
+                "prompt": "Refine",
+                "until": "DONE",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+        }
+    ]
+    if downstream:
+        nodes.append({
+            "id": "after",
+            "bash": "printf downstream",
+            "depends_on": ["refine"],
+        })
+    workflow = workflow_writer(
+        tmp_path / "signal-crash-source" / "workflows",
+        name="signal-crash",
+        interactive=True,
+        nodes=nodes,
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    home = tmp_path / "signal-crash-home"
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="signal-crash",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="signal-crash",
+            concurrency_key="signal-crash",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return home, store, admitted.run_id
+
+
+def test_restart_publishes_journaled_loop_signal_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(tmp_path, workflow_writer)
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    original_complete = store.complete_node
+
+    def crash_before_pause_publication(*args, **kwargs):
+        if kwargs.get("status") == "paused":
+            raise SystemExit("simulated process loss after iteration journal")
+        return original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(store, "complete_node", crash_before_pause_publication)
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+    assert len(runner.requests) == 1
+    assert any(
+        event["event_type"] == "loop_iteration_completed"
+        for event in store.tail_events(run_id)
+    )
+
+    monkeypatch.setattr(store, "complete_node", original_complete)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("restart replayed a journaled provider result")
+
+    restarted = RunStore(home)
+    recovered = RunScheduler(
+        restarted,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert recovered["status"] == "paused"
+    pending = recovered["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == "loop_signal_confirmation"
+    assert len(recovered["artifacts"]) == 1
+    restarted.approve_run(
+        run_id,
+        expected_state_version=recovered["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    assert restarted.get_run_status(run_id)["status"] == "succeeded"
+    assert len(runner.requests) == 1
+
+
+def test_restart_schedules_downstream_once_after_signal_acceptance(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        downstream=True,
+    )
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    paused = RunScheduler(store, agent_runner=runner).advance(run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+
+    store.approve_run(
+        run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("accepted signal replayed the loop provider")
+
+    restarted = RunStore(home)
+    completed = RunScheduler(
+        restarted,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert completed["status"] == "succeeded"
+    assert completed["nodes"]["refine"]["state"] == "succeeded"
+    assert completed["nodes"]["after"]["state"] == "succeeded"
+    assert len(completed["nodes"]["after"]["attempts"]) == 1
+    assert len(runner.requests) == 1
 
 
 def test_expired_lease_interrupts_and_stale_completion_cannot_win(

@@ -4,16 +4,29 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import hmac
 from pathlib import Path
 import re
 from typing import Mapping
 
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
-from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.language import (
+    supports_phase3_semantics,
+    supports_phase4_semantics,
+)
 from plugins.workflow.executors.bash import BashExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
-from plugins.workflow.resources import VariableContext, substitution_renderer
+from plugins.workflow.models import LoopSignalConfirmation, WorkflowNode, freeze_value
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    ArchonOutputUnavailableError,
+    _read_descriptor_relative,
+)
+from plugins.workflow.resources import (
+    ResourceResolver,
+    VariableContext,
+    substitution_renderer,
+)
 from plugins.workflow.store import ArtifactRef
 
 
@@ -68,7 +81,58 @@ class LoopExecutor:
                 error_message="loop must be a mapping",
             )
         loop = context.node.value
-        prompt = str(loop.get("prompt", ""))
+        phase4 = supports_phase4_semantics(
+            context.language_profile,
+            context.normalizer_version,
+        )
+        loop_semantics = context.node.options.get("_sealed_loop_semantics")
+        if phase4 and (
+            not isinstance(loop_semantics, Mapping)
+            or set(loop_semantics)
+            != {
+                "prompt_source",
+                "command_binding",
+                "effective_interactive",
+                "signal_completes",
+            }
+        ):
+            return NodeExecutionResult(
+                "failed",
+                error_code="workflow_snapshot_integrity_mismatch",
+                error_message="sealed loop semantics are unavailable",
+            )
+        if phase4 and loop_semantics["prompt_source"] == "command":
+            binding = loop_semantics["command_binding"]
+            if not isinstance(binding, str) or loop.get("command") != binding:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="workflow_snapshot_integrity_mismatch",
+                    error_message="sealed loop command binding is unavailable",
+                )
+            try:
+                prompt = ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
+                ).command(binding).body
+            except (FileNotFoundError, UnicodeError, ValueError) as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="workflow_snapshot_integrity_mismatch",
+                    error_message=f"sealed loop command binding is unavailable: {exc}",
+                )
+        else:
+            prompt = str(loop.get("prompt", ""))
+        effective_interactive = (
+            bool(loop_semantics["effective_interactive"])
+            if phase4
+            else loop.get("interactive") is True
+        )
+        signal_completes = (
+            bool(loop_semantics["signal_completes"])
+            if phase4
+            else True
+        )
         signal = str(loop.get("until", ""))
         maximum = loop.get("max_iterations")
         if (
@@ -95,7 +159,10 @@ class LoopExecutor:
                 "failed",
                 error_code="loop_max_iterations",
                 error_message=f"loop reached its hard limit of {maximum} iterations",
-                metadata={"loop_state": {"iteration": maximum}},
+                metadata={
+                    "loop_state": {"iteration": maximum},
+                    **({"archon_terminal_failure": True} if phase4 else {}),
+                },
             )
         base_variables = context.variable_context
         if not isinstance(base_variables, VariableContext):
@@ -123,19 +190,73 @@ class LoopExecutor:
         previous_metadata: Mapping[str, object] | None = None
         resumed = isinstance(previous_state, Mapping)
         fresh_context = bool(loop.get("fresh_context", False))
-        if resumed and loop.get("interactive") is not True:
+        if resumed and (phase4 or loop.get("interactive") is not True):
             previous_artifact = previous_state.get("output_artifact")
             if isinstance(previous_artifact, str) and previous_artifact:
                 try:
-                    path = (context.run_directory / previous_artifact).resolve(
-                        strict=True
-                    )
-                    path.relative_to(context.run_directory.resolve())
-                    data = path.read_bytes()
-                    if len(data) > context.max_output_bytes:
-                        raise ValueError("persisted loop output exceeds its bound")
+                    if phase4:
+                        expected_size = previous_state.get("output_size_bytes")
+                        expected_digest = previous_state.get("output_sha256")
+                        if (
+                            isinstance(expected_size, bool)
+                            or not isinstance(expected_size, int)
+                            or expected_size < 0
+                            or expected_size > context.max_output_bytes
+                            or not isinstance(expected_digest, str)
+                        ):
+                            raise ValueError(
+                                "persisted loop output identity changed"
+                            )
+                        data = _read_descriptor_relative(
+                            context.run_directory,
+                            previous_artifact,
+                            size_bytes=expected_size,
+                        )
+                        if not hmac.compare_digest(
+                            hashlib.sha256(data).hexdigest(), expected_digest
+                        ):
+                            raise ValueError(
+                                "persisted loop output identity changed"
+                            )
+                    else:
+                        path = (context.run_directory / previous_artifact).resolve(
+                            strict=True
+                        )
+                        path.relative_to(context.run_directory.resolve())
+                        if not path.is_file():
+                            raise ValueError(
+                                "persisted loop output is not a regular file"
+                            )
+                        before = path.stat()
+                        data = path.read_bytes()
+                        after = path.stat()
+                        if (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                        ) != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        ):
+                            raise ValueError(
+                                "persisted loop output changed during read"
+                            )
+                        if len(data) > context.max_output_bytes:
+                            raise ValueError(
+                                "persisted loop output exceeds its bound"
+                            )
                     previous_output = data.decode("utf-8")
-                except (FileNotFoundError, OSError, UnicodeError, ValueError) as exc:
+                except (
+                    ArchonOutputIntegrityError,
+                    ArchonOutputUnavailableError,
+                    FileNotFoundError,
+                    OSError,
+                    UnicodeError,
+                    ValueError,
+                ) as exc:
                     return NodeExecutionResult(
                         "failed",
                         error_code="loop_state_invalid",
@@ -208,12 +329,48 @@ class LoopExecutor:
             previous_output = cleaned
             previous_metadata = result.metadata
             state["output_artifact"] = iteration_artifacts[-1].relative_path
+            if phase4:
+                state["output_size_bytes"] = iteration_artifacts[-1].size_bytes
+                state["output_sha256"] = iteration_artifacts[-1].sha256
+            pending_confirmation = None
+            if phase4 and completed and not signal_completes:
+                result_artifact = iteration_artifacts[-1]
+                pending_confirmation = LoopSignalConfirmation.create(
+                    run_id=context.run_id,
+                    node_id=context.node.id,
+                    message=str(loop.get("gate_message", "")),
+                    iteration=iteration,
+                    max_iterations=maximum,
+                    result_artifact=result_artifact.relative_path,
+                    result_sha256=result_artifact.sha256,
+                )
             if context.record_iteration is not None:
-                context.record_iteration(tuple(iteration_artifacts), state)
-            if completed:
+                journal_state = state
+                if pending_confirmation is not None:
+                    journal_state = {
+                        **state,
+                        "_pending_signal_confirmation": (
+                            pending_confirmation.to_dict()
+                        ),
+                    }
+                context.record_iteration(
+                    tuple(iteration_artifacts), journal_state
+                )
+            if completed and signal_completes:
                 state["completed_by"] = "signal"
                 return NodeExecutionResult(
                     "succeeded", tuple(artifacts), metadata={"loop_state": state}
+                )
+            if completed:
+                state["completed_by"] = "signal_pending_confirmation"
+                assert pending_confirmation is not None
+                return NodeExecutionResult(
+                    "paused",
+                    tuple(artifacts),
+                    metadata={
+                        "pending_interaction": pending_confirmation.to_dict(),
+                        "loop_state": state,
+                    },
                 )
             until_bash = until_bash_template
             if isinstance(until_bash, str) and until_bash:
@@ -252,7 +409,9 @@ class LoopExecutor:
             if context.is_cancelled is not None and context.is_cancelled():
                 cancelled = self._cancelled(context)
                 return replace(cancelled, artifacts=tuple(artifacts))
-            if loop.get("interactive") is True:
+            if iteration == maximum:
+                break
+            if effective_interactive:
                 message = str(loop.get("gate_message", ""))
                 identity = hashlib.sha256(
                     f"{context.run_id}\0{context.node.id}\0{iteration}\0{message}".encode()
@@ -278,7 +437,13 @@ class LoopExecutor:
             tuple(artifacts),
             "loop_max_iterations",
             f"loop reached its hard limit of {maximum} iterations",
-            {"loop_state": {"iteration": maximum, "max_iterations": maximum}},
+            {
+                "loop_state": {
+                    "iteration": maximum,
+                    "max_iterations": maximum,
+                },
+                **({"archon_terminal_failure": True} if phase4 else {}),
+            },
         )
 
 

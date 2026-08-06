@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 
 import pytest
 import yaml
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     make_language_snapshot,
@@ -45,6 +48,59 @@ def _compile_v4(path: Path):
     return _compile_version(path, 4)
 
 
+class _CountedAgentRunner:
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
+        self.requests = []
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        return PluginAgentRunResult(
+            final_response=self.responses.pop(0),
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
+def _admit_compilation(
+    tmp_path: Path,
+    compilation,
+    *,
+    key: str,
+) -> tuple[RunStore, str]:
+    store = RunStore(tmp_path / "home")
+    if compilation.package.language.normalizer_version == 4:
+        prepared = store.prepare_run_snapshot(
+            compilation.package,
+            compilation=compilation,
+            trusted_package_digest=WorkflowPackageDigest(
+                compilation.composite_digest,
+                compilation.covered_relative_paths,
+            ),
+        )
+    else:
+        prepared = store.prepare_run_snapshot(compilation.package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=compilation.package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=compilation.package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return store, admitted.run_id
+
+
 def _write_loop(
     tmp_path: Path,
     loop: dict[str, object],
@@ -65,6 +121,313 @@ def _write_loop(
         encoding="utf-8",
     )
     return path
+
+
+@pytest.mark.parametrize(
+    ("version", "explicit_signal", "expected_status"),
+    [
+        (3, None, "succeeded"),
+        (4, None, "paused"),
+        (4, True, "succeeded"),
+    ],
+)
+def test_counted_provider_signal_outcomes_follow_sealed_loop_semantics(
+    tmp_path: Path,
+    version: int,
+    explicit_signal: bool | None,
+    expected_status: str,
+) -> None:
+    loop: dict[str, object] = {
+        "prompt": "Refine",
+        "until": "DONE",
+        "max_iterations": 2,
+        "interactive": True,
+        "gate_message": "Accept this result or provide feedback",
+    }
+    if explicit_signal is not None:
+        loop["signal_completes"] = explicit_signal
+    workflow = _write_loop(
+        tmp_path / f"v{version}-{explicit_signal}",
+        loop,
+        workflow_interactive=True,
+    )
+    if version < 4:
+        workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+            "language_compatibility: archon-2026-07\n",
+            encoding="utf-8",
+        )
+    compilation = _compile_version(workflow, version)
+    store, run_id = _admit_compilation(
+        tmp_path / f"admitted-v{version}-{explicit_signal}",
+        compilation,
+        key=f"signal-v{version}-{explicit_signal}",
+    )
+    runner = _CountedAgentRunner("draft <promise>DONE</promise>")
+
+    outcome = RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    assert outcome["status"] == expected_status
+    assert len(runner.requests) == 1
+    artifact = outcome["artifacts"][-1]
+    cleaned = store.run_directory(run_id).joinpath(
+        artifact["relative_path"]
+    ).read_bytes()
+    assert cleaned == b"draft"
+    assert artifact["sha256"] == hashlib.sha256(cleaned).hexdigest()
+    if expected_status == "paused":
+        pending = outcome["nodes"]["refine"]["pending_interaction"]
+        assert pending["type"] == "loop_signal_confirmation"
+        assert pending["result_artifact"] == artifact["relative_path"]
+        assert pending["result_sha256"] == artifact["sha256"]
+        store.approve_run(
+            run_id,
+            expected_state_version=outcome["state_version"],
+            interaction_id=pending["interaction_id"],
+        )
+        assert len(runner.requests) == 1
+        assert store.get_run_status(run_id)["status"] == "succeeded"
+
+
+def test_v4_loop_executes_only_its_authenticated_command_body(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    workflow = _write_loop(
+        source_root,
+        {
+            "command": "refine",
+            "until": "DONE",
+            "max_iterations": 1,
+        },
+    )
+    command = source_root / "commands" / "refine.md"
+    command.parent.mkdir()
+    command.write_text(
+        "---\ndescription: Refine safely\n---\nUse the sealed instruction.\n",
+        encoding="utf-8",
+    )
+    compilation = _compile_v4(workflow)
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-command",
+        compilation,
+        key="sealed-command-runtime",
+    )
+    command.write_text("LIVE MUTATION MUST NOT RUN\n", encoding="utf-8")
+    runner = _CountedAgentRunner("<promise>DONE</promise>")
+
+    outcome = RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    assert outcome["status"] == "succeeded"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].prompt == "Use the sealed instruction.\n"
+
+
+def test_v4_final_interactive_iteration_fails_without_unusable_input(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / "final-iteration",
+            {
+                "prompt": "Refine",
+                "until": "DONE",
+                "max_iterations": 1,
+                "interactive": True,
+                "gate_message": "No next iteration exists",
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-final",
+        compilation,
+        key="final-hard-limit",
+    )
+    runner = _CountedAgentRunner("not complete")
+
+    outcome = RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    assert outcome["status"] == "failed", {
+        "node": outcome["nodes"]["refine"],
+        "last_error": outcome.get("last_error"),
+    }
+    assert outcome["last_error"]["code"] == "loop_max_iterations"
+    assert outcome["nodes"]["refine"].get("pending_interaction") is None
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("first_response", "pending_type"),
+    [
+        ("draft", "loop_input"),
+        ("draft <promise>DONE</promise>", "loop_signal_confirmation"),
+    ],
+)
+def test_v4_feedback_resume_authenticates_prior_output_and_consumes_input_once(
+    tmp_path: Path,
+    first_response: str,
+    pending_type: str,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / pending_type,
+            {
+                "prompt": (
+                    "Previous=<$LOOP_PREV_OUTPUT> "
+                    "Feedback=<$LOOP_USER_INPUT>"
+                ),
+                "until": "DONE",
+                "max_iterations": 3,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / f"admitted-{pending_type}",
+        compilation,
+        key=f"feedback-{pending_type}",
+    )
+    first_runner = _CountedAgentRunner(first_response)
+    paused = RunScheduler(store, agent_runner=first_runner).advance(run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == pending_type
+
+    store.provide_loop_input(
+        run_id,
+        "tighten the evidence",
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    second_runner = _CountedAgentRunner("final <promise>DONE</promise>")
+    restarted = RunStore(store.hermes_home)
+    confirmed = RunScheduler(restarted, agent_runner=second_runner).advance(run_id)
+
+    assert second_runner.requests[0].prompt == (
+        "Previous=<draft> Feedback=<tighten the evidence>"
+    )
+    assert len(first_runner.requests) == len(second_runner.requests) == 1
+    assert confirmed["nodes"]["refine"].get("loop_user_input_artifact") is None
+    second_pending = confirmed["nodes"]["refine"]["pending_interaction"]
+    assert second_pending["type"] == "loop_signal_confirmation"
+    restarted.approve_run(
+        run_id,
+        expected_state_version=confirmed["state_version"],
+        interaction_id=second_pending["interaction_id"],
+    )
+    assert len(second_runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_status", "completed_by"),
+    [
+        ("signal <promise>DONE</promise>", "paused", "signal_pending_confirmation"),
+        ("no signal", "succeeded", "until_bash"),
+    ],
+)
+def test_v4_signal_precedes_until_bash_and_plain_success_needs_no_confirmation(
+    tmp_path: Path,
+    response: str,
+    expected_status: str,
+    completed_by: str,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / completed_by,
+            {
+                "prompt": "Refine",
+                "until": "DONE",
+                "until_bash": "exit 0",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / f"admitted-{completed_by}",
+        compilation,
+        key=f"until-order-{completed_by}",
+    )
+    runner = _CountedAgentRunner(response)
+
+    outcome = RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    assert outcome["status"] == expected_status
+    node = outcome["nodes"]["refine"]
+    assert node["loop_state"]["completed_by"] == completed_by
+    if expected_status == "paused":
+        assert node["pending_interaction"]["type"] == "loop_signal_confirmation"
+    else:
+        assert node.get("pending_interaction") is None
+
+
+def test_v4_loop_evidence_projects_only_bounded_state_machine_facts(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / "evidence",
+            {
+                "prompt": "PROMPT_BODY_MUST_NOT_LEAK",
+                "until": "DONE",
+                "max_iterations": 3,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-evidence",
+        compilation,
+        key="loop-evidence",
+    )
+    first = RunScheduler(
+        store,
+        agent_runner=_CountedAgentRunner(
+            "RESULT_BODY_MUST_NOT_LEAK <promise>DONE</promise>"
+        ),
+    ).advance(run_id)
+    first_pending = first["nodes"]["refine"]["pending_interaction"]
+    store.provide_loop_input(
+        run_id,
+        "FEEDBACK_BODY_MUST_NOT_LEAK",
+        expected_state_version=first["state_version"],
+        interaction_id=first_pending["interaction_id"],
+        actor="operator-1",
+        channel="desktop",
+    )
+    second = RunScheduler(
+        store,
+        agent_runner=_CountedAgentRunner("accepted <promise>DONE</promise>"),
+    ).advance(run_id)
+    second_pending = second["nodes"]["refine"]["pending_interaction"]
+    store.approve_run(
+        run_id,
+        expected_state_version=second["state_version"],
+        interaction_id=second_pending["interaction_id"],
+        actor="operator-1",
+        channel="desktop",
+    )
+
+    evidence = EvidenceReader(store).query(run_id, kind="interactions", limit=20)
+
+    event_types = [item.get("event_type") for item in evidence["items"]]
+    assert event_types == [
+        "loop_signal_confirmation_required",
+        "loop_feedback_provided",
+        "loop_signal_confirmation_required",
+        "loop_signal_accepted",
+    ]
+    assert "operator-1" in str(evidence)
+    assert "desktop" in str(evidence)
+    assert "PROMPT_BODY_MUST_NOT_LEAK" not in str(evidence)
+    assert "RESULT_BODY_MUST_NOT_LEAK" not in str(evidence)
+    assert "FEEDBACK_BODY_MUST_NOT_LEAK" not in str(evidence)
+    assert str(tmp_path) not in str(evidence)
 
 
 def test_v4_inline_loop_projects_noninteractive_default_semantics(

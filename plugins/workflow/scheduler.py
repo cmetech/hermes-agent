@@ -49,6 +49,7 @@ from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     read_language_snapshot,
     supports_phase3_semantics,
+    supports_phase4_semantics,
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
@@ -3499,11 +3500,32 @@ class RunScheduler:
                         if structured_output is not None
                         else None
                     )
+                    runtime_node = node
+                    if (
+                        node.node_type == "loop"
+                        and supports_phase4_semantics(
+                            package.language.effective_profile,
+                            package.language.normalizer_version,
+                        )
+                    ):
+                        node_semantics = package.language.node_semantics.get(node.id)
+                        loop_semantics = (
+                            node_semantics.get("loop")
+                            if isinstance(node_semantics, Mapping)
+                            else None
+                        )
+                        runtime_node = replace(
+                            node,
+                            options={
+                                **dict(node.options),
+                                "_sealed_loop_semantics": loop_semantics,
+                            },
+                        )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
                             run_directory=self.store.run_directory(run_id),
-                            node=node,
+                            node=runtime_node,
                             attempt_id=claim.attempt_id,
                             timeout_seconds=timeout,
                             is_cancelled=lambda: self._cancelled(run_id),
@@ -4052,6 +4074,8 @@ class RunScheduler:
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
         self._reconcile_session_registry_update(run_id)
+        if self.store.reconcile_recorded_loop_signal(run_id):
+            return self.store.load_run(run_id)
         if max_nodes is None:
             advanced = self.advance_all([run_id])
             return advanced.get(run_id, self.store.load_run(run_id))
@@ -4284,8 +4308,15 @@ class RunScheduler:
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
+        recovered_loop_signals = {}
+        pending_run_ids = []
         for run_id in run_ids:
             self._reconcile_session_registry_update(run_id)
+            if self.store.reconcile_recorded_loop_signal(run_id):
+                recovered_loop_signals[run_id] = self.store.load_run(run_id)
+            else:
+                pending_run_ids.append(run_id)
+        run_ids = pending_run_ids
         authorizations = {}
         preparation_state_versions = {}
         authorized_run_ids = []
@@ -4544,6 +4575,7 @@ class RunScheduler:
             for run_id in run_ids:
                 self._resolve_graph(run_id, packages[run_id].definition.nodes)
             return {
+                **recovered_loop_signals,
                 **package_failures,
                 **{run_id: self.store.load_run(run_id) for run_id in run_ids},
             }

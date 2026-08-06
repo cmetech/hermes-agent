@@ -10,12 +10,15 @@ import threading
 import pytest
 import yaml
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.dependency_manifest import WorkflowDependencyManifest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.models import LoopSignalConfirmation, WorkflowValidationError
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import ArtifactRef, RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 def _parse(path: Path, *, sidecar: bytes | None, source: str, precedence: int):
@@ -123,6 +126,24 @@ def _defensive_signal_pause(
         },
     )
     return store, admitted.run_id, pending
+
+
+class _CountedSignalRunner:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        return PluginAgentRunResult(
+            final_response="defensive result <promise>DONE</promise>",
+            session_id="defensive-session",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
 
 
 def test_compilation_rejects_swapped_definition_bytes(
@@ -548,6 +569,73 @@ def test_signal_stale_and_cross_run_decisions_leave_defensive_state_unchanged(
     current = store.load_run(first_run)
     assert current["state_version"] == first["state_version"]
     assert current["nodes"]["refine"]["pending_interaction"] == first_pending
+
+
+def test_counted_signal_acceptance_survives_store_restart_without_provider_replay(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "restart-signal-source" / "workflows",
+        name="defensive-restart-signal",
+        interactive=True,
+        nodes=[{
+            "id": "refine",
+            "loop": {
+                "prompt": "Refine",
+                "until": "DONE",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+        }],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    compilation = _compile(
+        _parse(
+            workflow,
+            sidecar=sidecar,
+            source="project",
+            precedence=1,
+        )
+    )
+    home = tmp_path / "restart-signal-home"
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=compilation.package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="defensive-restart-signal",
+            concurrency_key=compilation.package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    runner = _CountedSignalRunner()
+    paused = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+
+    restarted = RunStore(home)
+    decision = restarted.approve_run(
+        admitted.run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    assert decision.outcome == "applied"
+    assert restarted.get_run_status(admitted.run_id)["status"] == "succeeded"
+    assert len(runner.requests) == 1
 
 
 def test_final_signal_feedback_is_defensively_rejected_without_mutation(

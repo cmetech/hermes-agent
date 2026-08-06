@@ -12249,6 +12249,30 @@ class RunStore:
                     projection,
                     session_registry_update,
                 )
+            if (
+                isinstance(pending_candidate, Mapping)
+                and pending_candidate.get("type")
+                == "loop_signal_confirmation"
+            ):
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_signal_confirmation_required",
+                    {
+                        "iteration": pending_candidate.get("iteration"),
+                        "max_iterations": pending_candidate.get("max_iterations"),
+                        "result_artifact": pending_candidate.get(
+                            "result_artifact"
+                        ),
+                        "result_sha256": pending_candidate.get("result_sha256"),
+                        "interaction_id": pending_candidate.get("interaction_id"),
+                    },
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
+                )
             self._append_locked(
                 directory,
                 projection,
@@ -12629,6 +12653,7 @@ class RunStore:
         now: LeaseClockSample | None = None,
     ) -> None:
         """Persist one completed loop iteration before evaluating continuation."""
+        artifacts = tuple(artifacts)
         directory = self.run_directory(claim.run_id)
         with workflow_lock(
             self._run_lock_path(claim.run_id)
@@ -12641,7 +12666,48 @@ class RunStore:
             if active.get("attempt_id") != claim.attempt_id:
                 raise RuntimeError("stale loop iteration")
             safe_state = dict(_sanitize(dict(loop_state)))
+            language = projection.get("language")
+            phase4 = (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            )
+            if phase4:
+                output_path = safe_state.get("output_artifact")
+                output_size = safe_state.get("output_size_bytes")
+                output_digest = safe_state.get("output_sha256")
+                matches = [
+                    artifact
+                    for artifact in artifacts
+                    if artifact.relative_path == output_path
+                    and artifact.size_bytes == output_size
+                    and artifact.sha256 == output_digest
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "phase 4 loop iteration output identity is inconsistent"
+                    )
+                pending_signal = safe_state.get(
+                    "_pending_signal_confirmation"
+                )
+                if pending_signal is not None:
+                    confirmation = self._loop_signal_confirmation(
+                        pending_signal,
+                        run_id=claim.run_id,
+                        node_id=claim.node_id,
+                    )
+                    if (
+                        confirmation.result_artifact != output_path
+                        or confirmation.result_sha256 != output_digest
+                        or confirmation.iteration != safe_state.get("iteration")
+                    ):
+                        raise ValueError(
+                            "phase 4 loop signal transition is inconsistent"
+                        )
             node["loop_state"] = safe_state
+            if phase4:
+                node.pop("loop_user_input_artifact", None)
             existing = {
                 (entry.get("attempt_id"), entry.get("relative_path"))
                 for entry in projection["artifacts"]
@@ -12672,6 +12738,146 @@ class RunStore:
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
             )
+
+    def reconcile_recorded_loop_signal(self, run_id: str) -> bool:
+        """Publish one journaled v4 signal decision without provider replay."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            candidates = []
+            for node_id, node in projection.get("nodes", {}).items():
+                loop_state = node.get("loop_state") if isinstance(node, dict) else None
+                pending = (
+                    loop_state.get("_pending_signal_confirmation")
+                    if isinstance(loop_state, Mapping)
+                    else None
+                )
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if pending is not None and isinstance(claim, Mapping):
+                    candidates.append((node_id, node, loop_state, claim, pending))
+            if not candidates:
+                return False
+            if len(candidates) != 1:
+                raise JournalRecoveryError(
+                    "multiple loop signal transitions require recovery"
+                )
+            node_id, node, loop_state, claim, pending = candidates[0]
+            confirmation = self._loop_signal_confirmation(
+                pending,
+                run_id=run_id,
+                node_id=node_id,
+            )
+            self._verify_pending_loop_result(
+                directory,
+                projection,
+                node_id=node_id,
+                node=node,
+                confirmation=confirmation,
+            )
+            attempt_id = claim.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt identity is missing"
+                )
+            attempts = node.get("attempts")
+            if not isinstance(attempts, list) or not attempts:
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt is missing"
+                )
+            attempt = next(
+                (
+                    item
+                    for item in reversed(attempts)
+                    if item.get("attempt_id") == attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt is ambiguous"
+                )
+            clean_state = dict(loop_state)
+            clean_state.pop("_pending_signal_confirmation", None)
+            clean_state["completed_by"] = "signal_pending_confirmation"
+            node["loop_state"] = clean_state
+            node["pending_interaction"] = confirmation.to_dict()
+            node["state"] = "paused"
+            node.pop("claim", None)
+            attempt.update({
+                "state": "paused",
+                "error_code": None,
+                "error_message": None,
+                "completed_at": _utc_now(),
+                "metadata": {
+                    "loop_state": clean_state,
+                    "pending_interaction": confirmation.to_dict(),
+                },
+            })
+            projection["status"] = "paused"
+            required_payload = {
+                "iteration": confirmation.iteration,
+                "max_iterations": confirmation.max_iterations,
+                "result_artifact": confirmation.result_artifact,
+                "result_sha256": confirmation.result_sha256,
+                "interaction_id": confirmation.interaction_id,
+            }
+            self._append_locked(
+                directory,
+                projection,
+                "loop_signal_confirmation_required",
+                required_payload,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "node_paused",
+                {
+                    "artifacts": [],
+                    "error_code": None,
+                    "metadata": {
+                        "loop_state": clean_state,
+                        "pending_interaction": confirmation.to_dict(),
+                    },
+                },
+                node_id=node_id,
+                attempt_id=attempt_id,
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "run_paused",
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(attempt_id, connection=connection)
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (attempt_id,),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="loop_signal_confirmation_required",
+                )
+            self._notify_coordinator()
+            return True
 
     def block_cleanup_failed(
         self,
@@ -14798,14 +15004,13 @@ class RunStore:
             raise ValueError("loop signal result attempt is malformed")
         relative = PurePosixPath(confirmation.result_artifact)
         owned_prefixes = {
-            ("nodes", node_id, attempt_id),
-            (
-                "nodes",
-                _safe_component("node", node_id),
-                _safe_component("attempt", attempt_id),
-            ),
+            ("nodes", node_id),
+            ("nodes", _safe_component("node", node_id)),
         }
-        if len(relative.parts) <= 3 or relative.parts[:3] not in owned_prefixes:
+        if (
+            len(relative.parts) <= 3
+            or relative.parts[:2] not in owned_prefixes
+        ):
             raise ValueError("loop signal result is not owned by the paused attempt")
         matches = [
             artifact
@@ -15167,6 +15372,10 @@ class RunStore:
             if terminal:
                 self._append_locked(directory, projection, "run_cancelled")
                 with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
+                    )
                     self._sync_integrity_index(
                         connection,
                         projection=projection,
@@ -15184,11 +15393,53 @@ class RunStore:
                     )
                 self._notify_coordinator()
             else:
-                projection = self._request_runnable_locked(
-                    directory,
-                    projection,
-                    reason=f"interaction_{decision}",
-                )
+                states = {
+                    candidate["state"]
+                    for candidate in projection["nodes"].values()
+                }
+                terminal_status = None
+                if states and states <= {
+                    "succeeded",
+                    "failed",
+                    "skipped",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    terminal_status = (
+                        "failed" if "failed" in states else "succeeded"
+                    )
+                if terminal_status is not None:
+                    projection["status"] = terminal_status
+                    event_type = f"run_{terminal_status}"
+                    self._append_locked(directory, projection, event_type)
+                    with self._connect() as connection:
+                        connection.execute(
+                            "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                            (
+                                projection["status"],
+                                projection["updated_at"],
+                                run_id,
+                            ),
+                        )
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=_sha256(
+                                (directory / "events.jsonl").read_bytes()
+                            ),
+                        )
+                        self._record_coordinator_wake(
+                            connection,
+                            run_id=run_id,
+                            reason_code=event_type,
+                        )
+                    self._notify_coordinator()
+                else:
+                    projection = self._request_runnable_locked(
+                        directory,
+                        projection,
+                        reason=f"interaction_{decision}",
+                    )
             return ApprovalDecision(
                 run_id=run_id,
                 node_id=node_id,

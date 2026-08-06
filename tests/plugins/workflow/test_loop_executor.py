@@ -252,6 +252,58 @@ def test_noninteractive_restart_restores_previous_persisted_output(
     assert runner.requests[0].prompt == "Previous: persisted draft"
 
 
+def test_v4_restart_rejects_symlinked_previous_output_before_provider(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / "run"
+    output = run_directory / "nodes" / "iterate" / "prior" / "output.txt"
+    output.parent.mkdir(parents=True)
+    alias = run_directory / "nodes" / "iterate" / "same-content.txt"
+    alias.write_text("persisted draft", encoding="utf-8")
+    output.symlink_to(alias)
+    content = alias.read_bytes()
+    runner = FakeAgentRunner("provider must not run")
+    context = _context(
+        tmp_path,
+        {
+            "prompt": "Previous: $LOOP_PREV_OUTPUT",
+            "until": "DONE",
+            "max_iterations": 2,
+        },
+        variable_context=VariableContext(normalizer_version=4),
+        node_state={
+            "loop_state": {
+                "iteration": 1,
+                "output_artifact": "nodes/iterate/prior/output.txt",
+                "output_size_bytes": len(content),
+                "output_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        },
+    )
+    context = replace(
+        context,
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+        node=replace(
+            context.node,
+            options=freeze_value({
+                "_sealed_loop_semantics": {
+                    "prompt_source": "inline",
+                    "command_binding": None,
+                    "effective_interactive": False,
+                    "signal_completes": False,
+                }
+            }),
+        ),
+    )
+
+    result = LoopExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "loop_state_invalid"
+    assert runner.requests == []
+
+
 def test_until_bash_exit_zero_completes_using_shell_quoted_previous_output(
     tmp_path: Path,
 ) -> None:
