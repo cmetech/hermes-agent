@@ -63,7 +63,6 @@ class NodeExecutionContext:
     record_iteration: (
         Callable[[tuple[ArtifactRef, ...], Mapping[str, object]], None] | None
     ) = None
-    record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
     spawn_intent: Callable[[str], bool] | None = None
     spawn_failed: Callable[[str, str], bool] | None = None
     process_started: Callable[[ProcessIdentity], bool] | None = None
@@ -95,6 +94,7 @@ class NodeExecutionContext:
     provider_start_delivered: Callable[[str], bool] | None = None
     provider_execute_received: Callable[[str], bool] | None = None
     provider_execute_release: Callable[[str], bool] | None = None
+    record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
 
 
 @dataclass(frozen=True)

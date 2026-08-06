@@ -8,6 +8,7 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -1886,12 +1887,11 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
     def long_name_compile(source, *args, **kwargs):
         compiled = original_compile(source, *args, **kwargs)
         if source.workflow_path.name == "long.yaml":
-            return replace(
-                compiled,
+            return SimpleNamespace(
                 package=replace(
                     compiled.package,
                     definition=replace(compiled.package.definition, name=long_name),
-                ),
+                )
             )
         return compiled
 

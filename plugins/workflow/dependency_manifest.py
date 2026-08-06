@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass, fields, is_dataclass
+from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -202,22 +204,63 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _logical_graph_value(value: object) -> object:
-    if value is None or isinstance(value, str | bool | int | float):
+def _logical_graph_value(
+    value: object,
+    *,
+    trusted_legacy_values: bool = False,
+) -> object:
+    if value is None or isinstance(value, str | bool | float):
         return value
+    if isinstance(value, int):
+        if trusted_legacy_values:
+            # Python protects decimal conversion of very large integers. Legacy
+            # workflow versions accepted such YAML scalars before Phase 4 added
+            # this internal graph digest, so represent only values that would
+            # trip that runtime guard as exact hexadecimal text.
+            decimal_limit = sys.get_int_max_str_digits()
+            estimated_digits = (abs(value).bit_length() * 30_103) // 100_000 + 1
+            if decimal_limit and estimated_digits > decimal_limit:
+                return {
+                    "$hermes_legacy_integer": format(value, "x"),
+                }
+        return value
+    if trusted_legacy_values and isinstance(value, datetime):
+        return {"$hermes_legacy_timestamp": value.isoformat()}
+    if trusted_legacy_values and isinstance(value, date):
+        return {"$hermes_legacy_date": value.isoformat()}
+    if trusted_legacy_values and isinstance(value, bytes):
+        return {"$hermes_legacy_binary": value.hex()}
     if isinstance(value, Mapping):
         return {
-            str(key): _logical_graph_value(item)
+            str(key): _logical_graph_value(
+                item,
+                trusted_legacy_values=trusted_legacy_values,
+            )
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         }
     if isinstance(value, tuple | list):
-        return [_logical_graph_value(item) for item in value]
+        return [
+            _logical_graph_value(
+                item,
+                trusted_legacy_values=trusted_legacy_values,
+            )
+            for item in value
+        ]
     if isinstance(value, set | frozenset):
-        projected = [_logical_graph_value(item) for item in value]
+        projected = [
+            _logical_graph_value(
+                item,
+                trusted_legacy_values=trusted_legacy_values,
+            )
+            for item in value
+        ]
         return sorted(projected, key=_canonical_json)
     if is_dataclass(value):
         return {
-            field.name: _logical_graph_value(getattr(value, field.name))
+            field.name: _logical_graph_value(
+                getattr(value, field.name),
+                trusted_legacy_values=trusted_legacy_values,
+            )
             for field in fields(value)
         }
     raise TypeError(
@@ -225,7 +268,11 @@ def _logical_graph_value(value: object) -> object:
     )
 
 
-def _definition_graph(definition) -> dict[str, object]:
+def _definition_graph(
+    definition,
+    *,
+    trusted_legacy_values: bool,
+) -> dict[str, object]:
     return {
         "name": definition.name,
         "description": definition.description,
@@ -233,11 +280,17 @@ def _definition_graph(definition) -> dict[str, object]:
             {
                 "id": node.id,
                 "node_type": node.node_type,
-                "value": _logical_graph_value(node.value),
+                "value": _logical_graph_value(
+                    node.value,
+                    trusted_legacy_values=trusted_legacy_values,
+                ),
                 "depends_on": list(node.depends_on),
                 "source_index": node.source_index,
                 "source_line": node.source_line,
-                "options": _logical_graph_value(node.options),
+                "options": _logical_graph_value(
+                    node.options,
+                    trusted_legacy_values=trusted_legacy_values,
+                ),
                 "origin": (
                     _origin_to_dict(node.origin)
                     if node.origin is not None
@@ -246,7 +299,10 @@ def _definition_graph(definition) -> dict[str, object]:
             }
             for node in definition.nodes
         ],
-        "options": _logical_graph_value(definition.options),
+        "options": _logical_graph_value(
+            definition.options,
+            trusted_legacy_values=trusted_legacy_values,
+        ),
     }
 
 
@@ -255,10 +311,25 @@ def digest_workflow_package_graph(package: WorkflowPackage) -> str:
     if not isinstance(package, WorkflowPackage):
         raise ValueError("package graph digest requires a WorkflowPackage")
     language = package.language
+    from plugins.workflow.language import supports_phase4_semantics
+
+    trusted_legacy_values = not supports_phase4_semantics(
+        language.effective_profile,
+        language.normalizer_version,
+    )
     graph = {
-        "source_definition": _definition_graph(package.source_definition),
-        "definition": _definition_graph(package.definition),
-        "sidecar": _logical_graph_value(package.sidecar),
+        "source_definition": _definition_graph(
+            package.source_definition,
+            trusted_legacy_values=trusted_legacy_values,
+        ),
+        "definition": _definition_graph(
+            package.definition,
+            trusted_legacy_values=trusted_legacy_values,
+        ),
+        "sidecar": _logical_graph_value(
+            package.sidecar,
+            trusted_legacy_values=trusted_legacy_values,
+        ),
         "source": package.source,
         "precedence": package.precedence,
         "language": {
@@ -271,14 +342,22 @@ def digest_workflow_package_graph(package: WorkflowPackage) -> str:
             "normalizer_version": language.normalizer_version,
             "normalized_definition_digest": language.normalized_definition_digest,
             "structured_outputs": _logical_graph_value(
-                language.structured_outputs
+                language.structured_outputs,
+                trusted_legacy_values=trusted_legacy_values,
             ),
-            "node_semantics": _logical_graph_value(language.node_semantics),
+            "node_semantics": _logical_graph_value(
+                language.node_semantics,
+                trusted_legacy_values=trusted_legacy_values,
+            ),
         },
         "compatibility_findings": _logical_graph_value(
-            package.compatibility_findings
+            package.compatibility_findings,
+            trusted_legacy_values=trusted_legacy_values,
         ),
-        "validation_issues": _logical_graph_value(package.validation_issues),
+        "validation_issues": _logical_graph_value(
+            package.validation_issues,
+            trusted_legacy_values=trusted_legacy_values,
+        ),
     }
     return hashlib.sha256(_canonical_json(graph)).hexdigest()
 
@@ -516,7 +595,12 @@ class _WorkflowManifestCounts:
     sealed_bytes: int
 
     @classmethod
-    def from_dict(cls, raw: object) -> "_WorkflowManifestCounts":
+    def from_dict(
+        cls,
+        raw: object,
+        *,
+        expanded_node_limit: int = WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+    ) -> "_WorkflowManifestCounts":
         value = _exact_mapping(raw, _COUNT_FIELDS, "manifest counts")
         return cls(
             dependency_packages=_bounded_integer(
@@ -532,7 +616,7 @@ class _WorkflowManifestCounts:
             expanded_nodes=_bounded_integer(
                 value["expanded_nodes"],
                 "expanded node count",
-                maximum=WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+                maximum=expanded_node_limit,
             ),
             authenticated_files=_bounded_integer(
                 value["authenticated_files"],
@@ -618,6 +702,36 @@ class WorkflowDependencyManifest:
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkflowDependencyManifest":
+        return cls._from_dict(
+            raw,
+            expanded_node_limit=WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+        )
+
+    @classmethod
+    def _from_trusted_legacy_compilation(
+        cls,
+        raw: object,
+        *,
+        expanded_node_limit: int,
+    ) -> "WorkflowDependencyManifest":
+        """Validate an already-materialized v1-v3 root without v4's closure cap."""
+        if (
+            type(expanded_node_limit) is not int
+            or expanded_node_limit < WORKFLOW_MANIFEST_MAX_EXPANDED_NODES
+        ):
+            raise ValueError("trusted legacy expanded node limit is invalid")
+        return cls._from_dict(
+            raw,
+            expanded_node_limit=expanded_node_limit,
+        )
+
+    @classmethod
+    def _from_dict(
+        cls,
+        raw: object,
+        *,
+        expanded_node_limit: int,
+    ) -> "WorkflowDependencyManifest":
         value = _exact_mapping(raw, _MANIFEST_FIELDS, "dependency manifest")
         if (
             type(value["schema_version"]) is not int
@@ -638,7 +752,7 @@ class WorkflowDependencyManifest:
         origins_value = _bounded_sequence(
             value["node_origins"],
             "node origin",
-            maximum=WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+            maximum=expanded_node_limit,
         )
         resources_value = _bounded_sequence(
             value["resources"],
@@ -694,7 +808,10 @@ class WorkflowDependencyManifest:
             raise ValueError(
                 "resource bindings digest does not match canonical bindings"
             )
-        counts = _WorkflowManifestCounts.from_dict(value["counts"])
+        counts = _WorkflowManifestCounts.from_dict(
+            value["counts"],
+            expanded_node_limit=expanded_node_limit,
+        )
         root = WorkflowDependencyRecord.from_dict(value["root"])
         package_keys = {root.package_key, *(item.package_key for item in dependencies)}
         if len(package_keys) != len(dependencies) + 1:
@@ -1113,6 +1230,7 @@ def seal_workflow_compilation(
     definition_bytes: bytes,
     active_policy_bytes: bytes,
     bind_executable_resources: bool,
+    enforce_phase4_bounds: bool = True,
 ):
     """Authenticate and bind one immutable closure under one aggregate budget."""
     sources = (root, *dependencies)
@@ -1559,7 +1677,16 @@ def seal_workflow_compilation(
         "resource_bindings_digest": digest_resource_bindings(bindings_tuple),
         "active_root_policy_digest": hashlib.sha256(active_policy_bytes).hexdigest(),
     }
-    manifest = WorkflowDependencyManifest.from_dict(manifest_raw)
+    if enforce_phase4_bounds:
+        manifest = WorkflowDependencyManifest.from_dict(manifest_raw)
+    else:
+        manifest = WorkflowDependencyManifest._from_trusted_legacy_compilation(
+            manifest_raw,
+            expanded_node_limit=max(
+                WORKFLOW_MANIFEST_MAX_EXPANDED_NODES,
+                len(origins),
+            ),
+        )
     return (
         manifest,
         sealed_files,

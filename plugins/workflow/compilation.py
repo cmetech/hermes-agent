@@ -280,6 +280,10 @@ def compile_workflow(
                 selection.effective_profile,
                 selected_version,
             ),
+            enforce_phase4_bounds=supports_phase4_semantics(
+                selection.effective_profile,
+                selected_version,
+            ),
         )
     )
     if supports_phase4_semantics(selection.effective_profile, selected_version):

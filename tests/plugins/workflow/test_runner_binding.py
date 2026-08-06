@@ -850,12 +850,15 @@ def test_verified_showcase_cache_contains_authenticated_raw_material_only() -> N
 
     package = verified["ai-extensions"]
     assert len(package.package_digest) == 64
-    assert set(package.__slots__) == {
-        "scenario",
-        "package",
-        "package_digest",
-        "bundle_digest",
-    }
+    assert package.compilation.package is package.package
+    assert package.compilation.dependency_manifest.root.workflow_name == (
+        package.package.definition.name
+    )
+    assert package.compilation.covered_relative_paths
+    assert all(
+        isinstance(package.compilation.sealed_files[path], bytes)
+        for path in package.compilation.covered_relative_paths
+    )
     assert not hasattr(package, "compatibility")
     assert not hasattr(package, "risk")
 

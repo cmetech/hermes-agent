@@ -588,7 +588,11 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
         "load_showcase_catalog",
         lambda: {scenario.id: scenario},
     )
-    monkeypatch.setattr(showcase_module, "_scenario_package", lambda _scenario: package)
+    monkeypatch.setattr(
+        showcase_module,
+        "_scenario_package",
+        lambda _scenario, **_kwargs: package,
+    )
     monkeypatch.setattr(
         showcase_module,
         "preflight_showcase",

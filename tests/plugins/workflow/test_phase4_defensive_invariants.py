@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
+import shutil
 import threading
 
 import pytest
@@ -45,6 +46,59 @@ def _compile(root, *dependencies):
         WorkflowCatalogSnapshot.capture((root, *dependencies)),
         normalizer_version=4,
     )
+
+
+class _TraversalBomb:
+    """Fail the test if an over-limit v4 node reaches materialization."""
+
+
+def test_current_v3_large_root_projects_while_v4_rejects_before_node_513(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch Phase 4 closure bounds leaking into current v3 compilation."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.topology import project_topology
+
+    root_path = workflow_writer(
+        tmp_path / "versioned-large-root/workflows",
+        name="versioned-large-root",
+        filename="versioned-large-root.yaml",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = _parse(
+        root_path,
+        sidecar=sidecar,
+        source="project",
+        precedence=1,
+    )
+    catalog = WorkflowCatalogSnapshot.capture((source,))
+
+    current = compile_workflow(source, catalog)
+    projection = project_topology(current.package.definition)
+
+    assert current.package.language.normalizer_version == 3
+    assert projection.node_count == 513
+
+    bomb_source = replace(
+        source,
+        nodes=(
+            *source.nodes[:512],
+            replace(source.nodes[512], value=_TraversalBomb()),
+        ),
+    )
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_workflow(
+            bomb_source,
+            WorkflowCatalogSnapshot.capture((bomb_source,)),
+            normalizer_version=4,
+        )
+
+    assert exc.value.issues[0].code == "include_expansion_limit"
 
 
 def _root_command_compilation(tmp_path: Path, workflow_writer):
@@ -392,6 +446,59 @@ def test_origin_resource_symlink_escape_fails_without_host_path_disclosure(
     assert str(tmp_path) not in issue.message
 
 
+def test_same_name_resources_keep_distinct_root_and_dependency_origins(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch same-name resources collapsing onto one package or sealed path."""
+    root_path = workflow_writer(
+        tmp_path / "same-name-root/workflows",
+        name="same-name-root",
+        filename="same-name-root.yaml",
+        nodes=[
+            {"id": "root-review", "command": "review"},
+            {
+                "id": "checks",
+                "include": "same-name-child",
+                "depends_on": ["root-review"],
+            },
+        ],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    root_path.with_name("same-name-root.hermes.yaml").write_bytes(sidecar)
+    root_commands = tmp_path / "same-name-root/commands"
+    root_commands.mkdir()
+    (root_commands / "review.md").write_bytes(b"root review\n")
+
+    child_path = workflow_writer(
+        tmp_path / "same-name-child/workflows",
+        name="same-name-child",
+        filename="same-name-child.yaml",
+        nodes=[{"id": "review", "command": "review"}],
+    )
+    child_commands = tmp_path / "same-name-child/commands"
+    child_commands.mkdir()
+    (child_commands / "review.md").write_bytes(b"child review\n")
+
+    compilation = _compile(
+        _parse(root_path, sidecar=sidecar, source="project", precedence=1),
+        _parse(child_path, sidecar=None, source="profile", precedence=2),
+    )
+    bindings = {
+        binding.node_id: binding
+        for binding in compilation.dependency_manifest.resources
+        if binding.resource_kind == "command"
+    }
+    root_binding = bindings["root-review"]
+    child_binding = bindings["checks__review"]
+
+    assert root_binding.source_relative_path == child_binding.source_relative_path
+    assert root_binding.package_key != child_binding.package_key
+    assert root_binding.snapshot_path != child_binding.snapshot_path
+    assert compilation.sealed_files[root_binding.snapshot_path] == b"root review\n"
+    assert compilation.sealed_files[child_binding.snapshot_path] == b"child review\n"
+
+
 def test_manifest_is_complete_and_detects_changed_digests_or_sealed_bytes(
     tmp_path: Path,
     workflow_writer,
@@ -551,20 +658,23 @@ def test_sealed_aggregate_authority_rejects_changed_identity_and_cache_miss(
         budget.read(tmp_path / "missing.txt")
 
 
-def test_admitted_closure_completes_after_every_live_origin_is_deleted(
+@dataclass(frozen=True, slots=True)
+class _AdmittedComposition:
+    run_id: str
+    hermes_home: Path
+    root_package_root: Path
+    dependency_root: Path
+
+
+def admit_composed_workflow(
     tmp_path: Path,
     workflow_writer,
-) -> None:
-    """Independently gate recovery against accidental live-package fallback."""
-    import shutil
-
-    from plugins.workflow.admission import RunAdmissionRequest
-    from plugins.workflow.scheduler import RunScheduler
-    from plugins.workflow.store import RunStore
-    from plugins.workflow.trust import WorkflowPackageDigest
-
+) -> _AdmittedComposition:
+    """Admit one root/dependency composition under a sealed format-2 snapshot."""
+    root_package_root = tmp_path / "root"
+    dependency_root = tmp_path / "child"
     root_path = workflow_writer(
-        tmp_path / "root/workflows",
+        root_package_root / "workflows",
         name="defensive-root",
         filename="defensive-root.yaml",
         nodes=[{"id": "child", "include": "defensive-child"}],
@@ -572,7 +682,7 @@ def test_admitted_closure_completes_after_every_live_origin_is_deleted(
     root_policy = b"language_compatibility: archon-2026-07\n"
     root_path.with_name("defensive-root.hermes.yaml").write_bytes(root_policy)
     child_path = workflow_writer(
-        tmp_path / "child/workflows",
+        dependency_root / "workflows",
         name="defensive-child",
         filename="defensive-child.yaml",
         nodes=[{"id": "execute", "bash": "true"}],
@@ -581,7 +691,8 @@ def test_admitted_closure_completes_after_every_live_origin_is_deleted(
         _parse(root_path, sidecar=root_policy, source="project", precedence=1),
         _parse(child_path, sidecar=None, source="profile", precedence=2),
     )
-    store = RunStore(tmp_path / "home")
+    hermes_home = tmp_path / "home"
+    store = RunStore(hermes_home)
     prepared = store.prepare_run_snapshot(
         compilation.package,
         compilation=compilation,
@@ -603,12 +714,52 @@ def test_admitted_closure_completes_after_every_live_origin_is_deleted(
         immutable_snapshot=prepared,
     )
     assert admitted.run_id is not None
-    shutil.rmtree(root_path.parent.parent)
-    shutil.rmtree(child_path.parent.parent)
+    return _AdmittedComposition(
+        run_id=admitted.run_id,
+        hermes_home=hermes_home,
+        root_package_root=root_package_root,
+        dependency_root=dependency_root,
+    )
 
-    result = RunScheduler(RunStore(tmp_path / "home")).advance(admitted.run_id)
 
-    assert result["status"] == "succeeded"
+def restart_scheduler_and_complete(
+    admitted: _AdmittedComposition,
+) -> dict[str, object]:
+    """Restart storage/scheduling and drive an admitted composition terminal."""
+    return RunScheduler(RunStore(admitted.hermes_home)).advance(admitted.run_id)
+
+
+def test_admitted_run_never_reopens_deleted_dependency(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    """Independently gate recovery against accidental live-package fallback."""
+    admitted = admit_composed_workflow(tmp_path, workflow_writer)
+    quarantined_child_root = tmp_path / "quarantined-child"
+    quarantined_root = tmp_path / "quarantined-root"
+    shutil.move(admitted.dependency_root, quarantined_child_root)
+    shutil.move(admitted.root_package_root, quarantined_root)
+
+    removed_dependency_root = admitted.dependency_root.absolute()
+    live_source_open_attempts: list[Path] = []
+    path_open = Path.open
+
+    def track_removed_dependency_open(path: Path, *args, **kwargs):
+        candidate = path.absolute()
+        if (
+            candidate == removed_dependency_root
+            or removed_dependency_root in candidate.parents
+        ):
+            live_source_open_attempts.append(candidate)
+        return path_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_removed_dependency_open)
+
+    terminal = restart_scheduler_and_complete(admitted)
+
+    assert terminal["status"] == "succeeded"
+    assert live_source_open_attempts == []
 
 
 def test_future_compilation_changes_when_dependency_precedence_is_shadowed(
@@ -667,6 +818,131 @@ def test_future_compilation_changes_when_dependency_precedence_is_shadowed(
         after.dependency_manifest.dependencies[0].catalog_source,
         after.dependency_manifest.dependencies[0].precedence,
     ) == ("project", 1)
+
+
+@pytest.mark.parametrize("symlink_owner", ["root", "included_child"])
+def test_catalog_rejects_external_sidecar_before_phase4_authentication(
+    tmp_path: Path,
+    workflow_writer,
+    symlink_owner: str,
+) -> None:
+    """Catch adjacent sidecars escaping catalog containment before capture."""
+    from plugins.workflow.catalog_api import (
+        WorkflowCatalogInvalidDefinitionError,
+        resolve_workflow_catalog_compilation,
+    )
+
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    root_path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="defensive-sidecar-root",
+        filename="defensive-sidecar-root.yaml",
+        nodes=(
+            [{"id": "child", "include": "defensive-sidecar-child"}]
+            if symlink_owner == "included_child"
+            else [{"id": "execute", "bash": "true"}]
+        ),
+    )
+    root_sidecar = root_path.with_name("defensive-sidecar-root.hermes.yaml")
+    external_sidecar = tmp_path / f"outside-{symlink_owner}.hermes.yaml"
+    if symlink_owner == "root":
+        external_sidecar.write_text(
+            "language_compatibility: archon-2026-07\n",
+            encoding="utf-8",
+        )
+        escaped_sidecar = root_sidecar
+    else:
+        root_sidecar.write_text(
+            "language_compatibility: archon-2026-07\n",
+            encoding="utf-8",
+        )
+        child_path = workflow_writer(
+            home / "workflows",
+            name="defensive-sidecar-child",
+            filename="defensive-sidecar-child.yaml",
+            nodes=[{"id": "execute", "bash": "true"}],
+        )
+        external_sidecar.write_text(
+            "required_secrets: [DEFENSIVE_EXTERNAL_CHILD_SECRET]\n",
+            encoding="utf-8",
+        )
+        escaped_sidecar = child_path.with_name(
+            "defensive-sidecar-child.hermes.yaml"
+        )
+    try:
+        escaped_sidecar.symlink_to(external_sidecar)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(WorkflowCatalogInvalidDefinitionError) as exc:
+        resolve_workflow_catalog_compilation(
+            "defensive-sidecar-root",
+            hermes_home=home,
+            workdir=workdir,
+            normalizer_version=4,
+        )
+
+    assert str(external_sidecar) not in str(exc.value)
+    assert "DEFENSIVE_EXTERNAL_CHILD_SECRET" not in str(exc.value)
+
+
+@pytest.mark.parametrize("replaced_name", ["definition", "sidecar"])
+def test_catalog_rejects_definition_or_sidecar_replaced_during_capture(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    replaced_name: str,
+) -> None:
+    """Catch a regular catalog candidate becoming an external symlink mid-read."""
+    import os
+
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workflow_path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="defensive-replaced-catalog-source",
+        filename="defensive-replaced-catalog-source.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    sidecar_path = workflow_path.with_name(
+        "defensive-replaced-catalog-source.hermes.yaml"
+    )
+    sidecar_path.write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    target = workflow_path if replaced_name == "definition" else sidecar_path
+    external = tmp_path / f"outside-replaced-{target.name}"
+    external.write_bytes(target.read_bytes())
+    original_open = os.open
+    replaced = False
+
+    def replace_before_descriptor_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and kwargs.get("dir_fd") is not None and path == target.name:
+            replaced = True
+            target.unlink()
+            try:
+                target.symlink_to(external)
+            except OSError:
+                pytest.skip("symlinks unavailable")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_api.os, "open", replace_before_descriptor_open)
+
+    with pytest.raises(catalog_api.WorkflowCatalogInvalidDefinitionError) as exc:
+        catalog_api.resolve_workflow_catalog_compilation(
+            "defensive-replaced-catalog-source",
+            hermes_home=home,
+            workdir=workdir,
+            normalizer_version=4,
+        )
+
+    assert replaced is True
+    assert str(external) not in str(exc.value)
 
 
 def test_signal_stale_and_cross_run_decisions_leave_defensive_state_unchanged(

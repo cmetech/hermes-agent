@@ -378,7 +378,7 @@ def start_api_run(
         raise ApiAdmissionError(
             "workflow_showcase_verification_failed", status_code=409
         )
-    resource_budget.seal()
+    resource_budget.seal_authenticated_snapshot()
 
     if verified_showcase is None:
         trust_store = WorkflowTrustStore(home)

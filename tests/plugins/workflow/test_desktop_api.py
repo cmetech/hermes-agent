@@ -612,7 +612,7 @@ def test_post_runs_rejects_schedule_over_durable_metadata_value_boundary(
     monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
     monkeypatch.setattr(
         api_admission_module,
-        "_catalog_package",
+        "_catalog_compilation",
         lambda *_args, **_kwargs: pytest.fail("oversized schedule loaded a package"),
     )
 
@@ -668,7 +668,7 @@ def test_post_runs_rejects_invalid_schedule_at_before_store_or_package_work(
     monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
     monkeypatch.setattr(
         api_admission_module,
-        "_catalog_package",
+        "_catalog_compilation",
         lambda *_args, **_kwargs: pytest.fail("invalid schedule loaded a package"),
     )
 
@@ -1818,7 +1818,7 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
     store = RunStore(home)
     _healthy_coordinator(store)
 
-    def incompatible(package, _context, *, read_budget=None):
+    def incompatible(package, _context, *, read_budget=None, compilation=None):
         compatibility = CompatibilityReport(
             level=CompatibilityLevel.UNSUPPORTED,
             findings=(
@@ -1835,6 +1835,7 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
             package,
             compatibility,
             read_budget=read_budget,
+            compilation=compilation,
         )
 
     monkeypatch.setattr(
@@ -2211,10 +2212,15 @@ def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
     original_assess = api_admission_module.assess_package_execution
     assessments = 0
 
-    def counted_assess(package, context, *, read_budget=None):
+    def counted_assess(package, context, *, read_budget=None, compilation=None):
         nonlocal assessments
         assessments += 1
-        return original_assess(package, context, read_budget=read_budget)
+        return original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+            compilation=compilation,
+        )
 
     monkeypatch.setattr(
         api_admission_module,
@@ -2979,25 +2985,22 @@ def test_post_runs_snapshots_only_sealed_trusted_resource_bytes(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_read = WorkflowResourceReadBudget.read
-    canonical_resource = resource.resolve()
-    trusted_reads = 0
+    original_seal = WorkflowResourceReadBudget.seal_authenticated_snapshot
 
-    def mutate_after_trusted_read(self, path):
-        nonlocal trusted_reads
-        data = original_read(self, path)
-        if path == canonical_resource:
-            trusted_reads += 1
-            if trusted_reads == 2:
-                resource.unlink()
-                if mutation == "symlink":
-                    try:
-                        resource.symlink_to(external)
-                    except OSError:
-                        pytest.skip("symlinks unavailable")
-        return data
+    def mutate_after_snapshot_authority_is_sealed(self):
+        original_seal(self)
+        resource.unlink()
+        if mutation == "symlink":
+            try:
+                resource.symlink_to(external)
+            except OSError:
+                pytest.skip("symlinks unavailable")
 
-    monkeypatch.setattr(WorkflowResourceReadBudget, "read", mutate_after_trusted_read)
+    monkeypatch.setattr(
+        WorkflowResourceReadBudget,
+        "seal_authenticated_snapshot",
+        mutate_after_snapshot_authority_is_sealed,
+    )
     response = TestClient(_app(_router()), raise_server_exceptions=False).post(
         "/api/plugins/workflow/runs",
         json={

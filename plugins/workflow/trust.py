@@ -151,6 +151,23 @@ class WorkflowResourceReadBudget:
     def seal(self) -> None:
         self._sealed = True
 
+    def seal_authenticated_snapshot(self) -> None:
+        """Freeze verified live reads into the immutable snapshot authority."""
+        for canonical, identity in self._identities.items():
+            try:
+                current = canonical.stat()
+            except OSError as exc:
+                raise OSError("package resource changed after shared read") from exc
+            if canonical.is_symlink() or not canonical.is_file() or identity != (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ):
+                raise OSError("package resource changed after shared read")
+        self._identities.clear()
+        self._sealed = True
+
     def remember_authenticated(self, logical_path: Path, data: bytes) -> bytes:
         """Count immutable source-package bytes in this aggregate authority."""
         if not isinstance(data, bytes):
