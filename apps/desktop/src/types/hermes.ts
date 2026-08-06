@@ -192,7 +192,34 @@ export interface WorkflowCompatibilityFinding {
   path: string
 }
 
+export interface WorkflowCompilationCounts extends Record<string, unknown> {
+  dependency_packages?: number
+  expanded_edges?: number
+  expanded_nodes?: number
+}
+
+export interface WorkflowCompilationSource extends Record<string, unknown> {
+  catalog_source?: string
+  package_key?: string
+  precedence?: number
+  workflow_name?: string
+}
+
+export interface WorkflowIgnoredPolicy extends Record<string, unknown> {
+  fields?: string[]
+  package_key?: string
+}
+
+export interface WorkflowCompilationProjection extends Record<string, unknown> {
+  composite_digest?: string
+  counts?: WorkflowCompilationCounts
+  include_depth?: number
+  ignored_policies?: WorkflowIgnoredPolicy[]
+  sources?: WorkflowCompilationSource[]
+}
+
 export interface WorkflowDetail extends WorkflowDefinition {
+  compilation?: null | WorkflowCompilationProjection
   compatibility: Record<string, unknown> & {
     findings?: WorkflowCompatibilityFinding[]
     level: string
