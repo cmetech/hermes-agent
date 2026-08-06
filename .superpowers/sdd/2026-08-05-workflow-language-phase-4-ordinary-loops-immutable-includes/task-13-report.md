@@ -1,6 +1,6 @@
 # Task 13 report: Defensive, distribution, and base verification gates
 
-Status: **PASS_AFTER_FIX; SDD IMPORTANT FINDINGS FIXED; PRE-ACTIVATION**
+Status: **PASS_AFTER_FIX; SDD/CONTROLLER FOLLOW-UPS FIXED; PRE-ACTIVATION**
 
 ## Outcome
 
@@ -119,6 +119,18 @@ regressions, and these two evidence documents.
       disables `O_NOFOLLOW` in the forced fallback case, tracks all opened descriptors
       to closure, and verifies external path/content redaction;
     - GREEN 4/4; no catalog production refactor was needed; full catalog remained 77.
+12. Controller full-suite deferred-build harness race:
+    - controller full Python after fix round 1 was 32,338 passed / 28 failed plus the
+      known Anthropic collection error; one additional failure was branch-only;
+    - TUI gateway whole-file RED was 516 passed / 1 failed while the exact concurrent
+      write target passed 1/1 alone and exact `base` passed the whole file;
+    - two profile-scoped agent-build tests waited for fake `_make_agent` `built`, then
+      popped their sessions before `agent_ready` proved the daemon build had finished
+      its final JSON emission;
+    - both retain the `built` assertion and now await `agent_ready` before teardown;
+      whole-file GREEN was 517/517 in 15.1s with retries disabled;
+    - production TUI gateway behavior was unchanged, and no second full Python run was
+      required for this bounded controller follow-up.
 
 ## Final deterministic verification
 

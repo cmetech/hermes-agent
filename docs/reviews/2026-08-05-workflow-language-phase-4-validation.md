@@ -2,7 +2,7 @@
 
 Date: 2026-08-06
 
-Status: **PASS_AFTER_FIX; SDD IMPORTANT FINDINGS FIXED; PRE-ACTIVATION PIN
+Status: **PASS_AFTER_FIX; SDD/CONTROLLER FOLLOW-UPS FIXED; PRE-ACTIVATION PIN
 CONFIRMED**
 
 This document records Task 13 verification for ordinary loops and immutable
@@ -124,6 +124,24 @@ Post-fix-round evidence: full Desktop API 158/158, full catalog API 77/77, exact
 mandatory Step 1 163/163, and defensive/catalog/security-boundary 130/130, all with
 retries disabled. Step 4 remained 1,059/1,059. Ruff passed the three Python files
 touched in the round.
+
+## Controller full-suite follow-up (fix round 2)
+
+The controller's full Python run after SDD fix round 1 reported 32,338 passed and 28
+failed, plus the known Anthropic collection error. One failure was additional and
+branch-only: `test_write_json_serializes_concurrent_writes`. The complete TUI gateway
+server file was 516 passed / 1 failed, the exact write test passed 1/1 alone, and the
+complete file passed on exact `base`.
+
+The two preceding profile-scoped deferred-build tests waited only for a `built` event
+set inside their fake `_make_agent`; they removed the session before its `agent_ready`
+event proved the daemon build thread had completed its final JSON emission. That
+thread could cross monkeypatch teardown and write a ninth partial line into the next
+test's `_ChunkyStdout`. Both tests now preserve their `built` assertions and also
+require `agent_ready` before popping the session. The no-retry complete-file GREEN was
+517 passed, 0 failed in 15.1s. This was a test-harness synchronization fix only; no TUI
+gateway production behavior changed. A second full Python run was not required for
+this bounded controller follow-up.
 
 ## Mandatory defects repaired during the gate
 
