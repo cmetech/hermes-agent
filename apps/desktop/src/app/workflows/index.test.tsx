@@ -971,6 +971,39 @@ describe('WorkflowsView', () => {
     expect(onAction).toHaveBeenNthCalledWith(2, 'provide-input', { value: 'Tighten it' })
   })
 
+  it('catches feedback state being reused across distinct signal confirmations', () => {
+    const onAction = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const inspector = (interactionId: string, iteration: number) => (
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={onAction}
+          run={run({
+            next_actions: ['approve', 'provide-input', 'cancel'],
+            pending_interaction: {
+              interaction_id: interactionId,
+              iteration,
+              max_iterations: 3,
+              type: 'loop_signal_confirmation'
+            }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    const view = render(inspector('signal-1', 1))
+
+    fireEvent.change(screen.getByLabelText('Feedback'), { target: { value: 'Tighten it' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with feedback' }))
+    expect(onAction).toHaveBeenCalledWith('provide-input', { value: 'Tighten it' })
+
+    view.rerender(inspector('signal-2', 2))
+
+    expect((screen.getByLabelText('Feedback') as HTMLInputElement).value).toBe('')
+    expect((screen.getByRole('button', { name: 'Continue with feedback' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('catches final signal confirmations inventing a feedback action the backend omitted', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 

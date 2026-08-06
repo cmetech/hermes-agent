@@ -112,3 +112,68 @@ jest-dom Chai matchers. The tests enforce the same behavior.
 No scoped production or compatibility concerns remain. `npm ci` reported audit
 findings from the existing lockfile; Task 11 did not change dependencies or package
 metadata.
+
+## Fix round 1 — interaction-scoped feedback draft
+
+Status: DONE
+
+Review base: `a04dbcb6a42bcc69ed1ae45c92e506f74d577a82`
+
+### Finding addressed
+
+`RunInspector` is reused while the selected run snapshot changes, so its scalar
+`inputValue` state survived a completed signal interaction. A later signal confirmation
+could therefore render the previous feedback and enable submission before the operator
+entered feedback for the new interaction.
+
+The feedback/input draft is now paired with the current backend `interaction_id`.
+Rendering a distinct interaction derives an empty value immediately, without an effect
+or stale intermediate paint. Editing stores the value against that interaction ID.
+Backend `next_actions` still solely determines whether a feedback control exists, and
+ordinary `loop_input` or unknown interaction shapes retain their generic labels and
+wire behavior.
+
+### Strict TDD evidence
+
+1. RED, before production edits:
+   - `cd apps/desktop && npm test -- src/app/workflows/index.test.tsx -t 'catches feedback state being reused across distinct signal confirmations'`
+   - 1 failed / 48 skipped. After submitting `Tighten it` for `signal-1` and rerendering
+     the same `RunInspector` with `signal-2`, the new feedback input still contained
+     `Tighten it` instead of the literal empty value.
+2. GREEN, after the interaction-keyed draft:
+   - The same focused command passed 1 / 1 selected test with 48 skipped.
+   - The new interaction renders an empty input and a disabled **Continue with
+     feedback** button.
+
+### Files changed
+
+- `apps/desktop/src/app/workflows/index.test.tsx`: added the real two-interaction
+  rerender regression covering entry, submission, new interaction ID, empty value, and
+  disabled state.
+- `apps/desktop/src/app/workflows/run-inspector.tsx`: replaced the scalar input state
+  with the narrow interaction-keyed draft.
+- `.superpowers/sdd/2026-08-05-workflow-language-phase-4-ordinary-loops-immutable-includes/task-11-report.md`:
+  appended this fix-round evidence.
+
+### Final verification
+
+- Focused regression: 1 passed / 0 failed (48 skipped).
+- Exact Task 11 gate:
+  `cd apps/desktop && npm test -- src/app/workflows/index.test.tsx src/app/workflows/workflow-operations.e2e.test.tsx src/app/workflows/view-workflow-dialog.test.tsx`
+  — 83 passed / 0 failed.
+- `cd apps/desktop && npm run typecheck` — passed all three TypeScript projects.
+- Prettier check on `run-inspector.tsx` and `index.test.tsx` — passed after applying
+  formatting.
+- ESLint on the same files — 0 errors / 17 unchanged baseline warnings in
+  `index.test.tsx`; `run-inspector.tsx` has no warnings.
+- `git diff --check` — passed before and after the report append.
+
+### Self-review and concerns
+
+- The draft key comes only from the existing bounded pending interaction projection;
+  no backend state or action vocabulary changed.
+- The value mismatch is resolved during render rather than in an effect, so the new
+  interaction cannot paint or submit stale text for one frame.
+- The requested Minor exact-type malformed-guard case remains intentionally deferred
+  to final review and was not entered in this fix round.
+- No scoped concerns remain.
