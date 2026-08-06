@@ -2361,11 +2361,15 @@ class RunScheduler:
         run_id: str,
         *,
         read_budget: WorkflowResourceReadBudget | None = None,
+        projection: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowPackage, frozenset[str], Mapping[str, bytes]]:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
-        projection = self.store.load_run(run_id)
+        # A caller that supplies a projection owns its journal corroboration and
+        # receives authentication against those exact bytes without store repair.
+        if projection is None:
+            projection = self.store.load_run(run_id)
         resources_path = run_directory / "resources.json"
         read_budget = read_budget or WorkflowResourceReadBudget(
             max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,

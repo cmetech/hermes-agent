@@ -220,14 +220,16 @@ history, and public evidence.
   evidence. Public event views strip recovery projections and expose only bounded
   payloads.
 - No unresolved concerns remain for Task 9.
-- ## Integrity exception round 7 (integrity-only)
-- `RunStore._decide_run` now calls `RunScheduler._load_verified_run_package(run_id)`
-  before an approved `loop_signal_confirmation` can publish a typed loop output.
-  This re-validates the full format-2 sealed closure (`definition.yaml`,
-  `resources.json`, optional `policy.yaml`, and sealed-tree digests) before any
-  promotion step.
-- Net effect: tampering with sealed-closure content while preserving loop metadata
-  (id/output_type) cannot reach typed output publication on approval.
+## Integrity exception round 7 (integrity-only)
+
+`RunStore._decide_run` now calls `RunScheduler._load_verified_run_package(run_id)`
+before an approved `loop_signal_confirmation` can publish a typed loop output.
+This re-validates the full format-2 sealed closure (`definition.yaml`,
+`resources.json`, optional `policy.yaml`, and sealed-tree digests) before any
+promotion step.
+
+Net effect: tampering with sealed-closure content while preserving loop metadata
+(`id/output_type`) cannot reach typed output publication on approval.
 
 ## Review convergence: fix round 5 of 5
 
@@ -682,3 +684,83 @@ Every Python test command used `scripts/run_tests.sh`.
   provider. Existing transferred-owner coverage proves stale same-attempt claims
   cannot call `complete_node()` to stage or replace candidate metadata.
 - No unresolved round-6 concerns remain.
+
+## Integrity exception round 8 (exact projection and authority bytes)
+
+Status: DONE
+
+### Root cause and fix
+
+Round 7 invoked `RunScheduler._load_verified_run_package(run_id)` before the
+decision locks. That verifier called `RunStore.load_run()`. When a forged staged
+candidate made `run.json` disagree with the journal, `load_run()` quarantined the
+raw projection and rebuilt it from the journal. `_decide_run()` then reloaded the
+repaired projection and approved it, so the verification step masked the exact
+tampering it was meant to reject.
+
+Signal approval now authenticates under the existing admission-then-run locks.
+It first corroborates the exact raw projection against the journal, then passes that
+projection to the verifier through a projection-aware interface that performs no
+repair or recovery. A signal transition hidden by a changed preliminary projection
+is rejected rather than allowed to cross into the repairing non-signal path.
+Duplicate signal approvals retain their existing idempotent result and authenticate
+the exact current closure before returning.
+
+The verifier's authenticated sealed-byte mapping is also the publication authority.
+Staged typed declaration resolution parses the captured `definition.yaml` bytes
+instead of reopening the live path after verification. The shared declaration parser
+keeps existing typed-publication recovery behavior unchanged for all other callers.
+
+### Real-behavior regressions and TDD evidence
+
+Every Python test command used `scripts/run_tests.sh`.
+
+1. Exact projection masking RED:
+   - Command: `scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py`
+   - RED on `d48137f03`: 22 passed, 2 failed. Both
+     `candidate_output_type` and `candidate_attempt_path` completed approval instead
+     of raising `ArchonOutputIntegrityError`.
+   - The regression now also asserts that rejection leaves the forged candidate in
+     the raw projection and creates no `run.json.corrupt-*` quarantine, proving no
+     repair path replaced the evidence.
+2. Full format-2 sealed-closure coverage:
+   - Command: `scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k tampered_confirmed_loop_sealed_closure_publishes_nothing`
+   - Initial result: 4 passed, 0 failed for post-pause changes to
+     `definition.yaml`, `resources.json`, `policy.yaml`, and the sealed-tree-only
+     `dependencies.json` member. This test was added after the exploratory round-7
+     closure check already existed, so that round-7 production change predates the
+     regression; each case still asserts observable rejection, paused state, zero
+     publication, and zero provider replay.
+3. Exact projection GREEN:
+   - Command: `scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k 'tampered_confirmed_loop_result_or_staged_candidate_publishes_nothing and (candidate_output_type or candidate_attempt_path)'`
+   - GREEN: 2 passed, 0 failed, including the no-repair assertions.
+4. Complete typed-publication file:
+   - Command: `scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py`
+   - GREEN: 28 passed, 0 failed.
+
+### Round-8 verification
+
+- Mandatory Task 9 runtime/recovery gate plus typed publication:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_loops.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_phase4_loop_interactions.py tests/plugins/workflow/test_phase4_defensive_invariants.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_evidence_api.py tests/plugins/workflow/test_typed_publication.py`
+  - 274 passed, 0 failed.
+- Relevant Task 8 action/store regression gate:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_loop_interactions.py tests/plugins/workflow/test_phase4_defensive_invariants.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_approval_races.py tests/plugins/workflow/test_phase4_snapshot.py`
+  - 74 passed, 0 failed.
+- Explicit v1-v3 compatibility matrix:
+  - `scripts/run_tests.sh tests/plugins/workflow/test_phase4_loops.py tests/plugins/workflow/test_phase4_loop_interactions.py tests/plugins/workflow/test_approval.py -k 'v1_through_v3 or v3_inline'`
+  - 13 passed, 0 failed.
+- Ruff on `plugins/workflow/store.py`, `plugins/workflow/scheduler.py`, and
+  `tests/plugins/workflow/test_typed_publication.py`: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+
+### Round-8 self-review and concerns
+
+- Existing lock order, non-signal approval definition loading, the original attempt,
+  concurrent/duplicate compare-and-set behavior, and provider-call count remain
+  unchanged.
+- Approval uses no live workflow-definition read for typed declaration authority
+  after the authenticated closure is captured.
+- No Task 10 diagnostics, security review, normalizer activation, public action/wire
+  surface, telemetry, or core-tool work was added.
+- No unresolved round-8 concerns remain.

@@ -1903,12 +1903,10 @@ def _sealed_typed_output_declarations(
             raise JournalRecoveryError(
                 "typed publication sealed definition is unsafe"
             )
-        document = yaml.safe_load(
-            _read_descriptor_relative(
-                directory,
-                "definition.yaml",
-                size_bytes=observed.st_size,
-            )
+        definition_bytes = _read_descriptor_relative(
+            directory,
+            "definition.yaml",
+            size_bytes=observed.st_size,
         )
     except ArchonOutputUnavailableError:
         raise
@@ -1920,7 +1918,19 @@ def _sealed_typed_output_declarations(
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc
-    except (ArchonOutputIntegrityError, yaml.YAMLError) as exc:
+    except ArchonOutputIntegrityError as exc:
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    return _typed_output_declarations_from_definition_bytes(definition_bytes)
+
+
+def _typed_output_declarations_from_definition_bytes(
+    definition_bytes: bytes,
+) -> dict[str, _DeclaredTypedOutput]:
+    try:
+        document = yaml.safe_load(definition_bytes)
+    except (UnicodeError, yaml.YAMLError) as exc:
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc
@@ -16141,12 +16151,12 @@ class RunStore:
 
     def _staged_loop_typed_publication(
         self,
-        directory: Path,
         projection: Mapping[str, object],
         *,
         node_id: str,
         node: Mapping[str, object],
         confirmation: LoopSignalConfirmation,
+        authenticated_definition_bytes: bytes,
     ) -> tuple[dict[str, object], ArtifactRef, TypedPublicationCandidate] | None:
         attempts = node.get("attempts")
         if not isinstance(attempts, list) or not attempts:
@@ -16170,9 +16180,8 @@ class RunStore:
         staged = _typed_publication_candidate_from_metadata(
             attempt.get("metadata")
         )
-        declaration = _sealed_typed_output_declarations(
-            directory,
-            projection,
+        declaration = _typed_output_declarations_from_definition_bytes(
+            authenticated_definition_bytes
         ).get(node_id)
         if declaration is None:
             if staged is not None:
@@ -16355,17 +16364,51 @@ class RunStore:
         definitions = None
         from plugins.workflow.scheduler import RunScheduler
 
+        scheduler = RunScheduler(self)
         if not has_signal_confirmation:
-            package = RunScheduler(self)._load_run_package(run_id)
+            package = scheduler._load_run_package(run_id)
             definitions = {node.id: node for node in package.definition.nodes}
-        else:
-            RunScheduler(self)._load_verified_run_package(run_id)
+
+        def authenticated_signal_bytes(
+            projection: Mapping[str, object],
+        ) -> Mapping[str, bytes]:
+            if not has_signal_confirmation:
+                raise ArchonOutputIntegrityError(
+                    "loop signal confirmation changed before authentication"
+                )
+            if not self._journal_matches_projection(
+                directory,
+                projection=projection,
+                run_id=run_id,
+            ):
+                raise ArchonOutputIntegrityError(
+                    "staged loop result is not corroborated by the journal"
+                )
+            _package, _sealed_paths, authenticated_bytes = (
+                scheduler._load_verified_run_package(
+                    run_id,
+                    projection=projection,
+                )
+            )
+            return authenticated_bytes
+
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),
         ):
             projection = json.loads((directory / "run.json").read_text())
             duplicate = self._already_decided(projection, interaction_id)
+            duplicate_signal_confirmation = any(
+                isinstance(candidate, Mapping)
+                and isinstance(candidate.get("approval_last_decision"), Mapping)
+                and candidate["approval_last_decision"].get("type")
+                == "loop_signal_confirmation"
+                and candidate["approval_last_decision"].get("interaction_id")
+                == interaction_id
+                for candidate in projection.get("nodes", {}).values()
+            )
+            if duplicate is not None and duplicate_signal_confirmation:
+                authenticated_signal_bytes(projection)
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
@@ -16404,14 +16447,7 @@ class RunStore:
                     run_id=run_id,
                     node_id=node_id,
                 )
-                if not self._journal_matches_projection(
-                    directory,
-                    projection=projection,
-                    run_id=run_id,
-                ):
-                    raise ArchonOutputIntegrityError(
-                        "staged loop result is not corroborated by the journal"
-                    )
+                authenticated_bytes = authenticated_signal_bytes(projection)
                 self._verify_pending_loop_result(
                     directory,
                     projection,
@@ -16420,11 +16456,13 @@ class RunStore:
                     confirmation=confirmation,
                 )
                 staged_loop_publication = self._staged_loop_typed_publication(
-                    directory,
                     projection,
                     node_id=node_id,
                     node=node,
                     confirmation=confirmation,
+                    authenticated_definition_bytes=authenticated_bytes[
+                        "definition.yaml"
+                    ],
                 )
             elif definitions is None:
                 raise WorkflowConflict("pending interaction changed during decision")

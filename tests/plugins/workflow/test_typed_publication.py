@@ -15,6 +15,7 @@ import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -467,6 +468,60 @@ def test_tampered_confirmed_loop_result_or_staged_candidate_publishes_nothing(
             expected_state_version=int(paused["state_version"]),
             interaction_id=pending["interaction_id"],
         )
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+    raw_after = json.loads(
+        (store.run_directory(admitted.run_id) / "run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw_after["nodes"]["produce"]["state"] == "paused"
+    if tamper != "result_bytes":
+        candidate_after = raw_after["nodes"]["produce"]["attempts"][-1][
+            "metadata"
+        ]["primary_output_candidate"]
+        if tamper == "candidate_output_type":
+            assert candidate_after["output_type"] == "ForgedReport"
+        else:
+            assert candidate_after["attempt_relative_path"] == (
+                "nodes/produce/foreign-attempt/iteration-0001/output.md"
+            )
+        assert not tuple(
+            store.run_directory(admitted.run_id).glob("run.json.corrupt-*")
+        )
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "sealed_relative_path",
+    ["definition.yaml", "resources.json", "policy.yaml", "dependencies.json"],
+)
+def test_tampered_confirmed_loop_sealed_closure_publishes_nothing(
+    tmp_path,
+    workflow_writer,
+    sealed_relative_path: str,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "workflows",
+        name=f"typed-confirmation-sealed-{sealed_relative_path}",
+        downstream=False,
+    )
+    runner = _CountedAgentRunner("sealed draft <promise>DONE</promise>")
+    paused = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    pending = paused["nodes"]["produce"]["pending_interaction"]
+    sealed_path = store.run_directory(admitted.run_id) / sealed_relative_path
+    sealed_path.write_bytes(sealed_path.read_bytes() + b"\n")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as raised:
+        store.approve_run(
+            admitted.run_id,
+            expected_state_version=int(paused["state_version"]),
+            interaction_id=pending["interaction_id"],
+        )
+
+    assert raised.value.code == "workflow_snapshot_integrity_mismatch"
     assert not (store.run_directory(admitted.run_id) / "publications").exists()
     raw_after = json.loads(
         (store.run_directory(admitted.run_id) / "run.json").read_text(
