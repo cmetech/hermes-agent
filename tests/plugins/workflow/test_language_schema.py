@@ -60,6 +60,25 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
     assert len(json.dumps(contract).encode()) < 256_000
 
 
+def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
+    loop_specs = {
+        spec.yaml_name: spec
+        for spec in FIELD_INVENTORY
+        if spec.scope == "loop"
+    }
+
+    assert loop_specs["command"].enforcement_phase == 4
+    assert loop_specs["signal_completes"].enforcement_phase == 4
+    assert loop_specs["signal_completes"].json_type == "boolean"
+    assert loop_specs["prompt"].required is False
+
+    schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+    loop_schema = schema["properties"]["nodes"]["items"]["properties"]["loop"]
+    assert "prompt" in loop_schema["required"]
+    assert "command" not in loop_schema["properties"]
+    assert "signal_completes" not in loop_schema["properties"]
+
+
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 

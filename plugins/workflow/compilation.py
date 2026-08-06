@@ -248,7 +248,11 @@ def compile_workflow(
         source_to_compile,
         normalizer_version=normalizer_version,
     )
-    from plugins.workflow.dependency_manifest import seal_workflow_compilation
+    from plugins.workflow.dependency_manifest import (
+        composite_workflow_digest,
+        digest_expanded_compilation,
+        seal_workflow_compilation,
+    )
     from plugins.workflow.includes import collect_include_edges
 
     active_policy_bytes = (
@@ -278,6 +282,26 @@ def compile_workflow(
             ),
         )
     )
+    if supports_phase4_semantics(selection.effective_profile, selected_version):
+        from plugins.workflow.language import bind_v4_loop_command_semantics
+
+        package = bind_v4_loop_command_semantics(
+            package,
+            {
+                binding.node_id: binding.snapshot_path
+                for binding in dependency_manifest.resources
+                if binding.resource_kind == "loop_command"
+                and binding.node_id is not None
+            },
+        )
+        dependency_manifest = replace(
+            dependency_manifest,
+            expanded_definition_digest=digest_expanded_compilation(
+                bound_definition_bytes,
+                package,
+            ),
+        )
+        composite_digest = composite_workflow_digest(dependency_manifest)
     compiled = WorkflowCompilation(
         package=package,
         definition_bytes=bound_definition_bytes,

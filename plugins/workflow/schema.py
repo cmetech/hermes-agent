@@ -485,7 +485,13 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         _validate_relative_resource(mcp, f"{path}.mcp")
 
 
-def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> None:
+def _validate_node_type(
+    node: Mapping[str, Any],
+    node_type: str,
+    path: str,
+    *,
+    phase4_semantics: bool | None = None,
+) -> None:
     value = node[node_type]
     if node_type in {"command", "prompt", "bash", "script", "cancel"}:
         _string(value, f"{path}.{node_type}")
@@ -512,14 +518,29 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
-        unknown = sorted(set(loop) - LOOP_FIELDS)
+        allowed_fields = LOOP_FIELDS
+        if phase4_semantics is False:
+            allowed_fields = allowed_fields - {"command", "signal_completes"}
+        unknown = sorted(set(loop) - allowed_fields)
         if unknown:
             _fail(
                 f"{path}.loop",
                 "unknown_loop_field",
                 f"{path}.loop has unknown execution field: {unknown[0]}",
             )
-        _string(loop.get("prompt"), f"{path}.loop.prompt")
+        if phase4_semantics is False:
+            _string(loop.get("prompt"), f"{path}.loop.prompt")
+        else:
+            prompt_authored = "prompt" in loop
+            command_authored = "command" in loop
+            if prompt_authored is command_authored:
+                _fail(
+                    f"{path}.loop",
+                    "invalid_loop",
+                    f"{path}.loop must define exactly one of prompt or command",
+                )
+            field = "prompt" if prompt_authored else "command"
+            _string(loop[field], f"{path}.loop.{field}")
         _string(loop.get("until"), f"{path}.loop.until")
         iterations = loop.get("max_iterations")
         if (
@@ -532,12 +553,23 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
                 "invalid_loop",
                 f"{path}.loop.max_iterations must be between 1 and 100",
             )
-        if loop.get("interactive") is True and not loop.get("gate_message"):
-            _fail(
-                f"{path}.loop.gate_message",
-                "invalid_loop",
-                f"{path}.loop.gate_message is required when interactive",
+        if phase4_semantics is True:
+            for field in ("interactive", "signal_completes"):
+                if field in loop:
+                    _boolean(loop[field], f"{path}.loop.{field}")
+        if loop.get("interactive") is True:
+            gate_message = loop.get("gate_message")
+            invalid_gate = (
+                not isinstance(gate_message, str) or not gate_message.strip()
+                if phase4_semantics is True
+                else not gate_message
             )
+            if invalid_gate:
+                _fail(
+                    f"{path}.loop.gate_message",
+                    "invalid_loop",
+                    f"{path}.loop.gate_message is required when interactive",
+                )
     if node_type == "approval":
         approval = _mapping(value, f"{path}.approval")
         unknown = sorted(set(approval) - APPROVAL_FIELDS)
@@ -632,7 +664,12 @@ def _normalize_node(
             f"{path}.{field} is not structurally valid for {node_type} nodes",
             line=lines.get(field),
         )
-    _validate_node_type(node, node_type, path)
+    _validate_node_type(
+        node,
+        node_type,
+        path,
+        phase4_semantics=supports_phase4_semantics(profile, normalizer_version),
+    )
     _validate_declared_options(node, path)
     depends = node.get("depends_on", [])
     if not isinstance(depends, list) or any(
@@ -1217,6 +1254,13 @@ def _interpolated_node_templates(
         gate_message = node.value.get("gate_message")
         if include_phase4_templates and isinstance(gate_message, str):
             yield f"{prefix}.loop.gate_message", gate_message
+        command_body = (
+            command_bodies.get(node.id)
+            if command_bodies is not None
+            else None
+        )
+        if include_phase4_templates and isinstance(command_body, str):
+            yield f"{prefix}.loop.command", command_body
     elif node.node_type == "approval" and isinstance(node.value, Mapping):
         message = node.value.get("message")
         if isinstance(message, str):
@@ -1445,7 +1489,11 @@ def validate_authenticated_resource_references(
                             package,
                             node,
                             command_body,
-                            field="command",
+                            field=(
+                                "loop.command"
+                                if node.node_type == "loop"
+                                else "command"
+                            ),
                         )
                     )
                 script_body = rewritten_scripts.get(node.id)

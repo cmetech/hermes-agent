@@ -1207,6 +1207,8 @@ def seal_workflow_compilation(
                 body = parse_command_resource(
                     source.root / relative, raw.decode("utf-8")
                 ).body
+                if not body.strip():
+                    raise ValueError("loop command body is empty")
             except (UnicodeError, ValueError, yaml.YAMLError) as exc:
                 raise _validation_error(
                     f"nodes[{node.source_index}].loop.command",
@@ -1313,11 +1315,7 @@ def seal_workflow_compilation(
     for node_id, (raw, relative, resource_kind) in command_raw.items():
         node = next(item for item in package.definition.nodes if item.id == node_id)
         assert node.origin is not None
-        compiled_body = (
-            validated.command_bodies[node_id]
-            if resource_kind == "command"
-            else command_source_bodies[node_id]
-        )
+        compiled_body = validated.command_bodies[node_id]
         uses.append(
             _CompilationResourceUse(
                 binding_id=f"{node.id}:{resource_kind}",

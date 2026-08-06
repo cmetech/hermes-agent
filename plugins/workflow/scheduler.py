@@ -509,6 +509,7 @@ def load_snapshot_format2(
         digest_node_origins,
     )
     from plugins.workflow.includes import collect_include_edges, expand_workflow_source
+    from plugins.workflow.language import bind_v4_loop_command_semantics
     from plugins.workflow.models import WorkflowNodeOrigin
     from plugins.workflow.schema import (
         _compile_workflow_source_document,
@@ -653,6 +654,15 @@ def load_snapshot_format2(
         identity_package = _compile_workflow_source_document(
             identity_source,
             normalizer_version=4,
+        )
+        identity_package = bind_v4_loop_command_semantics(
+            identity_package,
+            {
+                binding.node_id: binding.snapshot_path
+                for binding in manifest.resources
+                if binding.resource_kind == "loop_command"
+                and binding.node_id is not None
+            },
         )
     except WorkflowLanguageCompatibilityError:
         raise

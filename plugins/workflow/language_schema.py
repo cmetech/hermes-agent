@@ -16,6 +16,7 @@ from plugins.workflow.language import (
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
     SUPPORTED_NORMALIZER_VERSIONS,
     supports_phase3_semantics,
+    supports_phase4_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -1617,12 +1618,26 @@ _RETRY_FIELDS = (
     _field("retry", "delay_ms", "integer", "retry_delay"),
 )
 _LOOP_FIELDS = (
-    _field("loop", "prompt", "string", "nonempty_string", required=True),
+    _field("loop", "prompt", "string", "nonempty_string"),
+    _field(
+        "loop",
+        "command",
+        "string",
+        "nonempty_string",
+        phase=4,
+    ),
     _field("loop", "until", "string", "nonempty_string", required=True),
     _field("loop", "max_iterations", "integer", "loop_iterations", required=True),
     _field("loop", "fresh_context", "any", "any"),
     _field("loop", "until_bash", "any", "any"),
     _field("loop", "interactive", "any", "any"),
+    _field(
+        "loop",
+        "signal_completes",
+        "boolean",
+        "boolean",
+        phase=4,
+    ),
     _field("loop", "gate_message", "any", "any"),
 )
 _APPROVAL_FIELDS = (
@@ -2146,6 +2161,19 @@ def _object_schema(
     hook_event: str | None = None,
 ) -> dict[str, Any]:
     specs = _specs(scope)
+    phase4_loop = (
+        scope == "loop"
+        and supports_phase4_semantics(
+            profile,
+            CURRENT_NORMALIZER_BY_PROFILE[profile],
+        )
+    )
+    if scope == "loop" and not phase4_loop:
+        specs = tuple(
+            spec
+            for spec in specs
+            if spec.yaml_name not in {"command", "signal_completes"}
+        )
     result: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -2159,8 +2187,21 @@ def _object_schema(
         "additionalProperties": False,
     }
     required = tuple(spec.yaml_name for spec in specs if spec.required)
+    if scope == "loop" and not phase4_loop:
+        required = ("prompt", *required)
     if required:
         result["required"] = list(required)
+    if phase4_loop:
+        result["oneOf"] = [
+            {
+                "required": ["prompt"],
+                "not": {"required": ["command"]},
+            },
+            {
+                "required": ["command"],
+                "not": {"required": ["prompt"]},
+            },
+        ]
     conditions = tuple(item for item in STRUCTURAL_REQUIREMENTS if item.scope == scope)
     if conditions:
         result["allOf"] = [

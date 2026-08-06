@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from hashlib import sha256
 import math
+from pathlib import PurePosixPath
 import re
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -284,34 +285,13 @@ def normalize_workflow(
             node_semantics,
         )
 
-    normalized_document_value: dict[str, object] = {
-        "profile": selection.effective_profile.value,
-        "normalizer_version": normalizer_version,
-        "definition": {
-            "name": normalized_definition.name,
-            "description": normalized_definition.description,
-            "nodes": [
-                {
-                    "id": node.id,
-                    "node_type": node.node_type,
-                    "value": node.value,
-                    "depends_on": list(node.depends_on),
-                    "options": node.options,
-                }
-                for node in normalized_definition.nodes
-            ],
-            "options": normalized_definition.options,
-        },
-    }
-    if normalizer_version >= 2:
-        normalized_document_value["structured_outputs"] = (
-            _structured_outputs_projection(structured_outputs)
-        )
-    if supports_phase3_semantics(selection.effective_profile, normalizer_version):
-        normalized_document_value["node_semantics"] = _node_semantics_projection(
-            node_semantics
-        )
-    normalized_document = _json_safe(normalized_document_value)
+    normalized_document = _normalized_definition_document(
+        normalized_definition,
+        profile=selection.effective_profile,
+        normalizer_version=normalizer_version,
+        structured_outputs=structured_outputs,
+        node_semantics=node_semantics,
+    )
     metadata = WorkflowLanguageMetadata(
         declared_profile=selection.declared_profile,
         effective_profile=selection.effective_profile,
@@ -321,6 +301,100 @@ def normalize_workflow(
         node_semantics=node_semantics,
     )
     return NormalizedWorkflow(definition=normalized_definition, metadata=metadata)
+
+
+def _normalized_definition_document(
+    definition: WorkflowDefinition,
+    *,
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+    structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> object:
+    value: dict[str, object] = {
+        "profile": profile.value,
+        "normalizer_version": normalizer_version,
+        "definition": {
+            "name": definition.name,
+            "description": definition.description,
+            "nodes": [
+                {
+                    "id": node.id,
+                    "node_type": node.node_type,
+                    "value": node.value,
+                    "depends_on": list(node.depends_on),
+                    "options": node.options,
+                }
+                for node in definition.nodes
+            ],
+            "options": definition.options,
+        },
+    }
+    if normalizer_version >= 2:
+        value["structured_outputs"] = (
+            _structured_outputs_projection(structured_outputs)
+        )
+    if supports_phase3_semantics(profile, normalizer_version):
+        value["node_semantics"] = _node_semantics_projection(
+            node_semantics
+        )
+    return _json_safe(value)
+
+
+def bind_v4_loop_command_semantics(
+    package: WorkflowPackage,
+    command_bindings: Mapping[str, str],
+) -> WorkflowPackage:
+    """Finalize v4 loop semantics with authenticated snapshot-relative paths."""
+    metadata = package.language
+    if not supports_phase4_semantics(
+        metadata.effective_profile, metadata.normalizer_version
+    ):
+        if command_bindings:
+            raise ValueError("loop command bindings require Phase 4 semantics")
+        return package
+    command_nodes = {
+        node.id
+        for node in package.definition.nodes
+        if node.node_type == "loop"
+        and isinstance(node.value, Mapping)
+        and "command" in node.value
+    }
+    if set(command_bindings) != command_nodes or any(
+        not isinstance(binding, str) or not binding
+        for binding in command_bindings.values()
+    ):
+        raise ValueError("loop command bindings must exactly cover command loops")
+    if not command_nodes:
+        return package
+    node_semantics = {
+        node_id: freeze_value(_thaw(value))
+        for node_id, value in metadata.node_semantics.items()
+    }
+    for node_id, binding in command_bindings.items():
+        raw = node_semantics.get(node_id)
+        loop = raw.get("loop") if isinstance(raw, Mapping) else None
+        if not isinstance(loop, Mapping) or loop.get("prompt_source") != "command":
+            raise ValueError("loop command semantic projection is missing")
+        node_semantics[node_id] = freeze_value({
+            **dict(raw),
+            "loop": {**dict(loop), "command_binding": binding},
+        })
+    frozen_semantics = MappingProxyType(node_semantics)
+    rebound_metadata = replace(
+        metadata,
+        normalized_definition_digest=_sha256_json(
+            _normalized_definition_document(
+                package.definition,
+                profile=metadata.effective_profile,
+                normalizer_version=metadata.normalizer_version,
+                structured_outputs=metadata.structured_outputs,
+                node_semantics=frozen_semantics,
+            )
+        ),
+        node_semantics=frozen_semantics,
+    )
+    return replace(package, language=rebound_metadata)
 
 
 def select_normalizer_version(
@@ -495,8 +569,39 @@ def _normalize_v4(
     Mapping[str, WorkflowStructuredOutput],
     Mapping[str, Mapping[str, object]],
 ]:
-    """Reserve the v4 normalization step while preserving inherited semantics."""
-    return normalized_definition, structured_outputs, node_semantics
+    """Add immutable Phase 4 loop semantics after inherited normalization."""
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return normalized_definition, structured_outputs, node_semantics
+
+    semantics = dict(node_semantics)
+    root_interactive = normalized_definition.options.get("interactive") is True
+    for node in normalized_definition.nodes:
+        if node.node_type != "loop" or not isinstance(node.value, Mapping):
+            continue
+        loop = node.value
+        effective_interactive = (
+            root_interactive and loop.get("interactive") is True
+        )
+        signal_completes = loop.get(
+            "signal_completes", not effective_interactive
+        )
+        if signal_completes is False and not effective_interactive:
+            raise WorkflowSemanticNormalizationError(
+                node.source_index,
+                "loop.signal_completes",
+                "archon_loop_signal_confirmation_unavailable",
+                "signal_completes cannot be false without an effective interactive operator path",
+            )
+        semantics[node.id] = freeze_value({
+            **dict(semantics.get(node.id, {})),
+            "loop": {
+                "prompt_source": "command" if "command" in loop else "inline",
+                "command_binding": loop.get("command"),
+                "effective_interactive": effective_interactive,
+                "signal_completes": signal_completes,
+            },
+        })
+    return normalized_definition, structured_outputs, MappingProxyType(semantics)
 
 
 def _normalize_v3_retry(
@@ -907,7 +1012,11 @@ def read_language_snapshot(
         else _read_structured_outputs(value["structured_outputs"])
     )
     node_semantics = (
-        _read_node_semantics(value["node_semantics"])
+        _read_node_semantics(
+            value["node_semantics"],
+            profile=profile,
+            normalizer_version=normalizer_version,
+        )
         if supports_phase3_semantics(profile, normalizer_version)
         else MappingProxyType({})
     )
@@ -1008,6 +1117,9 @@ def _copy_node_semantics(
 
 def _read_node_semantics(
     value: object,
+    *,
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
 ) -> Mapping[str, Mapping[str, object]]:
     if not isinstance(value, Mapping) or len(value) > 512:
         raise WorkflowLanguageCompatibilityError(
@@ -1025,7 +1137,10 @@ def _read_node_semantics(
             "workflow language snapshot node semantics are invalid",
         ) from exc
     result: dict[str, Mapping[str, object]] = {}
+    phase4 = supports_phase4_semantics(profile, normalizer_version)
     allowed_node_keys = {"wall_timeout_seconds", "idle_timeout_seconds", "retry"}
+    if phase4:
+        allowed_node_keys.add("loop")
     retry_keys = {
         "explicit",
         "requested_retries",
@@ -1040,7 +1155,7 @@ def _read_node_semantics(
             or not isinstance(raw, Mapping)
             or not raw
             or not set(raw) <= allowed_node_keys
-            or "retry" not in raw
+            or ("retry" not in raw and "loop" not in raw)
             or (
                 "wall_timeout_seconds" in raw
                 and "idle_timeout_seconds" in raw
@@ -1050,6 +1165,52 @@ def _read_node_semantics(
                 "workflow_language_snapshot_invalid",
                 "workflow language snapshot node semantics are invalid",
             )
+        loop = raw.get("loop")
+        if loop is not None:
+            loop_keys = {
+                "prompt_source",
+                "command_binding",
+                "effective_interactive",
+                "signal_completes",
+            }
+            if not isinstance(loop, Mapping) or set(loop) != loop_keys:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_language_snapshot_invalid",
+                    "workflow language snapshot node semantics are invalid",
+                )
+            prompt_source = loop["prompt_source"]
+            command_binding = loop["command_binding"]
+            effective_interactive = loop["effective_interactive"]
+            signal_completes = loop["signal_completes"]
+            command_path_valid = False
+            if isinstance(command_binding, str) and command_binding:
+                candidate = PurePosixPath(command_binding)
+                parts = candidate.parts
+                command_path_valid = (
+                    not candidate.is_absolute()
+                    and ".." not in candidate.parts
+                    and command_binding == candidate.as_posix()
+                    and not command_binding.startswith("~")
+                    and "\\" not in command_binding
+                    and len(parts) >= 4
+                    and parts[0] == "packages"
+                    and _SHA256.fullmatch(parts[1]) is not None
+                    and _SHA256.fullmatch(parts[2]) is not None
+                )
+            if (
+                set(raw) != {"loop"}
+                or
+                prompt_source not in {"inline", "command"}
+                or not isinstance(effective_interactive, bool)
+                or not isinstance(signal_completes, bool)
+                or (signal_completes is False and not effective_interactive)
+                or (prompt_source == "inline" and command_binding is not None)
+                or (prompt_source == "command" and not command_path_valid)
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_language_snapshot_invalid",
+                    "workflow language snapshot node semantics are invalid",
+                )
         for timeout_key in ("wall_timeout_seconds", "idle_timeout_seconds"):
             timeout = raw.get(timeout_key)
             try:
@@ -1067,6 +1228,9 @@ def _read_node_semantics(
                     "workflow language snapshot node semantics are invalid",
                 )
         retry = raw.get("retry")
+        if retry is None and set(raw) == {"loop"}:
+            result[node_id] = freeze_value(_thaw(raw))
+            continue
         if not isinstance(retry, Mapping) or set(retry) != retry_keys:
             raise WorkflowLanguageCompatibilityError(
                 "workflow_language_snapshot_invalid",
