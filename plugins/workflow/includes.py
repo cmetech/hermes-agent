@@ -799,3 +799,47 @@ def expand_workflow_source(
         logical_chain=(root.name,),
     )
     return state.finish(expanded.nodes)
+
+
+def collect_include_edges(
+    root: WorkflowSourceDocument,
+    catalog,
+) -> tuple[dict[str, object], ...]:
+    """Project exact logical include edges without rereading mutable sources."""
+    edges: list[dict[str, object]] = []
+
+    def visit(
+        source: WorkflowSourceDocument,
+        namespace: tuple[str, ...],
+        active_keys: tuple[str, ...],
+    ) -> None:
+        for node in source.nodes:
+            if node.node_type != "include":
+                continue
+            child = catalog.selected.get(str(node.value))
+            if child is None:
+                raise _issue(
+                    "include_not_found",
+                    f"workflow include target was not found: {node.value}",
+                    node=node,
+                    field="include",
+                )
+            child_key = _package_key(child)
+            if child_key in active_keys:
+                raise _issue(
+                    "include_cycle",
+                    f"workflow include cycle: {source.name} -> {child.name}",
+                    node=node,
+                    field="include",
+                )
+            instance_path = (*namespace, node.id)
+            edges.append({
+                "include_instance_path": list(instance_path),
+                "source_package_key": _package_key(source),
+                "source_node_id": node.id,
+                "target_package_key": child_key,
+            })
+            visit(child, instance_path, (*active_keys, child_key))
+
+    visit(root, (), (_package_key(root),))
+    return tuple(edges)

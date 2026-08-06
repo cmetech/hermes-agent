@@ -465,6 +465,15 @@ class ResourceResolver:
         return self.read_bytes(relative).decode("utf-8")
 
     def command(self, name: str) -> CommandResource:
+        if (
+            isinstance(name, str)
+            and name.startswith("packages/")
+            and self.sealed_bytes is not None
+        ):
+            return self._parse_command(
+                self.package_root / name,
+                text=self.read_bytes(name).decode("utf-8"),
+            )
         if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
             raise ValueError("command must be a contained command name")
         filename = name if name.endswith(".md") else f"{name}.md"
@@ -517,6 +526,12 @@ class ResourceResolver:
             raise ValueError("uv requires a Python script")
         if runtime == "bun" and suffix and suffix not in {".js", ".ts"}:
             raise ValueError("bun requires a JavaScript or TypeScript script")
+        if normalized.startswith("packages/") and self.sealed_bytes is not None:
+            return ScriptResource(
+                path=self.package_root / normalized,
+                runtime=runtime,
+                authenticated_bytes=self.read_bytes(normalized),
+            )
         if suffix:
             names = (normalized,)
         elif runtime == "uv":

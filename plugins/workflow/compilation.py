@@ -9,6 +9,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
+from plugins.workflow.dependency_manifest import (
+    WorkflowDependencyManifest,
+    composite_workflow_digest,
+)
 from plugins.workflow.models import WorkflowPackage, WorkflowSourceDocument
 
 
@@ -109,6 +113,10 @@ class WorkflowCompilation:
     package: WorkflowPackage
     definition_bytes: bytes
     active_policy_bytes: bytes
+    dependency_manifest: WorkflowDependencyManifest
+    sealed_files: Mapping[str, bytes]
+    composite_digest: str
+    covered_relative_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.package, WorkflowPackage):
@@ -117,6 +125,36 @@ class WorkflowCompilation:
             raise ValueError("compiled definition must be immutable bytes")
         if not isinstance(self.active_policy_bytes, bytes):
             raise ValueError("compiled active policy must be immutable bytes")
+        if not isinstance(self.dependency_manifest, WorkflowDependencyManifest):
+            raise ValueError("compiled dependency manifest must be exact and immutable")
+        sealed_files = MappingProxyType({
+            str(path): bytes(data) for path, data in self.sealed_files.items()
+        })
+        if tuple(sorted(sealed_files)) != tuple(self.covered_relative_paths):
+            raise ValueError("compiled covered paths must match every sealed file")
+        bindings_by_path = {
+            binding.snapshot_path: binding
+            for binding in self.dependency_manifest.resources
+        }
+        if set(bindings_by_path) != set(sealed_files):
+            raise ValueError("compiled manifest must bind every sealed file")
+        for path, data in sealed_files.items():
+            binding = bindings_by_path[path]
+            if (
+                len(data) != binding.compiled_byte_size
+                or hashlib.sha256(data).hexdigest() != binding.compiled_digest
+            ):
+                raise ValueError("compiled sealed file digest does not match manifest")
+        if self.composite_digest != composite_workflow_digest(
+            self.dependency_manifest
+        ):
+            raise ValueError("compiled composite digest does not match its manifest")
+        object.__setattr__(self, "sealed_files", sealed_files)
+        object.__setattr__(
+            self,
+            "covered_relative_paths",
+            tuple(self.covered_relative_paths),
+        )
 
 
 COMPILED_ROOT_CACHE_MAX_ENTRIES = 128
@@ -179,6 +217,7 @@ def compile_workflow(
 
     selection = resolve_language_profile(root.sidecar)
     selected_version = select_normalizer_version(selection, normalizer_version)
+    expanded = None
     if supports_phase4_semantics(selection.effective_profile, selected_version):
         expanded = expand_workflow_source(root, catalog)
         if has_includes:
@@ -193,10 +232,41 @@ def compile_workflow(
         source_to_compile,
         normalizer_version=normalizer_version,
     )
+    from plugins.workflow.dependency_manifest import seal_workflow_compilation
+    from plugins.workflow.includes import collect_include_edges
+
+    (
+        dependency_manifest,
+        sealed_files,
+        covered_paths,
+        composite_digest,
+        bound_definition_bytes,
+    ) = (
+        seal_workflow_compilation(
+            root=root,
+            dependencies=expanded.dependencies if expanded is not None else (),
+            include_edges=(
+                collect_include_edges(root, catalog)
+                if expanded is not None and has_includes
+                else ()
+            ),
+            package=package,
+            definition_bytes=definition_bytes,
+            active_policy_bytes=root.sidecar_bytes or b"",
+            bind_executable_resources=supports_phase4_semantics(
+                selection.effective_profile,
+                selected_version,
+            ),
+        )
+    )
     compiled = WorkflowCompilation(
         package=package,
-        definition_bytes=definition_bytes,
+        definition_bytes=bound_definition_bytes,
         active_policy_bytes=root.sidecar_bytes or b"",
+        dependency_manifest=dependency_manifest,
+        sealed_files=sealed_files,
+        composite_digest=composite_digest,
+        covered_relative_paths=covered_paths,
     )
     if COMPILED_ROOT_CACHE_MAX_ENTRIES > 0:
         _COMPILED_ROOT_CACHE[cache_key] = compiled

@@ -151,15 +151,56 @@ class WorkflowResourceReadBudget:
     def seal(self) -> None:
         self._sealed = True
 
+    def remember_authenticated(self, logical_path: Path, data: bytes) -> bytes:
+        """Count immutable source-package bytes in this aggregate authority."""
+        if not isinstance(data, bytes):
+            raise ValueError("authenticated package resource must be immutable bytes")
+        canonical = self._logical_key(logical_path)
+        cached = self._contents.get(canonical)
+        if cached is not None:
+            if cached != data:
+                raise OSError("authenticated package resource identity changed")
+            return cached
+        if self._sealed:
+            raise WorkflowResourceCacheMissError(
+                "sealed package resource is unavailable"
+            )
+        if self.files_read >= self.max_files:
+            raise WorkflowResourceCapacityError("package resource file limit exceeded")
+        if len(data) > self.max_file_bytes:
+            raise WorkflowResourceCapacityError(
+                "package resource per-file limit exceeded"
+            )
+        if self.bytes_read + len(data) > self.max_total_bytes:
+            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
+        self.files_read += 1
+        self.bytes_read += len(data)
+        self._contents[canonical] = bytes(data)
+        return self._contents[canonical]
+
     def read_cached(self, logical_path: Path) -> bytes:
         key = self._logical_key(logical_path)
         canonical = self._aliases.get(key, key)
         try:
-            return self._contents[canonical]
+            data = self._contents[canonical]
         except KeyError as exc:
             raise WorkflowResourceCacheMissError(
                 "sealed package resource is unavailable"
             ) from exc
+        identity = self._identities.get(canonical)
+        if identity is not None:
+            try:
+                current = canonical.stat()
+            except OSError as exc:
+                raise OSError("package resource changed after shared read") from exc
+            if canonical.is_symlink() or not canonical.is_file() or identity != (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ):
+                raise OSError("package resource changed after shared read")
+        return data
 
     def has_cached(self, logical_path: Path) -> bool:
         key = self._logical_key(logical_path)
@@ -215,6 +256,24 @@ class ExecutionEnvironmentRequirement:
 
 
 @dataclass(frozen=True)
+class WorkflowOriginRisk:
+    package_key: str
+    shell_or_script_nodes: tuple[str, ...]
+    requested_tools: tuple[str, ...]
+    requested_skills: tuple[str, ...]
+    local_mcp_servers: tuple[str, ...]
+    providers: tuple[str, ...]
+    outward_action_nodes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkflowIgnoredChildPolicy:
+    package_key: str
+    sidecar_digest: str
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WorkflowRiskSummary:
     package_digest: str
     risk_digest: str
@@ -226,6 +285,8 @@ class WorkflowRiskSummary:
     outward_action_nodes: tuple[str, ...]
     required_secret_names: tuple[str, ...]
     execution_environment: Literal["trusted_local", "isolated_backend_required"]
+    origin_risks: tuple[WorkflowOriginRisk, ...] = ()
+    ignored_child_policies: tuple[WorkflowIgnoredChildPolicy, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -485,8 +546,20 @@ def build_risk_summary(
     compatibility: CompatibilityReport,
     *,
     read_budget: WorkflowResourceReadBudget | None = None,
+    compilation=None,
 ) -> WorkflowRiskSummary:
-    package_digest = compute_package_digest(package, read_budget=read_budget).sha256
+    if compilation is not None:
+        from plugins.workflow.compilation import WorkflowCompilation
+
+        if not isinstance(compilation, WorkflowCompilation):
+            raise ValueError("compilation must be an immutable workflow compilation")
+        if compilation.package != package:
+            raise ValueError("risk compilation must contain the assessed package")
+        package_digest = compilation.composite_digest
+    else:
+        package_digest = compute_package_digest(
+            package, read_budget=read_budget
+        ).sha256
     shell_nodes = tuple(
         node.id
         for node in package.definition.nodes
@@ -538,6 +611,85 @@ def build_risk_summary(
         if environment_value == "trusted_local"
         else "isolated_backend_required"
     )
+    origin_risks: tuple[WorkflowOriginRisk, ...] = ()
+    ignored_child_policies: tuple[WorkflowIgnoredChildPolicy, ...] = ()
+    if compilation is not None:
+        outward_set = frozenset(outward)
+        package_keys = tuple(
+            dict.fromkeys(
+                node.origin.package_key
+                for node in package.definition.nodes
+                if node.origin is not None
+            )
+        )
+        projected: list[WorkflowOriginRisk] = []
+        for package_key in sorted(package_keys):
+            nodes = tuple(
+                node
+                for node in package.definition.nodes
+                if node.origin is not None and node.origin.package_key == package_key
+            )
+            projected.append(
+                WorkflowOriginRisk(
+                    package_key=package_key,
+                    shell_or_script_nodes=tuple(
+                        node.id
+                        for node in nodes
+                        if node.node_type in {"bash", "script"}
+                    ),
+                    requested_tools=tuple(
+                        sorted({
+                            ARCHON_TOOL_ALIASES.get(str(tool), str(tool))
+                            for node in nodes
+                            for field in ("allowed_tools", "denied_tools")
+                            for tool in node.options.get(field, ())
+                        })
+                    ),
+                    requested_skills=tuple(
+                        sorted({
+                            str(skill)
+                            for node in nodes
+                            for skill in node.options.get("skills", ())
+                        })
+                    ),
+                    local_mcp_servers=tuple(
+                        sorted({
+                            str(reference)
+                            for node in nodes
+                            for reference in (
+                                (node.options.get("mcp"),)
+                                if isinstance(node.options.get("mcp"), str)
+                                else node.options.get("mcp", ())
+                            )
+                            if isinstance(reference, str)
+                        })
+                    ),
+                    providers=tuple(
+                        sorted({
+                            str(provider)
+                            for provider in (
+                                package.definition.options.get("provider"),
+                                *(node.options.get("provider") for node in nodes),
+                            )
+                            if isinstance(provider, str) and provider
+                        })
+                    ),
+                    outward_action_nodes=tuple(
+                        node.id for node in nodes if node.id in outward_set
+                    ),
+                )
+            )
+        origin_risks = tuple(projected)
+        ignored_child_policies = tuple(
+            WorkflowIgnoredChildPolicy(
+                package_key=dependency.package_key,
+                sidecar_digest=dependency.sidecar_digest,
+                fields=dependency.ignored_policy_fields,
+            )
+            for dependency in compilation.dependency_manifest.dependencies
+            if dependency.sidecar_status == "authenticated_ignored"
+            and dependency.sidecar_digest is not None
+        )
     risk_fields = {
         "package_digest": package_digest,
         "shell_or_script_nodes": shell_nodes,
@@ -553,6 +705,13 @@ def build_risk_summary(
             finding.path for finding in compatibility.blocking_findings
         ),
     }
+    if compilation is not None:
+        risk_fields["origin_risks"] = tuple(
+            asdict(origin_risk) for origin_risk in origin_risks
+        )
+        risk_fields["ignored_child_policies"] = tuple(
+            asdict(policy) for policy in ignored_child_policies
+        )
     if supports_phase3_semantics(
         package.language.effective_profile, package.language.normalizer_version
     ):
@@ -568,6 +727,8 @@ def build_risk_summary(
     ).hexdigest()
     return WorkflowRiskSummary(
         risk_digest=risk_digest,
+        origin_risks=origin_risks,
+        ignored_child_policies=ignored_child_policies,
         **{
             key: value
             for key, value in risk_fields.items()
@@ -575,6 +736,8 @@ def build_risk_summary(
                 "compatibility",
                 "blocking_findings",
                 "language_identity",
+                "origin_risks",
+                "ignored_child_policies",
             }
         },
     )
