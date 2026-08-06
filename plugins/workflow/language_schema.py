@@ -15,10 +15,11 @@ from plugins.workflow.language import (
     CURRENT_NORMALIZER_BY_PROFILE,
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
     SUPPORTED_NORMALIZER_VERSIONS,
+    select_normalizer_version,
     supports_phase3_semantics,
     supports_phase4_semantics,
 )
-from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowLanguageSelection
 
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -1903,10 +1904,13 @@ def _authoring_normalizer_version(
     profile: WorkflowLanguageProfile,
     requested: int | None,
 ) -> int:
-    version = CURRENT_NORMALIZER_BY_PROFILE[profile] if requested is None else requested
-    if type(version) is not int or version not in SUPPORTED_NORMALIZER_VERSIONS:
-        raise ValueError("unsupported workflow authoring normalizer version")
-    return version
+    return select_normalizer_version(
+        WorkflowLanguageSelection(
+            declared_profile=profile,
+            effective_profile=profile,
+        ),
+        requested,
+    )
 
 
 def _loop_specs(

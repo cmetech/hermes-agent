@@ -205,3 +205,50 @@ legacy JSON-truthiness matrix remains green. Explicit v4 schema and loader outco
 now agree for valid interactive/noninteractive loops, non-boolean interaction and
 signal fields, missing/blank gates, and non-string authored gates. No known concern
 remains from these two findings.
+
+## Fix round 2
+
+### Convergence finding resolved
+
+The three public versioned authoring projections now reuse
+`language.select_normalizer_version()` through `_authoring_normalizer_version()`.
+They therefore share admission's complete version authority: supported integer
+membership, boolean rejection, profile defaults, and the rule that normalizer v3 or
+greater requires `archon-2026-07`. The removed local check can no longer drift from
+admission or emit an impossible `hermes-legacy` v4 schema/descriptor/contract pair.
+
+The supported projection matrix remains unchanged: default Archon emits current v3,
+explicit Archon v4 remains available only as a staged projection, and legacy v1/v2
+remain valid. No normalizer activation, identity, sealing, snapshot, runtime,
+interaction, UI, tool, telemetry, or Task 8 path changed.
+
+### Authentic RED-GREEN evidence
+
+- RED:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k versioned_authoring_projections_reject_impossible_profile_pair`
+  produced **0 passed, 3 failed**. `definition_json_schema()`,
+  `node_kind_descriptors()`, and `workflow_authoring_contract()` all failed to raise
+  for `hermes-legacy` plus normalizer v4.
+- GREEN: the same command produced **3 passed, 0 failed** after delegating to the
+  authoritative selector.
+- Supported projection matrix:
+  `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k 'versioned_authoring_projections_reject_impossible_profile_pair or legacy_authoring_contract_preserves_supported_versions or explicit_v4_authoring_contract_exposes_staged_loop_fields or archon_authoring_contract_is_bounded_and_versioned'`
+  produced **7 passed, 0 failed**, covering Archon current v3/staged v4 and legacy
+  explicit v1/v2.
+
+### Fix-round verification
+
+- Complete language-schema suite: **618 passed, 0 failed**.
+- Task 7 schema/loop-executor gate: **677 passed, 0 failed**.
+- Focused v1-v3 source/snapshot matrix: **72 passed, 0 failed**.
+- `.venv/bin/ruff check plugins/workflow/language_schema.py tests/plugins/workflow/test_language_schema.py`: **all checks passed**.
+- `git diff --check`: passed with no whitespace errors.
+
+### Fix-round files and self-review
+
+- `plugins/workflow/language_schema.py`
+- `tests/plugins/workflow/test_language_schema.py`
+
+Confirmed every public versioned projection rejects the impossible pair with the
+same `workflow_normalizer_version_unsupported` compatibility error used by admission.
+No known concern remains from this convergence finding.

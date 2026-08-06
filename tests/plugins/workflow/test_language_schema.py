@@ -104,6 +104,47 @@ def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
     } <= loop_paths
 
 
+@pytest.mark.parametrize(
+    "projection",
+    [
+        pytest.param(definition_json_schema, id="definition-schema"),
+        pytest.param(language_schema.node_kind_descriptors, id="node-kinds"),
+        pytest.param(workflow_authoring_contract, id="authoring-contract"),
+    ],
+)
+def test_versioned_authoring_projections_reject_impossible_profile_pair(
+    projection,
+):
+    with pytest.raises(workflow_language.WorkflowLanguageCompatibilityError) as raised:
+        projection(
+            WorkflowLanguageProfile.HERMES_LEGACY,
+            normalizer_version=4,
+        )
+
+    assert raised.value.code == "workflow_normalizer_version_unsupported"
+
+
+@pytest.mark.parametrize("normalizer_version", [1, 2])
+def test_legacy_authoring_contract_preserves_supported_versions(
+    normalizer_version,
+):
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.HERMES_LEGACY,
+        normalizer_version=normalizer_version,
+    )
+
+    assert contract["normalizer_version"] == normalizer_version
+    loop_schema = contract["definition_schema"]["properties"]["nodes"]["items"][
+        "properties"
+    ]["loop"]
+    assert "prompt" in loop_schema["required"]
+    assert "command" not in loop_schema["properties"]
+    loop_kind = next(item for item in contract["node_kinds"] if item["id"] == "loop")
+    assert "nodes[].loop.command" not in {
+        item["field_path"] for item in loop_kind["fields"]
+    }
+
+
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
