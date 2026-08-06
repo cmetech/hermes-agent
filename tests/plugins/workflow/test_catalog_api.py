@@ -18,7 +18,10 @@ import pytest
 import yaml
 
 from plugins.workflow.compat import assess_compatibility
-from plugins.workflow.catalog_api import workflow_catalog_run_support
+from plugins.workflow.catalog_api import (
+    resolve_workflow_catalog_compilation,
+    workflow_catalog_run_support,
+)
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
@@ -1417,6 +1420,71 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     }
     assert set(row["language"]) == {"effective_profile", "legacy"}
     assert set(row["compatibility"]) == {"level", "runnable"}
+
+
+def test_current_v4_composite_trust_is_consistent_between_catalog_and_detail(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    root = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="catalog-v4-composite",
+        filename="catalog-v4-composite.yaml",
+        nodes=[{"id": "dependency", "include": "catalog-v4-child"}],
+    )
+    root.with_name("catalog-v4-composite.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="catalog-v4-child",
+        filename="catalog-v4-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    compilation = resolve_workflow_catalog_compilation(
+        "catalog-v4-composite",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="project",
+    )
+    assert compilation is not None
+    risk = build_risk_summary(
+        compilation.package,
+        assess_compatibility(compilation.package),
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="catalog-v4-test",
+        risk_digest=risk.risk_digest,
+    )
+
+    router = _module().router
+    catalog_response = _catalog_get(router, token=_reader())
+    detail_response = _detail_get(
+        router,
+        "catalog-v4-composite",
+        source="project",
+        token=_reader(),
+    )
+
+    assert catalog_response.status_code == detail_response.status_code == 200
+    catalog_row = next(
+        item
+        for item in _user_items(catalog_response)
+        if item["name"] == "catalog-v4-composite"
+    )
+    detail = detail_response.json()
+    assert catalog_row["trust_state"] == detail["trust_state"] == "trusted"
+    assert detail["risk_summary"]["package_digest"] == compilation.composite_digest
+    assert detail["compilation"]["composite_digest"] == (
+        compilation.composite_digest
+    )
 
 
 def test_workflow_detail_bounds_more_than_512_real_findings_and_keeps_omitted_blocker(

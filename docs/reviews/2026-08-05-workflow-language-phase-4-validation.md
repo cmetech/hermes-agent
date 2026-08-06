@@ -430,6 +430,51 @@ rerun was not relevant. No production, dependency, security, or
 language-progress artifact changed, and no full-suite or security rerun was
 required. Ruff on the changed test, YAML parsing, and `git diff --check` passed.
 
+## Final whole-branch review fixes — 2026-08-06
+
+Two Important findings from the final whole-branch review are closed on the feature
+branch. Current-v4 `trust` and `untrust` now resolve the same full
+`WorkflowCompilation` authority used by doctor and run admission, including a second
+resolution before trust-store mutation. Catalog list construction retains discovered
+compilations, so list and detail now assess current-v4 trust against the same include-
+closure composite digest. V1-v3 and current legacy showcases retain their established
+package-only identity.
+
+Strict test-first evidence used retries-disabled repository-wrapper commands. The
+three CLI relationships were RED at 0/3: the lifecycle could not resolve its include,
+the trust dependency race returned invocation/digest mismatch rather than conflict,
+and the untrust dependency race silently succeeded. The catalog relationship was RED
+at 0/1 because list reported untrusted while detail reported trusted. After the
+repairs, those selections passed 3/3 and 1/1; the expanded CLI relationship including
+both unsupported-field controls passed 5/5.
+
+Final verification evidence:
+
+- exact eleven-file Phase 4 gate: 225/225;
+- activation language/schema/snapshot gate: 766/766;
+- surfaces/catalog/detail/doctor/defensive/evidence gate: 179/179;
+- fresh installed-distribution integration: 1/1;
+- final combined operator/catalog relationship gate: 6/6;
+- relevant CLI/trust/catalog/detail gate: 222 passed / 5 exact-base packaged-schema
+  CLI failures;
+- full no-retry `tests/plugins/workflow` gate: 103 files, 4,941 passed / 6 failed in
+  187.4s. The failures are the same five exact-base packaged-schema CLI cases plus the
+  exact-base persistent-session
+  `test_recomputed_contiguous_pre_activation_order_damage_is_value_safe[prefix-delete]`
+  case;
+- Ruff on the four changed Python files and `git diff --check`: passed.
+
+The runtime continues to execute sealed compilation bytes; these read-only operator
+and catalog projections do not introduce post-admission source reads or weaken the
+reviewed containment, resource-budget, or trust-store boundaries. The Desktop Minor
+presentation guard remains deferred because backend `next_actions` remains the
+authority and this fix does not change that contract. The older Task 12 concern about
+vacuous Phase 4 coverage is obsolete after activation: ordinary Archon authoring now
+selects v4 and these regressions use real current-v4 root-plus-dependency closures.
+
+The detailed implementation and RED/GREEN record is in
+`.superpowers/sdd/2026-08-05-workflow-language-phase-4-ordinary-loops-immutable-includes/final-review-fix-report.md`.
+
 ## Conclusion
 
 Phase 4 activation is complete and verified on the feature branch: new/default

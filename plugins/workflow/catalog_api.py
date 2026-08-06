@@ -758,19 +758,6 @@ def _discover_catalog_compilations(
     )
 
 
-def _discover_catalog(
-    workdir: Path, hermes_home: Path
-) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
-    discovered, truncated = _discover_catalog_compilations(workdir, hermes_home)
-    return (
-        tuple(
-            item.package if isinstance(item, WorkflowCompilation) else item
-            for item in discovered
-        ),
-        truncated,
-    )
-
-
 def resolve_workflow_catalog_compilation(
     name: str,
     *,
@@ -1123,15 +1110,24 @@ def _catalog_entry(
     trust_snapshot: Mapping[str, object] | None,
     resource_budget: WorkflowResourceReadBudget,
     *,
+    compilation: WorkflowCompilation | None = None,
     verified_showcase: "VerifiedShowcasePackage | None" = None,
     execution_context: ExecutionCapabilityContext,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility, risk = assess_package_execution(
-        package,
-        execution_context,
-        read_budget=resource_budget,
-    )
+    if compilation is None:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+        )
+    else:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+            compilation=compilation,
+        )
     if (
         verified_showcase is not None
         and risk.package_digest != verified_showcase.package_digest
@@ -1142,6 +1138,7 @@ def _catalog_entry(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
+        compilation=compilation,
     )
     if verified_showcase is None:
         assert trust_store is not None and trust_snapshot is not None
@@ -1206,7 +1203,7 @@ def build_workflow_catalog(
     """Return at most 500 stable entries without executing workflow code."""
     home = Path(hermes_home).expanduser().resolve()
     binding = runner_binding or production_workflow_runner_binding()
-    discovered, truncated = _discover_catalog(
+    discovered, truncated = _discover_catalog_compilations(
         Path(workdir).expanduser().resolve(), home
     )
     showcase_budget = WorkflowResourceReadBudget(
@@ -1251,12 +1248,21 @@ def build_workflow_catalog(
     showcase_items: list[CatalogEntry] = []
     try:
         for verified in verified_showcases.values():
+            showcase_compilation = (
+                verified.compilation
+                if supports_phase4_semantics(
+                    verified.package.language.effective_profile,
+                    verified.package.language.normalizer_version,
+                )
+                else None
+            )
             showcase_items.append(
                 _catalog_entry(
                     verified.package,
                     None,
                     None,
                     showcase_budget,
+                    compilation=showcase_compilation,
                     verified_showcase=verified,
                     execution_context=background_execution_context(
                         binding,
@@ -1290,9 +1296,18 @@ def build_workflow_catalog(
         ):
             truncated = True
             break
-        if not isinstance(discovered_item, WorkflowPackage):
+        if not isinstance(discovered_item, WorkflowCompilation):
             items.append(discovered_item)
             continue
+        package = discovered_item.package
+        compilation = (
+            discovered_item
+            if supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            else None
+        )
         resource_budget = WorkflowResourceReadBudget(
             max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
             max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -1301,10 +1316,11 @@ def build_workflow_catalog(
         try:
             items.append(
                 _catalog_entry(
-                    discovered_item,
+                    package,
                     trust_store,
                     trust_snapshot,
                     resource_budget,
+                    compilation=compilation,
                     execution_context=background_execution_context(
                         binding,
                         requires_ai=None,
@@ -1313,7 +1329,7 @@ def build_workflow_catalog(
             )
         except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
             items.append(
-                _error_entry(discovered_item.definition.name, "catalog_capacity")
+                _error_entry(package.definition.name, "catalog_capacity")
             )
         except WorkflowTrustError as exc:
             raise WorkflowCatalogTrustUnavailableError(
@@ -1321,7 +1337,7 @@ def build_workflow_catalog(
             ) from exc
         except (OSError, UnicodeError, WorkflowValidationError, ValueError):
             items.append(
-                _error_entry(discovered_item.definition.name, "invalid_definition")
+                _error_entry(package.definition.name, "invalid_definition")
             )
         finally:
             resource_bytes_read += resource_budget.bytes_read

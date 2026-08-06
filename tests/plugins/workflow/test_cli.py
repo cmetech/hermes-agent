@@ -15,6 +15,7 @@ import yaml
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
+from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow import machine_contract
 from plugins.workflow.models import ExecutionFence, ValidationIssue
@@ -372,8 +373,10 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
     assert (code, f"nodes[0].{field}") in identities
     assert len(validation["result"]["issues"]) == len(identities)
 
-    package = load_workflow(path)
-    digest = compute_package_digest(package).sha256
+    digest = _resolve_compilation(
+        argparse.Namespace(workdir=tmp_path, hermes_home=home),
+        path.stem,
+    ).composite_digest
     trust = parser.parse_args(
         [*common, "trust", path.stem, "--digest", digest, "--json"]
     )
@@ -1438,6 +1441,200 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     args = parser.parse_args([*common, "untrust", "sample", "--json"])
     assert args.func(args) == 0
     assert _json_result(capsys)["status"] == "untrusted"
+
+
+def _write_current_v4_include_closure(workflow_writer, workdir: Path) -> Path:
+    root = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="current-v4-composite",
+        filename="current-v4-composite.yaml",
+        nodes=[{"id": "dependency", "include": "current-v4-child"}],
+    )
+    root.with_name("current-v4-composite.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="current-v4-child",
+        filename="current-v4-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    return root
+
+
+def test_current_v4_operator_trust_lifecycle_uses_exact_composite_authority(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    root = _write_current_v4_include_closure(workflow_writer, workdir)
+    home = tmp_path / "profile"
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(home)]
+
+    doctor_args = parser.parse_args([
+        *common,
+        "doctor",
+        "current-v4-composite",
+        "--json",
+    ])
+    assert doctor_args.func(doctor_args) == 0
+    doctor = _json_result(capsys)
+    composite_digest = doctor["package_digest"]
+    assert doctor["compilation"]["composite_digest"] == composite_digest
+
+    compilation = _resolve_compilation(
+        argparse.Namespace(workdir=workdir, hermes_home=home),
+        "current-v4-composite",
+    )
+    legacy_digest = compute_package_digest(compilation.package).sha256
+    assert composite_digest == compilation.composite_digest
+    assert legacy_digest != composite_digest
+
+    legacy_trust_args = parser.parse_args([
+        *common,
+        "trust",
+        "current-v4-composite",
+        "--digest",
+        legacy_digest,
+        "--json",
+    ])
+    assert legacy_trust_args.func(legacy_trust_args) == machine_contract.EXIT_INVOCATION
+    assert _json_envelope(capsys)["error"]["code"] == "digest_mismatch"
+
+    trust_args = parser.parse_args([
+        *common,
+        "trust",
+        "current-v4-composite",
+        "--digest",
+        composite_digest,
+        "--json",
+    ])
+    assert trust_args.func(trust_args) == 0
+    trusted = _json_result(capsys)
+    assert trusted["package_digest"] == composite_digest
+    assert WorkflowTrustStore(home).check(composite_digest) == "trusted"
+    assert WorkflowTrustStore(home).check(legacy_digest) == "untrusted"
+
+    run_args = parser.parse_args([
+        *common,
+        "run",
+        "current-v4-composite",
+        "--foreground",
+        "--idempotency-key",
+        "current-v4-composite-authority",
+        "--json",
+    ])
+    assert run_args.func(run_args) == 0
+    run = _json_result(capsys)
+    assert run["status"] == "succeeded"
+    assert RunStore(home).load_run(run["run_id"])["definition_digest"] == (
+        composite_digest
+    )
+
+    untrust_args = parser.parse_args([
+        *common,
+        "untrust",
+        "current-v4-composite",
+        "--json",
+    ])
+    assert untrust_args.func(untrust_args) == 0
+    untrusted = _json_result(capsys)
+    assert untrusted == {
+        "name": "current-v4-composite",
+        "package_digest": composite_digest,
+        "status": "untrusted",
+        "revoked": True,
+    }
+    assert WorkflowTrustStore(home).check(composite_digest) == "untrusted"
+    assert root.is_file()
+
+
+def _changed_v4_include_compilations(
+    workflow_writer, tmp_path: Path
+) -> tuple[Path, Path, WorkflowCompilation, WorkflowCompilation]:
+    workdir = tmp_path / "repo"
+    _write_current_v4_include_closure(workflow_writer, workdir)
+    home = tmp_path / "profile"
+    namespace = argparse.Namespace(workdir=workdir, hermes_home=home)
+    before = _resolve_compilation(namespace, "current-v4-composite")
+    workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="current-v4-child",
+        filename="current-v4-child.yaml",
+        nodes=[{"id": "execute", "bash": "printf changed"}],
+    )
+    after = _resolve_compilation(namespace, "current-v4-composite")
+    assert before.composite_digest != after.composite_digest
+    return workdir, home, before, after
+
+
+def test_current_v4_trust_rechecks_dependency_composite_before_recording(
+    workflow_writer, tmp_path, capsys, monkeypatch
+) -> None:
+    workdir, home, before, after = _changed_v4_include_compilations(
+        workflow_writer, tmp_path
+    )
+    resolutions = iter((before, after))
+    monkeypatch.setattr(
+        "plugins.workflow.cli._resolve_compilation",
+        lambda _args, _name: next(resolutions),
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(home),
+        "trust",
+        "current-v4-composite",
+        "--digest",
+        before.composite_digest,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_CONFLICT
+    assert _json_envelope(capsys)["error"]["code"] == "package_changed"
+    store = WorkflowTrustStore(home)
+    assert store.check(before.composite_digest) == "untrusted"
+    assert store.check(after.composite_digest) == "untrusted"
+
+
+def test_current_v4_untrust_rechecks_dependency_composite_before_revoking(
+    workflow_writer, tmp_path, capsys, monkeypatch
+) -> None:
+    workdir, home, before, after = _changed_v4_include_compilations(
+        workflow_writer, tmp_path
+    )
+    compatibility = assess_compatibility(before.package)
+    risk = build_risk_summary(
+        before.package,
+        compatibility,
+        compilation=before,
+    )
+    store = WorkflowTrustStore(home)
+    store.trust(
+        before.composite_digest,
+        actor="test",
+        risk_digest=risk.risk_digest,
+    )
+    resolutions = iter((before, after))
+    monkeypatch.setattr(
+        "plugins.workflow.cli._resolve_compilation",
+        lambda _args, _name: next(resolutions),
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(home),
+        "untrust",
+        "current-v4-composite",
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_CONFLICT
+    assert _json_envelope(capsys)["error"]["code"] == "package_changed"
+    assert store.check(before.composite_digest) == "trusted"
 
 
 def test_validate_and_doctor_text_include_effective_language_profile(

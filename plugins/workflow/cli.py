@@ -99,6 +99,7 @@ from plugins.workflow.store import (
 )
 from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
+    WorkflowRiskSummary,
     WorkflowTrustError,
     WorkflowTrustStore,
     WorkflowPackageDigest,
@@ -1084,6 +1085,21 @@ def _admission_package_digest(
     return compute_package_digest(compilation.package)
 
 
+def _compilation_trust_material(
+    compilation: WorkflowCompilation,
+) -> tuple[WorkflowPackageDigest, CompatibilityReport, WorkflowRiskSummary]:
+    """Return the exact digest, compatibility, and risk for one compilation."""
+    package = compilation.package
+    compatibility = assess_compatibility(package)
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        compilation=_admission_compilation(compilation),
+    )
+    digest = _admission_package_digest(compilation)
+    return digest, compatibility, risk
+
+
 def _cron_jobs() -> Iterable[Mapping[str, object]]:
     try:
         from cron.jobs import list_jobs
@@ -1981,29 +1997,25 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_trust(args: argparse.Namespace) -> int:
-    package = _resolve(args, args.name)
-    before = compute_package_digest(package)
+    compilation = _resolve_compilation(args, args.name)
+    package = compilation.package
+    before, compatibility, risk = _compilation_trust_material(compilation)
     if args.digest != before.sha256:
         raise WorkflowCommandError(
             "digest_mismatch",
             "supplied digest does not match the current package digest",
             exit_code=EXIT_INVOCATION,
         )
-    compatibility = assess_compatibility(package)
     require_runnable(compatibility)
-    risk = build_risk_summary(package, compatibility)
-    fresh_package = load_workflow(
-        package.workflow_path,
-        source=package.source,
-        precedence=package.precedence,
+    fresh_compilation = _resolve_compilation(args, args.name)
+    after, fresh_compatibility, fresh_risk = _compilation_trust_material(
+        fresh_compilation
     )
-    fresh_compatibility = assess_compatibility(fresh_package)
     require_runnable(fresh_compatibility)
-    fresh_risk = build_risk_summary(fresh_package, fresh_compatibility)
-    after = compute_package_digest(fresh_package)
     if (
         before != after
-        or risk.package_digest != after.sha256
+        or risk.package_digest != before.sha256
+        or fresh_risk.package_digest != after.sha256
         or risk.risk_digest != fresh_risk.risk_digest
     ):
         raise WorkflowConflict(
@@ -2028,12 +2040,27 @@ def _cmd_trust(args: argparse.Namespace) -> int:
 
 
 def _cmd_untrust(args: argparse.Namespace) -> int:
-    package = _resolve(args, args.name)
-    digest = compute_package_digest(package)
-    revoked = WorkflowTrustStore(args.hermes_home).revoke(digest.sha256)
+    compilation = _resolve_compilation(args, args.name)
+    package = compilation.package
+    before, _compatibility, risk = _compilation_trust_material(compilation)
+    fresh_compilation = _resolve_compilation(args, args.name)
+    after, _fresh_compatibility, fresh_risk = _compilation_trust_material(
+        fresh_compilation
+    )
+    if (
+        before != after
+        or risk.package_digest != before.sha256
+        or fresh_risk.package_digest != after.sha256
+        or risk.risk_digest != fresh_risk.risk_digest
+    ):
+        raise WorkflowConflict(
+            "package changed while trust was being revoked; rerun doctor",
+            code="package_changed",
+        )
+    revoked = WorkflowTrustStore(args.hermes_home).revoke(after.sha256)
     payload = {
         "name": package.definition.name,
-        "package_digest": digest.sha256,
+        "package_digest": after.sha256,
         "status": "untrusted",
         "revoked": revoked,
     }
