@@ -247,7 +247,10 @@ def test_canonical_expanded_byte_hard_boundary_minus_at_and_plus_one(
     ).canonical_definition_bytes == exact_bytes
     with pytest.raises(WorkflowValidationError) as exc:
         expand_workflow_source(above, WorkflowCatalogSnapshot.capture((above,)))
-    assert exc.value.issues[0].code == "include_expansion_limit"
+    issue = exc.value.issues[0]
+    assert issue.code == "include_expansion_limit"
+    assert issue.path == "nodes[0].bash"
+    assert issue.source_line == above.nodes[0].field_lines["bash"]
 
 
 class _TraversalBomb:
@@ -366,7 +369,10 @@ def test_canonical_byte_limit_aborts_before_materializing_later_node(
             bomb_source,
             WorkflowCatalogSnapshot.capture((bomb_source,)),
         )
-    assert exc.value.issues[0].code == "include_expansion_limit"
+    issue = exc.value.issues[0]
+    assert issue.code == "include_expansion_limit"
+    assert issue.path == "nodes[0].bash"
+    assert issue.source_line == bomb_source.nodes[0].field_lines["bash"]
 
 
 def test_include_depth_and_dependency_bounds_accept_exactly_the_boundary(
