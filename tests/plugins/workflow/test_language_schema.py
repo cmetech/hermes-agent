@@ -126,6 +126,83 @@ def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
     } <= loop_paths
 
 
+def test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices():
+    """Catch v4 syntax leaking into v3 or an include becoming executable."""
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    current = workflow_authoring_contract(profile)
+    phase4 = workflow_authoring_contract(profile, normalizer_version=4)
+
+    phase4_variants = phase4["definition_schema"]["properties"]["nodes"][
+        "items"
+    ]["oneOf"]
+    assert current["normalizer_version"] == 3
+    assert phase4["normalizer_version"] == 4
+    include = next(
+        variant for variant in phase4_variants if "include" in variant["required"]
+    )
+    assert set(include["properties"]) == {
+        "id",
+        "include",
+        "depends_on",
+        "trigger_rule",
+    }
+    assert "include" not in {item["id"] for item in phase4["node_kinds"]}
+    assert "include" not in NODE_TYPES
+
+    loop = phase4["definition_schema"]["properties"]["nodes"]["items"][
+        "properties"
+    ]["loop"]
+    choices = {
+        (
+            tuple(choice["required"]),
+            tuple(choice["not"]["required"]),
+        )
+        for choice in loop["oneOf"]
+    }
+    assert choices == {
+        (("prompt",), ("command",)),
+        (("command",), ("prompt",)),
+    }
+
+
+def test_explicit_v4_contract_documents_signal_interactions_and_stable_codes():
+    """Catch generated v4 contracts omitting operational semantics or failures."""
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    current = workflow_authoring_contract(profile)
+    phase4 = workflow_authoring_contract(profile, normalizer_version=4)
+    current_topics = {item["id"]: item for item in current["documentation"]["topics"]}
+    phase4_topics = {item["id"]: item for item in phase4["documentation"]["topics"]}
+
+    assert "ordinary-loops-and-includes" not in current_topics
+    topic = phase4_topics["ordinary-loops-and-includes"]
+    assert topic["parameters"]["include_mode"] == "compile_only"
+    assert topic["parameters"]["loop_prompt_sources"] == {
+        "cardinality": "exactly_one",
+        "fields": ["prompt", "command"],
+    }
+    assert topic["parameters"]["effective_interactive_requires"] == [
+        "workflow.interactive",
+        "loop.interactive",
+    ]
+    assert topic["parameters"]["signal_completes_defaults"] == {
+        "effective_interactive": False,
+        "otherwise": True,
+    }
+    assert topic["parameters"]["signal_confirmation_actions"] == {
+        "before_final_iteration": ["approve", "provide-input", "cancel"],
+        "final_iteration": ["approve", "cancel"],
+    }
+
+    registered = set(language_schema.phase4_durable_code_catalog())
+    assert registered
+    assert registered.isdisjoint(current["compatibility_codes"])
+    assert registered <= set(phase4["compatibility_codes"])
+    assert not any(
+        entry.get("blocking") and entry.get("enforcement_phase") == 4
+        for entry in phase4["compatibility_codes"].values()
+    )
+
+
 @pytest.mark.parametrize(
     "projection",
     [

@@ -91,6 +91,70 @@ to one declared inventory field: `workflow_language_profile_unsupported`,
 and Archon `archon_unknown_top_level_field`. Preserve those codes when
 reporting validation failures; do not collapse them to a generic parse error.
 
+### Staged normalizer v4
+
+Normal authoring contracts and new Archon admissions still select normalizer
+v3. Normalizer v4 is not the current Archon default. It is a staged, explicit contract; do not claim that
+`language_compatibility: archon-2026-07` activates it. An installed integration
+or contract test can retrieve its authoritative inventory with:
+
+```python
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
+
+contract = workflow_authoring_contract(
+    WorkflowLanguageProfile.ARCHON_2026_07,
+    normalizer_version=4,
+)
+```
+
+Use v4 only when the caller can explicitly compile, validate, trust, and admit
+that version while pinning it in the immutable run snapshot. Standard end-user
+CLI admission remains v3 until activation.
+
+V4 adds `include` as a compile-only source directive. It is not executable and
+its only fields are `id`, literal `include`, optional `depends_on`, and optional
+`trigger_rule`. Root policy is authoritative. Ignored child companions remain
+authenticated package bytes, including their required-secret declarations,
+limits, and services. The
+compiler expands depth-first, namespaces child nodes, and removes every include
+before scheduling.
+
+The complete root closure is bounded to include depth 3, 64 distinct selected
+dependencies, 512 executable nodes, 4,096 edges, 2 MiB of selected source, 2
+MiB of expanded definition, 512 authenticated files, 1 MiB per authenticated
+file, and 8 MiB total authenticated bytes.
+
+An include's entries are nodes without internal dependencies. Its sinks are
+nodes without internal consumers. Parent dependencies connect to all entries;
+downstream dependencies wait for all sinks. An include output alias selects the
+first sink in definition order. It never exposes a deep child or a completion-
+ordered result.
+
+Every included named command, script, and MCP resource remains bound to its
+logical child package and the sealed snapshot. The composite digest and
+dependency manifest cover that origin. Source deletion after admission does not
+change execution or resume; a snapshot mismatch fails closed. Diagnostics use
+bounded logical include provenance rather than host paths. Review warnings and
+all stable include codes before trust.
+
+A v4 loop has exactly one of inline `prompt` or named `command`. A named command
+body is resolved and sealed before execution. Effective interactivity requires
+both workflow and loop `interactive`; the loop also supplies `gate_message`.
+`signal_completes` defaults false for that effective interactive case and true
+otherwise. False is invalid without an operator path.
+
+When a completion signal needs confirmation, reuse the existing wire actions:
+`status`, `events`, `approve`, `provide-input`, and `cancel`. Before the final
+iteration, mutation choices are approve, provide-input, or cancel. The final
+iteration removes provide-input and offers approve or cancel. Approval accepts
+the sealed result without re-running the provider; feedback permits the next
+bounded iteration.
+
+Runtime child workflows, `include.with`, and `loop_group` are deliberate later
+Archon omissions. Do not synthesize them from v4. Portable `maxBudgetUsd` and
+sandbox guarantees also remain blocked.
+
 ## Portable YAML shape
 
 Required top-level fields are `name`, `description`, and a nonempty `nodes`
@@ -209,9 +273,11 @@ warning/fresh behavior. Use `workflow doctor`, generated
 `compatibility_codes`, and Run Inspector recovery evidence as the operator
 authority.
 
-MCP and skills remain options, not node kinds. Loops and includes remain Phase 4.
-Do not synthesize Phase 4 loop/include behavior or Phase 5 `maxBudgetUsd`,
-sandbox, or provider-portability guarantees.
+MCP and skills remain options, not node kinds. Explicit v4 adds compile-only
+includes and the sealed ordinary-loop contract above; it adds no executable
+node kind. Do not synthesize runtime child workflows, include parameters,
+`loop_group`, Phase 5 `maxBudgetUsd`, sandbox, or provider-portability
+guarantees.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

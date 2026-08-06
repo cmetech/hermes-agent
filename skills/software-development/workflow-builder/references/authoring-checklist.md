@@ -30,7 +30,33 @@ Before writing files:
   safe token contexts. Larger values are contents, never pathnames.
 - Only a confirmed missing cross-run session may start fresh. Same-run missing
   context and session-store errors must remain failures.
-- MCP and skills remain node options. Loops and includes remain Phase 4.
+- MCP and skills remain node options. Normalizer v4 is not the current Archon
+  default. `include` is a compile-only directive in staged v4, not an executable
+  node kind; ordinary admissions and generated contracts remain v3 until
+  activation.
+- Use explicit v4 only when the calling integration can request
+  `normalizer_version=4`, compile and admit that exact version, and preserve it
+  in the sealed run snapshot. Never imply that the Archon companion activates
+  v4 by itself.
+- Give an include only `id`, literal `include`, optional `depends_on`, and
+  optional `trigger_rule`. Do not add runtime fields, `with`, URLs, paths,
+  expressions, or a `loop_group`.
+- Treat the root companion as the only policy. Authenticate but ignore child
+  companions; never import their required-secret declarations, services,
+  limits, or profile choice.
+- Keep the complete include closure within depth 3, 64 distinct dependencies,
+  512 executable nodes, 4,096 edges, 2 MiB selected/expanded byte ceilings,
+  512 authenticated files, 1 MiB per file, and 8 MiB total.
+- Connect parent dependencies to every child entry and downstream consumers to
+  every child sink. An include output alias means the first sink in definition
+  order; it is not a deep-child reference.
+- For a v4 loop, author exactly one of `prompt` or named `command`. Seal a named
+  command from its logical package origin. Effective interactivity requires
+  both workflow and loop `interactive` plus `gate_message`.
+- Review `signal_completes`: it defaults false for effective interactivity and
+  true otherwise. Before the final iteration, a confirmation can approve,
+  provide-input, or cancel; the final iteration can only approve or cancel.
+  Approval must not replay the provider.
 - For shared package bytes, establish the oldest backend. Keep the companion
   unversioned while any consumer predates `language_compatibility` support.
 - Translate any legacy `create-workflow` request into `nodes`; do not adopt
@@ -40,6 +66,10 @@ Before offering execution or scheduling:
 
 - Portable YAML and the companion match the selected generated schemas, with
   no blocking annotations or findings ignored.
+- For explicit v4, review the composite root-plus-dependency digest, stable
+  include diagnostics, bounded logical origins, and all warnings before trust.
+  Source deletion after admission is safe only because execution and resume
+  verify the immutable dependency manifest and sealed resource bindings.
 - Every referenced command, script, skill, MCP definition, hook, inline agent,
   runtime, service, provider field, and output schema has a doctor finding.
 - Every referenced `commands/`, `scripts/`, and `mcp/` resource exists below

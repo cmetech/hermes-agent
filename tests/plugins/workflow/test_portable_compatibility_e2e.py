@@ -311,3 +311,95 @@ def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(
         assert node.options["mcp"] == "echo.yaml"
         assert node.options["skills"] == ("ascii-art",)
     assert {"mcp", "skills"}.isdisjoint(NODE_TYPES)
+
+
+def test_explicit_v4_include_loop_is_runnable_without_changing_current_archon(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    """Exercise the staged contract and compatibility path as one relationship."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    root_path = workflow_writer(
+        tmp_path / "root/workflows",
+        name="portable-v4-root",
+        interactive=True,
+        nodes=[{"id": "checks", "include": "portable-v4-child"}],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child/workflows",
+        name="portable-v4-child",
+        nodes=[
+            {
+                "id": "refine",
+                "loop": {
+                    "command": "refine",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                    "interactive": True,
+                    "gate_message": "Accept or refine",
+                },
+            }
+        ],
+    )
+    child_commands = child_path.parent.parent / "commands"
+    child_commands.mkdir()
+    child_commands.joinpath("refine.md").write_text(
+        "Refine the result from sealed bytes.\n",
+        encoding="utf-8",
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    root = parse_workflow_source_bytes(
+        root_path,
+        workflow_bytes=root_path.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    child = parse_workflow_source_bytes(
+        child_path,
+        workflow_bytes=child_path.read_bytes(),
+        sidecar_bytes=b"required_secrets: [IGNORED_CHILD_SECRET]\n",
+        source="profile",
+        precedence=2,
+    )
+    compilation = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+    report = assess_compatibility(compilation.package)
+    default_contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07
+    )
+    explicit_contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+
+    assert default_contract["normalizer_version"] == 3
+    assert explicit_contract["normalizer_version"] == 4
+    assert report.runnable
+    assert [node.id for node in compilation.package.definition.nodes] == [
+        "checks__refine"
+    ]
+    assert compilation.package.language.node_semantics["checks__refine"]["loop"] == {
+        "prompt_source": "command",
+        "command_binding": next(
+            resource.snapshot_path
+            for resource in compilation.dependency_manifest.resources
+            if resource.resource_kind == "loop_command"
+        ),
+        "effective_interactive": True,
+        "signal_completes": False,
+    }
+    finding_codes = {finding.code for finding in report.findings}
+    assert {
+        "phase4_loop_prompt_sealed",
+        "phase4_signal_confirmation",
+    } <= finding_codes
+    assert not any(
+        finding.blocking and finding.code.startswith("phase4_")
+        for finding in report.findings
+    )

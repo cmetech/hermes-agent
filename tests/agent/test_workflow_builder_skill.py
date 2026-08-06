@@ -48,6 +48,8 @@ def test_builder_references_cover_portable_shape_and_authoring_gate() -> None:
     checklist = (SKILL / "references" / "authoring-checklist.md").read_text(
         encoding="utf-8"
     )
+    schema_words = " ".join(schema.lower().split())
+    checklist_words = " ".join(checklist.lower().split())
 
     for field in ("nodes", "depends_on", "allowed_tools", "hooks", "agents"):
         assert f"`{field}`" in schema
@@ -73,10 +75,46 @@ def test_builder_references_cover_portable_shape_and_authoring_gate() -> None:
     ):
         assert phase3_contract.lower() in schema.lower()
     assert "blocked pending Phase 3" not in schema
-    assert "loops and includes remain phase 4" in schema.lower()
+    assert "normalizer v4 is not the current archon default" in schema_words
 
     assert "Archon timeout and retry fields are supported" in checklist
-    assert "loops and includes remain phase 4" in checklist.lower()
+    assert "normalizer v4 is not the current archon default" in checklist_words
+
+
+def test_builder_references_retrieve_complete_explicit_v4_authoring_guidance() -> None:
+    """Pressure-test the references for a root/include/confirmed-loop request."""
+    schema = (SKILL / "references" / "portable-schema.md").read_text(
+        encoding="utf-8"
+    ).lower()
+    checklist = (SKILL / "references" / "authoring-checklist.md").read_text(
+        encoding="utf-8"
+    ).lower()
+    guidance = f"{schema}\n{checklist}"
+    schema_words = " ".join(schema.split())
+
+    for required in (
+        "normalizer_version=4",
+        "compile-only",
+        "root companion",
+        "ignored child",
+        "depth 3",
+        "64 distinct",
+        "512 executable",
+        "4,096",
+        "first sink",
+        "signal_completes",
+        "provide-input",
+        "final iteration",
+        "sealed",
+        "source deletion",
+    ):
+        assert required in guidance
+
+    assert "live child workflow" not in guidance
+    assert "loop_group" in guidance
+    assert schema_words.index(
+        "normalizer v4 is not the current archon default"
+    ) < schema_words.index("review warnings and all stable include codes before trust")
 
 
 def test_builder_contract_fixtures_are_valid_portable_packages() -> None:

@@ -430,6 +430,10 @@ capabilities = ["capabilities/*.json", "capabilities/*.yaml"]
 "skills/productivity/workflow-showcase" = ["skills/productivity/workflow-showcase/SKILL.md"]
 "skills/productivity/workflow-showcase/workflows" = ["skills/productivity/workflow-showcase/workflows/*.md"]
 "skills/productivity/workflow-showcase/references" = ["skills/productivity/workflow-showcase/references/*.md"]
+# The generated-contract workflow-builder references are part of the installed
+# authoring surface. Keep them at their repository-relative location so a
+# wheel-backed skill can resolve the same relative links as a source checkout.
+"skills/software-development/workflow-builder/references" = ["skills/software-development/workflow-builder/references/*.md"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1", "observability/schemas/*.json"]

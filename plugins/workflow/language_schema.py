@@ -873,10 +873,84 @@ PHASE3_DURABLE_CODES = (
     ),
 )
 
-# Phase 4 tasks append codes here as they add an executable emitter test.  Keep
-# the registry separate from Phase 3 so its coverage cannot silently expand a
-# frozen Phase 3 inventory.
-PHASE4_DURABLE_CODES: tuple[DurableWorkflowCode, ...] = ()
+# Keep Phase 4 separate from the frozen Phase 3 inventory. Every entry is
+# exercised through the real compiler/resource behavior in the Phase 4 catalog
+# test before it can appear in a generated contract.
+PHASE4_DURABLE_CODES: tuple[DurableWorkflowCode, ...] = tuple(
+    DurableWorkflowCode(
+        code,
+        meaning,
+        area,
+        _ARCHON_V3,
+        _NORMALIZER_V4,
+        False,
+        True,
+        False,
+        fields,
+    )
+    for code, meaning, area, fields in (
+        (
+            "include_not_found",
+            "the selected catalog contains no literal include target",
+            "includes",
+            ("nodes[].include",),
+        ),
+        (
+            "include_ambiguous",
+            "catalog precedence does not select one include target",
+            "includes",
+            ("nodes[].include",),
+        ),
+        (
+            "include_cycle",
+            "the active include chain repeats a package",
+            "includes",
+            ("nodes[].include",),
+        ),
+        (
+            "include_depth_exceeded",
+            "the include closure would exceed depth three",
+            "includes",
+            ("nodes[].include",),
+        ),
+        (
+            "include_dependency_limit",
+            "the include closure exceeds the distinct dependency limit",
+            "includes",
+            ("nodes[].include",),
+        ),
+        (
+            "include_expansion_limit",
+            "the selected closure exceeds a bounded expansion resource",
+            "includes",
+            ("nodes",),
+        ),
+        (
+            "include_id_collision",
+            "authored and expanded node identifiers are not unique",
+            "includes",
+            ("nodes[].id",),
+        ),
+        (
+            "include_reference_invalid",
+            "an included dependency or output reference cannot be rewritten safely",
+            "includes",
+            ("nodes[].output references",),
+        ),
+        (
+            "include_resource_invalid",
+            "an origin-bound include resource is missing, unsafe, or changed",
+            "resources",
+            ("nodes[].command", "nodes[].script", "nodes[].loop.command"),
+        ),
+        (
+            "include_empty_graph",
+            "an include contributes no executable entry and sink graph",
+            "includes",
+            ("nodes[].include",),
+        ),
+    )
+)
 
 
 def phase4_durable_code_catalog() -> Mapping[str, DurableWorkflowCode]:
@@ -2424,9 +2498,12 @@ def _contract_path(spec: WorkflowFieldSpec) -> str:
 
 def compatibility_code_catalog(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> dict[str, object]:
     """Return stable profile-specific codes referenced by schema annotations."""
     selected = _profile(profile)
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
     grouped: dict[str, dict[str, object]] = {}
     for spec in FIELD_INVENTORY:
         status = _field_status(spec, selected)
@@ -2461,7 +2538,19 @@ def compatibility_code_catalog(
             "enforcement_phase": spec.enforcement_phase,
             "fields": list(spec.fields),
         }
-    for spec in (*PHASE3_DURABLE_CODES, *PHASE4_DURABLE_CODES):
+    durable_codes = (
+        *(
+            PHASE3_DURABLE_CODES
+            if supports_phase3_semantics(selected, selected_version)
+            else ()
+        ),
+        *(
+            PHASE4_DURABLE_CODES
+            if supports_phase4_semantics(selected, selected_version)
+            else ()
+        ),
+    )
+    for spec in durable_codes:
         if selected not in spec.profiles:
             continue
         entry = {
@@ -2857,8 +2946,11 @@ def semantic_rule_descriptors(
 
 def contract_documentation(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> dict[str, object]:
     selected = _profile(profile)
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
     applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
@@ -2894,7 +2986,76 @@ def contract_documentation(
                 },
             },
         ]
-        if selected is WorkflowLanguageProfile.ARCHON_2026_07
+        if supports_phase3_semantics(selected, selected_version)
+        else []
+    )
+    phase4_topics = (
+        [
+            {
+                "id": "ordinary-loops-and-includes",
+                "title": "Ordinary loops and immutable includes",
+                "description": (
+                    "Compile-time includes and confirmed ordinary-loop outcomes."
+                ),
+                "field_paths": [
+                    "nodes[].include",
+                    "nodes[].loop.prompt",
+                    "nodes[].loop.command",
+                    "nodes[].loop.interactive",
+                    "nodes[].loop.signal_completes",
+                    "nodes[].loop.gate_message",
+                ],
+                "applicability": applicability,
+                "parameters": {
+                    "include_mode": "compile_only",
+                    "root_policy_authority": True,
+                    "child_sidecars": "authenticated_ignored",
+                    "closure_limits": {
+                        "include_depth": 3,
+                        "distinct_dependencies": 64,
+                        "expanded_nodes": 512,
+                        "expanded_edges": 4_096,
+                        "selected_source_bytes": 2 * 1024 * 1024,
+                        "expanded_definition_bytes": 2 * 1024 * 1024,
+                        "authenticated_files": 512,
+                        "authenticated_file_bytes": 1024 * 1024,
+                        "authenticated_total_bytes": 8 * 1024 * 1024,
+                    },
+                    "include_entries": "nodes_without_internal_dependencies",
+                    "include_sinks": "nodes_without_internal_consumers",
+                    "include_output": "first_sink_in_definition_order",
+                    "resource_origin": "logical_package_and_sealed_snapshot",
+                    "loop_prompt_sources": {
+                        "cardinality": "exactly_one",
+                        "fields": ["prompt", "command"],
+                    },
+                    "effective_interactive_requires": [
+                        "workflow.interactive",
+                        "loop.interactive",
+                    ],
+                    "signal_completes_defaults": {
+                        "effective_interactive": False,
+                        "otherwise": True,
+                    },
+                    "signal_confirmation_actions": {
+                        "before_final_iteration": [
+                            "approve",
+                            "provide-input",
+                            "cancel",
+                        ],
+                        "final_iteration": ["approve", "cancel"],
+                    },
+                    "wire_actions_reused": True,
+                    "approval_reexecutes_provider": False,
+                    "later_archon_features": [
+                        "runtime_child_workflows",
+                        "include.with",
+                        "loop_group",
+                    ],
+                },
+            }
+        ]
+        if supports_phase4_semantics(selected, selected_version)
         else []
     )
     return {
@@ -2947,6 +3108,7 @@ def contract_documentation(
                 "code_source": "compatibility_codes",
             },
             *phase3_topics,
+            *phase4_topics,
         ],
         "examples": [
             {
@@ -3071,8 +3233,14 @@ def workflow_authoring_contract(
             selected,
             normalizer_version=selected_version,
         ),
-        "compatibility_codes": compatibility_code_catalog(selected),
-        "documentation": contract_documentation(selected),
+        "compatibility_codes": compatibility_code_catalog(
+            selected,
+            normalizer_version=selected_version,
+        ),
+        "documentation": contract_documentation(
+            selected,
+            normalizer_version=selected_version,
+        ),
         "limits": {
             "max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES,
             "max_contract_bytes": CONTRACT_MAX_BYTES,

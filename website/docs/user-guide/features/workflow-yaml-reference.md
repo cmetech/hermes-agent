@@ -1,7 +1,7 @@
 ---
 sidebar_position: 14
 title: "Workflow YAML reference"
-description: "Author profile-aware portable workflows with Phase 3 execution semantics"
+description: "Author profile-aware portable workflows and inspect the staged Phase 4 contract"
 ---
 
 # Workflow YAML reference
@@ -10,9 +10,10 @@ Hermes reads a portable workflow definition and an optional Hermes companion
 file. The portable file describes the DAG. The companion selects the language
 profile and adds Hermes admission and execution policy.
 
-This page describes the implemented Phase 3 contract: millisecond timeout and
-retry authoring, typed conditions and strict output references, bounded Bash
-substitution, and confirmed-missing persistent-session recovery.
+This page describes the current Phase 3 contract and the explicit, staged
+normalizer v4 contract for ordinary loops and immutable compile-time includes.
+The v4 inventory is published for authoring and installed-distribution
+validation, but it is not the default yet.
 
 ## Authoritative schema
 
@@ -80,6 +81,149 @@ consumer can parse `language_compatibility`.
 Changing the declaration changes the package digest and requires validation,
 doctor, and the normal digest-bound trust review again.
 
+### Staged explicit-v4 posture
+
+The current `archon-2026-07` mapping remains normalizer v3. The ordinary
+`workflow schema`, discovery, validate, trust, and new-admission paths continue
+to select v3 until a later activation change. Do not infer v4 from an Archon
+companion or an `include` field alone.
+
+Installed integrators can request the staged inventory explicitly without
+changing that default:
+
+```python
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
+
+contract = workflow_authoring_contract(
+    WorkflowLanguageProfile.ARCHON_2026_07,
+    normalizer_version=4,
+)
+```
+
+That envelope is the authoritative v4 syntax and diagnostic inventory. An
+integration that explicitly compiles and admits v4 must keep version `4`
+pinned through the immutable run snapshot. Standard end-user CLI admission
+remains v3 until activation; authoring ahead is safe, but attempting to bypass
+that gate is not.
+
+## Phase 4 ordinary loops and immutable includes
+
+An include is a compile directive, not an eighth executable node kind. Its
+closed source shape is `id`, `include`, optional `depends_on`, and optional
+`trigger_rule`. The target is one literal portable workflow name; paths, URLs,
+expressions, `with`, runtime fields, and nested `loop_group` graphs are
+rejected. Compilation expands the selected child depth-first, namespaces its
+nodes, and removes the include directive before scheduling.
+
+Only the root companion supplies language and execution policy. Child
+companions remain authenticated package bytes, but their required-secret
+declarations, limits, services, and other policy are ignored. A child cannot
+weaken or augment the root policy.
+
+For each include instance, entries are child nodes with no internal
+dependencies and sinks are child nodes with no internal consumers. Parent
+dependencies fan out to every entry. A downstream dependency on the include
+waits for every sink. `$checks.output` selects the first sink in child
+definition order; it is not a set, a last-completed result, or access to a deep
+child. Direct deep-child and graph-escape references fail validation.
+
+Compilation applies these hard closure ceilings before admission:
+
+| Dimension | Maximum |
+| --- | ---: |
+| Include depth | 3 |
+| Distinct selected dependencies | 64 |
+| Expanded executable nodes | 512 |
+| Expanded edges | 4,096 |
+| Selected source bytes | 2 MiB |
+| Expanded definition bytes | 2 MiB |
+| Authenticated files | 512 |
+| One authenticated file | 1 MiB |
+| All authenticated files | 8 MiB |
+
+Named commands, scripts, and MCP resources used by an included node resolve
+from that node's logical child package. Compilation records that origin, and
+admission materializes the complete authenticated closure into the immutable
+run snapshot. Execution and resume read only the sealed binding; deleting or
+changing the original root or child source cannot redirect it. Diagnostics use
+bounded logical provenance such as `include[checks]/child.yaml`, never a host
+filesystem path.
+
+### Root and child authoring shape
+
+`root/workflows/release.yaml`:
+
+```yaml
+name: release
+description: Run shared checks and confirm a bounded refinement
+interactive: true
+nodes:
+  - id: prepare
+    bash: "printf '%s\\n' ready"
+  - id: checks
+    include: shared-checks
+    depends_on: [prepare]
+  - id: refine
+    depends_on: [checks]
+    loop:
+      command: refine-release
+      until: DONE
+      max_iterations: 3
+      interactive: true
+      signal_completes: false
+      gate_message: Accept this result or provide feedback
+```
+
+`root/workflows/release.hermes.yaml` selects
+`language_compatibility: archon-2026-07` and owns all policy. The named loop
+body lives at `root/commands/refine-release.md`.
+
+`child/workflows/shared-checks.yaml`:
+
+```yaml
+name: shared-checks
+description: Reusable deterministic checks
+nodes:
+  - id: lint
+    bash: "printf '%s\\n' linted"
+  - id: test
+    depends_on: [lint]
+    bash: "printf '%s\\n' tested"
+```
+
+A neighboring `shared-checks.hermes.yaml` may be present in the authenticated
+closure, but it has no policy effect. In this example `lint` is the entry,
+`test` is the only sink, and `$checks.output` aliases `test`.
+
+### Confirmed loop signals and operator actions
+
+A v4 loop supplies exactly one of inline `prompt` or a named `command`, plus
+`until` and `max_iterations` from 1 through 100. A command body is resolved and
+sealed before execution. The loop is effectively interactive only when both
+workflow-level `interactive` and loop-level `interactive` are true; an
+interactive loop also requires `gate_message`.
+
+`signal_completes` defaults to `false` for an effectively interactive loop and
+to `true` otherwise. Setting it to `false` without an effective operator path
+is rejected. When a completion signal requires confirmation, Hermes pauses on
+the authenticated cleaned result and reuses the existing run wire actions:
+
+- before the final iteration: `approve`, `provide-input`, or `cancel`;
+- on the final iteration: `approve` or `cancel` only.
+
+`status` and `events` remain available in both states. Approval accepts the
+sealed result and completes without replaying the provider. `provide-input`
+records feedback and permits the next bounded iteration. The final iteration
+cannot request another one, so it never advertises `provide-input`. Resume,
+approval, and input use the run's existing interaction ID and expected state
+version; no Phase 4-specific mutation endpoint or action name is introduced.
+
+Phase 4 deliberately does not implement runtime child workflows,
+parameterized `include.with`, or `loop_group`. Portable sandbox and budget
+guarantees also remain later Archon work. Do not synthesize those meanings from
+the staged include and ordinary-loop contract.
+
 ## Status vocabulary
 
 | Status | Meaning on this page |
@@ -92,7 +236,7 @@ doctor, and the normal digest-bound trust review again.
 ### Generated stable codes
 
 The `compatibility_codes` object is the versioned public authority for both
-compatibility findings and durable Phase 3 runtime/evidence codes. Operator
+compatibility findings and durable Phase 3 and explicit-v4 runtime/evidence codes. Operator
 surfaces preserve those codes, while messages may improve. Run `workflow
 doctor` for package-specific findings and use Run Inspector for bounded attempt
 or recovery evidence. Do not copy the catalog into package metadata or prose.
@@ -154,7 +298,7 @@ dependencies, and references are validated as one acyclic graph.
 | `prompt` | `prompt: nonempty string`; inline prompt text. | AI fields below. | Mapped to an isolated Hermes agent worker |
 | `bash` | `bash: nonempty string`. | Optional millisecond `timeout` and `retry`. | Enforced through the contained process runner |
 | `script` | `script: nonempty string` and `runtime: uv | bun`. | `deps` string array; optional millisecond `timeout` and `retry`. Named scripts resolve below `scripts/`. | Enforced when the runtime and resource exist |
-| `loop` | `loop` object below. | Common fields except node `retry`. | Enforced with the existing loop shape; later Archon loop expansion is not claimed |
+| `loop` | `loop` object below. | Common fields except node `retry`. | Current v3 behavior is preserved; explicit v4 seals exactly one prompt/command source and confirmed-signal semantics |
 | `approval` | `approval` object below. | Common fields; node retry is not supported in Archon v3. | Enforced durable compare-and-set user gate |
 | `cancel` | `cancel: nonempty string` reason. | Common fields; node retry is not supported in Archon v3. | Enforced durable cancellation; it never publishes because it cannot complete successfully |
 
@@ -341,13 +485,15 @@ stream the verified original with a safe attachment name.
 
 | Object | Field | Shape and present meaning | Status |
 | --- | --- | --- | --- |
-| `loop` | `prompt` | Required nonempty prompt string. | Enforced |
+| `loop` | `prompt` | Nonempty inline prompt; explicit v4 requires exactly one of `prompt` or `command`. | Enforced |
+| `loop` | `command` | Named package command; explicit v4 requires exactly one of `command` or `prompt` and seals the resolved body. | Enforced in explicit v4 |
 | `loop` | `until` | Required nonempty completion condition. | Enforced |
 | `loop` | `max_iterations` | Required integer from 1 through 100. | Enforced |
 | `loop` | `fresh_context` | Current truth-tested option controlling per-iteration context. | Mapped/cache-enforced |
 | `loop` | `until_bash` | Current truth-tested deterministic completion command. | Enforced through contained Bash execution |
 | `loop` | `interactive` | Current truth-tested interactive-gate option. | Enforced |
 | `loop` | `gate_message` | Required and JSON-truthy when `interactive` is true. | Enforced |
+| `loop` | `signal_completes` | Boolean signal outcome; explicit v4 defaults false only for an effectively interactive loop, otherwise true. | Enforced in explicit v4 |
 | `approval` | `message` | Required nonempty review message. | Enforced |
 | `approval` | `capture_response` | Current truth-tested response-capture option. | Enforced |
 | `approval` | `on_reject` | Optional object with required nonempty `prompt` and optional `max_attempts` from 1 through 10. | Enforced; this is approval rework, not node retry |
@@ -624,9 +770,11 @@ Archon node `timeout` field.
 5. Rerun validate and doctor. Review and trust the new exact digest before a
    run.
 
-Phase 3 does not add new node kinds. MCP and skills remain options on AI nodes.
-Loops and includes remain Phase 4; portable sandbox and budget guarantees
-remain later work represented by their generated compatibility findings.
+Phase 4 does not add an executable node kind: `include` is compile-only, and
+the existing `loop` node receives the sealed prompt/command and signal contract
+described above. MCP and skills remain options on AI nodes. Runtime child
+workflows, `include.with`, `loop_group`, and portable sandbox and budget
+guarantees remain later work represented by generated compatibility findings.
 
 The legacy global `create-workflow` skill is not an authoring authority for
 Hermes. OTTO V1 `steps`, `produces`, `context_from`, `verify`, and `iterate`
