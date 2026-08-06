@@ -24,6 +24,9 @@ rebase, publication, `base` integration, or worktree cleanup was performed.
   presented as a captured runner-summary line.
 - The historical Task 13 defensive, distribution, Desktop, functional-review,
   and bounded security conclusions remain valid and are retained below.
+- The Task 14 documentation SDD follow-up also reconciles every active
+  customization entry sharing the language-guide surface with the one current
+  v4 authority; its exact relationship and full customization gates pass.
 - Activation is complete only on the feature branch. No `base` integration or
   remote/release operation was performed.
 
@@ -405,6 +408,28 @@ The Task 13 functional review remains clean and its bounded defensive security r
 remains **PASS_AFTER_FIX**. Activation did not introduce a new security finding or
 weaken the repaired catalog-sidecar boundary.
 
+### Task 14 SDD review fix round 2
+
+Re-review of the first activation-guidance fix found one Important ledger
+contradiction: the historical Phase 1 authoring-reference entry still called
+Archon millisecond semantics Phase-3-deferred and forbade Phase-2+ execution,
+despite sharing all four live guides with the current Phase 4 entry.
+
+Strict test-first expansion of the existing customization relationship produced
+0/1 in 0.6s and named both stale claims. The historical entry now keeps its
+Phase 1 provenance but points live language/removal authority to
+`workflow-phase4-language-contracts`. It acknowledges current/default Archon
+v4, legacy v2, explicit/sealed v1-v3 readers, and inherited Phase 3 semantics;
+only current generated blockers and actual later work remain unavailable.
+
+The corrected focused relationship passed 1/1 in 0.5s. The combined
+customization/source-guide relationships passed 2/2 in 0.6s, and the full
+customization checker passed 275/275 in 80.1s; its final post-refactor rerun
+passed 275/275 in 79.4s. No guide bytes changed, so an installed-wheel marker
+rerun was not relevant. No production, dependency, security, or
+language-progress artifact changed, and no full-suite or security rerun was
+required. Ruff on the changed test, YAML parsing, and `git diff --check` passed.
+
 ## Conclusion
 
 Phase 4 activation is complete and verified on the feature branch: new/default
@@ -412,5 +437,7 @@ Archon admissions use v4, legacy remains v2, and explicit or sealed v1-v3
 snapshots remain compatible. The exact activation, migration, installed-wheel,
 and baseline-attributed full-suite evidence above supports that conclusion.
 Task 13's pre-activation observations remain preserved as historical evidence;
-they no longer describe the current profile default. No `base` integration,
-push, merge, rebase, publication, release, or worktree cleanup was performed.
+they no longer describe the current profile default. Historical customization
+provenance likewise remains preserved without competing with the single current
+v4 authority. No `base` integration, push, merge, rebase, publication, release,
+or worktree cleanup was performed.

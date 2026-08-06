@@ -14,8 +14,10 @@ Activation implementation commit:
 `7bf55d5d680faea8d82474c1d3e2a3dd8f69a096`
 (`feat(workflow): activate phase 4 language semantics`). The documentation commit is
 `2e7e11bc4d05e5e93d37cc84162cda054432f960`
-(`docs(workflow): record phase 4 activation evidence`). The bounded SDD review
-reconciliation is the later `docs(workflow): reconcile phase 4 activation guidance`
+(`docs(workflow): record phase 4 activation evidence`). The first bounded SDD
+review reconciliation is `338baabf6959d3d9e6bf7a7273f6679098d4b4a2`
+(`docs(workflow): reconcile phase 4 activation guidance`). The second bounded
+reconciliation is the later `docs(workflow): align workflow customization guidance`
 commit containing the updated report.
 
 No push, merge, rebase, publication, `base` integration, branch deletion, or worktree
@@ -140,6 +142,56 @@ boundary. No production code or security boundary changed, so no additional
 security review or full Python rerun was required. Ruff passed all three changed
 Python test files; `git diff --check`, YAML parsing, the one-marker-per-guide
 check, and the current-Phase-4-progress-ledger exclusion check all passed.
+
+## SDD review fix round 2
+
+The re-review of `338baabf6959d3d9e6bf7a7273f6679098d4b4a2` returned **NOT
+CONVERGED** with zero Critical, one Important, and zero Minor findings. The
+adjacent historical `workflow-language-authoring-reference` entry shared the
+four live guides but still called Archon millisecond timeout behavior
+Phase-3-deferred and prohibited all Phase-2+ execution. That live guidance
+contradicted both the current v4 authority and the entry reconciled in fix round
+1.
+
+The existing customization relationship was extended before the YAML edit. It
+now scans every active entry owning any of the four guides for stale language
+claims, finds the one runtime/generated-contract authority, and requires every
+entry sharing the complete four-guide language surface to point to that
+authority rather than duplicate it. Exact RED command:
+
+```text
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/scripts/test_check_upstream_customizations.py::test_phase4_customization_current_state_matches_runtime_contract
+```
+
+Result: 1 file, 0 passed, 1 failed in 0.6s. The failure named the historical
+entry and both contradictions: `Phase 3-deferred` and `must not claim Phase 2+
+execution`.
+
+The older entry now retains its original Phase 1 symbols and commit subject,
+adds one machine-readable supersession pointer to
+`workflow-phase4-language-contracts`, and defers live version/removal authority
+to that entry. Its merge guidance acknowledges current Archon v4, legacy v2,
+explicit/sealed v1-v3 readers, and the Phase 3 semantics inherited by v4. Its
+negative boundary is limited to current generated blockers and actual later
+work: runtime child workflows, `include.with`, `loop_group`, portable budget
+and sandbox guarantees, and provider portability. It no longer uses a blanket
+phase threshold.
+
+The first post-YAML run cleared both contradictions but exposed an overbroad
+test assumption: three unrelated Desktop/showcase entries own only
+`workflows.md` and are not language authorities. The contradiction scan still
+covers them, while supersession is now required only for entries owning all
+four language guides. Corrected exact GREEN was 1/1 in 0.5s. The combined
+customization/source-guide relationships passed 2/2 in 0.6s, and the full
+customization checker passed 275/275 in 80.1s. After the owner-classification
+refactor, its final full rerun passed 275/275 in 79.4s. Installed guide bytes
+were unchanged, so the installed-wheel marker gate was not relevant to this
+ledger-only correction and was not rerun.
+
+No production code, live guide, dependency, lockfile, security boundary, or
+current Phase 4 progress ledger changed. No security review or full-suite run
+was required. Ruff on the changed test, YAML parsing, `git diff --check`, and
+the current-Phase-4-progress-ledger exclusion check passed.
 
 ## Strict TDD evidence
 

@@ -30,6 +30,19 @@ from scripts.check_upstream_customizations import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NORMALIZER_INVARIANT_PREFIX = "current normalizer contract: "
+LANGUAGE_AUTHORITY_SUPERSESSION_PREFIX = (
+    "workflow language authority superseded by: "
+)
+WORKFLOW_LANGUAGE_GUIDES = frozenset({
+    "website/docs/user-guide/features/workflow-yaml-reference.md",
+    "website/docs/user-guide/features/workflows.md",
+    "skills/software-development/workflow-builder/references/portable-schema.md",
+    "skills/software-development/workflow-builder/references/authoring-checklist.md",
+})
+STALE_LANGUAGE_GUIDANCE = re.compile(
+    r"phase\s*3[-\s]+deferred|must\s+not\s+claim\s+phase\s*2\+\s+execution",
+    re.IGNORECASE,
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -89,11 +102,27 @@ def test_phase4_customization_current_state_matches_runtime_contract() -> None:
             REPO_ROOT / "docs" / "upstream-customizations" / "workflow-orchestration.yaml"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
+    guide_entries = [
         item
         for item in manifest["upstream_changes"]
-        if item["id"] == "workflow-phase4-language-contracts"
-    )
+        if WORKFLOW_LANGUAGE_GUIDES.intersection(item["files"])
+    ]
+    language_authority_entries = [
+        entry
+        for entry in guide_entries
+        if WORKFLOW_LANGUAGE_GUIDES <= set(entry["files"])
+    ]
+    authority_entries = [
+        entry
+        for entry in language_authority_entries
+        if any(
+            invariant.startswith(NORMALIZER_INVARIANT_PREFIX)
+            for invariant in entry.get("owned_invariants", [])
+        )
+    ]
+    assert len(authority_entries) == 1
+    entry = authority_entries[0]
+    assert WORKFLOW_LANGUAGE_GUIDES <= set(entry["files"])
     encoded = next(
         invariant.removeprefix(NORMALIZER_INVARIANT_PREFIX)
         for invariant in entry["owned_invariants"]
@@ -120,6 +149,29 @@ def test_phase4_customization_current_state_matches_runtime_contract() -> None:
         )["normalizer_version"]
         for version in sorted(SUPPORTED_NORMALIZER_VERSIONS)
     ] == sorted(SUPPORTED_NORMALIZER_VERSIONS)
+
+    contradictions: dict[str, list[str]] = {}
+    for candidate in guide_entries:
+        guidance = " ".join([
+            *candidate.get("owned_invariants", []),
+            candidate["merge_guidance"],
+            candidate["removal_condition"],
+        ])
+        if matches := STALE_LANGUAGE_GUIDANCE.findall(guidance):
+            contradictions[candidate["id"]] = sorted(set(matches))
+    assert contradictions == {}
+
+    for historical in language_authority_entries:
+        if historical is entry:
+            continue
+        superseded_by = [
+            invariant.removeprefix(LANGUAGE_AUTHORITY_SUPERSESSION_PREFIX)
+            for invariant in historical.get("owned_invariants", [])
+            if invariant.startswith(LANGUAGE_AUTHORITY_SUPERSESSION_PREFIX)
+        ]
+        assert superseded_by == [entry["id"]]
+        assert entry["id"] in historical["merge_guidance"]
+        assert entry["id"] in historical["removal_condition"]
 
 
 def _parser_request(
