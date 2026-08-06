@@ -4128,7 +4128,7 @@ class RunScheduler:
         language_profile: WorkflowLanguageProfile,
     ) -> NodeExecutionResult:
         if (
-            result.status != "succeeded"
+            not RunScheduler._retains_declared_primary_output(node, result)
             or result.primary_output is not None
             or language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
             or node.node_type not in {"bash", "script", "loop"}
@@ -4166,6 +4166,21 @@ class RunScheduler:
                 canonicalization_version=1,
                 output_type=str(node.options["output_type"]),
             ),
+        )
+
+    @staticmethod
+    def _retains_declared_primary_output(
+        node: WorkflowNode,
+        result: NodeExecutionResult,
+    ) -> bool:
+        if result.status == "succeeded":
+            return True
+        pending = result.metadata.get("pending_interaction")
+        return (
+            result.status == "paused"
+            and node.node_type == "loop"
+            and isinstance(pending, Mapping)
+            and pending.get("type") == "loop_signal_confirmation"
         )
 
     def _persist_result(
@@ -4252,7 +4267,10 @@ class RunScheduler:
             completion_metadata = dict(result.metadata)
             completion_artifacts = result.artifacts
             retained_candidate = None
-            if result.status == "succeeded" and result.primary_output is not None:
+            if (
+                self._retains_declared_primary_output(node, result)
+                and result.primary_output is not None
+            ):
                 retained_candidate = result.primary_output
                 if (
                     language_profile is WorkflowLanguageProfile.ARCHON_2026_07

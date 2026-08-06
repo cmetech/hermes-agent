@@ -70,6 +70,7 @@ from plugins.workflow.provenance import (
 )
 from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
 from plugins.workflow.output_resolution import (
+    PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
     ArchonOutputIntegrityError,
     ArchonOutputUnavailableError,
     _RETRYABLE_READ_ERRNOS,
@@ -77,6 +78,7 @@ from plugins.workflow.output_resolution import (
     _safe_component,
     canonical_output_publication_identity,
     output_publication_identity_sha256,
+    primary_output_candidate_from_identity,
     write_archon_output_exclusive,
 )
 from plugins.workflow.schedule_time import (
@@ -693,6 +695,36 @@ class TypedPublicationCandidate:
     schema_fingerprint: str | None
     canonicalization_version: int
     session_id: str | None
+
+
+def _typed_publication_candidate_from_metadata(
+    metadata: object,
+) -> TypedPublicationCandidate | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw_candidate = metadata.get(PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY)
+    if raw_candidate is None:
+        return None
+    retained = primary_output_candidate_from_identity(raw_candidate)
+    if retained.output_type is None:
+        raise ArchonOutputIntegrityError(
+            "staged typed publication has no output type"
+        )
+    session_id = metadata.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise ArchonOutputIntegrityError(
+            "staged typed publication session identity is invalid"
+        )
+    return TypedPublicationCandidate(
+        attempt_relative_path=retained.attempt_relative_path,
+        output_type=retained.output_type,
+        media_type=retained.media_type,
+        size_bytes=retained.size_bytes,
+        sha256=retained.sha256,
+        schema_fingerprint=retained.schema_fingerprint,
+        canonicalization_version=retained.canonicalization_version,
+        session_id=session_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1925,6 +1957,65 @@ def _sealed_typed_output_declarations(
     return declarations
 
 
+def _structured_output_authority(
+    projection: Mapping[str, object],
+) -> Mapping[str, object]:
+    language = projection.get("language")
+    if (
+        not isinstance(language, Mapping)
+        or language.get("effective_profile") != "archon-2026-07"
+    ):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    structured_outputs = language.get("structured_outputs")
+    if language.get("normalizer_version") == 1:
+        structured_outputs = {}
+    elif not isinstance(structured_outputs, Mapping):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    return structured_outputs
+
+
+def _typed_output_requirement(
+    projection: Mapping[str, object],
+    *,
+    node_id: str,
+    declaration: _DeclaredTypedOutput,
+) -> _RequiredTypedPublication:
+    structured_outputs = _structured_output_authority(projection)
+    structured = structured_outputs.get(node_id)
+    if declaration.has_structured_schema:
+        if not isinstance(structured, Mapping):
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+        fingerprint = structured.get("schema_fingerprint")
+        version = structured.get("canonicalization_version")
+        if (
+            not isinstance(fingerprint, str)
+            or _SHA256_PATTERN.fullmatch(fingerprint) is None
+            or isinstance(version, bool)
+            or version != 1
+        ):
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+    else:
+        if structured is not None:
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+        fingerprint = None
+        version = 1
+    return _RequiredTypedPublication(
+        output_type=declaration.output_type,
+        schema_fingerprint=fingerprint,
+        canonicalization_version=version,
+    )
+
+
 def _journaled_typed_publications(
     projection: Mapping[str, object],
     declared_outputs: Mapping[str, _DeclaredTypedOutput],
@@ -1941,13 +2032,8 @@ def _journaled_typed_publications(
         isinstance(language, Mapping)
         and language.get("effective_profile") == "archon-2026-07"
     )
-    structured_outputs = language.get("structured_outputs") if archon else None
-    if archon and language.get("normalizer_version") == 1:
-        structured_outputs = {}
-    elif archon and not isinstance(structured_outputs, Mapping):
-        raise JournalRecoveryError(
-            "typed publication language authority is invalid"
-        )
+    if archon:
+        _structured_output_authority(projection)
     requirements: dict[str, _RequiredTypedPublication] = {}
     for node_id, declaration in declared_outputs.items():
         node = nodes.get(node_id)
@@ -1957,34 +2043,10 @@ def _journaled_typed_publications(
             )
         if not archon or node.get("state") != "succeeded":
             continue
-        structured = structured_outputs.get(node_id)
-        if declaration.has_structured_schema:
-            if not isinstance(structured, Mapping):
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-            fingerprint = structured.get("schema_fingerprint")
-            version = structured.get("canonicalization_version")
-            if (
-                not isinstance(fingerprint, str)
-                or _SHA256_PATTERN.fullmatch(fingerprint) is None
-                or isinstance(version, bool)
-                or version != 1
-            ):
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-        else:
-            if structured is not None:
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-            fingerprint = None
-            version = 1
-        requirements[node_id] = _RequiredTypedPublication(
-            output_type=declaration.output_type,
-            schema_fingerprint=fingerprint,
-            canonicalization_version=version,
+        requirements[node_id] = _typed_output_requirement(
+            projection,
+            node_id=node_id,
+            declaration=declaration,
         )
     descriptors: list[_JournaledTypedPublication] = []
     publication_ids: set[str] = set()
@@ -12029,6 +12091,7 @@ class RunStore:
             raise ValueError(f"invalid node completion state: {status}")
         artifacts = tuple(artifacts)
         pending_candidate = (metadata or {}).get("pending_interaction")
+        confirmation = None
         if (
             isinstance(pending_candidate, Mapping)
             and pending_candidate.get("type") == "loop_signal_confirmation"
@@ -12195,11 +12258,65 @@ class RunStore:
                     }
             publication_ref = None
             publication_artifact = None
-            if status == "succeeded" and typed_publication is not None:
+            staged_confirmation = status == "paused" and confirmation is not None
+            staged_publication = (
+                _typed_publication_candidate_from_metadata(metadata)
+                if staged_confirmation
+                else None
+            )
+            if staged_confirmation and staged_publication != typed_publication:
+                raise ArchonOutputIntegrityError(
+                    "paused typed publication does not match its staged identity"
+                )
+            if (
+                staged_confirmation
+                and staged_publication is None
+                and claim.node_id
+                in _sealed_typed_output_declarations(directory, projection)
+            ):
+                raise ArchonOutputIntegrityError(
+                    "declared loop output has no staged typed publication"
+                )
+            if typed_publication is not None and (
+                status == "succeeded" or staged_confirmation
+            ):
                 publication_artifact = _canonical_typed_publication_artifact(
                     artifacts,
                     typed_publication,
                 )
+                if staged_confirmation and (
+                    publication_artifact.relative_path
+                    != confirmation.result_artifact
+                    or publication_artifact.sha256 != confirmation.result_sha256
+                ):
+                    raise ArchonOutputIntegrityError(
+                        "staged typed publication is not the confirmed loop result"
+                    )
+                if staged_confirmation:
+                    declaration = _sealed_typed_output_declarations(
+                        directory,
+                        projection,
+                    ).get(claim.node_id)
+                    if declaration is None:
+                        raise ArchonOutputIntegrityError(
+                            "typed publication has no sealed output authority"
+                        )
+                    requirement = _typed_output_requirement(
+                        projection,
+                        node_id=claim.node_id,
+                        declaration=declaration,
+                    )
+                    if (
+                        typed_publication.output_type
+                        != requirement.output_type
+                        or typed_publication.schema_fingerprint
+                        != requirement.schema_fingerprint
+                        or typed_publication.canonicalization_version
+                        != requirement.canonicalization_version
+                    ):
+                        raise ArchonOutputIntegrityError(
+                            "typed publication conflicts with sealed output authority"
+                        )
                 projected_matches = [
                     entry
                     for entry in projection["artifacts"]
@@ -12218,15 +12335,16 @@ class RunStore:
                     raise ArchonOutputIntegrityError(
                         "projected artifact conflicts with typed publication"
                     )
-                publication_ref = self._publish_typed_bundle_locked(
-                    directory,
-                    projection,
-                    run_id=claim.run_id,
-                    node_id=claim.node_id,
-                    attempt_id=claim.attempt_id,
-                    artifact=publication_artifact,
-                    candidate=typed_publication,
-                )
+                if status == "succeeded":
+                    publication_ref = self._publish_typed_bundle_locked(
+                        directory,
+                        projection,
+                        run_id=claim.run_id,
+                        node_id=claim.node_id,
+                        attempt_id=claim.attempt_id,
+                        artifact=publication_artifact,
+                        candidate=typed_publication,
+                    )
             node["state"] = status
             node.pop("claim", None)
             safe_error_message = _sanitize_diagnostic(error_message)
@@ -16021,6 +16139,108 @@ class RunStore:
         ):
             raise ValueError("loop signal result artifact digest changed")
 
+    def _staged_loop_typed_publication(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        node: Mapping[str, object],
+        confirmation: LoopSignalConfirmation,
+    ) -> tuple[dict[str, object], ArtifactRef, TypedPublicationCandidate] | None:
+        attempts = node.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is missing"
+            )
+        attempt = attempts[-1]
+        if not isinstance(attempt, Mapping):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is malformed"
+            )
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt.get("state") != "paused"
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is not the paused attempt"
+            )
+        staged = _typed_publication_candidate_from_metadata(
+            attempt.get("metadata")
+        )
+        declaration = _sealed_typed_output_declarations(
+            directory,
+            projection,
+        ).get(node_id)
+        if declaration is None:
+            if staged is not None:
+                raise ArchonOutputIntegrityError(
+                    "staged typed publication has no sealed output authority"
+                )
+            return None
+        if staged is None:
+            raise ArchonOutputIntegrityError(
+                "declared loop output has no staged typed publication"
+            )
+        requirement = _typed_output_requirement(
+            projection,
+            node_id=node_id,
+            declaration=declaration,
+        )
+        if (
+            staged.output_type != requirement.output_type
+            or staged.schema_fingerprint != requirement.schema_fingerprint
+            or staged.canonicalization_version
+            != requirement.canonicalization_version
+            or staged.attempt_relative_path != confirmation.result_artifact
+            or staged.sha256 != confirmation.result_sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication conflicts with its durable authority"
+            )
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, dict)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") == attempt_id
+            and artifact.get("relative_path") == staged.attempt_relative_path
+        ]
+        if len(matches) != 1:
+            raise ArchonOutputIntegrityError(
+                "staged typed publication artifact identity is ambiguous"
+            )
+        projected = matches[0]
+        typed_markers = {
+            "typed_publication_version",
+            "publication_id",
+            "content_name",
+            "metadata_sha256",
+            "produced_at",
+        }
+        if typed_markers.intersection(projected):
+            raise ArchonOutputIntegrityError(
+                "paused loop result is already a typed publication"
+            )
+        artifact = ArtifactRef(
+            relative_path=staged.attempt_relative_path,
+            media_type=staged.media_type,
+            size_bytes=staged.size_bytes,
+            sha256=staged.sha256,
+        )
+        _canonical_typed_publication_artifact((artifact,), staged)
+        if (
+            projected.get("media_type") != artifact.media_type
+            or projected.get("size_bytes") != artifact.size_bytes
+            or projected.get("sha256") != artifact.sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication conflicts with its projected artifact"
+            )
+        return projected, artifact, staged
+
     def _already_decided(
         self,
         projection: Mapping[str, object],
@@ -16169,6 +16389,7 @@ class RunStore:
             pending = node["pending_interaction"]
             pending_type = str(pending.get("type") or pending.get("kind") or "")
             confirmation = None
+            staged_loop_publication = None
             if pending_type == "loop_signal_confirmation":
                 if decision != "approved":
                     raise ValueError("loop signal confirmation is not rejectable")
@@ -16181,7 +16402,22 @@ class RunStore:
                     run_id=run_id,
                     node_id=node_id,
                 )
+                if not self._journal_matches_projection(
+                    directory,
+                    projection=projection,
+                    run_id=run_id,
+                ):
+                    raise ArchonOutputIntegrityError(
+                        "staged loop result is not corroborated by the journal"
+                    )
                 self._verify_pending_loop_result(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    confirmation=confirmation,
+                )
+                staged_loop_publication = self._staged_loop_typed_publication(
                     directory,
                     projection,
                     node_id=node_id,
@@ -16211,6 +16447,7 @@ class RunStore:
                 event_payload["channel"] = _sanitize_diagnostic(channel)
 
             terminal = False
+            activated_publication_ref = None
             if decision == "approved":
                 if pending_type == "workflow_approval":
                     definition = definitions[node_id]
@@ -16301,6 +16538,29 @@ class RunStore:
                     node["action_grant"] = resolved_id
                 elif pending_type == "loop_signal_confirmation":
                     assert confirmation is not None
+                    if staged_loop_publication is not None:
+                        (
+                            projected_artifact,
+                            publication_artifact,
+                            publication_candidate,
+                        ) = staged_loop_publication
+                        attempt_id = str(node["attempts"][-1]["attempt_id"])
+                        activated_publication_ref = (
+                            self._publish_typed_bundle_locked(
+                                directory,
+                                projection,
+                                run_id=run_id,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                artifact=publication_artifact,
+                                candidate=publication_candidate,
+                            )
+                        )
+                        projected_artifact.update(
+                            _typed_publication_fields(
+                                activated_publication_ref
+                            )
+                        )
                     node["state"] = "succeeded"
                     if node.get("attempts"):
                         node["attempts"][-1]["state"] = "succeeded"
@@ -16344,6 +16604,16 @@ class RunStore:
                 event_payload,
                 node_id=node_id,
             )
+            if activated_publication_ref is not None:
+                verified_content = self._recover_typed_publications_locked(
+                    directory,
+                    projection,
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    projection,
+                    verified_content,
+                )
             if terminal:
                 self._append_locked(directory, projection, "run_cancelled")
                 with self._connect() as connection:

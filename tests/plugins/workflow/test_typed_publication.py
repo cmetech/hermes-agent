@@ -13,19 +13,22 @@ import pytest
 from agent.plugin_agent import PluginAgentRunResult
 import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     PrimaryOutputCandidate,
     ResolvedNodeOutput,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.store import (
     ArtifactRef,
     RunStore,
     TypedPublicationCandidate,
 )
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 def _node(kind: str, *, output_type: str) -> dict[str, object]:
@@ -148,6 +151,330 @@ class _AgentRunner:
             usage={},
             audit={},
         )
+
+
+class _CountedAgentRunner(_AgentRunner):
+    def __init__(self, response: str) -> None:
+        super().__init__(response)
+        self.requests = []
+
+    def run(self, request, **kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        return super().run(request, **kwargs)
+
+
+def _start_v4_confirmed_typed_loop(
+    store: RunStore,
+    workflow_writer,
+    root: Path,
+    *,
+    name: str,
+    downstream: bool = True,
+):
+    nodes = [
+        {
+            "id": "produce",
+            "loop": {
+                "prompt": "Produce a typed report",
+                "until": "DONE",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "Accept the typed report or provide feedback",
+            },
+            "output_type": "LoopReport",
+        }
+    ]
+    if downstream:
+        nodes.append({
+            "id": "consume",
+            "bash": "printf '%s' '$produce.output'",
+            "depends_on": ["produce"],
+        })
+    workflow = workflow_writer(
+        root,
+        name=name,
+        filename=f"{name}.yaml",
+        interactive=True,
+        nodes=nodes,
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+            concurrency_policy="allow",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return admitted
+
+
+@pytest.mark.parametrize("restart_before_approval", [False, True])
+def test_v4_confirmed_typed_loop_approval_publishes_original_attempt_once(
+    tmp_path,
+    workflow_writer,
+    restart_before_approval: bool,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    admitted = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "workflows",
+        name=f"typed-confirmation-{restart_before_approval}",
+    )
+    runner = _CountedAgentRunner("typed draft <promise>DONE</promise>")
+    scheduler = RunScheduler(store, agent_runner=runner)
+
+    paused = scheduler.advance(admitted.run_id)
+
+    assert paused["status"] == "paused"
+    pending = paused["nodes"]["produce"]["pending_interaction"]
+    attempt = paused["nodes"]["produce"]["attempts"][-1]
+    attempt_id = attempt["attempt_id"]
+    assert len(runner.requests) == 1
+    assert not any(
+        artifact.get("publication_id") for artifact in paused["artifacts"]
+    )
+    assert attempt["metadata"]["primary_output_candidate"] == {
+        "attempt_relative_path": pending["result_artifact"],
+        "media_type": "text/markdown; charset=utf-8",
+        "size_bytes": len(b"typed draft"),
+        "sha256": hashlib.sha256(b"typed draft").hexdigest(),
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": "LoopReport",
+    }
+
+    if restart_before_approval:
+        store = RunStore(home)
+        scheduler = RunScheduler(store, agent_runner=runner)
+    store.approve_run(
+        admitted.run_id,
+        expected_state_version=int(paused["state_version"]),
+        interaction_id=pending["interaction_id"],
+    )
+    approved = store.load_run(admitted.run_id)
+    publications = [
+        artifact
+        for artifact in approved["artifacts"]
+        if artifact.get("publication_id")
+    ]
+
+    assert len(publications) == 1
+    publication = publications[0]
+    assert publication["attempt_id"] == attempt_id
+    assert publication["output_type"] == "LoopReport"
+    assert len(runner.requests) == 1
+    resolved = scheduler._output_values(
+        approved,
+        store.run_directory(admitted.run_id),
+    )["produce"]
+    assert isinstance(resolved, ResolvedNodeOutput)
+    assert resolved.publication_id == publication["publication_id"]
+
+    completed = scheduler.advance(admitted.run_id)
+    assert completed["status"] == "succeeded"
+    assert completed["nodes"]["consume"]["state"] == "succeeded"
+    assert len(runner.requests) == 1
+
+
+def test_concurrent_and_duplicate_typed_loop_approval_publishes_one_bundle(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "workflows",
+        name="typed-confirmation-race",
+        downstream=False,
+    )
+    runner = _CountedAgentRunner("race draft <promise>DONE</promise>")
+    paused = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    pending = paused["nodes"]["produce"]["pending_interaction"]
+    barrier = threading.Barrier(2)
+
+    def approve() -> str:
+        barrier.wait(timeout=5)
+        return store.approve_run(
+            admitted.run_id,
+            expected_state_version=int(paused["state_version"]),
+            interaction_id=pending["interaction_id"],
+        ).outcome
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _index: approve(), range(2)))
+
+    assert sorted(outcomes) == ["already_decided", "applied"]
+    duplicate = store.approve_run(
+        admitted.run_id,
+        expected_state_version=int(paused["state_version"]),
+        interaction_id=pending["interaction_id"],
+    )
+    assert duplicate.outcome == "already_decided"
+    completed = store.load_run(admitted.run_id)
+    publications = [
+        artifact
+        for artifact in completed["artifacts"]
+        if artifact.get("publication_id")
+    ]
+    assert len(publications) == 1
+    bundles = store.run_directory(admitted.run_id) / "publications"
+    assert [path.name for path in bundles.iterdir()] == [
+        publications[0]["publication_id"]
+    ]
+    assert len(runner.requests) == 1
+
+
+def test_stale_wrong_and_cross_run_approvals_publish_nothing(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    runner = _CountedAgentRunner("guarded draft <promise>DONE</promise>")
+    first = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "first" / "workflows",
+        name="typed-confirmation-first",
+        downstream=False,
+    )
+    first_paused = RunScheduler(store, agent_runner=runner).advance(first.run_id)
+    second = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "second" / "workflows",
+        name="typed-confirmation-second",
+        downstream=False,
+    )
+    second_paused = RunScheduler(store, agent_runner=runner).advance(second.run_id)
+    first_pending = first_paused["nodes"]["produce"]["pending_interaction"]
+
+    with pytest.raises(WorkflowConflict, match="stale approval"):
+        store.approve_run(
+            first.run_id,
+            expected_state_version=int(first_paused["state_version"]) - 1,
+            interaction_id=first_pending["interaction_id"],
+        )
+    with pytest.raises(ValueError, match="matching pending interaction"):
+        store.approve_run(
+            first.run_id,
+            expected_state_version=int(first_paused["state_version"]),
+            interaction_id="f" * 64,
+        )
+    with pytest.raises(ValueError, match="matching pending interaction"):
+        store.approve_run(
+            second.run_id,
+            expected_state_version=int(second_paused["state_version"]),
+            interaction_id=first_pending["interaction_id"],
+        )
+    for admitted in (first, second):
+        assert not (
+            store.run_directory(admitted.run_id) / "publications"
+        ).exists()
+
+    store.approve_run(
+        first.run_id,
+        expected_state_version=int(first_paused["state_version"]),
+        interaction_id=first_pending["interaction_id"],
+    )
+    first_completed = store.load_run(first.run_id)
+    assert len([
+        artifact
+        for artifact in first_completed["artifacts"]
+        if artifact.get("publication_id")
+    ]) == 1
+    assert not (store.run_directory(second.run_id) / "publications").exists()
+    assert len(runner.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["result_bytes", "candidate_output_type", "candidate_attempt_path"],
+)
+def test_tampered_confirmed_loop_result_or_staged_candidate_publishes_nothing(
+    tmp_path,
+    workflow_writer,
+    tamper: str,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_v4_confirmed_typed_loop(
+        store,
+        workflow_writer,
+        tmp_path / "workflows",
+        name=f"typed-confirmation-tamper-{tamper}",
+        downstream=False,
+    )
+    runner = _CountedAgentRunner("sealed draft <promise>DONE</promise>")
+    paused = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    pending = paused["nodes"]["produce"]["pending_interaction"]
+    attempt = paused["nodes"]["produce"]["attempts"][-1]
+    staged = attempt["metadata"]["primary_output_candidate"]
+    assert staged["attempt_relative_path"] == pending["result_artifact"]
+
+    if tamper == "result_bytes":
+        result_path = (
+            store.run_directory(admitted.run_id) / pending["result_artifact"]
+        )
+        result_path.write_bytes(b"tampered result")
+        expected_error = ValueError
+    else:
+        raw_path = store.run_directory(admitted.run_id) / "run.json"
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+        candidate = raw["nodes"]["produce"]["attempts"][-1]["metadata"][
+            "primary_output_candidate"
+        ]
+        if tamper == "candidate_output_type":
+            candidate["output_type"] = "ForgedReport"
+        else:
+            candidate["attempt_relative_path"] = (
+                "nodes/produce/foreign-attempt/iteration-0001/output.md"
+            )
+        raw_path.write_text(json.dumps(raw), encoding="utf-8")
+        expected_error = ArchonOutputIntegrityError
+
+    with pytest.raises(expected_error):
+        store.approve_run(
+            admitted.run_id,
+            expected_state_version=int(paused["state_version"]),
+            interaction_id=pending["interaction_id"],
+        )
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+    raw_after = json.loads(
+        (store.run_directory(admitted.run_id) / "run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw_after["nodes"]["produce"]["state"] == "paused"
+    assert len(runner.requests) == 1
 
 
 @pytest.mark.parametrize(

@@ -576,3 +576,101 @@ their pre-feature path again.
 - Ruff on every touched Python file: passed.
 - `git diff --check`: passed.
 - `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+
+## Review convergence: fix round 6
+
+Status: DONE
+
+The sixth external review found that a normalizer-v4 loop with a declared
+`output_type` staged a confirmed result while paused, but signal approval changed
+the attempt to succeeded without activating the typed publication. The resulting
+projection violated the existing invariant that every succeeded declared output
+has exactly one winning typed descriptor.
+
+### Owner-fenced staging and approval-time activation
+
+The scheduler now retains a declared primary output for one additional exact case:
+a paused loop carrying `loop_signal_confirmation`. It applies the same text-to-
+Markdown canonicalization as the immediate-success path and stores the existing
+bounded, body-free `primary_output_candidate` identity in the original attempt's
+metadata. All other paused results remain ineligible.
+
+`complete_node()` stages that identity only while the original claim still matches
+both attempt and owner. It binds the staged candidate to the exact confirmation
+artifact and immutable sealed output/schema authority but creates no publication
+bundle while the node is paused.
+
+Approval continues to avoid live workflow-definition loading and provider/executor
+re-entry. Under the admission and run locks it now corroborates the raw projection
+against the journal head, reauthenticates the recorded result bytes, restores the
+latest paused attempt's exact staged candidate, checks the immutable run-snapshot
+authority and one projected artifact, and reuses the existing secure atomic typed
+publisher. The publication fields and succeeded attempt/node state are committed in
+the same `loop_signal_accepted` journal projection. Duplicate and concurrent
+approvals serialize through the existing interaction compare-and-set and cannot
+publish twice.
+
+The sealed structured-output requirement calculation was extracted from journal
+recovery and reused by staging/activation. The valid immediate-success path retains
+its original publisher and validation ordering; no new publication lifecycle or
+authority was added.
+
+### Fix-round TDD evidence
+
+Every Python test command used `scripts/run_tests.sh`.
+
+1. Normal and restart activation:
+   - RED: 0 passed, 2 failed. The authentic counted-provider run paused correctly,
+     approval marked it succeeded, and `load_run()` raised
+     `typed publication requires exactly one winning descriptor`.
+   - GREEN: both cases retain the original attempt, publish exactly one typed
+     bundle, resolve `$produce.output`, run the downstream node, and keep the
+     provider count at one.
+2. Concurrent and duplicate approval:
+   - RED: the two concurrent decisions converged to `applied` and
+     `already_decided`, but the run still had no descriptor.
+   - GREEN: the concurrent pair plus another duplicate leave exactly one projected
+     publication and one physical bundle.
+3. Stale, wrong, and cross-run authority:
+   - Stale state, wrong interaction, and a foreign run's interaction all fail before
+     filesystem publication. Correct approval publishes only the intended run.
+4. Tamper defenses:
+   - RED: all three cases first exposed that paused attempts had no staged candidate.
+   - GREEN: changed result bytes, a forged candidate output type, and a foreign
+     attempt path all fail closed, leave the node paused, create no publication
+     directory, and make no additional provider call.
+5. Immediate-path compatibility:
+   - The first broad run exposed one changed error ordering for oversized producer
+     metadata. The new authority precheck was narrowed to paused staging, restoring
+     the original immediate publisher's `typed publication candidate is invalid`
+     classification. The evidence and typed files then passed 53/53.
+
+### Fix-round final verification
+
+- Focused round-6 activation/concurrency/authority/tamper matrix: 7 passed, 0
+  failed.
+- Complete typed-publication file: 24 passed, 0 failed.
+- Dedicated typed-publication recovery file: 40 passed, 0 failed.
+- Mandatory Task 9 eight-file gate plus typed publication: 270 passed, 0 failed.
+  - V4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 74; shutdown recovery 5; parallel scheduler 19; evidence API
+    29; typed publication 24.
+- Required Task 8 broad action/store/query gate: 91 passed, 0 failed.
+- Combined explicit v1-v3 compatibility gates: 13 passed, 0 failed.
+- Ruff on all touched Python files: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+- Normalizer-v4 activation, Task 10 diagnostics, Task 8 wire/actions, mutable live
+  definition loading, result bodies, and security-review scope remain untouched.
+
+## Round 6 self-review and concerns
+
+- The paused projection contains only the canonical candidate identity; publication
+  IDs and bundle bodies appear only after the exact approval wins.
+- Journal corroboration prevents a syntactically valid raw candidate rewrite from
+  becoming approval authority, while source bytes are still read no-follow and
+  rehashed at activation.
+- A restart uses the same original attempt and never re-enters the loop executor or
+  provider. Existing transferred-owner coverage proves stale same-attempt claims
+  cannot call `complete_node()` to stage or replace candidate metadata.
+- No unresolved round-6 concerns remain.
