@@ -255,17 +255,23 @@ class WorkflowCompilationLimits:
     max_expanded_bytes: int
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "max_include_depth",
-            "max_dependencies",
-            "max_nodes",
-            "max_edges",
-            "max_source_bytes",
-            "max_expanded_bytes",
-        ):
+        hard_ceilings = {
+            "max_include_depth": 3,
+            "max_dependencies": 64,
+            "max_nodes": 512,
+            "max_edges": 4096,
+            "max_source_bytes": 2 * 1024 * 1024,
+            "max_expanded_bytes": 2 * 1024 * 1024,
+        }
+        for field_name, hard_ceiling in hard_ceilings.items():
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field_name} must be a non-negative integer")
+            if value > hard_ceiling:
+                raise ValueError(
+                    f"{field_name} exceeds the hard compilation ceiling "
+                    f"of {hard_ceiling}"
+                )
 
 
 @dataclass(frozen=True, slots=True)

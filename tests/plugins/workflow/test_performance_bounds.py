@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -56,6 +57,316 @@ def _limits(**changes):
     }
     values.update(changes)
     return WorkflowCompilationLimits(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("max_include_depth", 4),
+        ("max_dependencies", 65),
+        ("max_nodes", 513),
+        ("max_edges", 4097),
+        ("max_source_bytes", (2 * 1024 * 1024) + 1),
+        ("max_expanded_bytes", (2 * 1024 * 1024) + 1),
+    ),
+)
+def test_custom_compilation_limits_cannot_raise_hard_ceiling(field, value) -> None:
+    """Catch caller-supplied limits weakening mandatory compilation ceilings."""
+    with pytest.raises(ValueError, match="hard compilation ceiling"):
+        _limits(**{field: value})
+
+
+def _dependency_boundary_sources(tmp_path, workflow_writer):
+    child_sources = []
+    for index in range(65):
+        path = workflow_writer(
+            tmp_path / f"dependency-{index:02d}",
+            name=f"dependency-{index:02d}",
+            nodes=[{"id": "done", "bash": "true"}],
+        )
+        child_sources.append(_include_source(path))
+    root_64_path = workflow_writer(
+        tmp_path / "root-64",
+        name="root-64",
+        nodes=[
+            {"id": f"use-{index:02d}", "include": f"dependency-{index:02d}"}
+            for index in range(64)
+        ],
+    )
+    root_65_path = workflow_writer(
+        tmp_path / "root-65",
+        name="root-65",
+        nodes=[
+            {"id": f"use-{index:02d}", "include": f"dependency-{index:02d}"}
+            for index in range(65)
+        ],
+    )
+    return _include_source(root_64_path), _include_source(root_65_path), child_sources
+
+
+def test_distinct_dependency_hard_boundary_accepts_64_and_rejects_65(
+    tmp_path, workflow_writer
+) -> None:
+    root_64, root_65, children = _dependency_boundary_sources(
+        tmp_path, workflow_writer
+    )
+    catalog_64 = WorkflowCatalogSnapshot.capture((root_64, *children))
+    catalog_65 = WorkflowCatalogSnapshot.capture((root_65, *children))
+
+    accepted = expand_workflow_source(root_64, catalog_64)
+    assert len(accepted.dependencies) == 64
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(root_65, catalog_65)
+    assert exc.value.issues[0].code == "include_dependency_limit"
+
+
+def _edge_boundary_source(tmp_path, workflow_writer, *, extra_edge: bool):
+    producer_ids = [f"producer-{index:02d}" for index in range(64)]
+    nodes = [{"id": node_id, "bash": "true"} for node_id in producer_ids]
+    nodes.extend(
+        {
+            "id": f"consumer-{index:02d}",
+            "bash": "true",
+            "depends_on": producer_ids,
+        }
+        for index in range(64)
+    )
+    if extra_edge:
+        nodes.append(
+            {"id": "overflow", "bash": "true", "depends_on": [producer_ids[0]]}
+        )
+    path = workflow_writer(
+        tmp_path / ("edges-4097" if extra_edge else "edges-4096"),
+        name="edges",
+        nodes=nodes,
+    )
+    return _include_source(path)
+
+
+def test_expanded_edge_hard_boundary_accepts_4096_and_rejects_4097(
+    tmp_path, workflow_writer
+) -> None:
+    accepted_source = _edge_boundary_source(
+        tmp_path, workflow_writer, extra_edge=False
+    )
+    rejected_source = _edge_boundary_source(
+        tmp_path, workflow_writer, extra_edge=True
+    )
+
+    accepted = expand_workflow_source(
+        accepted_source,
+        WorkflowCatalogSnapshot.capture((accepted_source,)),
+    )
+    assert sum(len(node.depends_on) for node in accepted.nodes) == 4096
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            rejected_source,
+            WorkflowCatalogSnapshot.capture((rejected_source,)),
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+def _workflow_bytes_of_size(name: str, size: int) -> bytes:
+    prefix = f"name: {name}\ndescription: ".encode()
+    suffix = b"\nnodes:\n  - id: done\n    bash: 'true'\n"
+    padding = size - len(prefix) - len(suffix)
+    assert padding > 0
+    return prefix + (b"x" * padding) + suffix
+
+
+def _aggregate_source_case(tmp_path, workflow_writer, total_bytes: int, label: str):
+    root_path = workflow_writer(
+        tmp_path / f"source-{label}" / "root",
+        name="root",
+        nodes=[{"id": "child", "include": "child"}],
+    )
+    child_path = tmp_path / f"source-{label}" / "child.yaml"
+    child_bytes = _workflow_bytes_of_size(
+        "child", total_bytes - len(root_path.read_bytes())
+    )
+    child_path.write_bytes(child_bytes)
+    root = _include_source(root_path)
+    child = _include_source(child_path)
+    return root, child
+
+
+def test_selected_source_byte_hard_boundary_minus_at_and_plus_one(
+    tmp_path, workflow_writer
+) -> None:
+    hard_limit = 2 * 1024 * 1024
+    below = _aggregate_source_case(tmp_path, workflow_writer, hard_limit - 1, "below")
+    exact = _aggregate_source_case(tmp_path, workflow_writer, hard_limit, "exact")
+    above = _aggregate_source_case(tmp_path, workflow_writer, hard_limit + 1, "above")
+
+    assert expand_workflow_source(
+        below[0], WorkflowCatalogSnapshot.capture(below)
+    ).source_bytes == hard_limit - 1
+    assert expand_workflow_source(
+        exact[0], WorkflowCatalogSnapshot.capture(exact)
+    ).source_bytes == hard_limit
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(above[0], WorkflowCatalogSnapshot.capture(above))
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+def _canonical_byte_case(tmp_path, workflow_writer, target_bytes: int, label: str):
+    prefix = (
+        b'{"description":"Portable workflow fixture","name":"c",'
+        b'"nodes":[{"bash":"'
+    )
+    suffix = b'","id":"payload"}]}'
+    payload_size = target_bytes - len(prefix) - len(suffix)
+    assert payload_size > 0
+    path = workflow_writer(
+        tmp_path / f"canonical-{label}",
+        name="c",
+        nodes=[{"id": "payload", "bash": "x" * payload_size}],
+    )
+    return _include_source(path), prefix + (b"x" * payload_size) + suffix
+
+
+def test_canonical_expanded_byte_hard_boundary_minus_at_and_plus_one(
+    tmp_path, workflow_writer
+) -> None:
+    hard_limit = 2 * 1024 * 1024
+    below, below_bytes = _canonical_byte_case(
+        tmp_path, workflow_writer, hard_limit - 1, "below"
+    )
+    exact, exact_bytes = _canonical_byte_case(
+        tmp_path, workflow_writer, hard_limit, "exact"
+    )
+    above, _above_bytes = _canonical_byte_case(
+        tmp_path, workflow_writer, hard_limit + 1, "above"
+    )
+
+    assert expand_workflow_source(
+        below, WorkflowCatalogSnapshot.capture((below,))
+    ).canonical_definition_bytes == below_bytes
+    assert expand_workflow_source(
+        exact, WorkflowCatalogSnapshot.capture((exact,))
+    ).canonical_definition_bytes == exact_bytes
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(above, WorkflowCatalogSnapshot.capture((above,)))
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+class _TraversalBomb:
+    """A source value that fails if an over-limit traversal reaches it."""
+
+
+def test_dependency_limit_aborts_before_traversing_dependency_65(
+    tmp_path, workflow_writer
+) -> None:
+    _root_64, root_65, children = _dependency_boundary_sources(
+        tmp_path, workflow_writer
+    )
+    bomb_child = replace(
+        children[64],
+        nodes=(replace(children[64].nodes[0], value=_TraversalBomb()),),
+    )
+    catalog = WorkflowCatalogSnapshot.capture(
+        (root_65, *children[:64], bomb_child)
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(root_65, catalog)
+    assert exc.value.issues[0].code == "include_dependency_limit"
+
+
+def test_node_limit_aborts_before_materializing_node_513(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path / "nodes-513",
+        name="nodes-513",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+    source = _include_source(path)
+    bomb_source = replace(
+        source,
+        nodes=(
+            *source.nodes[:512],
+            replace(source.nodes[512], value=_TraversalBomb()),
+        ),
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            bomb_source,
+            WorkflowCatalogSnapshot.capture((bomb_source,)),
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+def test_edge_limit_aborts_before_materializing_edge_4097_node(
+    tmp_path, workflow_writer
+) -> None:
+    source = _edge_boundary_source(tmp_path, workflow_writer, extra_edge=True)
+    bomb_source = replace(
+        source,
+        nodes=(
+            *source.nodes[:-1],
+            replace(source.nodes[-1], value=_TraversalBomb()),
+        ),
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            bomb_source,
+            WorkflowCatalogSnapshot.capture((bomb_source,)),
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+def test_source_byte_limit_aborts_before_traversing_oversized_child(
+    tmp_path, workflow_writer
+) -> None:
+    hard_limit = 2 * 1024 * 1024
+    root, child = _aggregate_source_case(
+        tmp_path, workflow_writer, hard_limit + 1, "abort"
+    )
+    bomb_child = replace(
+        child,
+        nodes=(replace(child.nodes[0], value=_TraversalBomb()),),
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            root,
+            WorkflowCatalogSnapshot.capture((root, bomb_child)),
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
+
+
+def test_canonical_byte_limit_aborts_before_materializing_later_node(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path / "canonical-abort",
+        name="canonical-abort",
+        nodes=[
+            {"id": "oversized", "bash": "true"},
+            {"id": "unreached", "bash": "true"},
+        ],
+    )
+    source = _include_source(path)
+    bomb_source = replace(
+        source,
+        nodes=(
+            replace(source.nodes[0], value="x" * (2 * 1024 * 1024)),
+            replace(source.nodes[1], value=_TraversalBomb()),
+        ),
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            bomb_source,
+            WorkflowCatalogSnapshot.capture((bomb_source,)),
+        )
+    assert exc.value.issues[0].code == "include_expansion_limit"
 
 
 def test_include_depth_and_dependency_bounds_accept_exactly_the_boundary(

@@ -393,6 +393,10 @@ def test_empty_include_and_final_namespace_collision_are_rejected(
     with pytest.raises(WorkflowValidationError) as collision:
         expand_workflow_source(root, WorkflowCatalogSnapshot.capture((root, child)))
     assert collision.value.issues[0].code == "include_id_collision"
+    assert collision.value.issues[0].path == "nodes[0].id"
+    assert (
+        collision.value.issues[0].source_line == child.nodes[0].field_lines["id"]
+    )
 
     empty_child = replace(child, nodes=())
     with pytest.raises(WorkflowValidationError) as empty:
@@ -401,6 +405,89 @@ def test_empty_include_and_final_namespace_collision_are_rejected(
             WorkflowCatalogSnapshot.capture((root, empty_child)),
         )
     assert empty.value.issues[0].code == "include_empty_graph"
+
+
+def test_cyclic_included_graph_fails_with_a_typed_bounded_topology_issue(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch nonempty child graphs reaching alias indexing without entries or sinks."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot
+    from plugins.workflow.includes import expand_workflow_source
+
+    root_path = workflow_writer(
+        tmp_path / "root",
+        name="root",
+        nodes=[{"id": "checks", "include": "child"}],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child",
+        name="child",
+        nodes=[
+            {"id": "first", "bash": "true", "depends_on": ["second"]},
+            {"id": "second", "bash": "true", "depends_on": ["first"]},
+        ],
+    )
+    root, child = _parse(root_path), _parse(child_path)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        expand_workflow_source(
+            root,
+            WorkflowCatalogSnapshot.capture((root, child)),
+        )
+
+    issue = exc.value.issues[0]
+    assert issue.code == "include_empty_graph"
+    assert issue.path == "nodes[0].include"
+    assert len(issue.message) < 1024
+
+
+def test_executable_limit_diagnostics_name_real_source_fields(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch executable node/edge failures being reported at nonexistent include fields."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot
+    from plugins.workflow.includes import expand_workflow_source
+    from plugins.workflow.models import WorkflowCompilationLimits
+
+    path = workflow_writer(
+        tmp_path / "root",
+        name="root",
+        nodes=[
+            {"id": "first", "bash": "true"},
+            {"id": "second", "bash": "true", "depends_on": ["first"]},
+        ],
+    )
+    root = _parse(path)
+    catalog = WorkflowCatalogSnapshot.capture((root,))
+    base = {
+        "max_include_depth": 3,
+        "max_dependencies": 64,
+        "max_nodes": 512,
+        "max_edges": 4096,
+        "max_source_bytes": 2 * 1024 * 1024,
+        "max_expanded_bytes": 2 * 1024 * 1024,
+    }
+
+    with pytest.raises(WorkflowValidationError) as nodes:
+        expand_workflow_source(
+            root,
+            catalog,
+            WorkflowCompilationLimits(**{**base, "max_nodes": 0}),
+        )
+    with pytest.raises(WorkflowValidationError) as edges:
+        expand_workflow_source(
+            root,
+            catalog,
+            WorkflowCompilationLimits(**{**base, "max_edges": 0}),
+        )
+
+    assert nodes.value.issues[0].path == "nodes[0].id"
+    assert nodes.value.issues[0].source_line == root.nodes[0].field_lines["id"]
+    assert edges.value.issues[0].path == "nodes[1].depends_on"
+    assert (
+        edges.value.issues[0].source_line
+        == root.nodes[1].field_lines["depends_on"]
+    )
 
 
 def test_compilation_normalizes_expanded_nodes_with_only_root_authority(

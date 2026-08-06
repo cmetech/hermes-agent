@@ -33,13 +33,21 @@ def _issue(
     message: str,
     *,
     node: WorkflowSourceNode | None = None,
+    field: str | None = None,
 ) -> WorkflowValidationError:
+    if node is None:
+        path = "nodes"
+        source_line = None
+    else:
+        source_field = field or node.node_type
+        path = f"nodes[{node.source_index}].{source_field}"
+        source_line = node.field_lines.get(source_field, node.source_line)
     return WorkflowValidationError(
         ValidationIssue(
-            path=(f"nodes[{node.source_index}].include" if node else "nodes"),
+            path=path,
             code=code,
             message=message,
-            source_line=node.source_line if node else None,
+            source_line=source_line,
         )
     )
 
@@ -123,9 +131,18 @@ class _ExpansionState:
             "expanded canonical definition exceeds the compilation limit",
         )
 
-    def _canonical_length(self, value: Any, message: str) -> int:
+    def _canonical_length(
+        self,
+        value: Any,
+        message: str,
+        *,
+        node: WorkflowSourceNode | None = None,
+        field: str | None = None,
+    ) -> int:
         if self.limits.max_expanded_bytes == 0:
-            raise _issue("include_expansion_limit", message)
+            raise _issue(
+                "include_expansion_limit", message, node=node, field=field
+            )
         try:
             return len(
                 canonical_json_bytes(
@@ -134,14 +151,23 @@ class _ExpansionState:
                 )
             )
         except ValueError as exc:
-            raise _issue("include_expansion_limit", message) from exc
+            raise _issue(
+                "include_expansion_limit", message, node=node, field=field
+            ) from exc
 
-    def _check_projected_bytes(self, node_bytes: int, node_count: int) -> None:
+    def _check_projected_bytes(
+        self,
+        node_bytes: int,
+        node_count: int,
+        *,
+        node: WorkflowSourceNode | None = None,
+    ) -> None:
         projected = self.base_canonical_bytes + node_bytes + max(0, node_count - 1)
         if projected > self.limits.max_expanded_bytes:
             raise _issue(
                 "include_expansion_limit",
                 "expanded canonical definition exceeds the compilation limit",
+                node=node,
             )
 
     def add_dependency(
@@ -159,6 +185,7 @@ class _ExpansionState:
                 "workflow include dependency count exceeds the compilation limit: "
                 f"{logical_chain}",
                 node=node,
+                field="include",
             )
         projected_source_bytes = self.source_bytes + len(source.definition_bytes)
         if projected_source_bytes > self.limits.max_source_bytes:
@@ -166,39 +193,32 @@ class _ExpansionState:
                 "include_expansion_limit",
                 "selected workflow source bytes exceed the compilation limit",
                 node=node,
+                field="include",
             )
         self.dependency_keys.add(key)
         self.dependencies.append(source)
         self.source_bytes = projected_source_bytes
 
-    def add_node(self, node: WorkflowSourceNode) -> None:
+    def reserve_node(self, node: WorkflowSourceNode) -> None:
         if node.id in self.nodes_by_id or node.id in self.aliases:
             raise _issue(
                 "include_id_collision",
                 f"expanded workflow node id collides: {node.id}",
                 node=node,
+                field="id",
             )
         if len(self.nodes_by_id) >= self.limits.max_nodes:
             raise _issue(
                 "include_expansion_limit",
                 "expanded workflow node count exceeds the compilation limit",
                 node=node,
+                field="id",
             )
-        length = self._canonical_length(
-            _node_mapping(node),
-            "expanded canonical definition exceeds the compilation limit",
-        )
-        self._check_projected_bytes(
-            self.node_bytes + length,
-            len(self.nodes_by_id) + 1,
-        )
         self.nodes_by_id[node.id] = node
-        self.node_byte_lengths[node.id] = length
+        self.node_byte_lengths[node.id] = 0
         self.edge_counts[node.id] = 0
-        self.node_bytes += length
 
     def replace_node(self, node: WorkflowSourceNode) -> None:
-        old = self.nodes_by_id[node.id]
         old_edges = self.edge_counts[node.id]
         new_edges = len(node.depends_on)
         projected_edges = self.edge_count - old_edges + new_edges
@@ -207,21 +227,27 @@ class _ExpansionState:
                 "include_expansion_limit",
                 "expanded workflow edge count exceeds the compilation limit",
                 node=node,
+                field="depends_on",
             )
         length = self._canonical_length(
             _node_mapping(node),
             "expanded canonical definition exceeds the compilation limit",
+            node=node,
+            field=node.node_type,
         )
         projected_node_bytes = (
             self.node_bytes - self.node_byte_lengths[node.id] + length
         )
-        self._check_projected_bytes(projected_node_bytes, len(self.nodes_by_id))
+        self._check_projected_bytes(
+            projected_node_bytes,
+            len(self.nodes_by_id),
+            node=node,
+        )
         self.nodes_by_id[node.id] = node
         self.node_byte_lengths[node.id] = length
         self.edge_counts[node.id] = new_edges
         self.node_bytes = projected_node_bytes
         self.edge_count = projected_edges
-        del old
 
     def add_alias(
         self,
@@ -234,6 +260,7 @@ class _ExpansionState:
                 "include_id_collision",
                 f"expanded include alias collides: {alias_id}",
                 node=node,
+                field="id",
             )
         self.aliases[alias_id] = WorkflowIncludeAlias(
             entries=instance.entries,
@@ -306,6 +333,7 @@ def _expand_instance(
                 "include_id_collision",
                 f"authored workflow id collides: {authored.id}",
                 node=authored,
+                field="id",
             )
         if authored.node_type != "include":
             expanded = replace(
@@ -313,7 +341,7 @@ def _expand_instance(
                 id=_qualified(namespace, authored.id),
                 depends_on=(),
             )
-            state.add_node(expanded)
+            state.reserve_node(expanded)
             nodes.append(expanded)
             direct_nodes[authored.id] = expanded
             local_targets[authored.id] = (expanded.id,)
@@ -326,6 +354,7 @@ def _expand_instance(
                 "include_depth_exceeded",
                 f"workflow include depth exceeds the compilation limit: {chain}",
                 node=authored,
+                field="include",
             )
         target = str(authored.value)
         chain = " -> ".join((*logical_chain, target))
@@ -334,6 +363,7 @@ def _expand_instance(
                 "include_ambiguous",
                 f"workflow include target is ambiguous: {chain}",
                 node=authored,
+                field="include",
             )
         child = catalog.selected.get(target)
         if child is None:
@@ -341,6 +371,7 @@ def _expand_instance(
                 "include_not_found",
                 f"workflow include target was not found: {chain}",
                 node=authored,
+                field="include",
             )
         child_key = _package_key(child)
         if child_key in active_keys:
@@ -348,6 +379,7 @@ def _expand_instance(
                 "include_cycle",
                 f"workflow include cycle: {chain}",
                 node=authored,
+                field="include",
             )
         state.add_dependency(child, authored, chain)
         child_instance = _expand_instance(
@@ -364,6 +396,14 @@ def _expand_instance(
                 "include_empty_graph",
                 f"workflow include expands to no executable nodes: {target}",
                 node=authored,
+                field="include",
+            )
+        if not child_instance.entries or not child_instance.sinks:
+            raise _issue(
+                "include_empty_graph",
+                f"workflow include has no executable entry or sink: {target}",
+                node=authored,
+                field="include",
             )
         nodes.extend(child_instance.nodes)
         included.append((authored, child_instance))
