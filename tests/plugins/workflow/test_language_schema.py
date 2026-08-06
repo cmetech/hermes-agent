@@ -78,6 +78,31 @@ def test_phase4_loop_inventory_is_staged_without_changing_current_v3_schema():
     assert "command" not in loop_schema["properties"]
     assert "signal_completes" not in loop_schema["properties"]
 
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    loop_kind = next(item for item in contract["node_kinds"] if item["id"] == "loop")
+    loop_paths = {item["field_path"] for item in loop_kind["fields"]}
+    assert "nodes[].loop.command" not in loop_paths
+    assert "nodes[].loop.signal_completes" not in loop_paths
+
+
+def test_explicit_v4_authoring_contract_exposes_staged_loop_fields():
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+
+    assert contract["normalizer_version"] == 4
+    loop_schema = contract["definition_schema"]["properties"]["nodes"]["items"][
+        "properties"
+    ]["loop"]
+    assert {"command", "signal_completes"} <= set(loop_schema["properties"])
+    loop_kind = next(item for item in contract["node_kinds"] if item["id"] == "loop")
+    loop_paths = {item["field_path"] for item in loop_kind["fields"]}
+    assert {
+        "nodes[].loop.command",
+        "nodes[].loop.signal_completes",
+    } <= loop_paths
+
 
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
@@ -807,8 +832,13 @@ def test_structural_requirements_are_inventory_metadata():
 def _structural_outcomes(
     document: dict[str, object],
     profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY,
+    *,
+    normalizer_version: int | None = None,
 ) -> tuple[bool, bool]:
-    schema = definition_json_schema(profile)
+    schema = definition_json_schema(
+        profile,
+        normalizer_version=normalizer_version,
+    )
     schema_valid = not list(Draft202012Validator(schema).iter_errors(document))
     try:
         load_workflow_snapshot(
@@ -819,6 +849,7 @@ def _structural_outcomes(
                 if profile is WorkflowLanguageProfile.ARCHON_2026_07
                 else None
             ),
+            normalizer_version=normalizer_version,
         )
     except WorkflowValidationError:
         loader_valid = False
@@ -1239,6 +1270,66 @@ def test_interactive_gate_message_json_truthiness_matches_loader(
     })
 
     assert _structural_outcomes(document) == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    ("loop_options", "expected"),
+    [
+        pytest.param(
+            {"interactive": True, "gate_message": "Confirm"},
+            True,
+            id="interactive-valid",
+        ),
+        pytest.param(
+            {"interactive": False},
+            True,
+            id="noninteractive-valid",
+        ),
+        pytest.param(
+            {"interactive": "yes", "gate_message": "Confirm"},
+            False,
+            id="interactive-must-be-boolean",
+        ),
+        pytest.param(
+            {"interactive": True},
+            False,
+            id="interactive-requires-gate",
+        ),
+        pytest.param(
+            {"interactive": True, "gate_message": "   "},
+            False,
+            id="gate-must-be-nonblank",
+        ),
+        pytest.param(
+            {"interactive": False, "gate_message": 1},
+            False,
+            id="authored-gate-must-be-string",
+        ),
+        pytest.param(
+            {"signal_completes": "yes"},
+            False,
+            id="signal-completes-must-be-boolean",
+        ),
+    ],
+)
+def test_explicit_v4_loop_schema_matches_admission_validation(
+    loop_options, expected
+):
+    document = _workflow({
+        "id": "n",
+        "loop": {
+            "prompt": "again",
+            "until": "done",
+            "max_iterations": 2,
+            **loop_options,
+        },
+    })
+
+    assert _structural_outcomes(
+        document,
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    ) == (expected, expected)
 
 
 @pytest.mark.parametrize(

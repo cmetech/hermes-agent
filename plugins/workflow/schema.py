@@ -557,6 +557,15 @@ def _validate_node_type(
             for field in ("interactive", "signal_completes"):
                 if field in loop:
                     _boolean(loop[field], f"{path}.loop.{field}")
+            if "gate_message" in loop and (
+                not isinstance(loop["gate_message"], str)
+                or not loop["gate_message"].strip()
+            ):
+                _fail(
+                    f"{path}.loop.gate_message",
+                    "invalid_loop",
+                    f"{path}.loop.gate_message must be a nonblank string",
+                )
         if loop.get("interactive") is True:
             gate_message = loop.get("gate_message")
             invalid_gate = (

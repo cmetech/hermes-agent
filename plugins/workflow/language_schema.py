@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 import math
@@ -1899,6 +1899,44 @@ def _specs(scope: str) -> tuple[WorkflowFieldSpec, ...]:
     return tuple(spec for spec in FIELD_INVENTORY if spec.scope == scope)
 
 
+def _authoring_normalizer_version(
+    profile: WorkflowLanguageProfile,
+    requested: int | None,
+) -> int:
+    version = CURRENT_NORMALIZER_BY_PROFILE[profile] if requested is None else requested
+    if type(version) is not int or version not in SUPPORTED_NORMALIZER_VERSIONS:
+        raise ValueError("unsupported workflow authoring normalizer version")
+    return version
+
+
+def _loop_specs(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int | None = None,
+) -> tuple[WorkflowFieldSpec, ...]:
+    version = _authoring_normalizer_version(profile, normalizer_version)
+    specs = _specs("loop")
+    if supports_phase4_semantics(profile, version):
+        phase4_shapes = {
+            "interactive": ("boolean", "boolean"),
+            "gate_message": ("string", "nonblank_string"),
+        }
+        return tuple(
+            replace(
+                spec,
+                json_type=phase4_shapes[spec.yaml_name][0],
+                shape=phase4_shapes[spec.yaml_name][1],
+            )
+            if spec.yaml_name in phase4_shapes
+            else spec
+            for spec in specs
+        )
+    return tuple(
+        spec
+        for spec in specs
+        if spec.yaml_name not in {"command", "signal_completes"}
+    )
+
+
 def _profile(value: WorkflowLanguageProfile) -> WorkflowLanguageProfile:
     if not isinstance(value, WorkflowLanguageProfile):
         raise TypeError("profile must be a WorkflowLanguageProfile")
@@ -1916,10 +1954,12 @@ def _editor_status(status: str) -> str:
 
 
 def _field_order(spec: WorkflowFieldSpec) -> int:
-    try:
-        return FIELD_INVENTORY.index(spec) + 1
-    except ValueError:
-        return len(FIELD_INVENTORY) + SOURCE_DIRECTIVE_INVENTORY.index(spec) + 1
+    inventory = (*FIELD_INVENTORY, *SOURCE_DIRECTIVE_INVENTORY)
+    return next(
+        index
+        for index, candidate in enumerate(inventory, start=1)
+        if (candidate.scope, candidate.yaml_name) == (spec.scope, spec.yaml_name)
+    )
 
 
 def _field_unit(
@@ -1972,6 +2012,7 @@ def _schema_for_shape(
     profile: WorkflowLanguageProfile,
     *,
     hook_event: str | None = None,
+    normalizer_version: int | None = None,
 ) -> dict[str, Any]:
     if shape == "any":
         return {}
@@ -1981,6 +2022,8 @@ def _schema_for_shape(
         return {"type": "string"}
     if shape == "nonempty_string":
         return {"type": "string", "minLength": 1}
+    if shape == "nonblank_string":
+        return {"type": "string", "minLength": 1, "pattern": r"\S"}
     if shape == "boolean":
         return {"type": "boolean"}
     if shape == "positive_number":
@@ -2061,40 +2104,72 @@ def _schema_for_shape(
     if shape == "pause_lane_policy":
         return {"type": "string", "enum": ["hold", "release"]}
     if shape == "retry":
-        return _object_schema("retry", profile)
+        return _object_schema(
+            "retry", profile, normalizer_version=normalizer_version
+        )
     if shape == "hooks":
-        return _object_schema("hook_event", profile)
+        return _object_schema(
+            "hook_event", profile, normalizer_version=normalizer_version
+        )
     if shape == "hook_entries":
         return {
             "type": "array",
             "minItems": 1,
-            "items": _object_schema("hook_entry", profile, hook_event=hook_event),
+            "items": _object_schema(
+                "hook_entry",
+                profile,
+                hook_event=hook_event,
+                normalizer_version=normalizer_version,
+            ),
         }
     if shape == "hook_response":
-        return _object_schema("hook_response", profile, hook_event=hook_event)
+        return _object_schema(
+            "hook_response",
+            profile,
+            hook_event=hook_event,
+            normalizer_version=normalizer_version,
+        )
     if shape == "hook_specific":
-        return _object_schema("hook_specific", profile, hook_event=hook_event)
+        return _object_schema(
+            "hook_specific",
+            profile,
+            hook_event=hook_event,
+            normalizer_version=normalizer_version,
+        )
     if shape == "nullable_hook_specific":
         return {
             "oneOf": [
                 {"type": "null"},
-                _object_schema("hook_specific", profile, hook_event=hook_event),
+                _object_schema(
+                    "hook_specific",
+                    profile,
+                    hook_event=hook_event,
+                    normalizer_version=normalizer_version,
+                ),
             ]
         }
     if shape == "agents":
         return {
             "type": "object",
             "propertyNames": {"pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
-            "additionalProperties": _object_schema("agent", profile),
+            "additionalProperties": _object_schema(
+                "agent", profile, normalizer_version=normalizer_version
+            ),
         }
     if shape == "nodes":
-        return _nodes_schema(profile)
+        return _nodes_schema(profile, normalizer_version=normalizer_version)
     if shape == "loop_payload":
-        return _object_schema("loop", profile)
+        return _object_schema(
+            "loop", profile, normalizer_version=normalizer_version
+        )
     if shape == "approval_payload":
-        return _object_schema("approval", profile)
+        return _object_schema(
+            "approval", profile, normalizer_version=normalizer_version
+        )
     if shape == "approval_reject":
-        return _object_schema("approval_reject", profile)
+        return _object_schema(
+            "approval_reject", profile, normalizer_version=normalizer_version
+        )
     if shape.endswith("_payload"):
         return {"type": "string", "minLength": 1}
     raise ValueError(f"unknown workflow field shape: {shape}")
@@ -2105,8 +2180,14 @@ def _field_schema(
     profile: WorkflowLanguageProfile,
     *,
     hook_event: str | None = None,
+    normalizer_version: int | None = None,
 ) -> dict[str, Any]:
-    result = _schema_for_shape(spec.shape, profile, hook_event=hook_event)
+    result = _schema_for_shape(
+        spec.shape,
+        profile,
+        hook_event=hook_event,
+        normalizer_version=normalizer_version,
+    )
     status = _field_status(spec, profile)
     result.update({
         "title": spec.title,
@@ -2159,21 +2240,19 @@ def _object_schema(
     profile: WorkflowLanguageProfile,
     *,
     hook_event: str | None = None,
+    normalizer_version: int | None = None,
 ) -> dict[str, Any]:
-    specs = _specs(scope)
+    selected_version = _authoring_normalizer_version(profile, normalizer_version)
+    specs = (
+        _loop_specs(profile, selected_version) if scope == "loop" else _specs(scope)
+    )
     phase4_loop = (
         scope == "loop"
         and supports_phase4_semantics(
             profile,
-            CURRENT_NORMALIZER_BY_PROFILE[profile],
+            selected_version,
         )
     )
-    if scope == "loop" and not phase4_loop:
-        specs = tuple(
-            spec
-            for spec in specs
-            if spec.yaml_name not in {"command", "signal_completes"}
-        )
     result: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -2181,6 +2260,7 @@ def _object_schema(
                 spec,
                 profile,
                 hook_event=(spec.yaml_name if scope == "hook_event" else hook_event),
+                normalizer_version=selected_version,
             )
             for spec in specs
         },
@@ -2216,7 +2296,17 @@ def _object_schema(
                     "required": [item.required_field],
                     "properties": {
                         item.required_field: _schema_for_shape(
-                            item.required_shape, profile
+                            (
+                                next(
+                                    spec.shape
+                                    for spec in specs
+                                    if spec.yaml_name == item.required_field
+                                )
+                                if phase4_loop
+                                else item.required_shape
+                            ),
+                            profile,
+                            normalizer_version=selected_version,
                         )
                     },
                 },
@@ -2226,9 +2316,21 @@ def _object_schema(
     return result
 
 
-def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
+def _nodes_schema(
+    profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
+) -> dict[str, Any]:
+    selected_version = _authoring_normalizer_version(profile, normalizer_version)
     specs = (*_specs("node"), *SOURCE_DIRECTIVE_INVENTORY)
-    union_properties = {spec.yaml_name: _field_schema(spec, profile) for spec in specs}
+    union_properties = {
+        spec.yaml_name: _field_schema(
+            spec,
+            profile,
+            normalizer_version=selected_version,
+        )
+        for spec in specs
+    }
     variants = []
     for node_type in SOURCE_NODE_TYPES:
         properties = {
@@ -2260,9 +2362,12 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
 
 def definition_json_schema(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> dict[str, object]:
     """Return the deterministic definition authoring schema for ``profile``."""
     selected = _profile(profile)
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
     return {
         "$schema": _DRAFT_2020_12,
         "$id": f"https://hermes.local/workflow/{selected.value}/definition.schema.json",
@@ -2274,7 +2379,11 @@ def definition_json_schema(
         ),
         "type": "object",
         "properties": {
-            spec.yaml_name: _field_schema(spec, selected)
+            spec.yaml_name: _field_schema(
+                spec,
+                selected,
+                normalizer_version=selected_version,
+            )
             for spec in _specs("definition")
         },
         "required": [spec.yaml_name for spec in _specs("definition") if spec.required],
@@ -2375,7 +2484,10 @@ def compatibility_code_catalog(
 
 
 def _nested_specs_for_kind(
-    node_type: str, profile: WorkflowLanguageProfile,
+    node_type: str,
+    profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> tuple[tuple[WorkflowFieldSpec, str], ...]:
     nested: list[tuple[WorkflowFieldSpec, str]] = []
     if node_type != "loop" and not (
@@ -2387,7 +2499,8 @@ def _nested_specs_for_kind(
         )
     if node_type == "loop":
         nested.extend(
-            (spec, f"nodes[].loop.{spec.yaml_name}") for spec in _specs("loop")
+            (spec, f"nodes[].loop.{spec.yaml_name}")
+            for spec in _loop_specs(profile, normalizer_version)
         )
     if node_type == "approval":
         nested.extend(
@@ -2480,9 +2593,12 @@ def _node_example(node_type: str) -> dict[str, object]:
 
 def node_kind_descriptors(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> list[dict[str, object]]:
     """Project the authoritative inventory into editor node-kind descriptors."""
     selected = _profile(profile)
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
     descriptors: list[dict[str, object]] = []
     for kind_order, node_type in enumerate(NODE_TYPES, start=1):
         payload = next(spec for spec in _specs("node") if spec.yaml_name == node_type)
@@ -2520,7 +2636,11 @@ def node_kind_descriptors(
                     }[spec.scope]
                 ),
             )
-            for spec, field_path in _nested_specs_for_kind(node_type, selected)
+            for spec, field_path in _nested_specs_for_kind(
+                node_type,
+                selected,
+                normalizer_version=selected_version,
+            )
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
         descriptors.append({
@@ -2898,10 +3018,16 @@ def canonical_contract_json(value: object) -> str:
 
 def workflow_authoring_contract(
     profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
 ) -> dict[str, object]:
     """Return one bounded, side-effect-free workflow authoring contract."""
     selected = _profile(profile)
-    node_kinds = node_kind_descriptors(selected)
+    selected_version = _authoring_normalizer_version(selected, normalizer_version)
+    node_kinds = node_kind_descriptors(
+        selected,
+        normalizer_version=selected_version,
+    )
     referenced_definitions = frozenset(
         str(field["definition_ref"])
         for node_kind in node_kinds
@@ -2912,11 +3038,14 @@ def workflow_authoring_contract(
         "contract_reader_version": CONTRACT_READER_VERSION,
         "editor_projection_version": EDITOR_PROJECTION_VERSION,
         "profile": selected.value,
-        "normalizer_version": CURRENT_NORMALIZER_BY_PROFILE[selected],
+        "normalizer_version": selected_version,
         "field_definitions": field_definition_catalog(
             selected, definition_ids=referenced_definitions
         ),
-        "definition_schema": definition_json_schema(selected),
+        "definition_schema": definition_json_schema(
+            selected,
+            normalizer_version=selected_version,
+        ),
         "sidecar_schema": sidecar_json_schema(selected),
         "node_kinds": node_kinds,
         "semantic_rules": semantic_rule_descriptors(selected),

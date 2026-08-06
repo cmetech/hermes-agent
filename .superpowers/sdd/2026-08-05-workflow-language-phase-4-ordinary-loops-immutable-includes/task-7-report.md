@@ -134,3 +134,74 @@ the only authorities able to finalize and reload immutable command bindings.
   tool, prompt schema, telemetry, or UI work entered the diff.
 - No known product defects or baseline failures remain in Task 7. Runtime consumption
   of these normalized semantics is intentionally deferred to its later planned task.
+
+## Fix round 1
+
+### Review findings resolved
+
+1. Current-v3 authoring descriptors no longer advertise the staged Phase 4
+   `loop.command` or `loop.signal_completes` fields while the current JSON Schema
+   rejects them. One version-aware `_loop_specs()` selector now feeds both
+   `_object_schema()` and nested node-kind descriptors.
+2. `definition_json_schema()`, `node_kind_descriptors()`, and
+   `workflow_authoring_contract()` accept an explicit keyword-only normalizer version
+   for staged projections. Their default remains the profile's current normalizer,
+   so Archon continues to publish v3 unless a caller explicitly asks for v4.
+3. Explicit-v4 loop schema projection now derives boolean `interactive` and
+   nonblank-string `gate_message` constraints from the same selected field specs.
+   The interactive conditional requires that selected nonblank gate shape. The
+   existing v1-v3 permissive/truthiness schema remains unchanged.
+4. Explicit-v4 admission now rejects any authored `gate_message` that is not a
+   nonblank string, including on a noninteractive loop, keeping loader behavior equal
+   to the staged schema. Existing boolean validation for `interactive` and
+   `signal_completes` remains the loader authority.
+5. Field ordering now resolves projected field specs by their unique `(scope,
+   yaml_name)` identity, preserving inventory order when a phase-aware projection
+   changes only type/shape metadata.
+
+No normalizer activation, identity/sealing/snapshot, runtime, interaction, Task 8,
+UI, tool, or telemetry path changed.
+
+### Authentic RED-GREEN evidence
+
+All Python commands used `scripts/run_tests.sh`.
+
+1. Current-v3 descriptor RED:
+   `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k phase4_loop_inventory_is_staged_without_changing_current_v3_schema`
+   produced **0 passed, 1 failed** because the current contract contained
+   `nodes[].loop.command`. After sharing the selector, the same command produced
+   **1 passed, 0 failed**.
+2. Explicit staged-v4 RED:
+   `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k explicit_v4_authoring_contract_exposes_staged_loop_fields`
+   produced **0 passed, 1 failed** with an unexpected
+   `normalizer_version` keyword. After localized version propagation, the combined
+   current/staged selector checks produced **2 passed, 0 failed**.
+3. Schema/admission parity RED:
+   `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py -q -k explicit_v4_loop_schema_matches_admission_validation`
+   produced **4 passed, 3 failed**. Staged schema admitted non-boolean
+   `interactive`, whitespace-only gate text, and a numeric authored gate; the loader
+   already rejected the first two but also needed to reject the inactive numeric
+   gate. After phase-aware shapes and strict authored-gate validation, the focused
+   staged/current/legacy matrix produced **19 passed, 0 failed**.
+
+### Fix-round verification
+
+- Complete language-schema suite: **613 passed, 0 failed**.
+- Task 7 schema/loop-executor gate: **672 passed, 0 failed**.
+- Task 7 manifest/security-boundary gate: **93 passed, 0 failed**.
+- Task 7 language/format-2 snapshot gate: **145 passed, 0 failed**.
+- Focused v1-v3 source/snapshot matrix: **72 passed, 0 failed**.
+- `.venv/bin/ruff check plugins/workflow/language_schema.py plugins/workflow/schema.py tests/plugins/workflow/test_language_schema.py`: **all checks passed**.
+- `git diff --check`: passed with no whitespace errors.
+
+### Fix-round files and self-review
+
+- `plugins/workflow/language_schema.py`
+- `plugins/workflow/schema.py`
+- `tests/plugins/workflow/test_language_schema.py`
+
+Confirmed the default Archon authoring contract still reports normalizer v3 and the
+legacy JSON-truthiness matrix remains green. Explicit v4 schema and loader outcomes
+now agree for valid interactive/noninteractive loops, non-boolean interaction and
+signal fields, missing/blank gates, and non-string authored gates. No known concern
+remains from these two findings.
