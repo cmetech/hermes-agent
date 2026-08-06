@@ -92,7 +92,6 @@ def test_authenticated_included_command_body_is_rewritten_before_validation(
 ) -> None:
     """Catch digest admission validating child-local command references unchanged."""
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
-    from plugins.workflow.trust import compute_package_digest
 
     root_path = workflow_writer(
         tmp_path / "command-root",
@@ -101,12 +100,6 @@ def test_authenticated_included_command_body_is_rewritten_before_validation(
     )
     sidecar_bytes = b"language_compatibility: archon-2026-07\n"
     root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
-    commands = root_path.parent / "commands"
-    commands.mkdir()
-    (commands / "consume.md").write_text(
-        "consume $producer.output and $$HOME\n",
-        encoding="utf-8",
-    )
     child_path = workflow_writer(
         tmp_path / "command-child",
         name="command-child",
@@ -120,6 +113,12 @@ def test_authenticated_included_command_body_is_rewritten_before_validation(
             },
         ],
     )
+    commands = child_path.parent / "commands"
+    commands.mkdir()
+    (commands / "consume.md").write_text(
+        "consume $producer.output and $$HOME\n",
+        encoding="utf-8",
+    )
     root = _parse(
         root_path,
         sidecar_bytes=sidecar_bytes,
@@ -131,7 +130,7 @@ def test_authenticated_included_command_body_is_rewritten_before_validation(
         normalizer_version=4,
     )
 
-    assert compute_package_digest(compiled.package).sha256
+    assert compiled.composite_digest
 
 
 def test_authenticated_root_command_include_alias_selects_first_sink(
@@ -201,7 +200,6 @@ def test_authenticated_resource_validation_returns_final_id_bodies_for_binding(
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
     from plugins.workflow.resources import ResourceResolver
     from plugins.workflow.schema import validate_authenticated_resource_references
-    from plugins.workflow.trust import compute_package_digest
 
     root_path = workflow_writer(
         tmp_path / "binding-root",
@@ -210,18 +208,6 @@ def test_authenticated_resource_validation_returns_final_id_bodies_for_binding(
     )
     sidecar_bytes = b"language_compatibility: archon-2026-07\n"
     root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
-    commands = root_path.parent / "commands"
-    commands.mkdir()
-    (commands / "consume.md").write_text(
-        "command $producer.output and $$HOME\n",
-        encoding="utf-8",
-    )
-    scripts = root_path.parent / "scripts"
-    scripts.mkdir()
-    (scripts / "consume.py").write_text(
-        "print('$producer.output', '$$HOME')\n",
-        encoding="utf-8",
-    )
     child_path = workflow_writer(
         tmp_path / "binding-child",
         name="binding-child",
@@ -241,6 +227,18 @@ def test_authenticated_resource_validation_returns_final_id_bodies_for_binding(
             },
         ],
     )
+    commands = child_path.parent / "commands"
+    commands.mkdir()
+    (commands / "consume.md").write_text(
+        "command $producer.output and $$HOME\n",
+        encoding="utf-8",
+    )
+    scripts = child_path.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "consume.py").write_text(
+        "print('$producer.output', '$$HOME')\n",
+        encoding="utf-8",
+    )
     root = _parse(root_path, sidecar_bytes=sidecar_bytes)
     child = _parse(child_path)
     compiled = compile_workflow(
@@ -249,9 +247,9 @@ def test_authenticated_resource_validation_returns_final_id_bodies_for_binding(
         normalizer_version=4,
     )
     package = compiled.package
-    resolver = ResourceResolver(package.root)
+    resolver = ResourceResolver(child.root)
 
-    assert compute_package_digest(package).sha256
+    assert compiled.composite_digest
     validated = validate_authenticated_resource_references(
         package,
         command_bodies={
@@ -288,7 +286,6 @@ def test_invalid_included_named_script_reference_uses_logical_provenance(
 ) -> None:
     """Catch named-script escapes losing include provenance or leaking host paths."""
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
-    from plugins.workflow.trust import compute_package_digest
 
     root_path = workflow_writer(
         tmp_path / "invalid-script-root",
@@ -297,12 +294,6 @@ def test_invalid_included_named_script_reference_uses_logical_provenance(
     )
     sidecar_bytes = b"language_compatibility: archon-2026-07\n"
     root_path.with_name(f"{root_path.stem}.hermes.yaml").write_bytes(sidecar_bytes)
-    scripts = root_path.parent / "scripts"
-    scripts.mkdir()
-    (scripts / "consume.py").write_text(
-        "print('$outside.output')\n",
-        encoding="utf-8",
-    )
     child_path = workflow_writer(
         tmp_path / "invalid-script-child",
         name="invalid-script-child",
@@ -317,16 +308,20 @@ def test_invalid_included_named_script_reference_uses_logical_provenance(
             },
         ],
     )
+    scripts = child_path.parent / "scripts"
+    scripts.mkdir()
+    (scripts / "consume.py").write_text(
+        "print('$outside.output')\n",
+        encoding="utf-8",
+    )
     root = _parse(root_path, sidecar_bytes=sidecar_bytes)
     child = _parse(child_path)
-    compiled = compile_workflow(
-        root,
-        WorkflowCatalogSnapshot.capture((root, child)),
-        normalizer_version=4,
-    )
-
     with pytest.raises(WorkflowValidationError) as exc:
-        compute_package_digest(compiled.package)
+        compile_workflow(
+            root,
+            WorkflowCatalogSnapshot.capture((root, child)),
+            normalizer_version=4,
+        )
 
     issue = exc.value.issues[0]
     assert issue.code == "include_reference_invalid"
