@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+import pytest
+
+from plugins.workflow.language import (
+    make_language_snapshot,
+    read_language_snapshot,
+    supports_phase3_semantics,
+    supports_phase4_semantics,
+    supports_structured_outputs,
+)
+from plugins.workflow.execution_semantics import build_phase3_execution_semantics
+from plugins.workflow.models import RunExecutionLimits, WorkflowLanguageProfile
+from plugins.workflow.schema import load_workflow_snapshot
+
+
+@pytest.mark.parametrize(
+    ("version", "structured", "phase3", "phase4"),
+    [
+        (1, False, False, False),
+        (2, True, False, False),
+        (3, True, True, False),
+        (4, True, True, True),
+    ],
+)
+def test_archon_capabilities_are_cumulative(version, structured, phase3, phase4):
+    """Catch a new language version dropping an inherited capability."""
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+
+    assert supports_structured_outputs(profile, version) is structured
+    assert supports_phase3_semantics(profile, version) is phase3
+    assert supports_phase4_semantics(profile, version) is phase4
+
+
+def test_explicit_v4_preserves_phase3_normalized_behavior(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch v4 admission bypassing strict references or v3 normalization."""
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Produce a result",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}},
+                    "required": ["status"],
+                },
+            },
+            {
+                "id": "shell",
+                "bash": "printf '%s' $producer.output.status",
+                "depends_on": ["producer"],
+                "timeout": 2_500,
+                "retry": {"max_attempts": 1, "delay_ms": 4_000},
+            },
+        ],
+    )
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
+
+    v3 = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=3,
+    )
+    v4 = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=4,
+    )
+
+    assert v4.definition == v3.definition
+    assert v4.language.structured_outputs == v3.language.structured_outputs
+    assert v4.language.node_semantics == v3.language.node_semantics
+    assert v4.language.node_semantics["shell"] == {
+        "wall_timeout_seconds": 2.5,
+        "retry": {
+            "explicit": True,
+            "requested_retries": 1,
+            "requested_total_attempts": 2,
+            "delay_ms": 4_000,
+            "on_error": "transient",
+        },
+    }
+
+    limits = RunExecutionLimits(
+        ai_idle_timeout_seconds=90.0,
+        ai_wall_timeout_seconds=120.0,
+        provider_request_timeout_seconds=60.0,
+        subprocess_timeout_seconds=30.0,
+        combined_retries=3,
+    )
+    v3_execution = build_phase3_execution_semantics(v3, limits).to_dict()
+    v4_execution = build_phase3_execution_semantics(v4, limits).to_dict()
+    assert v3_execution.pop("normalizer_version") == 3
+    assert v4_execution.pop("normalizer_version") == 4
+    assert v4_execution == v3_execution
+
+    v3_snapshot = make_language_snapshot(v3, "a" * 64).to_dict()
+    v4_snapshot = make_language_snapshot(v4, "a" * 64).to_dict()
+    assert read_language_snapshot(v4_snapshot).to_dict() == v4_snapshot
+    for field in (
+        "normalizer_version",
+        "normalized_definition_digest",
+        "semantic_fingerprint",
+    ):
+        v3_snapshot.pop(field)
+        v4_snapshot.pop(field)
+    assert v4_snapshot == v3_snapshot

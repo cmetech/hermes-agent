@@ -28,6 +28,8 @@ from plugins.workflow.bash_rendering import (
     bash_output_references,
     render_v3_bash,
 )
+from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     ResolvedOutputReference,
@@ -60,14 +62,23 @@ _REFERENCE_NODE_CANDIDATE = re.compile(
 )
 
 
+def _supports_phase3_runtime(normalizer_version: int) -> bool:
+    """Version 3+ contexts are admitted only for the Archon language profile."""
+    return supports_phase3_semantics(
+        WorkflowLanguageProfile.ARCHON_2026_07, normalizer_version
+    )
+
+
 def iter_output_field_references(
     template: str,
     *,
     normalizer_version: int = 2,
 ) -> Iterable[tuple[str, tuple[str, ...]]]:
     """Yield field references recognized by runtime variable substitution."""
-    if normalizer_version == 3:
-        for reference in iter_output_references(template, normalizer_version=3):
+    if _supports_phase3_runtime(normalizer_version):
+        for reference in iter_output_references(
+            template, normalizer_version=normalizer_version
+        ):
             if reference.path:
                 yield reference.node_id, reference.path
         return
@@ -675,7 +686,7 @@ class VariableContext:
         node = match.group("node")
         if node is not None:
             dot = match.group("dot")
-            if self.normalizer_version == 3:
+            if _supports_phase3_runtime(self.normalizer_version):
                 return self.output_reference(
                     node,
                     tuple(dot.split(".")) if dot else (),
@@ -1000,7 +1011,7 @@ def substitution_renderer(
     ] | None = None,
 ) -> VariableContext | StrictSubstitutionRenderer:
     """Select strict v3 rendering without changing legacy substitution."""
-    if variables.normalizer_version != 3:
+    if not _supports_phase3_runtime(variables.normalizer_version):
         return variables
     return StrictSubstitutionRenderer(
         variables=variables,

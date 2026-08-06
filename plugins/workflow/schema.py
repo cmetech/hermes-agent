@@ -31,6 +31,7 @@ from plugins.workflow.language import (
     prove_output_path_impossible,
     resolve_language_profile,
     select_normalizer_version,
+    supports_phase3_semantics,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
@@ -598,10 +599,7 @@ def _normalize_node(
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
     structural_fields = set(structural_node_field_names(node_type))
-    archon_v3 = (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version == 3
-    )
+    archon_v3 = supports_phase3_semantics(profile, normalizer_version)
     if archon_v3 and not is_reference_safe_node_id(node_id):
         _fail(
             f"{path}.id",
@@ -1223,7 +1221,9 @@ def validate_authenticated_resource_references(
     """Scan authenticated command and named-script bytes before promotion."""
     if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
         return
-    if package.language.normalizer_version == 3:
+    if supports_phase3_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
         _validate_v3_static_output_references(
             package.definition.nodes,
             package.language.structured_outputs,
@@ -1514,9 +1514,8 @@ def _load_workflow_bytes(
         )
         for index, node in enumerate(raw_nodes)
     )
-    archon_v3 = (
-        selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and selected_normalizer_version == 3
+    archon_v3 = supports_phase3_semantics(
+        selection.effective_profile, selected_normalizer_version
     )
     _validate_graph(nodes, strict_output_references=archon_v3)
     options = {

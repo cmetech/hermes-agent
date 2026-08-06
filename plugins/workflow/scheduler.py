@@ -48,6 +48,7 @@ from plugins.workflow.language import (
     WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
     read_language_snapshot,
+    supports_phase3_semantics,
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
@@ -775,7 +776,9 @@ class RunScheduler:
                 if node_id in requested
             }
 
-        strict_v3 = snapshot.normalizer_version == 3
+        strict_v3 = supports_phase3_semantics(
+            snapshot.effective_profile, snapshot.normalizer_version
+        )
 
         artifacts = projection.get("artifacts", [])
         nodes = projection.get("nodes", {})
@@ -1270,11 +1273,9 @@ class RunScheduler:
             projection = self.store.load_run(run_id)
             run_directory = self.store.run_directory(run_id)
             language_snapshot = read_language_snapshot(projection.get("language"))
-            strict_v3 = (
-                language_snapshot is not None
-                and language_snapshot.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and language_snapshot.normalizer_version == 3
+            strict_v3 = language_snapshot is not None and supports_phase3_semantics(
+                language_snapshot.effective_profile,
+                language_snapshot.normalizer_version,
             )
             outputs = (
                 None
@@ -1542,10 +1543,8 @@ class RunScheduler:
         sealed_resource_bytes: Mapping[str, bytes] | None,
     ) -> bool | _StrictReferenceSnapshot:
         """Resolve v3 references before claim without rendering Task 7 consumers."""
-        if (
-            package.language.effective_profile
-            is not WorkflowLanguageProfile.ARCHON_2026_07
-            or package.language.normalizer_version != 3
+        if not supports_phase3_semantics(
+            package.language.effective_profile, package.language.normalizer_version
         ):
             return True
         retained_output = self._revalidate_retained_output_resolution(
@@ -2662,10 +2661,8 @@ class RunScheduler:
                     )
                 )
             semantics = None
-            if (
-                package.language.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and package.language.normalizer_version == 3
+            if supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
             ):
                 try:
                     resources_bytes = sealed_bytes.get("resources.json")
@@ -2957,9 +2954,9 @@ class RunScheduler:
     ) -> int:
         """Reserve selection, winning obligation, and outcome frames up front."""
         if (
-            package.language.effective_profile
-            is not WorkflowLanguageProfile.ARCHON_2026_07
-            or package.language.normalizer_version != 3
+            not supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
+            )
             or node.node_type not in {"command", "prompt"}
             or node.options.get("context") == "fresh"
             or not bool(
@@ -3118,7 +3115,10 @@ class RunScheduler:
                         sealed_resource_bytes=sealed_resource_bytes,
                         output_node_ids=(
                             node.depends_on
-                            if package.language.normalizer_version == 3
+                            if supports_phase3_semantics(
+                                package.language.effective_profile,
+                                package.language.normalizer_version,
+                            )
                             else None
                         ),
                         resolved_outputs=(
@@ -3167,7 +3167,10 @@ class RunScheduler:
                                 strict_reference_snapshot.resolve
                                 if strict_reference_snapshot is not None
                                 else variables.output_reference
-                                if package.language.normalizer_version == 3
+                                if supports_phase3_semantics(
+                                    package.language.effective_profile,
+                                    package.language.normalizer_version,
+                                )
                                 else None
                             ),
                             predecessor_results=self._predecessor_results(

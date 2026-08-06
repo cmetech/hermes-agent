@@ -184,8 +184,8 @@ def iter_output_reference_candidate_spans(
     normalizer_version: int,
 ) -> Iterator[tuple[int, int]]:
     """Yield reference-like dollar ranges without rejecting their grammar."""
-    if normalizer_version != 3:
-        raise ValueError("strict output references require normalizer version 3")
+    if normalizer_version < 3:
+        raise ValueError("strict output references require normalizer version 3 or newer")
     position = 0
     while True:
         start = template.find("$", position)
@@ -206,8 +206,8 @@ def iter_output_references_in_spans(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Apply the strict grammar only to lexically admitted candidate spans."""
-    if normalizer_version != 3:
-        raise ValueError("strict output references require normalizer version 3")
+    if normalizer_version < 3:
+        raise ValueError("strict output references require normalizer version 3 or newer")
     previous_end = 0
     for start, end in spans:
         if start < previous_end or start < 0 or end <= start or end > len(template):
@@ -280,8 +280,8 @@ def iter_output_references(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Iterate references with the single ASCII grammar used by Archon v3."""
-    if normalizer_version != 3:
-        raise ValueError("strict output references require normalizer version 3")
+    if normalizer_version < 3:
+        raise ValueError("strict output references require normalizer version 3 or newer")
     position = 0
     while True:
         start = template.find("$", position)
@@ -302,8 +302,8 @@ def contains_output_reference(
     normalizer_version: int,
 ) -> bool:
     """Find any complete v3 reference despite other malformed candidates."""
-    if normalizer_version != 3:
-        raise ValueError("strict output references require normalizer version 3")
+    if normalizer_version < 3:
+        raise ValueError("strict output references require normalizer version 3 or newer")
     position = 0
     while True:
         start = template.find("$", position)
@@ -320,8 +320,8 @@ def iter_when_output_references(
     normalizer_version: int,
 ) -> Iterator[OutputReferenceToken]:
     """Yield only v3 condition operands; quoted RHS text stays literal."""
-    if normalizer_version != 3:
-        raise ValueError("strict output references require normalizer version 3")
+    if normalizer_version < 3:
+        raise ValueError("strict output references require normalizer version 3 or newer")
     position = 0
     while position < len(expression) and expression[position].isspace():
         position += 1
@@ -423,6 +423,18 @@ class DurableWorkflowCode:
     evidence: bool
     fields: tuple[str, ...]
 
+    @property
+    def minimum_normalizer_version(self) -> int:
+        """Return the earliest sealed language version that can emit this code."""
+        return min(self.normalizer_versions)
+
+    @property
+    def effective_profile(self) -> str:
+        """Return the sole profile covered by a durable language code."""
+        if len(self.profiles) != 1:
+            raise ValueError("durable code must name exactly one effective profile")
+        return next(iter(self.profiles)).value
+
     def to_dict(self) -> dict[str, object]:
         return {
             "code": self.code,
@@ -439,6 +451,7 @@ class DurableWorkflowCode:
 
 _ARCHON_V3 = frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
 _NORMALIZER_V3 = frozenset({3})
+_NORMALIZER_V4 = frozenset({4})
 # The projected Phase 3 code catalog is an authenticated/API-facing bounded
 # summary. 16 KiB covers the approved normalization/reference/condition codes
 # plus the remaining planned Bash and session-recovery entries without making
@@ -846,6 +859,22 @@ PHASE3_DURABLE_CODES = (
         ("evidence.recovery",),
     ),
 )
+
+# Phase 4 tasks append codes here as they add an executable emitter test.  Keep
+# the registry separate from Phase 3 so its coverage cannot silently expand a
+# frozen Phase 3 inventory.
+PHASE4_DURABLE_CODES: tuple[DurableWorkflowCode, ...] = ()
+
+
+def validate_durable_code_emitters(
+    codes: Iterable[DurableWorkflowCode], *, emitted_codes: set[str]
+) -> None:
+    """Reject registered durable failures without executable behavior coverage."""
+    missing = sorted({code.code for code in codes} - emitted_codes)
+    if missing:
+        raise RuntimeError(
+            "durable workflow codes lack executable emitters: " + ", ".join(missing)
+        )
 
 
 def _compatibility(
@@ -2231,7 +2260,7 @@ def compatibility_code_catalog(
             "enforcement_phase": spec.enforcement_phase,
             "fields": list(spec.fields),
         }
-    for spec in PHASE3_DURABLE_CODES:
+    for spec in (*PHASE3_DURABLE_CODES, *PHASE4_DURABLE_CODES):
         if selected not in spec.profiles:
             continue
         entry = {

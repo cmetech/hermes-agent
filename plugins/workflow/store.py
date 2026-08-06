@@ -36,7 +36,7 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.language import make_language_snapshot
+from plugins.workflow.language import make_language_snapshot, supports_phase3_semantics
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
@@ -100,6 +100,23 @@ from plugins.workflow.trust import (
     compute_package_digest,
 )
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
+
+
+def _language_has_phase3_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 3 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase3_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
 
 
 class InputSnapshotError(ValueError):
@@ -5001,8 +5018,7 @@ class RunStore:
             if (
                 has_unframed_selection
                 and event.get("event_type") == "node_succeeded"
-                and isinstance(language, Mapping)
-                and language.get("normalizer_version") == 3
+                and _language_has_phase3_semantics(language)
                 and isinstance(recoveries, list)
                 and any(
                     isinstance(recovery, Mapping)
@@ -5318,10 +5334,7 @@ class RunStore:
                 ):
                     return False
         language = projection.get("language")
-        strict_recovery = (
-            isinstance(language, Mapping)
-            and language.get("normalizer_version") == 3
-        )
+        strict_recovery = _language_has_phase3_semantics(language)
         if strict_recovery:
             for node in nodes.values():
                 recoveries = (
@@ -5449,10 +5462,8 @@ class RunStore:
             )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
             phase3_execution_semantics = None
-            if (
-                package.language.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and package.language.normalizer_version == 3
+            if supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
             ):
                 from plugins.workflow.execution_semantics import (
                     build_phase3_execution_semantics,
@@ -12862,11 +12873,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("v3 condition transition requires an Archon v3 run")
             if projection.get("status") != "running":
                 return False
@@ -12923,11 +12930,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("v3 reference transition requires an Archon v3 run")
             if projection.get("status") != "running":
                 return False
@@ -13011,11 +13014,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("output resolution waits require an Archon v3 run")
             if projection.get("status") != "running":
                 return False

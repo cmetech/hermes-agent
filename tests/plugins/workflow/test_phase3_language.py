@@ -39,7 +39,7 @@ def test_new_packages_select_the_current_normalizer_for_their_profile(
     legacy = load_workflow(legacy_path)
     archon = load_workflow(archon_path)
 
-    assert workflow_language.LATEST_NORMALIZER_VERSION == 3
+    assert workflow_language.LATEST_NORMALIZER_VERSION == 4
     assert workflow_language.CURRENT_NORMALIZER_BY_PROFILE == {
         WorkflowLanguageProfile.HERMES_LEGACY: 2,
         WorkflowLanguageProfile.ARCHON_2026_07: 3,

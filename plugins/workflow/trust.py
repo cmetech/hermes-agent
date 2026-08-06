@@ -17,6 +17,7 @@ from typing import Iterable, Literal, Mapping
 import yaml
 
 from plugins.workflow.compat import ARCHON_TOOL_ALIASES, CompatibilityReport
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowLanguageProfile,
@@ -372,10 +373,8 @@ def compute_package_digest(
     resources: dict[str, bytes] = {}
     command_bodies: dict[str, str] = {}
     named_script_bodies: dict[str, str] = {}
-    strict_v3_resources = (
-        package.language.effective_profile
-        is WorkflowLanguageProfile.ARCHON_2026_07
-        and package.language.normalizer_version == 3
+    strict_v3_resources = supports_phase3_semantics(
+        package.language.effective_profile, package.language.normalizer_version
     )
 
     def add(path: Path) -> tuple[str, bytes]:
@@ -554,9 +553,8 @@ def build_risk_summary(
             finding.path for finding in compatibility.blocking_findings
         ),
     }
-    if (
-        package.language.effective_profile.value == "archon-2026-07"
-        and package.language.normalizer_version == 3
+    if supports_phase3_semantics(
+        package.language.effective_profile, package.language.normalizer_version
     ):
         risk_fields["language_identity"] = {
             "effective_profile": package.language.effective_profile.value,

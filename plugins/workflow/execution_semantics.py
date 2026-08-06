@@ -7,6 +7,7 @@ import math
 from types import MappingProxyType
 from typing import Mapping
 
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.models import (
     RunExecutionLimits,
     WorkflowLanguageProfile,
@@ -269,10 +270,8 @@ def build_phase3_execution_semantics(
     limits: RunExecutionLimits,
 ) -> Phase3ExecutionSemantics:
     """Intersect normalized v3 requests with one resolved admission authority."""
-    if (
-        package.language.effective_profile
-        is not WorkflowLanguageProfile.ARCHON_2026_07
-        or package.language.normalizer_version != 3
+    if not supports_phase3_semantics(
+        package.language.effective_profile, package.language.normalizer_version
     ):
         raise WorkflowExecutionSemanticsError(
             "Phase 3 execution semantics require an Archon v3 package"
@@ -338,7 +337,11 @@ def build_phase3_execution_semantics(
                 ),
             ),
         }
-    return Phase3ExecutionSemantics(limits=effective_limits, nodes=nodes)
+    return Phase3ExecutionSemantics(
+        limits=effective_limits,
+        nodes=nodes,
+        normalizer_version=package.language.normalizer_version,
+    )
 
 
 def read_phase3_execution_semantics(
@@ -363,7 +366,10 @@ def read_phase3_execution_semantics(
             or value["schema_version"] != 1
             or isinstance(value["normalizer_version"], bool)
             or not isinstance(value["normalizer_version"], int)
-            or value["normalizer_version"] != 3
+            or value["normalizer_version"] != package.language.normalizer_version
+            or not supports_phase3_semantics(
+                package.language.effective_profile, value["normalizer_version"]
+            )
         ):
             raise WorkflowExecutionSemanticsError(
                 "execution semantics version is unsupported"

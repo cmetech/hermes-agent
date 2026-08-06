@@ -19,8 +19,8 @@ from plugins.workflow.executors.base import (
     NodeExecutionResult,
     process_tree_active,
 )
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.store import ArtifactRef
-from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from tools.managed_process import ManagedProcessTree
 
@@ -37,9 +37,8 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
 
 class BashExecutor:
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
-        secure_v3 = (
-            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            and context.normalizer_version == 3
+        secure_v3 = supports_phase3_semantics(
+            context.language_profile, context.normalizer_version
         )
         if context.sealed_attempt_timeout:
             assert context.deadline_budget is not None

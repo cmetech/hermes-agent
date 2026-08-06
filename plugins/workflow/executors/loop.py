@@ -10,8 +10,9 @@ from typing import Mapping
 
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.executors.bash import BashExecutor
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.models import WorkflowNode, freeze_value
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.store import ArtifactRef
 
@@ -101,9 +102,8 @@ class LoopExecutor:
             base_variables = VariableContext(workflow_id=context.run_id)
         until_bash_template = loop.get("until_bash")
         loop_output_resolver = context.output_resolver
-        if (
-            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            and base_variables.normalizer_version == 3
+        if supports_phase3_semantics(
+            context.language_profile, base_variables.normalizer_version
         ):
             strict_renderer = substitution_renderer(
                 base_variables,

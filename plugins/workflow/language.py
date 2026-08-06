@@ -31,14 +31,14 @@ from plugins.workflow.models import (
 )
 
 
-LATEST_NORMALIZER_VERSION = 3
+LATEST_NORMALIZER_VERSION = 4
 # Pre-language legacy snapshots used this public fallback. Keep it at v2.
 WORKFLOW_NORMALIZER_VERSION = 2
 CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
     WorkflowLanguageProfile.HERMES_LEGACY: 2,
     WorkflowLanguageProfile.ARCHON_2026_07: 3,
 })
-SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3})
+SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
 # The normalized type-tag document expands the already bounded workflow and
@@ -97,6 +97,36 @@ class WorkflowSemanticNormalizationError(ValueError):
         self.field = field
         self.code = code
         super().__init__(message)
+
+
+def supports_structured_outputs(
+    profile: WorkflowLanguageProfile, normalizer_version: int
+) -> bool:
+    """Return whether this sealed language version has v2 output semantics."""
+    return (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version >= 2
+    )
+
+
+def supports_phase3_semantics(
+    profile: WorkflowLanguageProfile, normalizer_version: int
+) -> bool:
+    """Return whether this sealed language version inherits Phase 3 semantics."""
+    return (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version >= 3
+    )
+
+
+def supports_phase4_semantics(
+    profile: WorkflowLanguageProfile, normalizer_version: int
+) -> bool:
+    """Return whether this sealed language version enables Phase 4 semantics."""
+    return (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version >= 4
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +217,9 @@ class WorkflowLanguageSnapshot:
             value["structured_outputs"] = _structured_outputs_projection(
                 self.structured_outputs
             )
-        if self.normalizer_version == 3:
+        if supports_phase3_semantics(
+            self.effective_profile, self.normalizer_version
+        ):
             value["node_semantics"] = _node_semantics_projection(
                 self.node_semantics
             )
@@ -238,11 +270,18 @@ def normalize_workflow(
         normalized_definition, structured_outputs = _normalize_v2(
             source_definition, selection.effective_profile
         )
-    if normalizer_version == 3:
+    if supports_phase3_semantics(selection.effective_profile, normalizer_version):
         normalized_definition, structured_outputs, node_semantics = _normalize_v3(
             normalized_definition,
             selection.effective_profile,
             structured_outputs,
+        )
+    if supports_phase4_semantics(selection.effective_profile, normalizer_version):
+        normalized_definition, structured_outputs, node_semantics = _normalize_v4(
+            normalized_definition,
+            selection.effective_profile,
+            structured_outputs,
+            node_semantics,
         )
 
     normalized_document_value: dict[str, object] = {
@@ -268,7 +307,7 @@ def normalize_workflow(
         normalized_document_value["structured_outputs"] = (
             _structured_outputs_projection(structured_outputs)
         )
-    if normalizer_version == 3:
+    if supports_phase3_semantics(selection.effective_profile, normalizer_version):
         normalized_document_value["node_semantics"] = _node_semantics_projection(
             node_semantics
         )
@@ -304,12 +343,12 @@ def select_normalizer_version(
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
     if (
-        normalizer_version == 3
+        normalizer_version >= 3
         and selection.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07
     ):
         raise WorkflowLanguageCompatibilityError(
             WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
-            "workflow normalizer version 3 requires archon-2026-07",
+            "workflow normalizer version 3 or greater requires archon-2026-07",
         )
     return normalizer_version
 
@@ -444,6 +483,20 @@ def _normalize_v3(
         if entry:
             semantics[node.id] = freeze_value(entry)
     return normalized_definition, structured_outputs, MappingProxyType(semantics)
+
+
+def _normalize_v4(
+    normalized_definition: WorkflowDefinition,
+    profile: WorkflowLanguageProfile,
+    structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> tuple[
+    WorkflowDefinition,
+    Mapping[str, WorkflowStructuredOutput],
+    Mapping[str, Mapping[str, object]],
+]:
+    """Reserve the v4 normalization step while preserving inherited semantics."""
+    return normalized_definition, structured_outputs, node_semantics
 
 
 def _normalize_v3_retry(
@@ -742,7 +795,9 @@ def bind_semantic_fingerprint(
         document["structured_outputs"] = _structured_outputs_projection(
             metadata.structured_outputs
         )
-    if metadata.normalizer_version == 3:
+    if supports_phase3_semantics(
+        metadata.effective_profile, metadata.normalizer_version
+    ):
         document["node_semantics"] = _node_semantics_projection(
             metadata.node_semantics
         )
@@ -815,18 +870,18 @@ def read_language_snapshot(
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
     if (
-        normalizer_version == 3
+        normalizer_version >= 3
         and profile is not WorkflowLanguageProfile.ARCHON_2026_07
     ):
         raise WorkflowLanguageCompatibilityError(
             WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
-            "workflow normalizer version 3 requires archon-2026-07",
+            "workflow normalizer version 3 or greater requires archon-2026-07",
         )
 
     expected_keys = v1_keys
     if normalizer_version >= 2:
         expected_keys = expected_keys | {"structured_outputs"}
-    if normalizer_version == 3:
+    if supports_phase3_semantics(profile, normalizer_version):
         expected_keys = expected_keys | {"node_semantics"}
     if set(value) != expected_keys:
         raise WorkflowLanguageCompatibilityError(
@@ -853,7 +908,7 @@ def read_language_snapshot(
     )
     node_semantics = (
         _read_node_semantics(value["node_semantics"])
-        if normalizer_version == 3
+        if supports_phase3_semantics(profile, normalizer_version)
         else MappingProxyType({})
     )
     return WorkflowLanguageSnapshot(
