@@ -141,6 +141,10 @@ class JournalRecoveryError(RuntimeError):
     pass
 
 
+class StaleLoopDecisionError(RuntimeError):
+    """A loop decision lost its exact active attempt-owner comparison."""
+
+
 class PublicationNotFoundError(LookupError):
     """No authorized publication matches the opaque identifier."""
 
@@ -10157,7 +10161,10 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if (
+                active.get("attempt_id") != claim.attempt_id
+                or active.get("owner_id") != claim.owner_id
+            ):
                 return False
             attempt = node.get("attempts", [])[-1]
             if (
@@ -12820,7 +12827,7 @@ class RunStore:
                 active.get("attempt_id") != claim.attempt_id
                 or active.get("owner_id") != claim.owner_id
             ):
-                raise RuntimeError("stale loop decision")
+                raise StaleLoopDecisionError("stale loop decision")
             current = node.get("loop_state")
             if not isinstance(current, Mapping):
                 raise RuntimeError("recorded loop iteration is missing")
@@ -17287,6 +17294,7 @@ __all__ = [
     "PublicationNotFoundError",
     "PublicationUnavailableError",
     "RunStore",
+    "StaleLoopDecisionError",
     "StorageQuotaError",
     "TypedPublicationCandidate",
     "TypedPublicationRef",

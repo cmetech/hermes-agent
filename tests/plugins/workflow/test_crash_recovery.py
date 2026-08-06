@@ -22,6 +22,7 @@ from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
     RunStore,
+    StorageQuotaError,
     TypedPublicationCandidate,
 )
 from plugins.workflow.trust import WorkflowPackageDigest
@@ -252,6 +253,19 @@ def _recorded_loop_recovery_takeover(
     )
     assert winner is not None
     return store, run_id, stale, winner, winner_now
+
+
+def _worker_claim_record(
+    store: RunStore,
+    attempt_id: str,
+) -> dict[str, object] | None:
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT owner_id, lease_expires_at FROM worker_claims "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 @pytest.mark.parametrize(
@@ -627,12 +641,7 @@ def test_stale_recorded_loop_recoverer_cannot_schedule_retry_after_takeover(
 
     assert store.load_run(run_id) == before
     assert store.tail_events(run_id) == events_before
-    with store._connect() as connection:
-        worker = connection.execute(
-            "SELECT owner_id, lease_expires_at FROM worker_claims "
-            "WHERE attempt_id=?",
-            (winner.claim.attempt_id,),
-        ).fetchone()
+    worker = _worker_claim_record(store, winner.claim.attempt_id)
     assert worker is not None
     assert worker["owner_id"] == winner.claim.owner_id
     assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
@@ -659,15 +668,131 @@ def test_stale_recorded_loop_recoverer_cannot_block_cleanup_after_takeover(
 
     assert store.load_run(run_id) == before
     assert store.tail_events(run_id) == events_before
-    with store._connect() as connection:
-        worker = connection.execute(
-            "SELECT owner_id, lease_expires_at FROM worker_claims "
-            "WHERE attempt_id=?",
-            (winner.claim.attempt_id,),
-        ).fetchone()
+    worker = _worker_claim_record(store, winner.claim.attempt_id)
     assert worker is not None
     assert worker["owner_id"] == winner.claim.owner_id
     assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
+
+
+def test_stale_fenced_executor_cannot_release_recorded_loop_recovery_winner(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    started_at = datetime(2026, 8, 6, 13, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 200.0, "boot-a"))
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        lease_clock=clock,
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity_a = CoordinatorIdentity(
+        owner_id="recorded-loop-coordinator-a",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-host-a",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    leadership_a = coordinator.try_acquire(
+        identity_a,
+        now=started_at,
+        lease_seconds=1,
+    )
+    assert leadership_a.is_leader
+    fence_a = ExecutionFence(identity_a.owner_id, leadership_a.lease.epoch)
+    claims = []
+    original_claim = store.claim_node
+
+    def capture_claim(*args, **kwargs):
+        claim = original_claim(*args, **kwargs)
+        if claim is not None:
+            claims.append(claim)
+        return claim
+
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated stale coordinator before publication")
+
+    monkeypatch.setattr(store, "claim_node", capture_claim)
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    scheduler_a = RunScheduler(
+        store,
+        owner_id="recorded-loop-worker-a",
+        execution_fence=fence_a,
+        agent_runner=runner,
+        utcnow=lambda: started_at,
+        monotonic=lambda: 200.0,
+    )
+    with pytest.raises(SystemExit, match="stale coordinator"):
+        scheduler_a.advance(run_id)
+    assert len(claims) == 1
+    assert len(runner.requests) == 1
+
+    recorded = store.load_run(run_id)
+    prepared = scheduler_a._prepare_run_package(
+        run_id,
+        None,
+        expected_state_version=int(recorded["state_version"]),
+    )
+    assert prepared is not None
+    package, execution_limits, resource_paths, resource_bytes, semantics = prepared
+    node = next(node for node in package.definition.nodes if node.id == "refine")
+
+    takeover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(takeover_at, 202.0, "boot-a")
+    identity_b = CoordinatorIdentity(
+        owner_id="recorded-loop-coordinator-b",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-host-b",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership_b = coordinator.try_acquire(
+        identity_b,
+        now=takeover_at,
+        lease_seconds=30,
+    )
+    assert leadership_b.is_leader
+    fence_b = ExecutionFence(identity_b.owner_id, leadership_b.lease.epoch)
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-b",
+        now=clock.sample,
+        lease_seconds=30,
+        execution_fence=fence_b,
+    )
+    assert winner is not None
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+    worker_before = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker_before is not None
+
+    scheduler_a._execute_claim(
+        run_id,
+        claims[0],
+        node,
+        package,
+        recorded,
+        None,
+        execution_limits,
+        semantics,
+        resource_paths,
+        resource_bytes,
+    )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    worker_after = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker_after is not None
+    assert worker_after == worker_before
+    assert worker_after["owner_id"] == winner.claim.owner_id
+    assert len(runner.requests) == 1
 
 
 def test_fresh_recorded_loop_decision_cannot_be_taken_over_from_live_executor(
@@ -872,6 +997,69 @@ def test_restart_reconciles_until_bash_crash_window_without_provider_replay(
         if event["event_type"] == "loop_predicate_recovery_prepared"
     ]
     assert len(recovery_events) == (0 if crash_after_final_decision else 1)
+
+
+def test_until_bash_recovery_propagates_decision_storage_failure_without_redispatch(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/predicate-quota-count"',
+        },
+    )
+    runner = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+
+    def crash_before_predicate(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated loss before quota predicate")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_before_predicate)
+    with pytest.raises(SystemExit, match="before quota predicate"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    recorded_claim = store.load_run(run_id)["nodes"]["refine"]["claim"]
+    expired_at = datetime.fromisoformat(
+        recorded_claim["lease_expires_at"]
+    ) + timedelta(seconds=1)
+    expired_monotonic = (
+        float(recorded_claim["heartbeat_monotonic"])
+        + float(recorded_claim["lease_seconds"])
+        + 1.0
+    )
+    restarted = RunStore(home)
+
+    def fail_decision_journal(*_args, **_kwargs):
+        raise StorageQuotaError("injected loop decision quota failure")
+
+    monkeypatch.setattr(restarted, "record_loop_decision", fail_decision_journal)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("decision storage failure replayed the loop provider")
+
+    with pytest.raises(StorageQuotaError, match="injected loop decision"):
+        RunScheduler(
+            restarted,
+            agent_runner=NoReplayRunner(),
+            utcnow=lambda: expired_at,
+            monotonic=lambda: expired_monotonic,
+        ).advance(run_id)
+
+    counter = store.run_directory(run_id) / "artifacts" / "predicate-quota-count"
+    assert counter.read_bytes() == b"x"
+    assert len(runner.requests) == 1
+    failed_closed = restarted.load_run(run_id)
+    assert (
+        failed_closed["nodes"]["refine"]["loop_state"][
+            "_pending_loop_decision"
+        ]["kind"]
+        == "until_bash_pending"
+    )
 
 
 def test_until_bash_recovery_authenticates_one_shot_feedback_without_provider_replay(

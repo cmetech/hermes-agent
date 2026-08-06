@@ -221,6 +221,68 @@ history, and public evidence.
   payloads.
 - No unresolved concerns remain for Task 9.
 
+## Review convergence: fix round 4 of 5
+
+Status: DONE
+
+The fourth external review found one remaining pre-execution owner fence and one
+over-broad exception boundary in recovered predicate publication. Both failures
+were reproduced through authentic scheduler/store paths before production edits.
+
+### Fence-loss release preserves a recovery winner
+
+`release_claim_before_execution()` now compares both the attempt ID and active
+owner before making a claim retryable. This matches the terminal mutation fences
+and prevents an expired coordinator's executor from removing a newer recoverer's
+same-attempt claim or worker row.
+
+The regression test creates coordinator A, journals a provider iteration, expires
+A's lease, and has coordinator B transactionally take over that exact recorded-loop
+attempt. B is paused after takeover. Resuming A through `_execute_claim()` exercises
+the real failed execution-fence renewal and release helper; the helper now leaves
+B's projection, decision, takeover history, event journal, claim owner/lease, and
+worker row unchanged. The provider remains at one original call.
+
+### Predicate journal failures propagate without redispatch
+
+The store now raises a typed `StaleLoopDecisionError` only when
+`record_loop_decision()` loses its exact active attempt-owner comparison. Recovery
+suppresses only that expected convergence signal. Quota, integrity, journal, and
+other persistence failures propagate immediately.
+
+The adjacent recovery-result publication catch was audited: it already re-raises
+every runtime failure except the explicit stale-completion outcome, so it required
+no change. No generic storage or recovery exception is converted into convergence.
+
+### Fix-round TDD evidence
+
+1. Stale fence-loss release:
+   - RED: after B's recorded-loop takeover, resuming stale A through the real
+     execution-fence loss branch changed B's projection and released its claim.
+   - GREEN: the active-owner comparison makes A's release a no-op; projection,
+     events, recovery history, worker owner/lease, and provider count are unchanged.
+2. Recovered predicate storage fault:
+   - RED: an injected `StorageQuotaError` after the recovered `until_bash` process
+     was swallowed. Recovery recursively re-ran the side-effecting predicate until
+     `JournalRecoveryError` reported that the bounded recovery history was exhausted.
+   - GREEN: `StorageQuotaError` propagates from the first failed decision journal,
+     the predicate counter contains exactly one increment, the provider is not
+     replayed, and the pending decision remains fail-closed.
+
+### Fix-round final verification
+
+- Complete crash-recovery file: 54 passed, 0 failed.
+- Mandatory Task 9 eight-file gate: 226 passed, 0 failed.
+  - v4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 54; shutdown recovery 5; parallel scheduler 19; evidence API 29.
+- Required Task 8 broad action/store gate: 74 passed, 0 failed.
+- Combined explicit v1-v3 compatibility gates: 13 passed, 0 failed.
+- Ruff on all touched Python files: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+- Normalizer v4 activation, Task 10 diagnostics, and security-review scope remain
+  untouched.
+
 ## Review convergence: fix round 3 of 5
 
 Status: DONE

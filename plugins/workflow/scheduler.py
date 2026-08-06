@@ -96,6 +96,7 @@ from plugins.workflow.store import (
     ArtifactRef,
     NodeClaim,
     RunStore,
+    StaleLoopDecisionError,
     StorageQuotaError,
     TypedPublicationCandidate,
 )
@@ -1246,7 +1247,7 @@ class RunScheduler:
                         "_pending_loop_decision": final,
                     },
                 )
-            except RuntimeError:
+            except StaleLoopDecisionError:
                 pass
             return self._reconcile_recorded_loop_decision(run_id)
 
