@@ -1,4 +1,13 @@
-# Continue — Phase 3 adversarial remediation complete / integration handoff
+# Continue — Phase 3 handoff superseded by Phase 4 feature-branch activation
+
+## Supersession — 2026-08-06
+
+This historical Phase 3 handoff is superseded by the completed Phase 4 development
+branch `feat/workflow-language-phase-4-ordinary-loops-immutable-includes`. Phase 4
+current-version activation is committed at
+`7bf55d5d680faea8d82474c1d3e2a3dd8f69a096`; current Archon selects v4, legacy remains
+v2, and explicit/sealed v3 remains supported. This statement does **not** claim
+integration into `base`: no merge, push, rebase, publication, or cleanup occurred.
 
 ## Last action
 
@@ -11,11 +20,11 @@ passed. The prohibited threat-model/security suites remained excluded.
 
 ## Next action
 
-Wait for explicit user authorization before integration. If authorized, use
-the project branch rule that developer shorthand `main` means `base`; do not
-target literal `main`. Reverify repaired production candidate `060f60f54`, the
-report-only closure commit above it, the clean worktree, and current `base`
-state before any merge, push, PR, release, branch deletion, or worktree removal.
+Wait for explicit user authorization before integrating the Phase 4 feature branch.
+If authorized, use the project rule that developer shorthand `main` means `base`; do
+not target literal `main`. Reverify the Phase 4 activation/evidence commits, clean
+worktree, and current `base` state before any merge, push, PR, release, branch
+deletion, or worktree removal.
 
 ## Why
 
@@ -46,7 +55,8 @@ double rendering, and upstream ownership of provider-attempt transport seams.
 - Do not document behavioral configuration through a raw environment variable.
 - Do not remove MCP/skills as documented options or promote loops/includes
   before Phase 4.
-- Do not begin Phase 4 loops/includes or new artifact/provider surfaces.
+- Phase 4 loops/includes are complete on their feature branch; do not start a new
+  follow-on surface or imply `base` integration without separate authorization.
 - Do not merge, push, publish, propagate brand refs, delete the branch, or
   remove the feature worktree without separate user authorization.
 - Do not modify the shared base checkout, literal `main`, push, publish, or

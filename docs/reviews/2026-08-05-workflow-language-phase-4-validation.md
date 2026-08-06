@@ -298,3 +298,86 @@ Task 14 activation has not been performed.
 
 Task 13 review convergence is complete. This remains a pre-activation result: Task 14,
 push, merge, rebase, publication, and worktree cleanup are not authorized here.
+
+## Task 14 activation evidence — 2026-08-06
+
+Phase 4 language semantics are activated on
+`feat/workflow-language-phase-4-ordinary-loops-immutable-includes` by commit
+`7bf55d5d680faea8d82474c1d3e2a3dd8f69a096`. The one public selection authority now
+maps Archon to normalizer v4 while legacy remains v2. Supported sealed readers remain
+v1-v4, including explicit v3 resume. This is a feature-branch result only: no merge,
+push, rebase, publication, `base` integration, or worktree cleanup was performed.
+
+### Strict RED/GREEN activation sequence
+
+1. The exact four-file activation RED was 758 passed / 8 failed. Every failure was a
+   moving-current assertion that still observed Archon v3.
+2. Changing only `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` to 4 exposed the
+   expected stale contract/trust tests. The exact Step 3 activation command ultimately
+   reached 874 passed / 5 failed; all five are the exact-base packaged-schema CLI
+   failures documented above.
+3. The generated compatibility-code section serialized to 15,714 bytes, exceeding
+   its advertised 15,000-byte section ceiling. The authoritative ceiling is now
+   16,000 bytes; the total 256,000-byte envelope, 4,000-byte reserve, and other section
+   ceilings are unchanged.
+4. The initial exact eleven-file Phase 4 no-retry gate was 224 passed / 1 failed. The
+   failing defensive test incorrectly called moving current "v3"; its historical leg
+   now explicitly selects v3 and retains the current-v4 rejection relationship. The
+   final gate was 225 passed / 0 failed in 6.7s.
+5. The first full no-retry run after activation was 32,302 passed / 66 failed in
+   662.6s: the exact 27 base failures plus 39 activation-only failures across 15 files,
+   with the known four Anthropic setup errors in one additional file. Those 15 files
+   passed together after migration, 535/535 initially and 536/536 after the added
+   serializer relationship.
+
+### Production defects exposed by activation
+
+- The Desktop/detail response model rejected valid normalizer v4 with an upper bound
+  of 3. The exact `StrictInt`, lower bound, and closed response shape remain; the upper
+  bound is now 4. The stale invalid-version test now uses unsupported v5.
+- Phase 4 dependency identity initially used Python's ordinary decimal conversion and
+  could not digest a valid 5,000-digit structured-schema integer already preserved by
+  Phase 3. The bounded manifest encoder now delegates scalar leaves to the exact
+  canonical encoder while enforcing the existing 8 MiB total envelope.
+- A first correction made that encoder too strict for historical non-finite YAML graph
+  values. Focused reproduction proved failure occurred during package-graph hashing,
+  before language normalization. The workflow-scoped encoder now preserves the prior
+  `NaN`, `Infinity`, and `-Infinity` byte representation, distinguishes those values
+  from strings, enforces sorted string keys and bounded lists/tuples, and leaves the
+  core structured-output encoder strict. Ordinary canonical bytes are unchanged.
+
+Focused serializer/response evidence was 5/5 for non-finite values, ordinary byte
+identity, collision distinction, and the 5,000-digit integer; the full language,
+structured-output, and catalog API files were 148/148. A separate focused production
+relationship set was 4/4. The fresh installed-wheel integration test was 1/1.
+
+### Final gates and full-suite attribution
+
+- Exact Step 3: 874 passed / 5 exact-base CLI failures in 15.9s.
+- Exact eleven-file Phase 4 gate, retries disabled: 225 passed / 0 failed in 6.7s.
+- Exact 15-file activation migration set, retries disabled: 536 passed / 0 failed in
+  12.4s.
+- Fresh installed-wheel integration: 1 passed / 0 failed in 8.9s.
+- Ruff over all 27 activation Python files: `All checks passed!`.
+- `git diff --check`: passed.
+
+The second post-migration full run was 32,337 passed / 32 failed in 681.4s. Twenty-seven
+failures were the exact base set. Three deterministic extras exposed the response and
+manifest defects above; two process-heavy extras in `tests/test_tui_gateway_server.py`
+and `tests/scripts/test_workflow_upstream_merge.py` passed immediate no-retry
+whole-file reruns (517/517 and 104/104 respectively).
+
+After the deterministic corrections, the final full no-retry run discovered 2,776
+files with one additional relationship test and produced exactly the documented 27
+failures across the same 16 base files, plus the same four Anthropic setup errors in
+`tests/agent/test_anthropic_output_field_leak.py`. No activation-specific or transient
+failure remained. The tool transport retained the final failure inventory but
+truncated the middle runner-summary line, so the passing aggregate is explicitly
+reconstructed rather than presented as directly captured: the previous complete run
+had 32,369 total outcomes, the final run added one test, and 32,370 minus 27 yields
+32,343 passing tests. Invocation/result timestamps give 688.4s command wall; no
+runner-reported duration is invented.
+
+The Task 13 functional review remains clean and its bounded defensive security result
+remains **PASS_AFTER_FIX**. Activation did not introduce a new security finding or
+weaken the repaired catalog-sidecar boundary.
