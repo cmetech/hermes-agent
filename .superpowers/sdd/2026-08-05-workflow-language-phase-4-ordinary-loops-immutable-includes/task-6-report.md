@@ -262,3 +262,69 @@ expectations. Ruff on every changed Python file and `git diff --check` passed.
 
 No Task 7 ordinary-loop semantics, v4 activation, security-review work, core
 tool or prompt-schema changes, telemetry, or unrelated cleanup was added.
+
+## Fix round 2
+
+### Status
+
+DONE_WITH_CONCERNS
+
+Explicit standalone pre-Phase-4 admissions no longer depend on project/profile
+catalog availability. The only observed failures remain the same five
+pre-existing packaged-schema temporary-home isolation cases documented above.
+
+### Authentic RED/GREEN
+
+Regression command:
+
+`scripts/run_tests.sh tests/plugins/workflow/test_cli.py -k explicit_pre_phase4_run_ignores_unavailable_unrelated_catalog`
+
+- RED: **0 passed, 2 failed**. Both an unversioned v2 foreground run and an
+  `archon-2026-07` v3 foreground run returned exit 70 / `internal_error` with
+  `WorkflowCatalogUnavailableError` when an unrelated project catalog could
+  not be enumerated.
+- GREEN: **2 passed, 0 failed** after explicit resolution selected the language
+  profile and normalizer from the already parsed root source, used a root-only
+  immutable catalog snapshot for versions below v4, and captured the bounded
+  project/profile catalog only when `supports_phase4_semantics(...)` was true.
+
+The combined preservation check:
+
+`scripts/run_tests.sh tests/plugins/workflow/test_cli.py -k 'explicit_phase4_path_resolves_includes or explicit_pre_phase4_run_ignores_unavailable_unrelated_catalog'`
+
+produced **3 passed, 0 failed**, proving the existing explicit-v4 profile
+include still resolves through the bounded catalog while v2/v3 standalone
+admission does not touch it. The root is parsed once and compiled once; the
+selected normalizer version is passed into that single compilation.
+
+### Files changed
+
+- `plugins/workflow/cli.py` — language-gated explicit catalog capture with the
+  legacy root-only snapshot path preserved.
+- `tests/plugins/workflow/test_cli.py` — public foreground execution regression
+  for unversioned v2 and current Archon v3 under unavailable unrelated catalog
+  enumeration.
+- `task-6-report.md` — this fix-round evidence.
+
+### Verification
+
+- Full `test_cli.py`: **81 passed, 5 failed**; all five failures are the
+  already-confirmed packaged-schema baseline cases.
+- Snapshot + language gate: **106 passed, 0 failed**.
+- Snapshot + crash + shutdown recovery gate: **44 passed, 0 failed**.
+- Full CLI/API/authenticated command/Gateway notification/scheduled/showcase
+  gate: **171 passed, 5 failed** in 91.9 seconds. The scheduled file passed
+  **47/47**; the same five packaged-schema baseline cases were the only
+  failures.
+- Ruff on both changed Python files and `git diff --check`: passed.
+
+### Self-review and residual concerns
+
+- Current authored explicit admissions select v2 for legacy/unversioned and v3
+  for Archon; sealed v1 reload remains outside `_resolve_compilation()` and is
+  covered by the unchanged snapshot/recovery contracts.
+- Explicit v4 continues to capture one bounded project/profile source view,
+  preserving include precedence and ambiguity behavior from fix round 1.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains 3.
+- No Task 7 behavior, activation, security-review work, core tool/prompt schema,
+  telemetry, or unrelated cleanup was added.

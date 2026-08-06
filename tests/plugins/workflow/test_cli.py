@@ -87,6 +87,75 @@ def test_explicit_phase4_path_resolves_includes_from_bounded_catalog(
     ] == ["explicit-phase4-child"]
 
 
+@pytest.mark.parametrize(
+    ("declared_profile", "expected_version"),
+    [
+        pytest.param(None, 2, id="unversioned-v2"),
+        pytest.param("archon-2026-07", 3, id="archon-v3"),
+    ],
+)
+def test_explicit_pre_phase4_run_ignores_unavailable_unrelated_catalog(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    capsys,
+    declared_profile: str | None,
+    expected_version: int,
+) -> None:
+    """Standalone pre-v4 admission must not depend on catalog enumeration."""
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    catalog_root = workdir / ".hermes/workflows"
+    catalog_root.mkdir(parents=True)
+    workflow = workflow_writer(
+        tmp_path / "standalone",
+        name=f"standalone-{expected_version}",
+        filename=f"standalone-{expected_version}.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    if declared_profile is not None:
+        workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {declared_profile}\n",
+            encoding="utf-8",
+        )
+    package = load_workflow(workflow)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        risk.package_digest,
+        actor="explicit-legacy-test",
+        risk_digest=risk.risk_digest,
+    )
+    original_scandir = os.scandir
+    catalog_scan_attempts: list[Path] = []
+
+    def fail_catalog_enumeration(path):
+        resolved = Path(path).resolve()
+        if resolved == catalog_root.resolve():
+            catalog_scan_attempts.append(resolved)
+            raise OSError("unrelated catalog is unavailable")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_catalog_enumeration)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(home),
+        "run",
+        str(workflow),
+        "--foreground",
+        "--idempotency-key",
+        f"standalone-{expected_version}",
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    result = _json_result(capsys)
+    assert result["status"] == "succeeded"
+    assert result["language"]["normalizer_version"] == expected_version
+    assert catalog_scan_attempts == []
+
+
 def _json_result(capsys):
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["schema_version"] == 1
