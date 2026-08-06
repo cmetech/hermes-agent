@@ -570,9 +570,11 @@ class _WorkflowManifestCounts:
 
 def _origin_from_dict(raw: object) -> WorkflowNodeOrigin:
     value = _exact_mapping(raw, _NODE_ORIGIN_FIELDS, "node origin")
-    path_value = value["include_instance_path"]
-    if not isinstance(path_value, list | tuple):
-        raise ValueError("node origin include path must be an ordered sequence")
+    path_value = _bounded_sequence(
+        value["include_instance_path"],
+        "node origin include path",
+        maximum=3,
+    )
     return WorkflowNodeOrigin(
         include_instance_path=tuple(path_value),
         package_key=value["package_key"],

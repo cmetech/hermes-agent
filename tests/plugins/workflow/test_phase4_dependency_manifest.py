@@ -223,6 +223,22 @@ def test_manifest_codec_round_trips_exact_bounded_fields_immutably() -> None:
         manifest.node_origins[0]["include_instance_path"].append("changed")
 
 
+def test_manifest_codec_bounds_node_origin_path_before_materializing_items() -> None:
+    """Catch over-depth origin paths being copied before their bound is checked."""
+
+    class ExplodingPath(list[str]):
+        def __iter__(self):
+            raise AssertionError("over-depth origin path must not be materialized")
+
+    forged = _manifest_document()
+    forged["node_origins"][0]["include_instance_path"] = ExplodingPath(
+        ["first", "second", "third", "fourth"]
+    )
+
+    with pytest.raises(ValueError, match="node origin include path collection.*bound"):
+        WorkflowDependencyManifest.from_dict(forged)
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     (
