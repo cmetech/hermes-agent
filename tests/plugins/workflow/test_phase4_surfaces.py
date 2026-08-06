@@ -31,6 +31,8 @@ _EXPECTED_SIGNAL_ACTIONS = [
     "provide-input",
     "cancel",
 ]
+_PRIVATE_PHASE4_FEEDBACK = "PRIVATE_PHASE4_FEEDBACK"
+_PRIVATE_PHASE4_PROVIDER_RESPONSE = b"PRIVATE_PHASE4_PROVIDER_RESPONSE\n"
 
 
 def _api_module():
@@ -126,7 +128,7 @@ def _paused_signal_run(
     claim = store.claim_node(admitted.run_id, "refine", "surface-worker")
     assert claim is not None
     store.mark_node_started(claim)
-    result = b"cleaned public result identity\n"
+    result = _PRIVATE_PHASE4_PROVIDER_RESPONSE
     digest = hashlib.sha256(result).hexdigest()
     relative = (
         Path("nodes")
@@ -213,11 +215,7 @@ def _dependency_compilation_v4(tmp_path: Path, workflow_writer):
         nodes=[
             {
                 "id": "draft",
-                "prompt": (
-                    "PRIVATE_PHASE4_PROMPT_BODY "
-                    "PRIVATE_PHASE4_FEEDBACK "
-                    "PRIVATE_PHASE4_PROVIDER_RESPONSE"
-                ),
+                "prompt": "PRIVATE_PHASE4_PROMPT_BODY",
             },
             {"id": "review", "command": "review", "depends_on": ["draft"]},
         ],
@@ -374,6 +372,30 @@ def test_phase4_compilation_diagnostics_reach_show_validate_doctor_and_detail(
         ):
             assert private_value not in output
 
+    diagnostics = shown["compilation"]
+    assert isinstance(diagnostics, Mapping)
+    expected_text = (
+        f"Dependencies ({len(diagnostics['dependencies'])}):",
+        f"Sources and precedence ({len(diagnostics['sources'])}):",
+        (
+            "Expansion: "
+            f"dependencies={diagnostics['counts']['dependency_packages']} "
+            f"expanded_nodes={diagnostics['counts']['expanded_nodes']} "
+            f"expanded_edges={diagnostics['counts']['expanded_edges']} "
+            f"include_depth={diagnostics['include_depth']}"
+        ),
+        f"Ignored child policies ({len(diagnostics['ignored_policies'])}):",
+        f"Logical node origins ({len(diagnostics['node_origins'])}):",
+        f"Logical resource origins ({len(diagnostics['resource_origins'])}):",
+        f"Per-origin risks ({len(diagnostics['origin_risks'])}):",
+        "Diagnostics truncated: false",
+        '"workflow_name":"surface-child"',
+        '"catalog_source":"profile"',
+    )
+    for output in text_outputs:
+        for fragment in expected_text:
+            assert fragment in output
+
 
 def test_paused_signal_has_one_backend_action_contract_across_every_surface(
     tmp_path,
@@ -513,6 +535,29 @@ def test_paused_signal_has_one_backend_action_contract_across_every_surface(
     assert gateway_conflict["error"] == "version_conflict"
     assert _run_facts(gateway_conflict["current"]) == expected
 
+    gateway_wrong_interaction = json.loads(
+        workflow_gateway_command(
+            " ".join((
+                "provide-input",
+                run_id,
+                "--interaction-id",
+                f"{pending['interaction_id']}-wrong",
+                "--expected-version",
+                str(current["state_version"]),
+                "--value",
+                "wrong-interaction",
+            )),
+            invocation,
+            hermes_home=home,
+        )
+    )
+    assert gateway_wrong_interaction["ok"] is False
+    assert gateway_wrong_interaction["error"] == "invalid_transition"
+    assert gateway_wrong_interaction["message"] == (
+        "workflow input transition is invalid"
+    )
+    assert _run_facts(gateway_wrong_interaction["current"]) == expected
+
     gateway_applied = json.loads(
         workflow_gateway_command(
             " ".join((
@@ -523,7 +568,7 @@ def test_paused_signal_has_one_backend_action_contract_across_every_surface(
                 "--expected-version",
                 str(current["state_version"]),
                 "--value",
-                "continue",
+                _PRIVATE_PHASE4_FEEDBACK,
             )),
             invocation,
             hermes_home=home,
@@ -533,10 +578,71 @@ def test_paused_signal_has_one_backend_action_contract_across_every_surface(
     assert gateway_applied["result"]["action"] == "provide-input"
     assert captured[-1] == {
         "run_id": run_id,
-        "value": "continue",
+        "value": _PRIVATE_PHASE4_FEEDBACK,
         "expected_state_version": current["state_version"],
         "interaction_id": pending["interaction_id"],
         "actor": invocation.principal,
         "channel": "gateway",
         "operator_scope": invocation.operator_scope,
     }
+
+    updated = store.get_run_status(run_id, operator_scope=operator_scope)
+    gateway_wrong_state = json.loads(
+        workflow_gateway_command(
+            " ".join((
+                "provide-input",
+                run_id,
+                "--interaction-id",
+                str(pending["interaction_id"]),
+                "--expected-version",
+                str(updated["state_version"]),
+                "--value",
+                "wrong-state",
+            )),
+            invocation,
+            hermes_home=home,
+        )
+    )
+    assert gateway_wrong_state["ok"] is False
+    assert gateway_wrong_state["error"] == "invalid_transition"
+    assert gateway_wrong_state["message"] == "workflow input transition is invalid"
+    assert gateway_wrong_state["current"]["run_id"] == run_id
+    assert gateway_wrong_state["current"]["state_version"] == updated["state_version"]
+    assert gateway_wrong_state["current"]["next_actions"] == updated["next_actions"]
+
+    updated_cli = _cli_status(home, run_id, capsys)
+    with TestClient(_app(module.router)) as client:
+        updated_rest = client.get(f"/api/plugins/workflow/runs/{run_id}")
+        updated_attention = client.get("/api/plugins/workflow/attention")
+    assert updated_rest.status_code == 200
+    assert updated_attention.status_code == 200
+    updated_notifications = NotificationOutbox(store).history(run_id=run_id)
+    updated_evidence = EvidenceReader(store).query(
+        run_id,
+        kind="interactions",
+        operator_scope=operator_scope,
+    )
+
+    public_surfaces = (
+        current,
+        cli_status,
+        rest_status.json(),
+        conflict.json()["detail"]["current"],
+        attention.json(),
+        notification,
+        evidence,
+        gateway_conflict,
+        gateway_wrong_interaction,
+        gateway_applied,
+        updated,
+        updated_cli,
+        updated_rest.json(),
+        updated_attention.json(),
+        updated_notifications,
+        updated_evidence,
+        gateway_wrong_state,
+    )
+    for surface in public_surfaces:
+        encoded = json.dumps(surface, sort_keys=True)
+        assert _PRIVATE_PHASE4_FEEDBACK not in encoded
+        assert _PRIVATE_PHASE4_PROVIDER_RESPONSE.decode().strip() not in encoded

@@ -233,6 +233,20 @@ def workflow_gateway_command(
                         },
                         sort_keys=True,
                     )
+                except ValueError:
+                    current = store.get_run_status(
+                        args.run_id,
+                        operator_scope=invocation.operator_scope,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "invalid_transition",
+                            "message": "workflow input transition is invalid",
+                            "current": public_run_projection(current),
+                        },
+                        sort_keys=True,
+                    )
                 result = {
                     "action": args.action,
                     **public_run_projection(updated),

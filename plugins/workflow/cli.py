@@ -117,6 +117,7 @@ _MACHINE_COMMAND: ContextVar[str] = ContextVar(
 )
 _BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
 _DOCTOR_TEXT_FINDINGS_MAX = 200
+_COMPILATION_TEXT_ITEMS_MAX = 200
 _DOCTOR_ABSOLUTE_PATH_START = re.compile(
     r"(?:[A-Za-z]:[\\/]|\\\\|(?<![A-Za-z0-9_:/-])/)"
 )
@@ -683,6 +684,63 @@ def compilation_diagnostics(
     return sanitized
 
 
+def _compilation_text_items(
+    diagnostics: Mapping[str, object], key: str
+) -> list[object]:
+    value = diagnostics.get(key)
+    if not isinstance(value, list | tuple):
+        return []
+    return list(value[:_COMPILATION_TEXT_ITEMS_MAX])
+
+
+def _compilation_text_json(value: object) -> str:
+    return json.dumps(
+        sanitize_projection(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _print_compilation_diagnostics(diagnostics: Mapping[str, object]) -> None:
+    """Render the bounded machine projection without source or runtime bodies."""
+    print(
+        "Compilation: "
+        f"profile={diagnostics['effective_profile']} "
+        f"normalizer={diagnostics['normalizer_version']} "
+        f"snapshot={diagnostics['snapshot_format_version']} "
+        f"manifest={diagnostics['dependency_manifest_schema_version']}"
+    )
+    print(f"Composite digest: {diagnostics['composite_digest']}")
+    counts = diagnostics.get("counts")
+    if not isinstance(counts, Mapping):
+        counts = {}
+    print(
+        "Expansion: "
+        f"dependencies={counts.get('dependency_packages', 0)} "
+        f"expanded_nodes={counts.get('expanded_nodes', 0)} "
+        f"expanded_edges={counts.get('expanded_edges', 0)} "
+        f"include_depth={diagnostics.get('include_depth', 0)}"
+    )
+    sections = (
+        ("Dependencies", "dependencies"),
+        ("Sources and precedence", "sources"),
+        ("Ignored child policies", "ignored_policies"),
+        ("Logical node origins", "node_origins"),
+        ("Logical resource origins", "resource_origins"),
+        ("Per-origin risks", "origin_risks"),
+    )
+    for title, key in sections:
+        items = _compilation_text_items(diagnostics, key)
+        print(f"{title} ({len(items)}):")
+        for item in items:
+            print(f"- {_compilation_text_json(item)}")
+    print(
+        "Diagnostics truncated: "
+        f"{'true' if diagnostics.get('truncated') is True else 'false'}"
+    )
+
+
 def _json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Emit stable JSON output")
 
@@ -1104,13 +1162,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Compatibility: {detail['compatibility']['level']}")
     diagnostics = detail.get("compilation")
     if isinstance(diagnostics, Mapping):
-        print(
-            "Compilation: "
-            f"normalizer={diagnostics['normalizer_version']} "
-            f"snapshot={diagnostics['snapshot_format_version']} "
-            f"manifest={diagnostics['dependency_manifest_schema_version']}"
-        )
-        print(f"Composite digest: {diagnostics['composite_digest']}")
+        _print_compilation_diagnostics(diagnostics)
     selector = args.topology or "text"
     if selector in {"text", "both"}:
         print(f"Topology: {detail['topology_text']}")
@@ -1223,13 +1275,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         print(f"Language: {payload['language']['effective_profile']}")
         diagnostics = payload.get("compilation")
         if isinstance(diagnostics, Mapping):
-            print(
-                "Compilation: "
-                f"normalizer={diagnostics['normalizer_version']} "
-                f"snapshot={diagnostics['snapshot_format_version']} "
-                f"manifest={diagnostics['dependency_manifest_schema_version']}"
-            )
-            print(f"Composite digest: {diagnostics['composite_digest']}")
+            _print_compilation_diagnostics(diagnostics)
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
     return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
@@ -1907,13 +1953,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"Language: {payload['language']['effective_profile']}")
         diagnostics = payload.get("compilation")
         if isinstance(diagnostics, Mapping):
-            print(
-                "Compilation: "
-                f"normalizer={diagnostics['normalizer_version']} "
-                f"snapshot={diagnostics['snapshot_format_version']} "
-                f"manifest={diagnostics['dependency_manifest_schema_version']}"
-            )
-            print(f"Composite digest: {diagnostics['composite_digest']}")
+            _print_compilation_diagnostics(diagnostics)
         print(
             f"Execution environment: {payload['risk_summary']['execution_environment']}"
         )

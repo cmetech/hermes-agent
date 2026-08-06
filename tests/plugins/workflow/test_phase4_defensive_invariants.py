@@ -17,6 +17,8 @@ from plugins.workflow.dependency_manifest import WorkflowDependencyManifest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.models import LoopSignalConfirmation, WorkflowValidationError
+from plugins.workflow.evidence import EvidenceReader
+from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import ArtifactRef, RunStore
@@ -82,11 +84,7 @@ def test_phase4_diagnostics_defensively_hide_private_source_and_runtime_values(
         nodes=[
             {
                 "id": "draft",
-                "prompt": (
-                    "DEFENSIVE_PRIVATE_PROMPT_BODY "
-                    "DEFENSIVE_PRIVATE_FEEDBACK "
-                    "DEFENSIVE_PRIVATE_PROVIDER_RESPONSE"
-                ),
+                "prompt": "DEFENSIVE_PRIVATE_PROMPT_BODY",
             },
             {"id": "review", "command": "review", "depends_on": ["draft"]},
         ],
@@ -152,9 +150,7 @@ def test_phase4_diagnostics_defensively_hide_private_source_and_runtime_values(
             str(tmp_path),
             "DEFENSIVE_PRIVATE_PROMPT_BODY",
             "DEFENSIVE_PRIVATE_COMMAND_BODY",
-            "DEFENSIVE_PRIVATE_FEEDBACK",
             "DEFENSIVE_PRIVATE_SECRET_VALUE",
-            "DEFENSIVE_PRIVATE_PROVIDER_RESPONSE",
         ):
             assert private_value not in output
 
@@ -166,6 +162,7 @@ def _defensive_signal_pause(
     key: str,
     iteration: int = 1,
     maximum: int = 2,
+    result: bytes = b"defensive cleaned result\n",
 ):
     store = RunStore(tmp_path / "signal-home", max_executing_runs=20)
     package = load_workflow(
@@ -192,7 +189,6 @@ def _defensive_signal_pause(
     claim = store.claim_node(admitted.run_id, "refine", f"worker-{key}")
     assert claim is not None
     store.mark_node_started(claim)
-    result = b"defensive cleaned result\n"
     digest = hashlib.sha256(result).hexdigest()
     relative = (
         Path("nodes") / "refine" / claim.attempt_id / "iteration-output.txt"
@@ -221,6 +217,49 @@ def _defensive_signal_pause(
         },
     )
     return store, admitted.run_id, pending
+
+
+def test_public_projections_hide_authentic_loop_feedback_and_provider_result(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    """Catch real stored runtime bodies crossing metadata-only projections."""
+    feedback = "DEFENSIVE_PRIVATE_FEEDBACK"
+    provider_result = b"DEFENSIVE_PRIVATE_PROVIDER_RESPONSE\n"
+    store, run_id, pending = _defensive_signal_pause(
+        tmp_path,
+        workflow_writer,
+        key="private-runtime-values",
+        result=provider_result,
+    )
+    paused = store.get_run_status(run_id)
+    result_path = store.run_directory(run_id) / str(pending["result_artifact"])
+    assert result_path.read_bytes() == provider_result
+
+    before = (
+        paused,
+        NotificationOutbox(store).history(run_id=run_id),
+        EvidenceReader(store).query(run_id, kind="interactions"),
+    )
+    store.provide_loop_input(
+        run_id,
+        feedback,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    internal = store.load_run(run_id)
+    feedback_path = internal["nodes"]["refine"]["loop_user_input_artifact"]
+    assert (store.run_directory(run_id) / feedback_path).read_text() == feedback
+    after = (
+        store.get_run_status(run_id),
+        NotificationOutbox(store).history(run_id=run_id),
+        EvidenceReader(store).query(run_id, kind="interactions"),
+    )
+
+    for public_projection in (*before, *after):
+        encoded = json.dumps(public_projection, sort_keys=True)
+        assert feedback not in encoded
+        assert provider_result.decode().strip() not in encoded
 
 
 class _CountedSignalRunner:
