@@ -53,6 +53,7 @@ from plugins.workflow.language import (
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
+from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
@@ -1038,7 +1039,17 @@ class RunScheduler:
 
     def _reconcile_recorded_loop_decision(self, run_id: str) -> bool:
         """Publish one authenticated v4 decision without replaying its provider."""
-        authority = self.store.recorded_loop_decision(run_id)
+        authority = self.store.recorded_loop_decision(
+            run_id,
+            recovery_owner_id=self.owner_id,
+            now=LeaseClockSample(
+                self._utcnow(),
+                self._monotonic(),
+                self.store._lease_clock().boot_id,
+            ),
+            lease_seconds=self.lease_seconds,
+            execution_fence=self.execution_fence,
+        )
         if authority is None:
             return self.store.reconcile_recorded_loop_signal(run_id)
         projection = self.store.load_run(run_id)
@@ -1108,6 +1119,16 @@ class RunScheduler:
             variables = replace(
                 variables,
                 loop_prev_output=data.decode("utf-8"),
+                loop_user_input=(
+                    self._authenticated_loop_input(
+                        run_id,
+                        projection,
+                        node_id=node.id,
+                        relative_path=str(decision["feedback_artifact"]),
+                    )
+                    if decision.get("feedback_artifact") is not None
+                    else None
+                ),
             )
             bash_node = WorkflowNode(
                 id=node.id,

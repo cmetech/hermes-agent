@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import threading
 
 import pytest
 
@@ -149,6 +150,39 @@ def _phase4_signal_run(
     return home, store, admitted.run_id
 
 
+def _expired_loop_recovery_scheduler(
+    home,
+    run_id: str,
+    *,
+    agent_runner,
+) -> RunScheduler:
+    restarted = RunStore(home)
+    projection = restarted.load_run(run_id)
+    claims = [
+        node["claim"]
+        for node in projection.get("nodes", {}).values()
+        if isinstance(node, dict)
+        and isinstance(node.get("loop_state"), dict)
+        and node["loop_state"].get("_pending_loop_decision") is not None
+        and isinstance(node.get("claim"), dict)
+    ]
+    if not claims:
+        return RunScheduler(restarted, agent_runner=agent_runner)
+    assert len(claims) == 1
+    claim = claims[0]
+    lease_seconds = float(claim["lease_seconds"])
+    expired_utc = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    expired_monotonic = float(claim["heartbeat_monotonic"]) + lease_seconds + 1
+    return RunScheduler(
+        restarted,
+        agent_runner=agent_runner,
+        utcnow=lambda: expired_utc,
+        monotonic=lambda: expired_monotonic,
+    )
+
+
 @pytest.mark.parametrize(
     (
         "case",
@@ -232,11 +266,13 @@ def test_restart_publishes_every_recorded_v4_loop_decision_without_provider_repl
         def run(self, *_args, **_kwargs):
             pytest.fail("restart replayed a recorded loop provider result")
 
-    restarted = RunStore(home)
-    recovered = RunScheduler(
-        restarted,
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
         agent_runner=NoReplayRunner(),
-    ).advance(run_id)
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
 
     assert recovered["status"] == expected_status
     assert len(recovered["artifacts"]) == 1
@@ -314,8 +350,9 @@ def test_concurrent_restart_publishes_recorded_loop_decision_once(
             pytest.fail("concurrent recovery replayed the loop provider")
 
     def recover() -> str:
-        recovered = RunScheduler(
-            RunStore(home),
+        recovered = _expired_loop_recovery_scheduler(
+            home,
+            run_id,
             agent_runner=NoReplayRunner(),
         ).advance(run_id)
         return str(recovered["status"])
@@ -327,6 +364,74 @@ def test_concurrent_restart_publishes_recorded_loop_decision_once(
     assert len(runner.requests) == 1
     events = RunStore(home).tail_events(run_id)
     assert sum(event["event_type"] == "node_succeeded" for event in events) == 1
+
+
+def test_fresh_recorded_loop_decision_cannot_be_taken_over_from_live_executor(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/live-predicate"; exit 1',
+        },
+    )
+    original_runner = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+    iteration_recorded = threading.Event()
+    release_original = threading.Event()
+
+    def block_live_executor_after_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        iteration_recorded.set()
+        assert release_original.wait(timeout=10)
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        block_live_executor_after_record,
+    )
+    original_scheduler = RunScheduler(store, agent_runner=original_runner)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        original = pool.submit(original_scheduler.advance, run_id)
+        assert iteration_recorded.wait(timeout=10)
+        before = store.load_run(run_id)
+        attempt_id = before["nodes"]["refine"]["claim"]["attempt_id"]
+        takeover_runner = _CountedLoopRunner("must not run")
+        try:
+            observed = RunScheduler(
+                RunStore(home),
+                agent_runner=takeover_runner,
+            ).advance(run_id)
+
+            assert observed["status"] == "running"
+            assert observed["nodes"]["refine"]["claim"]["attempt_id"] == attempt_id
+            assert takeover_runner.requests == []
+            assert not (
+                store.run_directory(run_id) / "artifacts" / "live-predicate"
+            ).exists()
+            assert not any(
+                event["event_type"]
+                in {
+                    "loop_predicate_recovery_prepared",
+                    "loop_decision_recorded",
+                    "loop_continuation_recovered",
+                    "node_paused",
+                    "node_succeeded",
+                }
+                for event in store.tail_events(run_id)
+            )
+        finally:
+            release_original.set()
+        completed = original.result(timeout=10)
+
+    assert completed["status"] == "paused"
+    assert (
+        store.run_directory(run_id) / "artifacts" / "live-predicate"
+    ).read_bytes() == b"x"
+    assert len(original_runner.requests) == 1
 
 
 def test_restart_preserves_typed_loop_publication_attempt_authority(
@@ -352,8 +457,9 @@ def test_restart_preserves_typed_loop_publication_attempt_authority(
         RunScheduler(store, agent_runner=runner).advance(run_id)
 
     recovery_runner = _CountedLoopRunner("must not run")
-    recovered = RunScheduler(
-        RunStore(home),
+    recovered = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
         agent_runner=recovery_runner,
     ).advance(run_id)
 
@@ -391,14 +497,21 @@ def test_restart_continues_after_recorded_noninteractive_iteration_without_repla
         RunScheduler(store, agent_runner=first).advance(run_id)
 
     second = _CountedLoopRunner("refined <promise>DONE</promise>")
-    scheduler = RunScheduler(RunStore(home), agent_runner=second)
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=second,
+    )
     recovered = scheduler.advance(run_id)
 
     assert recovered["status"] == "running"
     assert recovered["nodes"]["refine"]["state"] == "ready"
     assert len(second.requests) == 0
 
-    completed = scheduler.advance(run_id)
+    completed = RunScheduler(
+        scheduler.store,
+        agent_runner=second,
+    ).advance(run_id)
 
     assert completed["status"] == "succeeded"
     assert len(first.requests) == 1
@@ -438,11 +551,13 @@ def test_restart_reconciles_until_bash_crash_window_without_provider_replay(
         def run(self, *_args, **_kwargs):
             pytest.fail("predicate recovery replayed the loop provider")
 
-    restarted = RunStore(home)
-    recovered = RunScheduler(
-        restarted,
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
         agent_runner=NoReplayRunner(),
-    ).advance(run_id)
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
 
     assert recovered["status"] == "succeeded"
     assert counter.read_bytes() == (b"x" if crash_after_final_decision else b"xx")
@@ -453,6 +568,144 @@ def test_restart_reconciles_until_bash_crash_window_without_provider_replay(
         if event["event_type"] == "loop_predicate_recovery_prepared"
     ]
     assert len(recovery_events) == (0 if crash_after_final_decision else 1)
+
+
+def test_until_bash_recovery_authenticates_one_shot_feedback_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": "test $LOOP_USER_INPUT = 'accept predicate'",
+        },
+    )
+    first = RunScheduler(
+        store,
+        agent_runner=_CountedLoopRunner("draft"),
+    ).advance(run_id)
+    pending = first["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == "loop_input"
+    ready = store.provide_loop_input(
+        run_id,
+        "accept predicate",
+        expected_state_version=first["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    feedback_path = ready["nodes"]["refine"]["loop_user_input_artifact"]
+    second_runner = _CountedLoopRunner("refined")
+    original_record = store.record_loop_iteration
+
+    def crash_after_second_iteration(*args, **kwargs):
+        original_record(*args, **kwargs)
+        if kwargs["loop_state"]["iteration"] == 2:
+            raise SystemExit("simulated loss before feedback predicate")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_second_iteration,
+    )
+    with pytest.raises(SystemExit, match="before feedback predicate"):
+        RunScheduler(store, agent_runner=second_runner).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    assert recorded["nodes"]["refine"]["loop_user_input_artifact"] == feedback_path
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("feedback predicate recovery replayed the provider")
+
+    recovered = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["loop_state"]["completed_by"] == (
+        "until_bash"
+    )
+    assert recovered["nodes"]["refine"].get("loop_user_input_artifact") is None
+    assert len(second_runner.requests) == 1
+
+
+@pytest.mark.parametrize("mutation", ("same_size_digest", "symlink"))
+def test_until_bash_recovery_rejects_changed_feedback_before_predicate_dispatch(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": (
+                'printf x >> "$ARTIFACTS_DIR/feedback-predicate-count"; '
+                "test $LOOP_USER_INPUT = 'accept predicate'"
+            ),
+        },
+    )
+    first = RunScheduler(
+        store,
+        agent_runner=_CountedLoopRunner("draft"),
+    ).advance(run_id)
+    ready = store.provide_loop_input(
+        run_id,
+        "accept predicate",
+        expected_state_version=first["state_version"],
+        interaction_id=first["nodes"]["refine"]["pending_interaction"][
+            "interaction_id"
+        ],
+    )
+    relative_path = ready["nodes"]["refine"]["loop_user_input_artifact"]
+    original_record = store.record_loop_iteration
+
+    def crash_after_second_iteration(*args, **kwargs):
+        original_record(*args, **kwargs)
+        if kwargs["loop_state"]["iteration"] == 2:
+            raise SystemExit("simulated loss before feedback predicate")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_second_iteration,
+    )
+    with pytest.raises(SystemExit, match="before feedback predicate"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("refined"),
+        ).advance(run_id)
+
+    feedback_path = store.run_directory(run_id) / relative_path
+    if mutation == "same_size_digest":
+        feedback_path.write_text("reject predicate", encoding="utf-8")
+    else:
+        replacement = tmp_path / "foreign-feedback.txt"
+        replacement.write_text("accept predicate", encoding="utf-8")
+        feedback_path.unlink()
+        feedback_path.symlink_to(replacement)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("changed feedback recovery replayed the provider")
+
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    )
+    with pytest.raises(JournalRecoveryError, match="loop feedback"):
+        scheduler.advance(run_id)
+
+    predicate_count = (
+        store.run_directory(run_id) / "artifacts" / "feedback-predicate-count"
+    )
+    assert predicate_count.read_bytes() == b"x"
+    assert "accept predicate" not in json.dumps(store.tail_events(run_id))
 
 
 def test_restart_publishes_journaled_loop_signal_without_provider_replay(
@@ -484,11 +737,13 @@ def test_restart_publishes_journaled_loop_signal_without_provider_replay(
         def run(self, *_args, **_kwargs):
             pytest.fail("restart replayed a journaled provider result")
 
-    restarted = RunStore(home)
-    recovered = RunScheduler(
-        restarted,
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
         agent_runner=NoReplayRunner(),
-    ).advance(run_id)
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
 
     assert recovered["status"] == "paused"
     pending = recovered["nodes"]["refine"]["pending_interaction"]

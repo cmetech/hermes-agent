@@ -136,6 +136,79 @@ Every Python test command used `scripts/run_tests.sh`.
 - `git diff --check`: passed.
 - `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
 
+## Review convergence: fix round 2 of 5
+
+Status: DONE
+
+The second external review found two crash-recovery gaps. Both were reproduced
+through the authentic scheduler/store path before production edits.
+
+### Durable recovery ownership
+
+A scheduler no longer treats the mere presence of a recorded loop decision as
+takeover authority. Recovery now reuses the existing durable worker-claim row and
+per-run/admission locks. The store permits a transactional recovery-claim CAS only
+after the original lease is expired (or its coordinator fence is durably
+superseded) and the attempt has stopped/not-started evidence. The CAS transfers the
+existing claim owner and lease to one recoverer, records bounded takeover history,
+and returns authority only to that winner while its lease is fresh.
+
+The original worker's loop-decision, process-spawn, and terminal-publication paths
+also compare the active owner, not only the immutable attempt ID, so a worker that
+resumes after losing its lease cannot publish over the recovery winner. Concurrent
+recoverers retain exactly-once publication and can recover another failed recovery
+only after its transferred lease expires and its predicate process is proven
+stopped.
+
+### Feedback-bound pending predicates
+
+When an `until_bash` decision is pending, the exact one-shot feedback descriptor is
+now bound into the private decision by relative path, bounded byte size, and
+SHA-256. The store authenticates the unique projected `text/plain` descriptor and
+opens it through the descriptor-relative no-follow reader before the iteration is
+journaled, again before recovery authority is granted, and again before the
+predicate is dispatched. Recovery restores both authenticated `LOOP_PREV_OUTPUT`
+and `LOOP_USER_INPUT`.
+
+The node retains `loop_user_input_artifact` while the predicate outcome is pending.
+It is removed only in the same compare-and-set journal transition that records the
+final predicate decision. Feedback bodies remain absent from events, recovery
+history, and public evidence.
+
+### Fix-round TDD evidence
+
+1. Fresh live-executor takeover:
+   - RED: the second scheduler changed the live run from `running` to `paused` and
+     reconciled the pending predicate while the original scheduler was blocked
+     immediately after `record_loop_iteration` returned.
+   - GREEN: the second scheduler leaves the original claim and run untouched, makes
+     zero provider calls, and performs no predicate/recovery/terminal transition.
+2. Feedback-dependent predicate recovery:
+   - RED: `record_loop_iteration` removed `loop_user_input_artifact`, producing a
+     `KeyError` before recovery could restore the accepted feedback.
+   - GREEN: after an expired-lease restart, iteration two completes by
+     `until_bash` with zero provider replay and the descriptor is cleared only after
+     the final decision is durable.
+3. Feedback integrity:
+   - Same-size content substitution and a same-content symbolic link are both
+     rejected before predicate dispatch. The predicate counter remains unchanged
+     and feedback text is absent from journal events.
+
+### Fix-round final verification
+
+- Complete crash-recovery file: 48 passed, 0 failed.
+- Mandatory Task 9 eight-file gate: 220 passed, 0 failed.
+  - v4 loops 56; loop executor 21; interactions 28; defensive invariants 14;
+    crash recovery 48; shutdown recovery 5; parallel scheduler 19; evidence API 29.
+- Required Task 8 broad action/store gate: 74 passed, 0 failed.
+- Direct approval/store regression gate: 35 passed, 0 failed.
+- Explicit v1-v3 compatibility subset: 7 passed, 0 failed.
+- Ruff on all touched Python files: passed.
+- `git diff --check`: passed.
+- `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` remains `3`.
+- Normalizer v4 activation, Task 10 diagnostics, and security-review scope remain
+  untouched.
+
 ## Self-review and concerns
 
 - No normalizer activation, Task 10 diagnostics, public action/wire surface, core
