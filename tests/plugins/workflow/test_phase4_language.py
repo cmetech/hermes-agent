@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
     make_language_snapshot,
     read_language_snapshot,
     supports_phase3_semantics,
@@ -30,6 +31,31 @@ def test_archon_capabilities_are_cumulative(version, structured, phase3, phase4)
     assert supports_structured_outputs(profile, version) is structured
     assert supports_phase3_semantics(profile, version) is phase3
     assert supports_phase4_semantics(profile, version) is phase4
+
+
+@pytest.mark.parametrize("profile", (None, "hermes-legacy"))
+def test_explicit_v4_is_rejected_for_unversioned_and_legacy_workflows(
+    tmp_path, workflow_writer, profile
+) -> None:
+    """Catch a non-Archon workflow being admitted with v4 capabilities."""
+    path = workflow_writer(tmp_path / str(profile or "unversioned"))
+    sidecar = None
+    if profile is not None:
+        sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
+        sidecar_path.write_text(
+            f"language_compatibility: {profile}\n", encoding="utf-8"
+        )
+        sidecar = sidecar_path.read_bytes()
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        load_workflow_snapshot(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=sidecar,
+            normalizer_version=4,
+        )
+
+    assert exc.value.code == "workflow_normalizer_version_unsupported"
 
 
 def test_explicit_v4_preserves_phase3_normalized_behavior(

@@ -866,15 +866,12 @@ PHASE3_DURABLE_CODES = (
 PHASE4_DURABLE_CODES: tuple[DurableWorkflowCode, ...] = ()
 
 
-def validate_durable_code_emitters(
-    codes: Iterable[DurableWorkflowCode], *, emitted_codes: set[str]
-) -> None:
-    """Reject registered durable failures without executable behavior coverage."""
-    missing = sorted({code.code for code in codes} - emitted_codes)
-    if missing:
-        raise RuntimeError(
-            "durable workflow codes lack executable emitters: " + ", ".join(missing)
-        )
+def phase4_durable_code_catalog() -> Mapping[str, DurableWorkflowCode]:
+    """Expose the real Phase 4 durable registrations for behavior coverage."""
+    catalog = {code.code: code for code in PHASE4_DURABLE_CODES}
+    if len(catalog) != len(PHASE4_DURABLE_CODES):
+        raise RuntimeError("Phase 4 durable codes must be unique")
+    return MappingProxyType(catalog)
 
 
 def _compatibility(
