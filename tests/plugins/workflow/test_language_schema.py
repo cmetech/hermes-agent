@@ -132,11 +132,16 @@ def test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices():
     current = workflow_authoring_contract(profile)
     phase4 = workflow_authoring_contract(profile, normalizer_version=4)
 
+    current_items = current["definition_schema"]["properties"]["nodes"]["items"]
     phase4_variants = phase4["definition_schema"]["properties"]["nodes"][
         "items"
     ]["oneOf"]
     assert current["normalizer_version"] == 3
     assert phase4["normalizer_version"] == 4
+    assert "include" not in current_items["properties"]
+    assert not any(
+        "include" in variant["required"] for variant in current_items["oneOf"]
+    )
     include = next(
         variant for variant in phase4_variants if "include" in variant["required"]
     )

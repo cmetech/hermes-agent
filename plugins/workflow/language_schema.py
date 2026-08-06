@@ -2403,7 +2403,11 @@ def _nodes_schema(
     normalizer_version: int | None = None,
 ) -> dict[str, Any]:
     selected_version = _authoring_normalizer_version(profile, normalizer_version)
-    specs = (*_specs("node"), *SOURCE_DIRECTIVE_INVENTORY)
+    phase4 = supports_phase4_semantics(profile, selected_version)
+    specs = (
+        *_specs("node"),
+        *(SOURCE_DIRECTIVE_INVENTORY if phase4 else ()),
+    )
     union_properties = {
         spec.yaml_name: _field_schema(
             spec,
@@ -2413,7 +2417,7 @@ def _nodes_schema(
         for spec in specs
     }
     variants = []
-    for node_type in SOURCE_NODE_TYPES:
+    for node_type in SOURCE_NODE_TYPES if phase4 else EXECUTABLE_NODE_TYPES:
         properties = {
             spec.yaml_name: True
             for spec in specs

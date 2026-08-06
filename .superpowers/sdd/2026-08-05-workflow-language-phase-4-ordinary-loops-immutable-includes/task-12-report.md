@@ -186,3 +186,69 @@ skills, and capability descriptors are present.
   not change website dependencies or the lockfile.
 - No scoped production, security, or compatibility concern remains. Task 13 security
   review and Task 14 v4 activation were intentionally not performed.
+
+## Fix round 1 — keep the Phase 4 schema staged
+
+Status: DONE
+
+Review base: `bd38e52dc7957d6e554f6de1f7cd98e5ab19b454`
+
+### Finding addressed
+
+`_nodes_schema()` selected the requested normalizer but still appended
+`SOURCE_DIRECTIVE_INVENTORY` and iterated `SOURCE_NODE_TYPES` unconditionally. As a
+result, the default Archon contract truthfully reported normalizer 3 while its JSON
+Schema exposed the staged v4 `include` property and include-required variant. The
+initial Task 12 relationship test checked the explicit v4 shape but did not inspect the
+current v3 node union, so it could not catch that leak.
+
+Source-directive specs and variants now participate only when
+`supports_phase4_semantics(profile, selected_version)` is true. Versions 1–3 retain
+only the seven executable variants; explicit v4 receives the literal four-field
+include variant. Source parsing and compilation remain unchanged, and `include` stays
+absent from executable `NODE_TYPES`.
+
+### Strict TDD evidence
+
+1. RED before the production change:
+   - `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py`
+   - 627 passed / 1 failed.
+   - `test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices`
+     demonstrated that current v3 still contained `include` in the union properties.
+     The same test retained explicit-v4 exact-four-field presence as its control.
+2. GREEN after the minimal `_nodes_schema()` gate:
+   - the same command passed 628 / 628.
+3. Cross-suite stale-assumption correction:
+   - the first exact no-retry Step 4 rerun passed 216 and failed 1 because
+     `test_literal_include_is_a_source_directive_but_not_an_executable_kind` asked the
+     default v3 schema to validate Phase 4 syntax;
+   - the parent authorized the narrow test ownership expansion, and that one schema
+     request now passes `normalizer_version=4` while preserving every parser,
+     compile-directive, and executable-kind assertion;
+   - an initial indentation typo in that test edit caused collection to stop and is
+     not counted as behavioral RED/GREEN evidence. The corrected focused include file
+     passed 24 / 24 before the complete gate was rerun.
+
+### Final verification
+
+- Targeted language schema: 628 passed / 0 failed.
+- Exact Task 12 Step 1: 4 files, 642 passed / 0 failed.
+- Focused Phase 4 include file: 24 passed / 0 failed.
+- Exact Task 12 no-retry Step 4: 11 files, 217 passed / 0 failed.
+- Ruff on `plugins/workflow/language_schema.py`,
+  `tests/plugins/workflow/test_language_schema.py`, and
+  `tests/plugins/workflow/test_phase4_includes.py`: all checks passed.
+- Direct version probe: current Archon remains 3; explicit Archon versions 1–3 omit
+  both the include union property and include-required variant; explicit v4 publishes
+  the exact `id`, `include`, `depends_on`, `trigger_rule` variant.
+- `git diff --check`: passed.
+
+### Self-review and concerns
+
+- The gate uses the same profile/version predicate as Phase 4 loop field selection;
+  it does not duplicate the current-profile mapping or infer availability from syntax.
+- The default map remains v3, and no Task 13 security or Task 14 activation work is
+  included.
+- The regression derives literal expectations from the public contract envelope and
+  fails if either the union property or executable variant leaks again.
+- No scoped concern remains.

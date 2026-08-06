@@ -61,7 +61,10 @@ def test_literal_include_is_a_source_directive_but_not_an_executable_kind(
     )
     assert [node.node_type for node in root.nodes] == ["bash", "include"]
     Draft202012Validator(
-        definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+        definition_json_schema(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=4,
+        )
     ).validate(
         {
             "name": "root",
