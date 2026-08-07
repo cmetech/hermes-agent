@@ -27,8 +27,26 @@ from plugins.workflow.scheduler import (
     classify_failure,
     compute_retry_delay,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import (
+    load_workflow as _load_current_workflow,
+    load_workflow_snapshot,
+)
 from plugins.workflow.store import RunStore
+
+
+def load_workflow(path):
+    """Keep Archon retry fixtures on their recorded normalizer-v4 contract."""
+    workflow_path = Path(path)
+    sidecar_path = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+    sidecar_bytes = sidecar_path.read_bytes() if sidecar_path.exists() else None
+    if sidecar_bytes is not None and b"archon-2026-07" in sidecar_bytes:
+        return load_workflow_snapshot(
+            workflow_path,
+            workflow_bytes=workflow_path.read_bytes(),
+            sidecar_bytes=sidecar_bytes,
+            normalizer_version=4,
+        )
+    return _load_current_workflow(workflow_path)
 
 
 class _InlineAuthorityProvider(BaseHTTPRequestHandler):
