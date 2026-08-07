@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from agent.plugin_agent import PluginAgentRunResult
-from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
+from hermes_cli.runtime_provider import (
+    ExecutionRuntimeCapabilities,
+    classify_execution_runtime,
+)
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.coordinator import WorkflowCoordinatorService
@@ -90,6 +94,23 @@ def _binding(
     runtime_mode: str = "chat_completions",
     real_runner: object | None = None,
 ) -> WorkflowRunnerBinding:
+    model_config = {
+        "provider": "openrouter",
+        "default": "openai/gpt-5.4",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    runtime_capabilities = (
+        classify_execution_runtime(
+            provider="openrouter",
+            model_config=model_config,
+            provider_config={"base_url": "https://openrouter.ai/api/v1"},
+        )
+        if runtime_mode == "chat_completions"
+        else ExecutionRuntimeCapabilities(
+            api_mode=runtime_mode,
+            hermes_managed_tool_loop=False,
+        )
+    )
     return WorkflowRunnerBinding(
         real_runner=real_runner or object(),
         deterministic_runner=object(),
@@ -97,10 +118,8 @@ def _binding(
             starts_request_mcp=runner_capable,
         ),
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
-        runtime_capabilities=ExecutionRuntimeCapabilities(
-            api_mode=runtime_mode,
-            hermes_managed_tool_loop=runtime_mode != "codex_app_server",
-        ),
+        runtime_capabilities=runtime_capabilities,
+        model_config_snapshot=parse_workflow_model_config({"model": model_config}),
     )
 
 

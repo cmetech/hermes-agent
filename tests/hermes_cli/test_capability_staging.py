@@ -285,7 +285,7 @@ def test_complete_package_swap_is_atomic_and_distribution_trust_is_digest_bound(
     assert trust["records"][digest]["actor"] == "trusted_distribution"
 
 
-def test_trusted_distribution_stages_and_trusts_phase4_composite_digest(
+def test_trusted_distribution_stages_and_trusts_current_composite_digest(
     tmp_path,
     home,
     fake_config,
@@ -308,7 +308,7 @@ def test_trusted_distribution_stages_and_trusts_phase4_composite_digest(
     compilation = compile_workflow(
         source,
         WorkflowCatalogSnapshot.capture((source,)),
-        normalizer_version=4,
+        normalizer_version=5,
     )
     (package_root / "digests.json").write_text(
         json.dumps({

@@ -30,7 +30,7 @@ from plugins.workflow.coordinator_store import (
     install_coordinator_schema,
 )
 from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.topology import sanitize_topology_label
 from plugins.workflow.trust import (
@@ -344,7 +344,19 @@ def test_workflow_compatibility_models_accept_real_producer_state_variants(
             path.with_name(f"{path.stem}.hermes.yaml").write_text(
                 yaml.safe_dump(sidecar), encoding="utf-8"
             )
-        report = assess_compatibility(load_workflow(path))
+        package = (
+            load_workflow_snapshot(
+                path,
+                workflow_bytes=path.read_bytes(),
+                sidecar_bytes=path.with_name(
+                    f"{path.stem}.hermes.yaml"
+                ).read_bytes(),
+                normalizer_version=4,
+            )
+            if sidecar is not None
+            else load_workflow(path)
+        )
+        report = assess_compatibility(package)
         projection = {
             "level": report.level.value,
             "runnable": report.runnable,

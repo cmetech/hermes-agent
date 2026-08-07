@@ -19,7 +19,7 @@ from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     WorkflowOutputReferenceError,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
 from plugins.workflow.store import ArtifactRef, RunStore
 from plugins.workflow.models import WorkflowValidationError
@@ -260,7 +260,14 @@ def _start_archon_run(tmp_path, workflow_writer, *, name: str, nodes) -> tuple[R
     package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(package_path)
+    package = load_workflow_snapshot(
+        package_path,
+        workflow_bytes=package_path.read_bytes(),
+        sidecar_bytes=package_path.with_name(
+            f"{package_path.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / f"home-{name}")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(

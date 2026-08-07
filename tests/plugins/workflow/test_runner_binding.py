@@ -14,6 +14,7 @@ from hermes_cli.runtime_provider import (
     classify_execution_runtime,
     snapshot_configured_execution_routes,
 )
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
@@ -44,7 +45,7 @@ from plugins.workflow.models import ExecutionFence
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.trust import WorkflowResourceReadBudget
 from plugins.workflow.store import RunStore
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
@@ -208,6 +209,16 @@ def test_execution_context_seals_structured_output_decisions_into_identity(
     assert direct_context.identity_digest != prompt_context.identity_digest
 
 
+def _load_v4(path: Path):
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes() if sidecar.exists() else None,
+        normalizer_version=4,
+    )
+
+
 def _structured_package(home: Path, workflow_writer, *, name: str):
     path = workflow_writer(
         home / "workflows",
@@ -227,7 +238,7 @@ def _structured_package(home: Path, workflow_writer, *, name: str):
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    return load_workflow(path)
+    return _load_v4(path)
 
 
 def _structured_route_package(
@@ -246,10 +257,20 @@ def _structured_route_package(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    return load_workflow(path)
+    return _load_v4(path)
 
 
 def _runtime_binding(runtime, *, runtime_provider=None, configured_routes=None):
+    model_config = (
+        parse_workflow_model_config({
+            "model": {
+                "provider": runtime.effective_provider,
+                "default": runtime.model,
+            }
+        })
+        if runtime.effective_provider and runtime.model
+        else parse_workflow_model_config({})
+    )
     return WorkflowRunnerBinding(
         real_runner=object(),
         deterministic_runner=object(),
@@ -257,6 +278,7 @@ def _runtime_binding(runtime, *, runtime_provider=None, configured_routes=None):
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
         runtime_capabilities=runtime,
         configured_provider_routes=configured_routes or {},
+        model_config_snapshot=model_config,
         runtime_capabilities_provider=runtime_provider,
     )
 
@@ -359,7 +381,7 @@ def test_per_node_provider_overrides_seal_distinct_truthful_decisions(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v4(path)
     context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -408,7 +430,7 @@ def test_unknown_node_provider_override_is_unsupported_and_blocks(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v4(path)
     context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
