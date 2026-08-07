@@ -45,6 +45,33 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: desktop-workflow-lint-invariants
+  change_class: desktop-workflow-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/contrib/surfaces.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.tsx
+  owned_symbols:
+  - StatusbarControls and StatusbarBoundary import order
+  - WorkflowsView mounted and review generation lifecycle guard
+  - ReviewRunDialog request lifecycle guard
+  - TypedArtifactView download lifecycle guard
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.test.tsx
+  expected_commit_subject: 'fix(desktop): restore workflow lint baseline'
+  upstream_candidate: true
+  merge_guidance: Keep Desktop imports in canonical order. Retain the narrow
+    no-restricted-syntax exemptions only for workflow mount, request, and download
+    lifecycle refs; these refs guard asynchronous cleanup and are not mirrors of
+    nanostore values. Reactive callback reads must continue to use atom.get()
+    directly rather than expanding these exemptions.
+  removal_condition: Remove when upstream includes equivalent lint-clean workflow
+    lifecycle guards and canonical imports.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-model-settings-baseline-contracts
   change_class: desktop-test-generic
   owner: workflow-orchestration

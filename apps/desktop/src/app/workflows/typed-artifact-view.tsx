@@ -89,6 +89,7 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
   const [downloading, setDownloading] = useState<ActiveDownload | null>(null)
   const [selectedPublicationId, setSelectedPublicationId] = useState<null | string>(null)
 
+  // eslint-disable-next-line no-restricted-syntax -- download-lifetime cancellation guard, not an atom mirror
   useEffect(() => {
     setDownloadFeedback(null)
     setDownloading(null)

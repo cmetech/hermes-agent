@@ -416,6 +416,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const submitInFlight = useRef(false)
   const [idempotencyKey] = useState(() => globalThis.crypto.randomUUID())
 
+  // eslint-disable-next-line no-restricted-syntax -- request-lifetime cancellation guard, not an atom mirror
   useEffect(() => {
     active.current = true
     setDetail(null)
