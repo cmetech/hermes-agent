@@ -47,7 +47,7 @@ import types
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -1244,7 +1244,8 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        self._manager._hooks.setdefault(hook_name, []).append(callback)
+        with self._manager._hook_lock:
+            self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1265,7 +1266,8 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        with self._manager._hook_lock:
+            self._manager._middleware.setdefault(kind, []).append(callback)
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1320,6 +1322,24 @@ class PluginContext:
 # PluginManager
 # ---------------------------------------------------------------------------
 
+
+class _ScopedLifecycleRegistration:
+    """Opaque idempotent ownership handle for temporary callbacks."""
+
+    def __init__(self, manager: "PluginManager", token: object) -> None:
+        self._manager = manager
+        self._token = token
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._manager._close_scoped_lifecycle(self._token)
+
+
 class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
@@ -1327,6 +1347,10 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._hook_lock = threading.RLock()
+        self._scoped_lifecycle: Dict[
+            object, tuple[tuple[str, str, Callable], ...]
+        ] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -1404,8 +1428,10 @@ class PluginManager:
 
     def _clear_plugin_registries(self) -> None:
         self._plugins.clear()
-        self._hooks.clear()
-        self._middleware.clear()
+        with self._hook_lock:
+            self._hooks.clear()
+            self._middleware.clear()
+            self._scoped_lifecycle.clear()
         self._plugin_tool_names.clear()
         self._plugin_platform_names.clear()
         self._cli_commands.clear()
@@ -2193,6 +2219,53 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
+    def register_scoped_lifecycle(
+        self,
+        *,
+        hooks: Mapping[str, Collection[Callable]],
+        middleware: Mapping[str, Collection[Callable]],
+    ):
+        """Atomically register callbacks owned by one opaque removable token."""
+        if not isinstance(hooks, Mapping) or not isinstance(middleware, Mapping):
+            raise TypeError("scoped lifecycle callbacks must be mappings")
+        entries: list[tuple[str, str, Callable]] = []
+        for kind, values, valid in (
+            ("hook", hooks, VALID_HOOKS),
+            ("middleware", middleware, VALID_MIDDLEWARE),
+        ):
+            for name, callbacks in values.items():
+                if name not in valid:
+                    raise ValueError(f"unknown scoped {kind}: {name}")
+                if not isinstance(callbacks, Collection) or isinstance(
+                    callbacks, (str, bytes)
+                ):
+                    raise TypeError(f"scoped {kind} callbacks must be a collection")
+                for callback in callbacks:
+                    if not callable(callback):
+                        raise TypeError(f"scoped {kind} callback must be callable")
+                    entries.append((kind, name, callback))
+        if len(entries) > 256:
+            raise ValueError("scoped lifecycle registration exceeds 256 callbacks")
+        token = object()
+        with self._hook_lock:
+            for kind, name, callback in entries:
+                target = self._hooks if kind == "hook" else self._middleware
+                target.setdefault(name, []).append(callback)
+            self._scoped_lifecycle[token] = tuple(entries)
+        return _ScopedLifecycleRegistration(self, token)
+
+    def _close_scoped_lifecycle(self, token: object) -> None:
+        with self._hook_lock:
+            entries = self._scoped_lifecycle.pop(token, ())
+            for kind, name, callback in entries:
+                target = self._hooks if kind == "hook" else self._middleware
+                current = target.get(name)
+                if current is None:
+                    continue
+                target[name] = [item for item in current if item is not callback]
+                if not target[name]:
+                    target.pop(name, None)
+
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
@@ -2214,7 +2287,8 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        callbacks = self._hooks.get(hook_name, [])
+        with self._hook_lock:
+            callbacks = tuple(self._hooks.get(hook_name, ()))
         results: List[Any] = []
         for cb in callbacks:
             try:
@@ -2232,11 +2306,13 @@ class PluginManager:
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
-        return bool(self._hooks.get(hook_name))
+        with self._hook_lock:
+            return bool(self._hooks.get(hook_name))
 
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
-        return bool(self._middleware.get(kind))
+        with self._hook_lock:
+            return bool(self._middleware.get(kind))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call registered middleware callbacks for *kind*.
@@ -2245,7 +2321,8 @@ class PluginManager:
         path. Middleware that wants to change behavior must return the shape
         documented by the caller-specific contract.
         """
-        callbacks = self._middleware.get(kind, [])
+        with self._hook_lock:
+            callbacks = tuple(self._middleware.get(kind, ()))
         results: List[Any] = []
         for cb in callbacks:
             try:

@@ -924,14 +924,31 @@ def _compile_node_hook_resources(raw_hooks: Any) -> tuple[dict[str, Any], ...]:
     return tuple(compiled)
 
 
-def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
+class _InstalledNodeHooks(list[dict[str, str]]):
+    def __init__(self) -> None:
+        super().__init__()
+        self._registration = None
+
+    def bind(self, registration) -> None:
+        self._registration = registration
+
+    def close(self) -> None:
+        registration = self._registration
+        self._registration = None
+        if registration is not None:
+            registration.close()
+
+
+def _install_node_hooks(raw_hooks: Any) -> _InstalledNodeHooks:
     resources = _compile_node_hook_resources(raw_hooks)
+    observed = _InstalledNodeHooks()
     if not resources:
-        return []
+        return observed
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
-    observed: list[dict[str, str]] = []
+    hooks: dict[str, list[Any]] = {}
+    middleware_callbacks: dict[str, list[Any]] = {}
 
     def matches(resource: dict[str, Any], kwargs: dict[str, Any]) -> bool:
         matcher = resource["matcher"]
@@ -970,7 +987,7 @@ def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
             })
             return dict(_response) if isinstance(_response, dict) else None
 
-        manager._hooks.setdefault(hermes_event, []).append(callback)
+        hooks.setdefault(hermes_event, []).append(callback)
         if event == "PreToolUse" and isinstance(response, dict) and "args" in response:
 
             def middleware(
@@ -989,7 +1006,16 @@ def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
                     "source": "workflow-node-hook",
                 }
 
-            manager._middleware.setdefault("tool_request", []).append(middleware)
+            middleware_callbacks.setdefault("tool_request", []).append(middleware)
+    observed.bind(
+        manager.register_scoped_lifecycle(
+            hooks={name: tuple(callbacks) for name, callbacks in hooks.items()},
+            middleware={
+                name: tuple(callbacks)
+                for name, callbacks in middleware_callbacks.items()
+            },
+        )
+    )
     return observed
 
 
@@ -1332,9 +1358,7 @@ def _run(
     original_approval_callback = None
     original_sudo_callback = None
     original_secret_callback = None
-    node_hook_manager = None
-    original_node_hooks = None
-    original_node_middleware = None
+    installed_node_hooks = None
     original_registry_generation = None
     history = None
 
@@ -1774,18 +1798,8 @@ def _run(
                     provider_attempt_grant_exhausted[0],
                 )
             _active_agent = agent
-            from hermes_cli.plugins import get_plugin_manager
-
-            node_hook_manager = get_plugin_manager()
-            original_node_hooks = {
-                name: list(callbacks)
-                for name, callbacks in node_hook_manager._hooks.items()
-            }
-            original_node_middleware = {
-                name: list(callbacks)
-                for name, callbacks in node_hook_manager._middleware.items()
-            }
-            hook_events = _install_node_hooks(request.hooks)
+            installed_node_hooks = _install_node_hooks(request.hooks)
+            hook_events = installed_node_hooks
             if _cancel_event.is_set():
                 agent._interrupt_requested = True
             visible = {
@@ -1959,12 +1973,8 @@ def _run(
     finally:
         _active_agent = None
         try:
-            if node_hook_manager is not None and original_node_hooks is not None:
-                node_hook_manager._hooks.clear()
-                node_hook_manager._hooks.update(original_node_hooks)
-            if node_hook_manager is not None and original_node_middleware is not None:
-                node_hook_manager._middleware.clear()
-                node_hook_manager._middleware.update(original_node_middleware)
+            if installed_node_hooks is not None:
+                installed_node_hooks.close()
         finally:
             try:
                 if callbacks_installed:
