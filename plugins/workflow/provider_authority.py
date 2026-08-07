@@ -98,6 +98,8 @@ def _hook_operations_supported(event: str, operations: object) -> bool:
         values.get("permission_decision") in {"deny", "ask"}
     ):
         return False
+    if "stop_reason" in values and "permission_decision_reason" in values:
+        return False
     return action_effective or "update_input" in values
 
 

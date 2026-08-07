@@ -279,6 +279,17 @@ def test_approval_rework_blocks_options_its_executor_cannot_apply(
                 },
             },
         ),
+        (
+            "PreToolUse",
+            {
+                "stopReason": "silently dropped",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "preferred",
+                },
+            },
+        ),
     ],
 )
 def test_hook_response_operations_block_when_the_runtime_event_ignores_them(
