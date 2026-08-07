@@ -72,6 +72,13 @@ baseline `36cb5ae5530a75def7df3195e49b7a4aa2add482`. No
 `last_verified_upstream` value was advanced and no retroactive catch-all ledger
 entry was added.
 
+The plan's original standalone rehearsal example used the obsolete
+`--phase base` spelling and failed before mutation with `unknown argument:
+--phase`. The executable plan now uses the script's real explicit
+`--upstream-ref`, `--base-ref`, and dynamically enumerated `--brand-ref`
+contract. That corrected rehearsal is part of the pending clean-tree gate; the
+argument-validation failure is not counted as product-test evidence.
+
 ## Pending gates
 
 The following evidence will be appended after it exists:
@@ -84,4 +91,3 @@ The following evidence will be appended after it exists:
 - activation RED and GREEN evidence;
 - full post-activation Steps 2-4 against the exact committed activation SHA;
 - final commit IDs, exact Git/worktree state, and retry/exclusion accounting.
-

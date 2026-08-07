@@ -764,7 +764,11 @@ npm test
 npm run lint
 cd ../../
 HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/run_tests.sh tests/scripts/test_check_upstream_customizations.py tests/scripts/test_workflow_merge_gate.py tests/scripts/test_workflow_upstream_merge.py tests/test_desktop_workflow_test_gate.py -q
-PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_upstream_merge.sh --phase base
+PHASE5_UPSTREAM_REHEARSAL_ARGS=()
+while IFS= read -r brand_slug; do
+  PHASE5_UPSTREAM_REHEARSAL_ARGS+=(--brand-ref "origin/$brand_slug")
+done < <(node --input-type=module -e 'import fs from "node:fs"; import {loadDescriptor} from "./scripts/brand/descriptor.mjs"; for (const file of fs.readdirSync("brands").filter(name => /^[a-z][a-z0-9-]*\.json$/.test(name) && name !== "schema.json")) { const slug=file.slice(0,-5); loadDescriptor(slug,{root:process.cwd()}); console.log(slug); }')
+PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_upstream_merge.sh --upstream-ref origin/main --base-ref HEAD "${PHASE5_UPSTREAM_REHEARSAL_ARGS[@]}"
 ```
 
 - [ ] **Step 4: Run full base and branded-release regression gates without publishing.**
