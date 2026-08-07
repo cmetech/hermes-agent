@@ -20,7 +20,12 @@ from plugins.workflow.models import (
     DeadlineBudget,
     RunExecutionLimits,
     WorkflowNode,
+    WorkflowLanguageProfile,
     freeze_value,
+)
+from plugins.workflow.provider_authority import (
+    WorkflowProviderAuthority,
+    WorkflowResolvedProviderRoute,
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -456,8 +461,128 @@ class ReworkRunner:
             status="completed",
             pending_interaction=None,
             usage={},
-            audit={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            },
         )
+
+
+def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
+    tmp_path,
+) -> None:
+    runner = ReworkRunner()
+    route = WorkflowResolvedProviderRoute(
+        route_id="review:primary",
+        node_id="review",
+        role="primary",
+        inline_agent_id=None,
+        reference_kind="configured_alias",
+        requested_reference_sha256="1" * 64,
+        provider="sealed-provider",
+        model="sealed-model",
+        api_mode="chat_completions",
+        route_fingerprint="2" * 64,
+        registration_provenance_digest="3" * 64,
+        provider_options={},
+        config_scope="profile",
+        base_url_trust_class="provider_default",
+    )
+    fallback_route = WorkflowResolvedProviderRoute(
+        route_id="review:fallback",
+        node_id="review",
+        role="fallback",
+        inline_agent_id=None,
+        reference_kind="configured_alias",
+        requested_reference_sha256="6" * 64,
+        provider="sealed-fallback-provider",
+        model="sealed-fallback-model",
+        api_mode="chat_completions",
+        route_fingerprint="7" * 64,
+        registration_provenance_digest="8" * 64,
+        provider_options={},
+        config_scope="profile",
+        base_url_trust_class="provider_default",
+    )
+    authority = WorkflowProviderAuthority(
+        config_fingerprint="4" * 64,
+        routes={
+            route.route_id: route,
+            fallback_route.route_id: fallback_route,
+        },
+        obligations=(),
+        warnings=(),
+        authority_digest="5" * 64,
+    )
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+        }),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        workflow_options=freeze_value({
+            "provider": "authored-provider-must-not-run",
+            "model": "@mutable-alias",
+            "fallbackModel": "@mutable-fallback-must-not-run",
+        }),
+        variable_context=VariableContext(workflow_id="run-1"),
+        node_state=freeze_value({
+            "approval_rework": {"reason": "missing evidence"},
+        }),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=5,
+        sealed_provider_route=route,
+        sealed_provider_authority=authority,
+        intended_authority_digest="a" * 64,
+    )
+
+    result = ApprovalExecutor(runner).execute(context)
+
+    assert result.status == "paused"
+    request = runner.requests[0]
+    assert request.provider == "sealed-provider"
+    assert request.model == "sealed-model"
+    assert request.intended_authority_digest == "a" * 64
+    assert request.expected_runtime_identity == {
+        "provider": "sealed-provider",
+        "model": "sealed-model",
+        "api_mode": "chat_completions",
+        "base_url_trust_class": "provider_default",
+        "registration_provenance_digest": "3" * 64,
+    }
+    assert request.sealed_provider_attempt_grant is True
+    assert request.fallback_model is None
+    assert request.sealed_fallback_route == {
+        "provider": "sealed-fallback-provider",
+        "model": "sealed-fallback-model",
+        "context_mode": "fresh",
+        "expected_runtime_identity": {
+            "provider": "sealed-fallback-provider",
+            "model": "sealed-fallback-model",
+            "api_mode": "chat_completions",
+            "base_url_trust_class": "provider_default",
+            "registration_provenance_digest": "8" * 64,
+        },
+        "reasoning_config": {},
+        "request_overrides": {},
+    }
+    assert result.metadata["intended_authority_digest"] == "a" * 64
+    assert result.metadata["model_visible_prefix_digest"] == "9" * 64
 
 
 def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(

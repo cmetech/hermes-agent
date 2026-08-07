@@ -3947,6 +3947,14 @@ class RunScheduler:
                                 "_sealed_loop_semantics": loop_semantics,
                             },
                         )
+                    sealed_node_route = (
+                        provider_authority.routes.get(f"{node.id}:primary")
+                        if provider_authority is not None
+                        else None
+                    )
+                    sealed_node_authority = (
+                        provider_authority if sealed_node_route is not None else None
+                    )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -4078,29 +4086,25 @@ class RunScheduler:
                             sealed_resource_bytes=sealed_resource_bytes,
                             language_profile=package.language.effective_profile,
                             normalizer_version=package.language.normalizer_version,
-                            sealed_provider_route=(
-                                provider_authority.routes.get(f"{node.id}:primary")
-                                if provider_authority is not None
-                                else None
-                            ),
-                            sealed_provider_authority=provider_authority,
+                            sealed_provider_route=sealed_node_route,
+                            sealed_provider_authority=sealed_node_authority,
                             intended_authority_digest=(
                                 phase5_node_intended_authority_digest(
-                                    provider_authority,
+                                    sealed_node_authority,
                                     node_id=node.id,
                                     sealed_closure_digest=str(
                                         projection.get("definition_digest") or ""
                                     ),
                                 )
-                                if provider_authority is not None
+                                if sealed_node_authority is not None
                                 else None
                             ),
                             sealed_mcp_runtime_identity_digest=(
                                 phase5_node_mcp_runtime_identity_digest(
-                                    provider_authority,
+                                    sealed_node_authority,
                                     node_id=node.id,
                                 )
-                                if provider_authority is not None
+                                if sealed_node_authority is not None
                                 else None
                             ),
                             structured_output=structured_output,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import sys
 from types import MappingProxyType
 from typing import AbstractSet, Mapping
@@ -36,6 +37,98 @@ from plugins.workflow.compat import CompatibilityReport
 
 class WorkflowAdmissionAssessmentError(ValueError):
     """The immutable compilation and its derived admission identities disagree."""
+
+
+_PHASE5_MCP_PATH_SUFFIXES = frozenset({
+    ".bash",
+    ".cjs",
+    ".crt",
+    ".exe",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsx",
+    ".key",
+    ".mjs",
+    ".pem",
+    ".py",
+    ".pyw",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".yaml",
+    ".yml",
+})
+_PHASE5_MCP_PATH_OPTION = re.compile(
+    r"^--?(?:config|cwd|dir|directory|entry|file|manifest|path|root|script)(?:[-_].*)?$",
+    re.IGNORECASE,
+)
+_PHASE5_MCP_PATH_ENV = re.compile(
+    r"(?:^|_)(?:CONFIG|CWD|DIR|DIRECTORY|ENTRY|FILE|MANIFEST|PATH|ROOT|SCRIPT)$",
+    re.IGNORECASE,
+)
+_PHASE5_MCP_NETWORK_URL = re.compile(r"^(?:https?|wss?)://", re.IGNORECASE)
+_PHASE5_MCP_URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _phase5_mcp_path_reference(
+    value: str,
+    *,
+    compound: bool = False,
+    path_hint: bool = False,
+) -> str | None:
+    option = ""
+    candidate = value
+    if compound and value.startswith("-") and "=" in value:
+        option, candidate = value.split("=", 1)
+    if _PHASE5_MCP_NETWORK_URL.match(candidate):
+        return candidate if path_hint else None
+    looks_path_like = (
+        path_hint
+        or "%" in candidate
+        or _PHASE5_MCP_URI_SCHEME.match(candidate) is not None
+        or candidate.startswith(("./", "../", ".\\", "..\\", "/", "~"))
+        or "/" in candidate
+        or "\\" in candidate
+        or re.match(r"^[A-Za-z]:", candidate) is not None
+        or any(candidate.lower().endswith(suffix) for suffix in _PHASE5_MCP_PATH_SUFFIXES)
+        or bool(option and _PHASE5_MCP_PATH_OPTION.fullmatch(option))
+    )
+    if not looks_path_like:
+        return None
+    if candidate.startswith("./"):
+        candidate = candidate[2:]
+    return candidate
+
+
+def _phase5_mcp_launch_shape_is_sealed(
+    server: Mapping[str, object], sealed_resources: set[str]
+) -> bool:
+    args = server.get("args")
+    if not isinstance(args, list) or not args or any(
+        not isinstance(value, str) for value in args
+    ):
+        return False
+    for value in args:
+        reference = _phase5_mcp_path_reference(value, compound=True)
+        if reference is not None and reference not in sealed_resources:
+            return False
+    environment = server.get("env")
+    if environment is not None:
+        if not isinstance(environment, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            return False
+        for key, value in environment.items():
+            reference = _phase5_mcp_path_reference(
+                value,
+                path_hint=_PHASE5_MCP_PATH_ENV.search(key) is not None,
+            )
+            if reference is not None and reference not in sealed_resources:
+                return False
+    return True
 
 
 def _phase5_mcp_execution_preconditions(
@@ -85,6 +178,9 @@ def _phase5_mcp_execution_preconditions(
                 or entry.startswith("-")
                 or not entry.lower().endswith((".py", ".pyw"))
                 or entry not in sealed_resources
+                or not _phase5_mcp_launch_shape_is_sealed(
+                    server, sealed_resources
+                )
                 or not isinstance(runtime_files, list)
                 or any(
                     not isinstance(path, str) or path not in sealed_resources

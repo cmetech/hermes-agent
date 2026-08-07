@@ -208,6 +208,7 @@ upstream_changes:
   - run_agent.py
   - plugins/workflow/execution_semantics.py
   - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
   - plugins/workflow/executors/base.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/sessions.py
@@ -221,6 +222,7 @@ upstream_changes:
   - phase5_session_cache_fingerprint
   - NodeSessionRecord
   - _language_has_phase4_semantics
+  - ApprovalExecutor.execute
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
@@ -229,12 +231,15 @@ upstream_changes:
   - persistent and same-run resumption require both paired Phase 5 identities
   - durable recovery journals both private identities while legacy session and recovery records remain byte-compatible
   - normalizer v5 ordinary loops inherit v4 authenticated decision recovery and consumed-input cleanup
+  - provider-free nodes carry no fabricated provider route or provider execution identity
+  - normalizer-v5 approval rejection rework uses its sealed route and returns paired worker execution identities
   - prefix verification runs again at every sealed provider-attempt reservation
   - no prompts tools credentials provider payloads or local paths enter public identity evidence
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_phase5_provider_snapshot.py
+  - tests/plugins/workflow/test_approval.py
   - tests/plugins/workflow/test_persistent_session_recovery.py
   - tests/plugins/workflow/test_crash_recovery.py
   - tests/plugins/workflow/test_schedule_store_identity.py
@@ -305,9 +310,11 @@ upstream_changes:
   - plugin_agent_python_runtime_identity
   - _PHASE5_AUTHORITY_LOADER
   - _phase5_mcp_execution_preconditions
+  - _phase5_mcp_launch_shape_is_sealed
   - phase5_node_mcp_runtime_identity_digest
   owned_invariants:
   - v5 MCP admission supports only an exact trusted Hermes Python interpreter and sealed package entry script
+  - admission rejects non-string arguments malformed environments and every unsealed path-bearing argument or environment value before run creation
   - interpreter family version build bytes and import-policy version are sealed as a credential-free authority digest
   - worker startup recomputes the exact interpreter identity before MCP discovery or provider transport
   - v5 launches with isolated -I -S semantics and a lifetime import guard limited to standard-library and sealed package roots
@@ -435,6 +442,7 @@ upstream_changes:
   - plugins/workflow/provider_authority.py
   - plugins/workflow/executors/base.py
   - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
   - plugins/workflow/scheduler.py
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
@@ -447,6 +455,8 @@ upstream_changes:
   owned_invariants:
   - every accepted provider option has one reviewed exact transport encoder or blocks before transport
   - every provider-calling prompt command or ordinary loop node receives a sealed primary route
+  - approval nodes receive a provider route only when authenticated rejection rework can call the provider
+  - hook events without exact worker lifecycle and response semantics resolve unsupported and block admission
   - route-specific effort decisions cannot be inherited from a different provider or model
   - OpenRouter effort uses only the declared reasoning.effort or verbosity request field
   - unsupported thinking shapes and every current provider-native sandbox request block without provider use
@@ -458,6 +468,7 @@ upstream_changes:
   - tests/plugins/workflow/test_phase5_provider_options.py
   - tests/plugins/workflow/test_phase5_provider_authority.py
   - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_approval.py
   - tests/plugins/workflow/test_phase5_inline_limits.py
   - tests/plugins/workflow/test_phase4_loops.py
   - tests/agent/test_plugin_agent.py
@@ -483,6 +494,7 @@ upstream_changes:
   overlap_policy: owned_symbol
   files:
   - plugins/workflow/provider_authority.py
+  - plugins/workflow/catalog_api.py
   - plugins/workflow/sanitize.py
   - plugins/workflow/evidence.py
   - plugins/workflow/dashboard/plugin_api.py
@@ -496,6 +508,8 @@ upstream_changes:
   - WorkflowProviderDecisionProjection
   - WorkflowProviderCapabilityProjection
   - WorkflowDetailLanguageStatus
+  - WorkflowCatalogLanguageStatus
+  - _catalog_language_projection
   - isDesktopProviderCapabilityProjection
   owned_invariants:
   - catalog projects only bounded capability summary while detail adds bounded routes and decisions
@@ -506,6 +520,7 @@ upstream_changes:
   - provider authority and budget evidence contain only sealed digests bounded outcomes and closed totals
   - existing workflow action names and mutation URLs remain unchanged
   - the closed REST language projection accepts every supported v1 through v5 reader contract
+  - every catalog language row carries the backend-authored normalizer version so clients can fail closed without resolving language state
   tests:
   - tests/plugins/workflow/test_phase5_surfaces.py
   - tests/plugins/workflow/test_evidence_api.py

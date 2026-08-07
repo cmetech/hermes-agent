@@ -155,6 +155,70 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
         authority.authority_digest = "0" * 64  # type: ignore[misc]
 
 
+def test_provider_routes_cover_only_nodes_that_can_call_the_provider(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[
+            {"id": "shell", "bash": "true"},
+            {
+                "id": "review",
+                "approval": {
+                    "message": "Approve?",
+                    "on_reject": {"prompt": "Revise the result"},
+                },
+            },
+            {"id": "gate", "approval": {"message": "Approve?"}},
+            {"id": "stop", "cancel": "stop"},
+            {
+                "id": "refine",
+                "loop": {"prompt": "Refine", "until": "DONE", "max_iterations": 2},
+            },
+        ],
+    )
+
+    authority = _authority(_load_v5(path))
+
+    assert set(authority.routes) == {"review:primary", "refine:primary"}
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "SubagentStart",
+        "SubagentStop",
+        "TaskCompleted",
+        "Elicitation",
+        "ElicitationResult",
+        "PermissionRequest",
+        "Setup",
+        "InstructionsLoaded",
+    ],
+)
+def test_hook_events_without_exact_worker_semantics_block(
+    tmp_path, workflow_writer, event
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "hooks": {event: [{"response": {"continue": True}}]},
+        }],
+    )
+    package = _load_v5(path)
+    authority = _authority(package)
+
+    decision = authority.obligations_by_path[f"nodes[0].hooks.{event}[0]"][0]
+    report = assess_compatibility(package, provider_authority=authority)
+
+    assert decision.decision.disposition.value == "unsupported"
+    assert any(item.path == f"nodes[0].hooks.{event}[0]" for item in report.blocking_findings)
+
+
 def test_every_accepted_provider_dependent_path_has_one_matrix_decision(
     tmp_path, workflow_writer
 ):

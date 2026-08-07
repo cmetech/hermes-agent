@@ -391,26 +391,30 @@ compilation occurs from the authenticated source in the isolated worker; v5
 accepts only a string or null matcher, caps its length/complexity, and rejects
 invalid expressions before admission.
 
-Every response field is classified for its event. Supported operations include
-the existing allow/block/ask decision, input update, additional current-turn or
-tool-result context, MCP output replacement where applicable, elicitation
-result, and lifecycle observation. A value is accepted only if the mapped
-Hermes event actually fires on that path. In particular:
+Every response field is classified for its event. A value is accepted only if
+the mapped Hermes event actually fires on that path and the worker consumes its
+response with the documented semantics. The activation set is deliberately
+limited to the lifecycle paths proven by the isolated worker:
 
 - `PostToolUse` and `PostToolUseFailure` stay status-disjoint;
-- `SubagentStart`, `SubagentStop`, and `TaskCompleted` require declared inline
-  agents;
-- `Elicitation` and `ElicitationResult` require admitted MCP;
+- `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`,
+  `SessionEnd`, and `UserPromptSubmit` may use their event-valid bounded
+  operations;
+- `SubagentStart`, `SubagentStop`, `TaskCompleted`, `Elicitation`,
+  `ElicitationResult`, `PermissionRequest`, `Setup`, and
+  `InstructionsLoaded` normalize into explicit obligations but block because
+  the current worker does not provide an exact event-and-response contract;
 - hardline approval policy remains authoritative over hook requests;
 - `systemMessage`/`additionalContext` become bounded current-turn/tool-result
   content, never a system-message mutation;
 - an unsupported field such as output suppression on an event without exact
   suppression semantics blocks instead of being dropped.
 
-The published unsupported events remain blocking: `Notification`, `Stop`,
-`PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, and
-`WorktreeRemove`. The event and response-operation tables are derived from the
-central matrix inventory.
+The other published unsupported events remain blocking: `Notification`,
+`Stop`, `PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, and
+`WorktreeRemove`. Structurally recognizing and sealing an event never implies
+runtime support; the provider authority is the machine-readable activation
+decision.
 
 The worker must stop editing plugin-manager private dictionaries directly.
 Phase 5 adds one generic scoped hook-registration token/context manager to the

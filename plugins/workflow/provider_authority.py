@@ -47,17 +47,9 @@ _SUPPORTED_HOOK_EVENTS = frozenset({
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
-    "SubagentStart",
-    "SubagentStop",
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
-    "PermissionRequest",
-    "Setup",
-    "Elicitation",
-    "ElicitationResult",
-    "InstructionsLoaded",
-    "TaskCompleted",
 })
 _SUPPORTED_HOOK_OPERATIONS = frozenset({
     "continue",
@@ -846,7 +838,12 @@ def resolve_workflow_provider_authority(
 
     root = package.definition.options
     for index, node in enumerate(package.definition.nodes):
-        if node.node_type not in {"command", "prompt", "loop"}:
+        approval_rework = (
+            node.node_type == "approval"
+            and isinstance(node.value, Mapping)
+            and isinstance(node.value.get("on_reject"), Mapping)
+        )
+        if node.node_type not in {"command", "prompt", "loop"} and not approval_rework:
             continue
         node_options = node.options
         primary_reference = node_options.get("model", root.get("model"))

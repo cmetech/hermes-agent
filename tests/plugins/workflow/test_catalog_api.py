@@ -134,6 +134,7 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
     assert rows[("profile", "ordinary-user-workflow")]["language"] == {
         "effective_profile": "hermes-legacy",
         "legacy": True,
+        "normalizer_version": 2,
     }
     assert rows[("profile", "ordinary-user-workflow")]["compatibility"] == {
         "level": "mapped",
@@ -153,6 +154,7 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
     assert approval["language"] == {
         "effective_profile": "hermes-legacy",
         "legacy": True,
+        "normalizer_version": 2,
     }
     assert approval["trust_state"] == "verified_bundled"
     assert approval["supported_inputs"] == {
@@ -304,6 +306,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
     list_status = {
         "effective_profile": "hermes-legacy",
         "legacy": True,
+        "normalizer_version": 2,
     }
     detail_status = {
         "declared_profile": "archon-2026-07",
@@ -336,7 +339,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**detail_status, "effective_profile": "hermes-legacy"},
         {**detail_status, "legacy": 0},
         {**detail_status, "normalizer_version": True},
-        {**detail_status, "normalizer_version": 5},
+        {**detail_status, "normalizer_version": 6},
         {**detail_status, "normalized_definition_digest": "A" * 64},
         {**detail_status, "normalized_definition_digest": "a" * 63},
     ]
@@ -750,7 +753,7 @@ def test_workflow_compatibility_finding_api_projection_normalizes_only_empty_pat
         module.WorkflowCompatibilityFinding.model_validate(projected)
 
 
-def test_workflow_catalog_response_model_enforces_source_projection_and_old_optional_compatibility() -> None:
+def test_workflow_catalog_response_model_requires_language_version_and_keeps_old_optional_compatibility() -> None:
     module = _module()
     base = {
         "name": "response-model",
@@ -763,7 +766,11 @@ def test_workflow_catalog_response_model_enforces_source_projection_and_old_opti
         "inputs": [],
         "supported_inputs": {"supported": True, "reason": "parameterless"},
         "run_support": {"supported": True, "reason": "supported"},
-        "language": {"effective_profile": "hermes-legacy", "legacy": True},
+        "language": {
+            "effective_profile": "hermes-legacy",
+            "legacy": True,
+            "normalizer_version": 2,
+        },
     }
     summary = {"level": "mapped", "runnable": True}
     full = {
@@ -1357,6 +1364,7 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
         "language": {
             "effective_profile": "hermes-legacy",
             "legacy": True,
+            "normalizer_version": 2,
         },
         "compatibility": {"level": "mapped", "runnable": True},
     }
@@ -1369,6 +1377,7 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert user_items[1]["language"] == {
         "effective_profile": "hermes-legacy",
         "legacy": True,
+        "normalizer_version": 2,
     }
     assert user_items[1]["compatibility"] == {
         "level": "mapped",
@@ -1413,12 +1422,17 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert row["language"] == {
         "effective_profile": "archon-2026-07",
         "legacy": False,
+        "normalizer_version": 4,
     }
     assert row["compatibility"] == {
         "level": "portable",
         "runnable": True,
     }
-    assert set(row["language"]) == {"effective_profile", "legacy"}
+    assert set(row["language"]) == {
+        "effective_profile",
+        "legacy",
+        "normalizer_version",
+    }
     assert set(row["compatibility"]) == {"level", "runnable"}
 
 
@@ -1986,6 +2000,7 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
             "language": {
                 "effective_profile": "hermes-legacy",
                 "legacy": True,
+                "normalizer_version": 2,
             },
             "compatibility": {"level": "mapped", "runnable": True},
         },
@@ -2035,6 +2050,7 @@ def test_workflow_catalog_isolates_invalid_definition(
             "language": {
                 "effective_profile": "hermes-legacy",
                 "legacy": True,
+                "normalizer_version": 2,
             },
             "compatibility": {"level": "mapped", "runnable": True},
         },
@@ -2489,6 +2505,7 @@ def test_workflow_catalog_project_definition_overrides_profile(
             "language": {
                 "effective_profile": "hermes-legacy",
                 "legacy": True,
+                "normalizer_version": 2,
             },
             "compatibility": {"level": "mapped", "runnable": True},
         }

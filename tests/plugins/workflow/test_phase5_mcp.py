@@ -238,3 +238,58 @@ def test_phase5_sealed_python_mcp_satisfies_authority_preconditions(
     ]
     assert isinstance(runtime_digest, str) and len(runtime_digest) == 64
     assert obligation.decision.requested_semantics["import_policy_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"args": ["servers/main.py", 7]},
+        {"args": ["servers/main.py", "configs/missing.json"]},
+        {"args": ["servers/main.py"], "env": []},
+        {"args": ["servers/main.py"], "env": {"CONFIG_PATH": "missing.json"}},
+    ],
+)
+def test_phase5_mcp_admission_rejects_shapes_the_worker_cannot_authenticate(
+    tmp_path, workflow_writer, extra
+):
+    root = tmp_path / "source/workflows"
+    path = workflow_writer(
+        root,
+        name="invalid-mcp-closure",
+        filename="invalid-mcp-closure.yaml",
+        model="@primary",
+        nodes=[{"id": "ask", "prompt": "hello", "mcp": "local"}],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    path.with_name("invalid-mcp-closure.hermes.yaml").write_bytes(sidecar)
+    (root.parent / "mcp").mkdir()
+    (root.parent / "servers").mkdir()
+    document = {"command": sys.executable, **extra}
+    (root.parent / "mcp/local.yaml").write_text(
+        yaml.safe_dump(document), encoding="utf-8"
+    )
+    (root.parent / "servers/main.py").write_text("print('sealed')\n")
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=5,
+    )
+
+    facts = _phase5_mcp_execution_preconditions(compilation)
+    authority = _authority(
+        compilation.package,
+        mcp_execution_preconditions=facts,
+    )
+    obligation = next(
+        item for item in authority.obligations if item.decision.feature.value == "mcp"
+    )
+
+    assert facts == {"ask": False}
+    assert obligation.decision.disposition.value == "unsupported"

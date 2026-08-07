@@ -210,6 +210,40 @@ def test_v5_scheduler_binds_sealed_route_and_closure_identity_to_executor(
     assert len(contexts[0].intended_authority_digest) == 64
 
 
+def test_v5_scheduler_executes_non_provider_nodes_without_forging_a_route(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path / "source/workflows",
+        name="provider-free-v5",
+        filename="provider-free-v5.yaml",
+        nodes=[{"id": "shell", "bash": "printf ready"}],
+    )
+    policy = b"language_compatibility: archon-2026-07\n"
+    path.with_name("provider-free-v5.hermes.yaml").write_bytes(policy)
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=policy,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=5,
+    )
+    authority = _authority(compilation.package)
+    store = RunStore(tmp_path / "home")
+    _prepared, run_id = _admit(store, compilation, authority, key="provider-free")
+
+    projection = RunScheduler(store).advance(run_id)
+
+    assert authority.routes == {}
+    assert projection["status"] == "succeeded"
+    assert projection["nodes"]["shell"]["attempts"][-1]["error_code"] is None
+
+
 @pytest.mark.parametrize("mutation", ["tamper", "omit", "extra"])
 def test_v5_provider_authority_tree_mutation_fails_closed_before_reload(
     tmp_path, workflow_writer, mutation

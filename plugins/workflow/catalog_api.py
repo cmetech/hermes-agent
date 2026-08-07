@@ -1045,6 +1045,7 @@ def _catalog_language_projection(
     status: dict[str, object] = {
         "effective_profile": language.effective_profile.value,
         "legacy": language.effective_profile.value == "hermes-legacy",
+        "normalizer_version": language.normalizer_version,
     }
     if detail:
         expanded = language_projection(language)

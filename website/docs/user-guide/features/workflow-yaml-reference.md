@@ -644,10 +644,8 @@ exact finding. Recognition does not imply a runtime mapping.
 | Hook event | Current status |
 | --- | --- |
 | `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | Mapped to isolated worker tool lifecycle |
-| `SubagentStart`, `SubagentStop`, `TaskCompleted` | Mapped to declared `workflow_agent` child lifecycle |
-| `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Setup`, `InstructionsLoaded` | Mapped to isolated worker/session lifecycle |
-| `PermissionRequest` | Mapped to Hermes permission/approval policy; hardline policy remains authoritative |
-| `Elicitation`, `ElicitationResult` | Mapped only when MCP support is available |
+| `SessionStart`, `SessionEnd`, `UserPromptSubmit` | Mapped to isolated worker/session lifecycle |
+| `SubagentStart`, `SubagentStop`, `TaskCompleted`, `Elicitation`, `ElicitationResult`, `PermissionRequest`, `Setup`, `InstructionsLoaded` | Recognized and sealed, but blocked: the current worker does not provide the exact event-and-response contract |
 | `Notification`, `Stop`, `PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove` | Blocked by doctor: no equivalent node-worker contract |
 
 Each event value is a nonempty array of hook entries:

@@ -290,6 +290,7 @@ class WorkflowCatalogLanguageStatus(BaseModel):
 
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
+    normalizer_version: StrictInt = Field(..., ge=1, le=5)
 
     @model_validator(mode="after")
     def require_consistent_legacy_status(self):
