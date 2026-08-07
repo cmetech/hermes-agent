@@ -68,7 +68,6 @@ _PHASE5_MCP_PATH_ENV = re.compile(
     r"(?:^|_)(?:CONFIG|CWD|DIR|DIRECTORY|ENTRY|FILE|MANIFEST|PATH|ROOT|SCRIPT)$",
     re.IGNORECASE,
 )
-_PHASE5_MCP_NETWORK_URL = re.compile(r"^(?:https?|wss?)://", re.IGNORECASE)
 _PHASE5_MCP_URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -82,13 +81,6 @@ def _phase5_mcp_path_reference(
     candidate = value
     if compound and value.startswith("-") and "=" in value:
         option, candidate = value.split("=", 1)
-    if _PHASE5_MCP_NETWORK_URL.match(candidate):
-        ambiguous = (
-            "%" in candidate
-            or "\\" in candidate
-            or any(character.isspace() or ord(character) < 32 for character in candidate)
-        )
-        return candidate if path_hint or ambiguous else None
     looks_path_like = (
         path_hint
         or "%" in candidate

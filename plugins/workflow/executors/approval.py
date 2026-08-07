@@ -309,14 +309,20 @@ class ApprovalExecutor:
                     resolve_tool_name(name)
                     for name in context.node.options["allowed_tools"]
                 )
-                if "allowed_tools" in context.node.options
+                if phase5 and "allowed_tools" in context.node.options
                 else None
             ),
-            denied_tools=tuple(
-                resolve_tool_name(name)
-                for name in context.node.options.get("denied_tools", ())
+            denied_tools=(
+                tuple(
+                    resolve_tool_name(name)
+                    for name in context.node.options.get("denied_tools", ())
+                )
+                if phase5
+                else ()
             ),
-            ephemeral_system_prompt=context.node.options.get("systemPrompt"),
+            ephemeral_system_prompt=(
+                context.node.options.get("systemPrompt") if phase5 else None
+            ),
             workdir=context.run_directory,
             max_iterations=90,
             max_api_attempts=granted_provider_attempts,
@@ -387,14 +393,14 @@ class ApprovalExecutor:
                 error_message="workflow attempt deadline expired",
                 metadata={"provider_attempts": 0},
             )
-        if context.is_cancelled is not None and context.is_cancelled():
+        if phase5 and context.is_cancelled is not None and context.is_cancelled():
             return NodeExecutionResult(
                 "cancelled",
                 error_code="cancelled",
                 metadata={"provider_attempts": 0},
             )
         launch_kwargs = {"is_cancelled": context.is_cancelled}
-        if getattr(agent_runner, "starts_request_mcp", False):
+        if phase5 and getattr(agent_runner, "starts_request_mcp", False):
             launch_kwargs.update({
                 name: callback
                 for name, callback in {

@@ -256,7 +256,29 @@ def test_approval_rework_blocks_options_its_executor_cannot_apply(
         ("SessionStart", {"systemMessage": "ignored"}),
         ("PostToolUse", {"continue": False}),
         ("UserPromptSubmit", {"decision": "block"}),
+        (
+            "UserPromptSubmit",
+            {
+                "systemMessage": "first",
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "second",
+                },
+            },
+        ),
         ("PreToolUse", {"systemMessage": "ignored"}),
+        ("PreToolUse", {"continue": True}),
+        ("PreToolUse", {"decision": "approve"}),
+        ("PreToolUse", {"stopReason": "ignored"}),
+        (
+            "PreToolUse",
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecisionReason": "ignored",
+                },
+            },
+        ),
     ],
 )
 def test_hook_response_operations_block_when_the_runtime_event_ignores_them(
@@ -303,6 +325,36 @@ def test_user_prompt_context_is_the_only_non_tool_hook_response_currently_consum
     decision = authority.obligations_by_path[
         "nodes[0].hooks.UserPromptSubmit[0]"
     ][0]
+
+    assert decision.decision.disposition.value == "hermes_adapter"
+
+
+def test_pre_tool_response_requires_one_effective_consumed_operation(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "hooks": {
+                "PreToolUse": [{
+                    "response": {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "blocked",
+                            "updatedInput": {"path": "safe.txt"},
+                        },
+                    },
+                }],
+            },
+        }],
+    )
+
+    authority = _authority(_load_v5(path))
+    decision = authority.obligations_by_path["nodes[0].hooks.PreToolUse[0]"][0]
 
     assert decision.decision.disposition.value == "hermes_adapter"
 

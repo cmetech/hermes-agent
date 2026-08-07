@@ -245,6 +245,11 @@ def test_phase5_sealed_python_mcp_satisfies_authority_preconditions(
     [
         {"args": ["servers/main.py", 7]},
         {"args": ["servers/main.py", "configs/missing.json"]},
+        {"args": ["servers/main.py", "https://example.test"]},
+        {"args": ["servers/main.py", "https://"]},
+        {"args": ["servers/main.py", "https://example.test:"]},
+        {"args": ["servers/main.py", "https://[::1"]},
+        {"args": ["servers/main.py", "https://example.test/\u200b"]},
         {"args": ["servers/main.py", "https://example.test/%5csecret"]},
         {"args": ["servers/main.py"], "env": []},
         {"args": ["servers/main.py"], "env": {"CONFIG_PATH": "missing.json"}},

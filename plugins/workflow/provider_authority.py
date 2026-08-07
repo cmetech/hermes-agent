@@ -59,6 +59,48 @@ _SUPPORTED_HOOK_OPERATIONS_BY_EVENT = MappingProxyType({
 })
 
 
+def _hook_operations_supported(event: str, operations: object) -> bool:
+    if not isinstance(operations, tuple | list):
+        return False
+    values: dict[str, object] = {}
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            return False
+        name = operation.get("name")
+        if not isinstance(name, str) or name in values:
+            return False
+        values[name] = operation.get("value")
+    allowed = _SUPPORTED_HOOK_OPERATIONS_BY_EVENT.get(event)
+    if allowed is None or not set(values) <= allowed:
+        return False
+    if event == "UserPromptSubmit":
+        return len(values) == 1 and next(iter(values)) in {
+            "current_turn_context",
+            "additional_context",
+        }
+    if event != "PreToolUse":
+        return False
+    action_names = {
+        name
+        for name in ("continue", "decision", "permission_decision")
+        if name in values
+    }
+    if len(action_names) > 1:
+        return False
+    action_effective = (
+        values.get("continue") is False
+        or values.get("decision") == "block"
+        or values.get("permission_decision") in {"deny", "ask"}
+    )
+    if "stop_reason" in values and not action_effective:
+        return False
+    if "permission_decision_reason" in values and not (
+        values.get("permission_decision") in {"deny", "ask"}
+    ):
+        return False
+    return action_effective or "update_input" in values
+
+
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}
@@ -1008,11 +1050,6 @@ def resolve_workflow_provider_authority(
             if not isinstance(hook, Mapping):
                 continue
             operations = hook.get("operations", ())
-            operation_names = {
-                operation.get("name")
-                for operation in operations
-                if isinstance(operation, Mapping)
-            }
             event = str(hook.get("event", ""))
             add(
                 f"nodes[{index}].hooks.{event}[{hook_index}]",
@@ -1021,12 +1058,8 @@ def resolve_workflow_provider_authority(
                 option=event,
                 requested={
                     "normalized": True,
-                    "events_supported": (
-                        event in _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
-                        and operation_names
-                        <= _SUPPORTED_HOOK_OPERATIONS_BY_EVENT.get(
-                            event, frozenset()
-                        )
+                    "events_supported": _hook_operations_supported(
+                        event, operations
                     ),
                     "lifecycle_available": environment.hook_lifecycle_available,
                     "execution_adapter_available": not approval_rework,

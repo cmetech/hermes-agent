@@ -653,7 +653,11 @@ def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
         depends_on=("producer",),
         source_index=0,
         source_line=1,
-        options=freeze_value({}),
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+            "systemPrompt": "legacy prompt must remain ignored",
+        }),
     )
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -689,6 +693,10 @@ def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
 
     assert result.status == "paused"
     assert runner.requests[0].prompt == "Revise plan: missing evidence"
+    assert runner.requests[0].allowed_tools is None
+    assert runner.requests[0].denied_tools == ()
+    assert runner.requests[0].ephemeral_system_prompt is None
+    assert set(runner.launch_kwargs[0]) == {"is_cancelled"}
 
 
 def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path):
