@@ -31,7 +31,7 @@ def _compilation(tmp_path, workflow_writer, *, hook_event="Notification"):
                 "hooks": {
                     hook_event: [{
                         "response": (
-                            {"continue": True}
+                            {"continue": False}
                             if hook_event == "PreToolUse"
                             else {"suppressOutput": True}
                         )
