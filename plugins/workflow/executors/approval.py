@@ -257,6 +257,7 @@ class ApprovalExecutor:
                     return _phase5_execution_identity_failure(str(exc))
                 sealed_fallback_route = {
                     "provider": fallback_route.provider,
+                    "effective_provider": fallback_route.effective_provider,
                     "model": fallback_route.model,
                     "context_mode": "fresh",
                     "expected_runtime_identity": {

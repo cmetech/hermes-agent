@@ -1416,6 +1416,7 @@ class AgentNodeExecutor:
                     )
                 sealed_fallback_route = {
                     "provider": fallback_route.provider,
+                    "effective_provider": fallback_route.effective_provider,
                     "model": fallback_route.model,
                     "context_mode": "fresh",
                     "expected_runtime_identity": {

@@ -64,7 +64,7 @@ def _decision(
     return ProviderCapabilityDecision(
         feature=WorkflowProviderFeature.EFFORT_THINKING,
         disposition=CapabilityDisposition.DEGRADED_WITH_EXPLICIT_SEMANTICS,
-        provider=route.provider,
+        provider=route.effective_provider,
         model=route.model,
         option=option,
         requested_semantics={"value": value},
@@ -121,6 +121,25 @@ def test_sealed_effort_encoder_emits_only_the_declared_request_field() -> None:
     assert transport.request_overrides == {
         "extra_body": {"reasoning": {"effort": "high"}}
     }
+
+
+def test_option_encoder_compares_decisions_to_effective_provider() -> None:
+    route = replace(
+        _route(
+            "primary",
+            provider="openai-api",
+            model="gpt-5.4",
+            options={"effort": "high"},
+        ),
+        effective_provider="openai",
+    )
+
+    transport = encode_provider_option_transport(
+        route,
+        _authority(route).obligations,
+    )
+
+    assert transport.reasoning_config == {"enabled": True, "effort": "high"}
 
 
 def test_missing_option_encoder_fails_closed() -> None:
@@ -342,7 +361,10 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
             self.requests = []
 
         def run(self, request, **_kwargs):
+            from agent.plugin_agent import _validate_request
+
             self.requests.append(request)
+            _validate_request(request)
             evidence = {
                 "strategy": StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
                 "adapter_version": 1,
@@ -379,6 +401,10 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
             sealed_provider_authority=authority,
             structured_output=declared,
             structured_output_decision=primary_decision,
+            variable_context=replace(
+                context.variable_context,
+                normalizer_version=5,
+            ),
         )
     )
 
@@ -505,6 +531,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         ),
         sealed_fallback_route={
             "provider": "openrouter",
+            "effective_provider": "openrouter",
             "model": "anthropic/claude-sonnet-4.6",
             "context_mode": "fresh",
             "expected_runtime_identity": identity,

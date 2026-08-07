@@ -188,12 +188,14 @@ def encode_provider_option_transport(
 
     route_id = getattr(route, "route_id", None)
     provider = getattr(route, "provider", None)
+    effective_provider = getattr(route, "effective_provider", provider)
     model = getattr(route, "model", None)
     provenance = getattr(route, "registration_provenance_digest", None)
     options = getattr(route, "provider_options", None)
     if (
         not isinstance(route_id, str)
         or not isinstance(provider, str)
+        or not isinstance(effective_provider, str)
         or not isinstance(model, str)
         or not isinstance(options, Mapping)
     ):
@@ -233,7 +235,7 @@ def encode_provider_option_transport(
         decision = accepted[0]
         if (
             any(candidate.to_dict() != decision.to_dict() for candidate in accepted[1:])
-            or decision.provider != provider
+            or decision.provider != effective_provider
             or decision.model != model
             or decision.registration_provenance_digest != provenance
         ):

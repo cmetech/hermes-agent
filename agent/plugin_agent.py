@@ -1249,6 +1249,7 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         fallback = request.sealed_fallback_route
         required = {
             "provider",
+            "effective_provider",
             "model",
             "context_mode",
             "expected_runtime_identity",
@@ -1262,6 +1263,8 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             or fallback.get("context_mode") != "fresh"
             or not isinstance(fallback.get("provider"), str)
             or not fallback.get("provider")
+            or not isinstance(fallback.get("effective_provider"), str)
+            or not fallback.get("effective_provider")
             or not isinstance(fallback.get("model"), str)
             or not fallback.get("model")
             or not isinstance(fallback.get("reasoning_config"), Mapping)
@@ -1302,7 +1305,7 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         if (
             not isinstance(identity, Mapping)
             or set(identity) != expected_runtime_fields
-            or identity.get("provider") != fallback.get("provider")
+            or identity.get("provider") != fallback.get("effective_provider")
             or identity.get("model") != fallback.get("model")
             or any(
                 not isinstance(identity.get(field), str) or not identity.get(field)

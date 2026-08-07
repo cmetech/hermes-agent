@@ -591,6 +591,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
     assert request.fallback_model is None
     assert request.sealed_fallback_route == {
         "provider": "sealed-fallback-provider",
+        "effective_provider": "sealed-fallback-provider",
         "model": "sealed-fallback-model",
         "context_mode": "fresh",
         "expected_runtime_identity": {
