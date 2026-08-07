@@ -73,6 +73,9 @@ def _run_launcher_writer(tmp_path: Path) -> Path:
 
     bin_dir = tmp_path / "venv" / "bin"
     bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_text("#!/bin/sh\necho python stub\n")
+    python.chmod(0o755)
     # Only these were actually built by pip. `never-built` is declared in
     # [project.scripts] but absent, and must not get a launcher.
     for name in ("hermes", "hermes-agent", "loop24", "loop24-acp"):
@@ -96,7 +99,7 @@ def _run_launcher_writer(tmp_path: Path) -> Path:
         + _extract_shell_function(text, "write_command_launchers")
         + "\n"
         f'names="$(console_script_names "{pyproject}")"\n'
-        f'write_command_launchers "{link_dir}" "{bin_dir}" $names\n'
+        f'write_command_launchers "{link_dir}" "{bin_dir}" "{python}" $names\n'
     )
 
     proc = subprocess.run(
@@ -130,7 +133,10 @@ def test_each_launcher_scrubs_the_env_and_execs_its_own_entry_point(tmp_path: Pa
             assert f"unset {var}" in body, f"{name} launcher does not clear {var}"
         assert "export PYTHONNOUSERSITE=1" in body
         # Each launcher must exec ITS OWN entry point, not hermes for everything.
-        assert f'exec "{tmp_path / "venv" / "bin" / name}" "$@"' in body
+        assert (
+            f'exec "{tmp_path / "venv" / "bin" / "python"}" '
+            f'"{tmp_path / "venv" / "bin" / name}" "$@"'
+        ) in body
         # exec, not a plain call: the wrapper must not stay resident.
         assert "exec " in body
         assert LAUNCHER_MARKER in body, "launcher is not identifiable to the uninstaller"
@@ -193,7 +199,7 @@ def test_launcher_writer_refuses_to_shim_a_directory_into_itself(tmp_path: Path)
         "set -e\n"
         + _extract_shell_function(text, "write_command_launchers")
         + "\n"
-        f'write_command_launchers "{bin_dir}" "{bin_dir}" hermes\n'
+        f'write_command_launchers "{bin_dir}" "{bin_dir}" "" hermes\n'
     )
     proc = subprocess.run(["bash", str(harness)], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"

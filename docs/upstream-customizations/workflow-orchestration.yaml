@@ -45,6 +45,35 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: posix-generic-launcher-python-dispatch
+  change_class: installer-generic
+  owner: workflow-orchestration
+  files:
+  - scripts/install.sh
+  - tests/test_install_macos_launcher.py
+  - tests/test_install_sh_acp_launcher.py
+  - tests/test_posix_command_launchers.py
+  - tests/test_install_sh_symlink_stomp.py
+  owned_symbols:
+  - write_command_launchers python interpreter dispatch
+  - setup_path launcher_python binding
+  tests:
+  - tests/test_install_macos_launcher.py
+  - tests/test_install_sh_acp_launcher.py
+  - tests/test_posix_command_launchers.py
+  - tests/test_install_sh_symlink_stomp.py
+  - tests/test_install_python_isolation.py
+  expected_commit_subject: 'fix(install): preserve macOS-safe generic launchers'
+  upstream_candidate: true
+  merge_guidance: Preserve the generic project-script-derived launcher writer, but
+    have venv installs invoke every generated console script through the venv Python
+    interpreter. This bypasses uv's realpath-dependent shell trampoline on stock macOS
+    without reintroducing command-specific or brand-specific launcher blocks. Direct
+    non-venv installs must retain direct execution, and prior symlinks must be removed
+    before writing each launcher.
+  removal_condition: Remove when the upstream POSIX installer provides an equivalent
+    generic, brand-aware launcher that does not require realpath on stock macOS.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: explicit-profile-canonical-config-loader
   change_class: configuration-generic
   owner: workflow-orchestration

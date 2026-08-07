@@ -29,6 +29,16 @@ def _setup_path_function() -> str:
     return match.group(0)
 
 
+def _shell_function(name: str) -> str:
+    match = re.search(
+        rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+        INSTALL_SH.read_text(encoding="utf-8"),
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{name} function not found in scripts/install.sh"
+    return match.group(0)
+
+
 def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_path: Path) -> None:
     """Stock macOS must start Hermes even when its uv console script needs realpath."""
     install_dir = tmp_path / "install"
@@ -63,6 +73,9 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
             "log_success() { :; }",
+            "log_warn() { :; }",
+            _shell_function("console_script_names"),
+            _shell_function("write_command_launchers"),
             _setup_path_function(),
             "setup_path",
         ]
@@ -84,6 +97,6 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
 
     assert completed.returncode == 0, completed.stderr
     assert result.read_text(encoding="utf-8").splitlines() == [
-        str(install_dir / "hermes"),
+        str(venv_bin / "hermes"),
         "--version",
     ]
