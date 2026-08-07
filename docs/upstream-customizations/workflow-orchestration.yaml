@@ -45,6 +45,26 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: desktop-model-settings-baseline-contracts
+  change_class: desktop-test-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  owned_symbols:
+  - local main-model auxiliary inheritance test
+  - profile-bound MoA autosave expectations
+  tests:
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  expected_commit_subject: 'test(desktop): align model settings baseline contracts'
+  upstream_candidate: true
+  merge_guidance: Preserve the auto follow-main sentinel when an auxiliary slot
+    inherits a user-defined local main model; inheriting must not pin the current
+    model or copy its endpoint into the slot. MoA debounced autosaves must assert
+    their captured request profile explicitly, including null for the default
+    profile, and timer-driven state changes must remain inside React act boundaries.
+  removal_condition: Remove when upstream tests cover the same follow-main and
+    profile-captured autosave contracts.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: enrolled-browser-managed-npx-resolution
   change_class: runtime-resolution-generic
   owner: workflow-orchestration
