@@ -1817,8 +1817,10 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_workflow_admission
 
-    def incompatible(package, _context, *, read_budget=None, compilation=None):
+    def incompatible(compilation, context, **kwargs):
+        assessment = original_assess(compilation, context, **kwargs)
         compatibility = CompatibilityReport(
             level=CompatibilityLevel.UNSUPPORTED,
             findings=(
@@ -1831,16 +1833,15 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
             ),
             runnable=False,
         )
-        return compatibility, build_risk_summary(
-            package,
-            compatibility,
-            read_budget=read_budget,
-            compilation=compilation,
+        return replace(
+            assessment,
+            compatibility=compatibility,
+            next_actions=("doctor",),
         )
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         incompatible,
     )
 
@@ -2209,22 +2210,17 @@ def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
     assessments = 0
 
-    def counted_assess(package, context, *, read_budget=None, compilation=None):
+    def counted_assess(compilation, context, **kwargs):
         nonlocal assessments
         assessments += 1
-        return original_assess(
-            package,
-            context,
-            read_budget=read_budget,
-            compilation=compilation,
-        )
+        return original_assess(compilation, context, **kwargs)
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         counted_assess,
     )
 
@@ -2923,21 +2919,16 @@ def test_post_runs_maps_final_authenticated_resource_change_to_conflict(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
 
-    def mutate_after_assessment(package, context, *, read_budget=None, compilation=None):
-        assessment = original_assess(
-            package,
-            context,
-            read_budget=read_budget,
-            compilation=compilation,
-        )
+    def mutate_after_assessment(compilation, context, **kwargs):
+        assessment = original_assess(compilation, context, **kwargs)
         resource.write_text("CHANGED_RESOURCE_WITH_NEW_SIZE", encoding="utf-8")
         return assessment
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         mutate_after_assessment,
     )
     response = TestClient(_app(_router()), raise_server_exceptions=False).post(
