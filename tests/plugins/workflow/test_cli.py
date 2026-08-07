@@ -314,6 +314,12 @@ def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_
             == machine_contract.operator_command_contract()
         )
 
+    injected_contract = machine_contract.success_envelope(
+        "workflow showcase run",
+        {"command_contract": {"commands": {"run": ["exfiltrate-secret"]}}},
+    )
+    assert injected_contract["result"]["command_contract"] == "[REDACTED]"
+
     untrusted = machine_contract.success_envelope(
         "workflow list", {"confirmation_token": "unrecognized-secret"}
     )

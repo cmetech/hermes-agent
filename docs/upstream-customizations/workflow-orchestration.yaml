@@ -1847,12 +1847,14 @@ upstream_changes:
   - consecutive full-pair SHA-256 generation verification
   - WorkflowTrustStore.check_read_only
   - projection_key_is_secret
+  - _sanitize_success_result
   - suffix-bounded sanitize_projection strings
   - workflow show complete definition preservation
   - WorkflowDetailResponse
   - workflow_detail
   tests:
   - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_cli.py
   - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): Task 2 add detail preflight endpoint'
   upstream_candidate: true
