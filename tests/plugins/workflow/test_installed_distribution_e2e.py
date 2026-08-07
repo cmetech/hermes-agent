@@ -960,7 +960,7 @@ from plugins.workflow.runner_binding import (
     execution_capability_context,
 )
 from plugins.workflow.scheduler import RunScheduler
-    from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 
 
@@ -1034,13 +1034,13 @@ def admit_and_advance(package, store, *, idempotency_key: str):
 
 stage, schemaless_path, structured_path, installed_home = sys.argv[1:]
 store = RunStore(installed_home)
-    structured_path = Path(structured_path)
-    structured = load_workflow_snapshot(
-        structured_path,
-        workflow_bytes=structured_path.read_bytes(),
-        sidecar_bytes=structured_path.with_name("structured.hermes.yaml").read_bytes(),
-        normalizer_version=4,
-    )
+structured_path = Path(structured_path)
+structured = load_workflow_snapshot(
+    structured_path,
+    workflow_bytes=structured_path.read_bytes(),
+    sidecar_bytes=structured_path.with_name("structured.hermes.yaml").read_bytes(),
+    normalizer_version=4,
+)
 report = doctor_package(structured, hermes_home=installed_home)
 payload = {
     "validator_present": importlib.util.find_spec("jsonschema") is not None,
