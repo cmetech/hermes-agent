@@ -94,6 +94,29 @@ class TestDirectAliases:
         assert provider == "custom"
         assert alias == "glm"
 
+    def test_direct_alias_loader_shares_portable_parser_precedence(self, monkeypatch):
+        mock_config = {
+            "model": {
+                "provider": "anthropic",
+                "aliases": {"shared": "openrouter/legacy-model"},
+            },
+            "model_aliases": {
+                "shared": {
+                    "provider": "custom",
+                    "model": "rich-model",
+                    "base_url": "https://local.example/v1",
+                }
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: mock_config)
+
+        from hermes_cli.model_switch import _load_direct_aliases
+
+        alias = _load_direct_aliases()["shared"]
+        assert alias.model == "rich-model"
+        assert alias.provider == "custom"
+        assert alias.base_url == "https://local.example/v1"
+
 
 # ---------------------------------------------------------------------------
 # /model command persistence

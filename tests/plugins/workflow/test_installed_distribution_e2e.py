@@ -85,6 +85,28 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
     env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
 
+    portable_profile = tmp_path / "portable-profile.yaml"
+    portable_managed = tmp_path / "portable-managed.yaml"
+    portable_profile.write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  aliases:\n"
+        "    legacy: openrouter/legacy-model\n"
+        "model_aliases:\n"
+        "  review:\n"
+        "    provider: openrouter\n"
+        "    model: anthropic/claude-opus-4.6\n"
+        "model_tiers:\n"
+        "  small:\n"
+        "    provider: custom\n"
+        "    model: profile-small\n",
+        encoding="utf-8",
+    )
+    portable_managed.write_text(
+        "model_tiers:\n  small:\n    model: managed-small\n",
+        encoding="utf-8",
+    )
+
     probe = subprocess.run(
         [
             sys.executable,
@@ -108,17 +130,27 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
             sys.executable,
             "-c",
             (
-                "import json, pathlib, providers; "
+                "import json, pathlib, providers, sys; "
                 "from hermes_cli import provider_capabilities as pc; "
+                "from hermes_cli import workflow_model_resolution as wm; "
                 "profile = providers.get_provider_profile('openrouter'); "
+                "snapshot = wm.load_workflow_model_config_snapshot("
+                "pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])); "
                 "declaration = profile.declare_workflow_capability("
                 "'effort_thinking', model='anthropic/claude-sonnet-4.6', "
                 "option='effort'); "
                 "print(json.dumps({'provider_file': str(pathlib.Path("
                 "providers.__file__).resolve()), 'authority_file': str(pathlib.Path("
-                "pc.__file__).resolve()), 'features': sorted(x.value for x in "
-                "pc.WorkflowProviderFeature), 'disposition': declaration['disposition']}))"
+                "pc.__file__).resolve()), 'model_authority_file': str(pathlib.Path("
+                "wm.__file__).resolve()), 'features': sorted(x.value for x in "
+                "pc.WorkflowProviderFeature), 'disposition': declaration['disposition'], "
+                "'model_route': wm.resolve_workflow_model_reference("
+                "snapshot, '@review').to_dict(), 'tier_route': "
+                "wm.resolve_workflow_model_reference(snapshot, 'small').to_dict(), "
+                "'legacy_model': snapshot.aliases['legacy'].model}))"
             ),
+            str(portable_profile),
+            str(portable_managed),
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -130,6 +162,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     provider_contract = json.loads(provider_probe.stdout)
     assert Path(provider_contract["provider_file"]).is_relative_to(site.resolve())
     assert Path(provider_contract["authority_file"]).is_relative_to(site.resolve())
+    assert Path(provider_contract["model_authority_file"]).is_relative_to(site.resolve())
     assert set(provider_contract["features"]) == {
         "structured_output",
         "session_resumption",
@@ -144,6 +177,11 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
         "provider_native_sandbox",
     }
     assert provider_contract["disposition"] == "degraded_with_explicit_semantics"
+    assert provider_contract["model_route"]["provider"] == "openrouter"
+    assert provider_contract["model_route"]["model"] == "anthropic/claude-opus-4.6"
+    assert provider_contract["tier_route"]["model"] == "managed-small"
+    assert provider_contract["tier_route"]["config_scope"] == "managed"
+    assert provider_contract["legacy_model"] == "legacy-model"
 
     command = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "workflow", "list", "--json"],

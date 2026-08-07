@@ -1888,6 +1888,8 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "custom_providers",  # legacy list form; modern equivalent is providers: {}
     "fallback_model",    # optional single dict or chain list; omitted when disabled
     "mcp_servers",       # MCP server definitions written by setup/tools flows
+    "model_aliases",     # optional rich exact model references
+    "model_tiers",       # optional small/medium/large portable model references
     # Roots read from the raw user YAML (or written by our own flows) that are
     # intentionally absent from DEFAULT_CONFIG:
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
@@ -1951,6 +1953,28 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── portable workflow model references ──────────────────────────────
+    try:
+        from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+
+        model_snapshot = parse_workflow_model_config(config)
+        for issue in model_snapshot.issues:
+            issues.append(
+                ConfigIssue(
+                    issue.severity,
+                    f"{issue.code}: {issue.path}: {issue.message}",
+                    "Fix the portable model entry in config.yaml",
+                )
+            )
+    except Exception as exc:
+        issues.append(
+            ConfigIssue(
+                "error",
+                "model_reference_config_invalid: portable model config could not be parsed",
+                f"Fix model_aliases/model_tiers ({type(exc).__name__})",
+            )
+        )
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

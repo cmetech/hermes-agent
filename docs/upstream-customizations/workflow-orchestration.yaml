@@ -45,6 +45,43 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: portable-workflow-model-resolution
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/config.py
+  - hermes_cli/model_switch.py
+  - hermes_cli/workflow_model_resolution.py
+  - tests/hermes_cli/test_config_validation.py
+  - tests/hermes_cli/test_ollama_cloud_auth.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  owned_symbols:
+  - optional model_aliases and model_tiers config roots
+  - WorkflowModelConfigSnapshot and ConfiguredModelEntry immutable parser output
+  - ResolvedModelRoute credential-free model authority
+  - parse_workflow_model_config profile and managed leaf precedence
+  - resolve_workflow_model_reference tier alias literal and option precedence
+  - model_switch shared portable alias parser integration
+  tests:
+  - tests/hermes_cli/test_config_validation.py
+  - tests/hermes_cli/test_model_switch_configured_provider_routing.py
+  - tests/hermes_cli/test_ollama_cloud_auth.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  expected_commit_subject: 'feat(config): resolve portable workflow model references'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact small, medium, and large tier grammar,
+    exact @alias grammar, and literal model pass-through. Rich top-level aliases
+    win over model.aliases, managed config wins per leaf, and no project/package
+    alias authority or environment expansion is accepted. Resolution must remain
+    pure and independent of catalog, credential, and mutable global alias caches.
+    Public projections include only route URL digests, never URLs or secrets.
+  removal_condition: Remove when upstream has an equivalent bounded immutable
+    profile/managed parser shared with interactive aliases and a credential-free
+    workflow route resolver with identical precedence, provenance, warnings, and
+    installed-distribution guarantees.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: provider-workflow-capability-authority
   change_class: provider-runtime-generic
   owner: workflow-orchestration
