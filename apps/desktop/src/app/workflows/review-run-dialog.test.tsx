@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useKeybinds } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
+import { TRANSLATIONS } from '@/i18n'
 import { IS_MAC } from '@/lib/keybinds/combo'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import type * as ProfileStore from '@/store/profile'
@@ -18,6 +19,7 @@ import { WorkflowsView } from './index'
 const WORKFLOW_NAME = 'Portable contract'
 const IDEMPOTENCY_KEY = '11111111-2222-4333-8444-555555555555'
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
+const workflowCopy = TRANSLATIONS.en.operations
 
 // Spread the REAL module and override only the side-effecting actions. An
 // exhaustive hand-written mock breaks at collection time whenever upstream adds
@@ -942,7 +944,7 @@ describe('Review & Run workflow dialog', () => {
 
       const dialog = await openReviewDialog()
       expect(
-        within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+        within(dialog).getByText(workflowCopy.workflowRunIncompatible)
       ).toBeTruthy()
       expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
       expect(
@@ -978,7 +980,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+      within(dialog).getByText(workflowCopy.workflowRunIncompatible)
     ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
   })
@@ -1010,7 +1012,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+      within(dialog).getByText(workflowCopy.workflowRunSupportUnavailable)
     ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
@@ -1031,7 +1033,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+      within(dialog).getByText(workflowCopy.workflowRunSupportUnavailable)
     ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
@@ -1050,7 +1052,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+      within(dialog).getByText(workflowCopy.workflowRunSupportUnavailable)
     ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
   })
@@ -1078,7 +1080,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+      within(dialog).getByText(workflowCopy.workflowRunIncompatible)
     ).toBeTruthy()
     expect(within(dialog).getByText('provider custom does not advertise reasoning_effort')).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
