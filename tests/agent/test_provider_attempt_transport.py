@@ -9,7 +9,11 @@ import pytest
 from agent.anthropic_adapter import create_anthropic_message
 from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 from agent.codex_runtime import run_codex_app_server_turn, run_codex_stream
-from agent.provider_attempts import reserve_provider_transport_attempt
+from agent.provider_attempts import (
+    poison_provider_transport_attempt,
+    reserve_provider_transport_attempt,
+    settle_provider_transport_attempt,
+)
 from run_agent import AIAgent
 
 
@@ -193,6 +197,12 @@ def test_all_provider_transport_launch_sites_remain_reserved() -> None:
     assert _call_counts(
         "run_agent.py", "reserve_provider_transport_attempt"
     ) == {"_anthropic_messages_create": 1}
+    assert _call_counts(
+        "agent/conversation_loop.py", "settle_provider_transport_attempt"
+    ) == {"run_conversation": 1}
+    assert _call_counts(
+        "agent/conversation_loop.py", "poison_provider_transport_attempt"
+    ) == {"run_conversation": 2}
 
 
 def test_reservation_helper_is_optional_but_never_swallows_refusal() -> None:
@@ -204,3 +214,75 @@ def test_reservation_helper_is_optional_but_never_swallows_refusal() -> None:
     agent = SimpleNamespace(_provider_attempt_reservation_callback=refuse)
     with pytest.raises(RuntimeError, match="provider grant exhausted"):
         reserve_provider_transport_attempt(agent)
+
+
+def test_cost_lease_precedes_attempt_reservation_and_releases_when_no_transport():
+    events: list[object] = []
+
+    def refuse_attempt() -> None:
+        events.append("attempt")
+        raise RuntimeError("provider grant exhausted")
+
+    agent = SimpleNamespace(
+        provider="synthetic",
+        model="model",
+        _cost_budget_acquire_callback=lambda: events.append("cost") or "lease",
+        _cost_budget_release_unstarted_callback=(
+            lambda lease: events.append(("release", lease))
+        ),
+        _provider_attempt_reservation_callback=refuse_attempt,
+    )
+
+    with pytest.raises(RuntimeError, match="provider grant exhausted"):
+        reserve_provider_transport_attempt(agent)
+
+    assert events == ["cost", "attempt", ("release", "lease")]
+    assert getattr(agent, "_active_cost_budget_attempt_id", None) is None
+
+
+def test_success_and_ambiguous_transport_close_exactly_one_active_cost_lease():
+    settled = []
+    poisoned = []
+    agent = SimpleNamespace(
+        _cost_budget_acquire_callback=lambda: "lease",
+        _cost_budget_settle_callback=(
+            lambda lease, usage: settled.append((lease, usage)) or {"terminal": False}
+        ),
+        _cost_budget_poison_callback=(
+            lambda lease, code: poisoned.append((lease, code))
+        ),
+    )
+
+    reserve_provider_transport_attempt(agent)
+    evidence = settle_provider_transport_attempt(agent, {"cost": "0.1"})
+    assert evidence == {"terminal": False}
+    assert settled == [("lease", {"cost": "0.1"})]
+    assert poison_provider_transport_attempt(agent, "late") is False
+
+    reserve_provider_transport_attempt(agent)
+    assert poison_provider_transport_attempt(
+        agent, "authoritative_settlement_ambiguous"
+    ) is True
+    assert poisoned == [("lease", "authoritative_settlement_ambiguous")]
+    assert getattr(agent, "_active_cost_budget_attempt_id", None) is None
+
+
+def test_nested_physical_fallback_poisons_before_a_second_transport_can_reserve():
+    acquired = []
+    poisoned = []
+    agent = SimpleNamespace(
+        _cost_budget_acquire_callback=(
+            lambda: acquired.append("lease") or "lease"
+        ),
+        _cost_budget_poison_callback=(
+            lambda lease, code: poisoned.append((lease, code))
+        ),
+    )
+
+    reserve_provider_transport_attempt(agent)
+    with pytest.raises(RuntimeError, match="before authoritative settlement"):
+        reserve_provider_transport_attempt(agent)
+
+    assert acquired == ["lease"]
+    assert poisoned == [("lease", "authoritative_settlement_ambiguous")]
+    assert getattr(agent, "_active_cost_budget_attempt_id", None) is None

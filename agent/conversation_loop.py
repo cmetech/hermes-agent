@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.cost_budget import CostBudgetPoisoned, CostBudgetTerminalError
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -78,6 +79,10 @@ from agent.prompt_caching import (
     build_prompt_cache_plan,
     strip_anthropic_cache_control,
     strip_anthropic_tool_cache_control,
+)
+from agent.provider_attempts import (
+    poison_provider_transport_attempt,
+    settle_provider_transport_attempt,
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
@@ -2447,6 +2452,10 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                    settle_provider_transport_attempt(
+                        agent,
+                        getattr(response, "usage", None),
+                    )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3484,7 +3493,17 @@ def run_conversation(
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
-            except InterruptedError:
+            except CostBudgetTerminalError:
+                raise
+
+            except InterruptedError as interrupted_error:
+                if poison_provider_transport_attempt(
+                    agent, "authoritative_settlement_ambiguous"
+                ):
+                    raise CostBudgetPoisoned(
+                        "provider cancellation left billed cost ambiguous",
+                        failure_code="authoritative_settlement_ambiguous",
+                    ) from interrupted_error
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -3519,6 +3538,13 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if poison_provider_transport_attempt(
+                    agent, "authoritative_settlement_ambiguous"
+                ):
+                    raise CostBudgetPoisoned(
+                        "provider failure left billed cost ambiguous",
+                        failure_code="authoritative_settlement_ambiguous",
+                    ) from api_error
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 import threading
 import time
@@ -16,6 +17,7 @@ import unicodedata
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
+from agent.cost_budget import CostBudgetTerminalError
 from agent.plugin_agent import (
     _ProviderAttemptGrantExhausted,
     _reserve_shared_provider_attempt,
@@ -1174,6 +1176,10 @@ def _build_inline_agent_handler(
             fallback_model=getattr(parent, "fallback_model", None),
             request_overrides=getattr(parent, "request_overrides", {}),
             max_budget_usd=getattr(parent, "max_budget_usd", None),
+            _cost_budget_authority=getattr(
+                parent, "_cost_budget_authority", None
+            ),
+            _cost_budget_contract=getattr(parent, "_cost_budget_contract", None),
             sandbox_policy=getattr(parent, "sandbox_policy", None),
             max_process_tree_rss_bytes=getattr(
                 parent, "max_process_tree_rss_bytes", 2048 * 1024 * 1024
@@ -1772,6 +1778,44 @@ def _run(
                     requested=request.provider, target_model=model or None
                 )
 
+            cost_evidence = None
+            cost_contract = None
+            if request._cost_budget_authority is not None:
+                from agent.cost_budget import (
+                    CostBudgetExhausted,
+                    CostBudgetPoisoned,
+                    acquire_cost_lease,
+                    canonical_usd,
+                    poison_cost_lease,
+                    release_unstarted_cost_lease,
+                    settle_cost_lease,
+                    snapshot_cost_budget,
+                )
+                from agent.usage_pricing import AuthoritativeSettlementContract
+
+                raw_contract = dict(request._cost_budget_contract or {})
+                cost_contract = AuthoritativeSettlementContract(
+                    provider=str(raw_contract["provider"]),
+                    strategy=str(raw_contract["strategy"]),
+                    billing_mode=str(raw_contract["billing_mode"]),
+                    covered_outcomes=frozenset(raw_contract["covered_outcomes"]),
+                )
+                cost_evidence = snapshot_cost_budget(
+                    request._cost_budget_authority
+                )
+                if (
+                    cost_evidence["limit_usd"]
+                    != canonical_usd(request.max_budget_usd)
+                    or cost_evidence["provider"] != runtime.get("provider")
+                    or cost_evidence["model"] != model
+                    or cost_evidence["strategy"] != cost_contract.strategy
+                    or cost_contract.provider != runtime.get("provider")
+                ):
+                    raise CostBudgetPoisoned(
+                        "sealed authoritative cost route changed",
+                        failure_code="authoritative_cost_route_mismatch",
+                    )
+
             structured_decision = None
             if request.structured_output is not None:
                 runtime_capabilities = classify_resolved_execution_runtime(
@@ -1870,6 +1914,106 @@ def _run(
                 session_db=session_db,
                 clarify_callback=clarify,
             )
+            if request._cost_budget_authority is not None:
+                from agent.usage_pricing import authoritative_cost_fact
+
+                cost_authority = request._cost_budget_authority
+                cost_state_lock = threading.Lock()
+
+                def cost_deadline() -> float:
+                    deadlines = [
+                        deadline
+                        for deadline in (
+                            request.absolute_wall_deadline,
+                            request.absolute_idle_deadline,
+                            request.absolute_provider_deadline,
+                        )
+                        if deadline is not None
+                    ]
+                    return min(deadlines) if deadlines else (
+                        time.monotonic()
+                        + request.provider_request_timeout_seconds
+                    )
+
+                def acquire_cost_attempt() -> str:
+                    attempt_id = secrets.token_hex(16)
+                    return acquire_cost_lease(
+                        cost_authority,
+                        attempt_id=attempt_id,
+                        provider=str(agent.provider),
+                        model=str(agent.model),
+                        deadline=cost_deadline(),
+                        is_cancelled=lambda: (
+                            _cancel_event.is_set()
+                            or bool(getattr(agent, "_interrupt_requested", False))
+                        ),
+                    )
+
+                def release_unstarted_cost_attempt(attempt_id: str) -> None:
+                    nonlocal cost_evidence
+                    with cost_state_lock:
+                        cost_evidence = release_unstarted_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            provider=str(agent.provider),
+                            model=str(agent.model),
+                        )
+
+                def settle_cost_attempt(
+                    attempt_id: str, response_usage: object
+                ) -> dict[str, Any]:
+                    nonlocal cost_evidence
+                    assert cost_contract is not None
+                    fact = authoritative_cost_fact(
+                        response_usage,
+                        provider=str(agent.provider),
+                        model=str(agent.model),
+                        contract=cost_contract,
+                    )
+                    if fact is None:
+                        with cost_state_lock:
+                            cost_evidence = poison_cost_lease(
+                                cost_authority,
+                                attempt_id=attempt_id,
+                                failure_code="authoritative_settlement_missing",
+                            )
+                        raise CostBudgetPoisoned(
+                            "provider response lacked authoritative billed cost",
+                            failure_code="authoritative_settlement_missing",
+                        )
+                    with cost_state_lock:
+                        cost_evidence = settle_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            provider=fact.provider,
+                            model=fact.model,
+                            strategy=fact.strategy,
+                            amount_usd=fact.amount_usd,
+                            authoritative=fact.authoritative,
+                        )
+                    if cost_evidence["exhausted"]:
+                        raise CostBudgetExhausted(
+                            "authoritative cost budget is exhausted"
+                        )
+                    return cost_evidence
+
+                def poison_cost_attempt(
+                    attempt_id: str, failure_code: str
+                ) -> None:
+                    nonlocal cost_evidence
+                    with cost_state_lock:
+                        cost_evidence = poison_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            failure_code=failure_code,
+                        )
+
+                agent._cost_budget_acquire_callback = acquire_cost_attempt
+                agent._cost_budget_release_unstarted_callback = (
+                    release_unstarted_cost_attempt
+                )
+                agent._cost_budget_settle_callback = settle_cost_attempt
+                agent._cost_budget_poison_callback = poison_cost_attempt
             agent._api_max_retries = request.max_api_attempts
             provider_attempt_counter = [0]
             provider_attempt_grant_exhausted = [False]
@@ -2009,6 +2153,50 @@ def _run(
                 response = agent.run_conversation(
                     prompt, conversation_history=history
                 )
+            except CostBudgetTerminalError as exc:
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
+                provider_attempts = (
+                    shared_attempts
+                    if sealed_provider_grant or counted_provider_methods
+                    else model_calls
+                )
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {},
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": exc.failure_kind,
+                        "provider_attempts": provider_attempts,
+                        "model_calls": model_calls,
+                        "known_no_effect": provider_attempts == 0,
+                        "cost_budget": dict(
+                            cost_evidence
+                            or snapshot_cost_budget(cost_authority)
+                        ),
+                        **(
+                            {
+                                "intended_authority_digest": (
+                                    request.intended_authority_digest
+                                ),
+                                "model_visible_prefix_digest": (
+                                    model_visible_prefix_digest
+                                ),
+                            }
+                            if model_visible_prefix_digest is not None
+                            else {}
+                        ),
+                    },
+                    "structured_output": None,
+                }
             except Exception as exc:
                 if request.structured_output is None:
                     raise
@@ -2096,7 +2284,6 @@ def _run(
                 "provider_attempts": provider_attempts,
                 "model_calls": model_calls,
                 "hook_events": hook_events,
-                "max_budget_usd": request.max_budget_usd,
                 "sandbox_policy_declared": request.sandbox_policy is not None,
                 **(
                     {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
@@ -2105,6 +2292,13 @@ def _run(
                 ),
                 **(structured_evidence or {}),
             }
+            if cost_evidence is not None:
+                audit["cost_budget"] = dict(cost_evidence)
+            elif request.max_budget_usd is not None:
+                # Preserve the pre-Phase-5 generic plugin-agent audit shape.
+                # Sealed Phase 5 requests cannot reach this branch because
+                # request validation requires an authoritative cost broker.
+                audit["max_budget_usd"] = request.max_budget_usd
             if model_visible_prefix_digest is not None:
                 audit.update({
                     "intended_authority_digest": (

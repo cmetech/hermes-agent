@@ -534,7 +534,9 @@ class AgentNodeExecutor:
             ephemeral_system_prompt=None,
             request_overrides={},
             structured_output=structured_request,
-            max_budget_usd=None,
+            max_budget_usd=initial_request.max_budget_usd,
+            _cost_budget_authority=initial_request._cost_budget_authority,
+            _cost_budget_contract=initial_request._cost_budget_contract,
             sandbox_policy=None,
             approved_action_digest=None,
             workdir=context.run_directory,
@@ -551,6 +553,9 @@ class AgentNodeExecutor:
                 initial_request.provider_request_timeout_seconds,
                 remaining_wall,
             ),
+            absolute_wall_deadline=initial_request.absolute_wall_deadline,
+            absolute_idle_deadline=initial_request.absolute_idle_deadline,
+            absolute_provider_deadline=initial_request.absolute_provider_deadline,
             max_process_tree_rss_bytes=initial_request.max_process_tree_rss_bytes,
             max_process_tree_cpu_seconds=(initial_request.max_process_tree_cpu_seconds),
             max_descendants=initial_request.max_descendants,
@@ -749,6 +754,22 @@ class AgentNodeExecutor:
                 metadata={
                     "provider_attempts": 0,
                     "provider_attempts_exact": True,
+                    "known_no_effect": True,
+                    "archon_terminal_failure": True,
+                },
+            )
+        if phase5 and node.options.get(
+            "maxBudgetUsd", context.workflow_options.get("maxBudgetUsd")
+        ) is not None:
+            return NodeExecutionResult(
+                "failed",
+                error_code="authoritative_cost_unavailable",
+                error_message=(
+                    "no current provider route proves complete authoritative "
+                    "billing settlement"
+                ),
+                metadata={
+                    "provider_attempts": 0,
                     "known_no_effect": True,
                     "archon_terminal_failure": True,
                 },

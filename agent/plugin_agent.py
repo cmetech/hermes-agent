@@ -498,6 +498,12 @@ class PluginAgentRunRequest:
     request_overrides: Mapping[str, Any] = field(default_factory=dict)
     structured_output: StructuredOutputRequest | None = None
     max_budget_usd: float | None = None
+    _cost_budget_authority: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _cost_budget_contract: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
     sandbox_policy: Mapping[str, Any] | None = None
     approved_action_digest: str | None = None
     workdir: Path | None = None
@@ -575,6 +581,14 @@ class PluginAgentRunRequest:
             payload["_provider_attempt_authority"] = _wire_json(
                 self._provider_attempt_authority
             )
+        if self._cost_budget_authority is not None:
+            payload["_cost_budget_authority"] = _wire_json(
+                self._cost_budget_authority
+            )
+        if self._cost_budget_contract is not None:
+            payload["_cost_budget_contract"] = _wire_json(
+                self._cost_budget_contract
+            )
         return payload
 
     @classmethod
@@ -611,6 +625,8 @@ class PluginAgentRunRequest:
             "max_api_attempts",
             "sealed_provider_attempt_grant",
             "_provider_attempt_authority",
+            "_cost_budget_authority",
+            "_cost_budget_contract",
             "idle_timeout_seconds",
             "wall_timeout_seconds",
             "provider_request_timeout_seconds",
@@ -1207,6 +1223,42 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or request.max_budget_usd <= 0
     ):
         raise ValueError("max_budget_usd must be finite and positive")
+    cost_authority_present = request._cost_budget_authority is not None
+    cost_contract_present = request._cost_budget_contract is not None
+    if cost_authority_present != cost_contract_present:
+        raise ValueError("authoritative cost authority and contract must be paired")
+    if (
+        request.max_budget_usd is not None
+        and request.intended_authority_digest is not None
+        and not cost_authority_present
+    ):
+        raise ValueError("max_budget_usd requires authoritative cost enforcement")
+    if cost_authority_present:
+        if request.max_budget_usd is None:
+            raise ValueError("authoritative cost authority requires max_budget_usd")
+        from agent.cost_budget import validate_cost_budget_authority_descriptor
+        from agent.usage_pricing import AuthoritativeSettlementContract
+
+        validate_cost_budget_authority_descriptor(request._cost_budget_authority)
+        contract = request._cost_budget_contract
+        if not isinstance(contract, Mapping) or set(contract) != {
+            "provider",
+            "strategy",
+            "billing_mode",
+            "covered_outcomes",
+        }:
+            raise ValueError("authoritative cost contract is invalid")
+        covered = contract.get("covered_outcomes")
+        if not isinstance(covered, (list, tuple)):
+            raise ValueError("authoritative cost contract is invalid")
+        parsed_contract = AuthoritativeSettlementContract(
+            provider=contract.get("provider"),
+            strategy=contract.get("strategy"),
+            billing_mode=contract.get("billing_mode"),
+            covered_outcomes=frozenset(covered),
+        )
+        if not parsed_contract.complete:
+            raise ValueError("authoritative cost contract is incomplete")
     if request.structured_output is not None:
         _validate_structured_output(request.structured_output)
         overrides = request.request_overrides

@@ -368,6 +368,57 @@ upstream_changes:
     request authority with exact empty-tool semantics shared remaining limits and
     pre-provider fail-closed validation.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-authoritative-cost-budget
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/cost_budget.py
+  - agent/provider_attempts.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - agent/conversation_loop.py
+  - agent/usage_pricing.py
+  - plugins/workflow/executors/ai.py
+  owned_symbols:
+  - AuthoritativeCostBudget
+  - AuthoritativeSettlementContract
+  - AuthoritativeCostFact
+  - authoritative_cost_fact
+  - reserve_provider_transport_attempt cost lease ordering
+  - settle_provider_transport_attempt
+  - poison_provider_transport_attempt
+  - PluginAgentRunRequest private cost authority and contract
+  owned_invariants:
+  - hard budgets use bounded exact decimal settlement and never binary-float pricing estimates
+  - only a complete code-owned provider settlement contract can create an authoritative cost fact
+  - one authenticated in-flight lease serializes parent repair retry fallback and inline transports
+  - duplicate settlements are idempotent while contradictions route spoofing and missing settlement poison terminally
+  - a settled call may overrun once but exhaustion starts no later transport and cannot be retried or reset
+  - provider-attempt refusal releases a cost lease only with proof that transport did not start
+  - timeout cancellation disconnect and ambiguous transport failure never reopen the authority
+  - public evidence is a closed bounded credential-free ledger without raw usage or provider payloads
+  - OpenRouter shared-credit and BYOK routes remain unsupported until every billable terminal outcome is contractually covered
+  - pre-Phase-5 plugin-agent max-budget metadata retains its legacy wire and audit behavior
+  tests:
+  - tests/agent/test_cost_budget.py
+  - tests/agent/test_usage_pricing.py
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_plugin_agent.py
+  - tests/plugins/workflow/test_phase5_cost_budget.py
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_retry.py
+  expected_commit_subject: 'feat(agent): enforce shared authoritative cost budgets'
+  upstream_candidate: true
+  merge_guidance: Keep display estimates and local price tables wholly separate from
+    the hard authority. A provider route may install the generic callbacks only after
+    reviewed bundled code proves exact billed settlement across success streaming
+    charged errors disconnect timeout and cancellation. Preserve one shared lease and
+    poison rather than retry whenever billing outcome is ambiguous.
+  removal_condition: Remove when upstream provides an equivalent provider-neutral
+    authenticated exact-settlement authority plus a complete provider contract gate
+    and bounded public evidence.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration
