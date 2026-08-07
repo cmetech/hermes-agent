@@ -2165,7 +2165,7 @@ def _run(
                     max_budget_usd=request.max_budget_usd,
                     _cost_budget_authority=request._cost_budget_authority,
                     _cost_budget_contract=request._cost_budget_contract,
-                    sandbox_policy=None,
+                    sandbox_policy=request.sandbox_policy,
                     # A one-shot approval consumed or refused by the primary
                     # context must never be replayed in the fresh fallback.
                     approved_action_digest=None,

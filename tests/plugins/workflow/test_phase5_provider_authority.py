@@ -157,6 +157,57 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
         authority.authority_digest = "0" * 64  # type: ignore[misc]
 
 
+def test_fallback_route_classifies_inherited_capabilities_before_execution(
+    tmp_path, workflow_writer
+):
+    config = parse_workflow_model_config({
+        "model": {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.4",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+        "model_aliases": {
+            "primary": {
+                "provider": "openrouter",
+                "model": "openai/gpt-5.4",
+            },
+            "recovery": {
+                "provider": "future-provider",
+                "model": "future-model",
+            },
+        },
+    })
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "fallbackModel": "@recovery",
+            "allowed_tools": [],
+        }],
+    )
+    package = _load_v5(path)
+
+    authority = _authority(package, config=config)
+    decisions = authority.obligations_by_path["nodes[0].allowed_tools"]
+    report = assess_compatibility(package, provider_authority=authority)
+
+    assert {item.route_id for item in decisions} == {
+        "ask:primary",
+        "ask:fallback",
+    }
+    fallback = next(item for item in decisions if item.route_id == "ask:fallback")
+    assert fallback.decision.disposition.value == "unsupported"
+    assert fallback.decision.code == "hermes_managed_loop_required"
+    assert any(
+        item.path == "nodes[0].allowed_tools"
+        and item.code == "hermes_managed_loop_required"
+        for item in report.blocking_findings
+    )
+
+
 def test_provider_routes_cover_only_nodes_that_can_call_the_provider(
     tmp_path, workflow_writer
 ):
@@ -267,8 +318,6 @@ def test_approval_rework_blocks_options_its_executor_cannot_apply(
             },
         ),
         ("PreToolUse", {"systemMessage": "ignored"}),
-        ("PreToolUse", {"continue": True}),
-        ("PreToolUse", {"decision": "approve"}),
         ("PreToolUse", {"stopReason": "ignored"}),
         (
             "PreToolUse",
@@ -313,6 +362,43 @@ def test_hook_response_operations_block_when_the_runtime_event_ignores_them(
     assert decision.decision.disposition.value == "unsupported"
     assert any(
         item.path == f"nodes[0].hooks.{event}[0]"
+        for item in report.blocking_findings
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"continue": True},
+        {"decision": "approve"},
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            },
+        },
+    ],
+)
+def test_pre_tool_exact_allow_responses_use_normal_dispatch(
+    tmp_path, workflow_writer, response
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "hooks": {"PreToolUse": [{"response": response}]},
+        }],
+    )
+    package = _load_v5(path)
+    authority = _authority(package)
+    decision = authority.obligations_by_path["nodes[0].hooks.PreToolUse[0]"][0]
+    report = assess_compatibility(package, provider_authority=authority)
+
+    assert decision.decision.disposition.value == "hermes_adapter"
+    assert not any(
+        item.path == "nodes[0].hooks.PreToolUse[0]"
         for item in report.blocking_findings
     )
 
@@ -480,6 +566,29 @@ def test_every_accepted_provider_dependent_path_has_one_matrix_decision(
     assert all(authority.obligations_by_path.values())
     allowed = authority.obligations_by_path["nodes[0].allowed_tools"][0]
     assert allowed.decision.requested_semantics["explicit_empty"] is True
+    for inherited_path in (
+        "nodes[0].persist_session",
+        "nodes[0].allowed_tools",
+        "nodes[0].denied_tools",
+        "nodes[0].skills",
+        "nodes[0].mcp",
+        "nodes[0].agents",
+        "nodes[0].hooks.PreToolUse[0]",
+        "nodes[0].output_format",
+    ):
+        assert {
+            item.route_id
+            for item in authority.obligations_by_path[inherited_path]
+        } == {"ask:primary", "ask:fallback"}
+    for shared_authority_path in ("nodes[0].maxBudgetUsd", "sandbox"):
+        assert {
+            item.route_id
+            for item in authority.obligations_by_path[shared_authority_path]
+        } == {
+            "ask:primary",
+            "ask:fallback",
+            "ask:inline_agent:reviewer",
+        }
 
 
 def test_legacy_capability_sets_cannot_promote_v5_budget_or_sandbox(

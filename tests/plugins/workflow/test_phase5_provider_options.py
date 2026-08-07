@@ -334,6 +334,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         model="openai/gpt-5.4",
         intended_authority_digest="a" * 64,
         allowed_tools=(),
+        sandbox_policy={"mode": "provider_native"},
         workdir=tmp_path,
         sealed_provider_attempt_grant=True,
         sealed_fallback_route={
@@ -365,4 +366,5 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.request_overrides == {"verbosity": "high"}
     assert child.fallback_model is None
     assert child.sealed_fallback_route is None
+    assert child.sandbox_policy == {"mode": "provider_native"}
     assert kwargs["is_cancelled"]() is False

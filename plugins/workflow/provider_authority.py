@@ -89,8 +89,9 @@ def _hook_operations_supported(event: str, operations: object) -> bool:
         return False
     action_effective = (
         values.get("continue") is False
-        or values.get("decision") == "block"
-        or values.get("permission_decision") in {"deny", "ask"}
+        or values.get("continue") is True
+        or values.get("decision") in {"approve", "block"}
+        or values.get("permission_decision") in {"allow", "deny", "ask"}
     )
     if "stop_reason" in values and not action_effective:
         return False
@@ -967,158 +968,173 @@ def resolve_workflow_provider_authority(
                     )
 
         primary_id = primary.route_id
-        output = package.language.structured_outputs.get(node.id)
-        if output is not None:
-            add(
-                f"nodes[{index}].output_format",
-                primary_id,
-                WorkflowProviderFeature.STRUCTURED_OUTPUT,
-                option="json_schema",
-                requested={
-                    "schema_fingerprint": output.schema_fingerprint,
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        elif approval_rework and any(
-            field_name in node_options
-            for field_name in ("output_format", "output_type")
-        ):
-            add(
-                f"nodes[{index}].output_format",
-                primary_id,
-                WorkflowProviderFeature.STRUCTURED_OUTPUT,
-                option="json_schema",
-                requested={"execution_adapter_available": False},
-            )
-        if root.get("persist_sessions") is True:
-            add(
-                "persist_sessions",
-                primary_id,
-                WorkflowProviderFeature.SESSION_RESUMPTION,
-                requested={
-                    "session_available": environment.session_store_available,
-                    "cache_fingerprint_stable": True,
-                    "hermes_conversation_loop": (
-                        primary_runtime.hermes_managed_tool_loop
-                    ),
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        if node_options.get("persist_session") is True:
-            add(
-                f"nodes[{index}].persist_session",
-                primary_id,
-                WorkflowProviderFeature.SESSION_RESUMPTION,
-                requested={
-                    "session_available": environment.session_store_available,
-                    "cache_fingerprint_stable": True,
-                    "hermes_conversation_loop": (
-                        primary_runtime.hermes_managed_tool_loop
-                    ),
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        for field_name in ("allowed_tools", "denied_tools"):
-            if field_name in node_options:
-                add(
-                    f"nodes[{index}].{field_name}",
-                    primary_id,
-                    WorkflowProviderFeature.TOOL_RESTRICTIONS,
-                    option=field_name,
-                    requested={
-                        "explicit_empty": not bool(node_options[field_name]),
-                        "hermes_schema_selection": True,
-                        "hermes_dispatch": True,
-                    },
-                )
-        portability = package.language.node_semantics.get(node.id, {}).get(
-            "provider_portability"
-        )
-        hooks = portability.get("hooks", ()) if isinstance(portability, Mapping) else ()
-        if approval_rework and "hooks" in node_options and not hooks:
-            add(
-                f"nodes[{index}].hooks",
-                primary_id,
-                WorkflowProviderFeature.HOOKS,
-                option="approval_rework",
-                requested={
-                    "normalized": False,
-                    "events_supported": False,
-                    "lifecycle_available": environment.hook_lifecycle_available,
-                    "execution_adapter_available": False,
-                },
-            )
-        for hook_index, hook in enumerate(hooks):
-            if not isinstance(hook, Mapping):
-                continue
-            operations = hook.get("operations", ())
-            event = str(hook.get("event", ""))
-            add(
-                f"nodes[{index}].hooks.{event}[{hook_index}]",
-                primary_id,
-                WorkflowProviderFeature.HOOKS,
-                option=event,
-                requested={
-                    "normalized": True,
-                    "events_supported": _hook_operations_supported(
-                        event, operations
-                    ),
-                    "lifecycle_available": environment.hook_lifecycle_available,
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        if "mcp" in node_options:
-            mcp_precondition = (
-                mcp_execution_preconditions is None
-                or mcp_execution_preconditions.get(node.id) is True
-            )
-            add(
-                f"nodes[{index}].mcp",
-                primary_id,
-                WorkflowProviderFeature.MCP,
-                option="stdio",
-                requested={
-                    "sealed_definition": mcp_precondition,
-                    "bounded_lifecycle": True,
-                    "dependency_available": environment.mcp_available,
-                    "teardown_guaranteed": environment.mcp_available,
-                    "runtime_identity_digest": (
-                        plugin_agent_python_runtime_identity()
-                    ),
-                    "import_policy_version": (
-                        PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
-                    ),
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        if "skills" in node_options:
-            add(
-                f"nodes[{index}].skills",
-                primary_id,
-                WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
-                option="skills",
-                requested={
-                    "current_turn_content": True,
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
-        if "agents" in node_options:
-            add(
-                f"nodes[{index}].agents",
-                primary_id,
-                WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
-                option="inline_agents",
-                requested={
-                    "declared_worker_tool": environment.inline_agent_available,
-                    "shared_limits": environment.inline_agent_available,
-                    "execution_adapter_available": not approval_rework,
-                },
-            )
         node_route_ids = tuple(
             route_id
             for route_id, route in routes.items()
             if route.node_id == node.id
         )
+        execution_route_ids = tuple(
+            route_id
+            for route_id in node_route_ids
+            if routes[route_id].role in {"primary", "fallback"}
+        )
+        output = package.language.structured_outputs.get(node.id)
+        if output is not None:
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].output_format",
+                    route_id,
+                    WorkflowProviderFeature.STRUCTURED_OUTPUT,
+                    option="json_schema",
+                    requested={
+                        "schema_fingerprint": output.schema_fingerprint,
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        elif approval_rework and any(
+            field_name in node_options
+            for field_name in ("output_format", "output_type")
+        ):
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].output_format",
+                    route_id,
+                    WorkflowProviderFeature.STRUCTURED_OUTPUT,
+                    option="json_schema",
+                    requested={"execution_adapter_available": False},
+                )
+        if root.get("persist_sessions") is True:
+            for route_id in execution_route_ids:
+                add(
+                    "persist_sessions",
+                    route_id,
+                    WorkflowProviderFeature.SESSION_RESUMPTION,
+                    requested={
+                        "session_available": environment.session_store_available,
+                        "cache_fingerprint_stable": True,
+                        "hermes_conversation_loop": (
+                            runtimes[route_id].hermes_managed_tool_loop
+                        ),
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        if node_options.get("persist_session") is True:
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].persist_session",
+                    route_id,
+                    WorkflowProviderFeature.SESSION_RESUMPTION,
+                    requested={
+                        "session_available": environment.session_store_available,
+                        "cache_fingerprint_stable": True,
+                        "hermes_conversation_loop": (
+                            runtimes[route_id].hermes_managed_tool_loop
+                        ),
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        for field_name in ("allowed_tools", "denied_tools"):
+            if field_name in node_options:
+                for route_id in execution_route_ids:
+                    add(
+                        f"nodes[{index}].{field_name}",
+                        route_id,
+                        WorkflowProviderFeature.TOOL_RESTRICTIONS,
+                        option=field_name,
+                        requested={
+                            "explicit_empty": not bool(node_options[field_name]),
+                            "hermes_schema_selection": True,
+                            "hermes_dispatch": True,
+                        },
+                    )
+        portability = package.language.node_semantics.get(node.id, {}).get(
+            "provider_portability"
+        )
+        hooks = portability.get("hooks", ()) if isinstance(portability, Mapping) else ()
+        if approval_rework and "hooks" in node_options and not hooks:
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].hooks",
+                    route_id,
+                    WorkflowProviderFeature.HOOKS,
+                    option="approval_rework",
+                    requested={
+                        "normalized": False,
+                        "events_supported": False,
+                        "lifecycle_available": environment.hook_lifecycle_available,
+                        "execution_adapter_available": False,
+                    },
+                )
+        for hook_index, hook in enumerate(hooks):
+            if not isinstance(hook, Mapping):
+                continue
+            operations = hook.get("operations", ())
+            event = str(hook.get("event", ""))
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].hooks.{event}[{hook_index}]",
+                    route_id,
+                    WorkflowProviderFeature.HOOKS,
+                    option=event,
+                    requested={
+                        "normalized": True,
+                        "events_supported": _hook_operations_supported(
+                            event, operations
+                        ),
+                        "lifecycle_available": environment.hook_lifecycle_available,
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        if "mcp" in node_options:
+            mcp_precondition = (
+                mcp_execution_preconditions is None
+                or mcp_execution_preconditions.get(node.id) is True
+            )
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].mcp",
+                    route_id,
+                    WorkflowProviderFeature.MCP,
+                    option="stdio",
+                    requested={
+                        "sealed_definition": mcp_precondition,
+                        "bounded_lifecycle": True,
+                        "dependency_available": environment.mcp_available,
+                        "teardown_guaranteed": environment.mcp_available,
+                        "runtime_identity_digest": (
+                            plugin_agent_python_runtime_identity()
+                        ),
+                        "import_policy_version": (
+                            PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
+                        ),
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        if "skills" in node_options:
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].skills",
+                    route_id,
+                    WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
+                    option="skills",
+                    requested={
+                        "current_turn_content": True,
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
+        if "agents" in node_options:
+            for route_id in execution_route_ids:
+                add(
+                    f"nodes[{index}].agents",
+                    route_id,
+                    WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
+                    option="inline_agents",
+                    requested={
+                        "declared_worker_tool": environment.inline_agent_available,
+                        "shared_limits": environment.inline_agent_available,
+                        "execution_adapter_available": not approval_rework,
+                    },
+                )
         raw_allowed_tools = node_options.get("allowed_tools")
         raw_denied_tools = node_options.get("denied_tools", ())
         web_tool_names = {"web_search", "WebSearch"}
@@ -1186,26 +1202,28 @@ def resolve_workflow_provider_authority(
                 )
         if "maxBudgetUsd" in node_options:
             available = environment.authoritative_cost_available
-            add(
-                f"nodes[{index}].maxBudgetUsd",
-                primary_id,
-                WorkflowProviderFeature.COST_BUDGETS,
-                option="maxBudgetUsd",
-                requested={
-                    "authoritative_settlement": available,
-                    "all_billable_routes_observed": available,
-                    "single_unsettled": available,
-                },
-            )
+            for route_id in node_route_ids:
+                add(
+                    f"nodes[{index}].maxBudgetUsd",
+                    route_id,
+                    WorkflowProviderFeature.COST_BUDGETS,
+                    option="maxBudgetUsd",
+                    requested={
+                        "authoritative_settlement": available,
+                        "all_billable_routes_observed": available,
+                        "single_unsettled": available,
+                    },
+                )
 
         if "sandbox" in root:
-            add(
-                "sandbox",
-                primary_id,
-                WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
-                option="sandbox",
-                requested={"value": root["sandbox"]},
-            )
+            for route_id in node_route_ids:
+                add(
+                    "sandbox",
+                    route_id,
+                    WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
+                    option="sandbox",
+                    requested={"value": root["sandbox"]},
+                )
         if fallback_reference is not None:
             add(
                 (
@@ -1222,13 +1240,14 @@ def resolve_workflow_provider_authority(
                 },
             )
         if "sandbox" in node_options:
-            add(
-                f"nodes[{index}].sandbox",
-                primary_id,
-                WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
-                option="sandbox",
-                requested={"value": node_options["sandbox"]},
-            )
+            for route_id in node_route_ids:
+                add(
+                    f"nodes[{index}].sandbox",
+                    route_id,
+                    WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
+                    option="sandbox",
+                    requested={"value": node_options["sandbox"]},
+                )
 
     obligations.sort(
         key=lambda item: (
