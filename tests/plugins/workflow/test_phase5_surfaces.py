@@ -211,6 +211,20 @@ def test_rest_provider_projection_models_reject_open_or_unknown_shapes() -> None
             WorkflowProviderCapabilityProjection.model_validate(invalid)
 
 
+def test_rest_language_projection_accepts_the_explicit_v5_reader() -> None:
+    from plugins.workflow.dashboard.plugin_api import WorkflowDetailLanguageStatus
+
+    projected = WorkflowDetailLanguageStatus.model_validate({
+        "declared_profile": "archon-2026-07",
+        "effective_profile": "archon-2026-07",
+        "legacy": False,
+        "normalizer_version": 5,
+        "normalized_definition_digest": "a" * 64,
+    })
+
+    assert projected.normalizer_version == 5
+
+
 class _AttemptStore:
     def get_run_status(self, _run_id: str, *, operator_scope=None):
         return {

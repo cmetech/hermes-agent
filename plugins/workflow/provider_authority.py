@@ -846,7 +846,7 @@ def resolve_workflow_provider_authority(
 
     root = package.definition.options
     for index, node in enumerate(package.definition.nodes):
-        if node.node_type not in {"command", "prompt"}:
+        if node.node_type not in {"command", "prompt", "loop"}:
             continue
         node_options = node.options
         primary_reference = node_options.get("model", root.get("model"))

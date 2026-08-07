@@ -220,6 +220,7 @@ upstream_changes:
   - phase5_node_intended_authority_digest
   - phase5_session_cache_fingerprint
   - NodeSessionRecord
+  - _language_has_phase4_semantics
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
@@ -227,6 +228,7 @@ upstream_changes:
   - any intended authority or model-visible prefix drift selects fresh context before provider transport rather than mutating a cached prefix
   - persistent and same-run resumption require both paired Phase 5 identities
   - durable recovery journals both private identities while legacy session and recovery records remain byte-compatible
+  - normalizer v5 ordinary loops inherit v4 authenticated decision recovery and consumed-input cleanup
   - prefix verification runs again at every sealed provider-attempt reservation
   - no prompts tools credentials provider payloads or local paths enter public identity evidence
   tests:
@@ -237,6 +239,7 @@ upstream_changes:
   - tests/plugins/workflow/test_crash_recovery.py
   - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_typed_publication_recovery.py
+  - tests/plugins/workflow/test_phase4_loops.py
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true
   merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
@@ -438,10 +441,12 @@ upstream_changes:
   owned_symbols:
   - ProviderOptionTransport
   - encode_provider_option_transport
+  - resolve_workflow_provider_authority
   - NodeExecutionContext
   - PluginAgentRunRequest
   owned_invariants:
   - every accepted provider option has one reviewed exact transport encoder or blocks before transport
+  - every provider-calling prompt command or ordinary loop node receives a sealed primary route
   - route-specific effort decisions cannot be inherited from a different provider or model
   - OpenRouter effort uses only the declared reasoning.effort or verbosity request field
   - unsupported thinking shapes and every current provider-native sandbox request block without provider use
@@ -454,6 +459,7 @@ upstream_changes:
   - tests/plugins/workflow/test_phase5_provider_authority.py
   - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_phase5_inline_limits.py
+  - tests/plugins/workflow/test_phase4_loops.py
   - tests/agent/test_plugin_agent.py
   - tests/run_agent/test_fallback_reasoning_override.py
   - tests/run_agent/test_conversation_fallback_state.py
@@ -489,6 +495,7 @@ upstream_changes:
   - WorkflowProviderRouteProjection
   - WorkflowProviderDecisionProjection
   - WorkflowProviderCapabilityProjection
+  - WorkflowDetailLanguageStatus
   - isDesktopProviderCapabilityProjection
   owned_invariants:
   - catalog projects only bounded capability summary while detail adds bounded routes and decisions
@@ -498,6 +505,7 @@ upstream_changes:
   - missing malformed unsupported unknown or changed Phase 5 authority blocks before the existing run mutation URL
   - provider authority and budget evidence contain only sealed digests bounded outcomes and closed totals
   - existing workflow action names and mutation URLs remain unchanged
+  - the closed REST language projection accepts every supported v1 through v5 reader contract
   tests:
   - tests/plugins/workflow/test_phase5_surfaces.py
   - tests/plugins/workflow/test_evidence_api.py

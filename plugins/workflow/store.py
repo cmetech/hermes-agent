@@ -131,6 +131,23 @@ def _language_has_phase3_semantics(language: object) -> bool:
     )
 
 
+def _language_has_phase4_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 4 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase4_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
+
+
 class InputSnapshotError(ValueError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
@@ -12461,11 +12478,8 @@ class RunStore:
                 "_loop_input_consumed", False
             )
             language = projection.get("language")
-            if loop_input_consumed is True and (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
+            if loop_input_consumed is True and _language_has_phase4_semantics(
+                language
             ):
                 node.pop("loop_user_input_artifact", None)
             node["attempts"][-1]["metadata"] = safe_metadata
@@ -12968,12 +12982,7 @@ class RunStore:
                 raise RuntimeError("stale loop iteration")
             safe_state = dict(_sanitize(dict(loop_state)))
             language = projection.get("language")
-            phase4 = (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
-            )
+            phase4 = _language_has_phase4_semantics(language)
             feedback_binding = None
             if phase4:
                 output_path = safe_state.get("output_artifact")
@@ -13149,12 +13158,7 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if not (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
-            ):
+            if not _language_has_phase4_semantics(language):
                 return None
             candidates = []
             for node_id, node in projection.get("nodes", {}).items():
