@@ -886,6 +886,35 @@ def test_runtime_limits_load_from_plugin_entry_without_new_root_config(tmp_path)
     assert config.max_total_workers == 3
 
 
+def test_runtime_limits_honor_managed_profile_overlay(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 2\n"
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 5\n"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+
+    config = _runtime_config(profile)
+
+    assert config.max_parallel_nodes == 5
+
+
 def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():
     source = (Path(__file__).parents[3] / "plugins" / "workflow" / "cli.py").read_text(
         encoding="utf-8"

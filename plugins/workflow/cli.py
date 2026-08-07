@@ -1455,12 +1455,12 @@ def _doctor_compatibility_level(
 
 
 def _profile_config(hermes_home: str | Path) -> Mapping[str, object]:
+    from hermes_cli.config import load_config_readonly
+
     path = Path(hermes_home) / "config.yaml"
-    if not path.is_file():
-        return {}
     try:
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeError, yaml.YAMLError):
+        config = load_config_readonly(path)
+    except (OSError, UnicodeError):
         return {}
     return config if isinstance(config, Mapping) else {}
 
@@ -2103,10 +2103,10 @@ def _runtime_config(
     *,
     sidecar: Mapping[str, object] | None = None,
 ) -> WorkflowRuntimeConfig:
+    from hermes_cli.config import load_config_readonly
+
     path = Path(hermes_home) / "config.yaml"
-    raw: object = {}
-    if path.is_file():
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw: object = load_config_readonly(path)
     if not isinstance(raw, Mapping):
         raise ValueError("config.yaml must contain a mapping")
     plugins = raw.get("plugins", {})

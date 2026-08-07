@@ -45,6 +45,39 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: explicit-profile-canonical-config-loader
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/config.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/runtime.py
+  - tests/hermes_cli/test_config_loader_e2e.py
+  - tests/hermes_cli/test_config_read_guard.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - load_config config_path
+  - load_config_readonly config_path
+  - _load_config_impl config_path
+  - _profile_config canonical behavioral read
+  - _runtime_config canonical behavioral read
+  - WorkflowRetentionPolicy.from_profile canonical behavioral read
+  - WorkflowApiLimits.from_profile canonical behavioral read
+  tests:
+  - tests/hermes_cli/test_config_loader_e2e.py
+  - tests/hermes_cli/test_config_read_guard.py
+  - tests/plugins/workflow/test_cli.py
+  expected_commit_subject: 'fix(config): load explicit profile paths canonically'
+  upstream_candidate: true
+  merge_guidance: Preserve the optional explicit config path on both canonical behavioral
+    loaders so multi-profile services can resolve a selected profile without mutating
+    process-global HERMES_HOME. The explicit path must retain defaults, normalization,
+    environment expansion, managed-scope precedence, cache invalidation, and
+    last-known-good semantics. Workflow retention, API, compatibility, and runtime
+    policy reads must consume this authority instead of parsing config.yaml directly.
+  removal_condition: Remove when upstream provides an equivalent thread-safe explicit-profile
+    behavioral loader and every workflow config consumer uses it.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: brand-aware-version-label
   change_class: branding-generic
   owner: downstream-branding
