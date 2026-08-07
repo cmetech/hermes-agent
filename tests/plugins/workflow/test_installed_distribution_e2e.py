@@ -693,23 +693,23 @@ nodes:
             sys.executable,
             "-c",
             """
-    from datetime import datetime, timezone
-    import json
-    from pathlib import Path
-    import sys
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import sys
 
-    from plugins.workflow.admission import RunAdmissionRequest
-    from plugins.workflow.schema import load_workflow_snapshot
-    from plugins.workflow.scheduler import RunScheduler
-    from plugins.workflow.store import RunStore
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.schema import load_workflow_snapshot
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.store import RunStore
 
-    path = Path(sys.argv[1])
-    package = load_workflow_snapshot(
-        path,
-        workflow_bytes=path.read_bytes(),
-        sidecar_bytes=path.with_name("installed-official.hermes.yaml").read_bytes(),
-        normalizer_version=4,
-    )
+path = Path(sys.argv[1])
+package = load_workflow_snapshot(
+    path,
+    workflow_bytes=path.read_bytes(),
+    sidecar_bytes=path.with_name("installed-official.hermes.yaml").read_bytes(),
+    normalizer_version=4,
+)
 store = RunStore(sys.argv[2])
 snapshot = store.prepare_run_snapshot(package)
 admitted = store.start_run(
