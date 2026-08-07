@@ -201,3 +201,20 @@ def test_managed_uv_helpers_exist():
     assert callable(resolve_uv)
     assert callable(ensure_uv)
     assert managed_uv_path().parent.name == "bin"
+
+
+def test_enrolled_browser_uses_managed_npx(monkeypatch):
+    from tools import browser_session_manager
+
+    monkeypatch.setattr(
+        "tools.browser_tool._find_agent_browser", lambda: "npx agent-browser"
+    )
+    monkeypatch.setattr(
+        "hermes_constants.find_node_executable",
+        lambda command: "/managed/node/bin/npx" if command == "npx" else None,
+    )
+
+    assert browser_session_manager._agent_browser_cmd() == [
+        "/managed/node/bin/npx",
+        "agent-browser",
+    ]

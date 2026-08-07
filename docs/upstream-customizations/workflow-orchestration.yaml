@@ -45,6 +45,25 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: enrolled-browser-managed-npx-resolution
+  change_class: runtime-resolution-generic
+  owner: workflow-orchestration
+  files:
+  - tools/browser_session_manager.py
+  - tests/test_managed_runtime_resolution.py
+  owned_symbols:
+  - browser_session_manager._agent_browser_cmd managed npx resolution
+  tests:
+  - tests/test_managed_runtime_resolution.py
+  expected_commit_subject: 'fix(browser): resolve enrolled npx from managed runtime'
+  upstream_candidate: true
+  merge_guidance: Preserve the enrolled browser session manager's reuse of
+    browser_tool._find_agent_browser, but resolve its npx fallback through the
+    canonical managed Node authority. A missing or broken managed tree must fail
+    closed instead of falling back to an unrelated ambient npx.
+  removal_condition: Remove when upstream enrolled browser sessions use an
+    equivalent managed-aware npx resolver.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: posix-generic-launcher-python-dispatch
   change_class: installer-generic
   owner: workflow-orchestration

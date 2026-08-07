@@ -31,7 +31,6 @@ import base64
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -77,14 +76,19 @@ def _agent_browser_cmd() -> List[str]:
 
     ``_find_agent_browser()`` raises FileNotFoundError when the CLI is missing.
     The ``npx agent-browser`` special case mirrors browser_tool's own idiom: on
-    Windows npx is ``npx.cmd``, so ``shutil.which`` is required for
-    CreateProcessW to execute the batch shim.
+    Resolve npx through Hermes' managed Node authority so profile-scoped
+    installs work even when their bin directory is absent from ambient PATH.
     """
     from tools.browser_tool import _find_agent_browser
 
     browser_cmd = _find_agent_browser()
     if browser_cmd == "npx agent-browser":
-        return [shutil.which("npx") or "npx", "agent-browser"]
+        from hermes_constants import find_node_executable
+
+        npx = find_node_executable("npx")
+        if not npx:
+            raise FileNotFoundError("npx not found for agent-browser")
+        return [npx, "agent-browser"]
     return [browser_cmd]
 
 
