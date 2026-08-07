@@ -72,7 +72,16 @@ class OpenRouterProfile(ProviderProfile):
                 "code": "provider_native_sandbox_unavailable",
                 "rationale": "OpenRouter does not provide an exact native sandbox contract",
             }
-        if feature != "effort_thinking" or option not in {"effort", "thinking"}:
+        if feature == "effort_thinking" and option == "thinking":
+            return {
+                "disposition": "unsupported",
+                "code": "openrouter_thinking_shape_unsupported",
+                "rationale": (
+                    "OpenRouter has no single exact translation for the documented "
+                    "workflow thinking shapes"
+                ),
+            }
+        if feature != "effort_thinking" or option != "effort":
             return super().declare_workflow_capability(
                 feature,
                 model=model,

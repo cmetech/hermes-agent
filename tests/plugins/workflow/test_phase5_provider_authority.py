@@ -217,9 +217,17 @@ def test_every_accepted_provider_dependent_path_has_one_matrix_decision(
         "nodes[0].maxBudgetUsd",
         "nodes[0].output_format",
     }
-    assert all(
-        len(obligations) == 1 for obligations in authority.obligations_by_path.values()
-    )
+    decision_keys = [
+        (
+            obligation.path,
+            obligation.route_id,
+            obligation.decision.feature,
+            obligation.decision.option,
+        )
+        for obligation in authority.obligations
+    ]
+    assert len(decision_keys) == len(set(decision_keys))
+    assert all(authority.obligations_by_path.values())
     allowed = authority.obligations_by_path["nodes[0].allowed_tools"][0]
     assert allowed.decision.requested_semantics["explicit_empty"] is True
 

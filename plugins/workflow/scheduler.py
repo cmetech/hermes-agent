@@ -4083,6 +4083,7 @@ class RunScheduler:
                                 if provider_authority is not None
                                 else None
                             ),
+                            sealed_provider_authority=provider_authority,
                             intended_authority_digest=(
                                 phase5_node_intended_authority_digest(
                                     provider_authority,

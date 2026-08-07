@@ -419,6 +419,56 @@ upstream_changes:
     authenticated exact-settlement authority plus a complete provider contract gate
     and bounded public evidence.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-provider-option-transport
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/provider_capabilities.py
+  - plugins/model-providers/openrouter/__init__.py
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/scheduler.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  owned_symbols:
+  - ProviderOptionTransport and encode_provider_option_transport
+  - NodeExecutionContext sealed provider authority
+  - PluginAgentRunRequest sealed fallback route
+  - route-specific option obligations for primary fallback and inline-agent models
+  - worker-local fresh sealed fallback launch
+  owned_invariants:
+  - every accepted provider option has one reviewed exact transport encoder or blocks before transport
+  - route-specific effort decisions cannot be inherited from a different provider or model
+  - OpenRouter effort uses only the declared reasoning.effort or verbosity request field
+  - unsupported thinking shapes and every current provider-native sandbox request block without provider use
+  - Hermes web execution is admitted only when the service and exact web_search tool policy are reachable
+  - Phase 5 fallback uses a fresh child context with its own sealed provider model runtime and option identity
+  - primary fallback and inline agents share attempt cost deadline workdir resource and cancellation authorities
+  - legacy fallback request behavior remains wire-compatible and unchanged
+  tests:
+  - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_phase5_provider_authority.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_phase5_inline_limits.py
+  - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_fallback_reasoning_override.py
+  - tests/run_agent/test_conversation_fallback_state.py
+  - tests/plugins/web/test_web_search_provider_plugins.py
+  - tests/plugins/workflow/test_security_boundaries.py
+  - tests/plugins/workflow/test_provider_failures.py
+  expected_commit_subject: 'feat(workflow): enforce provider option capabilities'
+  upstream_candidate: true
+  merge_guidance: Keep provider declarations separate from transport encoders. A
+    declaration without a reviewed exact request mapping must fail closed. Preserve
+    the generic optional plugin-agent wire extension and run sealed fallback inside
+    the already registered worker tree so cached primary context is never mutated.
+    Do not describe process resource ceilings as sandbox enforcement.
+  removal_condition: Remove when upstream provides equivalent route-specific sealed
+    option transports fresh-context fallback with shared authorities and truthful
+    provider-native sandbox blocking.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration

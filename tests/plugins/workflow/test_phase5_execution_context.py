@@ -5,6 +5,11 @@ from dataclasses import replace
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.provider_capabilities import (
+    CapabilityDisposition,
+    ProviderCapabilityDecision,
+    WorkflowProviderFeature,
+)
 import plugins.workflow.execution_semantics as semantics
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.ai import AgentNodeExecutor
@@ -16,6 +21,7 @@ from plugins.workflow.models import (
 )
 from plugins.workflow.provider_authority import (
     WorkflowProviderAuthority,
+    WorkflowCapabilityObligation,
     WorkflowResolvedProviderRoute,
 )
 from plugins.workflow.resources import VariableContext
@@ -47,10 +53,34 @@ def _route(*, model: str = "sealed-model") -> WorkflowResolvedProviderRoute:
 
 
 def _authority(*, model: str = "sealed-model") -> WorkflowProviderAuthority:
+    route = _route(model=model)
     return WorkflowProviderAuthority(
         config_fingerprint="4" * 64,
-        routes={"ask:primary": _route(model=model)},
-        obligations=(),
+        routes={"ask:primary": route},
+        obligations=(
+            WorkflowCapabilityObligation(
+                path="nodes[0].effort",
+                route_id="ask:primary",
+                decision=ProviderCapabilityDecision(
+                    feature=WorkflowProviderFeature.EFFORT_THINKING,
+                    disposition=(
+                        CapabilityDisposition.DEGRADED_WITH_EXPLICIT_SEMANTICS
+                    ),
+                    provider=route.provider,
+                    model=route.model,
+                    option="effort",
+                    requested_semantics={"value": "high"},
+                    effective_semantics={"request_field": "reasoning.effort"},
+                    adapter_version=1,
+                    declaration_source="provider_profile",
+                    registration_provenance_digest=(
+                        route.registration_provenance_digest
+                    ),
+                    code="test_effort_translation",
+                    rationale="test fixture translation",
+                ),
+            ),
+        ),
         warnings=(),
         authority_digest=("5" if model == "sealed-model" else "6") * 64,
     )
@@ -136,6 +166,7 @@ def _context(tmp_path, *, route=True, shared=False) -> NodeExecutionContext:
         language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
         normalizer_version=5,
         sealed_provider_route=_route() if route else None,
+        sealed_provider_authority=_authority() if route else None,
         intended_authority_digest="a" * 64,
         predecessor_results=(
             {
@@ -167,7 +198,7 @@ def test_phase5_executor_uses_only_sealed_route_and_returns_both_identities(
     request = runner.requests[0]
     assert request.provider == "sealed-provider"
     assert request.model == "sealed-model"
-    assert request.reasoning_config == {"effort": "high"}
+    assert request.reasoning_config == {"enabled": True, "effort": "high"}
     assert request.intended_authority_digest == "a" * 64
     assert request.expected_runtime_identity == {
         "provider": "sealed-provider",

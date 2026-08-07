@@ -1140,8 +1140,20 @@ def _build_inline_agent_handler(
         parent = parent_request
         request = PluginAgentRunRequest(
             prompt=prompt,
-            provider=getattr(parent, "provider", None),
+            provider=(
+                definition.get("provider")
+                or getattr(parent, "provider", None)
+            ),
             model=definition.get("model") or getattr(parent, "model", None),
+            intended_authority_digest=definition.get(
+                "intended_authority_digest"
+            ),
+            expected_runtime_identity=definition.get(
+                "expected_runtime_identity"
+            ),
+            expected_mcp_runtime_identity_digest=getattr(
+                parent, "expected_mcp_runtime_identity_digest", None
+            ),
             allowed_tools=(
                 tuple(definition["allowed_tools"])
                 if definition.get("allowed_tools") is not None
@@ -1172,9 +1184,17 @@ def _build_inline_agent_handler(
                 parent, "absolute_provider_deadline", None
             ),
             approved_action_digest=getattr(parent, "approved_action_digest", None),
-            reasoning_config=getattr(parent, "reasoning_config", None),
-            fallback_model=getattr(parent, "fallback_model", None),
-            request_overrides=getattr(parent, "request_overrides", {}),
+            reasoning_config=(
+                definition["reasoning_config"]
+                if "reasoning_config" in definition
+                else getattr(parent, "reasoning_config", None)
+            ),
+            fallback_model=None,
+            request_overrides=(
+                definition["request_overrides"]
+                if "request_overrides" in definition
+                else getattr(parent, "request_overrides", {})
+            ),
             max_budget_usd=getattr(parent, "max_budget_usd", None),
             _cost_budget_authority=getattr(
                 parent, "_cost_budget_authority", None
@@ -2102,6 +2122,105 @@ def _run(
                     provider_attempt_counter[0],
                     provider_attempt_grant_exhausted[0],
                 )
+
+            def run_sealed_fallback(primary_usage: dict[str, Any]):
+                fallback = request.sealed_fallback_route
+                if (
+                    not isinstance(fallback, dict)
+                    or _cancel_event.is_set()
+                    or provider_attempt_state()[1]
+                ):
+                    return None
+                from agent.plugin_agent import (
+                    PluginAgentRunRequest,
+                    PluginAgentRunner,
+                )
+
+                child_request = PluginAgentRunRequest(
+                    prompt=prompt,
+                    provider=str(fallback["provider"]),
+                    model=str(fallback["model"]),
+                    context_mode="fresh",
+                    session_id=None,
+                    intended_authority_digest=request.intended_authority_digest,
+                    expected_runtime_identity=dict(
+                        fallback["expected_runtime_identity"]
+                    ),
+                    expected_mcp_runtime_identity_digest=(
+                        request.expected_mcp_runtime_identity_digest
+                    ),
+                    enabled_toolsets=request.enabled_toolsets,
+                    allowed_tools=request.allowed_tools,
+                    denied_tools=request.denied_tools,
+                    skills=(),
+                    hooks=request.hooks,
+                    mcp_servers=request.mcp_servers,
+                    inline_agents=request.inline_agents,
+                    reasoning_config=dict(fallback["reasoning_config"]),
+                    fallback_model=None,
+                    sealed_fallback_route=None,
+                    ephemeral_system_prompt=request.ephemeral_system_prompt,
+                    request_overrides=dict(fallback["request_overrides"]),
+                    structured_output=request.structured_output,
+                    max_budget_usd=request.max_budget_usd,
+                    _cost_budget_authority=request._cost_budget_authority,
+                    _cost_budget_contract=request._cost_budget_contract,
+                    sandbox_policy=None,
+                    # A one-shot approval consumed or refused by the primary
+                    # context must never be replayed in the fresh fallback.
+                    approved_action_digest=None,
+                    workdir=request.workdir,
+                    max_iterations=request.max_iterations,
+                    max_api_attempts=request.max_api_attempts,
+                    sealed_provider_attempt_grant=(
+                        request.sealed_provider_attempt_grant
+                    ),
+                    _provider_attempt_authority=(
+                        request._provider_attempt_authority
+                    ),
+                    idle_timeout_seconds=request.idle_timeout_seconds,
+                    wall_timeout_seconds=request.wall_timeout_seconds,
+                    provider_request_timeout_seconds=(
+                        request.provider_request_timeout_seconds
+                    ),
+                    absolute_wall_deadline=request.absolute_wall_deadline,
+                    absolute_idle_deadline=request.absolute_idle_deadline,
+                    absolute_provider_deadline=request.absolute_provider_deadline,
+                    max_process_tree_rss_bytes=request.max_process_tree_rss_bytes,
+                    max_process_tree_cpu_seconds=(
+                        request.max_process_tree_cpu_seconds
+                    ),
+                    max_descendants=max(0, request.max_descendants - 1),
+                    cooperative_shutdown_seconds=(
+                        request.cooperative_shutdown_seconds
+                    ),
+                    term_grace_seconds=request.term_grace_seconds,
+                    kill_reap_grace_seconds=request.kill_reap_grace_seconds,
+                )
+                fallback_result = PluginAgentRunner(plugin_id).run(
+                    child_request,
+                    is_cancelled=lambda: _cancel_event.is_set(),
+                )
+                wire = fallback_result.to_wire()
+                wire["usage"] = {
+                    key: sum(
+                        value
+                        for value in (
+                            primary_usage.get(key),
+                            fallback_result.usage.get(key),
+                        )
+                        if isinstance(value, int | float)
+                    )
+                    for key in sorted(
+                        set(primary_usage) | set(fallback_result.usage)
+                    )
+                }
+                wire["audit"] = {
+                    **dict(fallback_result.audit),
+                    "fallback_used": True,
+                    "fallback_context": "fresh",
+                }
+                return wire
             _active_agent = agent
             installed_node_hooks = _install_node_hooks(request.hooks)
             hook_events = installed_node_hooks
@@ -2198,8 +2317,59 @@ def _run(
                     "structured_output": None,
                 }
             except Exception as exc:
+                if request.sealed_fallback_route is not None:
+                    fallback_result = run_sealed_fallback({
+                        "input_tokens": int(
+                            getattr(agent, "session_input_tokens", 0) or 0
+                        ),
+                        "output_tokens": int(
+                            getattr(agent, "session_output_tokens", 0) or 0
+                        ),
+                        "cache_read_tokens": int(
+                            getattr(agent, "session_cache_read_tokens", 0) or 0
+                        ),
+                        "cache_write_tokens": int(
+                            getattr(agent, "session_cache_write_tokens", 0) or 0
+                        ),
+                    })
+                    if fallback_result is not None:
+                        return fallback_result
                 if request.structured_output is None:
-                    raise
+                    if request.intended_authority_digest is None:
+                        raise
+                    model_calls = max(
+                        0, int(getattr(agent, "_api_call_count", 0) or 0)
+                    )
+                    shared_attempts, shared_exhausted = provider_attempt_state()
+                    provider_attempt_grant_exhausted[0] = shared_exhausted
+                    failure_kind = getattr(
+                        exc, "failure_kind", type(exc).__name__
+                    )
+                    if not isinstance(failure_kind, str) or not failure_kind:
+                        failure_kind = type(exc).__name__
+                    return {
+                        "final_response": "",
+                        "session_id": str(agent.session_id or ""),
+                        "provider": str(agent.provider or ""),
+                        "model": str(agent.model or ""),
+                        "status": "failed",
+                        "pending_interaction": None,
+                        "usage": {},
+                        "audit": {
+                            "plugin_id": plugin_id,
+                            "failure_kind": failure_kind,
+                            "provider_attempts": shared_attempts,
+                            "model_calls": model_calls,
+                            "known_no_effect": shared_attempts == 0,
+                            "intended_authority_digest": (
+                                request.intended_authority_digest
+                            ),
+                            "model_visible_prefix_digest": (
+                                model_visible_prefix_digest
+                            ),
+                        },
+                        "structured_output": None,
+                    }
                 assert structured_decision is not None
                 model_calls = max(
                     0, int(getattr(agent, "_api_call_count", 0) or 0)
@@ -2269,6 +2439,15 @@ def _run(
                 if sealed_provider_grant or counted_provider_methods
                 else model_calls
             )
+            if (
+                failed
+                and not shared_exhausted
+                and not pending
+                and request.sealed_fallback_route is not None
+            ):
+                fallback_result = run_sealed_fallback(usage)
+                if fallback_result is not None:
+                    return fallback_result
             structured_evidence = None
             if request.structured_output is not None:
                 assert structured_decision is not None

@@ -159,6 +159,115 @@ class ProviderCapabilityDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderOptionTransport:
+    """Closed transport projection for one sealed workflow model route."""
+
+    reasoning_config: Mapping[str, Any]
+    request_overrides: Mapping[str, Any]
+    hermes_web_tool: bool = False
+
+    def __post_init__(self) -> None:
+        reasoning = _safe_semantics(self.reasoning_config)
+        overrides = _safe_semantics(self.request_overrides)
+        if reasoning is None or overrides is None:
+            raise ValueError("provider_option_encoder_unavailable")
+        object.__setattr__(self, "reasoning_config", reasoning)
+        object.__setattr__(self, "request_overrides", overrides)
+
+
+def encode_provider_option_transport(
+    route: object,
+    obligations: Iterable[object],
+) -> ProviderOptionTransport:
+    """Encode only capability-reviewed options for an immutable route.
+
+    This is intentionally a small allowlist. A provider declaration is not an
+    encoder: any accepted declaration without a reviewed request translation
+    fails closed before provider transport.
+    """
+
+    route_id = getattr(route, "route_id", None)
+    provider = getattr(route, "provider", None)
+    model = getattr(route, "model", None)
+    provenance = getattr(route, "registration_provenance_digest", None)
+    options = getattr(route, "provider_options", None)
+    if (
+        not isinstance(route_id, str)
+        or not isinstance(provider, str)
+        or not isinstance(model, str)
+        or not isinstance(options, Mapping)
+    ):
+        raise ValueError("provider_option_encoder_unavailable")
+
+    decisions: list[ProviderCapabilityDecision] = []
+    for obligation in obligations:
+        if getattr(obligation, "route_id", None) != route_id:
+            continue
+        decision = getattr(obligation, "decision", None)
+        if isinstance(decision, ProviderCapabilityDecision):
+            decisions.append(decision)
+
+    reasoning: dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
+    hermes_web_tool = False
+    for option, value in options.items():
+        feature = (
+            WorkflowProviderFeature.WEB_EXECUTION
+            if option == "web_execution"
+            else WorkflowProviderFeature.EFFORT_THINKING
+        )
+        matches = [
+            decision
+            for decision in decisions
+            if decision.feature is feature
+            and decision.option == (value if option == "web_execution" else option)
+            and decision.requested_semantics.get("value", value) == value
+        ]
+        accepted = [
+            decision
+            for decision in matches
+            if decision.disposition is not CapabilityDisposition.UNSUPPORTED
+        ]
+        if not accepted:
+            raise ValueError("provider_option_encoder_unavailable")
+        decision = accepted[0]
+        if (
+            any(candidate.to_dict() != decision.to_dict() for candidate in accepted[1:])
+            or decision.provider != provider
+            or decision.model != model
+            or decision.registration_provenance_digest != provenance
+        ):
+            raise ValueError("provider_option_encoder_unavailable")
+
+        if option == "effort":
+            if not isinstance(value, str) or not value:
+                raise ValueError("provider_option_encoder_unavailable")
+            request_field = decision.effective_semantics.get("request_field")
+            reasoning.update({"enabled": True, "effort": value})
+            if request_field == "verbosity":
+                overrides["verbosity"] = value
+            elif request_field == "reasoning.effort":
+                overrides["extra_body"] = {"reasoning": {"effort": value}}
+            else:
+                raise ValueError("provider_option_encoder_unavailable")
+        elif option == "web_execution":
+            if (
+                value != "hermes_tool"
+                or decision.effective_semantics.get("mode") != "hermes_web_tool"
+            ):
+                raise ValueError("provider_option_encoder_unavailable")
+            hermes_web_tool = True
+        else:
+            raise ValueError("provider_option_encoder_unavailable")
+
+    return ProviderOptionTransport(
+        reasoning_config=reasoning,
+        request_overrides=overrides,
+        hermes_web_tool=hermes_web_tool,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _ParsedDeclaration:
     disposition: CapabilityDisposition
     effective_semantics: Mapping[str, Any]

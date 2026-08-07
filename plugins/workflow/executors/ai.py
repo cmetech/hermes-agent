@@ -25,6 +25,7 @@ from agent.structured_output import (
     parse_validate_canonicalize,
     require_structured_output_validator,
 )
+from hermes_cli.provider_capabilities import encode_provider_option_transport
 from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
@@ -696,6 +697,10 @@ class AgentNodeExecutor:
     @staticmethod
     def _inline_agents(context: NodeExecutionContext) -> dict[str, dict[str, object]]:
         definitions: dict[str, dict[str, object]] = {}
+        phase5 = supports_phase5_semantics(
+            context.language_profile,
+            context.normalizer_version,
+        )
         for agent_id, raw in context.node.options.get("agents", {}).items():
             allowed = (
                 [resolve_tool_name(name) for name in raw["tools"]]
@@ -715,7 +720,7 @@ class AgentNodeExecutor:
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
                 ).text(f"node-agent-skills/{context.node.id}/{agent_id}.md")
-            definitions[str(agent_id)] = {
+            definition: dict[str, object] = {
                 "description": str(raw["description"]),
                 "prompt": str(raw["prompt"]),
                 "model": raw.get("model"),
@@ -724,6 +729,40 @@ class AgentNodeExecutor:
                 "instructions": instructions,
                 "max_iterations": min(int(raw.get("maxTurns", 90)), 90),
             }
+            if phase5:
+                authority = context.sealed_provider_authority
+                route = (
+                    authority.routes.get(
+                        f"{context.node.id}:inline_agent:{agent_id}"
+                    )
+                    if authority is not None
+                    else None
+                )
+                if route is None:
+                    raise ValueError("provider_capability_drift")
+                transport = encode_provider_option_transport(
+                    route,
+                    authority.obligations,
+                )
+                definition.update({
+                    "provider": route.provider,
+                    "model": route.model,
+                    "intended_authority_digest": (
+                        context.intended_authority_digest
+                    ),
+                    "expected_runtime_identity": {
+                        "provider": route.provider,
+                        "model": route.model,
+                        "api_mode": route.api_mode,
+                        "base_url_trust_class": route.base_url_trust_class,
+                        "registration_provenance_digest": (
+                            route.registration_provenance_digest
+                        ),
+                    },
+                    "reasoning_config": dict(transport.reasoning_config),
+                    "request_overrides": _thaw(transport.request_overrides),
+                })
+            definitions[str(agent_id)] = definition
         return definitions
 
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
@@ -735,9 +774,12 @@ class AgentNodeExecutor:
             context.normalizer_version,
         )
         sealed_route = context.sealed_provider_route
+        sealed_authority = context.sealed_provider_authority
         intended_authority_digest = context.intended_authority_digest
         if phase5 and (
             sealed_route is None
+            or sealed_authority is None
+            or sealed_authority.routes.get(f"{node.id}:primary") != sealed_route
             or sealed_route.node_id != node.id
             or sealed_route.role != "primary"
             or not isinstance(intended_authority_digest, str)
@@ -756,6 +798,22 @@ class AgentNodeExecutor:
                     "provider_attempts_exact": True,
                     "known_no_effect": True,
                     "archon_terminal_failure": True,
+                },
+            )
+        if phase5 and node.options.get(
+            "sandbox", context.workflow_options.get("sandbox")
+        ) is not None:
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_native_sandbox_unavailable",
+                error_message="no current provider route guarantees native sandbox enforcement",
+                metadata={
+                    "provider_attempts": 0,
+                    "known_no_effect": True,
+                    "archon_terminal_failure": True,
+                    "recommendation": (
+                        "execution_environment: isolated_backend_required"
+                    ),
                 },
             )
         if phase5 and node.options.get(
@@ -1172,38 +1230,120 @@ class AgentNodeExecutor:
                     )
                 if allowed_tools is not None:
                     allowed_tools = (*allowed_tools, "workflow_agent")
-            route_options = sealed_route.provider_options if phase5 else {}
-            effort = (
-                route_options.get("effort")
-                if phase5
-                else node.options.get("effort")
+            if phase5:
+                assert sealed_authority is not None
+                try:
+                    provider_transport = encode_provider_option_transport(
+                        sealed_route,
+                        sealed_authority.obligations,
+                    )
+                except ValueError as exc:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code=str(exc),
+                        error_message="sealed provider option has no exact transport encoder",
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                reasoning_config = dict(provider_transport.reasoning_config)
+                request_overrides = _thaw(provider_transport.request_overrides)
+                if provider_transport.hermes_web_tool and (
+                    (allowed_tools is not None and "web_search" not in allowed_tools)
+                    or "web_search" in denied_tools
+                ):
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="web_execution_precondition_unsatisfied",
+                        error_message="the sealed Hermes web tool is unreachable",
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+            else:
+                effort = (
+                    node.options.get("effort")
                 or context.workflow_options.get("modelReasoningEffort")
                 or context.workflow_options.get("effort")
-            )
-            thinking = (
-                route_options.get("thinking")
-                if phase5
-                else node.options.get("thinking")
+                )
+                thinking = (
+                    node.options.get("thinking")
                 or context.workflow_options.get("thinking")
-            )
-            reasoning_config = {
-                key: value
-                for key, value in {
-                    "effort": effort,
-                    "thinking": _thaw(thinking),
-                }.items()
-                if value is not None
-            }
+                )
+                reasoning_config = {
+                    key: value
+                    for key, value in {
+                        "effort": effort,
+                        "thinking": _thaw(thinking),
+                    }.items()
+                    if value is not None
+                }
+                request_overrides = {}
+                betas = node.options.get(
+                    "betas", context.workflow_options.get("betas")
+                )
+                web_mode = context.workflow_options.get("webSearchMode")
+                if betas is not None:
+                    request_overrides["betas"] = _thaw(betas)
+                if web_mode is not None:
+                    request_overrides["web_search_mode"] = web_mode
+
+            sealed_fallback_route = None
             fallback_model = node.options.get(
                 "fallbackModel", context.workflow_options.get("fallbackModel")
             )
-            request_overrides = {}
-            betas = node.options.get("betas", context.workflow_options.get("betas"))
-            web_mode = context.workflow_options.get("webSearchMode")
-            if betas is not None:
-                request_overrides["betas"] = _thaw(betas)
-            if web_mode is not None:
-                request_overrides["web_search_mode"] = web_mode
+            if phase5 and fallback_model is not None:
+                assert sealed_authority is not None
+                fallback_route = sealed_authority.routes.get(f"{node.id}:fallback")
+                if fallback_route is None:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="provider_capability_drift",
+                        error_message="sealed fallback route is missing",
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                try:
+                    fallback_transport = encode_provider_option_transport(
+                        fallback_route,
+                        sealed_authority.obligations,
+                    )
+                except ValueError as exc:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code=str(exc),
+                        error_message="sealed fallback option has no exact transport encoder",
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                sealed_fallback_route = {
+                    "provider": fallback_route.provider,
+                    "model": fallback_route.model,
+                    "context_mode": "fresh",
+                    "expected_runtime_identity": {
+                        "provider": fallback_route.provider,
+                        "model": fallback_route.model,
+                        "api_mode": fallback_route.api_mode,
+                        "base_url_trust_class": fallback_route.base_url_trust_class,
+                        "registration_provenance_digest": (
+                            fallback_route.registration_provenance_digest
+                        ),
+                    },
+                    "reasoning_config": dict(fallback_transport.reasoning_config),
+                    "request_overrides": _thaw(
+                        fallback_transport.request_overrides
+                    ),
+                }
             request = PluginAgentRunRequest(
                 prompt=prompt if prompt is not None else self._prompt(context),
                 provider=(
@@ -1259,7 +1399,12 @@ class AgentNodeExecutor:
                 mcp_servers=mcp_servers,
                 inline_agents=inline_agents,
                 reasoning_config=reasoning_config or None,
-                fallback_model=str(fallback_model) if fallback_model else None,
+                fallback_model=(
+                    None
+                    if phase5
+                    else str(fallback_model) if fallback_model else None
+                ),
+                sealed_fallback_route=sealed_fallback_route,
                 ephemeral_system_prompt=node.options.get("systemPrompt"),
                 request_overrides=request_overrides,
                 structured_output=structured_request,

@@ -15,8 +15,37 @@ from agent.plugin_agent_worker import _build_inline_agent_handler, _run
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.models import freeze_value
+from plugins.workflow.provider_authority import WorkflowCapabilityObligation
 from tests.plugins.workflow.test_phase5_execution_context import _Runner, _context
 from tests.plugins.workflow.test_phase5_provider_authority import _authority, _load_v5
+
+
+def _with_inline_authority(context):
+    authority = context.sealed_provider_authority
+    primary = context.sealed_provider_route
+    assert authority is not None and primary is not None
+    inline = replace(
+        primary,
+        route_id="ask:inline_agent:reviewer",
+        role="inline_agent",
+        inline_agent_id="reviewer",
+        requested_reference_sha256="c" * 64,
+        route_fingerprint="d" * 64,
+    )
+    primary_obligation = authority.obligations[0]
+    inline_obligation = WorkflowCapabilityObligation(
+        path="nodes[0].agents.reviewer.effort",
+        route_id=inline.route_id,
+        decision=replace(primary_obligation.decision),
+    )
+    return replace(
+        context,
+        sealed_provider_authority=replace(
+            authority,
+            routes={**dict(authority.routes), inline.route_id: inline},
+            obligations=(*authority.obligations, inline_obligation),
+        ),
+    )
 
 
 def test_phase5_admission_blocks_inline_agent_unreachable_by_tool_policy(
@@ -48,7 +77,7 @@ def test_phase5_admission_blocks_inline_agent_unreachable_by_tool_policy(
 
 def test_phase5_inline_agent_behind_explicit_empty_tool_policy_blocks(tmp_path):
     runner = _Runner()
-    context = _context(tmp_path)
+    context = _with_inline_authority(_context(tmp_path))
     node = replace(
         context.node,
         options=freeze_value({
@@ -72,7 +101,7 @@ def test_phase5_inline_agent_behind_explicit_empty_tool_policy_blocks(tmp_path):
 
 def test_phase5_omitted_tool_allowlist_keeps_declared_inline_agent_reachable(tmp_path):
     runner = _Runner()
-    context = _context(tmp_path)
+    context = _with_inline_authority(_context(tmp_path))
     node = replace(
         context.node,
         options=freeze_value({
@@ -96,7 +125,7 @@ def test_phase5_omitted_tool_allowlist_keeps_declared_inline_agent_reachable(tmp
 
 def test_phase5_inline_agent_deny_rule_is_not_overridden(tmp_path):
     runner = _Runner()
-    context = _context(tmp_path)
+    context = _with_inline_authority(_context(tmp_path))
     node = replace(
         context.node,
         options=freeze_value({

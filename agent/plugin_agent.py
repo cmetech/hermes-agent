@@ -494,6 +494,7 @@ class PluginAgentRunRequest:
     inline_agents: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     reasoning_config: Mapping[str, Any] | None = None
     fallback_model: str | None = None
+    sealed_fallback_route: Mapping[str, Any] | None = None
     ephemeral_system_prompt: str | None = None
     request_overrides: Mapping[str, Any] = field(default_factory=dict)
     structured_output: StructuredOutputRequest | None = None
@@ -550,6 +551,7 @@ class PluginAgentRunRequest:
             "inline_agents": _wire_json(self.inline_agents),
             "reasoning_config": _wire_json(self.reasoning_config),
             "fallback_model": self.fallback_model,
+            "sealed_fallback_route": _wire_json(self.sealed_fallback_route),
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "request_overrides": _wire_json(self.request_overrides),
             "structured_output": (
@@ -614,6 +616,7 @@ class PluginAgentRunRequest:
             "inline_agents",
             "reasoning_config",
             "fallback_model",
+            "sealed_fallback_route",
             "ephemeral_system_prompt",
             "request_overrides",
             "structured_output",
@@ -1212,6 +1215,55 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or not request.fallback_model.strip()
     ):
         raise ValueError("fallback_model must be a non-empty string or None")
+    if request.sealed_fallback_route is not None:
+        fallback = request.sealed_fallback_route
+        required = {
+            "provider",
+            "model",
+            "context_mode",
+            "expected_runtime_identity",
+            "reasoning_config",
+            "request_overrides",
+        }
+        if (
+            not isinstance(fallback, Mapping)
+            or set(fallback) != required
+            or fallback.get("context_mode") != "fresh"
+            or not isinstance(fallback.get("provider"), str)
+            or not fallback.get("provider")
+            or not isinstance(fallback.get("model"), str)
+            or not fallback.get("model")
+            or not isinstance(fallback.get("reasoning_config"), Mapping)
+            or not isinstance(fallback.get("request_overrides"), Mapping)
+            or request.intended_authority_digest is None
+            or request.sealed_provider_attempt_grant is not True
+            or request.fallback_model is not None
+        ):
+            raise ValueError("sealed fallback route is malformed")
+        identity = fallback.get("expected_runtime_identity")
+        expected_runtime_fields = {
+            "provider",
+            "model",
+            "api_mode",
+            "base_url_trust_class",
+            "registration_provenance_digest",
+        }
+        if (
+            not isinstance(identity, Mapping)
+            or set(identity) != expected_runtime_fields
+            or identity.get("provider") != fallback.get("provider")
+            or identity.get("model") != fallback.get("model")
+            or any(
+                not isinstance(identity.get(field), str) or not identity.get(field)
+                for field in expected_runtime_fields
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(identity.get("registration_provenance_digest", "")),
+            )
+            is None
+        ):
+            raise ValueError("sealed fallback route is malformed")
     if request.ephemeral_system_prompt is not None and not isinstance(
         request.ephemeral_system_prompt, str
     ):
@@ -1670,7 +1722,9 @@ def _exchange_worker(
     if (
         isinstance(request, dict)
         and request.get("sealed_provider_attempt_grant") is True
-        and bool(request.get("inline_agents"))
+        and bool(
+            request.get("inline_agents") or request.get("sealed_fallback_route")
+        )
         and request.get("_provider_attempt_authority") is None
     ):
         grant = request.get("max_api_attempts")

@@ -20,7 +20,10 @@ from plugins.workflow.output_resolution import (
     PrimaryOutputCandidate,
     ResolvedOutputReference,
 )
-from plugins.workflow.provider_authority import WorkflowResolvedProviderRoute
+from plugins.workflow.provider_authority import (
+    WorkflowProviderAuthority,
+    WorkflowResolvedProviderRoute,
+)
 from plugins.workflow.sessions import (
     PersistentSessionRecoverySelection,
     SessionRegistryUpdateCandidate,
@@ -82,6 +85,7 @@ class NodeExecutionContext:
     language_profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY
     normalizer_version: int = 2
     sealed_provider_route: WorkflowResolvedProviderRoute | None = None
+    sealed_provider_authority: WorkflowProviderAuthority | None = None
     intended_authority_digest: str | None = None
     expected_model_visible_prefix_digest: str | None = None
     sealed_mcp_runtime_identity_digest: str | None = None

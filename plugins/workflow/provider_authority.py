@@ -954,14 +954,75 @@ def resolve_workflow_provider_authority(
                     "shared_limits": environment.inline_agent_available,
                 },
             )
-        for field_name in ("effort", "thinking", "betas"):
-            if field_name in node_options:
+        node_route_ids = tuple(
+            route_id
+            for route_id, route in routes.items()
+            if route.node_id == node.id
+        )
+        raw_allowed_tools = node_options.get("allowed_tools")
+        raw_denied_tools = node_options.get("denied_tools", ())
+        web_tool_names = {"web_search", "WebSearch"}
+        web_tool_reachable = (
+            raw_allowed_tools is None
+            or bool(web_tool_names.intersection(raw_allowed_tools))
+        ) and not bool(web_tool_names.intersection(raw_denied_tools))
+        for route_id in node_route_ids:
+            effective_options = routes[route_id].provider_options
+            for option_name in ("effort", "thinking", "betas", "service_tier"):
+                if option_name not in effective_options:
+                    continue
+                if option_name in node_options:
+                    option_path = f"nodes[{index}].{option_name}"
+                elif option_name == "effort" and "modelReasoningEffort" in root:
+                    option_path = "modelReasoningEffort"
+                else:
+                    option_path = option_name
                 add(
-                    f"nodes[{index}].{field_name}",
+                    option_path,
+                    route_id,
+                    WorkflowProviderFeature.EFFORT_THINKING,
+                    option=option_name,
+                    requested={"value": effective_options[option_name]},
+                )
+            if "web_execution" in effective_options:
+                web_option = str(effective_options["web_execution"])
+                add(
+                    "webSearchMode",
+                    route_id,
+                    WorkflowProviderFeature.WEB_EXECUTION,
+                    option=web_option,
+                    requested={
+                        "value": web_option,
+                        "service_available": (
+                            environment.web_service_available
+                            and web_tool_reachable
+                        ),
+                        "explicit_mapping": web_option == "hermes_tool",
+                    },
+                )
+        for root_name, option_name in (
+            ("modelReasoningEffort", "effort"),
+            ("effort", "effort"),
+            ("thinking", "thinking"),
+            ("betas", "betas"),
+            ("service_tier", "service_tier"),
+        ):
+            if root_name in root:
+                if any(
+                    obligation.path == root_name
+                    and obligation.route_id == primary_id
+                    and obligation.decision.feature
+                    is WorkflowProviderFeature.EFFORT_THINKING
+                    and obligation.decision.option == option_name
+                    for obligation in obligations
+                ):
+                    continue
+                add(
+                    root_name,
                     primary_id,
                     WorkflowProviderFeature.EFFORT_THINKING,
-                    option=field_name,
-                    requested={"value": node_options[field_name]},
+                    option=option_name,
+                    requested={"value": root[root_name]},
                 )
         if "maxBudgetUsd" in node_options:
             available = environment.authoritative_cost_available
@@ -977,31 +1038,13 @@ def resolve_workflow_provider_authority(
                 },
             )
 
-        root_controls = (
-            ("modelReasoningEffort", WorkflowProviderFeature.EFFORT_THINKING, "effort"),
-            ("effort", WorkflowProviderFeature.EFFORT_THINKING, "effort"),
-            ("thinking", WorkflowProviderFeature.EFFORT_THINKING, "thinking"),
-            ("betas", WorkflowProviderFeature.EFFORT_THINKING, "betas"),
-            ("webSearchMode", WorkflowProviderFeature.WEB_EXECUTION, None),
-            ("sandbox", WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX, "sandbox"),
-        )
-        for field_name, feature, mapped_option in root_controls:
-            if field_name not in root:
-                continue
-            option = mapped_option
-            requested: Mapping[str, Any] = {"value": root[field_name]}
-            if field_name == "webSearchMode":
-                option = str(root[field_name])
-                requested = {
-                    "service_available": environment.web_service_available,
-                    "explicit_mapping": option == "hermes_tool",
-                }
+        if "sandbox" in root:
             add(
-                field_name,
+                "sandbox",
                 primary_id,
-                feature,
-                option=option,
-                requested=requested,
+                WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
+                option="sandbox",
+                requested={"value": root["sandbox"]},
             )
         if fallback_reference is not None:
             add(
