@@ -459,6 +459,9 @@ class PluginAgentRunRequest:
     model: str | None = None
     context_mode: Literal["fresh", "shared"] = "fresh"
     session_id: str | None = None
+    intended_authority_digest: str | None = None
+    expected_model_visible_prefix_digest: str | None = None
+    expected_runtime_identity: Mapping[str, str] | None = None
     enabled_toolsets: tuple[str, ...] | None = None
     allowed_tools: tuple[str, ...] | None = None
     denied_tools: tuple[str, ...] = ()
@@ -498,6 +501,11 @@ class PluginAgentRunRequest:
             "model": self.model,
             "context_mode": self.context_mode,
             "session_id": self.session_id,
+            "intended_authority_digest": self.intended_authority_digest,
+            "expected_model_visible_prefix_digest": (
+                self.expected_model_visible_prefix_digest
+            ),
+            "expected_runtime_identity": _wire_json(self.expected_runtime_identity),
             "enabled_toolsets": _wire_json(self.enabled_toolsets),
             "allowed_tools": _wire_json(self.allowed_tools),
             "denied_tools": _wire_json(self.denied_tools),
@@ -547,6 +555,9 @@ class PluginAgentRunRequest:
             "model",
             "context_mode",
             "session_id",
+            "intended_authority_digest",
+            "expected_model_visible_prefix_digest",
+            "expected_runtime_identity",
             "enabled_toolsets",
             "allowed_tools",
             "denied_tools",
@@ -942,6 +953,51 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         not isinstance(request.session_id, str) or not request.session_id.strip()
     ):
         raise ValueError("shared context requires session_id")
+    for label, value in (
+        ("intended authority", request.intended_authority_digest),
+        (
+            "expected model-visible prefix",
+            request.expected_model_visible_prefix_digest,
+        ),
+    ):
+        if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{label} digest must be lowercase SHA-256")
+    if (
+        request.expected_model_visible_prefix_digest is not None
+        and request.intended_authority_digest is None
+    ):
+        raise ValueError(
+            "expected model-visible prefix requires sealed intended authority"
+        )
+    if request.expected_runtime_identity is not None:
+        expected_runtime_fields = {
+            "provider",
+            "model",
+            "api_mode",
+            "base_url_trust_class",
+            "registration_provenance_digest",
+        }
+        if (
+            not isinstance(request.expected_runtime_identity, Mapping)
+            or set(request.expected_runtime_identity) != expected_runtime_fields
+            or any(
+                not isinstance(request.expected_runtime_identity[field], str)
+                or not request.expected_runtime_identity[field]
+                for field in expected_runtime_fields
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                request.expected_runtime_identity[
+                    "registration_provenance_digest"
+                ],
+            )
+            is None
+        ):
+            raise ValueError("expected runtime identity is malformed")
+        if request.intended_authority_digest is None:
+            raise ValueError(
+                "expected runtime identity requires sealed intended authority"
+            )
     if (
         not isinstance(request.max_iterations, int)
         or isinstance(request.max_iterations, bool)

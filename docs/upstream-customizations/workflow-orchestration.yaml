@@ -196,6 +196,58 @@ upstream_changes:
     provider-registration authority with immutable loader provenance, closure
     identity, and canonical transport round-tripping.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-sealed-runtime-context
+  change_class: workflow-security
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/conversation_loop.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - model_tools.py
+  - run_agent.py
+  - plugins/workflow/execution_semantics.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/sessions.py
+  - plugins/workflow/store.py
+  owned_symbols:
+  - model_visible_prefix_digest canonical prompt and ordered tool-schema identity
+  - AIAgent.seal_model_visible_prefix and verify_model_visible_prefix
+  - PluginAgentRunRequest Phase 5 intended prefix and runtime identities
+  - phase5_node_intended_authority_digest
+  - phase5_session_cache_fingerprint
+  - NodeSessionRecord paired Phase 5 identity columns
+  - scheduler authenticated provider authority execution binding
+  owned_invariants:
+  - normalizer-v5 execution uses only the authenticated sealed provider model and option route
+  - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
+  - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
+  - any intended authority or model-visible prefix drift selects fresh context before provider transport rather than mutating a cached prefix
+  - persistent and same-run resumption require both paired Phase 5 identities
+  - durable recovery journals both private identities while legacy session and recovery records remain byte-compatible
+  - prefix verification runs again at every sealed provider-attempt reservation
+  - no prompts tools credentials provider payloads or local paths enter public identity evidence
+  tests:
+  - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_phase5_provider_snapshot.py
+  - tests/plugins/workflow/test_persistent_session_recovery.py
+  - tests/plugins/workflow/test_crash_recovery.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_typed_publication_recovery.py
+  expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
+  upstream_candidate: true
+  merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
+    expected runtime identity and paired cache identities. Compute the runtime prefix
+    only after prompt contributors and final tool filtering, but before session reads
+    and provider calls. Preserve exact legacy recovery encodings and never resolve
+    workflow aliases or provider capabilities inside clients.
+  removal_condition: Remove when upstream provides equivalent two-stage immutable
+    provider and model-visible-prefix authority with crash-safe paired recovery and
+    pre-transport drift rejection.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration

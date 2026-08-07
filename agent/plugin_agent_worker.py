@@ -1210,6 +1210,58 @@ def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
     }
 
 
+def _prefix_identity_mismatch_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+    model_visible_prefix_digest: str,
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "cache_fingerprint_changed",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+            "model_visible_prefix_digest": model_visible_prefix_digest,
+        },
+        "structured_output": None,
+    }
+
+
+def _runtime_identity_mismatch_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "provider_capability_drift",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+        },
+        "structured_output": None,
+    }
+
+
 def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
     failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
     if (
@@ -1295,7 +1347,10 @@ def _run(
         # forging worker-origin zero-attempt evidence.
         from hermes_state import SessionDB
 
-        if request.context_mode == "shared":
+        if (
+            request.context_mode == "shared"
+            and request.intended_authority_digest is None
+        ):
             session_db = SessionDB()
             history = session_db.get_existing_session_conversation(
                 request.session_id
@@ -1372,12 +1427,36 @@ def _run(
 
         model = _configured_model(request.model)
         runtime = None
-        if enabled_mcp_names:
+        if enabled_mcp_names or request.expected_runtime_identity is not None:
             runtime = resolve_runtime_provider(
                 requested=request.provider, target_model=model or None
             )
             runtime_capabilities = classify_resolved_execution_runtime(runtime)
-            if not runtime_capabilities.hermes_managed_tool_loop:
+            if request.expected_runtime_identity is not None:
+                actual_runtime_identity = {
+                    "provider": runtime_capabilities.effective_provider,
+                    "model": runtime_capabilities.model,
+                    "api_mode": runtime_capabilities.api_mode,
+                    "base_url_trust_class": (
+                        runtime_capabilities.base_url_trust_class
+                    ),
+                    "registration_provenance_digest": (
+                        runtime_capabilities.registration_provenance_digest
+                    ),
+                }
+                if actual_runtime_identity != dict(
+                    request.expected_runtime_identity
+                ):
+                    return _runtime_identity_mismatch_failure(
+                        plugin_id,
+                        intended_authority_digest=(
+                            request.intended_authority_digest or ""
+                        ),
+                    )
+            if (
+                enabled_mcp_names
+                and not runtime_capabilities.hermes_managed_tool_loop
+            ):
                 raise PackageMCPUnavailable(
                     "package_mcp_unavailable: resolved runtime does not use "
                     "Hermes' tool loop"
@@ -1626,6 +1705,8 @@ def _run(
             if sealed_provider_grant:
 
                 def reserve_provider_attempt() -> None:
+                    if request.intended_authority_digest is not None:
+                        agent.verify_model_visible_prefix()
                     if _cancel_event.is_set() or getattr(
                         agent, "_interrupt_requested", False
                     ):
@@ -1718,6 +1799,31 @@ def _run(
             agent.valid_tool_names = {_tool_name(tool) for tool in agent.tools}
             if not agent.valid_tool_names <= visible:
                 raise RuntimeError("agent tool scope verification failed")
+
+            model_visible_prefix_digest = None
+            if request.intended_authority_digest is not None:
+                model_visible_prefix_digest = agent.seal_model_visible_prefix()
+                expected_prefix = request.expected_model_visible_prefix_digest
+                if (
+                    expected_prefix is not None
+                    and expected_prefix != model_visible_prefix_digest
+                ):
+                    return _prefix_identity_mismatch_failure(
+                        plugin_id,
+                        intended_authority_digest=(
+                            request.intended_authority_digest
+                        ),
+                        model_visible_prefix_digest=(
+                            model_visible_prefix_digest
+                        ),
+                    )
+                if request.context_mode == "shared":
+                    session_db = SessionDB()
+                    history = session_db.get_existing_session_conversation(
+                        request.session_id
+                    )
+                    if history is None:
+                        return _persistent_session_missing_failure(plugin_id)
 
             _emit("progress", phase="running", session_id=agent.session_id)
             if provider_start_gate is not None:
@@ -1824,6 +1930,13 @@ def _run(
                 ),
                 **(structured_evidence or {}),
             }
+            if model_visible_prefix_digest is not None:
+                audit.update({
+                    "intended_authority_digest": (
+                        request.intended_authority_digest
+                    ),
+                    "model_visible_prefix_digest": model_visible_prefix_digest,
+                })
             if provider_attempt_grant_exhausted[0]:
                 audit["failure_kind"] = (
                     _ProviderAttemptGrantExhausted.failure_kind

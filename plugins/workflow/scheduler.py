@@ -34,6 +34,7 @@ from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_enti
 from plugins.workflow.execution_semantics import (
     Phase3ExecutionSemantics,
     WorkflowExecutionSemanticsError,
+    phase5_node_intended_authority_digest,
     read_phase3_execution_semantics,
 )
 from plugins.workflow.executors.ai import AgentNodeExecutor
@@ -146,6 +147,25 @@ class _StrictReferenceSnapshot:
             raise WorkflowOutputReferenceError(
                 "output_reference_integrity", node_id, tuple(path)
             ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRunPackage:
+    """Legacy-five-tuple preparation result plus private Phase 5 authority."""
+
+    package: WorkflowPackage
+    execution_limits: RunExecutionLimits
+    sealed_resource_paths: frozenset[str]
+    sealed_resource_bytes: Mapping[str, bytes]
+    execution_semantics: Phase3ExecutionSemantics | None
+    provider_authority: object | None = None
+
+    def __iter__(self):
+        yield self.package
+        yield self.execution_limits
+        yield self.sealed_resource_paths
+        yield self.sealed_resource_bytes
+        yield self.execution_semantics
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
 _OUTPUT_RESOLUTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
@@ -1039,6 +1059,8 @@ class RunScheduler:
                 expected_generation=candidate.expected_generation,
                 session_id=candidate.new_session_id,
                 cache_fingerprint=candidate.cache_fingerprint,
+                intended_authority_digest=candidate.intended_authority_digest,
+                model_visible_prefix_digest=candidate.model_visible_prefix_digest,
             )
         except Exception:
             if retry_count < 5:
@@ -3383,6 +3405,7 @@ class RunScheduler:
                     )
                 )
             semantics = None
+            resources = None
             if supports_phase3_semantics(
                 package.language.effective_profile, package.language.normalizer_version
             ):
@@ -3426,7 +3449,21 @@ class RunScheduler:
                 )
             else:
                 execution_limits = self._run_execution_limits(package)
-            return package, execution_limits, sealed_paths, sealed_bytes, semantics
+            projection = self.store.load_run(run_id)
+            provider_authority = read_snapshot_provider_authority(
+                language_snapshot=package.language,
+                resources=resources or {},
+                authenticated_bytes=sealed_bytes,
+                projected_digest=projection.get("provider_resolution_sha256"),
+            )
+            return _PreparedRunPackage(
+                package=package,
+                execution_limits=execution_limits,
+                sealed_resource_paths=sealed_paths,
+                sealed_resource_bytes=sealed_bytes,
+                execution_semantics=semantics,
+                provider_authority=provider_authority,
+            )
         except WorkflowValidationError as exc:
             if not exc.issues:
                 raise
@@ -3712,6 +3749,7 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
+        provider_authority=None,
         claimed_deadline_budget: DeadlineBudget | None = None,
     ) -> None:
         with self._activity:
@@ -4039,6 +4077,22 @@ class RunScheduler:
                             sealed_resource_bytes=sealed_resource_bytes,
                             language_profile=package.language.effective_profile,
                             normalizer_version=package.language.normalizer_version,
+                            sealed_provider_route=(
+                                provider_authority.routes.get(f"{node.id}:primary")
+                                if provider_authority is not None
+                                else None
+                            ),
+                            intended_authority_digest=(
+                                phase5_node_intended_authority_digest(
+                                    provider_authority,
+                                    node_id=node.id,
+                                    sealed_closure_digest=str(
+                                        projection.get("definition_digest") or ""
+                                    ),
+                                )
+                                if provider_authority is not None
+                                else None
+                            ),
                             structured_output=structured_output,
                             structured_output_decision=structured_output_decision,
                             outward_action=(
@@ -4523,6 +4577,7 @@ class RunScheduler:
             sealed_resource_bytes,
             execution_semantics,
         ) = prepared_package
+        provider_authority = prepared_package.provider_authority
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -4682,6 +4737,7 @@ class RunScheduler:
                             execution_semantics,
                             sealed_resource_paths,
                             sealed_resource_bytes,
+                            provider_authority,
                             budget,
                         )
                         for claim, node, snapshot, strict_snapshot, budget in claims
@@ -4761,6 +4817,7 @@ class RunScheduler:
         sealed_resource_paths = {}
         sealed_resource_bytes = {}
         execution_semantics = {}
+        provider_authorities = {}
         package_failures = {}
         prepared_run_ids = []
         for run_id in run_ids:
@@ -4773,11 +4830,13 @@ class RunScheduler:
                 package_failures[run_id] = self.store.load_run(run_id)
                 continue
             package, limits, paths, resource_bytes, semantics = prepared_package
+            provider_authority = prepared_package.provider_authority
             packages[run_id] = package
             execution_limits[run_id] = limits
             sealed_resource_paths[run_id] = paths
             sealed_resource_bytes[run_id] = resource_bytes
             execution_semantics[run_id] = semantics
+            provider_authorities[run_id] = provider_authority
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -4964,6 +5023,7 @@ class RunScheduler:
                             execution_semantics[run_id],
                             sealed_resource_paths[run_id],
                             sealed_resource_bytes[run_id],
+                            provider_authorities[run_id],
                             claimed_deadline_budget,
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)

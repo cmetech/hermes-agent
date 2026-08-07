@@ -30,7 +30,8 @@ from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
     entitled_agent_runner,
 )
-from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.execution_semantics import phase5_session_cache_fingerprint
+from plugins.workflow.language import supports_phase3_semantics, supports_phase5_semantics
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -130,6 +131,14 @@ class AgentNodeExecutor:
         self.profile_name = profile_name
 
     def _fingerprint(self, context: NodeExecutionContext) -> str:
+        if supports_phase5_semantics(
+            context.language_profile,
+            context.normalizer_version,
+        ):
+            intended = context.intended_authority_digest
+            if not isinstance(intended, str) or len(intended) != 64:
+                raise ValueError("phase5 intended authority identity is missing")
+            return intended
         node = context.node
         workflow = context.workflow_options
         structured_identity = None
@@ -716,6 +725,34 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        phase5 = supports_phase5_semantics(
+            context.language_profile,
+            context.normalizer_version,
+        )
+        sealed_route = context.sealed_provider_route
+        intended_authority_digest = context.intended_authority_digest
+        if phase5 and (
+            sealed_route is None
+            or sealed_route.node_id != node.id
+            or sealed_route.role != "primary"
+            or not isinstance(intended_authority_digest, str)
+            or len(intended_authority_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in intended_authority_digest
+            )
+        ):
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_capability_drift",
+                error_message="sealed provider execution authority is incomplete",
+                metadata={
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                    "known_no_effect": True,
+                    "archon_terminal_failure": True,
+                },
+            )
         strict_v3 = (
             isinstance(context.variable_context, VariableContext)
             and supports_phase3_semantics(
@@ -801,6 +838,9 @@ class AgentNodeExecutor:
         session_source: str | None = None
         stale_session_id: str | None = None
         stale_cache_fingerprint: str | None = None
+        expected_model_visible_prefix_digest = (
+            context.expected_model_visible_prefix_digest
+        )
         recovery_selected = False
 
         def recovery_accounting_metadata(
@@ -886,7 +926,32 @@ class AgentNodeExecutor:
                     "shared context requires exactly one completed predecessor; use fresh",
                 )
             predecessor = predecessors[0]
-            if predecessor.get("cache_fingerprint") != fingerprint:
+            if phase5:
+                predecessor_intended = predecessor.get(
+                    "intended_authority_digest"
+                )
+                predecessor_prefix = predecessor.get(
+                    "model_visible_prefix_digest"
+                )
+                try:
+                    predecessor_fingerprint = phase5_session_cache_fingerprint(
+                        str(predecessor_intended or ""),
+                        str(predecessor_prefix or ""),
+                    )
+                except ValueError:
+                    predecessor_fingerprint = None
+                compatible = (
+                    predecessor_intended == intended_authority_digest
+                    and predecessor.get("cache_fingerprint")
+                    == predecessor_fingerprint
+                )
+                if compatible:
+                    expected_model_visible_prefix_digest = str(
+                        predecessor_prefix
+                    )
+            else:
+                compatible = predecessor.get("cache_fingerprint") == fingerprint
+            if not compatible:
                 return self._failure(
                     "context_incompatible",
                     "shared context cache fingerprint changed; use fresh context",
@@ -913,7 +978,9 @@ class AgentNodeExecutor:
                 and self.session_registry is not None
             ):
                 provider = str(
-                    node.options.get("provider")
+                    sealed_route.provider
+                    if phase5
+                    else node.options.get("provider")
                     or context.workflow_options.get("provider")
                     or "default"
                 )
@@ -941,7 +1008,26 @@ class AgentNodeExecutor:
                     ):
                         return self._recovery_unavailable()
                     expected_generation = record.generation
-                    if record.cache_fingerprint == fingerprint:
+                    if phase5:
+                        record_matches = (
+                            record.intended_authority_digest
+                            == intended_authority_digest
+                            and isinstance(
+                                record.model_visible_prefix_digest, str
+                            )
+                            and record.cache_fingerprint
+                            == phase5_session_cache_fingerprint(
+                                record.intended_authority_digest,
+                                record.model_visible_prefix_digest,
+                            )
+                        )
+                        if record_matches:
+                            expected_model_visible_prefix_digest = (
+                                record.model_visible_prefix_digest
+                            )
+                    else:
+                        record_matches = record.cache_fingerprint == fingerprint
+                    if record_matches:
                         context_mode = "shared"
                         session_id = record.session_id
                         session_source = "cross_run_registry"
@@ -1033,13 +1119,19 @@ class AgentNodeExecutor:
                 and "workflow_agent" not in allowed_tools
             ):
                 allowed_tools = (*allowed_tools, "workflow_agent")
+            route_options = sealed_route.provider_options if phase5 else {}
             effort = (
-                node.options.get("effort")
+                route_options.get("effort")
+                if phase5
+                else node.options.get("effort")
                 or context.workflow_options.get("modelReasoningEffort")
                 or context.workflow_options.get("effort")
             )
-            thinking = node.options.get("thinking") or context.workflow_options.get(
-                "thinking"
+            thinking = (
+                route_options.get("thinking")
+                if phase5
+                else node.options.get("thinking")
+                or context.workflow_options.get("thinking")
             )
             reasoning_config = {
                 key: value
@@ -1062,19 +1154,46 @@ class AgentNodeExecutor:
             request = PluginAgentRunRequest(
                 prompt=prompt if prompt is not None else self._prompt(context),
                 provider=(
-                    self._requested_provider(context)
+                    sealed_route.provider
+                    if phase5
+                    else self._requested_provider(context)
                     if structured_request is not None
                     else node.options.get("provider")
                     or context.workflow_options.get("provider")
                 ),
                 model=(
-                    context.structured_output_decision.model
+                    sealed_route.model
+                    if phase5
+                    else context.structured_output_decision.model
                     if structured_request is not None
                     else node.options.get("model")
                     or context.workflow_options.get("model")
                 ),
                 context_mode=context_mode,
                 session_id=session_id,
+                intended_authority_digest=(
+                    intended_authority_digest if phase5 else None
+                ),
+                expected_runtime_identity=(
+                    {
+                        "provider": sealed_route.provider,
+                        "model": sealed_route.model,
+                        "api_mode": sealed_route.api_mode,
+                        "base_url_trust_class": (
+                            sealed_route.base_url_trust_class
+                        ),
+                        "registration_provenance_digest": (
+                            sealed_route.registration_provenance_digest
+                        ),
+                    }
+                    if phase5
+                    else None
+                ),
+                expected_model_visible_prefix_digest=(
+                    expected_model_visible_prefix_digest
+                    if phase5 and context_mode == "shared"
+                    else None
+                ),
                 allowed_tools=allowed_tools,
                 denied_tools=denied_tools,
                 skills=(),
@@ -1175,6 +1294,7 @@ class AgentNodeExecutor:
                     request,
                     context_mode="fresh",
                     session_id=None,
+                    expected_model_visible_prefix_digest=None,
                 )
                 fresh_request = sealed_provider_request_for_launch(
                     context,
@@ -1217,6 +1337,14 @@ class AgentNodeExecutor:
                         cache_fingerprint=stale_cache_fingerprint,
                         run_id=context.run_id,
                         attempt_id=context.attempt_id,
+                        intended_authority_digest=(
+                            intended_authority_digest if phase5 else None
+                        ),
+                        model_visible_prefix_digest=(
+                            expected_model_visible_prefix_digest
+                            if phase5
+                            else None
+                        ),
                     )
                 )
                 recovery_selected = selected
@@ -1278,6 +1406,42 @@ class AgentNodeExecutor:
                     result = fresh_recovery_request()
                     if isinstance(result, NodeExecutionResult):
                         return result
+            prefix_changed = (
+                phase5
+                and result.status == "failed"
+                and result.audit.get("failure_kind")
+                == "cache_fingerprint_changed"
+            )
+            if prefix_changed:
+                observed_prefix = result.audit.get(
+                    "model_visible_prefix_digest"
+                )
+                exact_no_effect = (
+                    result.audit.get("intended_authority_digest")
+                    == intended_authority_digest
+                    and isinstance(observed_prefix, str)
+                    and len(observed_prefix) == 64
+                    and all(
+                        character in "0123456789abcdef"
+                        for character in observed_prefix
+                    )
+                    and result.audit.get("provider_attempts") == 0
+                    and result.audit.get("model_calls") == 0
+                    and result.audit.get("known_no_effect") is True
+                )
+                if not exact_no_effect:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="provider_capability_drift",
+                        error_message="worker cache drift evidence is invalid",
+                        metadata={"archon_terminal_failure": True},
+                    )
+                warnings.append(
+                    "runtime model-visible prefix changed; fresh context selected"
+                )
+                result = fresh_recovery_request()
+                if isinstance(result, NodeExecutionResult):
+                    return result
         except PermissionError as exc:
             return with_recovery_failure(
                 self._failure("authorization", str(exc))
@@ -1345,6 +1509,37 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
+        if phase5:
+            observed_intended = result.audit.get("intended_authority_digest")
+            observed_prefix = result.audit.get("model_visible_prefix_digest")
+            if (
+                observed_intended != intended_authority_digest
+                or not isinstance(observed_prefix, str)
+                or len(observed_prefix) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in observed_prefix
+                )
+            ):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_capability_drift",
+                    error_message="worker execution identity evidence is invalid",
+                    metadata={
+                        "provider_attempts": conservative_provider_retry_count(
+                            result.audit.get("provider_attempts"),
+                            granted_attempts=granted_provider_attempts,
+                        ),
+                        "archon_terminal_failure": True,
+                    },
+                )
+            metadata["intended_authority_digest"] = observed_intended
+            metadata["model_visible_prefix_digest"] = observed_prefix
+            fingerprint = phase5_session_cache_fingerprint(
+                observed_intended,
+                observed_prefix,
+            )
+            metadata["cache_fingerprint"] = fingerprint
         structured_counts: tuple[int, int] | None = None
         negotiation_failure = str(result.audit.get("failure_kind", ""))
         if structured_request is not None and negotiation_failure in {
@@ -1476,6 +1671,10 @@ class AgentNodeExecutor:
             failure_kind = str(result.audit.get("failure_kind", "")).lower()
             if failure_kind == "package_mcp_unavailable":
                 error_code = "package_mcp_unavailable"
+            elif failure_kind == "provider_capability_drift":
+                error_code = "provider_capability_drift"
+                metadata["known_no_effect"] = True
+                metadata["archon_terminal_failure"] = True
             elif failure_kind == "provider_attempt_grant_exhausted":
                 error_code = "provider_attempt_grant_exhausted"
                 metadata["known_no_effect"] = True
@@ -1607,6 +1806,14 @@ class AgentNodeExecutor:
                         winning_node_id=node.id,
                         winning_attempt_id=context.attempt_id,
                         recovery_selected=recovery_selected,
+                        intended_authority_digest=(
+                            intended_authority_digest if phase5 else None
+                        ),
+                        model_visible_prefix_digest=(
+                            str(metadata["model_visible_prefix_digest"])
+                            if phase5
+                            else None
+                        ),
                     )
                     return replace(
                         archon_result,

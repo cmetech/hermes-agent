@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import hmac
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ from model_tools import (
     get_toolset_for_tool,
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
+    model_visible_prefix_digest,
 )
 from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
@@ -4452,6 +4454,29 @@ class AIAgent:
         """Forwarder — see ``agent.system_prompt.build_system_prompt``."""
         from agent.system_prompt import build_system_prompt
         return build_system_prompt(self, system_message=system_message)
+
+    def seal_model_visible_prefix(self) -> str:
+        """Render once and bind the exact system text and visible tool schemas."""
+        prompt = getattr(self, "_cached_system_prompt", None)
+        if not isinstance(prompt, str):
+            prompt = self._build_system_prompt()
+            self._cached_system_prompt = prompt
+        digest = model_visible_prefix_digest(prompt, list(self.tools or []))
+        self._model_visible_prefix_digest = digest
+        return digest
+
+    def verify_model_visible_prefix(self) -> str:
+        """Reject mutations after a worker seals its model-visible prefix."""
+        expected = getattr(self, "_model_visible_prefix_digest", None)
+        if not isinstance(expected, str):
+            raise RuntimeError("model-visible prefix is not sealed")
+        prompt = getattr(self, "_cached_system_prompt", None)
+        if not isinstance(prompt, str):
+            raise RuntimeError("model-visible system prompt changed after sealing")
+        current = model_visible_prefix_digest(prompt, list(self.tools or []))
+        if not hmac.compare_digest(expected, current):
+            raise RuntimeError("model-visible prefix changed after sealing")
+        return current
 
     @staticmethod
     def _get_tool_call_id_static(tc) -> str:

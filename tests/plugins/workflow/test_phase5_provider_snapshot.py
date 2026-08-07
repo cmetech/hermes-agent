@@ -10,6 +10,7 @@ from hermes_cli.runtime_provider import classify_execution_runtime
 from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.provider_authority import (
     ProviderAuthorityEnvironment,
@@ -166,6 +167,46 @@ def test_v5_restart_recovers_authority_only_from_authenticated_snapshot_bytes(
     assert package.language.normalizer_version == 5
     assert "provider-resolution.json" in sealed_paths
     assert recovered.authority_digest == authority.authority_digest
+
+
+def test_v5_scheduler_preparation_carries_authenticated_provider_authority(
+    tmp_path, workflow_writer
+):
+    compilation = _v5_compilation(tmp_path, workflow_writer)
+    authority = _authority(compilation.package)
+    store = RunStore(tmp_path / "home")
+    _prepared, run_id = _admit(store, compilation, authority, key="prepare-provider")
+
+    prepared = RunScheduler(store)._prepare_run_package(run_id, None)
+
+    assert prepared is not None
+    assert prepared.provider_authority == authority
+
+
+def test_v5_scheduler_binds_sealed_route_and_closure_identity_to_executor(
+    tmp_path, workflow_writer
+):
+    compilation = _v5_compilation(tmp_path, workflow_writer)
+    authority = _authority(compilation.package)
+    store = RunStore(tmp_path / "home")
+    _prepared, run_id = _admit(store, compilation, authority, key="execute-provider")
+    contexts = []
+
+    class Capture:
+        def execute(self, context):
+            contexts.append(context)
+            return NodeExecutionResult("succeeded", metadata={"provider_attempts": 0})
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = Capture()
+
+    projection = scheduler.advance(run_id)
+
+    assert projection["status"] == "succeeded"
+    assert len(contexts) == 1
+    assert contexts[0].sealed_provider_route == authority.routes["ask:primary"]
+    assert contexts[0].intended_authority_digest is not None
+    assert len(contexts[0].intended_authority_digest) == 64
 
 
 @pytest.mark.parametrize("mutation", ["tamper", "omit", "extra"])

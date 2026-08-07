@@ -499,6 +499,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    if isinstance(getattr(agent, "_model_visible_prefix_digest", None), str):
+        agent.verify_model_visible_prefix()
+        return
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:

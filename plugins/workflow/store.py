@@ -245,8 +245,10 @@ def _session_registry_candidate_payload(
     *,
     retry_count: int = 0,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 1,
+    payload: dict[str, object] = {
+        "schema_version": (
+            2 if candidate.intended_authority_digest is not None else 1
+        ),
         "key": {
             "workflow": candidate.key.workflow,
             "node_id": candidate.key.node_id,
@@ -263,6 +265,12 @@ def _session_registry_candidate_payload(
         "recovery_selected": candidate.recovery_selected,
         "retry_count": retry_count,
     }
+    if candidate.intended_authority_digest is not None:
+        payload["intended_authority_digest"] = candidate.intended_authority_digest
+        payload["model_visible_prefix_digest"] = (
+            candidate.model_visible_prefix_digest
+        )
+    return payload
 
 
 def _private_authority_json(authority: Mapping[str, object]) -> str:
@@ -281,8 +289,10 @@ def _session_recovery_selection_authority(
     activation_event_type: str,
     activation_predecessor_chain_sha256: str,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 3,
+    authority: dict[str, object] = {
+        "schema_version": (
+            4 if selection.intended_authority_digest is not None else 3
+        ),
         "journal_order_version": 1,
         "activation_event_sequence": activation_event_sequence,
         "activation_predecessor_sequence": activation_event_sequence - 1,
@@ -305,6 +315,14 @@ def _session_recovery_selection_authority(
         "source": selection.source,
         "provider_attempts_before_recovery": 0,
     }
+    if selection.intended_authority_digest is not None:
+        authority["intended_authority_digest"] = (
+            selection.intended_authority_digest
+        )
+        authority["model_visible_prefix_digest"] = (
+            selection.model_visible_prefix_digest
+        )
+    return authority
 
 
 def _session_registry_winner_authority(
@@ -346,9 +364,9 @@ def _session_recovery_selection_from_authority(
     }
     activation: int | None = None
     event_type: str | None = None
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         expected_fields.update({"activation_event_sequence", "activation_event_type"})
-        if schema_version == 3:
+        if schema_version in {3, 4}:
             expected_fields.update(
                 {
                     "journal_order_version",
@@ -357,6 +375,10 @@ def _session_recovery_selection_from_authority(
                 }
             )
             _validate_journal_order_authority_fields(value)
+        if schema_version == 4:
+            expected_fields.update(
+                {"intended_authority_digest", "model_visible_prefix_digest"}
+            )
         activation_value = value.get("activation_event_sequence")
         if (
             isinstance(activation_value, bool)
@@ -403,6 +425,10 @@ def _session_recovery_selection_from_authority(
             run_id=value["run_id"],
             attempt_id=value["attempt_id"],
             source=value["source"],
+            intended_authority_digest=value.get("intended_authority_digest"),
+            model_visible_prefix_digest=value.get(
+                "model_visible_prefix_digest"
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise JournalRecoveryError(
@@ -455,8 +481,12 @@ def _session_registry_candidate_from_authority(
 def _session_registry_candidate_from_payload(
     value: object,
 ) -> tuple[SessionRegistryUpdateCandidate, int]:
-    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") not in {1, 2}
+    ):
         raise JournalRecoveryError("session registry obligation is malformed")
+    schema_version = value.get("schema_version")
     key = value.get("key")
     if not isinstance(key, Mapping) or set(key) != {
         "workflow",
@@ -512,12 +542,16 @@ def _session_registry_candidate_from_payload(
             winning_node_id=value["winning_node_id"],
             winning_attempt_id=value["winning_attempt_id"],
             recovery_selected=value["recovery_selected"],
+            intended_authority_digest=value.get("intended_authority_digest"),
+            model_visible_prefix_digest=value.get(
+                "model_visible_prefix_digest"
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise JournalRecoveryError(
             "session registry obligation identity is malformed"
         ) from exc
-    if set(value) != {
+    expected_fields = {
         "schema_version",
         "key",
         "expected_generation",
@@ -528,7 +562,12 @@ def _session_registry_candidate_from_payload(
         "winning_attempt_id",
         "recovery_selected",
         "retry_count",
-    }:
+    }
+    if schema_version == 2:
+        expected_fields.update(
+            {"intended_authority_digest", "model_visible_prefix_digest"}
+        )
+    if set(value) != expected_fields:
         raise JournalRecoveryError("session registry obligation fields are malformed")
     return candidate, retry_count
 
@@ -998,7 +1037,7 @@ def _validate_private_authority_journal_order(
             "session_registry_winner_authority",
         )
         for authority in authorities.get(table, {}).values()
-        if authority.get("schema_version") == 3
+        if authority.get("schema_version") in {3, 4}
     )
     if not ordered_authorities:
         return
@@ -5218,16 +5257,23 @@ class RunStore:
             "source",
             "provider_attempts_before_recovery",
         }
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 4}:
             expected_fields.update(
                 {"activation_event_sequence", "activation_event_type"}
             )
-            if schema_version == 3:
+            if schema_version in {3, 4}:
                 expected_fields.update(
                     {
                         "journal_order_version",
                         "activation_predecessor_sequence",
                         "activation_predecessor_chain_sha256",
+                    }
+                )
+            if schema_version == 4:
+                expected_fields.update(
+                    {
+                        "intended_authority_digest",
+                        "model_visible_prefix_digest",
                     }
                 )
         elif schema_version != 1:
@@ -5273,7 +5319,7 @@ class RunStore:
             if isinstance(recovery, Mapping)
             and recovery.get("attempt_id") == attempt_id
         ] if isinstance(recoveries, list) else []
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 4}:
             activation = selection_authority.get("activation_event_sequence")
             if (
                 isinstance(activation, bool)

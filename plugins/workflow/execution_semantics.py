@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
+import re
 from types import MappingProxyType
 from typing import Mapping
 
@@ -17,6 +20,7 @@ from plugins.workflow.models import (
 
 
 EXECUTION_SEMANTICS_MISMATCH_CODE = "workflow_execution_semantics_mismatch"
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _LIMIT_FIELDS = frozenset({
     "ai_idle_timeout_seconds",
     "ai_wall_timeout_seconds",
@@ -51,6 +55,67 @@ class WorkflowExecutionSemanticsError(ValueError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.code = EXECUTION_SEMANTICS_MISMATCH_CODE
+
+
+def phase5_node_intended_authority_digest(
+    provider_authority,
+    *,
+    node_id: str,
+    sealed_closure_digest: str,
+) -> str:
+    """Bind one node's sealed route to the complete authenticated closure."""
+    from plugins.workflow.provider_authority import WorkflowProviderAuthority
+
+    if not isinstance(provider_authority, WorkflowProviderAuthority):
+        raise TypeError("provider_authority must be immutable")
+    if not isinstance(node_id, str) or not node_id:
+        raise ValueError("node_id must be non-empty text")
+    if (
+        not isinstance(sealed_closure_digest, str)
+        or _SHA256_HEX.fullmatch(sealed_closure_digest) is None
+    ):
+        raise ValueError("sealed closure digest must be lowercase SHA-256")
+    route = provider_authority.routes.get(f"{node_id}:primary")
+    if route is None:
+        raise ValueError("sealed provider authority is missing the node primary route")
+    material = {
+        "schema_version": 1,
+        "node_id": node_id,
+        "sealed_closure_digest": sealed_closure_digest,
+        "provider_authority_digest": provider_authority.authority_digest,
+        "route": route.to_dict(),
+        "obligations": [
+            obligation.to_dict()
+            for obligation in provider_authority.obligations
+            if obligation.route_id == route.route_id
+        ],
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(b"hermes.workflow.intended-authority.v1\0" + encoded).hexdigest()
+
+
+def phase5_session_cache_fingerprint(
+    intended_authority_digest: str,
+    model_visible_prefix_digest: str,
+) -> str:
+    """Combine the two independently verified Phase 5 resume identities."""
+    for label, value in (
+        ("intended authority", intended_authority_digest),
+        ("model-visible prefix", model_visible_prefix_digest),
+    ):
+        if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+            raise ValueError(f"{label} digest must be lowercase SHA-256")
+    return hashlib.sha256(
+        b"hermes.workflow.session-cache.v1\0"
+        + intended_authority_digest.encode("ascii")
+        + model_visible_prefix_digest.encode("ascii")
+    ).hexdigest()
 
 
 def _thaw(value: object) -> object:
