@@ -250,10 +250,13 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
         "additionalProperties": False,
     })
     primary = _route("primary")
-    fallback = _route(
-        "fallback",
-        provider="anthropic",
-        model="claude-sonnet-4-6",
+    fallback = replace(
+        _route(
+            "fallback",
+            provider="openai-api",
+            model="gpt-5.4",
+        ),
+        effective_provider="openai",
     )
 
     def structured_obligation(
@@ -268,7 +271,7 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
             decision=ProviderCapabilityDecision(
                 feature=WorkflowProviderFeature.STRUCTURED_OUTPUT,
                 disposition=disposition,
-                provider=route.provider,
+                provider=route.effective_provider,
                 model=route.model,
                 option="json_schema",
                 requested_semantics={
@@ -351,7 +354,7 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
             return PluginAgentRunResult(
                 final_response='{"answer":"ok"}',
                 session_id="fallback-session",
-                provider=fallback.provider,
+                provider=fallback.effective_provider,
                 model=fallback.model,
                 status="completed",
                 pending_interaction=None,
@@ -379,11 +382,11 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
         )
     )
 
-    assert result.status == "succeeded", (
-        result.error_code,
-        result.error_message,
-        result.metadata,
-    )
+    assert result.status == "succeeded"
+    assert runner.requests[0].sealed_fallback_route["provider"] == "openai-api"
+    assert runner.requests[0].sealed_fallback_route["expected_runtime_identity"][
+        "provider"
+    ] == "openai"
     sealed_fallback = runner.requests[0].sealed_fallback_route
     assert sealed_fallback["structured_output"].strategy is (
         StructuredOutputStrategy.NATIVE_JSON_SCHEMA

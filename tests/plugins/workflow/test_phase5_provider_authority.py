@@ -803,3 +803,4 @@ def test_configured_provider_alias_may_classify_to_a_distinct_effective_provider
     )
 
     assert authority.routes["ask:primary"].provider == "openai-api"
+    assert authority.routes["ask:primary"].effective_provider == "openai"

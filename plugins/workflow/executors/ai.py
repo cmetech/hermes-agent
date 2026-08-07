@@ -276,7 +276,7 @@ class AgentNodeExecutor:
                 CapabilityDisposition.NATIVE,
                 CapabilityDisposition.HERMES_ADAPTER,
             }
-            or central.provider != route.provider
+            or central.provider != route.effective_provider
             or central.model != route.model
             or central.requested_semantics.get("schema_fingerprint")
             != declared.schema_fingerprint
@@ -299,7 +299,7 @@ class AgentNodeExecutor:
             raise ValueError("sealed fallback structured-output adapter is invalid")
         return StructuredOutputCapabilityDecision(
             strategy=parsed_strategy,
-            effective_provider=route.provider,
+            effective_provider=central.provider,
             model=route.model,
             api_mode=route.api_mode,
             declaration_source=central.declaration_source,
@@ -817,7 +817,7 @@ class AgentNodeExecutor:
                         context.intended_authority_digest
                     ),
                     "expected_runtime_identity": {
-                        "provider": route.provider,
+                        "provider": route.effective_provider,
                         "model": route.model,
                         "api_mode": route.api_mode,
                         "base_url_trust_class": route.base_url_trust_class,
@@ -1419,7 +1419,7 @@ class AgentNodeExecutor:
                     "model": fallback_route.model,
                     "context_mode": "fresh",
                     "expected_runtime_identity": {
-                        "provider": fallback_route.provider,
+                        "provider": fallback_route.effective_provider,
                         "model": fallback_route.model,
                         "api_mode": fallback_route.api_mode,
                         "base_url_trust_class": fallback_route.base_url_trust_class,
@@ -1458,7 +1458,7 @@ class AgentNodeExecutor:
                 ),
                 expected_runtime_identity=(
                     {
-                        "provider": sealed_route.provider,
+                        "provider": sealed_route.effective_provider,
                         "model": sealed_route.model,
                         "api_mode": sealed_route.api_mode,
                         "base_url_trust_class": (

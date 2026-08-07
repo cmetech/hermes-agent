@@ -260,7 +260,7 @@ class ApprovalExecutor:
                     "model": fallback_route.model,
                     "context_mode": "fresh",
                     "expected_runtime_identity": {
-                        "provider": fallback_route.provider,
+                        "provider": fallback_route.effective_provider,
                         "model": fallback_route.model,
                         "api_mode": fallback_route.api_mode,
                         "base_url_trust_class": fallback_route.base_url_trust_class,
@@ -272,6 +272,7 @@ class ApprovalExecutor:
                     "request_overrides": _thaw(
                         fallback_transport.request_overrides
                     ),
+                    "structured_output": None,
                 }
         request = PluginAgentRunRequest(
             prompt=prompt,
@@ -290,7 +291,7 @@ class ApprovalExecutor:
             ),
             expected_runtime_identity=(
                 {
-                    "provider": sealed_route.provider,
+                    "provider": sealed_route.effective_provider,
                     "model": sealed_route.model,
                     "api_mode": sealed_route.api_mode,
                     "base_url_trust_class": sealed_route.base_url_trust_class,

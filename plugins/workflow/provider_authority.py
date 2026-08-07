@@ -174,12 +174,15 @@ class WorkflowResolvedProviderRoute:
     provider_options: Mapping[str, Any]
     config_scope: str
     base_url_trust_class: str
+    effective_provider: str = ""
 
     def __post_init__(self) -> None:
         if not _valid_digest(self.requested_reference_sha256):
             raise ValueError("requested model reference digest is invalid")
         if not _valid_digest(self.route_fingerprint):
             raise ValueError("provider route fingerprint is invalid")
+        if not self.effective_provider:
+            object.__setattr__(self, "effective_provider", self.provider)
         object.__setattr__(
             self,
             "provider_options",
@@ -195,6 +198,7 @@ class WorkflowResolvedProviderRoute:
             "reference_kind": self.reference_kind,
             "requested_reference_sha256": self.requested_reference_sha256,
             "provider": self.provider,
+            "effective_provider": self.effective_provider,
             "model": self.model,
             "api_mode": self.api_mode,
             "route_fingerprint": self.route_fingerprint,
@@ -319,7 +323,7 @@ def public_provider_capability_projection(
     include_details: bool = False,
 ) -> dict[str, Any]:
     """Return the single closed provider-capability projection for public clients."""
-    providers = {route.provider for route in authority.routes.values()}
+    providers = {route.effective_provider for route in authority.routes.values()}
     unsupported = sum(
         item.decision.disposition is CapabilityDisposition.UNSUPPORTED
         for item in authority.obligations
@@ -351,7 +355,7 @@ def public_provider_capability_projection(
                 else _public_projection_text(route.inline_agent_id, max_chars=128)
             ),
             "reference_kind": route.reference_kind,
-            "provider": public_display_identifier(route.provider),
+            "provider": public_display_identifier(route.effective_provider),
             "model": public_display_identifier(route.model),
         }
         for route in authority.routes.values()
@@ -451,6 +455,7 @@ def _read_route(value: object) -> WorkflowResolvedProviderRoute:
             "reference_kind",
             "requested_reference_sha256",
             "provider",
+            "effective_provider",
             "model",
             "api_mode",
             "route_fingerprint",
@@ -480,6 +485,9 @@ def _read_route(value: object) -> WorkflowResolvedProviderRoute:
             record["requested_reference_sha256"], "model reference digest"
         ),
         provider=_bounded_text(record["provider"], "provider"),
+        effective_provider=_bounded_text(
+            record["effective_provider"], "effective provider"
+        ),
         model=_bounded_text(record["model"], "model"),
         api_mode=_bounded_text(record["api_mode"], "API mode", allow_empty=True),
         route_fingerprint=_bounded_text(
@@ -774,6 +782,7 @@ def _resolved_route(
         reference_kind=resolved.reference_kind,
         requested_reference_sha256=_sha256_text(resolved.requested_reference.strip()),
         provider=resolved.provider,
+        effective_provider=runtime.effective_provider,
         model=resolved.model,
         api_mode=resolved.api_mode,
         route_fingerprint=resolved.route_fingerprint,

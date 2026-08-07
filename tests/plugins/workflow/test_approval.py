@@ -459,6 +459,9 @@ class ReworkRunner:
         self.launch_kwargs = []
 
     def run(self, request, **kwargs):
+        from agent.plugin_agent import _validate_request
+
+        _validate_request(request)
         self.requests.append(request)
         self.launch_kwargs.append(kwargs)
         return PluginAgentRunResult(
@@ -599,6 +602,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         },
         "reasoning_config": {},
         "request_overrides": {},
+        "structured_output": None,
     }
     assert result.metadata["intended_authority_digest"] == "a" * 64
     assert result.metadata["model_visible_prefix_digest"] == "9" * 64
