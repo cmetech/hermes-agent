@@ -10,10 +10,12 @@ Hermes reads a portable workflow definition and an optional Hermes companion
 file. The portable file describes the DAG. The companion selects the language
 profile and adds Hermes admission and execution policy.
 
-This page describes the current normalizer v5 contract for provider portability.
-V5 inherits Phase 4 ordinary loops and immutable compile-time includes plus the
-Phase 3 timeout, retry, structured-output, and reference semantics. Older sealed
-language versions remain compatibility inputs.
+This page documents the staged normalizer v5 contract for provider portability.
+Until the final activation gate, new Archon admission remains on v4; explicit v5
+is available only for compatibility validation. V5 inherits Phase 4 ordinary
+loops and immutable compile-time includes plus the Phase 3 timeout, retry,
+structured-output, and reference semantics. Older sealed language versions
+remain compatibility inputs.
 
 ## Authoritative schema
 
@@ -83,7 +85,8 @@ doctor, and the normal digest-bound trust review again.
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions select normalizer v5.
+New and default `archon-2026-07` contracts and admissions select normalizer v4
+until the reviewed Phase 5 activation commit.
 Current `hermes-legacy` contracts select v2. Explicit and sealed v1 through v4
 remain readable with their original meanings; resume uses the version pinned in
 the immutable run snapshot rather than the moving profile default.
@@ -93,7 +96,7 @@ the immutable run snapshot rather than the moving profile default.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 5
+    "archon-2026-07": 4
   },
   "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
@@ -112,10 +115,12 @@ contract = workflow_authoring_contract(
 )
 ```
 
-The default call without `normalizer_version` is the authoritative current v5
+The default call without `normalizer_version` is the authoritative current v4
 syntax and diagnostic inventory. Any explicit version must remain pinned
 through compilation, validation, trust, admission, and the immutable run
-snapshot; explicit v1-v4 selection is compatibility behavior, not a way to
+snapshot; explicit v1-v3 selection is compatibility behavior, while explicit
+v5 selects the staged Phase 5 validator without changing the current profile
+default. Explicit version selection is not a way to
 change the current profile default.
 
 ## Phase 5 provider portability
