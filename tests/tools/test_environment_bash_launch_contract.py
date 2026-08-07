@@ -124,6 +124,8 @@ def test_docker_clean_launch_suppresses_startup_hooks(monkeypatch):
     env._docker_exe = "docker"
     env._container_id = "container-id"
     env._init_env_args = []
+    env._forward_env = []
+    env._profile_scoped_passthrough = False
 
     assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"] == [
