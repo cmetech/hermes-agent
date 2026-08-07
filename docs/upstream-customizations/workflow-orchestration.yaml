@@ -404,6 +404,10 @@ upstream_changes:
   - tests/agent/test_usage_pricing.py
   - tests/agent/test_provider_attempt_transport.py
   - tests/agent/test_plugin_agent.py
+  - tests/agent/test_cascading_interrupt_6600.py
+  - tests/agent/test_codex_app_server_persist.py
+  - tests/agent/test_cron_inline_api_call_62151.py
+  - tests/cron/test_cron_direct_api_call_62151.py
   - tests/plugins/workflow/test_phase5_cost_budget.py
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_retry.py
