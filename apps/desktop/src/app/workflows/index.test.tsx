@@ -23,6 +23,7 @@ const previewWorkflowCleanup = vi.fn()
 const executeWorkflowCleanup = vi.fn()
 const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null }))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
+const workflowCopy = TRANSLATIONS.en.operations
 
 vi.mock('@/hermes', () => ({
   cancelWorkflowArtifactDownload: vi.fn().mockResolvedValue({ cancelled: true }),
@@ -400,7 +401,7 @@ describe('WorkflowsView', () => {
 
     const expectedDisabledReasons = [
       'Run is unavailable because this workflow uses unsupported input fields.',
-      'This workflow is not compatible with the current Hermes runtime and cannot start.',
+      workflowCopy.workflowRunIncompatible,
       'Run is unavailable because this workflow failed trust verification.'
     ]
 
@@ -586,7 +587,7 @@ describe('WorkflowsView', () => {
     )
     expect(incompatibleRun.disabled).toBe(true)
     expect(document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
-      'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      workflowCopy.workflowRunIncompatible
     )
   })
 
@@ -605,7 +606,7 @@ describe('WorkflowsView', () => {
     const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(run.disabled).toBe(true)
     expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 
@@ -625,7 +626,7 @@ describe('WorkflowsView', () => {
       const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(run.disabled).toBe(true)
       expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
-        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+        workflowCopy.workflowRunIncompatible
       )
     }
   )
@@ -650,7 +651,7 @@ describe('WorkflowsView', () => {
     const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(run.disabled).toBe(true)
     expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 

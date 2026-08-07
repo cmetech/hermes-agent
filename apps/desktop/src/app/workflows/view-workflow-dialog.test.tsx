@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { openModalOwnsKeyboard } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
+import { TRANSLATIONS } from '@/i18n'
 import type * as ProfileStore from '@/store/profile'
 import type { WorkflowDefinition, WorkflowDetail } from '@/types/hermes'
 
@@ -17,6 +18,7 @@ const WORKFLOW_NAME = 'Portable contract'
 const MERMAID_SOURCE = 'flowchart TD\n  start["Start"] --> finish["Finish"]'
 const renderer = vi.hoisted(() => ({ calls: vi.fn<(code: string) => void>() }))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
+const workflowCopy = TRANSLATIONS.en.operations
 
 vi.mock('@/components/assistant-ui/embeds/mermaid-embed', () => ({
   default: ({ code }: { code: string }) => {
@@ -252,7 +254,7 @@ describe('workflow View dialog', () => {
     expect(await within(dialog).findByText('Legacy semantics')).toBeTruthy()
     expect(
       within(dialog).getByText(
-        'Existing Hermes behavior is preserved. Review compatibility findings before migrating to Archon 2026-07.'
+        workflowCopy.workflowLanguageLegacyDescription
       )
     ).toBeTruthy()
     expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
@@ -472,7 +474,7 @@ describe('workflow View dialog', () => {
     [
       'incompatible',
       { compatibility: { findings: [], level: 'unsupported', runnable: false } },
-      'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      workflowCopy.workflowRunIncompatible
     ],
     [
       'unhealthy coordinator',
@@ -498,7 +500,7 @@ describe('workflow View dialog', () => {
       await within(dialog).findByTestId('shared-mermaid-renderer')
       expectDisabledRunReason(
         dialog,
-        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+        workflowCopy.workflowRunIncompatible
       )
     }
   )
@@ -521,7 +523,7 @@ describe('workflow View dialog', () => {
     const dialog = await openView()
 
     await within(dialog).findByTestId('shared-mermaid-renderer')
-    expectDisabledRunReason(dialog, 'This workflow is not compatible with the current Hermes runtime and cannot start.')
+    expectDisabledRunReason(dialog, workflowCopy.workflowRunIncompatible)
   })
 
   it('enables Run when fetched detail is runnable despite a stale untrusted catalog row', async () => {
@@ -566,7 +568,7 @@ describe('workflow View dialog', () => {
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expectDisabledRunReason(
       dialog,
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 
@@ -582,7 +584,7 @@ describe('workflow View dialog', () => {
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expectDisabledRunReason(
       dialog,
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 
