@@ -494,6 +494,7 @@ child = parse_workflow_source_bytes(
 compilation = compile_workflow(
     root,
     WorkflowCatalogSnapshot.capture((root, child)),
+    normalizer_version=4,
 )
 package = compilation.package
 validation = validate_package(package)
