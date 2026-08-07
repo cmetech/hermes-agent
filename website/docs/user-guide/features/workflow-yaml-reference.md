@@ -1,7 +1,7 @@
 ---
 sidebar_position: 14
 title: "Workflow YAML reference"
-description: "Author profile-aware portable workflows with current Phase 4 semantics"
+description: "Author profile-aware portable workflows with current Phase 5 provider semantics"
 ---
 
 # Workflow YAML reference
@@ -10,10 +10,10 @@ Hermes reads a portable workflow definition and an optional Hermes companion
 file. The portable file describes the DAG. The companion selects the language
 profile and adds Hermes admission and execution policy.
 
-This page describes the current normalizer v4 contract for ordinary loops and
-immutable compile-time includes. V4 inherits the Phase 3 timeout, retry,
-structured-output, and reference semantics while preserving older sealed
-language versions as compatibility inputs.
+This page describes the current normalizer v5 contract for provider portability.
+V5 inherits Phase 4 ordinary loops and immutable compile-time includes plus the
+Phase 3 timeout, retry, structured-output, and reference semantics. Older sealed
+language versions remain compatibility inputs.
 
 ## Authoritative schema
 
@@ -83,8 +83,8 @@ doctor, and the normal digest-bound trust review again.
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions select normalizer v4.
-Current `hermes-legacy` contracts select v2. Explicit and sealed v1, v2, and v3
+New and default `archon-2026-07` contracts and admissions select normalizer v5.
+Current `hermes-legacy` contracts select v2. Explicit and sealed v1 through v4
 remain readable with their original meanings; resume uses the version pinned in
 the immutable run snapshot rather than the moving profile default.
 
@@ -93,7 +93,7 @@ the immutable run snapshot rather than the moving profile default.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 4
+    "archon-2026-07": 5
   },
   "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
@@ -112,11 +112,113 @@ contract = workflow_authoring_contract(
 )
 ```
 
-The default call without `normalizer_version` is the authoritative current v4
+The default call without `normalizer_version` is the authoritative current v5
 syntax and diagnostic inventory. Any explicit version must remain pinned
 through compilation, validation, trust, admission, and the immutable run
-snapshot; explicit v1-v3 selection is compatibility behavior, not a way to
+snapshot; explicit v1-v4 selection is compatibility behavior, not a way to
 change the current profile default.
+
+## Phase 5 provider portability
+
+Normalizer v5 resolves every accepted provider-dependent field through one
+backend capability authority. Each requested feature receives exactly one
+disposition: `native`, `hermes_adapter`,
+`degraded_with_explicit_semantics`, or `unsupported`. Unsupported Archon
+semantics are blocking; trust cannot override them, and no client may downgrade
+them to a warning or silently omit them. The same sealed authority drives
+validate, doctor, admission, execution, evidence, catalog/detail, and Desktop.
+
+### Model references and `config.yaml`
+
+Workflow `model` and `fallbackModel` values accept three forms:
+
+- `small`, `medium`, or `large` selects a configured tier;
+- `@name` selects a configured alias;
+- any other nonempty value is a literal model ID.
+
+Tiers and aliases are behavioral configuration and belong in profile or managed
+`config.yaml`, never `.env`. Credentials remain in `.env` or the configured
+credential store. A representative profile configuration is:
+
+```yaml
+model_tiers:
+  small:
+    provider: openrouter
+    model: google/gemini-3.6-flash
+    options:
+      effort: low
+  medium:
+    provider: anthropic
+    model: claude-sonnet-4.6
+  large:
+    provider: openrouter
+    model: anthropic/claude-opus-4.6
+
+model_aliases:
+  review:
+    provider: openrouter
+    model: anthropic/claude-opus-4.6
+    options:
+      effort: high
+```
+
+Managed configuration overrides profile configuration leaf-by-leaf. Within a
+workflow route, node options override workflow options, which override tier or
+alias defaults. A tier or alias owns its configured provider; a conflicting
+node or workflow `provider` is ignored with
+`model_reference_provider_overridden`. Literal IDs select provider in this
+order: non-`auto` node provider, non-`auto` workflow provider, then the active
+configured provider. An unresolved `auto` provider blocks. Admission pins the
+concrete provider, model, API mode, supported option set, and authority digest;
+Desktop only displays that backend result.
+
+Any provider, option, hook, MCP, skill, or inline-agent change that changes the
+sealed cache fingerprint starts fresh context. Fallback runs in a separately
+sealed fresh worker context. No Phase 5 path edits a cached system prompt or
+injects synthetic conversation messages.
+
+### Tools, hooks, MCP, skills, and inline agents
+
+`allowed_tools: []` means exactly no callable built-in tools. Deny rules apply
+after allow rules, and the backend resolves aliases before enforcing either.
+Skills are read completely, snapshotted, and added to the current user turn;
+they never mutate the system prompt. Inline agents are declared only through
+the bounded `agents` object and inherit the parent attempt, cost, resource,
+workdir, deadline, and cancellation authority. Raw unrestricted delegation is
+not available.
+
+Hook entries use the closed event and response shapes in the inventory below.
+Unsupported events or operations block instead of disappearing. An MCP file is
+package-local and may use one direct server object, a server-name mapping, or
+exactly one `mcp_servers`/`mcpServers` wrapper. Each server defines exactly one
+`command` or `url`; command transports are `stdio`, while URLs use
+`streamable_http` (or `http` as its alias) or `sse`. Definitions, referenced
+executables, and supporting resources for accepted local servers are
+digest-bound into the sealed package closure. Phase 5 canonicalizes remote
+HTTP/SSE definitions but classifies them as `unsupported`; only a
+package-contained Python entry script launched by the attested Hermes
+interpreter can execute. Workers apply existing process/resource bounds and
+deterministic teardown. Secret values are resolved outside the package and
+never appear in public evidence.
+
+### Cost budgets and sandbox truth
+
+`maxBudgetUsd` is accepted only on a route whose reviewed bundled adapter
+provides authoritative billed-cost settlement for every billable outcome.
+Estimated usage and local price tables cannot satisfy this contract. The
+parent, retries, structured repair, fallback, and inline agents share one
+budget; retry never resets it. A started provider call is settled atomically,
+so its authoritative final charge may exceed the remaining amount by that one
+call. Once exhausted, the run terminates with `cost_budget_exhausted` and is not
+retried. Public evidence contains only bounded totals and digests.
+
+No current provider profile proves provider-native `sandbox` enforcement.
+Every Archon v5 `sandbox` request therefore blocks with
+`provider_native_sandbox_unavailable`. When isolation is required, set the
+companion policy `execution_environment: isolated_backend_required` and use a
+backend that advertises that existing containment contract. Process RSS, CPU,
+descendant, timeout, and workdir limits are availability/containment controls;
+they are not a sandbox or security boundary.
 
 ## Phase 4 ordinary loops and immutable includes
 
@@ -231,9 +333,9 @@ approval, and input use the run's existing interaction ID and expected state
 version; no Phase 4-specific mutation endpoint or action name is introduced.
 
 Phase 4 deliberately does not implement runtime child workflows,
-parameterized `include.with`, or `loop_group`. Portable sandbox and budget
-guarantees also remain later Archon work. Do not synthesize those meanings from
-the include and ordinary-loop contract.
+parameterized `include.with`, or `loop_group`. Phase 5 adds no such graph
+features. Do not synthesize those meanings from provider portability, includes,
+or ordinary loops.
 
 ## Status vocabulary
 
@@ -247,7 +349,7 @@ the include and ordinary-loop contract.
 ### Generated stable codes
 
 The `compatibility_codes` object is the versioned public authority for both
-compatibility findings and durable Phase 3 and v4 runtime/evidence codes. Operator
+compatibility findings and durable Phase 3 through v5 runtime/evidence codes. Operator
 surfaces preserve those codes, while messages may improve. Run `workflow
 doctor` for package-specific findings and use Run Inspector for bounded attempt
 or recovery evidence. Do not copy the catalog into package metadata or prose.
@@ -278,7 +380,7 @@ behavior.
 | `thinking` | `adaptive`, `disabled`, or `{type: enabled, budgetTokens: positive integer}`. | Mapped; provider capability applies |
 | `fallbackModel` | Nonempty fallback model identifier. | Mapped; provider capability applies |
 | `betas` | Array of nonempty provider beta names. | Mapped; provider capability applies |
-| `sandbox` | Provider/backend mapping object. Resource limits are not a sandbox. | Legacy-only; blocked pending Phase 5 (`archon_sandbox_enforcement_unavailable`) |
+| `sandbox` | Provider-native mapping object. Resource limits are not a sandbox. | Provider-capability checked; currently blocked for Archon v5 (`provider_native_sandbox_unavailable`) |
 
 The generated nested helpers are also closed shapes: `worktree` contains only
 `enabled`; enabled `thinking` contains `type` and `budgetTokens`; and a script's
@@ -293,10 +395,10 @@ dependencies, and references are validated as one acyclic graph.
 | --- | --- | --- |
 | `id` | Nonempty node identifier, required. | Enforced |
 | `depends_on` | Array of direct upstream node IDs. Every Phase 3 output reference must name one. | Enforced |
-| `when` | Typed scalar comparisons over direct-dependency `$node.output` values. False skips; syntax, missing-value, and type errors fail before execution. | Enforced under Archon v3-v4; legacy behavior is unchanged |
+| `when` | Typed scalar comparisons over direct-dependency `$node.output` values. False skips; syntax, missing-value, and type errors fail before execution. | Enforced under Archon v3-v5; legacy behavior is unchanged |
 | `trigger_rule` | `all_success`, `one_success`, `none_failed_min_one_success`, or `all_done`. | Enforced |
 | `context` | `fresh` or `shared`; shared resumes only a cache-fingerprint-compatible predecessor. | Mapped and cache-enforced |
-| `idle_timeout` | Positive finite milliseconds on Archon AI nodes; omission uses the sealed Hermes AI idle ceiling. Legacy values remain seconds. | Enforced under Archon v3-v4; legacy warning retained |
+| `idle_timeout` | Positive finite milliseconds on Archon AI nodes; omission uses the sealed Hermes AI idle ceiling. Legacy values remain seconds. | Enforced under Archon v3-v5; legacy warning retained |
 | `retry` | Retry object documented below. Archon `max_attempts` counts retries after the initial attempt. | Enforced on Archon command, prompt, Bash, and script nodes; legacy total-attempt meaning retained |
 | `always_run` | Boolean graph scheduling flag. | Enforced |
 | `output_type` | Nonempty, case-sensitive semantic label, at most 16,384 characters. Under Archon, a successful output-producing node publishes one typed artifact for its winning attempt. | Enforced for Archon; legacy accepts the label but does not publish |
@@ -310,8 +412,8 @@ dependencies, and references are validated as one acyclic graph.
 | `bash` | `bash: nonempty string`. | Optional millisecond `timeout` and `retry`. | Enforced through the contained process runner |
 | `script` | `script: nonempty string` and `runtime: uv | bun`. | `deps` string array; optional millisecond `timeout` and `retry`. Named scripts resolve below `scripts/`. | Enforced when the runtime and resource exist |
 | `loop` | `loop` object below. | Common fields except node `retry`. | Current v4 seals exactly one prompt/command source and confirmed-signal semantics; sealed v3 behavior is preserved |
-| `approval` | `approval` object below. | Common fields; node retry is not supported in Archon v3-v4. | Enforced durable compare-and-set user gate |
-| `cancel` | `cancel: nonempty string` reason. | Common fields; node retry is not supported in Archon v3-v4. | Enforced durable cancellation; it never publishes because it cannot complete successfully |
+| `approval` | `approval` object below. | Common fields; node retry is not supported in Archon v3-v5. | Enforced durable compare-and-set user gate |
+| `cancel` | `cancel: nonempty string` reason. | Common fields; node retry is not supported in Archon v3-v5. | Enforced durable cancellation; it never publishes because it cannot complete successfully |
 
 For Archon Bash and script nodes, `timeout` is a positive finite millisecond
 value. Omission requests the Archon 120,000 ms default before Hermes intersects
@@ -336,11 +438,11 @@ and retain their generated migration warnings.
 | `agents` | Mapping from portable agent ID to the inline-agent shape below. | Mapped to bounded `workflow_agent` children |
 | `effort` | `low`, `medium`, `high`, or `max`. | Mapped; provider capability applies |
 | `thinking` | `adaptive`, `disabled`, or enabled object with positive `budgetTokens`. | Mapped; provider capability applies |
-| `maxBudgetUsd` | Positive number. Phase 2 cannot guarantee an enforceable portable cost budget. | Legacy-only/provider-conditional; blocked pending Phase 5 (`archon_budget_enforcement_unavailable`) |
+| `maxBudgetUsd` | Positive number shared by the parent, retries, repair, fallback, and inline agents. | Enforced only with authoritative provider settlement; otherwise blocked (`authoritative_cost_unavailable`) |
 | `systemPrompt` | Nonempty initial worker system prompt. | Mapped only for a fresh/fingerprint-safe context; changing a shared session blocks |
 | `fallbackModel` | Nonempty fallback identifier. | Mapped; provider capability applies |
 | `betas` | Array of nonempty provider beta names. | Mapped; provider capability applies |
-| `sandbox` | Provider/backend mapping object. | Legacy-only/provider-conditional; blocked pending Phase 5 (`archon_sandbox_enforcement_unavailable`) |
+| `sandbox` | Provider-native mapping object. | Capability checked; currently blocked for Archon v5 (`provider_native_sandbox_unavailable`) |
 
 Published aliases include `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`,
 `WebFetch`, `WebSearch`, `Agent`, and `Task`. Doctor shows the concrete Hermes
@@ -518,7 +620,7 @@ stream the verified original with a safe attachment name.
 
 ### Retry object
 
-| Field | Archon v3-v4 meaning | Legacy meaning |
+| Field | Archon v3-v5 meaning | Legacy meaning |
 | --- | --- | --- |
 | `max_attempts` | Required integer 1–5 counting retries after the initial attempt. | Integer 1–5 counting total workflow/provider attempts; warning `legacy_retry_total_attempts`. |
 | `delay_ms` | Optional integer 1,000–60,000 milliseconds between workflow retries. | Same unit with the legacy total-attempt ledger. |
@@ -640,7 +742,8 @@ never widen, the configured profile ceiling.
 | `max_descendants` | Process/worker descendant count. |
 
 These ceilings control execution availability and containment. They do not
-claim OS sandbox portability or enforce `maxBudgetUsd`.
+claim OS sandbox portability. Cost-budget enforcement is the separate
+authoritative provider-settlement contract described above.
 
 ## Examples
 
@@ -783,9 +886,11 @@ Archon node `timeout` field.
 
 Phase 4 does not add an executable node kind: `include` is compile-only, and
 the existing `loop` node receives the sealed prompt/command and signal contract
-described above. MCP and skills remain options on AI nodes. Runtime child
-workflows, `include.with`, `loop_group`, and portable sandbox and budget
-guarantees remain later work represented by generated compatibility findings.
+described above. Phase 5 adds provider portability without a new node kind.
+MCP and skills remain options on AI nodes. Runtime child workflows,
+`include.with`, and `loop_group` remain out of scope. Provider-native sandbox
+requests and providers without authoritative cost settlement remain explicit
+blocking compatibility findings.
 
 The legacy global `create-workflow` skill is not an authoring authority for
 Hermes. OTTO V1 `steps`, `produces`, `context_from`, `verify`, and `iterate`
