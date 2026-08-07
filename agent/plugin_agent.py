@@ -46,6 +46,28 @@ from tools.managed_process import (
 )
 
 
+PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION = 1
+
+
+def plugin_agent_python_runtime_identity() -> str:
+    """Credential-free identity for the exact trusted Python MCP host."""
+    digest = hashlib.sha256()
+    digest.update(b"hermes-plugin-agent-python-runtime-v1\0")
+    for value in (
+        sys.implementation.name,
+        getattr(sys.implementation, "cache_tag", ""),
+        sys.version,
+        str(PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION),
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    with Path(sys.executable).open("rb") as interpreter:
+        while chunk := interpreter.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 _PROTOCOL_VERSION = 1
 _MAX_REQUEST_BYTES = 1_000_000
 _MAX_FRAME_BYTES = 4_000_000
@@ -462,6 +484,7 @@ class PluginAgentRunRequest:
     intended_authority_digest: str | None = None
     expected_model_visible_prefix_digest: str | None = None
     expected_runtime_identity: Mapping[str, str] | None = None
+    expected_mcp_runtime_identity_digest: str | None = None
     enabled_toolsets: tuple[str, ...] | None = None
     allowed_tools: tuple[str, ...] | None = None
     denied_tools: tuple[str, ...] = ()
@@ -506,6 +529,9 @@ class PluginAgentRunRequest:
                 self.expected_model_visible_prefix_digest
             ),
             "expected_runtime_identity": _wire_json(self.expected_runtime_identity),
+            "expected_mcp_runtime_identity_digest": (
+                self.expected_mcp_runtime_identity_digest
+            ),
             "enabled_toolsets": _wire_json(self.enabled_toolsets),
             "allowed_tools": _wire_json(self.allowed_tools),
             "denied_tools": _wire_json(self.denied_tools),
@@ -558,6 +584,7 @@ class PluginAgentRunRequest:
             "intended_authority_digest",
             "expected_model_visible_prefix_digest",
             "expected_runtime_identity",
+            "expected_mcp_runtime_identity_digest",
             "enabled_toolsets",
             "allowed_tools",
             "denied_tools",
@@ -959,6 +986,10 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             "expected model-visible prefix",
             request.expected_model_visible_prefix_digest,
         ),
+        (
+            "expected MCP runtime identity",
+            request.expected_mcp_runtime_identity_digest,
+        ),
     ):
         if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise ValueError(f"{label} digest must be lowercase SHA-256")
@@ -998,6 +1029,13 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             raise ValueError(
                 "expected runtime identity requires sealed intended authority"
             )
+    if (
+        request.expected_mcp_runtime_identity_digest is not None
+        and request.intended_authority_digest is None
+    ):
+        raise ValueError(
+            "expected MCP runtime identity requires sealed intended authority"
+        )
     if (
         not isinstance(request.max_iterations, int)
         or isinstance(request.max_iterations, bool)

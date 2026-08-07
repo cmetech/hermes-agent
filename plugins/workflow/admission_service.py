@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from types import MappingProxyType
 from typing import AbstractSet, Mapping
 
+import yaml
+
 from hermes_cli.provider_capabilities import CapabilityDisposition
 from plugins.workflow.compilation import WorkflowCompilation
-from plugins.workflow.language import supports_phase4_semantics
+from plugins.workflow.language import supports_phase4_semantics, supports_phase5_semantics
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.provider_authority import (
     WorkflowProviderAuthority,
     WorkflowProviderAuthorityError,
 )
+from plugins.workflow.resources import normalize_mcp_server_document
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
@@ -32,6 +36,64 @@ from plugins.workflow.compat import CompatibilityReport
 
 class WorkflowAdmissionAssessmentError(ValueError):
     """The immutable compilation and its derived admission identities disagree."""
+
+
+def _phase5_mcp_execution_preconditions(
+    compilation: WorkflowCompilation,
+) -> Mapping[str, bool] | None:
+    package = compilation.package
+    if not supports_phase5_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        return None
+    resources_by_node: dict[str, set[str]] = {}
+    mcp_bindings = []
+    for binding in compilation.dependency_manifest.resources:
+        if binding.node_id is None:
+            continue
+        if binding.resource_kind == "mcp_resource":
+            resources = resources_by_node.setdefault(binding.node_id, set())
+            resources.add(binding.source_relative_path)
+            resources.add(binding.snapshot_path)
+        elif binding.resource_kind == "mcp":
+            mcp_bindings.append(binding)
+    facts: dict[str, bool] = {}
+    for binding in mcp_bindings:
+        node_id = str(binding.node_id)
+        supported = True
+        try:
+            encoded = compilation.sealed_files[binding.snapshot_path]
+            document = yaml.safe_load(encoded.decode("utf-8")) or {}
+            servers = normalize_mcp_server_document(
+                document,
+                default_name=binding.snapshot_path.rsplit("/", 1)[-1].split(".")[0],
+            )
+        except (KeyError, UnicodeError, ValueError, yaml.YAMLError):
+            supported = False
+            servers = {}
+        sealed_resources = resources_by_node.get(node_id, set())
+        for server in servers.values():
+            command = server.get("command")
+            args = server.get("args")
+            entry = args[0] if isinstance(args, list) and args else None
+            runtime_files = server.get("runtime_files", [])
+            if (
+                command != sys.executable
+                or server.get("transport") != "stdio"
+                or not isinstance(entry, str)
+                or entry.startswith("-")
+                or not entry.lower().endswith((".py", ".pyw"))
+                or entry not in sealed_resources
+                or not isinstance(runtime_files, list)
+                or any(
+                    not isinstance(path, str) or path not in sealed_resources
+                    for path in runtime_files
+                )
+            ):
+                supported = False
+        facts[node_id] = facts.get(node_id, True) and supported and bool(servers)
+    return MappingProxyType(facts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +177,12 @@ def assess_workflow_admission(
     )
     authority_error = None
     try:
-        authority = execution_context.provider_authority(package)
+        authority = execution_context.provider_authority(
+            package,
+            mcp_execution_preconditions=(
+                _phase5_mcp_execution_preconditions(compilation)
+            ),
+        )
     except WorkflowProviderAuthorityError as exc:
         authority = None
         authority_error = exc

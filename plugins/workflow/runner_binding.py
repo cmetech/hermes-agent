@@ -243,6 +243,8 @@ class ExecutionCapabilityContext:
     def provider_authority(
         self,
         package: "WorkflowPackage",
+        *,
+        mcp_execution_preconditions: Mapping[str, bool] | None = None,
     ) -> "WorkflowProviderAuthority | None":
         """Resolve the single v5 model/capability authority for a package."""
         from plugins.workflow.language import supports_phase5_semantics
@@ -273,6 +275,7 @@ class ExecutionCapabilityContext:
             model_config=self.model_config_snapshot,
             default_runtime=self.runtime_capabilities,
             environment=environment,
+            mcp_execution_preconditions=mcp_execution_preconditions,
         )
 
     def structured_output_identity_material(

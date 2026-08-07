@@ -49,7 +49,7 @@ def _v5_compilation(tmp_path: Path, workflow_writer):
     )
 
 
-def _authority(package):
+def _authority(package, *, mcp_execution_preconditions=None):
     config = parse_workflow_model_config({
         "model": {
             "provider": "openrouter",
@@ -83,6 +83,7 @@ def _authority(package):
             web_service_available=True,
             authoritative_cost_available=False,
         ),
+        mcp_execution_preconditions=mcp_execution_preconditions,
     )
 
 

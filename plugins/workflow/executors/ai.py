@@ -1108,6 +1108,21 @@ class AgentNodeExecutor:
                 if "mcp" in node.options
                 else None
             )
+            if (
+                phase5
+                and mcp_servers is not None
+                and context.sealed_mcp_runtime_identity_digest is None
+            ):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_capability_drift",
+                    error_message="sealed MCP runtime identity is missing",
+                    metadata={
+                        "provider_attempts": 0,
+                        "known_no_effect": True,
+                        "archon_terminal_failure": True,
+                    },
+                )
             inline_agents = self._inline_agents(context)
             denied_set = list(denied_tools)
             if "delegate_task" not in denied_set:
@@ -1186,6 +1201,11 @@ class AgentNodeExecutor:
                             sealed_route.registration_provenance_digest
                         ),
                     }
+                    if phase5
+                    else None
+                ),
+                expected_mcp_runtime_identity_digest=(
+                    context.sealed_mcp_runtime_identity_digest
                     if phase5
                     else None
                 ),

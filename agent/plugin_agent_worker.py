@@ -19,6 +19,7 @@ from agent.plugin_agent import (
     _ProviderAttemptGrantExhausted,
     _reserve_shared_provider_attempt,
     _snapshot_shared_provider_attempts,
+    plugin_agent_python_runtime_identity,
 )
 
 
@@ -53,6 +54,55 @@ _AUTHORITY_LOADER = (
     "os.chdir(r);sys.path[:]=[os.path.dirname(p),r,*sys.path];"
     "sys.argv=[p,*sys.argv[3:]];runpy.run_path(p,run_name='__main__')"
 )
+_PHASE5_AUTHORITY_LOADER = r"""
+import importlib.machinery
+import os
+import runpy
+import sys
+
+root, entry = sys.argv[1:3]
+root = os.path.realpath(root)
+entry_path = os.path.realpath(os.path.join(root, *entry.split('/')))
+stdlib = os.path.realpath(os.path.dirname(os.__file__))
+
+def contained(path, parent):
+    try:
+        return os.path.commonpath((os.path.realpath(path), parent)) == parent
+    except (OSError, ValueError):
+        return False
+
+def permitted(path):
+    normalized = os.path.realpath(path)
+    parts = {part.casefold() for part in normalized.split(os.sep)}
+    return (
+        contained(normalized, root)
+        or (
+            contained(normalized, stdlib)
+            and "site-packages" not in parts
+            and "dist-packages" not in parts
+        )
+    )
+
+class SealedImportGuard:
+    def find_spec(self, fullname, path=None, target=None):
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.origin in {None, "built-in", "frozen"}:
+            return spec
+        origins = [spec.origin, *(spec.submodule_search_locations or ())]
+        if not all(permitted(origin) for origin in origins):
+            raise ImportError(f"unsealed import blocked: {fullname}")
+        return spec
+
+sys.meta_path.insert(0, SealedImportGuard())
+sys.path[:] = [
+    os.path.dirname(entry_path),
+    root,
+    *(path for path in sys.path if path and permitted(path)),
+]
+os.chdir(root)
+sys.argv = [entry_path, *sys.argv[3:]]
+runpy.run_path(entry_path, run_name="__main__")
+"""
 
 
 def _canonical_authority_relative(value: object) -> str:
@@ -618,6 +668,8 @@ def _is_package_spec_argument(value: str, executable: str) -> bool:
 
 def _finalize_authenticated_mcp_config(
     servers: dict[str, dict[str, Any]],
+    *,
+    phase5: bool = False,
 ) -> dict[str, dict[str, Any]]:
     finalized: dict[str, dict[str, Any]] = {}
     validated: dict[str, tuple[Path, Path, dict[str, dict[str, object]]]] = {}
@@ -692,6 +744,8 @@ def _finalize_authenticated_mcp_config(
             return f"{prefix}{root.joinpath(*Path(relative).parts)}", relative
 
         if command is None and isinstance(config.get("url"), str):
+            if phase5:
+                reject_unproven()
             if _uri_disposition(config["url"]) != "network":
                 reject_unproven()
             finalized[name] = config
@@ -706,6 +760,8 @@ def _finalize_authenticated_mcp_config(
             )
         executable = re.split(r"[/\\]", command)[-1].lower().removesuffix(".exe")
         is_python = _PYTHON_EXECUTABLE.fullmatch(executable) is not None
+        if phase5 and command != sys.executable:
+            reject_unproven()
         command_path_hint = _looks_path_like(command) and not is_python
         rewritten_command, _command_relative = rewrite(
             command,
@@ -763,6 +819,28 @@ def _finalize_authenticated_mcp_config(
             ]
 
         if is_python:
+            if phase5:
+                entry = argument_references[0] if argument_references else None
+                if (
+                    not rewritten
+                    or entry is None
+                    or not entry.lower().endswith((".py", ".pyw"))
+                    or rewritten[0].startswith("-")
+                ):
+                    reject_unproven()
+                config["command"] = sys.executable
+                config["args"] = [
+                    "-I",
+                    "-S",
+                    "-c",
+                    _PHASE5_AUTHORITY_LOADER,
+                    str(root),
+                    entry,
+                    *rewritten[1:],
+                ]
+                config[_AUTHORITY_CWD_KEY] = str(root)
+                finalized[name] = config
+                continue
             isolated_args = rewritten[1:] if rewritten[:1] == ["-I"] else rewritten
             isolated_refs = (
                 argument_references[1:]
@@ -1401,7 +1479,21 @@ def _run(
             str(name): worker_mcp._interpolate_env_vars(dict(config))
             for name, config in raw_mcp.items()
         }
-        resolved_mcp = _finalize_authenticated_mcp_config(resolved_mcp)
+        if (
+            request.expected_mcp_runtime_identity_digest is not None
+            and plugin_agent_python_runtime_identity()
+            != request.expected_mcp_runtime_identity_digest
+        ):
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=(
+                    request.intended_authority_digest or ""
+                ),
+            )
+        resolved_mcp = _finalize_authenticated_mcp_config(
+            resolved_mcp,
+            phase5=request.intended_authority_digest is not None,
+        )
         enabled_mcp_names = {
             name
             for name, config in resolved_mcp.items()

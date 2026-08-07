@@ -9,6 +9,11 @@ import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from agent.plugin_agent import (
+    PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION,
+    plugin_agent_python_runtime_identity,
+)
+
 from hermes_cli.provider_capabilities import (
     CapabilityDisposition,
     ProviderCapabilityDecision,
@@ -696,6 +701,7 @@ def resolve_workflow_provider_authority(
     model_config: WorkflowModelConfigSnapshot,
     default_runtime: ExecutionRuntimeCapabilities,
     environment: ProviderAuthorityEnvironment,
+    mcp_execution_preconditions: Mapping[str, bool] | None = None,
 ) -> WorkflowProviderAuthority:
     """Resolve one complete credential-free v5 provider authority."""
     if not supports_phase5_semantics(
@@ -907,16 +913,26 @@ def resolve_workflow_provider_authority(
                 },
             )
         if "mcp" in node_options:
+            mcp_precondition = (
+                mcp_execution_preconditions is None
+                or mcp_execution_preconditions.get(node.id) is True
+            )
             add(
                 f"nodes[{index}].mcp",
                 primary_id,
                 WorkflowProviderFeature.MCP,
                 option="stdio",
                 requested={
-                    "sealed_definition": True,
+                    "sealed_definition": mcp_precondition,
                     "bounded_lifecycle": True,
                     "dependency_available": environment.mcp_available,
                     "teardown_guaranteed": environment.mcp_available,
+                    "runtime_identity_digest": (
+                        plugin_agent_python_runtime_identity()
+                    ),
+                    "import_policy_version": (
+                        PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
+                    ),
                 },
             )
         if "skills" in node_options:

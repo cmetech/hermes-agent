@@ -118,6 +118,27 @@ def phase5_session_cache_fingerprint(
     ).hexdigest()
 
 
+def phase5_node_mcp_runtime_identity_digest(
+    provider_authority,
+    *,
+    node_id: str,
+) -> str | None:
+    """Read one sealed MCP host identity from the node's authority obligation."""
+    route_id = f"{node_id}:primary"
+    for obligation in provider_authority.obligations:
+        if (
+            obligation.route_id == route_id
+            and obligation.decision.feature.value == "mcp"
+        ):
+            value = obligation.decision.requested_semantics.get(
+                "runtime_identity_digest"
+            )
+            if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+                raise ValueError("sealed MCP runtime identity is malformed")
+            return value
+    return None
+
+
 def _thaw(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}

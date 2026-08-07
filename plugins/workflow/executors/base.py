@@ -84,6 +84,7 @@ class NodeExecutionContext:
     sealed_provider_route: WorkflowResolvedProviderRoute | None = None
     intended_authority_digest: str | None = None
     expected_model_visible_prefix_digest: str | None = None
+    sealed_mcp_runtime_identity_digest: str | None = None
     structured_output: WorkflowStructuredOutput | None = None
     structured_output_decision: StructuredOutputCapabilityDecision | None = None
     outward_action: bool = False

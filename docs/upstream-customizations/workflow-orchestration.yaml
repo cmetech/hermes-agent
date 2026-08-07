@@ -282,6 +282,52 @@ upstream_changes:
   removal_condition: Remove when upstream exposes equivalent concurrency-safe scoped
     hook and middleware ownership with idempotent selective teardown.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-sealed-mcp-runtime
+  change_class: workflow-security
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - plugins/workflow/admission_service.py
+  - plugins/workflow/dependency_manifest.py
+  - plugins/workflow/execution_semantics.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduler.py
+  owned_symbols:
+  - PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
+  - plugin_agent_python_runtime_identity
+  - _PHASE5_AUTHORITY_LOADER
+  - _phase5_mcp_execution_preconditions
+  - phase5_node_mcp_runtime_identity_digest
+  owned_invariants:
+  - v5 MCP admission supports only an exact trusted Hermes Python interpreter and sealed package entry script
+  - interpreter family version build bytes and import-policy version are sealed as a credential-free authority digest
+  - worker startup recomputes the exact interpreter identity before MCP discovery or provider transport
+  - v5 launches with isolated -I -S semantics and a lifetime import guard limited to standard-library and sealed package roots
+  - PATH commands python module and inline-code forms Node npm registries standalone binaries and remote HTTP or SSE block
+  - v1-v4 authenticated MCP launch normalization and lifecycle behavior remain unchanged
+  - existing MCP startup cancellation shutdown process-tree cleanup and redacted diagnostics remain authoritative
+  tests:
+  - tests/plugins/workflow/test_phase5_mcp.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  - tests/tools/test_mcp_initial_connect_shutdown.py
+  - tests/tools/test_mcp_cancelled_error_propagation.py
+  - tests/tools/test_mcp_reconnect_log_hygiene.py
+  - tests/tools/test_process_registry.py
+  expected_commit_subject: 'feat(workflow): seal MCP executable closure'
+  upstream_candidate: true
+  merge_guidance: Keep v5 strictness conditional on sealed Phase 5 authority so
+    old snapshots retain their exact launch contract. Treat the trusted interpreter
+    as an attested host dependency rather than package content, recompute its digest
+    before discovery, and keep the import guard active for the entire child lifetime.
+  removal_condition: Remove when upstream supplies an equivalent versioned package-contained
+    MCP Python closure with interpreter attestation and lifetime import-root enforcement.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration
