@@ -12366,6 +12366,17 @@ class RunStore:
             })
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
+            loop_input_consumed = safe_metadata.pop(
+                "_loop_input_consumed", False
+            )
+            language = projection.get("language")
+            if loop_input_consumed is True and (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            ):
+                node.pop("loop_user_input_artifact", None)
             node["attempts"][-1]["metadata"] = safe_metadata
             if session_registry_update is not None:
                 node["attempts"][-1]["session_registry_authority"] = (
@@ -13095,6 +13106,81 @@ class RunStore:
                 )
             except ValueError as exc:
                 raise JournalRecoveryError("journaled loop lease is malformed") from exc
+            bound_attempt_id = (
+                raw_decision.get("attempt_id")
+                if isinstance(raw_decision, Mapping)
+                else None
+            )
+            if bound_attempt_id != attempt_id:
+                prior_attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", ())
+                        if isinstance(candidate, Mapping)
+                        and candidate.get("attempt_id") == bound_attempt_id
+                    ),
+                    None,
+                )
+                current_attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", ())
+                        if isinstance(candidate, Mapping)
+                        and candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+                if (
+                    not isinstance(bound_attempt_id, str)
+                    or not bound_attempt_id
+                    or prior_attempt is None
+                    or current_attempt is None
+                    or prior_attempt.get("state")
+                    not in {"cancelled", "failed", "interrupted"}
+                    or current_attempt.get("state") not in {"claimed", "running"}
+                ):
+                    raise JournalRecoveryError(
+                        "journaled loop decision binding changed"
+                    )
+                prior_claim = NodeClaim(
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=bound_attempt_id,
+                    owner_id=owner_id,
+                    lease_expires_at=claim.lease_expires_at,
+                )
+                self._validated_bound_loop_decision(
+                    raw_decision,
+                    claim=prior_claim,
+                    loop_state=loop_state,
+                )
+                clean_state = dict(loop_state)
+                clean_state.pop("_pending_loop_decision", None)
+                node["loop_state"] = clean_state
+                node.pop("loop_user_input_artifact", None)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_decision_superseded",
+                    {"reason_code": "attempt_replaced"},
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                )
+                with self._connect() as connection:
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="loop_decision_superseded",
+                    )
+                self._notify_coordinator()
+                return None
             decision = self._validated_bound_loop_decision(
                 raw_decision,
                 claim=claim,
@@ -13945,19 +14031,12 @@ class RunStore:
             from plugins.workflow.notifications import (
                 NotificationOutbox,
                 notification_kind,
+                projected_pending_interaction,
             )
 
             kind = notification_kind(event_type, projection)
             if kind is not None:
-                pending = next(
-                    (
-                        node.get("pending_interaction")
-                        for node in projection.get("nodes", {}).values()
-                        if isinstance(node, Mapping)
-                        and isinstance(node.get("pending_interaction"), Mapping)
-                    ),
-                    None,
-                )
+                pending = projected_pending_interaction(projection)
                 NotificationOutbox(self).record(
                     run_id=str(projection["run_id"]),
                     kind=kind,

@@ -440,6 +440,7 @@ def test_paused_signal_has_one_backend_action_contract_across_every_surface(
     assert rest_status.status_code == 200
     assert _run_facts(rest_status.json()) == expected
     assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "stale_state"
     assert _run_facts(conflict.json()["detail"]["current"]) == expected
 
     attention_item = next(
@@ -646,3 +647,35 @@ def test_paused_signal_has_one_backend_action_contract_across_every_surface(
         encoded = json.dumps(surface, sort_keys=True)
         assert _PRIVATE_PHASE4_FEEDBACK not in encoded
         assert _PRIVATE_PHASE4_PROVIDER_RESPONSE.decode().strip() not in encoded
+
+
+def test_desktop_rest_applies_phase4_signal_actions(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    module = _api_module()
+    for action in ("approve", "provide-input"):
+        operator_scope = "local-admin"
+        store, run_id, pending = _paused_signal_run(
+            tmp_path / action,
+            workflow_writer,
+            operator_scope=operator_scope,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(store.hermes_home))
+        current = store.get_run_status(run_id, operator_scope=operator_scope)
+        payload = {
+            "expected_version": current["state_version"],
+            "interaction_id": pending["interaction_id"],
+        }
+        if action == "provide-input":
+            payload["value"] = "tighten evidence"
+        with TestClient(_app(module.router)) as client:
+            response = client.post(
+                f"/api/plugins/workflow/runs/{run_id}/{action}",
+                json=payload,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["run_id"] == run_id
+        assert response.json()["state_version"] > current["state_version"]

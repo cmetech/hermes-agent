@@ -68,7 +68,12 @@ class LoopExecutor:
         self._bash = BashExecutor()
 
     @staticmethod
-    def _cancelled(context: NodeExecutionContext) -> NodeExecutionResult:
+    def _cancelled(
+        context: NodeExecutionContext,
+        *,
+        loop_state: Mapping[str, object] | None = None,
+        loop_input_consumed: bool = False,
+    ) -> NodeExecutionResult:
         reason = (
             context.cancellation_reason()
             if context.cancellation_reason is not None
@@ -77,6 +82,14 @@ class LoopExecutor:
         return NodeExecutionResult(
             "interrupted" if reason == "shutdown" else "cancelled",
             error_code=reason or "cancelled",
+            metadata={
+                **({"loop_state": dict(loop_state)} if loop_state is not None else {}),
+                **(
+                    {"_loop_input_consumed": True}
+                    if loop_input_consumed
+                    else {}
+                ),
+            },
         )
 
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
@@ -196,6 +209,23 @@ class LoopExecutor:
         previous_metadata: Mapping[str, object] | None = None
         resumed = isinstance(previous_state, Mapping)
         fresh_context = bool(loop.get("fresh_context", False))
+        committed_state: dict[str, object] | None = None
+        if phase4:
+            committed_state = {
+                key: previous_state[key]
+                for key in (
+                    "iteration",
+                    "max_iterations",
+                    "fresh_context",
+                    "output_artifact",
+                    "output_size_bytes",
+                    "output_sha256",
+                )
+                if isinstance(previous_state, Mapping) and key in previous_state
+            }
+            committed_state.setdefault("iteration", 0)
+            committed_state.setdefault("max_iterations", maximum)
+            committed_state.setdefault("fresh_context", fresh_context)
         if resumed and (phase4 or loop.get("interactive") is not True):
             previous_artifact = previous_state.get("output_artifact")
             if isinstance(previous_artifact, str) and previous_artifact:
@@ -271,7 +301,10 @@ class LoopExecutor:
 
         for iteration in range(start_iteration, maximum + 1):
             if context.is_cancelled is not None and context.is_cancelled():
-                cancelled = self._cancelled(context)
+                cancelled = self._cancelled(
+                    context,
+                    loop_state=committed_state,
+                )
                 return replace(cancelled, artifacts=tuple(artifacts))
             variables = replace(
                 base_variables,
@@ -318,10 +351,21 @@ class LoopExecutor:
                 "fresh_context": fresh_context,
             }
             if result.status != "succeeded":
+                persisted_state = committed_state if phase4 else state
                 return replace(
                     result,
                     artifacts=tuple(artifacts),
-                    metadata={**result.metadata, "loop_state": state},
+                    metadata={
+                        **result.metadata,
+                        "loop_state": persisted_state,
+                        **(
+                            {"_loop_input_consumed": True}
+                            if phase4
+                            and iteration == start_iteration
+                            and bool(base_variables.loop_user_input)
+                            else {}
+                        ),
+                    },
                 )
             output_path = context.run_directory / result.artifacts[-1].relative_path
             output = output_path.read_text(encoding="utf-8")
@@ -419,6 +463,8 @@ class LoopExecutor:
                 context.record_iteration(
                     tuple(iteration_artifacts), journal_state
                 )
+            if phase4:
+                committed_state = dict(state)
             if completed and signal_completes:
                 state["completed_by"] = "signal"
                 return NodeExecutionResult(
@@ -492,7 +538,14 @@ class LoopExecutor:
                         metadata={**check.metadata, "loop_state": state},
                     )
             if context.is_cancelled is not None and context.is_cancelled():
-                cancelled = self._cancelled(context)
+                cancelled = self._cancelled(
+                    context,
+                    loop_state=committed_state,
+                    loop_input_consumed=(
+                        iteration == start_iteration
+                        and bool(base_variables.loop_user_input)
+                    ),
+                )
                 return replace(cancelled, artifacts=tuple(artifacts))
             if iteration == maximum:
                 if (
@@ -562,10 +615,14 @@ class LoopExecutor:
             "loop_max_iterations",
             f"loop reached its hard limit of {maximum} iterations",
             {
-                "loop_state": {
-                    "iteration": maximum,
-                    "max_iterations": maximum,
-                },
+                "loop_state": (
+                    committed_state
+                    if phase4 and committed_state is not None
+                    else {
+                        "iteration": maximum,
+                        "max_iterations": maximum,
+                    }
+                ),
                 **({"archon_terminal_failure": True} if phase4 else {}),
             },
         )

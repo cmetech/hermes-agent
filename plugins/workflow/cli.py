@@ -1579,10 +1579,33 @@ def doctor_package(
         if compilation is not None
         else compute_package_digest(package)
     )
-    covered = package_digest.covered_relative_paths
-    commands = tuple(path for path in covered if path.startswith("commands/"))
-    scripts = tuple(path for path in covered if path.startswith("scripts/"))
-    mcp_servers = tuple(path for path in covered if path.startswith("mcp/"))
+    if phase4_compilation is not None:
+        bindings = phase4_compilation.dependency_manifest.resources
+
+        def logical_path(binding) -> str:
+            return f"{binding.package_key}::{binding.source_relative_path}"
+
+        covered = tuple(sorted({logical_path(binding) for binding in bindings}))
+        commands = tuple(sorted({
+            logical_path(binding)
+            for binding in bindings
+            if binding.resource_kind in {"command", "loop_command"}
+        }))
+        scripts = tuple(sorted({
+            logical_path(binding)
+            for binding in bindings
+            if binding.resource_kind == "named_script"
+        }))
+        mcp_servers = tuple(sorted({
+            logical_path(binding)
+            for binding in bindings
+            if binding.resource_kind == "mcp"
+        }))
+    else:
+        covered = package_digest.covered_relative_paths
+        commands = tuple(path for path in covered if path.startswith("commands/"))
+        scripts = tuple(path for path in covered if path.startswith("scripts/"))
+        mcp_servers = tuple(path for path in covered if path.startswith("mcp/"))
     skills = tuple(sorted(set(risk.requested_skills)))
 
     requirements = _input_requirements(package, findings)

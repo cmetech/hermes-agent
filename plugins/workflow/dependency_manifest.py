@@ -43,6 +43,13 @@ WORKFLOW_DEPENDENCY_MANIFEST_SCHEMA_VERSION = 1
 WORKFLOW_MANIFEST_MAX_DEPENDENCIES = 64
 WORKFLOW_MANIFEST_MAX_INCLUDE_EDGES = 4096
 WORKFLOW_MANIFEST_MAX_EXPANDED_NODES = 512
+_YAML_CANONICAL_TAGS = frozenset({
+    "$hermes_yaml_binary",
+    "$hermes_yaml_date",
+    "$hermes_yaml_float",
+    "$hermes_yaml_mapping",
+    "$hermes_yaml_timestamp",
+})
 WORKFLOW_MANIFEST_MAX_FILES = 512
 WORKFLOW_MANIFEST_MAX_FILE_BYTES = 1 * 1024 * 1024
 WORKFLOW_MANIFEST_MAX_TOTAL_BYTES = 8 * 1024 * 1024
@@ -248,8 +255,24 @@ def _logical_graph_value(
     *,
     trusted_legacy_values: bool = False,
 ) -> object:
-    if value is None or isinstance(value, str | bool | float):
+    if value is None or isinstance(value, str | bool):
         return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return {
+            (
+                "$hermes_legacy_float"
+                if trusted_legacy_values
+                else "$hermes_yaml_float"
+            ): (
+                "nan"
+                if math.isnan(value)
+                else "negative_infinity"
+                if value < 0
+                else "positive_infinity"
+            )
+        }
     if isinstance(value, int):
         if trusted_legacy_values:
             # Python protects decimal conversion of very large integers. Legacy
@@ -263,20 +286,45 @@ def _logical_graph_value(
                     "$hermes_legacy_integer": format(value, "x"),
                 }
         return value
-    if trusted_legacy_values and isinstance(value, datetime):
-        return {"$hermes_legacy_timestamp": value.isoformat()}
-    if trusted_legacy_values and isinstance(value, date):
-        return {"$hermes_legacy_date": value.isoformat()}
-    if trusted_legacy_values and isinstance(value, bytes):
-        return {"$hermes_legacy_binary": value.hex()}
-    if isinstance(value, Mapping):
+    if isinstance(value, datetime):
         return {
+            (
+                "$hermes_legacy_timestamp"
+                if trusted_legacy_values
+                else "$hermes_yaml_timestamp"
+            ): value.isoformat()
+        }
+    if isinstance(value, date):
+        return {
+            (
+                "$hermes_legacy_date"
+                if trusted_legacy_values
+                else "$hermes_yaml_date"
+            ): value.isoformat()
+        }
+    if isinstance(value, bytes):
+        return {
+            (
+                "$hermes_legacy_binary"
+                if trusted_legacy_values
+                else "$hermes_yaml_binary"
+            ): value.hex()
+        }
+    if isinstance(value, Mapping):
+        projected = {
             str(key): _logical_graph_value(
                 item,
                 trusted_legacy_values=trusted_legacy_values,
             )
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         }
+        if not trusted_legacy_values and _YAML_CANONICAL_TAGS.intersection(projected):
+            return {
+                "$hermes_yaml_mapping": [
+                    [key, projected[key]] for key in sorted(projected)
+                ]
+            }
+        return projected
     if isinstance(value, tuple | list):
         return [
             _logical_graph_value(

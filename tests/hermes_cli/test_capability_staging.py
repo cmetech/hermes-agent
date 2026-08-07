@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import capability_staging as cs
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     compute_package_digest,
@@ -282,6 +283,50 @@ def test_complete_package_swap_is_atomic_and_distribution_trust_is_digest_bound(
     assert WorkflowTrustStore(home).check(digest) == "trusted"
     trust = json.loads((home / "workflow/trust.json").read_text())
     assert trust["records"][digest]["actor"] == "trusted_distribution"
+
+
+def test_trusted_distribution_stages_and_trusts_phase4_composite_digest(
+    tmp_path,
+    home,
+    fake_config,
+) -> None:
+    bundle = make_bundle(tmp_path)
+    package_root = bundle / "capabilities/workflow-packages/ericsson"
+    workflow = package_root / "workflows/my-tickets-summary.yaml"
+    sidecar = workflow.with_name("my-tickets-summary.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        source="distribution",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    (package_root / "digests.json").write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "packages": {
+                "my-tickets-summary": compilation.composite_digest,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home, trusted_distribution=True)
+
+    trust = WorkflowTrustStore(home)
+    assert trust.check(compilation.composite_digest) == "trusted"
+    assert trust.check(compute_package_digest(compilation.package).sha256) == (
+        "untrusted"
+    )
 
 
 def test_package_digest_mismatch_preserves_previous_package_and_trust(

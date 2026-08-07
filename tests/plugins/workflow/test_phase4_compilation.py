@@ -179,6 +179,162 @@ def _parse_source(path, *, name: str, source: str, precedence: int, sidecar=None
     )
 
 
+def test_current_v4_compilation_preserves_accepted_yaml_native_scalars(
+    tmp_path,
+) -> None:
+    """Catch v4's internal bounds encoder rejecting values accepted by v1-v3."""
+    from datetime import date
+    import math
+
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    path = tmp_path / "native-scalars.yaml"
+    workflow_bytes = b"""\
+name: native-scalars
+description: Accepted YAML-native scalar compatibility
+sandbox:
+  expires: 2026-01-01
+  ratio: .inf
+  token: !!binary |
+    AAEC
+nodes:
+  - id: run
+    bash: "true"
+    sandbox:
+      expires: 2026-01-02
+      ratio: .nan
+      token: !!binary |
+        AwQF
+"""
+    source = schema_module.parse_workflow_source_bytes(
+        path,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        source="explicit",
+        precedence=0,
+    )
+
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+    )
+
+    assert compilation.package.language.normalizer_version == 4
+    root_sandbox = compilation.package.definition.options["sandbox"]
+    assert root_sandbox["expires"] == date(2026, 1, 1)
+    assert root_sandbox["ratio"] == math.inf
+    assert root_sandbox["token"] == b"\x00\x01\x02"
+    node_sandbox = compilation.package.definition.nodes[0].options["sandbox"]
+    assert node_sandbox["expires"] == date(2026, 1, 2)
+    assert math.isnan(node_sandbox["ratio"])
+    assert node_sandbox["token"] == b"\x03\x04\x05"
+    assert len(compilation.composite_digest) == 64
+
+
+def test_v4_native_scalar_tags_cannot_alias_literal_user_mappings(tmp_path) -> None:
+    from datetime import date
+
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.dependency_manifest import _logical_graph_value
+
+    assert _logical_graph_value(date(2026, 1, 1)) != _logical_graph_value({
+        "$hermes_yaml_date": "2026-01-01",
+    })
+
+    sources = []
+    for name, value in (
+        ("native-date", "2026-01-01"),
+        ("literal-tag", "{$hermes_yaml_date: '2026-01-01'}"),
+    ):
+        path = tmp_path / f"{name}.yaml"
+        sources.append(
+            schema_module.parse_workflow_source_bytes(
+                path,
+                workflow_bytes=(
+                    f"name: {name}\n"
+                    "description: Canonical tag separation\n"
+                    f"sandbox:\n  marker: {value}\n"
+                    "nodes:\n  - id: run\n    bash: 'true'\n"
+                ).encode(),
+                sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+                source="explicit",
+                precedence=0,
+            )
+        )
+    catalog = WorkflowCatalogSnapshot.capture(sources)
+    native, literal = (
+        compile_workflow(source, catalog, normalizer_version=4)
+        for source in sources
+    )
+
+    assert (
+        native.dependency_manifest.expanded_definition_digest
+        != literal.dependency_manifest.expanded_definition_digest
+    )
+    assert native.composite_digest != literal.composite_digest
+
+
+def test_v4_include_compilation_keeps_yaml_native_scalar_meaning(
+    tmp_path,
+) -> None:
+    from datetime import date
+
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    root_path = tmp_path / "root.yaml"
+    child_path = tmp_path / "child.yaml"
+    root = schema_module.parse_workflow_source_bytes(
+        root_path,
+        workflow_bytes=b"""\
+name: native-root
+description: Native values with an include
+sandbox:
+  expires: 2026-01-01
+  token: !!binary |
+    AAEC
+nodes:
+  - id: child
+    include: native-child
+""",
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        source="explicit",
+        precedence=0,
+    )
+    child = schema_module.parse_workflow_source_bytes(
+        child_path,
+        workflow_bytes=b"""\
+name: native-child
+description: Included child
+nodes:
+  - id: run
+    bash: "true"
+""",
+        sidecar_bytes=None,
+        source="explicit",
+        precedence=0,
+    )
+
+    compilation = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+        normalizer_version=4,
+    )
+    reparsed = schema_module.parse_workflow_source_bytes(
+        tmp_path / "expanded.yaml",
+        workflow_bytes=compilation.definition_bytes,
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+    )
+
+    assert compilation.package.definition.options["sandbox"] == {
+        "expires": date(2026, 1, 1),
+        "token": b"\x00\x01\x02",
+    }
+    assert reparsed.options["sandbox"] == {
+        "expires": date(2026, 1, 1),
+        "token": b"\x00\x01\x02",
+    }
+
+
 def test_catalog_snapshot_selects_precedence_and_seals_content_signatures(
     tmp_path,
 ) -> None:

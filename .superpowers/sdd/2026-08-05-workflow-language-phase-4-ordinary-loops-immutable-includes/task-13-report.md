@@ -136,10 +136,12 @@ regressions, and these two evidence documents.
 
 - Exact mandatory defensive Step 1 after SDD fix round 1, retries disabled: 5 files,
   163 passed / 0 failed in 33.2s.
-- Post-fix full Python gate, retries disabled: 2,776 files discovered; 32,338 tests
-  passed and 27 failed across 16 files in 673.0s, plus four collection errors in one
-  additional file. Every failing test and collection case exactly matches the prior
-  exact-base attribution set; no branch-only failure remains.
+- Observed full Python gate after fix round 1, retries disabled: 2,776 files
+  discovered; 32,338 tests passed and 28 failed, plus four collection errors in one
+  additional file. One failure was branch-only. After its bounded test-harness fix,
+  the complete affected file passed 517/517; no second full Python run was performed.
+  Therefore 27 remaining failures are base-attributed, but 32,338/27 is not presented
+  as the result of a single run.
 - Exact-base attribution over all initially implicated files: 26 files, 1,053 passed /
   27 failed in 82.1s, plus the same collection error.
 - Desktop typecheck: passed.

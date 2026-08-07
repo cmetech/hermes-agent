@@ -46,9 +46,10 @@ admission by the Task 14 activation evidence later in this document.
 - Desktop typechecking passes. The three Vitest failures and four ESLint errors are
   reproduced exactly on clean `base`; the branch adds nine passing Desktop tests and
   no lint diagnostic.
-- The post-fix full Python suite has no branch-only failure: 32,338 tests passed, 27
-  failed across 16 files, and four collection errors occurred in one additional file;
-  all failing cases reproduce on exact `base`.
+- The observed full Python suite after fix round 1 reported 32,338 passed and 28
+  failed, plus four collection errors. One failure was branch-only; its bounded
+  test-harness fix passed the complete affected file 517/517. The 27 remaining
+  failures reproduce on exact `base`, but no second full Python run was performed.
 - Ruff on every Python file changed during Task 13 and `git diff --check` pass.
 - Functional adversarial review: **PASS** with 545/545 independent tests, a clean
   review diff, and no Critical, High, Medium, or Low findings.
@@ -213,14 +214,14 @@ Command:
 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh
 ```
 
-The post-fix runner discovered 2,776 test files and ran with 14 workers. File retries
-were explicitly disabled, so there were no retry-based passes. Exact final result:
-32,338 tests passed and 27 failed across 16 files in 673.0s, plus four collection
-errors in `tests/agent/test_anthropic_output_field_leak.py`. Every failing test and
-collection case exactly matched the earlier exact-base attribution run. No Phase 4 or
-other branch-only failure remained. The filtered capture retained the discovery,
-failing-file, failing-test, collection-error, and aggregate lines; no result is
-estimated.
+The fix-round-1 runner discovered 2,776 test files and ran with 14 workers. File
+retries were explicitly disabled. Its captured result was 32,338 tests passed and 28
+failed, plus four collection errors in
+`tests/agent/test_anthropic_output_field_leak.py`. One failure was branch-only. The
+subsequent bounded harness fix passed the complete affected file 517/517, and exact
+`base` attribution accounts for the other 27 failures. No second full Python run was
+performed, so there is deliberately no derived aggregate pass/fail pair labeled as a
+full-suite result.
 
 Exact-base attribution command selected all 26 files implicated by the first full
 run. On clean `base` it produced 1,053 passed and 27 failed in 82.1s, with 16 failing

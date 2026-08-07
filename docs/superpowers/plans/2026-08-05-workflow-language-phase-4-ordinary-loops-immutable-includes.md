@@ -1111,7 +1111,9 @@ Adding another production module requires a concrete dependency-cycle or single-
 
   Build/install outside the repository, create a temporary `HERMES_HOME` with root+child packages and a loop command, validate/trust/admit, remove source, resume from snapshot, approve the signal, and inspect evidence. Assert new modules and documentation assets are in the wheel.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_portable_compatibility_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_portable_compatibility_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py`
+
+  Run the integration-marked wheel test explicitly: `scripts/run_tests.sh tests/plugins/workflow/test_installed_distribution_e2e.py -m integration`
 
   Expected before activation: explicit v4 works but new Archon packages still select v3.
 
@@ -1180,7 +1182,9 @@ Adding another production module requires a concrete dependency-cycle or single-
 
 - [ ] **Step 4: Run distribution, schema, merge, and customization gates.**
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_installed_distribution_e2e.py tests/plugins/workflow/test_showcase_distribution_e2e.py tests/scripts/test_check_upstream_customizations.py tests/scripts/test_workflow_merge_gate.py tests/scripts/test_workflow_upstream_merge.py tests/test_desktop_workflow_test_gate.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_showcase_distribution_e2e.py tests/scripts/test_check_upstream_customizations.py tests/scripts/test_workflow_merge_gate.py tests/scripts/test_workflow_upstream_merge.py tests/test_desktop_workflow_test_gate.py`
+
+  Run the installed-distribution gate separately: `scripts/run_tests.sh tests/plugins/workflow/test_installed_distribution_e2e.py -m integration`
 
 - [ ] **Step 5: Run functional adversarial review and resolve real findings.**
 
@@ -1260,7 +1264,9 @@ Adding another production module requires a concrete dependency-cycle or single-
 
   Test existing source YAML under the new current runtime, sealed v1-v3 resume, trust identity transition, generated contract v4, and an installed-wheel default Archon admission.
 
-  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase4_language.py tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_trust_policy.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_portable_compatibility_e2e.py tests/plugins/workflow/test_installed_distribution_e2e.py`
+  Run: `scripts/run_tests.sh tests/plugins/workflow/test_phase4_language.py tests/plugins/workflow/test_phase3_language.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_trust_policy.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_portable_compatibility_e2e.py`
+
+  Run the installed-distribution gate separately: `scripts/run_tests.sh tests/plugins/workflow/test_installed_distribution_e2e.py -m integration`
 
 - [ ] **Step 4: Re-run the complete focused and Python base gates after activation.**
 

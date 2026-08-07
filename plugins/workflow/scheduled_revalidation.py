@@ -465,7 +465,7 @@ def _load_exact_catalog_compilation(
         )
     except ScheduledRunRevalidationError:
         raise
-    except (OSError, UnicodeError, ValueError) as exc:
+    except (OSError, TypeError, UnicodeError, ValueError) as exc:
         raise ScheduledRunRevalidationError("catalog source is unavailable") from exc
     if (
         compilation is None

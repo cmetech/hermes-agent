@@ -46,6 +46,44 @@ import plugins.workflow.scheduled_revalidation as scheduled_revalidation_module
 UTC = timezone.utc
 
 
+def test_exact_scheduled_catalog_wraps_internal_compiler_type_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catch a compiler type gap escaping the bounded revalidation taxonomy."""
+    home = tmp_path / "home"
+    root = home / "workflows"
+    root.mkdir(parents=True)
+    (root / "scheduled.yaml").write_text(
+        "name: scheduled\ndescription: Scheduled\nnodes:\n  - id: run\n    bash: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        scheduled_revalidation_module,
+        "resolve_workflow_catalog_compilation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TypeError("synthetic internal canonicalization gap")
+        ),
+    )
+    run = {
+        "workflow": "scheduled",
+        "run_metadata": {
+            "catalog_source": "profile",
+            "catalog_source_root": str(root.resolve()),
+            "catalog_source_relative": "scheduled.yaml",
+        },
+        "language": None,
+    }
+
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="catalog source is unavailable",
+    ):
+        scheduled_revalidation_module._load_exact_catalog_compilation(
+            run,
+            hermes_home=home,
+        )
+
+
 def _binding(
     *,
     runner_capable: bool = True,

@@ -170,6 +170,7 @@ def derive_ai_entitlement(
             background_execution_context,
             production_workflow_runner_binding,
         )
+        from plugins.workflow.language import supports_phase4_semantics
 
         context = execution_context or background_execution_context(
             production_workflow_runner_binding(),
@@ -179,6 +180,14 @@ def derive_ai_entitlement(
             verified.package,
             context,
             read_budget=verification_budget,
+            compilation=(
+                verified.compilation
+                if supports_phase4_semantics(
+                    verified.package.language.effective_profile,
+                    verified.package.language.normalizer_version,
+                )
+                else None
+            ),
         )
     except Exception:
         return _integrity_failure(

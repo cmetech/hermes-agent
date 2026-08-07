@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import date, datetime
+import math
 from typing import Any
+
+import yaml
 
 from agent.structured_output import canonical_json_bytes
 from plugins.workflow.bash_rendering import BashRenderingError, bash_output_references
@@ -98,6 +102,46 @@ def _thaw(value: Any) -> Any:
     if isinstance(value, frozenset):
         return sorted((_thaw(item) for item in value), key=repr)
     return value
+
+
+def _canonical_source_value(value: Any) -> Any:
+    """Project accepted YAML-native scalars into bounded canonical JSON."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_source_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_canonical_source_value(item) for item in value]
+    if isinstance(value, datetime):
+        return {"$hermes_yaml_timestamp": value.isoformat()}
+    if isinstance(value, date):
+        return {"$hermes_yaml_date": value.isoformat()}
+    if isinstance(value, bytes):
+        return {"$hermes_yaml_binary": value.hex()}
+    if isinstance(value, float) and not math.isfinite(value):
+        return {
+            "$hermes_yaml_float": (
+                "nan"
+                if math.isnan(value)
+                else "negative_infinity"
+                if value < 0
+                else "positive_infinity"
+            )
+        }
+    return value
+
+
+def _has_yaml_native_scalar(value: Any) -> bool:
+    if isinstance(value, datetime | date | bytes):
+        return True
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(_has_yaml_native_scalar(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_has_yaml_native_scalar(item) for item in value)
+    return False
 
 
 def _node_mapping(node: WorkflowSourceNode) -> dict[str, Any]:
@@ -438,11 +482,11 @@ class _ExpansionState:
         try:
             return len(
                 canonical_json_bytes(
-                    value,
+                    _canonical_source_value(value),
                     max_bytes=self.limits.max_expanded_bytes,
                 )
             )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise _issue(
                 "include_expansion_limit", message, node=node, field=field
             ) from exc
@@ -561,12 +605,22 @@ class _ExpansionState:
         )
 
     def finish(self, nodes: tuple[WorkflowSourceNode, ...]) -> ExpandedWorkflowSource:
+        definition = _definition_mapping(self.root, nodes)
         try:
-            canonical = canonical_json_bytes(
-                _definition_mapping(self.root, nodes),
-                max_bytes=self.limits.max_expanded_bytes,
-            )
-        except ValueError as exc:
+            if _has_yaml_native_scalar(definition):
+                canonical = yaml.safe_dump(
+                    definition,
+                    allow_unicode=True,
+                    sort_keys=True,
+                ).encode("utf-8")
+                if len(canonical) > self.limits.max_expanded_bytes:
+                    raise ValueError("expanded canonical definition is too large")
+            else:
+                canonical = canonical_json_bytes(
+                    definition,
+                    max_bytes=self.limits.max_expanded_bytes,
+                )
+        except (TypeError, ValueError, yaml.YAMLError) as exc:
             raise _issue(
                 "include_expansion_limit",
                 "expanded canonical definition exceeds the compilation limit",

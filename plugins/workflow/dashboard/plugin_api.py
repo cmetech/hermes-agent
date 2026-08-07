@@ -1883,6 +1883,38 @@ class ActionRequest(BaseModel):
     node_id: str | None = None
 
 
+def _pending_interaction_for_action(
+    run: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Return the stored interaction, without public projection annotations."""
+    public_pending = run.get("pending_interaction")
+    nodes = run.get("nodes")
+    if isinstance(nodes, Mapping):
+        node_id = (
+            public_pending.get("node_id")
+            if isinstance(public_pending, Mapping)
+            else None
+        )
+        if isinstance(node_id, str):
+            node = nodes.get(node_id)
+            pending = (
+                node.get("pending_interaction")
+                if isinstance(node, Mapping)
+                else None
+            )
+            if isinstance(pending, Mapping):
+                return pending
+        for node in nodes.values():
+            pending = (
+                node.get("pending_interaction")
+                if isinstance(node, Mapping)
+                else None
+            )
+            if isinstance(pending, Mapping):
+                return pending
+    return public_pending if isinstance(public_pending, Mapping) else None
+
+
 @router.post("/runs/{run_id}/{action}")
 def mutate_run(
     request_context: Request,
@@ -1897,6 +1929,7 @@ def mutate_run(
     observed_at = _schedule_now_utc()
     with _store_lease() as store:
         current = _load_authorized(store, run_id, operator, now=observed_at)
+        pending_interaction = _pending_interaction_for_action(current)
         if action not in MUTATION_ACTIONS:
             raise HTTPException(status_code=404, detail={"code": "action_not_found"})
         if action in {"approve", "reject", "provide-input", "reconcile"} and (
@@ -1909,7 +1942,7 @@ def mutate_run(
         if not mutation_is_valid(
             action,
             status=str(current["status"]),
-            pending_interaction=current.get("pending_interaction"),
+            pending_interaction=pending_interaction,
             health=str(current.get("health") or ""),
             archived=bool(current.get("archived_at")),
         ):
@@ -1954,10 +1987,9 @@ def mutate_run(
                 if result.outcome != "applied":
                     raise RuntimeError("stale rejection decision")
             elif action == "provide-input":
-                pending = current.get("pending_interaction")
                 actual_interaction = (
-                    pending.get("interaction_id")
-                    if isinstance(pending, Mapping)
+                    pending_interaction.get("interaction_id")
+                    if pending_interaction is not None
                     else None
                 )
                 if actual_interaction != request.interaction_id:

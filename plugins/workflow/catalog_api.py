@@ -718,7 +718,7 @@ def _discover_catalog_compilations(
                 raw_snapshot,
                 normalizer_version=normalizer_version,
             )
-        except (OSError, UnicodeError, WorkflowValidationError, ValueError):
+        except (OSError, TypeError, UnicodeError, WorkflowValidationError, ValueError):
             invalid.append(_error_entry(source_document.name, "invalid_definition"))
             continue
         compiled_name = compiled.package.definition.name

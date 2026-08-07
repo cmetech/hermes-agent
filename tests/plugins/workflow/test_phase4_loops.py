@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta
 import hashlib
 from pathlib import Path
 
@@ -61,6 +62,28 @@ class _CountedAgentRunner:
             provider=request.provider or "fake-provider",
             model=request.model or "fake-model",
             status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
+class _ShutdownAgentRunner(_CountedAgentRunner):
+    def __init__(self, response: str, *, status: str) -> None:
+        super().__init__(response)
+        self.status = status
+        self.scheduler: RunScheduler | None = None
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        assert self.scheduler is not None
+        self.scheduler._shutdown.set()
+        return PluginAgentRunResult(
+            final_response=self.responses.pop(0),
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status=self.status,
             pending_interaction=None,
             usage={},
             audit={},
@@ -373,6 +396,169 @@ def test_v4_feedback_resume_authenticates_prior_output_and_consumes_input_once(
         interaction_id=second_pending["interaction_id"],
     )
     assert len(second_runner.requests) == 1
+
+
+def test_v4_shutdown_after_iteration_record_cannot_poison_a_new_attempt(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / "shutdown-boundary",
+            {
+                "prompt": "Previous=<$LOOP_PREV_OUTPUT>",
+                "until": "DONE",
+                "max_iterations": 3,
+                "signal_completes": True,
+            },
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-shutdown-boundary",
+        compilation,
+        key="shutdown-boundary",
+    )
+    interrupted_runner = _ShutdownAgentRunner("draft", status="completed")
+    scheduler = RunScheduler(store, agent_runner=interrupted_runner)
+    interrupted_runner.scheduler = scheduler
+
+    interrupted = scheduler.advance(run_id)
+
+    assert interrupted["status"] == "interrupted"
+    loop_state = interrupted["nodes"]["refine"]["loop_state"]
+    assert loop_state["iteration"] == 1
+    assert "_pending_loop_decision" not in loop_state
+    assert len(interrupted_runner.requests) == 1
+
+
+def test_v4_recovery_supersedes_a_decision_bound_to_a_bygone_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / "bygone-decision",
+            {
+                "prompt": "Refine",
+                "until": "DONE",
+                "max_iterations": 3,
+                "signal_completes": True,
+            },
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-bygone-decision",
+        compilation,
+        key="bygone-decision",
+    )
+    recorded_claims = []
+    original_record = store.record_loop_iteration
+
+    def lose_process_after_record(claim, **kwargs):
+        original_record(claim, **kwargs)
+        recorded_claims.append(claim)
+        raise SystemExit("lost after recording the decision")
+
+    monkeypatch.setattr(store, "record_loop_iteration", lose_process_after_record)
+    with pytest.raises(SystemExit, match="lost after recording"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedAgentRunner("draft"),
+        ).advance(run_id)
+
+    original_claim = recorded_claims[0]
+    store.complete_node(
+        original_claim,
+        status="interrupted",
+        error_code="shutdown",
+    )
+    store.resume_run(run_id, always_run_nodes=set())
+    replacement = store.claim_node(run_id, "refine", "replacement-worker")
+    assert replacement is not None
+    store.mark_node_started(replacement)
+
+    assert store.recorded_loop_decision(run_id) is None
+    projection = store.load_run(run_id)
+    loop_state = projection["nodes"]["refine"]["loop_state"]
+    assert "_pending_loop_decision" not in loop_state
+    replacement_claim = projection["nodes"]["refine"]["claim"]
+    expired_at = datetime.fromisoformat(
+        replacement_claim["lease_expires_at"]
+    ) + timedelta(seconds=1)
+    expired_monotonic = (
+        float(replacement_claim["heartbeat_monotonic"])
+        + float(replacement_claim["lease_seconds"])
+        + 1
+    )
+    assert store.expire_stale_claims(
+        run_id,
+        now=expired_at,
+        monotonic_now=expired_monotonic,
+    ) == ("refine",)
+    store.resume_run(run_id, always_run_nodes=set())
+    resumed_runner = _CountedAgentRunner("final <promise>DONE</promise>")
+    monkeypatch.setattr(store, "record_loop_iteration", original_record)
+
+    resumed = RunScheduler(store, agent_runner=resumed_runner).advance(run_id)
+
+    assert resumed["status"] == "succeeded"
+    assert len(resumed_runner.requests) == 1
+    assert resumed_runner.requests[0].prompt == "Refine"
+
+
+def test_v4_interrupted_feedback_iteration_preserves_committed_progress(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile_v4(
+        _write_loop(
+            tmp_path / "feedback-interrupted",
+            {
+                "prompt": (
+                    "Previous=<$LOOP_PREV_OUTPUT> "
+                    "Feedback=<$LOOP_USER_INPUT>"
+                ),
+                "until": "DONE",
+                "max_iterations": 5,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+                "signal_completes": True,
+            },
+            workflow_interactive=True,
+        )
+    )
+    store, run_id = _admit_compilation(
+        tmp_path / "admitted-feedback-interrupted",
+        compilation,
+        key="feedback-interrupted",
+    )
+    paused = RunScheduler(
+        store,
+        agent_runner=_CountedAgentRunner("draft"),
+    ).advance(run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+    store.provide_loop_input(
+        run_id,
+        "tighten the evidence",
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    interrupted_runner = _ShutdownAgentRunner("discarded", status="cancelled")
+    scheduler = RunScheduler(store, agent_runner=interrupted_runner)
+    interrupted_runner.scheduler = scheduler
+
+    interrupted = scheduler.advance(run_id)
+
+    node = interrupted["nodes"]["refine"]
+    assert interrupted["status"] == "interrupted"
+    assert node["loop_state"]["iteration"] == 1
+    assert node.get("loop_user_input_artifact") is None
+
+    store.resume_run(run_id, always_run_nodes=set())
+    resumed_runner = _CountedAgentRunner("final <promise>DONE</promise>")
+    resumed = RunScheduler(store, agent_runner=resumed_runner).advance(run_id)
+
+    assert resumed["status"] == "succeeded"
+    assert resumed["nodes"]["refine"]["loop_state"]["iteration"] == 2
+    assert resumed_runner.requests[0].prompt == "Previous=<draft> Feedback=<>"
 
 
 @pytest.mark.parametrize(

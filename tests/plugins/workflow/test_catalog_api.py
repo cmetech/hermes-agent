@@ -2044,6 +2044,39 @@ def test_workflow_catalog_isolates_invalid_definition(
     assert b"Traceback" not in response.content
 
 
+def test_workflow_catalog_isolates_unexpected_compiler_type_error(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch one compiler type gap disabling every healthy catalog entry."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="valid", filename="valid.yaml")
+    workflow_writer(home / "workflows", name="broken", filename="broken.yaml")
+    import plugins.workflow.catalog_api as catalog_api
+
+    original_compile = catalog_api.compile_workflow
+
+    def compile_with_one_type_gap(source, *args, **kwargs):
+        if source.name == "broken":
+            raise TypeError("synthetic internal canonicalization gap")
+        return original_compile(source, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_api, "compile_workflow", compile_with_one_type_gap)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert [item["name"] for item in _user_items(response)] == ["broken", "valid"]
+    assert _user_items(response)[0] == {
+        "name": "broken",
+        "error": "invalid_definition",
+    }
+    assert _user_items(response)[1]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+
+
 def test_workflow_catalog_caps_items_and_reports_truncation(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
