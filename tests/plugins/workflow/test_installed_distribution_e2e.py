@@ -183,6 +183,143 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     assert provider_contract["tier_route"]["config_scope"] == "managed"
     assert provider_contract["legacy_model"] == "legacy-model"
 
+    phase5_probe = tmp_path / "phase5_snapshot_probe.py"
+    phase5_probe.write_text(
+        """
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import shutil
+import sys
+
+from hermes_cli.runtime_provider import classify_execution_runtime
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.provider_authority import (
+    ProviderAuthorityEnvironment,
+    read_workflow_provider_authority_bytes,
+    resolve_workflow_provider_authority,
+)
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
+
+root = Path(sys.argv[1])
+home = Path(sys.argv[2])
+workflow_root = root / "workflows"
+workflow_root.mkdir(parents=True)
+path = workflow_root / "installed-v5.yaml"
+path.write_text(
+    "name: installed-v5\\ndescription: Installed v5 probe\\n"
+    "model: '@primary'\\nnodes:\\n"
+    "  - id: ask\\n    prompt: hello\\n    effort: high\\n",
+    encoding="utf-8",
+)
+policy = b"language_compatibility: archon-2026-07\\n"
+path.with_name("installed-v5.hermes.yaml").write_bytes(policy)
+source = parse_workflow_source_bytes(
+    path,
+    workflow_bytes=path.read_bytes(),
+    sidecar_bytes=policy,
+    source="project",
+    precedence=1,
+)
+compilation = compile_workflow(
+    source,
+    WorkflowCatalogSnapshot.capture((source,)),
+    normalizer_version=5,
+)
+config = parse_workflow_model_config({
+    "model": {
+        "provider": "openrouter",
+        "default": "openai/gpt-5.4",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "model_aliases": {
+        "primary": {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4",
+        }
+    },
+})
+runtime = classify_execution_runtime(
+    provider="openrouter",
+    model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+    provider_config={"base_url": "https://openrouter.ai/api/v1"},
+)
+authority = resolve_workflow_provider_authority(
+    compilation.package,
+    model_config=config,
+    default_runtime=runtime,
+    environment=ProviderAuthorityEnvironment(
+        session_store_available=True,
+        mcp_available=True,
+        hook_lifecycle_available=True,
+        inline_agent_available=True,
+        web_service_available=True,
+        authoritative_cost_available=False,
+    ),
+)
+store = RunStore(home)
+prepared = store.prepare_run_snapshot(
+    compilation.package,
+    compilation=compilation,
+    trusted_package_digest=WorkflowPackageDigest(
+        compilation.composite_digest,
+        compilation.covered_relative_paths,
+    ),
+    provider_authority=authority,
+)
+admitted = store.start_run(
+    RunAdmissionRequest(
+        workflow_name=compilation.package.definition.name,
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key="installed-v5",
+        concurrency_key=compilation.package.definition.name,
+    ),
+    immutable_snapshot=prepared,
+)
+shutil.rmtree(root)
+package, paths, contents = RunScheduler(
+    RunStore(home)
+)._load_verified_run_package(admitted.run_id)
+recovered = read_workflow_provider_authority_bytes(
+    contents["provider-resolution.json"]
+)
+print(json.dumps({
+    "normalizer_version": package.language.normalizer_version,
+    "provider_member": "provider-resolution.json" in paths,
+    "authority_digest": recovered.authority_digest,
+    "expected_digest": authority.authority_digest,
+}))
+""",
+        encoding="utf-8",
+    )
+    phase5_result = subprocess.run(
+        [
+            sys.executable,
+            str(phase5_probe),
+            str(tmp_path / "installed-v5-source"),
+            str(tmp_path / "installed-v5-home"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert phase5_result.returncode == 0, phase5_result.stderr
+    phase5_contract = json.loads(phase5_result.stdout)
+    assert phase5_contract["normalizer_version"] == 5
+    assert phase5_contract["provider_member"] is True
+    assert phase5_contract["authority_digest"] == phase5_contract["expected_digest"]
+
     command = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "workflow", "list", "--json"],
         cwd=tmp_path,

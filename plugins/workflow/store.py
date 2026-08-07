@@ -40,6 +40,7 @@ from plugins.workflow.language import (
     make_language_snapshot,
     supports_phase3_semantics,
     supports_phase4_semantics,
+    supports_phase5_semantics,
 )
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
@@ -110,6 +111,7 @@ from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 if TYPE_CHECKING:
     from plugins.workflow.compilation import WorkflowCompilation
+    from plugins.workflow.provider_authority import WorkflowProviderAuthority
 
 
 def _language_has_phase3_semantics(language: object) -> bool:
@@ -5544,6 +5546,7 @@ class RunStore:
         trusted_package_digest: WorkflowPackageDigest | None = None,
         execution_limits: RunExecutionLimits | None = None,
         compilation: WorkflowCompilation | None = None,
+        provider_authority: "WorkflowProviderAuthority | None" = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -5604,6 +5607,38 @@ class RunStore:
                     package, read_budget=resource_read_budget
                 )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
+            phase5 = supports_phase5_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            if phase5 and compilation is None:
+                raise InputSnapshotError(
+                    "normalizer-v5 provider authority requires a format-2 compilation"
+                )
+            provider_resolution_sha256 = None
+            if phase5:
+                from plugins.workflow.provider_authority import (
+                    WorkflowProviderAuthority,
+                    read_workflow_provider_authority_bytes,
+                )
+
+                if not isinstance(provider_authority, WorkflowProviderAuthority):
+                    raise InputSnapshotError(
+                        "normalizer-v5 snapshot is missing provider authority"
+                    )
+                provider_bytes = provider_authority.canonical_bytes()
+                try:
+                    read_workflow_provider_authority_bytes(provider_bytes)
+                except ValueError as exc:
+                    raise InputSnapshotError(
+                        "normalizer-v5 provider authority is invalid"
+                    ) from exc
+                provider_resolution_sha256 = _sha256(provider_bytes)
+                (staging / "provider-resolution.json").write_bytes(provider_bytes)
+            elif provider_authority is not None:
+                raise InputSnapshotError(
+                    "provider authority is forbidden before normalizer v5"
+                )
             phase3_execution_semantics = None
             if supports_phase3_semantics(
                 package.language.effective_profile, package.language.normalizer_version
@@ -5844,6 +5879,10 @@ class RunStore:
                 snapshot_resources["dependency_manifest_digest"] = (
                     dependency_manifest_digest
                 )
+            if provider_resolution_sha256 is not None:
+                snapshot_resources["provider_resolution_sha256"] = (
+                    provider_resolution_sha256
+                )
             if phase3_execution_semantics is not None:
                 snapshot_resources["phase3_execution_semantics"] = (
                     phase3_execution_semantics
@@ -5895,6 +5934,7 @@ class RunStore:
                 sealed_snapshot_digest=snapshot_digest,
                 snapshot_format_version=snapshot_format_version,
                 dependency_manifest_digest=dependency_manifest_digest,
+                provider_resolution_sha256=provider_resolution_sha256,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -6131,6 +6171,7 @@ class RunStore:
             snapshot.sealed_snapshot_digest,
             snapshot.snapshot_format_version,
             snapshot.dependency_manifest_digest,
+            snapshot.provider_resolution_sha256,
         )
 
     @staticmethod
@@ -6695,6 +6736,10 @@ class RunStore:
             projection["expanded_nodes"] = [
                 str(node["id"]) for node in snapshot.nodes
             ]
+            if snapshot.provider_resolution_sha256 is not None:
+                projection["provider_resolution_sha256"] = (
+                    snapshot.provider_resolution_sha256
+                )
         event = {
             "sequence": 1,
             "timestamp": now,

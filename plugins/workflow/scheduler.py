@@ -85,7 +85,11 @@ from plugins.workflow.output_resolution import (
     resolved_output_publication_identity,
     _read_descriptor_relative,
 )
-from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.resources import (
+    ResourceResolver,
+    VariableContext,
+    read_snapshot_provider_authority,
+)
 from plugins.workflow.schema import (
     is_inline_script,
     load_workflow_snapshot,
@@ -536,6 +540,22 @@ def load_snapshot_format2(
 
     if projection.get("snapshot_format_version") != 2:
         mismatch("workflow snapshot format identity is not version 2")
+    language_snapshot = read_language_snapshot(resources.get("language"))
+    if language_snapshot is None or not supports_phase4_semantics(
+        language_snapshot.effective_profile,
+        language_snapshot.normalizer_version,
+    ):
+        mismatch("format-2 language identity is missing")
+    normalizer_version = language_snapshot.normalizer_version
+    try:
+        read_snapshot_provider_authority(
+            language_snapshot=language_snapshot,
+            resources=resources,
+            authenticated_bytes=authenticated_bytes,
+            projected_digest=projection.get("provider_resolution_sha256"),
+        )
+    except ValueError as exc:
+        mismatch("provider authority identity changed", exc)
     definition_bytes = authenticated_bytes.get("definition.yaml")
     policy_bytes = authenticated_bytes.get("policy.yaml")
     manifest_bytes = authenticated_bytes.get("dependencies.json")
@@ -662,7 +682,7 @@ def load_snapshot_format2(
         )
         identity_package = _compile_workflow_source_document(
             identity_source,
-            normalizer_version=4,
+            normalizer_version=normalizer_version,
         )
         identity_package = bind_v4_loop_command_semantics(
             identity_package,
@@ -705,9 +725,6 @@ def load_snapshot_format2(
     ):
         mismatch("expanded workflow package identity changed")
 
-    language_snapshot = read_language_snapshot(resources.get("language"))
-    if language_snapshot is None or language_snapshot.normalizer_version != 4:
-        mismatch("format-2 language identity is missing")
     verify_language_snapshot(
         identity_package,
         composite_digest,
@@ -736,7 +753,7 @@ def load_snapshot_format2(
         runtime_source = replace(runtime_source, nodes=tuple(runtime_nodes))
         runtime_package = _compile_workflow_source_document(
             runtime_source,
-            normalizer_version=4,
+            normalizer_version=normalizer_version,
         )
     except WorkflowLanguageCompatibilityError:
         raise

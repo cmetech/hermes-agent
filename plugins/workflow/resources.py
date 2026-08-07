@@ -65,6 +65,43 @@ _REFERENCE_NODE_CANDIDATE = re.compile(
 )
 
 
+def read_snapshot_provider_authority(
+    *,
+    language_snapshot: object,
+    resources: Mapping[str, object],
+    authenticated_bytes: Mapping[str, bytes],
+    projected_digest: object = None,
+):
+    """Read the exact conditional v5 authority member or reject contradiction."""
+    from plugins.workflow.provider_authority import (
+        read_workflow_provider_authority_bytes,
+    )
+
+    profile = getattr(language_snapshot, "effective_profile", None)
+    normalizer_version = getattr(language_snapshot, "normalizer_version", None)
+    phase5 = supports_phase5_semantics(profile, normalizer_version)
+    member = authenticated_bytes.get("provider-resolution.json")
+    recorded_digest = resources.get("provider_resolution_sha256")
+    has_any = (
+        member is not None
+        or recorded_digest is not None
+        or projected_digest is not None
+    )
+    if not phase5:
+        if has_any:
+            raise ValueError("provider authority is forbidden before normalizer v5")
+        return None
+    if (
+        not isinstance(member, bytes)
+        or not isinstance(recorded_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", recorded_digest) is None
+        or projected_digest != recorded_digest
+        or hashlib.sha256(member).hexdigest() != recorded_digest
+    ):
+        raise ValueError("normalizer-v5 provider authority identity changed")
+    return read_workflow_provider_authority_bytes(member)
+
+
 def normalize_mcp_server_document(
     document: Mapping[str, object], *, default_name: str
 ) -> dict[str, dict[str, object]]:

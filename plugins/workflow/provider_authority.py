@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -30,6 +31,11 @@ from plugins.workflow.models import WorkflowPackage, freeze_value
 
 _AUTHORITY_SCHEMA_VERSION = 1
 _AUTHORITY_RESOLVER_VERSION = 1
+_AUTHORITY_MAX_BYTES = 1024 * 1024
+_AUTHORITY_MAX_ROUTES = 512
+_AUTHORITY_MAX_OBLIGATIONS = 4096
+_AUTHORITY_MAX_WARNINGS = 512
+_AUTHORITY_MAX_TEXT_CHARS = 512
 _SHA256 = frozenset("0123456789abcdef")
 _SUPPORTED_HOOK_EVENTS = frozenset({
     "PreToolUse",
@@ -136,7 +142,7 @@ class WorkflowResolvedProviderRoute:
         object.__setattr__(
             self,
             "provider_options",
-            freeze_value(_thaw(self.provider_options)),
+            freeze_value(_bounded_provider_option(_thaw(self.provider_options))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -226,12 +232,294 @@ class WorkflowProviderAuthority:
             "authority_digest": self.authority_digest,
         }
 
+    def canonical_bytes(self) -> bytes:
+        """Return the exact credential-free bytes sealed in format-2 roots."""
+        encoded = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(encoded) > _AUTHORITY_MAX_BYTES:
+            raise ValueError("provider authority exceeds its byte limit")
+        return encoded
+
 
 class WorkflowProviderAuthorityError(ValueError):
     def __init__(self, code: str, path: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.path = path
+
+
+def _exact_record(
+    value: object,
+    fields: frozenset[str],
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError(f"{label} fields are invalid")
+    return value
+
+
+def _bounded_text(value: object, label: str, *, allow_empty: bool = False) -> str:
+    if (
+        not isinstance(value, str)
+        or (not allow_empty and not value)
+        or len(value) > _AUTHORITY_MAX_TEXT_CHARS
+        or any(
+            ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    ):
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _bounded_provider_option(value: object, *, depth: int = 0) -> Any:
+    if depth > 4:
+        raise ValueError("provider option depth is invalid")
+    if value is None or isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("provider option number is invalid")
+        return value
+    if isinstance(value, str):
+        return _bounded_text(value, "provider option text", allow_empty=True)
+    if isinstance(value, list | tuple):
+        if len(value) > 32:
+            raise ValueError("provider option sequence is invalid")
+        return tuple(_bounded_provider_option(item, depth=depth + 1) for item in value)
+    if isinstance(value, Mapping):
+        if len(value) > 32:
+            raise ValueError("provider option mapping is invalid")
+        bounded: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = _bounded_text(raw_key, "provider option key")
+            if any(
+                part in key.lower()
+                for part in ("secret", "token", "password", "credential", "api_key")
+            ):
+                raise ValueError("provider option key is not public-safe")
+            bounded[key] = _bounded_provider_option(item, depth=depth + 1)
+        return bounded
+    raise ValueError("provider option value is invalid")
+
+
+def _read_route(value: object) -> WorkflowResolvedProviderRoute:
+    record = _exact_record(
+        value,
+        frozenset({
+            "route_id",
+            "node_id",
+            "role",
+            "inline_agent_id",
+            "reference_kind",
+            "requested_reference_sha256",
+            "provider",
+            "model",
+            "api_mode",
+            "route_fingerprint",
+            "registration_provenance_digest",
+            "provider_options",
+            "config_scope",
+            "base_url_trust_class",
+        }),
+        "provider route",
+    )
+    inline_agent_id = record["inline_agent_id"]
+    if inline_agent_id is not None:
+        inline_agent_id = _bounded_text(inline_agent_id, "inline agent ID")
+    reference_kind = _bounded_text(record["reference_kind"], "reference kind")
+    if reference_kind not in {"tier", "configured_alias", "literal"}:
+        raise ValueError("reference kind is invalid")
+    options = record["provider_options"]
+    if not isinstance(options, Mapping):
+        raise ValueError("provider options are invalid")
+    return WorkflowResolvedProviderRoute(
+        route_id=_bounded_text(record["route_id"], "route ID"),
+        node_id=_bounded_text(record["node_id"], "node ID"),
+        role=_bounded_text(record["role"], "route role"),
+        inline_agent_id=inline_agent_id,
+        reference_kind=reference_kind,
+        requested_reference_sha256=_bounded_text(
+            record["requested_reference_sha256"], "model reference digest"
+        ),
+        provider=_bounded_text(record["provider"], "provider"),
+        model=_bounded_text(record["model"], "model"),
+        api_mode=_bounded_text(record["api_mode"], "API mode", allow_empty=True),
+        route_fingerprint=_bounded_text(
+            record["route_fingerprint"], "route fingerprint"
+        ),
+        registration_provenance_digest=_bounded_text(
+            record["registration_provenance_digest"],
+            "registration provenance digest",
+            allow_empty=True,
+        ),
+        provider_options=_bounded_provider_option(options),
+        config_scope=_bounded_text(record["config_scope"], "config scope"),
+        base_url_trust_class=_bounded_text(
+            record["base_url_trust_class"], "base URL trust class"
+        ),
+    )
+
+
+def _read_obligation(value: object) -> WorkflowCapabilityObligation:
+    record = _exact_record(
+        value,
+        frozenset({"path", "route_id", "decision"}),
+        "provider obligation",
+    )
+    decision_record = _exact_record(
+        record["decision"],
+        frozenset({
+            "feature",
+            "disposition",
+            "provider",
+            "model",
+            "option",
+            "requested_semantics",
+            "effective_semantics",
+            "adapter_version",
+            "declaration_source",
+            "registration_provenance_digest",
+            "code",
+            "rationale",
+        }),
+        "provider capability decision",
+    )
+    try:
+        feature = WorkflowProviderFeature(decision_record["feature"])
+        disposition = CapabilityDisposition(decision_record["disposition"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("provider capability enum is invalid") from exc
+    option = decision_record["option"]
+    if option is not None:
+        option = _bounded_text(option, "provider capability option")
+    adapter_version = decision_record["adapter_version"]
+    if adapter_version is not None and (
+        type(adapter_version) is not int or adapter_version <= 0
+    ):
+        raise ValueError("provider capability adapter version is invalid")
+    requested = decision_record["requested_semantics"]
+    effective = decision_record["effective_semantics"]
+    if not isinstance(requested, Mapping) or not isinstance(effective, Mapping):
+        raise ValueError("provider capability semantics are invalid")
+    decision = ProviderCapabilityDecision(
+        feature=feature,
+        disposition=disposition,
+        provider=_bounded_text(decision_record["provider"], "decision provider"),
+        model=_bounded_text(
+            decision_record["model"], "decision model", allow_empty=True
+        ),
+        option=option,
+        requested_semantics=requested,
+        effective_semantics=effective,
+        adapter_version=adapter_version,
+        declaration_source=_bounded_text(
+            decision_record["declaration_source"], "declaration source"
+        ),
+        registration_provenance_digest=_bounded_text(
+            decision_record["registration_provenance_digest"],
+            "decision provenance digest",
+            allow_empty=True,
+        ),
+        code=_bounded_text(decision_record["code"], "decision code"),
+        rationale=_bounded_text(decision_record["rationale"], "decision rationale"),
+    )
+    return WorkflowCapabilityObligation(
+        path=_bounded_text(record["path"], "obligation path"),
+        route_id=_bounded_text(record["route_id"], "obligation route ID"),
+        decision=decision,
+    )
+
+
+def read_workflow_provider_authority_bytes(
+    encoded: bytes,
+) -> WorkflowProviderAuthority:
+    """Decode one exact bounded canonical provider authority snapshot."""
+    if not isinstance(encoded, bytes) or len(encoded) > _AUTHORITY_MAX_BYTES:
+        raise ValueError("provider authority bytes are invalid")
+    try:
+        raw = json.loads(encoded)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("provider authority JSON is invalid") from exc
+    record = _exact_record(
+        raw,
+        frozenset({
+            "schema_version",
+            "resolver_version",
+            "config_fingerprint",
+            "routes",
+            "obligations",
+            "warnings",
+            "authority_digest",
+        }),
+        "provider authority",
+    )
+    if (
+        type(record["schema_version"]) is not int
+        or record["schema_version"] != _AUTHORITY_SCHEMA_VERSION
+        or type(record["resolver_version"]) is not int
+        or record["resolver_version"] != _AUTHORITY_RESOLVER_VERSION
+    ):
+        raise ValueError("provider authority version is unsupported")
+    raw_routes = record["routes"]
+    raw_obligations = record["obligations"]
+    raw_warnings = record["warnings"]
+    if (
+        not isinstance(raw_routes, list)
+        or len(raw_routes) > _AUTHORITY_MAX_ROUTES
+        or not isinstance(raw_obligations, list)
+        or len(raw_obligations) > _AUTHORITY_MAX_OBLIGATIONS
+        or not isinstance(raw_warnings, list)
+        or len(raw_warnings) > _AUTHORITY_MAX_WARNINGS
+    ):
+        raise ValueError("provider authority collection is invalid")
+    routes: dict[str, WorkflowResolvedProviderRoute] = {}
+    for raw_route in raw_routes:
+        route = _read_route(raw_route)
+        if route.route_id in routes:
+            raise ValueError("provider route ID is duplicated")
+        routes[route.route_id] = route
+    obligations = tuple(_read_obligation(item) for item in raw_obligations)
+    warnings: list[ProviderAuthorityWarning] = []
+    for item in raw_warnings:
+        warning = _exact_record(
+            item,
+            frozenset({"path", "code", "rationale"}),
+            "provider authority warning",
+        )
+        warnings.append(
+            ProviderAuthorityWarning(
+                path=_bounded_text(warning["path"], "warning path"),
+                code=_bounded_text(warning["code"], "warning code"),
+                rationale=_bounded_text(warning["rationale"], "warning rationale"),
+            )
+        )
+    authority = WorkflowProviderAuthority(
+        config_fingerprint=_bounded_text(
+            record["config_fingerprint"], "config fingerprint"
+        ),
+        routes=routes,
+        obligations=obligations,
+        warnings=tuple(warnings),
+        authority_digest=_bounded_text(record["authority_digest"], "authority digest"),
+    )
+    if any(item.route_id not in authority.routes for item in authority.obligations):
+        raise ValueError("provider obligation route is missing")
+    expected_digest = _authority_digest(
+        config_fingerprint=authority.config_fingerprint,
+        routes=authority.routes,
+        obligations=authority.obligations,
+        warnings=authority.warnings,
+    )
+    if authority.authority_digest != expected_digest:
+        raise ValueError("provider authority digest changed")
+    if authority.canonical_bytes() != encoded:
+        raise ValueError("provider authority is not canonical")
+    return authority
 
 
 def _workflow_provider_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -763,5 +1051,6 @@ __all__ = [
     "WorkflowProviderAuthority",
     "WorkflowProviderAuthorityError",
     "WorkflowResolvedProviderRoute",
+    "read_workflow_provider_authority_bytes",
     "resolve_workflow_provider_authority",
 ]
