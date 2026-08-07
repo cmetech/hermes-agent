@@ -1422,7 +1422,7 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert row["language"] == {
         "effective_profile": "archon-2026-07",
         "legacy": False,
-        "normalizer_version": 4,
+        "normalizer_version": 5,
     }
     assert row["compatibility"] == {
         "level": "portable",
@@ -1436,7 +1436,7 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert set(row["compatibility"]) == {"level", "runnable"}
 
 
-def test_current_v4_composite_trust_is_consistent_between_catalog_and_detail(
+def test_current_v5_composite_trust_is_consistent_between_catalog_and_detail(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "home"
@@ -1467,11 +1467,11 @@ def test_current_v4_composite_trust_is_consistent_between_catalog_and_detail(
         catalog_source="project",
     )
     assert compilation is not None
-    risk = build_risk_summary(
-        compilation.package,
-        assess_compatibility(compilation.package),
-        compilation=compilation,
+    from plugins.workflow.admission_service import (
+        assess_production_workflow_admission,
     )
+
+    risk = assess_production_workflow_admission(compilation).risk
     WorkflowTrustStore(home).trust(
         compilation.composite_digest,
         actor="catalog-v4-test",

@@ -58,7 +58,7 @@ def test_explicit_v4_is_rejected_for_unversioned_and_legacy_workflows(
     assert exc.value.code == "workflow_normalizer_version_unsupported"
 
 
-def test_current_v4_preserves_explicit_v3_normalized_behavior(
+def test_explicit_v4_preserves_explicit_v3_normalized_behavior(
     tmp_path, workflow_writer
 ) -> None:
     """Catch current Archon admission bypassing or dropping sealed v3 semantics."""
@@ -92,7 +92,12 @@ def test_current_v4_preserves_explicit_v3_normalized_behavior(
         sidecar_bytes=sidecar.read_bytes(),
         normalizer_version=3,
     )
-    current = load_workflow(path)
+    current = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=4,
+    )
 
     assert current.language.normalizer_version == 4
     assert current.definition == v3.definition

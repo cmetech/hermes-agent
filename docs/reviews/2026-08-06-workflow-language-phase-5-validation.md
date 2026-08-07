@@ -2,15 +2,15 @@
 
 Date: 2026-08-07
 
-Status: **PRE-ACTIVATION VALIDATION IN PROGRESS**
+Status: **POST-ACTIVATION VALIDATION IN PROGRESS**
 
 This report records the implementation, independent review, and atomic
-activation of Workflow Language Phase 5 provider portability. Phase 5 remains
-dormant while the pre-activation evidence in this first revision is gathered:
-new `archon-2026-07` admissions still select normalizer v4, `hermes-legacy`
-selects v2, and explicit or sealed v1-v4 packages retain their recorded
-behavior. No push, merge, rebase, tag, release, brand mutation, or publication
-has been performed.
+activation of Workflow Language Phase 5 provider portability. The reviewed
+activation candidate now selects normalizer v5 for new `archon-2026-07`
+admissions. `hermes-legacy` still selects v2, and explicit or sealed v1-v4
+packages retain their recorded behavior. Post-activation regression gates are
+still running. No push, merge, rebase, tag, release, brand mutation, or
+publication has been performed.
 
 ## Scope and activation boundary
 
@@ -22,11 +22,12 @@ projections. It does not add `loop_group`, runtime child workflows, dynamic
 includes, input mapping, a core model tool, synthetic conversation messages,
 telemetry, an OS sandbox, or a client-side resolver.
 
-Normalizer v5 is readable but dormant through the pre-activation gates. The
-only planned default-selection production change is
-`CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` from 4 to 5 after independent
-review. Snapshot format remains 2, legacy remains v2, and v1-v4 readers remain
-available.
+Normalizer v5 remained readable but dormant through every implementation and
+pre-activation gate. After independent review returned GO, the sole profile
+selection authority `CURRENT_NORMALIZER_BY_PROFILE[ARCHON_2026_07]` changed
+from 4 to 5. `LATEST_NORMALIZER_VERSION` is now derived from that mapping so
+the two markers cannot drift. Snapshot format remains 2, legacy remains v2,
+and v1-v4 readers remain available.
 
 ## Pre-activation evidence
 
@@ -86,6 +87,38 @@ rehearsal in a detached temporary worktree once per dynamically validated brand
 and compares external state after each run. The neutral-checkout rejection is
 not counted as branded regression evidence.
 
+## Independent implementation review
+
+A fresh high-reasoning Sol reviewer examined the complete implementation and
+plan contract over multiple rounds. Every reported Critical or Important
+finding was first reproduced with a failing regression and then corrected.
+The dispositions covered provider-free deterministic nodes, sealed approval
+rejection identities, exact hook event/operation semantics, MCP admission and
+worker parity, Desktop normalizer projection, approval tool/lifecycle parity,
+cancel ordering, v1-v4 approval replay, and ambiguous dual hook reasons.
+
+The final review inspected the clean exact SHA
+`9c8653cb812164635967f8540733685c9355733e` and returned **GO: 0 Critical, 0
+Important**. That SHA is the reviewed pre-activation implementation; activation
+was not performed until after this verdict.
+
+## Atomic activation RED/GREEN
+
+Before the mapping changed, the Task 15 Step 6 command ran four files. It
+reported **154 passed and 2 failed**. Both failures were the new activation
+contract: current Archon and the default authoring schema still selected v4.
+No unrelated assertion failed.
+
+Changing the single Archon profile mapping to v5 made those activation
+assertions pass. Historical snapshot tests that intended format-1 or v4
+behavior were then pinned to explicit v4 instead of weakening v5's mandatory
+format-2 provider authority. The same four-file Step 6 command finished with
+**156 passed, 0 failed in 4.6s**. A subsequent affected-surface sweep found and
+fixed one generated-schema publication defect: the v5 string/null hook matcher
+had inherited a boolean example. The corrected language schema, catalog,
+Desktop middleware, and portable-compatibility sweep passed **715 tests, 0
+failed in 15.2s**.
+
 ## Pending gates
 
 The following evidence will be appended after it exists:
@@ -93,8 +126,5 @@ The following evidence will be appended after it exists:
 - clean-tree upstream base rehearsal and full no-retry Python suite;
 - dynamically enumerated non-publishing brand rehearsals with byte-identical
   pre/post local, remote, tag, release, branch, status, and worktree snapshots;
-- independent implementation review and dispositions for every Critical or
-  Important finding;
-- activation RED and GREEN evidence;
 - full post-activation Steps 2-4 against the exact committed activation SHA;
 - final commit IDs, exact Git/worktree state, and retry/exclusion accounting.

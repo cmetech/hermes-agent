@@ -28,24 +28,22 @@ script or extension node type.
 
 ### Phase 5 operation
 
-New and default `archon-2026-07` admissions remain on normalizer v4 until the
-reviewed Phase 5 activation commit. Current `hermes-legacy` admissions use v2.
-Explicit and already sealed v1 through v4 packages remain supported
-compatibility inputs; explicit v5 is available for staged validation without
-moving the default.
+New and default `archon-2026-07` admissions use normalizer v5. Current
+`hermes-legacy` admissions use v2. Explicit and already sealed v1 through v4
+packages remain supported compatibility inputs with their recorded behavior.
 
 <!-- workflow-language-version-selection -->
 ```json
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 4
+    "archon-2026-07": 5
   },
   "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
 ```
 
-The staged v5 contract adds provider-portable model resolution and a single
+The v5 contract adds provider-portable model resolution and a single
 backend-authored capability matrix on top of v4 compile-only package includes
 and confirmed ordinary-loop signals. The root companion remains the only policy authority;
 authenticated child companions are ignored. Included named resources are

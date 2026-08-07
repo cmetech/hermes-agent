@@ -65,7 +65,7 @@ upstream_changes:
   - explicit v5 hook matcher schema and validation
   owned_invariants:
   - explicit Archon v5 inherits v2 structured output, v3 execution, and v4 loop semantics
-  - current/default Archon admission remains normalizer v4 until the final activation gate
+  - v5 was introduced as a dormant explicit reader before its separately reviewed activation
   - model tiers, configured aliases, literals, hooks, and MCP references alter sealed semantic identity
   - unsupported hook events and operations remain canonical obligations rather than disappearing
   - v5 hook matchers, operation payloads, counts, timeouts, and readers are bounded and fail closed
@@ -79,15 +79,74 @@ upstream_changes:
   - tests/agent/test_workflow_builder_skill.py
   expected_commit_subject: 'feat(workflow): define dormant phase 5 semantics'
   upstream_candidate: true
-  merge_guidance: Preserve v5 as explicitly selectable and exactly readable while
-    current/default archon-2026-07 remains v4 until the complete provider-portability
-    authority and runtime gates pass. Keep v5 semantics cumulative, sealed in the
+  merge_guidance: Preserve v5 as explicitly selectable and exactly readable, including
+    for sealed snapshots created before or after its activation. Keep v5 semantics cumulative, sealed in the
     existing node-semantic envelope, and credential-free. Unsupported hooks remain
     visible obligations for the central authority to block. Canonicalize only explicit
     v5 MCP reads; v1-v4 resource behavior must remain unchanged.
   removal_condition: Remove when upstream provides an equivalent dormant cumulative
     language version with exact old-version replay, bounded hook/MCP normalization,
     portable model-reference identity, and an independently gated activation boundary.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-language-activation
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/language_schema.py
+  - website/docs/user-guide/features/workflows.md
+  - website/docs/user-guide/features/workflow-yaml-reference.md
+  - skills/software-development/workflow-builder/references/portable-schema.md
+  - skills/software-development/workflow-builder/references/authoring-checklist.md
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_phase3_language.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  owned_symbols:
+  - CURRENT_NORMALIZER_BY_PROFILE
+  - LATEST_NORMALIZER_VERSION
+  - _field_schema
+  - test_v5_is_the_current_archon_admission_contract
+  - test_current_v5_schema_is_bounded_and_explicit_v4_remains_readable
+  - test_archon_authoring_contract_is_bounded_and_versioned
+  - test_current_v5_composite_trust_is_consistent_between_catalog_and_detail
+  - test_language_status_crosses_real_desktop_middleware_without_mutation
+  owned_invariants:
+  - current/default archon-2026-07 selects v5 while hermes-legacy remains v2
+  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":5,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4,5]}'
+  - supported and sealed readers remain exactly v1 through v5 without changing snapshot format 2
+  - v5 format-2 admission requires one immutable provider authority while historical v1-v4 tests stay explicitly pinned
+  - generated authoring guidance and installed reference assets match the runtime profile mapping
+  - catalog detail and Desktop consume backend-authored normalizer and provider capability projections
+  tests:
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_phase3_language.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  expected_commit_subject: 'feat(workflow): activate provider portability'
+  upstream_candidate: true
+  merge_guidance: Keep CURRENT_NORMALIZER_BY_PROFILE as the sole profile-selection
+    authority and derive LATEST_NORMALIZER_VERSION from it. Preserve legacy at v2,
+    explicit and sealed v1-v4 replay, snapshot format 2, fail-closed provider authority,
+    config-only tiers and aliases, backend-authored client projections, and the exact
+    Phase 1-4 compatibility contracts inherited by v5.
+  removal_condition: Remove when upstream activates an equivalent v5 provider-portable
+    Archon contract with the same historical readers, immutable provider authority,
+    generated guidance, installed-distribution coverage, and backend-owned client surfaces.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: portable-workflow-model-resolution
   change_class: configuration-generic
@@ -4531,17 +4590,17 @@ upstream_changes:
   - OTTO V1 incompatible authoring-skill guidance
   owned_invariants:
   - historical Phase 1 workflow-language authoring-reference provenance
-  - 'workflow language authority superseded by: workflow-phase4-language-contracts'
+  - 'workflow language authority superseded by: workflow-phase5-language-activation'
   tests:
   - tests/plugins/workflow/test_language_schema.py
   - tests/agent/test_workflow_builder_skill.py
   expected_commit_subject: 'docs(workflow): publish language authoring contract'
   upstream_candidate: true
   merge_guidance: Preserve this entry's historical Phase 1 authoring-reference provenance,
-    but defer all live language-version guidance to workflow-phase4-language-contracts.
-    Current/default archon-2026-07 uses v4, hermes-legacy uses v2, and explicit/sealed
-    v1-v3 readers remain compatible. Phase 3 millisecond timeout, retry, structured-output,
-    and reference semantics are inherited by current v4 rather than deferred. Keep only
+    but defer all live language-version guidance to workflow-phase5-language-activation.
+    Current/default archon-2026-07 uses v5, hermes-legacy uses v2, and explicit/sealed
+    v1-v4 readers remain compatible. Phase 3 millisecond timeout, retry, structured-output,
+    and reference semantics are inherited by current v5 rather than deferred. Keep only
     fields that the generated current contract marks blocking behind the explicit two-choice
     authoring stop; later runtime child workflows, include.with, loop_group, portable
     budget/sandbox guarantees, and provider portability remain unavailable without
@@ -4553,7 +4612,7 @@ upstream_changes:
     equivalent profile-aware generated-contract reference, first-party authoring skill,
     legacy preservation, mixed-version backend guidance, current blocking-field choice
     gates, and explicit OTTO V1 incompatibility. Current language-authority removal remains
-    governed by workflow-phase4-language-contracts, not by this older entry.
+    governed by workflow-phase5-language-activation, not by this older entry.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: workflow-phase4-language-contracts
   change_class: workflow-compatibility
@@ -4583,10 +4642,10 @@ upstream_changes:
   - phase4_loop_prompt_sealed
   - phase4_signal_confirmation
   owned_invariants:
-  - current/default normalizer v4 generation and explicit/sealed v1-v3 compatibility
+  - current/default normalizer v5 generation with inherited v4 semantics and explicit/sealed v1-v4 compatibility
   - ordinary-loops-and-includes generated documentation topic
   - installed workflow-builder reference data files
-  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":4,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4,5]}'
+  - 'workflow language authority superseded by: workflow-phase5-language-activation'
   - include is compile-only and absent from executable node kinds
   - root-only policy and authenticated ignored child sidecars
   - exact bounded include closure guidance
@@ -4604,8 +4663,9 @@ upstream_changes:
   - tests/skills/test_workflow_operator_behavior.py
   expected_commit_subject: 'feat(workflow): publish phase 4 language contracts'
   upstream_candidate: true
-  merge_guidance: Preserve normalizer v4 as the current/default archon-2026-07
-    contract, hermes-legacy at v2, and explicit/sealed v1-v3 reader compatibility.
+  merge_guidance: Defer live version selection to workflow-phase5-language-activation.
+    Preserve normalizer v5 as the current/default archon-2026-07 contract,
+    hermes-legacy at v2, and explicit/sealed v1-v4 reader compatibility.
     The original publication staged v4 behind explicit selection while v3 remained
     current; retain that provenance in historical evidence without restoring stale
     operator guidance. Publish the complete v4 syntax, structured ordinary-loop/include
@@ -4617,9 +4677,11 @@ upstream_changes:
     the provider on approval. Keep runtime child workflows, include.with, and loop_group
     explicitly outside this phase. Installed wheels and sdists must retain the workflow-builder
     reference documents that teach this contract.
-  removal_condition: Remove when upstream publishes an equivalent current-v4 Archon
-    authoring/admission contract, legacy-v2 default, explicit/sealed v1-v3 compatibility,
-    code catalog, installed reference assets, and operator guidance.
+  removal_condition: Remove this historical entry when
+    workflow-phase5-language-activation can be removed because upstream publishes an
+    equivalent current-v5 Archon authoring/admission contract with inherited v4
+    behavior, legacy-v2 default, explicit/sealed v1-v4 compatibility, code catalog,
+    installed reference assets, and operator guidance.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: workflow-language-regression-gates
   change_class: workflow-testing

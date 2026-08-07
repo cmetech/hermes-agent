@@ -56,10 +56,13 @@ def test_archon_v5_capabilities_are_cumulative(
     assert supports_phase5_semantics(profile, version) is phase5
 
 
-def test_v5_is_readable_but_current_archon_admission_remains_v4(
+def test_v5_is_the_current_archon_admission_contract(
     tmp_path, workflow_writer
 ):
-    path = workflow_writer(tmp_path, nodes=[{"id": "ask", "prompt": "hello"}])
+    path = workflow_writer(
+        tmp_path,
+        nodes=[{"id": "ask", "prompt": "hello", "model": "small"}],
+    )
     _sidecar(path)
 
     current = load_workflow(path)
@@ -70,17 +73,18 @@ def test_v5_is_readable_but_current_archon_admission_remains_v4(
         normalizer_version=5,
     )
 
-    assert workflow_language.LATEST_NORMALIZER_VERSION == 4
+    assert workflow_language.LATEST_NORMALIZER_VERSION == 5
     assert (
         workflow_language.CURRENT_NORMALIZER_BY_PROFILE[
             WorkflowLanguageProfile.ARCHON_2026_07
         ]
-        == 4
+        == 5
     )
     assert workflow_language.SUPPORTED_NORMALIZER_VERSIONS == {1, 2, 3, 4, 5}
-    assert current.language.normalizer_version == 4
+    assert current.language.normalizer_version == 5
     assert explicit.language.normalizer_version == 5
-    assert "provider_portability" not in current.language.node_semantics["ask"]
+    assert current.language.node_semantics == explicit.language.node_semantics
+    assert "provider_portability" in current.language.node_semantics["ask"]
 
 
 def test_v5_tags_model_references_and_canonicalizes_hook_obligations(
@@ -331,7 +335,7 @@ def test_v5_semantic_mutation_changes_normalized_digest(tmp_path, workflow_write
     )
 
 
-def test_explicit_v5_schema_is_bounded_without_changing_current_v4_schema():
+def test_current_v5_schema_is_bounded_and_explicit_v4_remains_readable():
     profile = WorkflowLanguageProfile.ARCHON_2026_07
     current = definition_json_schema(profile)
     v4 = definition_json_schema(profile, normalizer_version=4)
@@ -340,7 +344,8 @@ def test_explicit_v5_schema_is_bounded_without_changing_current_v4_schema():
         "PreToolUse"
     ]["items"]["properties"]["matcher"]
 
-    assert current == v4
+    assert current == v5
+    assert current != v4
     assert matcher["type"] == ["string", "null"]
     assert matcher["maxLength"] == 512
 

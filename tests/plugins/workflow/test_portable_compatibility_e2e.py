@@ -51,6 +51,16 @@ def _run_package(package, home, key, **scheduler_kwargs):
     return store, admitted.run_id, result
 
 
+def _load_archon_v4(path):
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=4,
+    )
+
+
 def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
@@ -92,7 +102,7 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = _load_archon_v4(workflow)
     report = assess_compatibility(package, available_tools=frozenset())
 
     assert package.definition.name == "portable-contract"
@@ -191,7 +201,7 @@ def test_official_archon_bash_boundary_executes_inline_and_spilled_values(
         workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
             "language_compatibility: archon-2026-07\n", encoding="utf-8"
         )
-        package = load_workflow(workflow)
+        package = _load_archon_v4(workflow)
         _store, _run_id, result = _run_package(
             package, tmp_path / f"boundary-home-{size}", f"boundary-{size}"
         )
@@ -327,11 +337,11 @@ def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(
     assert {"mcp", "skills"}.isdisjoint(NODE_TYPES)
 
 
-def test_current_v4_include_loop_matches_the_explicit_contract(
+def test_current_v5_include_loop_inherits_the_explicit_v4_contract(
     tmp_path,
     workflow_writer,
 ) -> None:
-    """Exercise the current and explicit-v4 compatibility path as one relationship."""
+    """Exercise current v5 inheritance and explicit-v4 compatibility together."""
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
     from plugins.workflow.schema import parse_workflow_source_bytes
 
@@ -391,10 +401,14 @@ def test_current_v4_include_loop_matches_the_explicit_contract(
         normalizer_version=4,
     )
 
-    assert default_contract["normalizer_version"] == 4
+    assert default_contract["normalizer_version"] == 5
     assert explicit_contract["normalizer_version"] == 4
-    assert default_contract == explicit_contract
-    assert report.runnable
+    assert {
+        item["id"] for item in default_contract["documentation"]["topics"]
+    } >= {
+        item["id"] for item in explicit_contract["documentation"]["topics"]
+    }
+    assert not report.runnable
     assert [node.id for node in compilation.package.definition.nodes] == [
         "checks__refine"
     ]
@@ -409,6 +423,7 @@ def test_current_v4_include_loop_matches_the_explicit_contract(
         "signal_completes": False,
     }
     finding_codes = {finding.code for finding in report.findings}
+    assert "provider_authority_missing" in finding_codes
     assert {
         "phase4_loop_prompt_sealed",
         "phase4_signal_confirmation",

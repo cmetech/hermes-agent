@@ -2288,9 +2288,18 @@ def _field_schema(
     })
     if spec.examples:
         result["examples"] = (
-            [hook_event]
-            if spec.shape == "hook_event_name" and hook_event is not None
-            else [_thaw_editor_value(example) for example in spec.examples]
+            ["^read_file$"]
+            if (
+                spec.scope == "hook_entry"
+                and spec.yaml_name == "matcher"
+                and normalizer_version is not None
+                and supports_phase5_semantics(profile, normalizer_version)
+            )
+            else (
+                [hook_event]
+                if spec.shape == "hook_event_name" and hook_event is not None
+                else [_thaw_editor_value(example) for example in spec.examples]
+            )
         )
     if spec.default_value is not _NO_DEFAULT:
         result["default"] = (

@@ -52,7 +52,7 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
 
     assert contract["schema_version"] == 1
     assert contract["profile"] == "archon-2026-07"
-    assert contract["normalizer_version"] == 4
+    assert contract["normalizer_version"] == 5
     assert (
         contract["definition_schema"]["$schema"]
         == "https://json-schema.org/draft/2020-12/schema"
@@ -60,7 +60,7 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
     assert len(language_schema.canonical_contract_json(contract).encode()) < 256_000
 
 
-def test_phase4_loop_inventory_is_current_without_changing_v1_v3_schemas():
+def test_phase4_loop_inventory_remains_explicitly_readable_without_changing_v1_v3_schemas():
     loop_specs = {
         spec.yaml_name: spec
         for spec in FIELD_INVENTORY
@@ -72,13 +72,19 @@ def test_phase4_loop_inventory_is_current_without_changing_v1_v3_schemas():
     assert loop_specs["signal_completes"].json_type == "boolean"
     assert loop_specs["prompt"].required is False
 
-    schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+    schema = definition_json_schema(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
     loop_schema = schema["properties"]["nodes"]["items"]["properties"]["loop"]
     assert "prompt" not in loop_schema.get("required", ())
     assert "command" in loop_schema["properties"]
     assert "signal_completes" in loop_schema["properties"]
 
-    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
     loop_kind = next(item for item in contract["node_kinds"] if item["id"] == "loop")
     loop_paths = {item["field_path"] for item in loop_kind["fields"]}
     assert "nodes[].loop.command" in loop_paths
@@ -140,7 +146,7 @@ def test_explicit_v4_authoring_contract_exposes_current_loop_fields():
 def test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices():
     """Catch v4 syntax leaking into v3 or an include becoming executable."""
     profile = WorkflowLanguageProfile.ARCHON_2026_07
-    current = workflow_authoring_contract(profile)
+    current = workflow_authoring_contract(profile, normalizer_version=4)
     phase4 = workflow_authoring_contract(profile, normalizer_version=4)
 
     current_items = current["definition_schema"]["properties"]["nodes"]["items"]
@@ -193,7 +199,7 @@ def test_explicit_v4_contract_relates_compile_only_includes_and_loop_choices():
 def test_explicit_v4_contract_documents_signal_interactions_and_stable_codes():
     """Catch generated v4 contracts omitting operational semantics or failures."""
     profile = WorkflowLanguageProfile.ARCHON_2026_07
-    current = workflow_authoring_contract(profile)
+    current = workflow_authoring_contract(profile, normalizer_version=4)
     phase3 = workflow_authoring_contract(profile, normalizer_version=3)
     phase4 = workflow_authoring_contract(profile, normalizer_version=4)
     current_topics = {item["id"]: item for item in current["documentation"]["topics"]}
@@ -654,9 +660,12 @@ def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(pro
     assert isinstance(conditions["parameters"]["expression_pattern"], str)
 
 
-def test_current_strict_output_rule_adds_only_v4_loop_template_paths():
+def test_explicit_v4_strict_output_rule_adds_only_v4_loop_template_paths():
     profile = WorkflowLanguageProfile.ARCHON_2026_07
-    current_rule_list = workflow_authoring_contract(profile)["semantic_rules"]
+    current_rule_list = workflow_authoring_contract(
+        profile,
+        normalizer_version=4,
+    )["semantic_rules"]
     current_rules = {
         item["id"]: item
         for item in current_rule_list
@@ -680,7 +689,6 @@ def test_current_strict_output_rule_adds_only_v4_loop_template_paths():
         "nodes[].loop.command",
         "nodes[].loop.gate_message",
     }.isdisjoint(phase3_paths)
-    assert language_schema.semantic_rule_descriptors(profile) == current_rule_list
     assert language_schema.semantic_rule_descriptors(
         profile,
         normalizer_version=4,

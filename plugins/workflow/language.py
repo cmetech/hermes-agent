@@ -32,13 +32,13 @@ from plugins.workflow.models import (
 )
 
 
-LATEST_NORMALIZER_VERSION = 4
 # Pre-language legacy snapshots used this public fallback. Keep it at v2.
 WORKFLOW_NORMALIZER_VERSION = 2
 CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
     WorkflowLanguageProfile.HERMES_LEGACY: 2,
-    WorkflowLanguageProfile.ARCHON_2026_07: 4,
+    WorkflowLanguageProfile.ARCHON_2026_07: 5,
 })
+LATEST_NORMALIZER_VERSION = max(CURRENT_NORMALIZER_BY_PROFILE.values())
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
