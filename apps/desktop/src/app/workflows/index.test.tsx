@@ -268,6 +268,40 @@ describe('WorkflowsView', () => {
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
   })
 
+  it('renders the backend Phase 5 capability summary without resolving a model', async () => {
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          language: {
+            declared_profile: 'archon-2026-07',
+            effective_profile: 'archon-2026-07',
+            legacy: false,
+            normalizer_version: 5
+          },
+          provider_capability: {
+            authority_digest: 'a'.repeat(64),
+            degraded_count: 0,
+            level: 'portable',
+            mixed_provider: false,
+            resolved_route_count: 1,
+            schema_version: 1,
+            unsupported_count: 0,
+            warning_codes: []
+          }
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+
+    expect(row.textContent).toContain('Provider readiness: portable')
+    expect((within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(row.textContent).not.toContain('openai/')
+  })
+
   it('shows backend language badges while preserving old-backend source rows', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({

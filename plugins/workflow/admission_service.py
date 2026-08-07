@@ -9,13 +9,13 @@ from typing import AbstractSet, Mapping
 
 import yaml
 
-from hermes_cli.provider_capabilities import CapabilityDisposition
 from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.language import supports_phase4_semantics, supports_phase5_semantics
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.provider_authority import (
     WorkflowProviderAuthority,
     WorkflowProviderAuthorityError,
+    public_provider_capability_projection,
 )
 from plugins.workflow.resources import normalize_mcp_server_document
 from plugins.workflow.runner_binding import (
@@ -127,25 +127,7 @@ def _capability_summary(
 ) -> Mapping[str, object] | None:
     if authority is None:
         return None
-    providers = {route.provider for route in authority.routes.values()}
-    unsupported = sum(
-        item.decision.disposition is CapabilityDisposition.UNSUPPORTED
-        for item in authority.obligations
-    )
-    degraded = sum(
-        item.decision.disposition
-        is CapabilityDisposition.DEGRADED_WITH_EXPLICIT_SEMANTICS
-        for item in authority.obligations
-    )
-    return {
-        "schema_version": 1,
-        "resolved_route_count": len(authority.routes),
-        "mixed_provider": len(providers) > 1,
-        "unsupported_count": unsupported,
-        "degraded_count": degraded,
-        "warning_codes": tuple(sorted({item.code for item in authority.warnings})),
-        "authority_digest": authority.authority_digest,
-    }
+    return public_provider_capability_projection(authority)
 
 
 def assess_workflow_admission(

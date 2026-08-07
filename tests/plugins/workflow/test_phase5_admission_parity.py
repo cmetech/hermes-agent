@@ -109,11 +109,12 @@ def test_one_admission_result_owns_authority_compatibility_risk_and_summary(
     assert assessment.risk.package_digest == compilation.composite_digest
     assert assessment.capability_summary == {
         "schema_version": 1,
+        "level": "unsupported",
         "resolved_route_count": 1,
         "mixed_provider": False,
         "unsupported_count": 1,
         "degraded_count": 0,
-        "warning_codes": ("model_reference_not_globally_portable",),
+        "warning_codes": ["model_reference_not_globally_portable"],
         "authority_digest": assessment.provider_authority.authority_digest,
     }
     assert assessment.next_actions == ("doctor",)
@@ -359,4 +360,11 @@ def test_cli_gateway_rest_doctor_catalog_and_detail_share_blocking_decision(
         for item in detail["compatibility"]["findings"]
         if item["blocking"]
     } == expected
-    assert catalog[0]["provider_capability"] == detail["provider_capability"]
+    detail_capability = detail["provider_capability"]
+    assert catalog[0]["provider_capability"] == {
+        key: value
+        for key, value in detail_capability.items()
+        if key not in {"routes", "decisions"}
+    }
+    assert detail_capability["routes"]
+    assert detail_capability["decisions"]

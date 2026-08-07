@@ -278,6 +278,12 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
             <dd>{asDisplay(run.next_retry_at, copy.estimateUnavailable)}</dd>
             <dt>{copy.definition}</dt>
             <dd className="break-all">{asDisplay(run.definition_digest, copy.estimateUnavailable)}</dd>
+            {run.provider_resolution_sha256 ? (
+              <>
+                <dt>{copy.workflowProviderAuthorityDigest}</dt>
+                <dd className="break-all font-mono">{run.provider_resolution_sha256}</dd>
+              </>
+            ) : null}
           </dl>
         ) : tab === 'timeline' ? (
           <EvidenceItems emptyLabel={copy.noEvidence} items={events} />

@@ -47,6 +47,8 @@ from plugins.workflow.runtime import (
     WorkflowRetentionPolicy,
 )
 from plugins.workflow.sanitize import (
+    projection_key_is_secret,
+    public_display_identifier,
     public_run_projection,
     sanitize_evidence_bytes,
     sanitize_projection,
@@ -437,6 +439,109 @@ class WorkflowDetailCompatibilityFull(WorkflowCompatibilityFull):
     )
 
 
+class WorkflowProviderRouteProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(..., min_length=1, max_length=128)
+    role: Literal["primary", "fallback", "inline_agent"]
+    inline_agent_id: str | None = Field(None, min_length=1, max_length=128)
+    reference_kind: Literal["tier", "configured_alias", "literal"]
+    provider: str = Field(..., min_length=1, max_length=128)
+    model: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("provider", "model")
+    @classmethod
+    def require_safe_display_identifier(cls, value: str) -> str:
+        if public_display_identifier(value) != value:
+            raise ValueError("provider and model identifiers must be public-safe")
+        return value
+
+
+class WorkflowProviderDecisionProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=256)
+    feature: Literal[
+        "structured_output",
+        "session_resumption",
+        "tool_restrictions",
+        "hooks",
+        "mcp",
+        "skills_inline_agents",
+        "effort_thinking",
+        "fallback_models",
+        "web_execution",
+        "cost_budgets",
+        "provider_native_sandbox",
+    ]
+    disposition: Literal[
+        "native",
+        "hermes_adapter",
+        "degraded_with_explicit_semantics",
+        "unsupported",
+    ]
+    provider: str = Field(..., min_length=1, max_length=128)
+    model: str = Field(..., min_length=1, max_length=128)
+    option: str | None = Field(None, max_length=128)
+    effective_semantics: dict[str, object]
+    code: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("provider", "model")
+    @classmethod
+    def require_safe_display_identifier(cls, value: str) -> str:
+        if public_display_identifier(value) != value:
+            raise ValueError("provider and model identifiers must be public-safe")
+        return value
+
+    @field_validator("effective_semantics")
+    @classmethod
+    def require_public_semantics(cls, value: dict[str, object]) -> dict[str, object]:
+        pending: list[object] = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, Mapping):
+                for key, child in item.items():
+                    if projection_key_is_secret(str(key)):
+                        raise ValueError("effective semantics contain a private key")
+                    pending.append(child)
+            elif isinstance(item, list):
+                pending.extend(item)
+            elif isinstance(item, str) and public_display_identifier(item) != item:
+                raise ValueError("effective semantics contain an unsafe string")
+        return value
+
+
+class WorkflowProviderCapabilityProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    level: Literal["portable", "degraded", "unsupported"]
+    resolved_route_count: StrictInt = Field(..., ge=0, le=512)
+    mixed_provider: StrictBool
+    unsupported_count: StrictInt = Field(..., ge=0, le=4096)
+    degraded_count: StrictInt = Field(..., ge=0, le=4096)
+    warning_codes: list[str] = Field(..., max_length=512)
+    authority_digest: str = Field(
+        ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    routes: list[WorkflowProviderRouteProjection] | None = Field(
+        None, max_length=512
+    )
+    decisions: list[WorkflowProviderDecisionProjection] | None = Field(
+        None, max_length=4096
+    )
+
+    @model_validator(mode="after")
+    def require_consistent_counts(self):
+        if self.unsupported_count + self.degraded_count > 4096:
+            raise ValueError("provider capability counts exceed decision bound")
+        if (self.routes is None) != (self.decisions is None):
+            raise ValueError("provider capability detail fields must appear together")
+        if self.routes is not None and len(self.routes) != self.resolved_route_count:
+            raise ValueError("resolved route count must match detailed routes")
+        return self
+
+
 def _sanitize_compatibility_finding_projection(
     finding: Mapping[str, object],
 ) -> dict[str, object]:
@@ -541,6 +646,7 @@ class WorkflowCatalogEntry(BaseModel):
     compatibility: WorkflowCompatibilitySummary | WorkflowCompatibilityFull | None = (
         None
     )
+    provider_capability: WorkflowProviderCapabilityProjection | None = None
 
     @model_validator(mode="after")
     def require_source_compatibility_projection(self):
@@ -607,6 +713,7 @@ class WorkflowDetailResponse(BaseModel):
     topology: WorkflowTopologyResponse
     definition: dict[str, object]
     compilation: dict[str, object] | None = None
+    provider_capability: WorkflowProviderCapabilityProjection | None = None
 
 
 @router.get(

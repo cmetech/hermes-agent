@@ -469,6 +469,49 @@ upstream_changes:
     option transports fresh-context fallback with shared authorities and truthful
     provider-native sandbox blocking.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-public-provider-authority
+  change_class: workflow-desktop-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/evidence.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  owned_symbols:
+  - public_display_identifier and public_provider_capability_projection
+  - WorkflowProviderCapabilityProjection REST and Desktop contracts
+  - Phase 5 Desktop provider authority run gate and fresh pre-submit revalidation
+  - closed provider authority and cost-budget attempt evidence
+  owned_invariants:
+  - catalog projects only bounded capability summary while detail adds bounded routes and decisions
+  - unsafe provider and model identifiers are replaced wholesale by a stable digest label
+  - prompts commands credentials provider responses feedback private paths base URLs and MCP stderr never enter public projections
+  - Desktop renders backend-authored resolution and never resolves tiers aliases models or capabilities locally
+  - missing malformed unsupported unknown or changed Phase 5 authority blocks before the existing run mutation URL
+  - provider authority and budget evidence contain only sealed digests bounded outcomes and closed totals
+  - existing workflow action names and mutation URLs remain unchanged
+  tests:
+  - tests/plugins/workflow/test_phase5_surfaces.py
+  - tests/plugins/workflow/test_evidence_api.py
+  - tests/plugins/workflow/test_notifications.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  expected_commit_subject: 'feat(workflow): project provider authority to clients'
+  upstream_candidate: true
+  merge_guidance: Preserve the backend as the only model and capability authority.
+    Keep the public contract closed and versioned, redact unsafe identifiers wholesale,
+    and require a fresh authoritative detail check immediately before Desktop submits
+    through the existing mutation URL.
+  removal_condition: Remove when upstream provides an equivalent closed provider
+    authority projection shared by evidence REST catalog doctor notifications and
+    Desktop with fail-closed client skew handling.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration

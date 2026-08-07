@@ -50,6 +50,20 @@ _PERSISTENT_SESSION_RECOVERY_FIELDS = (
     "provider_attempts_before_recovery",
     "outcome",
 )
+_COST_BUDGET_FIELDS = (
+    "max_budget_usd",
+    "settled_cost_usd",
+    "remaining_usd",
+    "overage_usd",
+    "settlement_count",
+)
+_SHA256 = frozenset("0123456789abcdef")
+
+
+def _public_digest(value: object) -> str | None:
+    if isinstance(value, str) and len(value) == 64 and not set(value) - _SHA256:
+        return value
+    return None
 
 
 class _UnsafeEvidencePath(Exception):
@@ -340,7 +354,11 @@ class EvidenceReader:
             return [*historical, *pending_items]
         if kind == "attempts":
             return [
-                self._attempt_evidence_item(node_id, attempt)
+                self._attempt_evidence_item(
+                    node_id,
+                    attempt,
+                    manifest_digest=run.get("provider_resolution_sha256"),
+                )
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 for attempt in node.get("attempts", [])
@@ -397,18 +415,49 @@ class EvidenceReader:
     def _attempt_evidence_item(
         node_id: object,
         attempt: Mapping[str, object],
+        *,
+        manifest_digest: object = None,
     ) -> dict[str, object]:
         metadata = attempt.get("metadata")
-        if not isinstance(metadata, Mapping) or not all(
-            field in metadata for field in _PHASE3_RETRY_FIELDS
-        ):
-            return {"node_id": node_id, **attempt}
         projected: dict[str, object] = {
             "node_id": node_id,
             "attempt_id": attempt.get("attempt_id"),
             "state": attempt.get("state"),
-            "retry": {field: metadata[field] for field in _PHASE3_RETRY_FIELDS},
         }
+        if isinstance(metadata, Mapping) and all(
+            field in metadata for field in _PHASE3_RETRY_FIELDS
+        ):
+            projected["retry"] = {
+                field: metadata[field] for field in _PHASE3_RETRY_FIELDS
+            }
+        authority_digest = (
+            _public_digest(metadata.get("intended_authority_digest"))
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        public_manifest_digest = _public_digest(manifest_digest)
+        if authority_digest is not None and public_manifest_digest is not None:
+            projected["provider_authority"] = {
+                "authority_digest": authority_digest,
+                "manifest_digest": public_manifest_digest,
+            }
+        audit = metadata.get("audit") if isinstance(metadata, Mapping) else None
+        cost_budget = audit.get("cost_budget") if isinstance(audit, Mapping) else None
+        if isinstance(cost_budget, Mapping):
+            closed_budget = {
+                field: cost_budget[field]
+                for field in _COST_BUDGET_FIELDS
+                if field in cost_budget
+                and (
+                    isinstance(cost_budget[field], str)
+                    and len(cost_budget[field]) <= 64
+                    or field == "settlement_count"
+                    and type(cost_budget[field]) is int
+                    and 0 <= cost_budget[field] <= 1_000_000
+                )
+            }
+            if closed_budget:
+                projected["cost_budget"] = closed_budget
         if attempt.get("error_code") is not None:
             projected["error"] = {
                 "code": attempt.get("error_code"),

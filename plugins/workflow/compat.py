@@ -121,6 +121,7 @@ class DoctorReport:
     resolved_scripts: tuple[str, ...]
     resolved_mcp_servers: tuple[str, ...]
     resolved_skills: tuple[str, ...]
+    provider_capability: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable JSON representation used by the CLI and tests."""

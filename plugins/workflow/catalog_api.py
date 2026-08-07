@@ -1616,7 +1616,15 @@ def build_workflow_detail(
     if "compilation" in shown:
         detail["compilation"] = shown["compilation"]
     if assessment is not None and assessment.capability_summary is not None:
-        detail["provider_capability"] = dict(assessment.capability_summary)
+        from plugins.workflow.provider_authority import (
+            public_provider_capability_projection,
+        )
+
+        assert assessment.provider_authority is not None
+        detail["provider_capability"] = public_provider_capability_projection(
+            assessment.provider_authority,
+            include_details=True,
+        )
     return detail
 
 

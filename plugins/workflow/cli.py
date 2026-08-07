@@ -1928,6 +1928,11 @@ def doctor_package(
         resolved_scripts=scripts,
         resolved_mcp_servers=mcp_servers,
         resolved_skills=skills,
+        provider_capability=(
+            None
+            if assessment is None or assessment.capability_summary is None
+            else dict(assessment.capability_summary)
+        ),
     )
 
 

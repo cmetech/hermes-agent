@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import PurePath
@@ -15,7 +16,7 @@ from plugins.workflow.schedule_time import (
 
 
 _SECRET_KEY = re.compile(
-    r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt|return[_-]?route)"
+    r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt|command|provider[_-]?response|feedback|stderr|base[_-]?url|uri|return[_-]?route)"
 )
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -27,6 +28,36 @@ _PORTABLE_COMPONENT_MAX_UNITS = 255
 _TEXT_INPUT_SUFFIX = ".txt"
 _PROJECTION_MAX_CHARS = 16_384
 _TRUNCATION_SUFFIX = "…[TRUNCATED]"
+_DISPLAY_IDENTIFIER = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_DISPLAY_CREDENTIAL_PREFIX = re.compile(
+    r"(?i)^(?:sk|pk|api|key|token|bearer|basic|oauth|secret|password)[_-]"
+)
+_DISPLAY_HIGH_ENTROPY = re.compile(r"(?i)(?:[0-9a-f]{32,}|[a-z0-9_-]{64,})")
+_DISPLAY_REDACTED = re.compile(r"^redacted:[0-9a-f]{16}$")
+
+
+def public_display_identifier(value: object) -> str:
+    """Return a bounded provider/model label or one stable wholesale redaction."""
+    raw = value if isinstance(value, str) else str(value)
+    if _DISPLAY_REDACTED.fullmatch(raw):
+        return raw
+    safe = (
+        0 < len(raw) <= 128
+        and _DISPLAY_IDENTIFIER.fullmatch(raw) is not None
+        and not raw.startswith(("/", "\\"))
+        and all(part not in {"", ".", ".."} for part in raw.split("/"))
+        and _DISPLAY_CREDENTIAL_PREFIX.search(raw) is None
+        and _DISPLAY_HIGH_ENTROPY.search(raw) is None
+        and not any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw)
+    )
+    if safe:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"redacted:{digest[:16]}"
+
+
 def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
     """Return whether a name is one portable filename segment on every host OS."""
     if not isinstance(name, str):
@@ -121,6 +152,8 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
         ]
     if isinstance(value, str):
         cleaned, truncated = sanitize_text(value, max_chars=_PROJECTION_MAX_CHARS)
+        if key.lower() in {"provider", "model"}:
+            return public_display_identifier(cleaned)
         if key.lower() == "transition_key" and ":gateway:" in cleaned:
             cleaned = cleaned.partition(":gateway:")[0] + ":gateway:opaque"
         if key.lower() in {"path", "source_path", "run_directory", "relative_path"}:
@@ -163,6 +196,7 @@ def public_run_projection(
 
 __all__ = [
     "projection_key_is_secret",
+    "public_display_identifier",
     "public_run_projection",
     "sanitize_evidence_bytes",
     "sanitize_projection",

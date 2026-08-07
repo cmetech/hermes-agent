@@ -32,6 +32,7 @@ from hermes_cli.workflow_model_resolution import (
 )
 from plugins.workflow.language import supports_phase5_semantics
 from plugins.workflow.models import WorkflowPackage, freeze_value
+from plugins.workflow.sanitize import public_display_identifier, sanitize_text
 
 
 _AUTHORITY_SCHEMA_VERSION = 1
@@ -248,6 +249,98 @@ class WorkflowProviderAuthority:
         if len(encoded) > _AUTHORITY_MAX_BYTES:
             raise ValueError("provider authority exceeds its byte limit")
         return encoded
+
+
+def _public_capability_level(authority: WorkflowProviderAuthority) -> str:
+    dispositions = {item.decision.disposition for item in authority.obligations}
+    if CapabilityDisposition.UNSUPPORTED in dispositions:
+        return "unsupported"
+    if CapabilityDisposition.DEGRADED_WITH_EXPLICIT_SEMANTICS in dispositions:
+        return "degraded"
+    return "portable"
+
+
+def _public_projection_text(value: object, *, max_chars: int = 256) -> str:
+    cleaned, _truncated = sanitize_text(str(value), max_chars=max_chars)
+    return cleaned
+
+
+def _public_semantics(value: Any) -> Any:
+    """Project already-bounded capability semantics without trusting string values."""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return public_display_identifier(value)
+    if isinstance(value, Mapping):
+        return {str(key): _public_semantics(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_public_semantics(item) for item in value]
+    return public_display_identifier(value)
+
+
+def public_provider_capability_projection(
+    authority: WorkflowProviderAuthority,
+    *,
+    include_details: bool = False,
+) -> dict[str, Any]:
+    """Return the single closed provider-capability projection for public clients."""
+    providers = {route.provider for route in authority.routes.values()}
+    unsupported = sum(
+        item.decision.disposition is CapabilityDisposition.UNSUPPORTED
+        for item in authority.obligations
+    )
+    degraded = sum(
+        item.decision.disposition
+        is CapabilityDisposition.DEGRADED_WITH_EXPLICIT_SEMANTICS
+        for item in authority.obligations
+    )
+    projection: dict[str, Any] = {
+        "schema_version": 1,
+        "level": _public_capability_level(authority),
+        "resolved_route_count": len(authority.routes),
+        "mixed_provider": len(providers) > 1,
+        "unsupported_count": unsupported,
+        "degraded_count": degraded,
+        "warning_codes": sorted({item.code for item in authority.warnings}),
+        "authority_digest": authority.authority_digest,
+    }
+    if not include_details:
+        return projection
+    projection["routes"] = [
+        {
+            "node_id": _public_projection_text(route.node_id, max_chars=128),
+            "role": route.role.split(":", 1)[0],
+            "inline_agent_id": (
+                None
+                if route.inline_agent_id is None
+                else _public_projection_text(route.inline_agent_id, max_chars=128)
+            ),
+            "reference_kind": route.reference_kind,
+            "provider": public_display_identifier(route.provider),
+            "model": public_display_identifier(route.model),
+        }
+        for route in authority.routes.values()
+    ]
+    projection["decisions"] = [
+        {
+            "path": _public_projection_text(item.path),
+            "feature": item.decision.feature.value,
+            "disposition": item.decision.disposition.value,
+            "provider": public_display_identifier(item.decision.provider),
+            "model": public_display_identifier(item.decision.model),
+            "option": (
+                None
+                if item.decision.option is None
+                else _public_projection_text(item.decision.option, max_chars=128)
+            ),
+            "effective_semantics": _public_semantics(
+                item.decision.effective_semantics
+            ),
+            "code": _public_projection_text(item.decision.code, max_chars=128),
+        }
+        for item in authority.obligations
+    ]
+    return projection
 
 
 class WorkflowProviderAuthorityError(ValueError):
@@ -1110,6 +1203,7 @@ __all__ = [
     "WorkflowProviderAuthority",
     "WorkflowProviderAuthorityError",
     "WorkflowResolvedProviderRoute",
+    "public_provider_capability_projection",
     "read_workflow_provider_authority_bytes",
     "resolve_workflow_provider_authority",
 ]

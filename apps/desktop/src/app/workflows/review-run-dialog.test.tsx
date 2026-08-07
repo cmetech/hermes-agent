@@ -282,6 +282,52 @@ describe('Review & Run workflow dialog', () => {
     expect($notifications.get()[0]?.message).toBe('Started')
   })
 
+  it('revalidates Phase 5 provider authority immediately before POST and blocks drift', async () => {
+    const providerCapability = {
+      authority_digest: 'a'.repeat(64),
+      decisions: [],
+      degraded_count: 0,
+      level: 'portable' as const,
+      mixed_provider: false,
+      resolved_route_count: 0,
+      routes: [],
+      schema_version: 1 as const,
+      unsupported_count: 0,
+      warning_codes: []
+    }
+    const { decisions: _decisions, routes: _routes, ...providerSummary } = providerCapability
+    catalogDefinition = definition({
+      language: {
+        declared_profile: 'archon-2026-07',
+        effective_profile: 'archon-2026-07',
+        legacy: false,
+        normalizer_version: 5
+      },
+      provider_capability: providerSummary
+    })
+    let calls = 0
+    preflightHandler = async () => {
+      calls += 1
+      return {
+        ok: true,
+        value: detail({
+          ...catalogDefinition,
+          provider_capability: {
+            ...providerCapability,
+            authority_digest: (calls === 1 ? 'a' : 'b').repeat(64)
+          }
+        })
+      }
+    }
+    renderView()
+    const dialog = await openReviewDialog()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
+
+    await waitFor(() => expect(within(dialog).getByText('Provider readiness changed. Review it before starting.')).toBeTruthy())
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(0)
+    expect(calls).toBe(2)
+  })
+
   it('reviews the server-authored language profile beside digest-bound trust and risk', async () => {
     catalogDefinition = definition({
       language: { effective_profile: 'hermes-legacy', legacy: true }
@@ -581,7 +627,7 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(submit)
     fireEvent.click(submit)
 
-    expect(post).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1))
     expect(post.mock.calls[0]?.[0].body?.idempotency_key).toBe(IDEMPOTENCY_KEY)
     pending.resolve(startResponse())
     await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-created'))

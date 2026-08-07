@@ -158,6 +158,58 @@ export interface WorkflowLanguageStatus {
   normalizer_version?: number
 }
 
+export type WorkflowProviderCapabilityDisposition =
+  | 'degraded_with_explicit_semantics'
+  | 'hermes_adapter'
+  | 'native'
+  | 'unsupported'
+
+export type WorkflowProviderFeature =
+  | 'cost_budgets'
+  | 'effort_thinking'
+  | 'fallback_models'
+  | 'hooks'
+  | 'mcp'
+  | 'provider_native_sandbox'
+  | 'session_resumption'
+  | 'skills_inline_agents'
+  | 'structured_output'
+  | 'tool_restrictions'
+  | 'web_execution'
+
+export interface WorkflowProviderRouteProjection {
+  inline_agent_id: null | string
+  model: string
+  node_id: string
+  provider: string
+  reference_kind: 'configured_alias' | 'literal' | 'tier'
+  role: 'fallback' | 'inline_agent' | 'primary'
+}
+
+export interface WorkflowProviderDecisionProjection {
+  code: string
+  disposition: WorkflowProviderCapabilityDisposition
+  effective_semantics: Record<string, unknown>
+  feature: WorkflowProviderFeature
+  model: string
+  option: null | string
+  path: string
+  provider: string
+}
+
+export interface WorkflowProviderCapabilityProjection {
+  authority_digest: string
+  decisions?: WorkflowProviderDecisionProjection[]
+  degraded_count: number
+  level: 'degraded' | 'portable' | 'unsupported'
+  mixed_provider: boolean
+  resolved_route_count: number
+  routes?: WorkflowProviderRouteProjection[]
+  schema_version: 1
+  unsupported_count: number
+  warning_codes: string[]
+}
+
 export interface WorkflowDefinition {
   compatibility?: { level: string; runnable?: boolean }
   description: string
@@ -165,6 +217,7 @@ export interface WorkflowDefinition {
   language?: WorkflowLanguageStatus
   name: string
   precedence: 1 | 2 | 3
+  provider_capability?: WorkflowProviderCapabilityProjection
   requires_ai?: boolean
   run_support?: WorkflowRunSupport
   source: WorkflowCatalogSource
@@ -254,6 +307,7 @@ export interface WorkflowRunSnapshot {
   pending_interaction?: null | Record<string, unknown>
   presentation_state?: null | string
   previous_node?: null | string
+  provider_resolution_sha256?: string
   provenance?: WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
