@@ -43,26 +43,19 @@ _AUTHORITY_MAX_OBLIGATIONS = 4096
 _AUTHORITY_MAX_WARNINGS = 512
 _AUTHORITY_MAX_TEXT_CHARS = 512
 _SHA256 = frozenset("0123456789abcdef")
-_SUPPORTED_HOOK_EVENTS = frozenset({
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-})
-_SUPPORTED_HOOK_OPERATIONS = frozenset({
-    "continue",
-    "decision",
-    "stop_reason",
-    "current_turn_context",
-    "permission_decision",
-    "permission_decision_reason",
-    "update_input",
-    "additional_context",
-    "replace_mcp_tool_output",
-    "elicitation_action",
-    "elicitation_content",
+_SUPPORTED_HOOK_OPERATIONS_BY_EVENT = MappingProxyType({
+    "PreToolUse": frozenset({
+        "continue",
+        "decision",
+        "stop_reason",
+        "permission_decision",
+        "permission_decision_reason",
+        "update_input",
+    }),
+    "UserPromptSubmit": frozenset({
+        "current_turn_context",
+        "additional_context",
+    }),
 })
 
 
@@ -914,6 +907,7 @@ def resolve_workflow_provider_authority(
                                 "explicit_empty": not bool(raw_agent[field_name]),
                                 "hermes_schema_selection": True,
                                 "hermes_dispatch": True,
+                                "execution_adapter_available": not approval_rework,
                             },
                         )
                 if "skills" in raw_agent:
@@ -922,7 +916,10 @@ def resolve_workflow_provider_authority(
                         inline.route_id,
                         WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
                         option="skills",
-                        requested={"current_turn_content": True},
+                        requested={
+                            "current_turn_content": True,
+                            "execution_adapter_available": not approval_rework,
+                        },
                     )
 
         primary_id = primary.route_id
@@ -933,7 +930,21 @@ def resolve_workflow_provider_authority(
                 primary_id,
                 WorkflowProviderFeature.STRUCTURED_OUTPUT,
                 option="json_schema",
-                requested={"schema_fingerprint": output.schema_fingerprint},
+                requested={
+                    "schema_fingerprint": output.schema_fingerprint,
+                    "execution_adapter_available": not approval_rework,
+                },
+            )
+        elif approval_rework and any(
+            field_name in node_options
+            for field_name in ("output_format", "output_type")
+        ):
+            add(
+                f"nodes[{index}].output_format",
+                primary_id,
+                WorkflowProviderFeature.STRUCTURED_OUTPUT,
+                option="json_schema",
+                requested={"execution_adapter_available": False},
             )
         if root.get("persist_sessions") is True:
             add(
@@ -946,6 +957,7 @@ def resolve_workflow_provider_authority(
                     "hermes_conversation_loop": (
                         primary_runtime.hermes_managed_tool_loop
                     ),
+                    "execution_adapter_available": not approval_rework,
                 },
             )
         if node_options.get("persist_session") is True:
@@ -959,6 +971,7 @@ def resolve_workflow_provider_authority(
                     "hermes_conversation_loop": (
                         primary_runtime.hermes_managed_tool_loop
                     ),
+                    "execution_adapter_available": not approval_rework,
                 },
             )
         for field_name in ("allowed_tools", "denied_tools"):
@@ -978,6 +991,19 @@ def resolve_workflow_provider_authority(
             "provider_portability"
         )
         hooks = portability.get("hooks", ()) if isinstance(portability, Mapping) else ()
+        if approval_rework and "hooks" in node_options and not hooks:
+            add(
+                f"nodes[{index}].hooks",
+                primary_id,
+                WorkflowProviderFeature.HOOKS,
+                option="approval_rework",
+                requested={
+                    "normalized": False,
+                    "events_supported": False,
+                    "lifecycle_available": environment.hook_lifecycle_available,
+                    "execution_adapter_available": False,
+                },
+            )
         for hook_index, hook in enumerate(hooks):
             if not isinstance(hook, Mapping):
                 continue
@@ -996,10 +1022,14 @@ def resolve_workflow_provider_authority(
                 requested={
                     "normalized": True,
                     "events_supported": (
-                        event in _SUPPORTED_HOOK_EVENTS
-                        and operation_names <= _SUPPORTED_HOOK_OPERATIONS
+                        event in _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
+                        and operation_names
+                        <= _SUPPORTED_HOOK_OPERATIONS_BY_EVENT.get(
+                            event, frozenset()
+                        )
                     ),
                     "lifecycle_available": environment.hook_lifecycle_available,
+                    "execution_adapter_available": not approval_rework,
                 },
             )
         if "mcp" in node_options:
@@ -1023,6 +1053,7 @@ def resolve_workflow_provider_authority(
                     "import_policy_version": (
                         PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
                     ),
+                    "execution_adapter_available": not approval_rework,
                 },
             )
         if "skills" in node_options:
@@ -1031,7 +1062,10 @@ def resolve_workflow_provider_authority(
                 primary_id,
                 WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
                 option="skills",
-                requested={"current_turn_content": True},
+                requested={
+                    "current_turn_content": True,
+                    "execution_adapter_available": not approval_rework,
+                },
             )
         if "agents" in node_options:
             add(
@@ -1042,6 +1076,7 @@ def resolve_workflow_provider_authority(
                 requested={
                     "declared_worker_tool": environment.inline_agent_available,
                     "shared_limits": environment.inline_agent_available,
+                    "execution_adapter_available": not approval_rework,
                 },
             )
         node_route_ids = tuple(

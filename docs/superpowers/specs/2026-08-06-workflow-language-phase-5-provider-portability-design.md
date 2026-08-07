@@ -397,9 +397,11 @@ response with the documented semantics. The activation set is deliberately
 limited to the lifecycle paths proven by the isolated worker:
 
 - `PostToolUse` and `PostToolUseFailure` stay status-disjoint;
-- `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`,
-  `SessionEnd`, and `UserPromptSubmit` may use their event-valid bounded
-  operations;
+- `PreToolUse` may use exact allow/block/ask and tool-input replacement
+  operations, and `UserPromptSubmit` may add bounded current-turn context;
+- `PostToolUse`, `PostToolUseFailure`, `SessionStart`, and `SessionEnd`
+  normalize into explicit obligations but block because their current runtime
+  callbacks do not consume authored response values;
 - `SubagentStart`, `SubagentStop`, `TaskCompleted`, `Elicitation`,
   `ElicitationResult`, `PermissionRequest`, `Setup`, and
   `InstructionsLoaded` normalize into explicit obligations but block because

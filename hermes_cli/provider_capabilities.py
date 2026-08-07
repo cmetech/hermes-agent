@@ -671,6 +671,15 @@ def resolve_provider_capability(
             code="provider_capability_request_invalid",
             rationale="requested semantics are not bounded public JSON",
         )
+    if requested.get("execution_adapter_available") is False:
+        return _unsupported(
+            runtime,
+            feature,
+            option=option,
+            requested=requested,
+            code=f"{feature.value}_execution_adapter_unavailable",
+            rationale="the selected execution path cannot apply this capability",
+        )
     if feature is WorkflowProviderFeature.STRUCTURED_OUTPUT:
         return _resolve_structured_output(
             runtime,

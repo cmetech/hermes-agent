@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -191,7 +192,10 @@ def test_v3_approval_message_rechecks_direct_dependency_before_pause(tmp_path) -
         depends_on=(),
         source_index=0,
         source_line=1,
-        options=freeze_value({}),
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+        }),
     )
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -448,11 +452,15 @@ def test_typed_approval_retries_after_publication_fails_post_source_write(
 
 
 class ReworkRunner:
+    starts_request_mcp = True
+
     def __init__(self):
         self.requests = []
+        self.launch_kwargs = []
 
-    def run(self, request, **_kwargs):
+    def run(self, request, **kwargs):
         self.requests.append(request)
+        self.launch_kwargs.append(kwargs)
         return PluginAgentRunResult(
             final_response="revised plan",
             session_id="rework-session",
@@ -526,7 +534,10 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         depends_on=(),
         source_index=0,
         source_line=1,
-        options=freeze_value({}),
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+        }),
     )
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -549,6 +560,12 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         sealed_provider_route=route,
         sealed_provider_authority=authority,
         intended_authority_digest="a" * 64,
+        spawn_intent=lambda _nonce: True,
+        spawn_failed=lambda _nonce, _code: True,
+        provider_dispatch=lambda _nonce: True,
+        provider_start_delivered=lambda _nonce: True,
+        provider_execute_received=lambda _nonce: True,
+        provider_execute_release=lambda _nonce: True,
     )
 
     result = ApprovalExecutor(runner).execute(context)
@@ -566,6 +583,8 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         "registration_provenance_digest": "3" * 64,
     }
     assert request.sealed_provider_attempt_grant is True
+    assert request.allowed_tools == ()
+    assert request.denied_tools == ("terminal",)
     assert request.fallback_model is None
     assert request.sealed_fallback_route == {
         "provider": "sealed-fallback-provider",
@@ -583,6 +602,39 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
     }
     assert result.metadata["intended_authority_digest"] == "a" * 64
     assert result.metadata["model_visible_prefix_digest"] == "9" * 64
+    assert set(runner.launch_kwargs[0]) == {
+        "is_cancelled",
+        "spawn_intent",
+        "spawn_failed",
+        "provider_dispatch",
+        "provider_start_delivered",
+        "provider_execute_received",
+        "provider_execute_release",
+    }
+
+    pre_cancelled_runner = ReworkRunner()
+    pre_cancelled = ApprovalExecutor(pre_cancelled_runner).execute(
+        replace(context, is_cancelled=lambda: True)
+    )
+    assert pre_cancelled.status == "cancelled"
+    assert pre_cancelled_runner.requests == []
+
+    class CancelledRunner:
+        def run(self, _request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="cancelled-rework",
+                provider="fake",
+                model="fake",
+                status="cancelled",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    cancelled = ApprovalExecutor(CancelledRunner()).execute(context)
+    assert cancelled.status == "cancelled"
+    assert cancelled.error_code == "cancelled"
 
 
 def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(

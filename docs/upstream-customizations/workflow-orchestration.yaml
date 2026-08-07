@@ -144,6 +144,7 @@ upstream_changes:
   - ProviderProfile workflow capability declaration seam
   - ExecutionRuntimeCapabilities additive registration provenance
   - OpenRouter model-aware effort and explicit unsupported security declarations
+  - execution-adapter availability is an explicit fail-closed resolver precondition that provider declarations cannot override
   tests:
   - tests/hermes_cli/test_provider_capabilities.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
@@ -315,6 +316,7 @@ upstream_changes:
   owned_invariants:
   - v5 MCP admission supports only an exact trusted Hermes Python interpreter and sealed package entry script
   - admission rejects non-string arguments malformed environments and every unsealed path-bearing argument or environment value before run creation
+  - admission conservatively rejects ambiguous percent-encoded or control-bearing network arguments that the worker cannot authenticate as safe URLs
   - interpreter family version build bytes and import-policy version are sealed as a credential-free authority digest
   - worker startup recomputes the exact interpreter identity before MCP discovery or provider transport
   - v5 launches with isolated -I -S semantics and a lifetime import guard limited to standard-library and sealed package roots
@@ -349,6 +351,7 @@ upstream_changes:
   - plugins/workflow/executors/ai.py
   owned_symbols:
   - PluginAgentRunRequest
+  - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
   - _build_inline_agent_handler
   - _tool_policy_incompatible_failure
   owned_invariants:
@@ -457,6 +460,9 @@ upstream_changes:
   - every provider-calling prompt command or ordinary loop node receives a sealed primary route
   - approval nodes receive a provider route only when authenticated rejection rework can call the provider
   - hook events without exact worker lifecycle and response semantics resolve unsupported and block admission
+  - hook support is decided by an event-specific consumed-operation matrix rather than a global response-field allowlist
+  - approval rejection rework preserves exact empty tool restrictions and blocks every generic AI option its executor cannot apply
+  - approval rejection rework shares cancellation and process/provider lifecycle callbacks with the primary isolated agent path
   - route-specific effort decisions cannot be inherited from a different provider or model
   - OpenRouter effort uses only the declared reasoning.effort or verbosity request field
   - unsupported thinking shapes and every current provider-native sandbox request block without provider use

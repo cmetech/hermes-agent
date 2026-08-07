@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import sys
 
 import pytest
+import yaml
 
 from hermes_cli.runtime_provider import classify_execution_runtime
 from hermes_cli.workflow_model_resolution import parse_workflow_model_config
@@ -182,6 +184,127 @@ def test_provider_routes_cover_only_nodes_that_can_call_the_provider(
     authority = _authority(_load_v5(path))
 
     assert set(authority.routes) == {"review:primary", "refine:primary"}
+
+
+def test_approval_rework_blocks_options_its_executor_cannot_apply(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise the result"},
+            },
+            "persist_session": True,
+            "allowed_tools": [],
+            "hooks": {
+                "PreToolUse": [{"response": {"continue": True}}],
+            },
+            "mcp": "local",
+            "skills": ["review"],
+            "agents": {
+                "reviewer": {
+                    "description": "Review",
+                    "prompt": "Review the result",
+                },
+            },
+        }],
+    )
+    (tmp_path / "mcp").mkdir()
+    (tmp_path / "servers").mkdir()
+    (tmp_path / "mcp/local.yaml").write_text(
+        yaml.safe_dump({
+            "command": sys.executable,
+            "args": ["servers/main.py"],
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "servers/main.py").write_text("print('sealed')\n", encoding="utf-8")
+
+    package = _load_v5(path)
+    authority = _authority(package)
+    report = assess_compatibility(package, provider_authority=authority)
+
+    decisions = {
+        item.path: item.decision.disposition.value
+        for item in authority.obligations
+    }
+    assert decisions["nodes[0].allowed_tools"] == "hermes_adapter"
+    for path_key in (
+        "nodes[0].persist_session",
+        "nodes[0].mcp",
+        "nodes[0].skills",
+        "nodes[0].agents",
+    ):
+        assert decisions[path_key] == "unsupported"
+        assert any(item.path == path_key for item in report.blocking_findings)
+    hook_paths = [path_key for path_key in decisions if path_key.startswith("nodes[0].hooks")]
+    assert hook_paths
+    assert all(decisions[path_key] == "unsupported" for path_key in hook_paths)
+    assert all(
+        any(item.path == path_key for item in report.blocking_findings)
+        for path_key in hook_paths
+    )
+
+
+@pytest.mark.parametrize(
+    ("event", "response"),
+    [
+        ("SessionStart", {"systemMessage": "ignored"}),
+        ("PostToolUse", {"continue": False}),
+        ("UserPromptSubmit", {"decision": "block"}),
+        ("PreToolUse", {"systemMessage": "ignored"}),
+    ],
+)
+def test_hook_response_operations_block_when_the_runtime_event_ignores_them(
+    tmp_path, workflow_writer, event, response
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "hooks": {event: [{"response": response}]},
+        }],
+    )
+    package = _load_v5(path)
+    authority = _authority(package)
+
+    decision = authority.obligations_by_path[f"nodes[0].hooks.{event}[0]"][0]
+    report = assess_compatibility(package, provider_authority=authority)
+
+    assert decision.decision.disposition.value == "unsupported"
+    assert any(
+        item.path == f"nodes[0].hooks.{event}[0]"
+        for item in report.blocking_findings
+    )
+
+
+def test_user_prompt_context_is_the_only_non_tool_hook_response_currently_consumed(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{
+            "id": "ask",
+            "prompt": "hello",
+            "hooks": {
+                "UserPromptSubmit": [{"response": {"systemMessage": "bounded"}}],
+            },
+        }],
+    )
+
+    authority = _authority(_load_v5(path))
+    decision = authority.obligations_by_path[
+        "nodes[0].hooks.UserPromptSubmit[0]"
+    ][0]
+
+    assert decision.decision.disposition.value == "hermes_adapter"
 
 
 @pytest.mark.parametrize(

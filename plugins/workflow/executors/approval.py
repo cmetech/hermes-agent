@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
 from hermes_cli.provider_capabilities import encode_provider_option_transport
+from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
     entitled_agent_runner,
@@ -303,6 +304,19 @@ class ApprovalExecutor:
             reasoning_config=reasoning_config,
             request_overrides=request_overrides,
             sealed_fallback_route=sealed_fallback_route,
+            allowed_tools=(
+                tuple(
+                    resolve_tool_name(name)
+                    for name in context.node.options["allowed_tools"]
+                )
+                if "allowed_tools" in context.node.options
+                else None
+            ),
+            denied_tools=tuple(
+                resolve_tool_name(name)
+                for name in context.node.options.get("denied_tools", ())
+            ),
+            ephemeral_system_prompt=context.node.options.get("systemPrompt"),
             workdir=context.run_directory,
             max_iterations=90,
             max_api_attempts=granted_provider_attempts,
@@ -373,8 +387,30 @@ class ApprovalExecutor:
                 error_message="workflow attempt deadline expired",
                 metadata={"provider_attempts": 0},
             )
+        if context.is_cancelled is not None and context.is_cancelled():
+            return NodeExecutionResult(
+                "cancelled",
+                error_code="cancelled",
+                metadata={"provider_attempts": 0},
+            )
+        launch_kwargs = {"is_cancelled": context.is_cancelled}
+        if getattr(agent_runner, "starts_request_mcp", False):
+            launch_kwargs.update({
+                name: callback
+                for name, callback in {
+                    "spawn_intent": context.spawn_intent,
+                    "spawn_failed": context.spawn_failed,
+                    "process_started": context.process_started,
+                    "provider_dispatch": context.provider_dispatch,
+                    "provider_start_delivered": context.provider_start_delivered,
+                    "provider_execute_received": context.provider_execute_received,
+                    "provider_execute_release": context.provider_execute_release,
+                    "process_stopped": context.process_stopped,
+                }.items()
+                if callback is not None
+            })
         try:
-            result = agent_runner.run(request, is_cancelled=context.is_cancelled)
+            result = agent_runner.run(request, **launch_kwargs)
         except PermissionError as exc:
             return NodeExecutionResult(
                 "failed",
@@ -405,6 +441,8 @@ class ApprovalExecutor:
                     )
                 },
             )
+        if result.status == "cancelled":
+            return NodeExecutionResult("cancelled", error_code="cancelled")
         execution_identity: dict[str, str] = {}
         if phase5:
             observed_intended = result.audit.get("intended_authority_digest")
@@ -442,8 +480,6 @@ class ApprovalExecutor:
                     **execution_identity,
                 },
             )
-        if result.status == "cancelled":
-            return NodeExecutionResult("cancelled", error_code="cancelled")
         if result.status != "completed":
             metadata: dict[str, object] = {
                 "audit": dict(result.audit),

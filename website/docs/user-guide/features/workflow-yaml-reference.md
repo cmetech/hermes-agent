@@ -643,8 +643,9 @@ exact finding. Recognition does not imply a runtime mapping.
 
 | Hook event | Current status |
 | --- | --- |
-| `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | Mapped to isolated worker tool lifecycle |
-| `SessionStart`, `SessionEnd`, `UserPromptSubmit` | Mapped to isolated worker/session lifecycle |
+| `PreToolUse` | Mapped for exact allow/block/ask and tool-input replacement semantics |
+| `UserPromptSubmit` | Mapped only for bounded current-turn context |
+| `PostToolUse`, `PostToolUseFailure`, `SessionStart`, `SessionEnd` | Recognized and sealed, but blocked: current callbacks do not consume authored response values |
 | `SubagentStart`, `SubagentStop`, `TaskCompleted`, `Elicitation`, `ElicitationResult`, `PermissionRequest`, `Setup`, `InstructionsLoaded` | Recognized and sealed, but blocked: the current worker does not provide the exact event-and-response contract |
 | `Notification`, `Stop`, `PreCompact`, `TeammateIdle`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove` | Blocked by doctor: no equivalent node-worker contract |
 

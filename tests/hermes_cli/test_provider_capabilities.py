@@ -201,6 +201,19 @@ def test_every_feature_request_receives_exactly_one_disposition(
     assert isinstance(decision.disposition, CapabilityDisposition)
 
 
+@pytest.mark.parametrize("feature", list(WorkflowProviderFeature))
+def test_missing_execution_adapter_blocks_every_capability(feature) -> None:
+    decision = _resolve(
+        _managed_runtime(),
+        feature,
+        option="json_schema" if feature is WorkflowProviderFeature.STRUCTURED_OUTPUT else None,
+        semantics={"execution_adapter_available": False},
+    )
+
+    assert decision.disposition is CapabilityDisposition.UNSUPPORTED
+    assert decision.code == f"{feature.value}_execution_adapter_unavailable"
+
+
 @pytest.mark.parametrize(
     ("feature", "option", "semantics"),
     [
