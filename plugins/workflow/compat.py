@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
 from plugins.workflow.language_schema import NODE_TYPES, inapplicable_node_fields
+from plugins.workflow.language import supports_phase4_semantics
 from plugins.workflow.models import (
     CompatibilityFinding,
     CompatibilityLevel,
@@ -613,6 +614,39 @@ def assess_compatibility(
                 code="field_not_applicable",
                 blocking=True,
             )
+        if (
+            node.node_type == "loop"
+            and supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+        ):
+            loop_semantics = package.language.node_semantics.get(node.id, {}).get(
+                "loop"
+            )
+            if isinstance(loop_semantics, Mapping):
+                prompt_source = str(loop_semantics.get("prompt_source", ""))
+                _finding(
+                    findings,
+                    f"{prefix}.loop.{prompt_source}",
+                    CompatibilityLevel.MAPPED,
+                    (
+                        "ordinary loop prompt resolves through its immutable "
+                        f"{prompt_source} source"
+                    ),
+                    code="phase4_loop_prompt_sealed",
+                )
+                if (
+                    loop_semantics.get("effective_interactive") is True
+                    and loop_semantics.get("signal_completes") is False
+                ):
+                    _finding(
+                        findings,
+                        f"{prefix}.loop.signal_completes",
+                        CompatibilityLevel.MAPPED,
+                        "signal completion pauses for a backend-authored confirmation",
+                        code="phase4_signal_confirmation",
+                    )
         if node.node_type not in {"command", "prompt"}:
             continue
         if "persist_session" in node_options:

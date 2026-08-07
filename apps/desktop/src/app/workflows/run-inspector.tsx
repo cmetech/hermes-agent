@@ -26,6 +26,13 @@ interface RunInspectorProps {
 
 type InspectorTab = 'artifacts' | 'attempts' | 'logs' | 'outputs' | 'overview' | 'recovery' | 'timeline'
 
+interface LoopSignalConfirmation {
+  interaction_id: string
+  iteration: number
+  max_iterations: number
+  type: 'loop_signal_confirmation'
+}
+
 const MUTATING_ACTIONS = new Set([
   'abandon',
   'archive',
@@ -53,6 +60,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
+}
+
+export function isLoopSignalConfirmation(value: unknown): value is LoopSignalConfirmation {
+  return (
+    isRecord(value) &&
+    typeof value.interaction_id === 'string' &&
+    Number.isInteger(value.iteration) &&
+    Number.isInteger(value.max_iterations) &&
+    value.type === 'loop_signal_confirmation'
+  )
 }
 
 export function isWorkflowAttemptEvidence(item: unknown): item is WorkflowAttemptEvidence {
@@ -145,7 +162,12 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   const copy = t.operations
   const profile = getApiRequestProfile() ?? 'default'
   const [tab, setTab] = useState<InspectorTab>('overview')
-  const [inputValue, setInputValue] = useState('')
+
+  const [inputDraft, setInputDraft] = useState<{ interactionId: null | string; value: string }>({
+    interactionId: null,
+    value: ''
+  })
+
   const [reconciliationOutcome, setReconciliationOutcome] = useState('')
   const evidenceKind = tab === 'overview' || tab === 'timeline' ? null : (tab satisfies WorkflowEvidenceKind)
 
@@ -172,6 +194,14 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   const currentNode = run.current_nodes?.[0]
   const provenance = run.provenance
   const coordinator = run.coordinator
+  const signalConfirmation = isLoopSignalConfirmation(run.pending_interaction)
+
+  const inputInteractionId =
+    isRecord(run.pending_interaction) && typeof run.pending_interaction.interaction_id === 'string'
+      ? run.pending_interaction.interaction_id
+      : null
+
+  const inputValue = inputDraft.interactionId === inputInteractionId ? inputDraft.value : ''
 
   const scheduledAt =
     run.presentation_state === 'scheduled_wait' && typeof run.schedule_at === 'string' ? run.schedule_at : null
@@ -267,8 +297,14 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                 return (
                   <div className="flex min-w-60 flex-1 items-end gap-2" key={action}>
                     <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs text-(--ui-text-secondary)">
-                      {copy.inputValue}
-                      <Input onChange={event => setInputValue(event.target.value)} size="sm" value={inputValue} />
+                      {signalConfirmation ? copy.feedback : copy.inputValue}
+                      <Input
+                        onChange={event =>
+                          setInputDraft({ interactionId: inputInteractionId, value: event.target.value })
+                        }
+                        size="sm"
+                        value={inputValue}
+                      />
                     </label>
                     <Button
                       disabled={actionsDisabled || inputValue.length === 0}
@@ -276,7 +312,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                       size="sm"
                       variant="secondary"
                     >
-                      {copy.provideInput}
+                      {signalConfirmation ? copy.continueWithFeedback : copy.provideInput}
                     </Button>
                   </div>
                 )
@@ -318,11 +354,12 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                   size="sm"
                   variant={action === 'cancel' || action === 'abandon' ? 'destructive' : 'secondary'}
                 >
-                  {
-                    copy[
-                      action as 'approve' | 'reject' | 'cancel' | 'resume' | 'retry' | 'abandon' | 'archive' | 'restore'
-                    ]
-                  }
+                  {signalConfirmation && action === 'approve'
+                    ? copy.acceptResult
+                    : copy[
+                        action as
+                          'approve' | 'reject' | 'cancel' | 'resume' | 'retry' | 'abandon' | 'archive' | 'restore'
+                      ]}
                 </Button>
               )
             })}

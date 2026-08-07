@@ -31,6 +31,7 @@ from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 def _start(store, package, *, key="approval"):
@@ -53,6 +54,128 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     register_cli(parser)
     return parser
+
+
+def test_v4_approval_decision_loads_recorded_sealed_normalizer_and_definition(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    workflow = workflow_writer(
+        tmp_path / "v4-approval" / "workflows",
+        name="v4-approval",
+        nodes=[
+            {"id": "review", "approval": {"message": "Approve?"}},
+            {
+                "id": "refine",
+                "loop": {
+                    "prompt": "Refine",
+                    "until": "DONE",
+                    "max_iterations": 1,
+                    "signal_completes": True,
+                },
+                "depends_on": ["review"],
+            },
+        ],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    store = RunStore(tmp_path / "v4-home")
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="v4-approval",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="v4-sealed-approval",
+            concurrency_key="v4-approval",
+        ),
+        immutable_snapshot=prepared,
+    )
+    paused = RunScheduler(store).advance(admitted.run_id)
+    pending = paused["nodes"]["review"]["pending_interaction"]
+    workflow.unlink()
+
+    decision = RunStore(tmp_path / "v4-home").approve_run(
+        admitted.run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    assert decision.outcome == "applied"
+    current = store.load_run(admitted.run_id)
+    assert current["language"]["normalizer_version"] == 4
+    assert current["nodes"]["review"]["state"] == "succeeded"
+
+
+@pytest.mark.parametrize("normalizer_version", [1, 2, 3])
+def test_v1_through_v3_approval_decisions_keep_their_recorded_normalizer(
+    tmp_path,
+    workflow_writer,
+    normalizer_version: int,
+) -> None:
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    workflow = workflow_writer(
+        tmp_path / f"approval-v{normalizer_version}" / "workflows",
+        name=f"approval-v{normalizer_version}",
+        nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    sidecar_path = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+    sidecar_path.write_bytes(sidecar)
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    package = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=normalizer_version,
+    ).package
+    store = RunStore(tmp_path / f"approval-home-v{normalizer_version}")
+    admitted = _start(store, package, key=f"approval-v{normalizer_version}")
+    paused = RunScheduler(store).advance(admitted.run_id)
+    pending = paused["nodes"]["review"]["pending_interaction"]
+    workflow.unlink()
+    sidecar_path.unlink()
+
+    decision = RunStore(store.hermes_home).approve_run(
+        admitted.run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    assert decision.outcome == "applied"
+    current = store.load_run(admitted.run_id)
+    assert current["language"]["normalizer_version"] == normalizer_version
+    assert current["nodes"]["review"]["state"] == "succeeded"
 
 
 def test_v3_approval_message_rechecks_direct_dependency_before_pause(tmp_path) -> None:

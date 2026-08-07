@@ -1506,7 +1506,7 @@ def _classify_authored_bash_reference_spans(
     )
 
 
-def bash_output_references(template: str):
+def bash_output_references(template: str, *, normalizer_version: int = 3):
     """Parse outputs after validating every substituted Bash reference context."""
     # Local import preserves bash_rendering's dependency-neutral lexer surface.
     from plugins.workflow.language_schema import (
@@ -1515,7 +1515,10 @@ def bash_output_references(template: str):
     )
 
     output_candidates = tuple(
-        iter_output_reference_candidate_spans(template, normalizer_version=3)
+        iter_output_reference_candidate_spans(
+            template,
+            normalizer_version=normalizer_version,
+        )
     )
     scalar_candidates: list[tuple[int, int]] = []
     output_cursor = 0
@@ -1550,7 +1553,7 @@ def bash_output_references(template: str):
         iter_output_references_in_spans(
             template,
             admitted,
-            normalizer_version=3,
+            normalizer_version=normalizer_version,
         )
     )
 

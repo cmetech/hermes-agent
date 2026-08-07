@@ -190,7 +190,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert detail["language"]["declared_profile"] == "archon-2026-07"
         assert detail["language"]["effective_profile"] == "archon-2026-07"
         assert detail["language"]["legacy"] is False
-        assert detail["language"]["normalizer_version"] == 3
+        assert detail["language"]["normalizer_version"] == 4
         assert len(detail["language"]["normalized_definition_digest"]) == 64
         assert set(detail["language"]) == {
             "declared_profile",

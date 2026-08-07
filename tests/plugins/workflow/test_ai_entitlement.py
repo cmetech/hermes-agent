@@ -4,6 +4,7 @@ from pathlib import Path
 import copy
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -280,6 +281,79 @@ def test_exact_verified_requires_ai_scenario_corroborates_real_entitlement() -> 
     resolution = derive_ai_entitlement(
         metadata,
         definition_digest=risk.package_digest,
+        execution_context=execution_context,
+    )
+
+    assert resolution == AIEntitlementResolution("real")
+
+
+def test_exact_verified_v4_entitlement_uses_composite_identity(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    workflow = workflow_writer(
+        tmp_path / "v4-entitlement/workflows",
+        name="v4-entitlement",
+        nodes=[{"id": "inspect", "prompt": "Inspect"}],
+    )
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        source="showcase",
+        precedence=3,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+        ),
+    )
+    _compatibility, risk = assess_package_execution(
+        compilation.package,
+        execution_context,
+        compilation=compilation,
+    )
+    scenario = SimpleNamespace(
+        id="v4-entitlement",
+        package_version="1.0.0",
+        requires_ai=True,
+        verified_bundled_provenance=True,
+    )
+    verified = SimpleNamespace(
+        scenario=scenario,
+        package=compilation.package,
+        compilation=compilation,
+        bundle_digest="a" * 64,
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.showcase.load_verified_showcase_package",
+        lambda *_args, **_kwargs: verified,
+    )
+    metadata = entitlement_module.verified_showcase_run_metadata(
+        showcase_id=scenario.id,
+        showcase_version=scenario.package_version,
+        bundle_digest=verified.bundle_digest,
+        risk_digest=risk.risk_digest,
+        requires_ai=True,
+        include_verified_marker=False,
+    )
+
+    resolution = derive_ai_entitlement(
+        metadata,
+        definition_digest=compilation.composite_digest,
         execution_context=execution_context,
     )
 

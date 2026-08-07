@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { I18nProvider } from '@/i18n'
+import { I18nProvider, TRANSLATIONS } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
@@ -851,6 +851,51 @@ describe('WorkflowsView', () => {
     expect(container.textContent).not.toMatch(/operations\.(?:catalog|workflowCatalog)/)
   })
 
+  it('catches signal and dependency copy falling back to English in any locale', () => {
+    const stringKeys = [
+      'acceptResult',
+      'continueWithFeedback',
+      'feedback',
+      'workflowDependencies',
+      'workflowDependencySources',
+      'workflowDependencyPrecedence',
+      'workflowDependencyPackages',
+      'workflowExpandedNodes',
+      'workflowExpandedEdges',
+      'workflowIncludeDepth',
+      'workflowCompositeDigest',
+      'workflowIgnoredPolicies'
+    ] as const
+
+    const english = TRANSLATIONS.en.operations
+
+    expect(english.acceptResult).toBe('Accept result')
+    expect(english.continueWithFeedback).toBe('Continue with feedback')
+    expect(english.feedback).toBe('Feedback')
+    expect(english.workflowIgnoredPolicyField('required secrets')).toBe('Ignored: required secrets')
+
+    for (const locale of ['en', 'ar', 'ja', 'zh', 'zh-hant'] as const) {
+      const copy = TRANSLATIONS[locale].operations
+
+      for (const key of stringKeys) {
+        expect(copy[key], `${locale}.${key}`).toBeTypeOf('string')
+        expect(copy[key].length, `${locale}.${key}`).toBeGreaterThan(0)
+
+        if (locale !== 'en') {
+          expect(copy[key], `${locale}.${key} must not use the English fallback`).not.toBe(english[key])
+        }
+      }
+
+      expect(copy.workflowIgnoredPolicyField, `${locale}.workflowIgnoredPolicyField`).toBeTypeOf('function')
+
+      if (locale !== 'en') {
+        expect(copy.workflowIgnoredPolicyField('required secrets')).not.toBe(
+          english.workflowIgnoredPolicyField('required secrets')
+        )
+      }
+    }
+  })
+
   it('rejects the catalog navigation view before querying the run-list endpoint', async () => {
     const module = await import('./index')
 
@@ -892,6 +937,143 @@ describe('WorkflowsView', () => {
     const cancel = await screen.findByRole('button', { name: 'Cancel' })
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+  })
+
+  it('catches signal confirmations rendered with generic labels or submit-ready empty feedback', () => {
+    const onAction = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={onAction}
+          run={run({
+            next_actions: ['approve', 'provide-input', 'cancel'],
+            pending_interaction: {
+              interaction_id: 'signal-1',
+              iteration: 2,
+              max_iterations: 3,
+              type: 'loop_signal_confirmation'
+            }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    expect((screen.getByRole('button', { name: 'Accept result' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: 'Continue with feedback' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Feedback'), { target: { value: 'Tighten it' } })
+    expect((screen.getByRole('button', { name: 'Continue with feedback' }) as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Accept result' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with feedback' }))
+    expect(onAction).toHaveBeenNthCalledWith(1, 'approve')
+    expect(onAction).toHaveBeenNthCalledWith(2, 'provide-input', { value: 'Tighten it' })
+  })
+
+  it('catches feedback state being reused across distinct signal confirmations', () => {
+    const onAction = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const inspector = (interactionId: string, iteration: number) => (
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={onAction}
+          run={run({
+            next_actions: ['approve', 'provide-input', 'cancel'],
+            pending_interaction: {
+              interaction_id: interactionId,
+              iteration,
+              max_iterations: 3,
+              type: 'loop_signal_confirmation'
+            }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    const view = render(inspector('signal-1', 1))
+
+    fireEvent.change(screen.getByLabelText('Feedback'), { target: { value: 'Tighten it' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with feedback' }))
+    expect(onAction).toHaveBeenCalledWith('provide-input', { value: 'Tighten it' })
+
+    view.rerender(inspector('signal-2', 2))
+
+    expect((screen.getByLabelText('Feedback') as HTMLInputElement).value).toBe('')
+    expect((screen.getByRole('button', { name: 'Continue with feedback' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('catches final signal confirmations inventing a feedback action the backend omitted', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={vi.fn()}
+          run={run({
+            next_actions: ['approve', 'cancel'],
+            pending_interaction: {
+              interaction_id: 'signal-final',
+              iteration: 3,
+              max_iterations: 3,
+              type: 'loop_signal_confirmation'
+            }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    expect((screen.getByRole('button', { name: 'Accept result' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByLabelText('Feedback')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Continue with feedback' })).toBeNull()
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('catches signal labels leaking onto an ordinary loop input', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={vi.fn()}
+          run={run({
+            next_actions: ['provide-input', 'cancel'],
+            pending_interaction: { interaction_id: 'input-1', type: 'loop_input' }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByLabelText('Input value')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Provide input' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByLabelText('Feedback')).toBeNull()
+  })
+
+  it('catches an unknown future interaction being relabeled as a signal confirmation', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <RunInspector
+          onAction={vi.fn()}
+          run={run({
+            next_actions: ['approve', 'provide-input', 'cancel'],
+            pending_interaction: {
+              interaction_id: 'future-1',
+              iteration: 1,
+              max_iterations: 2,
+              type: 'loop_signal_confirmation_v2'
+            }
+          })}
+        />
+      </QueryClientProvider>
+    )
+
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: 'Provide input' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Accept result' })).toBeNull()
+    expect(screen.queryByLabelText('Feedback')).toBeNull()
   })
 
   it('renders the server-derived scheduled wait with localized and canonical instants', async () => {
@@ -1198,10 +1380,15 @@ describe('WorkflowsView', () => {
         ['input', 'Input workflow', 'loop_input', 'chat', 'operator input required', 'provide-input'],
         ['stalled', 'Stalled workflow', 'stalled', 'cron', 'node lease expired', 'resume'],
         ['failure', 'Failed workflow', 'failure', 'desktop', 'command failed', 'retry'],
-        ['reconcile', 'Reconcile workflow', 'reconcile', 'background_agent', 'outcome uncertain', 'reconcile']
+        ['reconcile', 'Reconcile workflow', 'reconcile', 'background_agent', 'outcome uncertain', 'reconcile'],
+        ['signal', 'Signal workflow', 'loop_signal_confirmation', 'desktop', 'review result', 'approve']
       ].map(([run_id, workflow, kind, origin, cause, action]) => ({
         cause,
         health: kind === 'stalled' ? 'stalled' : 'user_wait',
+        interaction:
+          kind === 'loop_signal_confirmation'
+            ? { interaction_id: 'signal-1', iteration: 1, max_iterations: 2, type: kind }
+            : undefined,
         kind,
         next_actions: [action],
         node_id: 'node-1',
@@ -1224,21 +1411,23 @@ describe('WorkflowsView', () => {
       'Input workflow',
       'Stalled workflow',
       'Failed workflow',
-      'Reconcile workflow'
+      'Reconcile workflow',
+      'Signal workflow'
     ]) {
       expect(await screen.findByText(workflow)).toBeTruthy()
     }
 
     expect(screen.getByText('approval required')).toBeTruthy()
     expect(screen.getByText('outcome uncertain')).toBeTruthy()
-    expect(screen.getAllByText(/1 minute ago/i)).toHaveLength(5)
+    expect(screen.getAllByText(/1 minute ago/i)).toHaveLength(6)
 
     for (const summary of [
       'workflow approval · Approve',
       'loop input · Provide input',
       'stalled · Resume',
       'failure · Retry',
-      'reconcile · Reconcile'
+      'reconcile · Reconcile',
+      'loop signal confirmation · Accept result'
     ]) {
       expect(screen.getByText(summary)).toBeTruthy()
     }

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useId, useMemo, useState } from 'react'
+import { Fragment, lazy, Suspense, useId, useMemo, useState } from 'react'
 
 import { RichBoundary } from '@/components/assistant-ui/embeds/rich-boundary'
 import { CodeCard, CodeCardBody } from '@/components/chat/code-card'
@@ -29,6 +29,12 @@ const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/merm
 
 type ViewMode = 'definition' | 'diagram'
 
+interface DependencySourceView {
+  catalogSource: string
+  precedence: number
+  workflow: string
+}
+
 export interface ViewWorkflowDialogProps {
   onClose: () => void
   onRun: () => void
@@ -49,6 +55,47 @@ function stableJsonValue(value: unknown): unknown {
     Object.entries(value as Record<string, unknown>)
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([key, item]) => [key, stableJsonValue(item)])
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function dependencySources(value: unknown): DependencySourceView[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value.flatMap(item => {
+    if (!isRecord(item) || typeof item.catalog_source !== 'string' || !Number.isFinite(item.precedence)) {
+      return []
+    }
+
+    const workflow =
+      typeof item.workflow_name === 'string' && item.workflow_name.length > 0
+        ? item.workflow_name
+        : typeof item.package_key === 'string' && item.package_key.length > 0
+          ? item.package_key
+          : null
+
+    return workflow ? [{ catalogSource: item.catalog_source, precedence: Number(item.precedence), workflow }] : []
+  })
+}
+
+function ignoredPolicyFields(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return Array.from(
+    new Set(
+      value.flatMap(item =>
+        isRecord(item) && Array.isArray(item.fields)
+          ? item.fields.filter((field): field is string => typeof field === 'string' && field.length > 0)
+          : []
+      )
+    )
   )
 }
 
@@ -106,6 +153,27 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
       ? copy.workflowViewRunLoading
       : desktopWorkflowRunDisabledReason(detail.data, copy, 'detail')
 
+  const compilation = isRecord(detail.data?.compilation) ? detail.data.compilation : null
+  const sources = dependencySources(compilation?.sources)
+  const counts = isRecord(compilation?.counts) ? compilation.counts : null
+
+  const dependencyCounts = [
+    [copy.workflowDependencyPackages, counts?.dependency_packages],
+    [copy.workflowExpandedNodes, counts?.expanded_nodes],
+    [copy.workflowExpandedEdges, counts?.expanded_edges],
+    [copy.workflowIncludeDepth, compilation?.include_depth]
+  ].filter((item): item is [string, number] => typeof item[1] === 'number' && Number.isFinite(item[1]))
+
+  const compositeDigest =
+    typeof compilation?.composite_digest === 'string' && compilation.composite_digest.length > 0
+      ? compilation.composite_digest
+      : null
+
+  const ignoredFields = ignoredPolicyFields(compilation?.ignored_policies)
+
+  const hasDependencyDetails =
+    sources.length > 0 || dependencyCounts.length > 0 || compositeDigest !== null || ignoredFields.length > 0
+
   const errorDescription =
     detail.error instanceof WorkflowApiError && detail.error.code === 'workflow_not_found'
       ? copy.workflowViewNotFound
@@ -154,6 +222,66 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
                   ) : null}
                 </AlertDescription>
               </Alert>
+            ) : null}
+            {hasDependencyDetails ? (
+              <section aria-label={copy.workflowDependencies} className="grid min-w-0 gap-2">
+                <h3 className="text-sm font-medium">{copy.workflowDependencies}</h3>
+                {sources.length > 0 ? (
+                  <div className="grid gap-1">
+                    <p className="text-xs text-(--ui-text-secondary)">{copy.workflowDependencySources}</p>
+                    <ul className="grid gap-1 text-xs">
+                      {sources.map(source => (
+                        <li
+                          className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
+                          key={`${source.catalogSource}:${source.precedence}:${source.workflow}`}
+                        >
+                          <span className="font-medium">{source.workflow}</span>
+                          <Badge variant="muted">
+                            {source.catalogSource === 'profile'
+                              ? copy.workflowSourceProfile
+                              : source.catalogSource === 'project'
+                                ? copy.workflowSourceProject
+                                : source.catalogSource === 'showcase'
+                                  ? copy.workflowSourceBundled
+                                  : source.catalogSource}
+                          </Badge>
+                          <span className="text-(--ui-text-secondary)">
+                            <span>{copy.workflowDependencyPrecedence}</span>: {source.precedence}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {dependencyCounts.length > 0 || compositeDigest ? (
+                  <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-1 text-xs">
+                    {dependencyCounts.map(([label, value]) => (
+                      <Fragment key={label}>
+                        <dt className="text-(--ui-text-secondary)">{label}</dt>
+                        <dd>{value}</dd>
+                      </Fragment>
+                    ))}
+                    {compositeDigest ? (
+                      <>
+                        <dt className="text-(--ui-text-secondary)">{copy.workflowCompositeDigest}</dt>
+                        <dd className="break-all font-mono">{compositeDigest}</dd>
+                      </>
+                    ) : null}
+                  </dl>
+                ) : null}
+                {ignoredFields.length > 0 ? (
+                  <div className="grid gap-1">
+                    <p className="text-xs text-(--ui-text-secondary)">{copy.workflowIgnoredPolicies}</p>
+                    <div className="flex flex-wrap gap-1">
+                      {ignoredFields.map(field => (
+                        <Badge key={field} variant="warn">
+                          {copy.workflowIgnoredPolicyField(field.replaceAll('_', ' '))}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
             ) : null}
             <SegmentedControl onChange={setMode} options={modes} value={mode} />
             {mode === 'diagram' ? (

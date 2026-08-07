@@ -26,6 +26,16 @@ def _sidecar(path, profile: str) -> None:
     )
 
 
+def _load_archon_version(path, version: int):
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=version,
+    )
+
+
 def test_new_packages_select_the_current_normalizer_for_their_profile(
     tmp_path, workflow_writer
 ) -> None:
@@ -39,14 +49,14 @@ def test_new_packages_select_the_current_normalizer_for_their_profile(
     legacy = load_workflow(legacy_path)
     archon = load_workflow(archon_path)
 
-    assert workflow_language.LATEST_NORMALIZER_VERSION == 3
+    assert workflow_language.LATEST_NORMALIZER_VERSION == 4
     assert workflow_language.CURRENT_NORMALIZER_BY_PROFILE == {
         WorkflowLanguageProfile.HERMES_LEGACY: 2,
-        WorkflowLanguageProfile.ARCHON_2026_07: 3,
+        WorkflowLanguageProfile.ARCHON_2026_07: 4,
     }
     assert unversioned.language.normalizer_version == 2
     assert legacy.language.normalizer_version == 2
-    assert archon.language.normalizer_version == 3
+    assert archon.language.normalizer_version == 4
 
 
 def test_legacy_default_normalization_is_identical_to_explicit_v2(
@@ -197,7 +207,7 @@ def test_archon_v3_normalizes_requested_timeout_and_retry_semantics(
     )
     _sidecar(path, "archon-2026-07")
 
-    package = load_workflow(path)
+    package = _load_archon_version(path, 3)
 
     assert package.language.node_semantics == {
         "ai-default": {
@@ -278,7 +288,7 @@ def test_archon_v3_rejects_inapplicable_requested_semantics(
     _sidecar(path, "archon-2026-07")
 
     with pytest.raises(WorkflowValidationError) as exc:
-        load_workflow(path)
+        _load_archon_version(path, 3)
 
     assert exc.value.issues[0].code == code
 
@@ -349,25 +359,19 @@ def test_archon_v3_rejects_invalid_requested_semantics(
     _sidecar(path, "archon-2026-07")
 
     with pytest.raises(WorkflowValidationError) as exc:
-        load_workflow(path)
+        _load_archon_version(path, 3)
 
     assert exc.value.issues[0].code == code
 
 
-def test_trust_risk_identity_changes_for_archon_v3_but_not_legacy_v2(
+def test_trust_risk_identity_changes_for_current_v4_and_sealed_v3(
     tmp_path, workflow_writer
 ) -> None:
     archon_path = workflow_writer(tmp_path / "archon")
     _sidecar(archon_path, "archon-2026-07")
-    archon_v3 = load_workflow(archon_path)
-    archon_v2 = load_workflow_snapshot(
-        archon_path,
-        workflow_bytes=archon_path.read_bytes(),
-        sidecar_bytes=archon_path.with_name(
-            f"{archon_path.stem}.hermes.yaml"
-        ).read_bytes(),
-        normalizer_version=2,
-    )
+    archon_v4 = load_workflow(archon_path)
+    archon_v3 = _load_archon_version(archon_path, 3)
+    archon_v2 = _load_archon_version(archon_path, 2)
     legacy_path = workflow_writer(tmp_path / "legacy")
     legacy_default = load_workflow(legacy_path)
     legacy_explicit = load_workflow_snapshot(
@@ -377,6 +381,9 @@ def test_trust_risk_identity_changes_for_archon_v3_but_not_legacy_v2(
         normalizer_version=2,
     )
 
+    archon_v4_risk = build_risk_summary(
+        archon_v4, assess_compatibility(archon_v4)
+    )
     archon_v3_risk = build_risk_summary(
         archon_v3, assess_compatibility(archon_v3)
     )
@@ -390,7 +397,11 @@ def test_trust_risk_identity_changes_for_archon_v3_but_not_legacy_v2(
         legacy_explicit, assess_compatibility(legacy_explicit)
     )
 
+    assert archon_v4.language.normalizer_version == 4
+    assert archon_v3.language.normalizer_version == 3
+    assert compute_package_digest(archon_v4) == compute_package_digest(archon_v3)
     assert compute_package_digest(archon_v3) == compute_package_digest(archon_v2)
+    assert archon_v4_risk.risk_digest != archon_v3_risk.risk_digest
     assert archon_v3_risk.risk_digest != archon_v2_risk.risk_digest
     assert legacy_default_risk.risk_digest == legacy_explicit_risk.risk_digest
 

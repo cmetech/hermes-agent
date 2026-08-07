@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
+    SUPPORTED_NORMALIZER_VERSIONS,
+)
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, validate_package
@@ -12,6 +19,43 @@ from plugins.workflow.store import RunStore
 ROOT = Path(__file__).resolve().parents[2]
 SKILL = ROOT / "skills" / "software-development" / "workflow-builder"
 FIXTURES = ROOT / "tests" / "plugins" / "workflow" / "fixtures" / "builder"
+VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
+GUIDANCE_PATHS = (
+    ROOT / "website" / "docs" / "user-guide" / "features" / "workflows.md",
+    ROOT
+    / "website"
+    / "docs"
+    / "user-guide"
+    / "features"
+    / "workflow-yaml-reference.md",
+    SKILL / "references" / "portable-schema.md",
+    SKILL / "references" / "authoring-checklist.md",
+)
+
+
+def _version_selection_from_guidance(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    marked = text.split(VERSION_SELECTION_MARKER, maxsplit=1)[1]
+    payload = marked.split("```json", maxsplit=1)[1].split("```", maxsplit=1)[0]
+    return json.loads(payload)
+
+
+def _runtime_version_selection() -> dict[str, object]:
+    current = {
+        profile.value: version
+        for profile, version in CURRENT_NORMALIZER_BY_PROFILE.items()
+    }
+    for profile, version in CURRENT_NORMALIZER_BY_PROFILE.items():
+        assert workflow_authoring_contract(profile)["normalizer_version"] == version
+    for version in SUPPORTED_NORMALIZER_VERSIONS:
+        assert workflow_authoring_contract(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=version,
+        )["normalizer_version"] == version
+    return {
+        "current_normalizer_by_profile": current,
+        "supported_normalizer_versions": sorted(SUPPORTED_NORMALIZER_VERSIONS),
+    }
 
 
 def test_builder_skill_encodes_safe_whole_package_authoring_contract() -> None:
@@ -73,10 +117,53 @@ def test_builder_references_cover_portable_shape_and_authoring_gate() -> None:
     ):
         assert phase3_contract.lower() in schema.lower()
     assert "blocked pending Phase 3" not in schema
-    assert "loops and includes remain phase 4" in schema.lower()
 
     assert "Archon timeout and retry fields are supported" in checklist
-    assert "loops and includes remain phase 4" in checklist.lower()
+
+
+def test_operator_guidance_matches_generated_normalizer_selection() -> None:
+    expected = _runtime_version_selection()
+
+    assert {
+        path.relative_to(ROOT).as_posix(): _version_selection_from_guidance(path)
+        for path in GUIDANCE_PATHS
+    } == {path.relative_to(ROOT).as_posix(): expected for path in GUIDANCE_PATHS}
+
+
+def test_builder_references_retrieve_complete_v4_authoring_guidance() -> None:
+    """Pressure-test the references for a root/include/confirmed-loop request."""
+    schema = (SKILL / "references" / "portable-schema.md").read_text(
+        encoding="utf-8"
+    ).lower()
+    checklist = (SKILL / "references" / "authoring-checklist.md").read_text(
+        encoding="utf-8"
+    ).lower()
+    guidance = f"{schema}\n{checklist}"
+    schema_words = " ".join(schema.split())
+
+    for required in (
+        "current_normalizer_by_profile",
+        "compile-only",
+        "root companion",
+        "ignored child",
+        "depth 3",
+        "64 distinct",
+        "512 executable",
+        "4,096",
+        "first sink",
+        "signal_completes",
+        "provide-input",
+        "final iteration",
+        "sealed",
+        "source deletion",
+    ):
+        assert required in guidance
+
+    assert "live child workflow" not in guidance
+    assert "loop_group" in guidance
+    assert schema_words.index(
+        VERSION_SELECTION_MARKER
+    ) < schema_words.index("review warnings and all stable include codes before trust")
 
 
 def test_builder_contract_fixtures_are_valid_portable_packages() -> None:

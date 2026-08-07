@@ -86,13 +86,60 @@ def test_recursive_workflow_keeps_neutral_package_root(workflow_writer, tmp_path
     assert package.root == root.resolve()
 
 
-def test_same_level_duplicate_names_are_errors(workflow_writer, tmp_path):
+def test_same_level_duplicate_names_are_errors_with_logical_provenance(
+    workflow_writer, tmp_path
+):
     root = tmp_path / "repo" / ".hermes" / "workflows"
     workflow_writer(root / "one", name="duplicate")
     workflow_writer(root / "two", name="duplicate")
 
-    with pytest.raises(WorkflowValidationError, match="duplicate workflow name"):
+    with pytest.raises(WorkflowValidationError, match="duplicate workflow name") as exc:
         discover_workflows(tmp_path / "repo", tmp_path / "profile", tmp_path / "home")
+
+    assert exc.value.issues[0].path == "workflows/two/example.yaml"
+
+
+def test_lower_precedence_duplicate_names_are_errors_even_when_shadowed(
+    workflow_writer, tmp_path
+):
+    workdir = tmp_path / "repo"
+    hermes_home = tmp_path / "profile"
+    workflow_writer(
+        workdir / ".hermes" / "workflows", name="duplicate", description="winner"
+    )
+    workflow_writer(
+        hermes_home / "workflows" / "one", name="duplicate", description="first"
+    )
+    workflow_writer(
+        hermes_home / "workflows" / "two", name="duplicate", description="second"
+    )
+
+    with pytest.raises(WorkflowValidationError, match="duplicate workflow name") as exc:
+        discover_workflows(workdir, hermes_home, tmp_path / "home")
+
+    assert exc.value.issues[0].path == "workflows/two/example.yaml"
+    assert "profile precedence" in exc.value.issues[0].message
+
+
+def test_explicit_path_overlapping_project_catalog_keeps_explicit_provenance(
+    workflow_writer, tmp_path
+):
+    workdir = tmp_path / "repo"
+    workflow_path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="shared",
+        description="same physical definition",
+    )
+
+    package = discover_workflows(
+        workdir,
+        tmp_path / "profile",
+        tmp_path / "home",
+        explicit_path=workflow_path,
+    )[0]
+
+    assert package.source == "explicit"
+    assert package.precedence == 0
 
 
 def test_profile_catalog_ignores_workflow_owned_runtime_directories(

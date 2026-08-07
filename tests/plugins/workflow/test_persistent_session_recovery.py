@@ -299,7 +299,9 @@ def _crash_cut_coordinator(
     time.sleep(60)
 
 
-def _archon_package(workflow_writer, root, *, name="persistent", nodes=None):
+def _archon_package(
+    workflow_writer, root, *, name="persistent", nodes=None, normalizer_version=None
+):
     path = workflow_writer(
         root,
         name=name,
@@ -312,7 +314,14 @@ def _archon_package(workflow_writer, root, *, name="persistent", nodes=None):
         "language_compatibility: archon-2026-07\n",
         encoding="utf-8",
     )
-    return load_workflow(path)
+    if normalizer_version is None:
+        return load_workflow(path)
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=normalizer_version,
+    )
 
 
 def _admit(store, package, key):
@@ -521,10 +530,15 @@ def _resolved_running_recovery(
     return admitted.run_id, candidate
 
 
+@pytest.mark.parametrize("normalizer_version", [3, 4])
 def test_confirmed_missing_cross_run_session_starts_fresh_once(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, normalizer_version
 ) -> None:
-    package = _archon_package(workflow_writer, tmp_path / "package")
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "package",
+        normalizer_version=normalizer_version,
+    )
     store = RunStore(tmp_path / "home")
     registry = NodeSessionRegistry(tmp_path / "home")
     runner = _PersistentRunner()

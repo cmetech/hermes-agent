@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, NotRequired, TypedDict
 
+from plugins.workflow.compilation import (
+    WorkflowCatalogSnapshot,
+    WorkflowCompilation,
+    compile_workflow,
+)
 from plugins.workflow.cli import (
     WorkflowDefinitionProjectionCapacityError,
     show_package,
@@ -23,8 +28,16 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
-from plugins.workflow.language import language_projection
-from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.language import language_projection, supports_phase4_semantics
+from plugins.workflow.models import (
+    WorkflowPackage,
+    WorkflowSourceDocument,
+    WorkflowValidationError,
+)
+from plugins.workflow.projection_limits import (
+    WORKFLOW_DEFINITION_MAX_EDGES,
+    WORKFLOW_DEFINITION_MAX_NODES,
+)
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
@@ -32,7 +45,7 @@ from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import parse_workflow_source_bytes
 from plugins.workflow.sanitize import (
     sanitize_projection,
     sanitize_text,
@@ -74,6 +87,7 @@ _ENUM_MAX_CHOICES = 128
 _ENUM_MAX_CHOICE_LENGTH = 512
 _STRUCTURED_OUTPUT_SUMMARY_LIMIT = 16
 _STRUCTURED_OUTPUT_SUMMARY_TEXT_MAX_CHARS = 64
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 CatalogSource = Literal["project", "profile", "showcase"]
 CatalogTrustState = Literal["trusted", "untrusted", "verified_bundled"]
@@ -172,25 +186,321 @@ class _DirectoryScanBudget:
 class _DefinitionReadBudget:
     bytes_reserved: int = 0
 
-    def reserve(self, workflow_path: Path) -> None:
-        paths = [workflow_path]
-        sidecar = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
-        if sidecar.is_file():
-            paths.append(sidecar)
-        sizes: list[int] = []
-        for path in paths:
-            size = path.stat().st_size
+    def reserve(self, sizes: tuple[int, ...]) -> None:
+        for size in sizes:
             if size > CATALOG_MAX_DEFINITION_FILE_BYTES:
                 raise WorkflowResourceCapacityError(
                     "workflow definition file limit exceeded"
                 )
-            sizes.append(size)
         reserved = sum(sizes)
         if self.bytes_reserved + reserved > CATALOG_MAX_DEFINITION_TOTAL_BYTES:
             raise WorkflowResourceCapacityError(
                 "workflow definition byte limit exceeded"
             )
         self.bytes_reserved += reserved
+
+
+class _UnsafeCatalogPath(OSError):
+    """A catalog candidate could not be proven to be a contained regular file."""
+
+
+def _catalog_file_identity(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _is_reparse_point(file_stat: os.stat_result) -> bool:
+    attributes = getattr(file_stat, "st_file_attributes", 0)
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _catalog_open_flags(*, directory: bool = False) -> int:
+    flags = os.O_RDONLY
+    for name in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW"):
+        flags |= getattr(os, name, 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    else:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+    return flags
+
+
+def _contained_catalog_path(root: Path, candidate: Path) -> tuple[Path, Path]:
+    root_absolute = Path(os.path.abspath(root))
+    candidate_absolute = Path(os.path.abspath(candidate))
+    try:
+        relative = candidate_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise _UnsafeCatalogPath("workflow catalog file is unsafe") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise _UnsafeCatalogPath("workflow catalog file is unsafe")
+    return root_absolute, relative
+
+
+def _read_catalog_descriptor(file_descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(file_descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _close_catalog_descriptors(descriptors: list[int]) -> None:
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _reject_catalog_reparse_components(
+    root: Path,
+    relative: Path,
+    *,
+    missing_ok: bool,
+) -> os.stat_result | None:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise _UnsafeCatalogPath("workflow catalog root is unavailable") from exc
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+        or _is_reparse_point(root_stat)
+    ):
+        raise _UnsafeCatalogPath("workflow catalog root is unsafe")
+
+    current = root
+    for index, component in enumerate(relative.parts):
+        current /= component
+        try:
+            component_stat = current.lstat()
+        except FileNotFoundError as exc:
+            if missing_ok and index == len(relative.parts) - 1:
+                return None
+            raise _UnsafeCatalogPath("workflow catalog file is unavailable") from exc
+        except OSError as exc:
+            raise _UnsafeCatalogPath("workflow catalog file is unavailable") from exc
+        if stat.S_ISLNK(component_stat.st_mode) or _is_reparse_point(component_stat):
+            raise _UnsafeCatalogPath("workflow catalog file is unsafe")
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(
+            component_stat.st_mode
+        ):
+            raise _UnsafeCatalogPath("workflow catalog file is unsafe")
+    return component_stat
+
+
+@dataclass(slots=True)
+class _OpenedCatalogFile:
+    descriptors: list[int]
+    file_descriptor: int
+    opened_stat: os.stat_result
+    root: Path
+    relative: Path
+    parent_descriptor: int | None = None
+
+    def read_stable(self) -> bytes:
+        try:
+            data = _read_catalog_descriptor(
+                self.file_descriptor,
+                self.opened_stat.st_size + 1,
+            )
+            descriptor_after = os.fstat(self.file_descriptor)
+            if self.parent_descriptor is not None:
+                path_after = os.stat(
+                    self.relative.parts[-1],
+                    dir_fd=self.parent_descriptor,
+                    follow_symlinks=False,
+                )
+            else:
+                path_after = _reject_catalog_reparse_components(
+                    self.root,
+                    self.relative,
+                    missing_ok=False,
+                )
+            if (
+                path_after is None
+                or len(data) != self.opened_stat.st_size
+                or _catalog_file_identity(self.opened_stat)
+                != _catalog_file_identity(descriptor_after)
+                or _catalog_file_identity(self.opened_stat)
+                != _catalog_file_identity(path_after)
+            ):
+                raise _UnsafeCatalogPath("workflow catalog file changed during read")
+            return data
+        except _UnsafeCatalogPath:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _UnsafeCatalogPath("workflow catalog file is unavailable") from exc
+
+    def close(self) -> None:
+        _close_catalog_descriptors(self.descriptors)
+
+
+def _open_posix_catalog_file(
+    root: Path,
+    relative: Path,
+    *,
+    missing_ok: bool,
+) -> _OpenedCatalogFile | None:
+    descriptors: list[int] = []
+    try:
+        directory_descriptor = os.open(root, _catalog_open_flags(directory=True))
+        descriptors.append(directory_descriptor)
+        root_stat = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(root_stat.st_mode) or _is_reparse_point(root_stat):
+            raise _UnsafeCatalogPath("workflow catalog root is unsafe")
+
+        for component in relative.parts[:-1]:
+            directory_descriptor = os.open(
+                component,
+                _catalog_open_flags(directory=True),
+                dir_fd=directory_descriptor,
+            )
+            descriptors.append(directory_descriptor)
+            directory_stat = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_stat.st_mode) or _is_reparse_point(
+                directory_stat
+            ):
+                raise _UnsafeCatalogPath("workflow catalog directory is unsafe")
+
+        filename = relative.parts[-1]
+        try:
+            before = os.stat(
+                filename,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                _close_catalog_descriptors(descriptors)
+                return None
+            raise
+        if not stat.S_ISREG(before.st_mode) or _is_reparse_point(before):
+            raise _UnsafeCatalogPath("workflow catalog file is unsafe")
+
+        file_descriptor = os.open(
+            filename,
+            _catalog_open_flags(),
+            dir_fd=directory_descriptor,
+        )
+        descriptors.append(file_descriptor)
+        opened = os.fstat(file_descriptor)
+        after_open = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or _catalog_file_identity(before) != _catalog_file_identity(opened)
+            or _catalog_file_identity(opened) != _catalog_file_identity(after_open)
+        ):
+            raise _UnsafeCatalogPath("workflow catalog file changed during open")
+        return _OpenedCatalogFile(
+            descriptors=descriptors,
+            file_descriptor=file_descriptor,
+            opened_stat=opened,
+            root=root,
+            relative=relative,
+            parent_descriptor=directory_descriptor,
+        )
+    except _UnsafeCatalogPath:
+        _close_catalog_descriptors(descriptors)
+        raise
+    except (OSError, ValueError) as exc:
+        _close_catalog_descriptors(descriptors)
+        raise _UnsafeCatalogPath("workflow catalog file is unavailable") from exc
+
+
+def _open_fallback_catalog_file(
+    root: Path,
+    relative: Path,
+    *,
+    missing_ok: bool,
+) -> _OpenedCatalogFile | None:
+    file_descriptor: int | None = None
+    try:
+        before = _reject_catalog_reparse_components(
+            root,
+            relative,
+            missing_ok=missing_ok,
+        )
+        if before is None:
+            return None
+        if not stat.S_ISREG(before.st_mode):
+            raise _UnsafeCatalogPath("workflow catalog file is unsafe")
+        file_descriptor = os.open(root / relative, _catalog_open_flags())
+        opened = os.fstat(file_descriptor)
+        after_open = _reject_catalog_reparse_components(
+            root,
+            relative,
+            missing_ok=False,
+        )
+        if (
+            after_open is None
+            or not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or _catalog_file_identity(before) != _catalog_file_identity(opened)
+            or _catalog_file_identity(opened) != _catalog_file_identity(after_open)
+        ):
+            raise _UnsafeCatalogPath("workflow catalog file changed during open")
+        return _OpenedCatalogFile(
+            descriptors=[file_descriptor],
+            file_descriptor=file_descriptor,
+            opened_stat=opened,
+            root=root,
+            relative=relative,
+        )
+    except _UnsafeCatalogPath:
+        if file_descriptor is not None:
+            _close_catalog_descriptors([file_descriptor])
+        raise
+    except (OSError, ValueError) as exc:
+        if file_descriptor is not None:
+            _close_catalog_descriptors([file_descriptor])
+        raise _UnsafeCatalogPath("workflow catalog file is unavailable") from exc
+
+
+def _open_contained_catalog_file(
+    root: Path,
+    candidate: Path,
+    *,
+    missing_ok: bool,
+) -> _OpenedCatalogFile | None:
+    root_absolute, relative = _contained_catalog_path(root, candidate)
+    descriptor_relative_supported = (
+        os.name != "nt"
+        and hasattr(os, "O_NOFOLLOW")
+        and os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+    )
+    if descriptor_relative_supported:
+        return _open_posix_catalog_file(
+            root_absolute,
+            relative,
+            missing_ok=missing_ok,
+        )
+    return _open_fallback_catalog_file(
+        root_absolute,
+        relative,
+        missing_ok=missing_ok,
+    )
 
 
 def _error_entry(
@@ -275,30 +585,80 @@ def _catalog_candidates(
     return candidates[:CATALOG_LIMIT], len(candidates) > CATALOG_LIMIT
 
 
-def _discover_catalog(
-    workdir: Path, hermes_home: Path
-) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
-    selected: dict[str, WorkflowPackage] = {}
+def _capture_catalog_source_documents(
+    workdir: Path,
+    hermes_home: Path,
+) -> tuple[
+    tuple[WorkflowSourceDocument, ...],
+    tuple[InvalidCatalogEntry, ...],
+    bool,
+]:
+    """Read one bounded, immutable project/profile source view."""
     invalid: list[InvalidCatalogEntry] = []
     candidates, truncated = _catalog_candidates(workdir, hermes_home)
     definition_budget = _DefinitionReadBudget()
+    catalog_roots = {
+        "project": workdir / ".hermes" / "workflows",
+        "profile": hermes_home / "workflows",
+    }
     by_location: dict[tuple[str, int], list[Path]] = {}
     for source, precedence, path in candidates:
         by_location.setdefault((source, precedence), []).append(path)
+    source_documents: list[WorkflowSourceDocument] = []
     for (source, precedence), paths in by_location.items():
-        level: dict[str, WorkflowPackage] = {}
+        level: dict[str, WorkflowSourceDocument] = {}
         duplicate_names: set[str] = set()
         for path in paths:
+            workflow_file: _OpenedCatalogFile | None = None
+            sidecar_file: _OpenedCatalogFile | None = None
             try:
-                definition_budget.reserve(path)
-                package = load_workflow(path, source=source, precedence=precedence)
+                root = catalog_roots[source]
+                workflow_file = _open_contained_catalog_file(
+                    root,
+                    path,
+                    missing_ok=False,
+                )
+                if workflow_file is None:
+                    raise _UnsafeCatalogPath("workflow catalog file is unavailable")
+                sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
+                sidecar_file = _open_contained_catalog_file(
+                    root,
+                    sidecar_path,
+                    missing_ok=True,
+                )
+                definition_budget.reserve(
+                    (
+                        workflow_file.opened_stat.st_size,
+                        *(
+                            (sidecar_file.opened_stat.st_size,)
+                            if sidecar_file is not None
+                            else ()
+                        ),
+                    )
+                )
+                workflow_bytes = workflow_file.read_stable()
+                sidecar_bytes = (
+                    sidecar_file.read_stable() if sidecar_file is not None else None
+                )
+                source_document = parse_workflow_source_bytes(
+                    path,
+                    workflow_bytes=workflow_bytes,
+                    sidecar_bytes=sidecar_bytes,
+                    source=source,
+                    precedence=precedence,
+                )
             except WorkflowResourceCapacityError:
                 invalid.append(_error_entry(path.stem, "catalog_capacity"))
                 continue
             except (OSError, UnicodeError, WorkflowValidationError, ValueError):
                 invalid.append(_error_entry(path.stem, "invalid_definition"))
                 continue
-            name = package.definition.name
+            finally:
+                if sidecar_file is not None:
+                    sidecar_file.close()
+                if workflow_file is not None:
+                    workflow_file.close()
+            name = source_document.name
             if not name.strip() or len(name) > 128:
                 invalid.append(_error_entry(name, "invalid_definition"))
                 continue
@@ -307,19 +667,89 @@ def _discover_catalog(
                 level.pop(name, None)
                 continue
             if name not in duplicate_names:
-                level[name] = package
+                level[name] = source_document
         invalid.extend(
             _error_entry(name, "invalid_definition") for name in sorted(duplicate_names)
         )
-        for name, package in level.items():
-            selected.setdefault(name, package)
+        source_documents.extend(level.values())
+
+    return tuple(source_documents), tuple(invalid), truncated
+
+
+def capture_workflow_catalog_snapshot(
+    *,
+    workdir: Path,
+    hermes_home: Path,
+    additional_sources: tuple[WorkflowSourceDocument, ...] = (),
+) -> WorkflowCatalogSnapshot:
+    """Capture the bounded project/profile catalog plus admission-local sources."""
+    source_documents, _invalid, _truncated = _capture_catalog_source_documents(
+        workdir,
+        hermes_home,
+    )
+    return WorkflowCatalogSnapshot.capture((*source_documents, *additional_sources))
+
+
+def _discover_catalog_compilations(
+    workdir: Path,
+    hermes_home: Path,
+    *,
+    normalizer_version: int | None = None,
+) -> tuple[tuple[WorkflowCompilation | InvalidCatalogEntry, ...], bool]:
+    source_documents, invalid_documents, truncated = (
+        _capture_catalog_source_documents(workdir, hermes_home)
+    )
+    invalid = list(invalid_documents)
+
+    raw_snapshot = WorkflowCatalogSnapshot.capture(source_documents)
+    compiled_sources: list[WorkflowSourceDocument] = []
+    compiled_by_source: dict[tuple[str, int, str], WorkflowCompilation] = {}
+    for source_document in source_documents:
+        if (
+            len(source_document.nodes) > WORKFLOW_DEFINITION_MAX_NODES
+            or sum(len(node.depends_on) for node in source_document.nodes)
+            > WORKFLOW_DEFINITION_MAX_EDGES
+        ):
+            invalid.append(_error_entry(source_document.name, "catalog_capacity"))
+            continue
+        try:
+            compiled = compile_workflow(
+                source_document,
+                raw_snapshot,
+                normalizer_version=normalizer_version,
+            )
+        except (OSError, TypeError, UnicodeError, WorkflowValidationError, ValueError):
+            invalid.append(_error_entry(source_document.name, "invalid_definition"))
+            continue
+        compiled_name = compiled.package.definition.name
+        if (
+            not compiled_name.strip()
+            or len(compiled_name) > 128
+            or compiled_name != source_document.name
+        ):
+            invalid.append(_error_entry(compiled_name, "invalid_definition"))
+            continue
+        compiled_sources.append(source_document)
+        compiled_by_source[
+            (
+                source_document.source,
+                source_document.precedence,
+                str(source_document.workflow_path),
+            )
+        ] = compiled
+
+    selected_snapshot = WorkflowCatalogSnapshot.capture(compiled_sources)
+    selected = [
+        compiled_by_source[(source.source, source.precedence, str(source.workflow_path))]
+        for source in selected_snapshot.selected.values()
+    ]
     return (
         tuple(
             sorted(
-                [*selected.values(), *invalid],
+                [*selected, *invalid],
                 key=lambda item: (
-                    item.definition.name
-                    if isinstance(item, WorkflowPackage)
+                    item.package.definition.name
+                    if isinstance(item, WorkflowCompilation)
                     else item["name"]
                 ),
             )
@@ -328,27 +758,32 @@ def _discover_catalog(
     )
 
 
-def resolve_workflow_catalog_package(
+def resolve_workflow_catalog_compilation(
     name: str,
     *,
     hermes_home: str | Path,
     workdir: str | Path,
     catalog_source: Literal["project", "profile"] | None = None,
-) -> WorkflowPackage | None:
-    """Resolve one runnable catalog entry with list/detail failure isolation."""
+    normalizer_version: int | None = None,
+) -> WorkflowCompilation | None:
+    """Resolve and compile one catalog closure exactly once for admission."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
         return None
-    discovered, _truncated = _discover_catalog(
+    discovered, _truncated = _discover_catalog_compilations(
         Path(workdir).expanduser().resolve(),
         Path(hermes_home).expanduser().resolve(),
+        normalizer_version=normalizer_version,
     )
     for item in discovered:
-        if isinstance(item, WorkflowPackage) and item.definition.name == name:
-            if catalog_source is not None and item.source != catalog_source:
+        if (
+            isinstance(item, WorkflowCompilation)
+            and item.package.definition.name == name
+        ):
+            if catalog_source is not None and item.package.source != catalog_source:
                 return None
             qualify_workflow_catalog_package(
-                item,
-                compatibility=assess_compatibility(item),
+                item.package,
+                compatibility=assess_compatibility(item.package),
             )
             return item
         if isinstance(item, dict) and item.get("name") == name:
@@ -360,6 +795,23 @@ def resolve_workflow_catalog_package(
                 "workflow catalog entry is invalid"
             )
     return None
+
+
+def resolve_workflow_catalog_package(
+    name: str,
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    catalog_source: Literal["project", "profile"] | None = None,
+) -> WorkflowPackage | None:
+    """Resolve one runnable catalog entry with list/detail failure isolation."""
+    compilation = resolve_workflow_catalog_compilation(
+        name,
+        hermes_home=hermes_home,
+        workdir=workdir,
+        catalog_source=catalog_source,
+    )
+    return compilation.package if compilation is not None else None
 
 
 def _input_projection(
@@ -596,7 +1048,10 @@ def _catalog_language_projection(
 
 
 def qualify_workflow_catalog_package(
-    package: WorkflowPackage, *, compatibility
+    package: WorkflowPackage,
+    *,
+    compatibility,
+    compilation: WorkflowCompilation | None = None,
 ) -> dict[str, object]:
     """Apply the shared bounded show/detail/admission projection contract."""
     try:
@@ -604,6 +1059,7 @@ def qualify_workflow_catalog_package(
             package,
             compatibility_report=compatibility,
             include_argument_hints=False,
+            compilation=compilation,
         )
     except WorkflowDefinitionProjectionCapacityError as exc:
         raise WorkflowCatalogCapacityError(
@@ -654,15 +1110,24 @@ def _catalog_entry(
     trust_snapshot: Mapping[str, object] | None,
     resource_budget: WorkflowResourceReadBudget,
     *,
+    compilation: WorkflowCompilation | None = None,
     verified_showcase: "VerifiedShowcasePackage | None" = None,
     execution_context: ExecutionCapabilityContext,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility, risk = assess_package_execution(
-        package,
-        execution_context,
-        read_budget=resource_budget,
-    )
+    if compilation is None:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+        )
+    else:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+            compilation=compilation,
+        )
     if (
         verified_showcase is not None
         and risk.package_digest != verified_showcase.package_digest
@@ -673,6 +1138,7 @@ def _catalog_entry(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
+        compilation=compilation,
     )
     if verified_showcase is None:
         assert trust_store is not None and trust_snapshot is not None
@@ -737,7 +1203,7 @@ def build_workflow_catalog(
     """Return at most 500 stable entries without executing workflow code."""
     home = Path(hermes_home).expanduser().resolve()
     binding = runner_binding or production_workflow_runner_binding()
-    discovered, truncated = _discover_catalog(
+    discovered, truncated = _discover_catalog_compilations(
         Path(workdir).expanduser().resolve(), home
     )
     showcase_budget = WorkflowResourceReadBudget(
@@ -782,12 +1248,21 @@ def build_workflow_catalog(
     showcase_items: list[CatalogEntry] = []
     try:
         for verified in verified_showcases.values():
+            showcase_compilation = (
+                verified.compilation
+                if supports_phase4_semantics(
+                    verified.package.language.effective_profile,
+                    verified.package.language.normalizer_version,
+                )
+                else None
+            )
             showcase_items.append(
                 _catalog_entry(
                     verified.package,
                     None,
                     None,
                     showcase_budget,
+                    compilation=showcase_compilation,
                     verified_showcase=verified,
                     execution_context=background_execution_context(
                         binding,
@@ -821,9 +1296,18 @@ def build_workflow_catalog(
         ):
             truncated = True
             break
-        if not isinstance(discovered_item, WorkflowPackage):
+        if not isinstance(discovered_item, WorkflowCompilation):
             items.append(discovered_item)
             continue
+        package = discovered_item.package
+        compilation = (
+            discovered_item
+            if supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            else None
+        )
         resource_budget = WorkflowResourceReadBudget(
             max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
             max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -832,10 +1316,11 @@ def build_workflow_catalog(
         try:
             items.append(
                 _catalog_entry(
-                    discovered_item,
+                    package,
                     trust_store,
                     trust_snapshot,
                     resource_budget,
+                    compilation=compilation,
                     execution_context=background_execution_context(
                         binding,
                         requires_ai=None,
@@ -844,7 +1329,7 @@ def build_workflow_catalog(
             )
         except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
             items.append(
-                _error_entry(discovered_item.definition.name, "catalog_capacity")
+                _error_entry(package.definition.name, "catalog_capacity")
             )
         except WorkflowTrustError as exc:
             raise WorkflowCatalogTrustUnavailableError(
@@ -852,7 +1337,7 @@ def build_workflow_catalog(
             ) from exc
         except (OSError, UnicodeError, WorkflowValidationError, ValueError):
             items.append(
-                _error_entry(discovered_item.definition.name, "invalid_definition")
+                _error_entry(package.definition.name, "invalid_definition")
             )
         finally:
             resource_bytes_read += resource_budget.bytes_read
@@ -924,6 +1409,7 @@ def build_workflow_detail(
         max_files=CATALOG_MAX_RESOURCE_FILES,
     )
     verified_showcase = None
+    compilation: WorkflowCompilation | None = None
     if catalog_source == "showcase":
         try:
             from plugins.workflow.showcase import load_verified_showcase_packages
@@ -944,20 +1430,23 @@ def build_workflow_detail(
         package = verified_showcase.package
     else:
         user_source = catalog_source if catalog_source in {"project", "profile"} else None
-        discovered, _truncated = _discover_catalog(
+        discovered, _truncated = _discover_catalog_compilations(
             Path(workdir).expanduser().resolve(), home
         )
-        package = next(
+        selected_compilation = next(
             (
                 item
                 for item in discovered
-                if isinstance(item, WorkflowPackage)
-                and item.definition.name == name
-                and (user_source is None or item.source == user_source)
+                if isinstance(item, WorkflowCompilation)
+                and item.package.definition.name == name
+                and (
+                    user_source is None
+                    or item.package.source == user_source
+                )
             ),
             None,
         )
-        if package is None:
+        if selected_compilation is None:
             if any(
                 isinstance(item, dict)
                 and item.get("name") == name
@@ -968,6 +1457,12 @@ def build_workflow_detail(
                     "workflow detail definition limit exceeded"
                 )
             raise WorkflowDetailNotFoundError(name)
+        package = selected_compilation.package
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            compilation = selected_compilation
 
     execution_context = background_execution_context(
         binding,
@@ -982,6 +1477,7 @@ def build_workflow_detail(
             package,
             execution_context,
             read_budget=resource_budget,
+            compilation=compilation,
         )
     except WorkflowResourceCapacityError as exc:
         raise WorkflowCatalogCapacityError(
@@ -994,6 +1490,7 @@ def build_workflow_detail(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
+        compilation=compilation,
     )
     if verified_showcase is None:
         try:
@@ -1034,7 +1531,7 @@ def build_workflow_detail(
             ),
             "topology_mermaid_omitted",
         )
-    return {
+    detail = {
         "name": (
             str(verified_showcase.scenario.id)
             if verified_showcase is not None
@@ -1067,6 +1564,9 @@ def build_workflow_detail(
         },
         "definition": shown["definition"],
     }
+    if "compilation" in shown:
+        detail["compilation"] = shown["compilation"]
+    return detail
 
 
 __all__ = [
@@ -1090,8 +1590,10 @@ __all__ = [
     "WorkflowShowcaseVerificationError",
     "build_workflow_catalog",
     "build_workflow_detail",
+    "capture_workflow_catalog_snapshot",
     "desktop_input_name_is_representable",
     "qualify_workflow_catalog_package",
+    "resolve_workflow_catalog_compilation",
     "resolve_workflow_catalog_package",
     "workflow_catalog_run_support",
 ]

@@ -1028,7 +1028,14 @@ def _start_archon_scheduler_run(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     execution_context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -1262,7 +1269,14 @@ def test_v3_admission_rejects_impossible_authenticated_command_before_snapshot(
         workflow_writer,
         name="package-validation-v3",
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / "home-package-validation-v3")
 
     with pytest.raises(WorkflowValidationError) as exc_info:

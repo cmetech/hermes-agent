@@ -13,6 +13,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
+
+
+def _version_selection_from_guidance(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    marked = text.split(VERSION_SELECTION_MARKER, maxsplit=1)[1]
+    payload = marked.split("```json", maxsplit=1)[1].split("```", maxsplit=1)[0]
+    return json.loads(payload)
 
 
 @pytest.mark.integration
@@ -136,7 +144,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     timeout_schema = installed_contract["definition_schema"]["properties"]["nodes"][
         "items"
     ]["properties"]["timeout"]
-    assert installed_contract["normalizer_version"] == 3
+    assert installed_contract["normalizer_version"] == 4
     assert timeout_schema["x-hermes-unit"] == "milliseconds"
     assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
     assert bash_schema["x-hermes-semantics"] == {
@@ -154,6 +162,294 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
         },
         "unsupported_context": "fail",
     }
+
+    phase4_root = tmp_path / "phase4-root"
+    phase4_child = tmp_path / "phase4-child"
+    (phase4_root / "workflows").mkdir(parents=True)
+    (phase4_child / "workflows").mkdir(parents=True)
+    (phase4_child / "commands").mkdir()
+    root_workflow = phase4_root / "workflows" / "installed-v4-root.yaml"
+    child_workflow = phase4_child / "workflows" / "installed-v4-child.yaml"
+    root_workflow.write_text(
+        """name: installed-v4-root
+description: Installed explicit-v4 root
+interactive: true
+nodes:
+  - id: child
+    include: installed-v4-child
+""",
+        encoding="utf-8",
+    )
+    root_workflow.with_name("installed-v4-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    child_workflow.write_text(
+        """name: installed-v4-child
+description: Installed explicit-v4 child
+nodes:
+  - id: refine
+    loop:
+      command: refine
+      until: DONE
+      max_iterations: 2
+      interactive: true
+      gate_message: Accept this sealed result or provide feedback
+""",
+        encoding="utf-8",
+    )
+    child_workflow.with_name("installed-v4-child.hermes.yaml").write_text(
+        "required_secrets: [IGNORED_CHILD_SECRET]\n",
+        encoding="utf-8",
+    )
+    (phase4_child / "commands" / "refine.md").write_text(
+        "---\ndescription: Refine\n---\nUse the sealed command body.\n",
+        encoding="utf-8",
+    )
+    phase4_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            r"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import shutil
+import sys
+
+from agent.plugin_agent import PluginAgentRunResult
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.evidence import EvidenceReader
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language import (
+    CURRENT_NORMALIZER_BY_PROFILE,
+    SUPPORTED_NORMALIZER_VERSIONS,
+)
+from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import parse_workflow_source_bytes, validate_package
+from plugins.workflow.store import RunStore
+from plugins.workflow.trust import (
+    WorkflowPackageDigest,
+    WorkflowTrustStore,
+    build_risk_summary,
+)
+
+
+class SignalRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, request, **_kwargs):
+        self.calls += 1
+        return PluginAgentRunResult(
+            final_response="installed result <promise>DONE</promise>",
+            session_id=f"installed-v4-{self.calls}",
+            provider=request.provider or "installed-provider",
+            model=request.model or "installed-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={"provider_attempts": 1},
+        )
+
+
+root_path = Path(sys.argv[1])
+child_path = Path(sys.argv[2])
+home = Path(sys.argv[3])
+root = parse_workflow_source_bytes(
+    root_path,
+    workflow_bytes=root_path.read_bytes(),
+    sidecar_bytes=root_path.with_name("installed-v4-root.hermes.yaml").read_bytes(),
+    source="project",
+    precedence=1,
+)
+child = parse_workflow_source_bytes(
+    child_path,
+    workflow_bytes=child_path.read_bytes(),
+    sidecar_bytes=child_path.with_name("installed-v4-child.hermes.yaml").read_bytes(),
+    source="profile",
+    precedence=2,
+)
+compilation = compile_workflow(
+    root,
+    WorkflowCatalogSnapshot.capture((root, child)),
+)
+package = compilation.package
+validation = validate_package(package)
+compatibility = assess_compatibility(package)
+risk = build_risk_summary(package, compatibility, compilation=compilation)
+trust = WorkflowTrustStore(home)
+trust.trust(compilation.composite_digest, actor="installed-test", risk_digest=risk.risk_digest)
+store = RunStore(home)
+prepared = store.prepare_run_snapshot(
+    package,
+    compilation=compilation,
+    trusted_package_digest=WorkflowPackageDigest(
+        compilation.composite_digest,
+        compilation.covered_relative_paths,
+    ),
+)
+admitted = store.start_run(
+    RunAdmissionRequest(
+        workflow_name=package.definition.name,
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key="installed-v4",
+        concurrency_key=package.definition.name,
+    ),
+    immutable_snapshot=prepared,
+)
+runner = SignalRunner()
+scheduler = RunScheduler(store, agent_runner=runner)
+try:
+    scheduler.advance(admitted.run_id)
+finally:
+    scheduler.shutdown(deadline_seconds=2)
+paused = store.get_run_status(admitted.run_id)
+pending = paused["pending_interaction"]
+shutil.rmtree(root_path.parent.parent)
+shutil.rmtree(child_path.parent.parent)
+resumed_store = RunStore(home)
+resumed_scheduler = RunScheduler(resumed_store)
+try:
+    resumed_package = resumed_scheduler._load_run_package(admitted.run_id)
+finally:
+    resumed_scheduler.shutdown(deadline_seconds=2)
+resumed_store.approve_run(
+    admitted.run_id,
+    expected_state_version=paused["state_version"],
+    interaction_id=pending["interaction_id"],
+    actor="installed-operator",
+    channel="cli",
+)
+completed = resumed_store.load_run(admitted.run_id)
+evidence = EvidenceReader(resumed_store).query(
+    admitted.run_id,
+    kind="interactions",
+    limit=20,
+)
+default_contract = workflow_authoring_contract(
+    WorkflowLanguageProfile.ARCHON_2026_07
+)
+explicit_contract = workflow_authoring_contract(
+    WorkflowLanguageProfile.ARCHON_2026_07,
+    normalizer_version=4,
+)
+print(json.dumps({
+    "current_normalizer_by_profile": {
+        profile.value: version
+        for profile, version in CURRENT_NORMALIZER_BY_PROFILE.items()
+    },
+    "supported_normalizer_versions": sorted(SUPPORTED_NORMALIZER_VERSIONS),
+    "reader_contract_versions": [
+        workflow_authoring_contract(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=version,
+        )["normalizer_version"]
+        for version in sorted(SUPPORTED_NORMALIZER_VERSIONS)
+    ],
+    "default_normalizer": default_contract["normalizer_version"],
+    "explicit_normalizer": explicit_contract["normalizer_version"],
+    "phase4_codes": sorted(
+        code
+        for code, entry in explicit_contract["compatibility_codes"].items()
+        if entry.get("normalizer_versions") == [4]
+    ),
+    "validation_blockers": [issue.code for issue in validation if issue.blocking],
+    "compatibility_runnable": compatibility.runnable,
+    "compatibility_codes": sorted(finding.code for finding in compatibility.findings),
+    "trust": trust.check(
+        compilation.composite_digest,
+        risk_digest=risk.risk_digest,
+    ),
+    "expanded_nodes": [node.id for node in package.definition.nodes],
+    "paused_status": paused["status"],
+    "pending_type": pending["type"],
+    "pending_actions": paused["next_actions"],
+    "provider_calls": runner.calls,
+    "sources_removed": not root_path.exists() and not child_path.exists(),
+    "resumed_normalizer": resumed_package.language.normalizer_version,
+    "completed_status": completed["status"],
+    "event_types": [
+        item["event_type"]
+        for item in resumed_store.tail_events(admitted.run_id, limit=50)
+        if item["event_type"].startswith("loop_signal_")
+    ],
+    "evidence_event_types": [
+        item.get("event_type") for item in evidence["items"]
+    ],
+}))
+""",
+            str(root_workflow),
+            str(child_workflow),
+            str(home / "phase4"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    assert phase4_probe.returncode == 0, phase4_probe.stderr
+    phase4_result = json.loads(phase4_probe.stdout)
+    installed_version_selection = {
+        "current_normalizer_by_profile": phase4_result[
+            "current_normalizer_by_profile"
+        ],
+        "supported_normalizer_versions": phase4_result[
+            "supported_normalizer_versions"
+        ],
+    }
+    assert phase4_result["reader_contract_versions"] == installed_version_selection[
+        "supported_normalizer_versions"
+    ]
+    installed_references = site / "skills" / "software-development" / "workflow-builder" / "references"
+    for reference_name in ("portable-schema.md", "authoring-checklist.md"):
+        assert _version_selection_from_guidance(
+            installed_references / reference_name
+        ) == installed_version_selection
+    assert phase4_result["default_normalizer"] == 4
+    assert phase4_result["explicit_normalizer"] == 4
+    assert {
+        "include_not_found",
+        "include_cycle",
+        "include_resource_invalid",
+    } <= set(phase4_result["phase4_codes"])
+    assert phase4_result["validation_blockers"] == []
+    assert phase4_result["compatibility_runnable"] is True
+    assert {
+        "phase4_loop_prompt_sealed",
+        "phase4_signal_confirmation",
+    } <= set(phase4_result["compatibility_codes"])
+    assert phase4_result["trust"] == "trusted"
+    assert phase4_result["expanded_nodes"] == ["child__refine"]
+    assert phase4_result["paused_status"] == "paused"
+    assert phase4_result["pending_type"] == "loop_signal_confirmation"
+    assert phase4_result["pending_actions"] == [
+        "status",
+        "events",
+        "approve",
+        "provide-input",
+        "cancel",
+    ]
+    assert phase4_result["provider_calls"] == 1
+    assert phase4_result["sources_removed"] is True
+    assert phase4_result["resumed_normalizer"] == 4
+    assert phase4_result["completed_status"] == "succeeded"
+    assert phase4_result["event_types"] == [
+        "loop_signal_confirmation_required",
+        "loop_signal_accepted",
+    ]
+    assert phase4_result["evidence_event_types"] == [
+        "loop_signal_confirmation_required",
+        "loop_signal_accepted",
+    ]
 
     installed_flow = tmp_path / "installed-official.yaml"
     installed_flow.write_text(

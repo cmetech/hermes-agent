@@ -94,6 +94,7 @@ class NodeExecutionContext:
     provider_start_delivered: Callable[[str], bool] | None = None
     provider_execute_received: Callable[[str], bool] | None = None
     provider_execute_release: Callable[[str], bool] | None = None
+    record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
 
 
 @dataclass(frozen=True)

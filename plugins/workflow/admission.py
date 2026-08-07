@@ -59,6 +59,8 @@ class PreparedRunSnapshot:
     outward_action_nodes: tuple[str, ...] = ()
     language: Mapping[str, object] | None = None
     sealed_snapshot_digest: str | None = None
+    snapshot_format_version: int = 1
+    dependency_manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.input_digests is None:
