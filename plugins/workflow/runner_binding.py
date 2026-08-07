@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from hermes_cli.config import read_raw_config
+from hermes_cli import managed_scope
 from hermes_cli.runtime_provider import (
     ConfiguredExecutionRoute,
     ExecutionRuntimeCapabilities,
@@ -17,6 +18,10 @@ from hermes_cli.runtime_provider import (
     classify_execution_runtime,
     resolve_structured_output_capability,
     snapshot_configured_execution_routes,
+)
+from hermes_cli.workflow_model_resolution import (
+    WorkflowModelConfigSnapshot,
+    parse_workflow_model_config,
 )
 from plugins.workflow.entitlement import (
     AIEntitlementResolution,
@@ -27,6 +32,10 @@ if TYPE_CHECKING:
     from plugins.workflow.compilation import WorkflowCompilation
     from plugins.workflow.compat import CompatibilityReport
     from plugins.workflow.models import WorkflowPackage
+    from plugins.workflow.provider_authority import (
+        ProviderAuthorityEnvironment,
+        WorkflowProviderAuthority,
+    )
     from plugins.workflow.trust import (
         WorkflowResourceReadBudget,
         WorkflowRiskSummary,
@@ -96,6 +105,7 @@ class RunnerCapabilities:
 class ExecutionProviderSnapshot:
     runtime_capabilities: ExecutionRuntimeCapabilities
     configured_provider_routes: Mapping[str, ConfiguredExecutionRoute]
+    model_config_snapshot: WorkflowModelConfigSnapshot | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -115,6 +125,8 @@ class ExecutionCapabilityContext:
     configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    model_config_snapshot: WorkflowModelConfigSnapshot | None = None
+    provider_authority_environment: "ProviderAuthorityEnvironment | None" = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -227,6 +239,41 @@ class ExecutionCapabilityContext:
             )
         return MappingProxyType(decisions)
 
+    def provider_authority(
+        self,
+        package: "WorkflowPackage",
+    ) -> "WorkflowProviderAuthority | None":
+        """Resolve the single v5 model/capability authority for a package."""
+        from plugins.workflow.language import supports_phase5_semantics
+        from plugins.workflow.provider_authority import (
+            ProviderAuthorityEnvironment,
+            resolve_workflow_provider_authority,
+        )
+
+        if not supports_phase5_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            return None
+        if self.model_config_snapshot is None:
+            return None
+        environment = self.provider_authority_environment
+        if environment is None:
+            environment = ProviderAuthorityEnvironment(
+                session_store_available=True,
+                mcp_available=self.mcp_available,
+                hook_lifecycle_available=True,
+                inline_agent_available=(self.entitlement.value == "real"),
+                web_service_available=True,
+                authoritative_cost_available=False,
+            )
+        return resolve_workflow_provider_authority(
+            package,
+            model_config=self.model_config_snapshot,
+            default_runtime=self.runtime_capabilities,
+            environment=environment,
+        )
+
     def structured_output_identity_material(
         self,
         package: "WorkflowPackage",
@@ -288,31 +335,38 @@ class ExecutionCapabilityContext:
     def _identity_digest(
         self,
         structured_output_decisions: object,
+        *,
+        provider_authority_digest: str | None = None,
     ) -> str:
         """Hash shared execution authority plus structured-output decisions."""
+        identity_material = {
+            "entitlement": self.entitlement.value,
+            "entitlement_error": self.entitlement.error_code,
+            "mcp_available": self.mcp_available,
+            "runner_starts_request_mcp": (
+                self.runner_capabilities.starts_request_mcp
+            ),
+            "runtime_api_mode": self.runtime_capabilities.api_mode,
+            "runtime_hermes_managed_tool_loop": (
+                self.runtime_capabilities.hermes_managed_tool_loop
+            ),
+            "runtime_provider": self.runtime_capabilities.effective_provider,
+            "runtime_model": self.runtime_capabilities.model,
+            "runtime_base_url_trust_class": (
+                self.runtime_capabilities.base_url_trust_class
+            ),
+            "runtime_declared_structured_output_strategy": (
+                self.runtime_capabilities.declared_structured_output_strategy
+            ),
+            "structured_output_decisions": structured_output_decisions,
+            "surface": self.surface,
+        }
+        if provider_authority_digest is not None:
+            identity_material["provider_authority_digest"] = (
+                provider_authority_digest
+            )
         material = json.dumps(
-            {
-                "entitlement": self.entitlement.value,
-                "entitlement_error": self.entitlement.error_code,
-                "mcp_available": self.mcp_available,
-                "runner_starts_request_mcp": (
-                    self.runner_capabilities.starts_request_mcp
-                ),
-                "runtime_api_mode": self.runtime_capabilities.api_mode,
-                "runtime_hermes_managed_tool_loop": (
-                    self.runtime_capabilities.hermes_managed_tool_loop
-                ),
-                "runtime_provider": self.runtime_capabilities.effective_provider,
-                "runtime_model": self.runtime_capabilities.model,
-                "runtime_base_url_trust_class": (
-                    self.runtime_capabilities.base_url_trust_class
-                ),
-                "runtime_declared_structured_output_strategy": (
-                    self.runtime_capabilities.declared_structured_output_strategy
-                ),
-                "structured_output_decisions": structured_output_decisions,
-                "surface": self.surface,
-            },
+            identity_material,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -325,7 +379,13 @@ class ExecutionCapabilityContext:
 
     def identity_digest_for(self, package: "WorkflowPackage") -> str:
         """Return the identity sealing complete actual per-node decisions."""
-        return self._identity_digest(self.structured_output_identity_material(package))
+        authority = self.provider_authority(package)
+        return self._identity_digest(
+            self.structured_output_identity_material(package),
+            provider_authority_digest=(
+                authority.authority_digest if authority is not None else None
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +398,7 @@ class WorkflowRunnerBinding:
     configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    model_config_snapshot: WorkflowModelConfigSnapshot | None = None
     runtime_capabilities_provider: (
         Callable[[], ExecutionRuntimeCapabilities | ExecutionProviderSnapshot] | None
     ) = None
@@ -373,10 +434,12 @@ class WorkflowRunnerBinding:
             return ExecutionProviderSnapshot(
                 refreshed,
                 self.configured_provider_routes,
+                self.model_config_snapshot,
             )
         return ExecutionProviderSnapshot(
             self.runtime_capabilities,
             self.configured_provider_routes,
+            self.model_config_snapshot,
         )
 
     def execution_context(
@@ -392,6 +455,7 @@ class WorkflowRunnerBinding:
             runner_capabilities=self.capabilities_for(entitlement),
             runtime_capabilities=provider_snapshot.runtime_capabilities,
             configured_provider_routes=provider_snapshot.configured_provider_routes,
+            model_config_snapshot=provider_snapshot.model_config_snapshot,
         )
 
 
@@ -402,6 +466,8 @@ def execution_capability_context(
     runner_capabilities: RunnerCapabilities,
     runtime_capabilities: ExecutionRuntimeCapabilities,
     configured_provider_routes: Mapping[str, ConfiguredExecutionRoute] | None = None,
+    model_config_snapshot: WorkflowModelConfigSnapshot | None = None,
+    provider_authority_environment: "ProviderAuthorityEnvironment | None" = None,
 ) -> ExecutionCapabilityContext:
     return ExecutionCapabilityContext(
         surface=surface,
@@ -409,6 +475,8 @@ def execution_capability_context(
         runner_capabilities=runner_capabilities,
         runtime_capabilities=runtime_capabilities,
         configured_provider_routes=configured_provider_routes or MappingProxyType({}),
+        model_config_snapshot=model_config_snapshot,
+        provider_authority_environment=provider_authority_environment,
         mcp_available=(
             surface == "background"
             and entitlement.value == "real"
@@ -431,6 +499,10 @@ def _configured_provider_metadata(
 
 def _production_provider_snapshot() -> ExecutionProviderSnapshot:
     config = read_raw_config()
+    model_config_snapshot = parse_workflow_model_config(
+        config,
+        managed_config=managed_scope.load_managed_config(),
+    )
     configured_provider_routes = snapshot_configured_execution_routes(config)
     provider, model_config, provider_config = _configured_provider_metadata(config)
     configured_route = (
@@ -458,6 +530,7 @@ def _production_provider_snapshot() -> ExecutionProviderSnapshot:
     return ExecutionProviderSnapshot(
         runtime_capabilities=runtime_capabilities,
         configured_provider_routes=configured_provider_routes,
+        model_config_snapshot=model_config_snapshot,
     )
 
 
@@ -486,6 +559,7 @@ def production_workflow_runner_binding() -> WorkflowRunnerBinding:
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
         runtime_capabilities=provider_snapshot.runtime_capabilities,
         configured_provider_routes=provider_snapshot.configured_provider_routes,
+        model_config_snapshot=provider_snapshot.model_config_snapshot,
         runtime_capabilities_provider=_production_provider_snapshot,
     )
 
@@ -521,10 +595,12 @@ def assess_package_execution(
     )
     from plugins.workflow.trust import build_risk_summary
 
+    provider_authority = context.provider_authority(package)
     compatibility = assess_compatibility(
         package,
         mcp_available=context.mcp_available,
         structured_output_decisions=context.structured_output_decisions(package),
+        provider_authority=provider_authority,
     )
     try:
         context.structured_output_run_metadata(package)
@@ -570,6 +646,11 @@ def assess_package_execution(
         compatibility,
         read_budget=read_budget,
         compilation=compilation,
+        provider_authority_digest=(
+            provider_authority.authority_digest
+            if provider_authority is not None
+            else None
+        ),
     )
     return compatibility, risk
 
