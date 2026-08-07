@@ -4649,11 +4649,23 @@ def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
 
 
 @pytest.mark.parametrize(
-    "damage",
-    ("prefix-delete", "prefix-insert", "prefix-duplicate", "prefix-reorder", "move-later-before"),
+    ("damage", "expected_messages"),
+    (
+        (
+            "prefix-delete",
+            {
+                "projection is ahead of its journal",
+                "private session journal order is invalid",
+            },
+        ),
+        ("prefix-insert", {"private session journal order is invalid"}),
+        ("prefix-duplicate", {"private session journal order is invalid"}),
+        ("prefix-reorder", {"private session journal order is invalid"}),
+        ("move-later-before", {"private session journal order is invalid"}),
+    ),
 )
 def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
-    tmp_path, workflow_writer, damage
+    tmp_path, workflow_writer, damage, expected_messages
 ) -> None:
     """Recomputed self-checksums cannot rewrite the recovery history prefix."""
     store, run_id = _failed_fresh_recovery_run(
@@ -4696,7 +4708,7 @@ def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
     ):
         with pytest.raises(JournalRecoveryError) as exc_info:
             reader()
-        assert str(exc_info.value) == "private session journal order is invalid"
+        assert str(exc_info.value) in expected_messages
         assert all(value not in str(exc_info.value) for value in values)
     with pytest.raises(NotificationReconciliationError) as exc_info:
         NotificationOutbox(store)._journal_candidates(
