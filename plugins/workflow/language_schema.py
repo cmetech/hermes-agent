@@ -18,6 +18,7 @@ from plugins.workflow.language import (
     select_normalizer_version,
     supports_phase3_semantics,
     supports_phase4_semantics,
+    supports_phase5_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowLanguageSelection
 
@@ -2269,6 +2270,13 @@ def _field_schema(
         hook_event=hook_event,
         normalizer_version=normalizer_version,
     )
+    if (
+        spec.scope == "hook_entry"
+        and spec.yaml_name == "matcher"
+        and normalizer_version is not None
+        and supports_phase5_semantics(profile, normalizer_version)
+    ):
+        result = {"type": ["string", "null"], "maxLength": 512}
     status = _field_status(spec, profile)
     result.update({
         "title": spec.title,

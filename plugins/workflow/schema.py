@@ -34,6 +34,7 @@ from plugins.workflow.language import (
     select_normalizer_version,
     supports_phase3_semantics,
     supports_phase4_semantics,
+    supports_phase5_semantics,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
@@ -311,7 +312,9 @@ def _validate_retry(value: Any, path: str) -> None:
         _fail(f"{path}.on_error", "invalid_retry", f"{path}.on_error is invalid")
 
 
-def _validate_hook_fields(hooks_value: Any, path: str) -> None:
+def _validate_hook_fields(
+    hooks_value: Any, path: str, *, phase5_semantics: bool = False
+) -> None:
     hooks = _mapping(hooks_value, path)
     for event, entries_value in hooks.items():
         if event not in HOOK_EVENTS:
@@ -334,6 +337,16 @@ def _validate_hook_fields(hooks_value: Any, path: str) -> None:
                     "unknown_hook_field",
                     f"{entry_path} has unknown execution field: {unknown_entry[0]}",
                 )
+            if phase5_semantics and "matcher" in entry:
+                matcher = entry["matcher"]
+                if matcher is not None and (
+                    not isinstance(matcher, str) or len(matcher) > 512
+                ):
+                    _fail(
+                        f"{entry_path}.matcher",
+                        "archon_hook_matcher_invalid",
+                        f"{entry_path}.matcher must be null or a string of at most 512 characters",
+                    )
             response = _mapping(entry.get("response"), f"{entry_path}.response")
             unknown_response = sorted(set(response) - HOOK_RESPONSE_FIELDS)
             if unknown_response:
@@ -413,6 +426,12 @@ def _validate_hook_fields(hooks_value: Any, path: str) -> None:
                 )
             if "timeout" in entry:
                 _positive_number(entry["timeout"], f"{entry_path}.timeout")
+                if phase5_semantics and entry["timeout"] > 300:
+                    _fail(
+                        f"{entry_path}.timeout",
+                        "archon_hook_timeout_invalid",
+                        f"{entry_path}.timeout must be between 0 and 300",
+                    )
 
 
 def _validate_agents(value: Any, path: str) -> None:
@@ -711,7 +730,13 @@ def _normalize_node(
         if "retry" in node:
             _validate_retry(node["retry"], f"{path}.retry")
     if "hooks" in node:
-        _validate_hook_fields(node["hooks"], f"{path}.hooks")
+        _validate_hook_fields(
+            node["hooks"],
+            f"{path}.hooks",
+            phase5_semantics=supports_phase5_semantics(
+                profile, normalizer_version
+            ),
+        )
     if "when" in node:
         when = _string(node["when"], f"{path}.when")
         if archon_v3:

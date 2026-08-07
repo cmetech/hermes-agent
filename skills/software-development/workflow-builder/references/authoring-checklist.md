@@ -11,7 +11,7 @@ their pinned semantics.
     "hermes-legacy": 2,
     "archon-2026-07": 4
   },
-  "supported_normalizer_versions": [1, 2, 3, 4]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
 ```
 

@@ -45,6 +45,50 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: workflow-phase5-dormant-language-contract
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/resources.py
+  - plugins/workflow/schema.py
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/agent/test_workflow_builder_skill.py
+  owned_symbols:
+  - supports_phase5_semantics explicit reader gate
+  - _normalize_v5 cumulative provider-portability semantic identity
+  - _read_phase5_provider_portability exact untrusted snapshot reader
+  - normalize_mcp_server_document bounded wrapper canonicalization
+  - explicit v5 hook matcher schema and validation
+  owned_invariants:
+  - explicit Archon v5 inherits v2 structured output, v3 execution, and v4 loop semantics
+  - current/default Archon admission remains normalizer v4 until the final activation gate
+  - model tiers, configured aliases, literals, hooks, and MCP references alter sealed semantic identity
+  - unsupported hook events and operations remain canonical obligations rather than disappearing
+  - v5 hook matchers, operation payloads, counts, timeouts, and readers are bounded and fail closed
+  - mcp_servers, mcpServers, bare maps, and single-server forms canonicalize without changing v1-v4 resolution
+  tests:
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  expected_commit_subject: 'feat(workflow): define dormant phase 5 semantics'
+  upstream_candidate: true
+  merge_guidance: Preserve v5 as explicitly selectable and exactly readable while
+    current/default archon-2026-07 remains v4 until the complete provider-portability
+    authority and runtime gates pass. Keep v5 semantics cumulative, sealed in the
+    existing node-semantic envelope, and credential-free. Unsupported hooks remain
+    visible obligations for the central authority to block. Canonicalize only explicit
+    v5 MCP reads; v1-v4 resource behavior must remain unchanged.
+  removal_condition: Remove when upstream provides an equivalent dormant cumulative
+    language version with exact old-version replay, bounded hook/MCP normalization,
+    portable model-reference identity, and an independently gated activation boundary.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: portable-workflow-model-resolution
   change_class: configuration-generic
   owner: workflow-orchestration
@@ -4188,7 +4232,7 @@ upstream_changes:
   - current/default normalizer v4 generation and explicit/sealed v1-v3 compatibility
   - ordinary-loops-and-includes generated documentation topic
   - installed workflow-builder reference data files
-  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":4,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4]}'
+  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":4,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4,5]}'
   - include is compile-only and absent from executable node kinds
   - root-only policy and authenticated ignored child sidecars
   - exact bounded include closure guidance
