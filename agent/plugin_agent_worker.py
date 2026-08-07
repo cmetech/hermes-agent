@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 import unicodedata
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
@@ -1106,6 +1107,7 @@ def _build_inline_agent_handler(
     runner_factory,
     emit_progress,
     pause,
+    is_cancelled=None,
 ):
     """Build the synchronous worker-local ``workflow_agent`` dispatcher."""
     admission_lock = threading.Lock()
@@ -1158,6 +1160,15 @@ def _build_inline_agent_handler(
             provider_request_timeout_seconds=getattr(
                 parent, "provider_request_timeout_seconds", 300.0
             ),
+            absolute_wall_deadline=getattr(
+                parent, "absolute_wall_deadline", None
+            ),
+            absolute_idle_deadline=getattr(
+                parent, "absolute_idle_deadline", None
+            ),
+            absolute_provider_deadline=getattr(
+                parent, "absolute_provider_deadline", None
+            ),
             approved_action_digest=getattr(parent, "approved_action_digest", None),
             reasoning_config=getattr(parent, "reasoning_config", None),
             fallback_model=getattr(parent, "fallback_model", None),
@@ -1177,7 +1188,7 @@ def _build_inline_agent_handler(
             term_grace_seconds=getattr(parent, "term_grace_seconds", 5.0),
             kill_reap_grace_seconds=getattr(parent, "kill_reap_grace_seconds", 2.0),
         )
-        result = runner_factory(plugin_id).run(request)
+        result = runner_factory(plugin_id).run(request, is_cancelled=is_cancelled)
         if result.status == "paused":
             descriptor = dict(result.pending_interaction or {})
             pause(descriptor)
@@ -1366,6 +1377,31 @@ def _runtime_identity_mismatch_failure(
     }
 
 
+def _tool_policy_incompatible_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "tool_policy_incompatible",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+        },
+        "structured_output": None,
+    }
+
+
 def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
     failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
     if (
@@ -1529,6 +1565,15 @@ def _run(
         def bounded_provider_timeout(provider: str, model_name: str) -> float:
             profile_timeout = configured_timeout(provider, model_name)
             request_timeout = float(request.provider_request_timeout_seconds)
+            now = time.monotonic()
+            for deadline in (
+                request.absolute_wall_deadline,
+                request.absolute_provider_deadline,
+            ):
+                if deadline is not None:
+                    request_timeout = min(request_timeout, float(deadline) - now)
+            if request_timeout <= 0:
+                raise TimeoutError("plugin-agent provider deadline expired")
             if profile_timeout is None:
                 return request_timeout
             return min(request_timeout, float(profile_timeout))
@@ -1600,15 +1645,28 @@ def _run(
                     f"did not connect: {', '.join(unavailable)}"
                 )
 
+        allowed = None if request.allowed_tools is None else set(request.allowed_tools)
+        denied = set(request.denied_tools) | {"delegate_task"}
+        inline_agent_reachable = bool(request.inline_agents) and (
+            allowed is None or "workflow_agent" in allowed
+        ) and "workflow_agent" not in denied
+        if (
+            request.inline_agents
+            and not inline_agent_reachable
+            and request.intended_authority_digest is not None
+        ):
+            return _tool_policy_incompatible_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest,
+            )
+        if not inline_agent_reachable:
+            denied.add("workflow_agent")
+
         # Import the agent only after the request loader is installed and
         # required MCP servers have registered their tools. Construction stays
         # below runtime classification and tool-policy validation.
         from run_agent import AIAgent
 
-        allowed = None if request.allowed_tools is None else set(request.allowed_tools)
-        denied = set(request.denied_tools) | {"delegate_task"}
-        if not request.inline_agents:
-            denied.add("workflow_agent")
         pending: list[dict[str, str]] = []
         approved_action_consumed = False
 
@@ -1618,7 +1676,7 @@ def _run(
             if active is not None:
                 active._interrupt_requested = True
 
-        if request.inline_agents:
+        if inline_agent_reachable:
             from agent.plugin_agent import PluginAgentRunner
 
             inline_handler = _build_inline_agent_handler(
@@ -1632,6 +1690,7 @@ def _run(
                 runner_factory=PluginAgentRunner,
                 emit_progress=lambda **progress: _emit("progress", **progress),
                 pause=pause,
+                is_cancelled=_cancel_event.is_set,
             )
             registry.register(
                 name="workflow_agent",
@@ -1821,6 +1880,16 @@ def _run(
             if sealed_provider_grant:
 
                 def reserve_provider_attempt() -> None:
+                    now = time.monotonic()
+                    for deadline in (
+                        request.absolute_wall_deadline,
+                        request.absolute_idle_deadline,
+                        request.absolute_provider_deadline,
+                    ):
+                        if deadline is not None and now >= deadline:
+                            raise TimeoutError(
+                                "plugin-agent absolute deadline expired"
+                            )
                     if request.intended_authority_digest is not None:
                         agent.verify_model_visible_prefix()
                     if _cancel_event.is_set() or getattr(

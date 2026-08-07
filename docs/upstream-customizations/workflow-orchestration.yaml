@@ -328,6 +328,46 @@ upstream_changes:
   removal_condition: Remove when upstream supplies an equivalent versioned package-contained
     MCP Python closure with interpreter attestation and lifetime import-root enforcement.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-inline-agent-authority
+  change_class: plugin-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - plugins/workflow/compat.py
+  - plugins/workflow/executors/ai.py
+  owned_symbols:
+  - PluginAgentRunRequest absolute wall idle and provider deadlines
+  - _build_inline_agent_handler inherited cancellation and deadline authority
+  - _tool_policy_incompatible_failure
+  - normalizer-v5 inline-agent tool-policy compatibility finding
+  owned_invariants:
+  - omitted allowed_tools remains distinct from an explicit empty allow set
+  - Phase 5 never auto-adds workflow_agent or overrides a deny rule
+  - unreachable inline agents block at admission and again before worker agent construction
+  - inline children inherit one shared provider-attempt authority and absolute parent deadlines
+  - inline children retain the exact contained workdir process-tree RSS CPU descendant and cancellation limits
+  - node and child skills remain complete sealed current-user-turn content and never mutate the system prompt
+  - legacy workflow snapshots retain their prior workflow_agent auto-add behavior
+  tests:
+  - tests/plugins/workflow/test_phase5_inline_limits.py
+  - tests/plugins/workflow/test_node_agents.py
+  - tests/plugins/workflow/test_node_skills.py
+  - tests/plugins/workflow/test_node_tool_policy.py
+  - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_iteration_budget_race.py
+  expected_commit_subject: 'feat(agent): share sealed inline-agent limits'
+  upstream_candidate: true
+  merge_guidance: Keep the request extension optional and wire-compatible for generic
+    plugin callers. Only sealed Phase 5 execution treats unreachable declared inline
+    agents as terminal; legacy workflows retain their existing adapter behavior. Preserve
+    one authenticated remaining-attempt authority and absolute deadline values across
+    every child without adding a raw delegation callback or core model tool.
+  removal_condition: Remove when upstream provides an equivalent bounded inline-agent
+    request authority with exact empty-tool semantics shared remaining limits and
+    pre-provider fail-closed validation.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration

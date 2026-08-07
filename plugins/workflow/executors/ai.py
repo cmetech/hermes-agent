@@ -1130,10 +1130,27 @@ class AgentNodeExecutor:
             denied_tools = tuple(denied_set)
             if (
                 inline_agents
-                and allowed_tools is not None
-                and "workflow_agent" not in allowed_tools
+                and (
+                    (allowed_tools is not None and "workflow_agent" not in allowed_tools)
+                    or "workflow_agent" in denied_tools
+                )
             ):
-                allowed_tools = (*allowed_tools, "workflow_agent")
+                if phase5:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="tool_policy_incompatible",
+                        error_message=(
+                            "inline agents must remain reachable through the "
+                            "declared tool policy"
+                        ),
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
+                if allowed_tools is not None:
+                    allowed_tools = (*allowed_tools, "workflow_agent")
             route_options = sealed_route.provider_options if phase5 else {}
             effort = (
                 route_options.get("effort")
@@ -1243,6 +1260,25 @@ class AgentNodeExecutor:
                 idle_timeout_seconds=idle_timeout,
                 wall_timeout_seconds=wall_timeout,
                 provider_request_timeout_seconds=provider_timeout,
+                absolute_wall_deadline=(wall_deadline if phase5 else None),
+                absolute_idle_deadline=(
+                    min(
+                        wall_deadline,
+                        (
+                            context.deadline_budget.last_semantic_progress
+                            if context.deadline_budget is not None
+                            else request_started_at
+                        )
+                        + idle_timeout,
+                    )
+                    if phase5
+                    else None
+                ),
+                absolute_provider_deadline=(
+                    min(wall_deadline, request_started_at + provider_timeout)
+                    if phase5
+                    else None
+                ),
                 max_process_tree_rss_bytes=(
                     execution_limits.process_tree_rss_bytes
                     if execution_limits is not None

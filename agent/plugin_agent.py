@@ -510,6 +510,9 @@ class PluginAgentRunRequest:
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
+    absolute_wall_deadline: float | None = None
+    absolute_idle_deadline: float | None = None
+    absolute_provider_deadline: float | None = None
     max_process_tree_rss_bytes: int = 2048 * 1024 * 1024
     max_process_tree_cpu_seconds: float = 900.0
     max_descendants: int = 32
@@ -558,6 +561,9 @@ class PluginAgentRunRequest:
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "wall_timeout_seconds": self.wall_timeout_seconds,
             "provider_request_timeout_seconds": self.provider_request_timeout_seconds,
+            "absolute_wall_deadline": self.absolute_wall_deadline,
+            "absolute_idle_deadline": self.absolute_idle_deadline,
+            "absolute_provider_deadline": self.absolute_provider_deadline,
             "max_process_tree_rss_bytes": self.max_process_tree_rss_bytes,
             "max_process_tree_cpu_seconds": self.max_process_tree_cpu_seconds,
             "max_descendants": self.max_descendants,
@@ -608,6 +614,9 @@ class PluginAgentRunRequest:
             "idle_timeout_seconds",
             "wall_timeout_seconds",
             "provider_request_timeout_seconds",
+            "absolute_wall_deadline",
+            "absolute_idle_deadline",
+            "absolute_provider_deadline",
             "max_process_tree_rss_bytes",
             "max_process_tree_cpu_seconds",
             "max_descendants",
@@ -1081,6 +1090,25 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("idle timeout cannot exceed wall timeout")
     if request.provider_request_timeout_seconds > request.wall_timeout_seconds:
         raise ValueError("provider request timeout cannot exceed wall timeout")
+    for label, value in (
+        ("absolute_wall_deadline", request.absolute_wall_deadline),
+        ("absolute_idle_deadline", request.absolute_idle_deadline),
+        ("absolute_provider_deadline", request.absolute_provider_deadline),
+    ):
+        if value is not None and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be finite and positive or None")
+    if request.absolute_wall_deadline is not None:
+        for label, value in (
+            ("absolute idle deadline", request.absolute_idle_deadline),
+            ("absolute provider deadline", request.absolute_provider_deadline),
+        ):
+            if value is not None and value > request.absolute_wall_deadline:
+                raise ValueError(f"{label} cannot exceed absolute wall deadline")
     for label, value in (
         ("cooperative shutdown", request.cooperative_shutdown_seconds),
         ("TERM grace", request.term_grace_seconds),
@@ -1673,6 +1701,29 @@ class PluginAgentRunner:
                     "persistent plugin-agent session is missing"
                 )
 
+        now = time.monotonic()
+        remaining_wall = request.wall_timeout_seconds
+        remaining_idle = request.idle_timeout_seconds
+        if request.absolute_wall_deadline is not None:
+            remaining_wall = min(
+                remaining_wall,
+                request.absolute_wall_deadline - now,
+            )
+        if request.absolute_idle_deadline is not None:
+            remaining_idle = min(
+                remaining_idle,
+                request.absolute_idle_deadline - now,
+            )
+        if remaining_wall <= 0:
+            raise TimeoutError("plugin-agent absolute wall deadline expired")
+        if remaining_idle <= 0:
+            raise TimeoutError("plugin-agent absolute idle deadline expired")
+        if (
+            request.absolute_provider_deadline is not None
+            and now >= request.absolute_provider_deadline
+        ):
+            raise TimeoutError("plugin-agent absolute provider deadline expired")
+
         payload = _request_payload(self.plugin_id, request)
         try:
             frame = _exchange_worker(
@@ -1680,8 +1731,8 @@ class PluginAgentRunner:
                 workdir=Path(request.workdir).expanduser().resolve()
                 if request.workdir
                 else None,
-                idle_timeout_seconds=request.idle_timeout_seconds,
-                wall_timeout_seconds=request.wall_timeout_seconds,
+                idle_timeout_seconds=min(remaining_idle, remaining_wall),
+                wall_timeout_seconds=remaining_wall,
                 is_cancelled=is_cancelled,
                 resource_limits=ProcessResourceLimits(
                     max_rss_bytes=request.max_process_tree_rss_bytes,

@@ -746,6 +746,29 @@ def assess_compatibility(
                         f"tool alias maps {requested} -> {target}",
                         code="tool_alias_mapped",
                     )
+        if "agents" in node_options and phase5:
+            explicit_allowed = node_options.get("allowed_tools")
+            denied = node_options.get("denied_tools", ())
+
+            def resolves_to_inline_agent(value: object) -> bool:
+                try:
+                    return resolve_tool_name(value) == "workflow_agent"
+                except (TypeError, ValueError):
+                    return False
+
+            unreachable = (
+                explicit_allowed is not None
+                and not any(resolves_to_inline_agent(value) for value in explicit_allowed)
+            ) or any(resolves_to_inline_agent(value) for value in denied)
+            if unreachable:
+                _finding(
+                    findings,
+                    f"{prefix}.agents",
+                    CompatibilityLevel.UNSUPPORTED,
+                    "inline agents are unreachable under the declared tool policy",
+                    code="tool_policy_incompatible",
+                    blocking=True,
+                )
         if "skills" in node_options and not phase5:
             _finding(
                 findings,
