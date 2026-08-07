@@ -24,6 +24,7 @@ import yaml
 
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission_service import assess_production_workflow_admission
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
 from plugins.workflow.compilation import (
     WorkflowCatalogSnapshot,
@@ -35,6 +36,7 @@ from plugins.workflow.compat import (
     CompatibilityLevel,
     CompatibilityReport,
     assess_compatibility,
+    require_runnable,
 )
 from plugins.workflow.entitlement import (
     validate_showcase_ai_contract,
@@ -47,7 +49,7 @@ from plugins.workflow.input_contract import (
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import RunExecutionLimits, WorkflowPackage
-from plugins.workflow.language import supports_phase4_semantics
+from plugins.workflow.language import supports_phase4_semantics, supports_phase5_semantics
 from plugins.workflow.schema import (
     load_workflow,
     load_workflow_snapshot,
@@ -1182,9 +1184,14 @@ def run_showcase(
     fixture_dir: Path | None = None
     with _scenario_compilation(scenario) as compilation:
         package = compilation.package
-        risk = _verified_distribution_risk(
+        phase5 = supports_phase5_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        verified_risk = _verified_distribution_risk(
             scenario,
             package,
+            enforce_runnable=not phase5,
             compilation=(
                 compilation
                 if supports_phase4_semantics(
@@ -1194,6 +1201,27 @@ def run_showcase(
                 else None
             ),
         )
+        assessment = (
+            assess_production_workflow_admission(
+                compilation,
+                requires_ai=scenario.requires_ai,
+            )
+            if phase5
+            else None
+        )
+        if assessment is not None:
+            require_runnable(assessment.compatibility)
+            if assessment.package_digest.sha256 != verified_risk.package_digest:
+                raise ShowcaseCatalogError(
+                    f"showcase package identity changed during admission: {scenario.id}"
+                )
+            risk = assessment.risk
+            preflight_execution(
+                risk,
+                trusted=scenario.verified_bundled_provenance,
+            )
+        else:
+            risk = verified_risk
         store, config = _store(home, package)
         try:
             inputs = None
@@ -1213,6 +1241,9 @@ def run_showcase(
                 inputs=inputs,
                 values={"arguments": symptom or ""},
                 execution_limits=RunExecutionLimits.resolve(config),
+                provider_authority=(
+                    assessment.provider_authority if assessment is not None else None
+                ),
             )
         finally:
             if fixture_dir is not None:
