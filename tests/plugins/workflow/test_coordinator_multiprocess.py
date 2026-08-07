@@ -16,7 +16,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from tools.managed_process import ProcessIdentity
 

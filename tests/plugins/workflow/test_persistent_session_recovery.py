@@ -42,7 +42,8 @@ from plugins.workflow.notifications import (
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+from plugins.workflow.schema import load_workflow_snapshot
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.sessions import (
     NodeSessionKey,
     NodeSessionRegistry,

@@ -35,7 +35,7 @@ from plugins.workflow.output_resolution import (
 )
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowPackageDigest
 

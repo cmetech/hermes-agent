@@ -14,6 +14,7 @@ import yaml
 
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission_service import assess_production_workflow_admission
 from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
 from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
@@ -339,7 +340,13 @@ def _archon_package(workflow_writer, tmp_path, *, field, value):
     node = (
         {"id": "start", "bash": "true", field: value}
         if field == "timeout"
-        else {"id": "start", "prompt": "x", field: value}
+        else {
+            "id": "start",
+            "prompt": "x",
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4",
+            field: value,
+        }
     )
     path = workflow_writer(
         tmp_path / ".hermes" / "workflows",
@@ -430,8 +437,18 @@ def test_current_archon_inherits_phase3_timeout_and_retry_fields(
     assert args.func(args) == 0
     result = _json_result(capsys)
     assert result["valid"] is True
-    assert result["issues"] == []
-    assert result["language"]["normalizer_version"] == 4
+    assert not any(issue["blocking"] for issue in result["issues"])
+    expected_resolution_paths = (
+        {"nodes[0].provider", "nodes[0].model"}
+        if field == "retry"
+        else set()
+    )
+    assert {
+        issue["path"]
+        for issue in result["issues"]
+        if issue["code"] == "provider_profile_resolution"
+    } == expected_resolution_paths
+    assert result["language"]["normalizer_version"] == 5
 
 
 def test_archon_cli_admission_seals_resolved_profile_execution_authority(
@@ -472,11 +489,10 @@ def test_archon_cli_admission_seals_resolved_profile_execution_authority(
         path.stem,
     )
     package = compilation.package
-    risk = build_risk_summary(
-        package,
-        assess_compatibility(package),
-        compilation=compilation,
-    )
+    risk = assess_production_workflow_admission(
+        compilation,
+        requires_ai=False,
+    ).risk
     WorkflowTrustStore(home).trust(
         compilation.composite_digest,
         actor="test",
@@ -535,7 +551,12 @@ def test_archon_phase_2_output_fields_validate(
     assert validate.func(validate) == 0
     result = _json_result(capsys)
     assert result["valid"] is True
-    assert result["issues"] == []
+    assert not any(issue["blocking"] for issue in result["issues"])
+    assert {
+        issue["path"]
+        for issue in result["issues"]
+        if issue["code"] == "provider_profile_resolution"
+    } == {"nodes[0].provider", "nodes[0].model"}
     assert result["language"]["effective_profile"] == "archon-2026-07"
 
 

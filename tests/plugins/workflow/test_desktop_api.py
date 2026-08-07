@@ -62,7 +62,7 @@ from plugins.workflow.scheduled_revalidation import (
     sealed_snapshot_digest,
     verify_sealed_snapshot,
 )
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.sessions import NodeSessionKey, SessionRegistryUpdateCandidate

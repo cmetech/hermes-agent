@@ -17,7 +17,8 @@ from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
+from plugins.workflow.schema import parse_workflow_source_bytes
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.sessions import (
     NodeSessionKey,
     PersistentSessionRecoverySelection,
