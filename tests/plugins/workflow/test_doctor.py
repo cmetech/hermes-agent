@@ -10,9 +10,10 @@ import types
 import yaml
 
 from plugins.workflow.cli import doctor_package
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.compat import CompatibilityLevel
 from plugins.workflow.models import WorkflowRuntimeConfig, WorkflowStructuredOutput
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.trust import WorkflowTrustStore
 
 
@@ -149,6 +150,90 @@ def test_doctor_reports_resources_trust_inputs_and_capacity_without_remote_calls
         finding.level is CompatibilityLevel.UNSUPPORTED and finding.blocking
         for finding in report.findings
     )
+
+
+def test_phase4_doctor_reports_logical_resources_across_include_origins(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    root_path = workflow_writer(
+        tmp_path / "root/workflows",
+        name="doctor-v4-root",
+        nodes=[
+            {"id": "inspect", "command": "inspect"},
+            {
+                "id": "normalize",
+                "script": "normalize",
+                "runtime": "uv",
+                "depends_on": ["inspect"],
+            },
+            {
+                "id": "child",
+                "include": "doctor-v4-child",
+                "depends_on": ["normalize"],
+            },
+        ],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child/workflows",
+        name="doctor-v4-child",
+        nodes=[{"id": "query", "prompt": "Query", "mcp": "local"}],
+    )
+    root = root_path.parents[1]
+    child = child_path.parents[1]
+    (root / "commands").mkdir()
+    (root / "commands/inspect.md").write_text(
+        "---\ndescription: Inspect\n---\nInspect safely.\n",
+        encoding="utf-8",
+    )
+    (root / "scripts").mkdir()
+    (root / "scripts/normalize.py").write_text(
+        "print('normalized')\n",
+        encoding="utf-8",
+    )
+    (child / "mcp").mkdir()
+    (child / "mcp/local.yaml").write_text(
+        "command: python\nargs: [server.py]\n",
+        encoding="utf-8",
+    )
+    root_source = parse_workflow_source_bytes(
+        root_path,
+        workflow_bytes=root_path.read_bytes(),
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        source="project",
+        precedence=1,
+    )
+    child_source = parse_workflow_source_bytes(
+        child_path,
+        workflow_bytes=child_path.read_bytes(),
+        sidecar_bytes=None,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        root_source,
+        WorkflowCatalogSnapshot.capture((root_source, child_source)),
+        normalizer_version=4,
+    )
+
+    report = doctor_package(
+        compilation.package,
+        compilation=compilation,
+        hermes_home=tmp_path / "home",
+        available_runtimes=frozenset({"uv"}),
+        mcp_available=True,
+    )
+    expected = {
+        binding.resource_kind: (
+            f"{binding.package_key}::{binding.source_relative_path}"
+        )
+        for binding in compilation.dependency_manifest.resources
+        if binding.resource_kind in {"command", "named_script", "mcp"}
+    }
+
+    assert report.resolved_commands == (expected["command"],)
+    assert report.resolved_scripts == (expected["named_script"],)
+    assert report.resolved_mcp_servers == (expected["mcp"],)
 
 
 def test_doctor_trust_is_bound_to_the_current_risk_digest(tmp_path: Path) -> None:

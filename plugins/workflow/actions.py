@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from plugins.workflow.models import LoopSignalConfirmation
+
 
 INSPECTION_ACTIONS = ("status", "events")
 MUTATION_ACTIONS = frozenset({
@@ -18,6 +20,7 @@ MUTATION_ACTIONS = frozenset({
     "archive",
     "restore",
 })
+WIRE_ACTIONS = frozenset(INSPECTION_ACTIONS) | MUTATION_ACTIONS
 LANE_STATES = frozenset({"held", "released"})
 
 
@@ -54,6 +57,18 @@ def available_actions(
     if status == "paused":
         if interaction_type in {"approval", "workflow_approval"}:
             actions.extend(("approve", "reject", "cancel"))
+        elif interaction_type == "loop_signal_confirmation":
+            try:
+                confirmation = LoopSignalConfirmation.from_mapping(
+                    pending_interaction
+                )
+            except ValueError:
+                actions.append("cancel")
+                return actions
+            actions.append("approve")
+            if confirmation.iteration < confirmation.max_iterations:
+                actions.append("provide-input")
+            actions.append("cancel")
         elif interaction_type == "loop_input":
             actions.extend(("provide-input", "cancel"))
         elif interaction_type == "reconcile":
@@ -95,6 +110,7 @@ __all__ = [
     "INSPECTION_ACTIONS",
     "LANE_STATES",
     "MUTATION_ACTIONS",
+    "WIRE_ACTIONS",
     "available_actions",
     "lane_state_for",
     "mutation_is_valid",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.structured_output import normalize_schema
@@ -25,10 +27,19 @@ def _archon_workflow(workflow_writer, tmp_path, *, nodes):
     return path
 
 
+def _load_v3(path):
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
+
+
 def test_archon_normalizes_output_format_and_accepts_output_type(
     workflow_writer, tmp_path
 ):
-    package = load_workflow(
+    package = _load_v3(
         _archon_workflow(
             workflow_writer,
             tmp_path,
@@ -269,6 +280,43 @@ def test_archon_yaml_preserves_integer_beyond_runtime_decimal_digit_limit(
     assert (
         package.language.structured_outputs["producer"].canonical_schema["maximum"]
         == 10**4_999
+    )
+
+
+def test_phase4_dependency_digest_encoder_preserves_ordinary_canonical_json() -> None:
+    from plugins.workflow.dependency_manifest import _canonical_json
+
+    value = {
+        "boolean": True,
+        "integer": 42,
+        "nested": [None, "分析", {"value": 1.5}],
+    }
+
+    assert _canonical_json(value) == json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def test_phase4_dependency_digest_encoder_preserves_nonfinite_canonical_json() -> None:
+    from plugins.workflow.dependency_manifest import _canonical_json
+
+    value = {
+        "negative": float("-inf"),
+        "not_a_number": float("nan"),
+        "positive": float("inf"),
+    }
+
+    assert _canonical_json(value) == json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert _canonical_json({"value": float("nan")}) != _canonical_json(
+        {"value": "NaN"}
     )
 
 
@@ -668,7 +716,7 @@ def test_prompt_reference_keeps_conservative_phase_two_admission(
         },
     ),
 )
-def test_non_interpolated_fields_are_not_static_reference_surfaces(
+def test_v3_non_interpolated_fields_are_not_static_reference_surfaces(
     workflow_writer, tmp_path, consumer
 ) -> None:
     producer = {
@@ -681,7 +729,7 @@ def test_non_interpolated_fields_are_not_static_reference_surfaces(
         },
     }
 
-    package = load_workflow(
+    package = _load_v3(
         _archon_workflow(
             workflow_writer,
             tmp_path,

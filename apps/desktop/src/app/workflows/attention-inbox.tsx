@@ -1,6 +1,8 @@
 import { useI18n } from '@/i18n'
 import type { WorkflowAttentionItem } from '@/types/hermes'
 
+import { isLoopSignalConfirmation } from './run-inspector'
+
 interface AttentionInboxProps {
   items: WorkflowAttentionItem[]
   onOpenRun: (runId: string) => void
@@ -23,7 +25,9 @@ function ageParts(updatedAt: string): { count: number; unit: 'day' | 'hour' | 'm
 export function AttentionInbox({ items, onOpenRun }: AttentionInboxProps) {
   const { t } = useI18n()
 
-  if (items.length === 0) {return null}
+  if (items.length === 0) {
+    return null
+  }
 
   return (
     <section aria-label={t.operations.workflowAttention} className="py-3">
@@ -32,17 +36,18 @@ export function AttentionInbox({ items, onOpenRun }: AttentionInboxProps) {
         {items.map(item => {
           const age = ageParts(item.updated_at)
           const action = item.next_actions.find(candidate => !['events', 'status'].includes(candidate))
+          const signalConfirmation = isLoopSignalConfirmation(item.interaction)
 
           const actionLabel = action
             ? ({
                 abandon: t.operations.abandon,
-                approve: t.operations.approve,
+                approve: signalConfirmation ? t.operations.acceptResult : t.operations.approve,
                 cancel: t.operations.cancel,
                 reconcile: t.operations.reconcile,
                 reject: t.operations.reject,
                 resume: t.operations.resume,
                 retry: t.operations.retry,
-                'provide-input': t.operations.provideInput
+                'provide-input': signalConfirmation ? t.operations.continueWithFeedback : t.operations.provideInput
               }[action] ?? action.replaceAll('-', ' '))
             : null
 

@@ -33,7 +33,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowValidationError,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import RunStore
@@ -213,6 +213,15 @@ def _catalog_session_package(workflow_writer, root, *, name, nodes=None):
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     return load_workflow(path)
+
+
+def _load_v3(path):
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
 
 
 def _run_catalog_session(store, package, scheduler, key):
@@ -444,7 +453,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as unsafe_exc:
-        load_workflow(unsafe)
+        _load_v3(unsafe)
     emitted.add(unsafe_exc.value.issues[0].code)
 
     undeclared = workflow_writer(
@@ -458,7 +467,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as undeclared_exc:
-        load_workflow(undeclared)
+        _load_v3(undeclared)
     emitted.add(undeclared_exc.value.issues[0].code)
 
     unsupported = workflow_writer(
@@ -476,7 +485,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as unsupported_exc:
-        load_workflow(unsupported)
+        _load_v3(unsupported)
     emitted.add(unsupported_exc.value.issues[0].code)
 
     impossible = workflow_writer(
@@ -502,7 +511,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as impossible_exc:
-        load_workflow(impossible)
+        _load_v3(impossible)
     emitted.add(impossible_exc.value.issues[0].code)
 
     named_root = tmp_path / "named"
@@ -526,7 +535,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as named_exc:
-        compute_package_digest(load_workflow(named))
+        compute_package_digest(_load_v3(named))
     emitted.add(named_exc.value.issues[0].code)
 
     invalid_command_root = tmp_path / "invalid-command"
@@ -542,7 +551,7 @@ def _emit_static_admission_codes(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError) as invalid_command_exc:
-        compute_package_digest(load_workflow(invalid_command))
+        compute_package_digest(_load_v3(invalid_command))
     emitted.add(invalid_command_exc.value.issues[0].code)
 
     assert emitted == {

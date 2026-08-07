@@ -8,6 +8,7 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -17,7 +18,10 @@ import pytest
 import yaml
 
 from plugins.workflow.compat import assess_compatibility
-from plugins.workflow.catalog_api import workflow_catalog_run_support
+from plugins.workflow.catalog_api import (
+    resolve_workflow_catalog_compilation,
+    workflow_catalog_run_support,
+)
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
@@ -332,7 +336,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**detail_status, "effective_profile": "hermes-legacy"},
         {**detail_status, "legacy": 0},
         {**detail_status, "normalizer_version": True},
-        {**detail_status, "normalizer_version": 4},
+        {**detail_status, "normalizer_version": 5},
         {**detail_status, "normalized_definition_digest": "A" * 64},
         {**detail_status, "normalized_definition_digest": "a" * 63},
     ]
@@ -1418,6 +1422,71 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert set(row["compatibility"]) == {"level", "runnable"}
 
 
+def test_current_v4_composite_trust_is_consistent_between_catalog_and_detail(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    root = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="catalog-v4-composite",
+        filename="catalog-v4-composite.yaml",
+        nodes=[{"id": "dependency", "include": "catalog-v4-child"}],
+    )
+    root.with_name("catalog-v4-composite.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="catalog-v4-child",
+        filename="catalog-v4-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    compilation = resolve_workflow_catalog_compilation(
+        "catalog-v4-composite",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="project",
+    )
+    assert compilation is not None
+    risk = build_risk_summary(
+        compilation.package,
+        assess_compatibility(compilation.package),
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="catalog-v4-test",
+        risk_digest=risk.risk_digest,
+    )
+
+    router = _module().router
+    catalog_response = _catalog_get(router, token=_reader())
+    detail_response = _detail_get(
+        router,
+        "catalog-v4-composite",
+        source="project",
+        token=_reader(),
+    )
+
+    assert catalog_response.status_code == detail_response.status_code == 200
+    catalog_row = next(
+        item
+        for item in _user_items(catalog_response)
+        if item["name"] == "catalog-v4-composite"
+    )
+    detail = detail_response.json()
+    assert catalog_row["trust_state"] == detail["trust_state"] == "trusted"
+    assert detail["risk_summary"]["package_digest"] == compilation.composite_digest
+    assert detail["compilation"]["composite_digest"] == (
+        compilation.composite_digest
+    )
+
+
 def test_workflow_detail_bounds_more_than_512_real_findings_and_keeps_omitted_blocker(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -1880,19 +1949,21 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
     workflow_writer(home / "workflows", name="placeholder", filename="long.yaml")
     import plugins.workflow.catalog_api as catalog_api
 
-    original_load = catalog_api.load_workflow
+    original_compile = catalog_api.compile_workflow
     long_name = "x" * 129
 
-    def long_name_load(path, **kwargs):
-        package = original_load(path, **kwargs)
-        if Path(path).name == "long.yaml":
-            return replace(
-                package,
-                definition=replace(package.definition, name=long_name),
+    def long_name_compile(source, *args, **kwargs):
+        compiled = original_compile(source, *args, **kwargs)
+        if source.workflow_path.name == "long.yaml":
+            return SimpleNamespace(
+                package=replace(
+                    compiled.package,
+                    definition=replace(compiled.package.definition, name=long_name),
+                )
             )
-        return package
+        return compiled
 
-    monkeypatch.setattr(catalog_api, "load_workflow", long_name_load)
+    monkeypatch.setattr(catalog_api, "compile_workflow", long_name_compile)
 
     response = _catalog_get(_module().router, token=_reader())
 
@@ -1973,6 +2044,39 @@ def test_workflow_catalog_isolates_invalid_definition(
     assert b"Traceback" not in response.content
 
 
+def test_workflow_catalog_isolates_unexpected_compiler_type_error(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch one compiler type gap disabling every healthy catalog entry."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="valid", filename="valid.yaml")
+    workflow_writer(home / "workflows", name="broken", filename="broken.yaml")
+    import plugins.workflow.catalog_api as catalog_api
+
+    original_compile = catalog_api.compile_workflow
+
+    def compile_with_one_type_gap(source, *args, **kwargs):
+        if source.name == "broken":
+            raise TypeError("synthetic internal canonicalization gap")
+        return original_compile(source, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_api, "compile_workflow", compile_with_one_type_gap)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert [item["name"] for item in _user_items(response)] == ["broken", "valid"]
+    assert _user_items(response)[0] == {
+        "name": "broken",
+        "error": "invalid_definition",
+    }
+    assert _user_items(response)[1]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+
+
 def test_workflow_catalog_caps_items_and_reports_truncation(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -1983,22 +2087,22 @@ def test_workflow_catalog_caps_items_and_reports_truncation(
         workflow_writer(home / "workflows", name=name, filename=f"{name}.yaml")
     import plugins.workflow.catalog_api as catalog_api
 
-    original_load = catalog_api.load_workflow
+    original_parse = catalog_api.parse_workflow_source_bytes
     original_read = catalog_api.WorkflowTrustStore._read
     loaded = 0
     trust_reads = 0
 
-    def counted_load(*args, **kwargs):
+    def counted_parse(*args, **kwargs):
         nonlocal loaded
         loaded += 1
-        return original_load(*args, **kwargs)
+        return original_parse(*args, **kwargs)
 
     def counted_read(*args, **kwargs):
         nonlocal trust_reads
         trust_reads += 1
         return original_read(*args, **kwargs)
 
-    monkeypatch.setattr(catalog_api, "load_workflow", counted_load)
+    monkeypatch.setattr(catalog_api, "parse_workflow_source_bytes", counted_parse)
     monkeypatch.setattr(catalog_api.WorkflowTrustStore, "_read", counted_read)
 
     response = _catalog_get(_module().router, token=_reader())

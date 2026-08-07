@@ -25,6 +25,11 @@ import yaml
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
+from plugins.workflow.compilation import (
+    WorkflowCatalogSnapshot,
+    WorkflowCompilation,
+    compile_workflow,
+)
 from plugins.workflow.compat import (
     CompatibilityFinding,
     CompatibilityLevel,
@@ -42,7 +47,12 @@ from plugins.workflow.input_contract import (
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import RunExecutionLimits, WorkflowPackage
-from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+from plugins.workflow.language import supports_phase4_semantics
+from plugins.workflow.schema import (
+    load_workflow,
+    load_workflow_snapshot,
+    parse_workflow_source_bytes,
+)
 from plugins.workflow.store import RunStore
 from plugins.workflow.sanitize import (
     workflow_filename_components_are_distinct,
@@ -109,6 +119,7 @@ class ShowcaseScenario:
 class VerifiedShowcasePackage:
     scenario: ShowcaseScenario
     package: WorkflowPackage
+    compilation: WorkflowCompilation
     package_digest: str
     bundle_digest: str
 
@@ -663,18 +674,76 @@ def _scenario_package(
         )
 
 
+def _compile_showcase_package(
+    package: WorkflowPackage,
+    *,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    catalog_packages: tuple[WorkflowPackage, ...] = (),
+) -> WorkflowCompilation:
+    def source_document(candidate: WorkflowPackage):
+        workflow_bytes = (
+            read_budget.read_cached(candidate.workflow_path)
+            if read_budget is not None
+            else candidate.workflow_path.read_bytes()
+        )
+        sidecar_bytes = None
+        if candidate.sidecar_path is not None:
+            sidecar_bytes = (
+                read_budget.read_cached(candidate.sidecar_path)
+                if read_budget is not None
+                else candidate.sidecar_path.read_bytes()
+            )
+        return parse_workflow_source_bytes(
+            candidate.workflow_path,
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=sidecar_bytes,
+            source=candidate.source,
+            precedence=candidate.precedence,
+        )
+
+    candidates = catalog_packages or (package,)
+    sources = tuple(source_document(candidate) for candidate in candidates)
+    root = next(
+        source
+        for source in sources
+        if source.workflow_path == package.workflow_path
+        and source.source == package.source
+        and source.precedence == package.precedence
+    )
+    return compile_workflow(root, WorkflowCatalogSnapshot.capture(sources))
+
+
+@contextmanager
+def _scenario_compilation(
+    scenario: ShowcaseScenario,
+) -> Iterator[WorkflowCompilation]:
+    """Keep materialized distribution paths alive through admission preparation."""
+    catalog = load_showcase_catalog()
+    with _bundle_path() as root:
+        packages_by_id = {
+            candidate_id: _scenario_package(candidate, bundle_root=root)
+            for candidate_id, candidate in catalog.items()
+        }
+        yield _compile_showcase_package(
+            packages_by_id[scenario.id],
+            catalog_packages=tuple(packages_by_id.values()),
+        )
+
+
 def _verified_distribution_risk(
     scenario: ShowcaseScenario,
     package: WorkflowPackage,
     read_budget: WorkflowResourceReadBudget | None = None,
     *,
     enforce_runnable: bool = True,
+    compilation: WorkflowCompilation | None = None,
 ) -> WorkflowRiskSummary:
     risk, _compatibility = _verified_distribution_assessment(
         scenario,
         package,
         read_budget,
         enforce_runnable=enforce_runnable,
+        compilation=compilation,
     )
     return risk
 
@@ -685,6 +754,7 @@ def _verified_distribution_assessment(
     read_budget: WorkflowResourceReadBudget | None = None,
     *,
     enforce_runnable: bool = True,
+    compilation: WorkflowCompilation | None = None,
 ) -> tuple[WorkflowRiskSummary, CompatibilityReport]:
     if not scenario.verified_bundled_provenance:
         raise ShowcaseCatalogError(
@@ -703,6 +773,15 @@ def _verified_distribution_assessment(
         package,
         compatibility,
         read_budget=read_budget,
+        compilation=(
+            compilation
+            if compilation is not None
+            and supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            else None
+        ),
     )
     try:
         preflight_execution(
@@ -848,25 +927,40 @@ def _verify_and_cache_showcase_packages(
         allow_repair=False,
     )
     verified: dict[str, VerifiedShowcasePackage] = {}
+    loaded_packages: dict[str, WorkflowPackage] = {}
     for scenario_id, scenario in catalog.items():
         if not scenario.verified_bundled_provenance:
             raise ShowcaseCatalogError(
                 "showcase lacks verified bundled distribution provenance"
             )
-        package = _scenario_package(
+        loaded_packages[scenario_id] = _scenario_package(
             scenario,
             source="showcase",
             precedence=3,
             bundle_root=resolved_root,
             read_budget=read_budget,
         )
+    catalog_packages = tuple(loaded_packages.values())
+    for scenario_id, scenario in catalog.items():
+        package = loaded_packages[scenario_id]
+        compilation = _compile_showcase_package(
+            package,
+            read_budget=read_budget,
+            catalog_packages=catalog_packages,
+        )
+        package = compilation.package
+        phase4 = supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
         verified[scenario_id] = VerifiedShowcasePackage(
             scenario=scenario,
             package=package,
+            compilation=compilation,
             package_digest=compute_package_digest(
                 package,
                 read_budget=read_budget,
-            ).sha256,
+            ).sha256 if not phase4 else compilation.composite_digest,
             bundle_digest=bundle_digest,
         )
 
@@ -1085,24 +1179,44 @@ def run_showcase(
         return _schedule_showcase(scenario, home=home, schedule_at=schedule_at, token=confirmation_token)
     if showcase_id == "laptop-diagnostic" and not (symptom and symptom.strip()):
         return {"status": "input_required", "reason_code": "showcase_input_required", "required_input": "symptom", "run_id": None}
-    package = _scenario_package(scenario)
-    risk = _verified_distribution_risk(scenario, package)
-    store, config = _store(home, package)
     fixture_dir: Path | None = None
-    try:
-        inputs = None
-        if showcase_id == "laptop-diagnostic":
-            fixture_dir, fixture = _stage_fixture(home)
-            inputs = {"evidence": fixture}
-        prepared = store.prepare_run_snapshot(
+    with _scenario_compilation(scenario) as compilation:
+        package = compilation.package
+        risk = _verified_distribution_risk(
+            scenario,
             package,
-            inputs=inputs,
-            values={"arguments": symptom or ""},
-            execution_limits=RunExecutionLimits.resolve(config),
+            compilation=(
+                compilation
+                if supports_phase4_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                )
+                else None
+            ),
         )
-    finally:
-        if fixture_dir is not None:
-            shutil.rmtree(fixture_dir, ignore_errors=True)
+        store, config = _store(home, package)
+        try:
+            inputs = None
+            if showcase_id == "laptop-diagnostic":
+                fixture_dir, fixture = _stage_fixture(home)
+                inputs = {"evidence": fixture}
+            prepared = store.prepare_run_snapshot(
+                package,
+                compilation=(
+                    compilation
+                    if supports_phase4_semantics(
+                        package.language.effective_profile,
+                        package.language.normalizer_version,
+                    )
+                    else None
+                ),
+                inputs=inputs,
+                values={"arguments": symptom or ""},
+                execution_limits=RunExecutionLimits.resolve(config),
+            )
+        finally:
+            if fixture_dir is not None:
+                shutil.rmtree(fixture_dir, ignore_errors=True)
     intent_key = idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name, definition_digest=prepared.definition_digest,

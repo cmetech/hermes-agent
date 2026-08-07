@@ -691,6 +691,93 @@ def test_authenticated_gateway_command_starts_real_background_run(
     assert run["provenance"]["return_route"] == "opaque-capability"
 
 
+def test_authenticated_gateway_explicit_phase4_run_seals_profile_include(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    from types import MappingProxyType, SimpleNamespace
+
+    import plugins.workflow.language as language_module
+    from plugins.workflow.cli import _resolve_compilation
+    from plugins.workflow.models import WorkflowLanguageProfile
+
+    monkeypatch.setattr(
+        language_module,
+        "CURRENT_NORMALIZER_BY_PROFILE",
+        MappingProxyType({
+            WorkflowLanguageProfile.HERMES_LEGACY: 2,
+            WorkflowLanguageProfile.ARCHON_2026_07: 4,
+        }),
+    )
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    root = workflow_writer(
+        tmp_path / "explicit",
+        name="gateway-explicit-root",
+        filename="gateway-explicit-root.yaml",
+        nodes=[{"id": "child", "include": "gateway-explicit-child"}],
+    )
+    root.with_name("gateway-explicit-root.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="gateway-explicit-child",
+        filename="gateway-explicit-child.yaml",
+        nodes=[{"id": "execute", "bash": "true"}],
+    )
+    compilation = _resolve_compilation(
+        SimpleNamespace(workdir=workdir, hermes_home=home),
+        str(root),
+    )
+    risk = build_risk_summary(
+        compilation.package,
+        assess_compatibility(compilation.package),
+        compilation=compilation,
+    )
+    WorkflowTrustStore(home).trust(
+        compilation.composite_digest,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-phase4-test",
+            host_kind="gateway",
+            host_instance_id="gateway-phase4-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"run {shlex.quote(str(root))} --idempotency-key phase4-explicit",
+            invocation,
+            hermes_home=home,
+            workdir=workdir,
+        )
+    )
+
+    assert response["ok"] is True
+    run = store.get_run_status(
+        response["result"]["run_id"],
+        operator_scope=invocation.operator_scope,
+    )
+    assert run["snapshot_format_version"] == 2
+    assert run["definition_digest"] == compilation.composite_digest
+
+
 def test_gateway_run_refuses_declared_archon_incompatibility_before_persistence(
     tmp_path, workflow_writer
 ) -> None:

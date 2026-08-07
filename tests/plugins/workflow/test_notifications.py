@@ -6,16 +6,19 @@ import logging
 import threading
 from types import SimpleNamespace
 
+from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 def _terminal_background_failure(tmp_path, workflow_writer, *, name: str):
@@ -403,6 +406,104 @@ def test_coordinator_reconciles_journal_outbox_crash_gap(
     facts = outbox.history(run_id=admitted.run_id)
     assert facts[0]["kind"] == "completion"
     assert facts[0]["state"] == "suppressed"
+
+
+def test_repaired_phase4_signal_notification_matches_primary_payload(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    workflow_path = workflow_writer(
+        tmp_path / "phase4-signal/workflows",
+        name="phase4-notification-repair",
+        filename="phase4-notification-repair.yaml",
+        interactive=True,
+        nodes=[{
+            "id": "refine",
+            "loop": {
+                "prompt": "Refine",
+                "until": "DONE",
+                "max_iterations": 3,
+                "interactive": True,
+                "gate_message": "Accept or refine",
+            },
+        }],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        workflow_path,
+        workflow_bytes=workflow_path.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    store = RunStore(tmp_path / "phase4-home")
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=compilation.package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="phase4-notification-repair",
+            concurrency_key="phase4-notification-repair",
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class SignalRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="draft <promise>DONE</promise>",
+                session_id="notification-repair-session",
+                provider=request.provider or "fake-provider",
+                model=request.model or "fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    RunScheduler(store, agent_runner=SignalRunner()).advance(admitted.run_id)
+    outbox = NotificationOutbox(store)
+    primary = next(
+        item
+        for item in outbox.history(run_id=admitted.run_id)
+        if item["kind"] == "approval_required"
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?",
+            (admitted.run_id,),
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?",
+            (admitted.run_id,),
+        )
+
+    assert outbox.reconcile_run(admitted.run_id) >= 1
+    repaired = next(
+        item
+        for item in outbox.history(run_id=admitted.run_id)
+        if item["kind"] == primary["kind"]
+        and item["transition_version"] == primary["transition_version"]
+    )
+
+    assert repaired["kind"] == primary["kind"]
+    assert repaired["transition_version"] == primary["transition_version"]
+    assert repaired["payload"] == primary["payload"]
 
 
 def test_journal_reconciliation_pages_and_wraps_without_stranding_old_runs(

@@ -168,6 +168,27 @@ def test_operator_phase3_guidance_uses_the_dynamic_catalog_authority() -> None:
     ]
 
 
+def test_operator_current_v4_guidance_keeps_backend_actions_authoritative() -> None:
+    """Retrieve the current interaction contract from its backend authority."""
+    current = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    phase4 = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+    topics = {item["id"]: item for item in phase4["documentation"]["topics"]}
+    parameters = topics["ordinary-loops-and-includes"]["parameters"]
+
+    assert current["normalizer_version"] == 4
+    assert phase4["normalizer_version"] == 4
+    assert current == phase4
+    assert parameters["signal_confirmation_actions"] == {
+        "before_final_iteration": ["approve", "provide-input", "cancel"],
+        "final_iteration": ["approve", "cancel"],
+    }
+    assert parameters["wire_actions_reused"] is True
+    assert parameters["approval_reexecutes_provider"] is False
+
+
 def test_operator_skills_are_structured_and_defer_syntax_to_runtime() -> None:
     skill_paths = (
         REPO_ROOT / "skills/productivity/workflow/SKILL.md",

@@ -48,9 +48,12 @@ from plugins.workflow.language import (
     WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
     read_language_snapshot,
+    supports_phase3_semantics,
+    supports_phase4_semantics,
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
+from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
@@ -63,6 +66,7 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
+    freeze_value,
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -79,6 +83,7 @@ from plugins.workflow.output_resolution import (
     resolve_node_output,
     resolve_output_reference,
     resolved_output_publication_identity,
+    _read_descriptor_relative,
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import (
@@ -91,6 +96,7 @@ from plugins.workflow.store import (
     ArtifactRef,
     NodeClaim,
     RunStore,
+    StaleLoopDecisionError,
     StorageQuotaError,
     TypedPublicationCandidate,
 )
@@ -112,6 +118,10 @@ _CLAUSE = re.compile(
     re.UNICODE,
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class LoopInputIntegrityError(ValueError):
+    """A durable loop input no longer matches its projected identity."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +503,343 @@ def evaluate_condition(expression: str, outputs: Mapping[str, object]) -> bool:
     )
 
 
+def load_snapshot_format2(
+    snapshot_root: Path,
+    projection: Mapping[str, object],
+    resources: Mapping[str, object],
+    authenticated_bytes: Mapping[str, bytes],
+) -> WorkflowPackage:
+    """Load one exact format-2 execution package from authenticated bytes only."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot
+    from plugins.workflow.dependency_manifest import (
+        WorkflowDependencyManifest,
+        composite_workflow_digest,
+        digest_expanded_compilation,
+        digest_node_origins,
+    )
+    from plugins.workflow.includes import collect_include_edges, expand_workflow_source
+    from plugins.workflow.language import bind_v4_loop_command_semantics
+    from plugins.workflow.models import WorkflowNodeOrigin
+    from plugins.workflow.schema import (
+        _compile_workflow_source_document,
+        parse_workflow_source_bytes,
+    )
+
+    def mismatch(message: str, cause: BaseException | None = None):
+        error = WorkflowLanguageCompatibilityError(
+            "workflow_snapshot_integrity_mismatch",
+            message,
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    if projection.get("snapshot_format_version") != 2:
+        mismatch("workflow snapshot format identity is not version 2")
+    definition_bytes = authenticated_bytes.get("definition.yaml")
+    policy_bytes = authenticated_bytes.get("policy.yaml")
+    manifest_bytes = authenticated_bytes.get("dependencies.json")
+    if not all(
+        isinstance(value, bytes)
+        for value in (definition_bytes, policy_bytes, manifest_bytes)
+    ):
+        mismatch("format-2 workflow authorities are incomplete")
+    assert isinstance(definition_bytes, bytes)
+    assert isinstance(policy_bytes, bytes)
+    assert isinstance(manifest_bytes, bytes)
+
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    if (
+        resources.get("snapshot_format_version") != 2
+        or resources.get("dependency_manifest_digest") != manifest_digest
+        or projection.get("dependency_manifest_digest") != manifest_digest
+    ):
+        mismatch("dependency manifest identity changed")
+    try:
+        manifest_raw = json.loads(manifest_bytes)
+        manifest = WorkflowDependencyManifest.from_dict(manifest_raw)
+    except (UnicodeError, ValueError) as exc:
+        mismatch("dependency manifest is malformed", exc)
+    if manifest.canonical_bytes() != manifest_bytes:
+        mismatch("dependency manifest is not canonical")
+    if (
+        hashlib.sha256(policy_bytes).hexdigest()
+        != manifest.active_root_policy_digest
+    ):
+        mismatch("active root policy identity changed")
+    composite_digest = composite_workflow_digest(manifest)
+    if projection.get("definition_digest") != composite_digest:
+        mismatch("composite workflow identity changed")
+
+    bindings_by_package: dict[str, dict[str, list[object]]] = {}
+    for binding in manifest.resources:
+        sealed = authenticated_bytes.get(binding.snapshot_path)
+        if (
+            sealed is None
+            or len(sealed) != binding.compiled_byte_size
+            or hashlib.sha256(sealed).hexdigest() != binding.compiled_digest
+        ):
+            mismatch("sealed workflow resource identity changed")
+        bindings_by_package.setdefault(binding.package_key, {}).setdefault(
+            binding.resource_kind,
+            [],
+        ).append(binding)
+
+    records = (manifest.root, *manifest.dependencies)
+
+    def source_from_record(record):
+        package_bindings = bindings_by_package.get(record.package_key, {})
+        definitions = package_bindings.get("definition", [])
+        sidecars = package_bindings.get("sidecar", [])
+        if len(definitions) != 1 or len(sidecars) > 1:
+            mismatch("sealed package definition authority is ambiguous")
+        definition_binding = definitions[0]
+        encoded_definition = authenticated_bytes[definition_binding.snapshot_path]
+        if hashlib.sha256(encoded_definition).hexdigest() != record.definition_digest:
+            mismatch("sealed origin definition identity changed")
+        encoded_sidecar = None
+        if record.sidecar_status != "absent":
+            if len(sidecars) != 1:
+                mismatch("sealed package sidecar authority is missing")
+            sidecar_binding = sidecars[0]
+            encoded_sidecar = authenticated_bytes[sidecar_binding.snapshot_path]
+            if (
+                record.sidecar_digest is None
+                or hashlib.sha256(encoded_sidecar).hexdigest()
+                != record.sidecar_digest
+            ):
+                mismatch("sealed origin sidecar identity changed")
+        elif sidecars:
+            mismatch("absent package sidecar has sealed authority")
+        try:
+            source = parse_workflow_source_bytes(
+                snapshot_root / definition_binding.snapshot_path,
+                workflow_bytes=encoded_definition,
+                sidecar_bytes=encoded_sidecar,
+                source=record.catalog_source,
+                precedence=record.precedence,
+            )
+        except (OSError, ValueError, WorkflowValidationError) as exc:
+            mismatch("sealed origin package is malformed", exc)
+        if (
+            source.name != record.workflow_name
+            or source.definition_location != record.definition_location
+            or source.sidecar_location != record.sidecar_location
+        ):
+            mismatch("sealed origin package identity changed")
+        return source
+
+    sealed_sources = tuple(source_from_record(record) for record in records)
+    root_source = sealed_sources[0]
+    catalog = WorkflowCatalogSnapshot.capture(sealed_sources)
+    try:
+        expanded = expand_workflow_source(root_source, catalog)
+        expanded_dependency_keys = {
+            f"{source.source}:{source.name}" for source in expanded.dependencies
+        }
+        manifest_dependency_keys = {
+            record.package_key for record in manifest.dependencies
+        }
+        if expanded_dependency_keys != manifest_dependency_keys:
+            mismatch("sealed dependency closure identity changed")
+        rebuilt_edges = tuple(
+            sorted(
+                (dict(edge) for edge in collect_include_edges(root_source, catalog)),
+                key=lambda item: (
+                    tuple(item["include_instance_path"]),
+                    item["source_package_key"],
+                    item["source_node_id"],
+                    item["target_package_key"],
+                ),
+            )
+        )
+        if rebuilt_edges != tuple(manifest.to_dict()["include_edges"]):
+            mismatch("sealed include-edge identity changed")
+        identity_source = replace(
+            root_source,
+            nodes=expanded.nodes,
+            definition_bytes=expanded.canonical_definition_bytes,
+        )
+        identity_package = _compile_workflow_source_document(
+            identity_source,
+            normalizer_version=4,
+        )
+        identity_package = bind_v4_loop_command_semantics(
+            identity_package,
+            {
+                binding.node_id: binding.snapshot_path
+                for binding in manifest.resources
+                if binding.resource_kind == "loop_command"
+                and binding.node_id is not None
+            },
+        )
+    except WorkflowLanguageCompatibilityError:
+        raise
+    except (KeyError, ValueError, WorkflowValidationError) as exc:
+        mismatch("sealed dependency closure cannot be reconstructed", exc)
+
+    manifest_origins = tuple(
+        sorted(
+            (WorkflowNodeOrigin(**dict(raw)) for raw in manifest.node_origins),
+            key=lambda item: item.expanded_node_id,
+        )
+    )
+    origins_by_id = {
+        origin.expanded_node_id: origin for origin in manifest_origins
+    }
+    identity_origins = tuple(sorted(
+        (
+        node.origin
+        for node in identity_package.definition.nodes
+        if node.origin is not None
+        ),
+        key=lambda item: item.expanded_node_id,
+    ))
+    if (
+        set(origins_by_id) != {node.id for node in identity_package.definition.nodes}
+        or identity_origins != manifest_origins
+        or digest_node_origins(identity_origins)
+        != manifest.node_origins_digest
+        or digest_expanded_compilation(definition_bytes, identity_package)
+        != manifest.expanded_definition_digest
+    ):
+        mismatch("expanded workflow package identity changed")
+
+    language_snapshot = read_language_snapshot(resources.get("language"))
+    if language_snapshot is None or language_snapshot.normalizer_version != 4:
+        mismatch("format-2 language identity is missing")
+    verify_language_snapshot(
+        identity_package,
+        composite_digest,
+        language_snapshot,
+    )
+
+    try:
+        runtime_source = parse_workflow_source_bytes(
+            snapshot_root / "definition.yaml",
+            workflow_bytes=definition_bytes,
+            sidecar_bytes=policy_bytes,
+            source=manifest.root.catalog_source,
+            precedence=manifest.root.precedence,
+        )
+        runtime_nodes = []
+        for node in runtime_source.nodes:
+            origin = origins_by_id.get(node.id)
+            if origin is None:
+                mismatch("expanded workflow node origin is missing")
+            runtime_nodes.append(replace(
+                node,
+                source_index=origin.source_index,
+                source_line=origin.source_line,
+                origin=origin,
+            ))
+        runtime_source = replace(runtime_source, nodes=tuple(runtime_nodes))
+        runtime_package = _compile_workflow_source_document(
+            runtime_source,
+            normalizer_version=4,
+        )
+    except WorkflowLanguageCompatibilityError:
+        raise
+    except (KeyError, ValueError, WorkflowValidationError) as exc:
+        mismatch("expanded workflow definition is malformed", exc)
+
+    def restore_definition(definition):
+        return replace(
+            definition,
+            nodes=tuple(
+                replace(
+                    node,
+                    source_index=origins_by_id[node.id].source_index,
+                    source_line=origins_by_id[node.id].source_line,
+                    origin=origins_by_id[node.id],
+                )
+                for node in definition.nodes
+            ),
+        )
+
+    runtime_package = replace(
+        runtime_package,
+        source_definition=restore_definition(runtime_package.source_definition),
+        definition=restore_definition(runtime_package.definition),
+        root=snapshot_root,
+        workflow_path=snapshot_root / "definition.yaml",
+        sidecar_path=snapshot_root / "policy.yaml",
+        language=identity_package.language,
+        compatibility_findings=identity_package.compatibility_findings,
+        validation_issues=identity_package.validation_issues,
+    )
+    if dict(runtime_package.sidecar) != dict(identity_package.sidecar):
+        mismatch("active root policy expansion changed")
+
+    runtime_by_id = {node.id: node for node in runtime_package.definition.nodes}
+    expected_by_id = {
+        node.id: node for node in identity_package.definition.nodes
+    }
+    for binding in manifest.resources:
+        if binding.node_id is None:
+            continue
+        node = runtime_by_id.get(binding.node_id)
+        if node is None or node.origin is None or node.origin.package_key != binding.package_key:
+            mismatch("resource binding origin changed")
+        expected = expected_by_id.get(binding.node_id)
+        if expected is None:
+            mismatch("resource binding node changed")
+        if binding.resource_kind == "mcp_resource":
+            mcp_bindings = [
+                item
+                for item in manifest.resources
+                if item.node_id == binding.node_id
+                and item.package_key == binding.package_key
+                and item.resource_kind == "mcp"
+            ]
+            if len(mcp_bindings) != 1 or (
+                binding.snapshot_path.encode("utf-8")
+                not in authenticated_bytes[mcp_bindings[0].snapshot_path]
+            ):
+                mismatch("local MCP resource binding changed")
+            continue
+        if binding.resource_kind == "command":
+            bound = node.value == binding.snapshot_path
+            expected = replace(expected, value=binding.snapshot_path)
+        elif binding.resource_kind == "named_script":
+            bound = node.value == binding.snapshot_path
+            expected = replace(expected, value=binding.snapshot_path)
+        elif binding.resource_kind == "loop_command":
+            bound = (
+                isinstance(node.value, Mapping)
+                and node.value.get("command") == binding.snapshot_path
+            )
+            expected = replace(
+                expected,
+                value={**dict(expected.value), "command": binding.snapshot_path},
+            )
+        elif binding.resource_kind == "mcp":
+            mcp = node.options.get("mcp")
+            bound = mcp == binding.snapshot_path or (
+                isinstance(mcp, tuple) and binding.snapshot_path in mcp
+            )
+            expected_mcp = expected.options.get("mcp")
+            if isinstance(expected_mcp, tuple):
+                expected_mcp = tuple(
+                    binding.snapshot_path if item == binding.source_relative_path else item
+                    for item in expected_mcp
+                )
+            else:
+                expected_mcp = binding.snapshot_path
+            expected = replace(
+                expected,
+                options={**dict(expected.options), "mcp": expected_mcp},
+            )
+        else:
+            continue
+        if not bound:
+            mismatch("expanded workflow resource binding changed")
+        expected_by_id[binding.node_id] = expected
+    if runtime_by_id != expected_by_id:
+        mismatch("bound runtime graph differs from sealed logical identity")
+    return runtime_package
+
+
 class RunScheduler:
     def __init__(
         self,
@@ -691,6 +1038,298 @@ class RunScheduler:
         )
         return True
 
+    def _reconcile_recorded_loop_decision(self, run_id: str) -> bool:
+        """Publish one authenticated v4 decision without replaying its provider."""
+        authority = self.store.recorded_loop_decision(
+            run_id,
+            recovery_owner_id=self.owner_id,
+            now=LeaseClockSample(
+                self._utcnow(),
+                self._monotonic(),
+                self.store._lease_clock().boot_id,
+            ),
+            lease_seconds=self.lease_seconds,
+            execution_fence=self.execution_fence,
+        )
+        if authority is None:
+            return self.store.reconcile_recorded_loop_signal(run_id)
+        projection = self.store.load_run(run_id)
+        prepared = self._prepare_run_package(
+            run_id,
+            None,
+            expected_state_version=int(projection.get("state_version", -1)),
+        )
+        if prepared is None:
+            return True
+        (
+            package,
+            execution_limits,
+            sealed_resource_paths,
+            sealed_resource_bytes,
+            execution_semantics,
+        ) = prepared
+        node = next(
+            (
+                candidate
+                for candidate in package.definition.nodes
+                if candidate.id == authority.claim.node_id
+            ),
+            None,
+        )
+        if node is None or node.node_type != "loop" or not isinstance(
+            node.value, Mapping
+        ):
+            raise ArchonOutputIntegrityError(
+                "journaled loop decision has no sealed loop definition"
+            )
+        decision = authority.decision
+        kind = decision["kind"]
+        if kind == "until_bash_pending":
+            if not self.store.prepare_recorded_loop_predicate_recovery(authority):
+                return self._reconcile_recorded_loop_decision(run_id)
+            until_bash = node.value.get("until_bash")
+            if (
+                not isinstance(until_bash, str)
+                or not until_bash
+                or not hmac.compare_digest(
+                    hashlib.sha256(until_bash.encode("utf-8")).hexdigest(),
+                    str(decision["until_bash_sha256"]),
+                )
+            ):
+                raise ArchonOutputIntegrityError(
+                    "journaled loop predicate changed from its sealed definition"
+                )
+            data = _read_descriptor_relative(
+                self.store.run_directory(run_id),
+                authority.artifact.relative_path,
+                size_bytes=authority.artifact.size_bytes,
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(data).hexdigest(), authority.artifact.sha256
+            ):
+                raise ArchonOutputIntegrityError(
+                    "journaled loop predicate input digest changed"
+                )
+            variables = self._variables(
+                projection,
+                self.store.run_directory(run_id),
+                sealed_resource_paths=sealed_resource_paths,
+                sealed_resource_bytes=sealed_resource_bytes,
+                output_node_ids=node.depends_on,
+            )
+            variables = replace(
+                variables,
+                loop_prev_output=data.decode("utf-8"),
+                loop_user_input=(
+                    self._authenticated_loop_input(
+                        run_id,
+                        projection,
+                        node_id=node.id,
+                        relative_path=str(decision["feedback_artifact"]),
+                    )
+                    if decision.get("feedback_artifact") is not None
+                    else None
+                ),
+            )
+            bash_node = WorkflowNode(
+                id=node.id,
+                node_type="bash",
+                value=until_bash,
+                depends_on=node.depends_on,
+                source_index=node.source_index,
+                source_line=node.source_line,
+                options=freeze_value({}),
+            )
+            check = BashExecutor().execute(
+                NodeExecutionContext(
+                    run_id=run_id,
+                    run_directory=self.store.run_directory(run_id),
+                    node=bash_node,
+                    attempt_id=(
+                        f"{authority.claim.attempt_id}/until-recovery-"
+                        f"{decision['iteration']:04d}-{uuid.uuid4().hex}"
+                    ),
+                    timeout_seconds=self._node_timeout(
+                        node, execution_limits, execution_semantics
+                    ),
+                    is_cancelled=lambda: self._cancelled(run_id),
+                    workflow_name=package.definition.name,
+                    workflow_options=package.definition.options,
+                    variable_context=variables,
+                    output_resolver=variables.output_reference,
+                    predecessor_results={},
+                    node_state={},
+                    execution_limits=execution_limits,
+                    resource_limits=ProcessResourceLimits(
+                        max_rss_bytes=execution_limits.process_tree_rss_bytes,
+                        max_cpu_seconds=execution_limits.process_tree_cpu_seconds,
+                        max_descendants=execution_limits.max_descendants,
+                    ),
+                    deadline_budget=self._attempt_deadline_budget(
+                        node, execution_limits, execution_semantics
+                    ),
+                    sealed_attempt_timeout=(execution_semantics is not None),
+                    cancellation_reason=lambda: self._cancellation_reason(run_id),
+                    spawn_intent=lambda nonce: self.store.record_spawn_intent(
+                        authority.claim, executor_nonce=nonce
+                    ),
+                    spawn_failed=lambda nonce, code: self.store.record_spawn_failed(
+                        authority.claim,
+                        executor_nonce=nonce,
+                        error_code=code,
+                    ),
+                    process_started=lambda identity: self.store.record_process_started(
+                        authority.claim, identity
+                    ),
+                    process_stopped=lambda identity, cleaned: (
+                        self.store.record_process_stopped(
+                            authority.claim, identity, cleaned=cleaned
+                        )
+                    ),
+                    sealed_resource_paths=sealed_resource_paths,
+                    sealed_resource_bytes=sealed_resource_bytes,
+                    language_profile=package.language.effective_profile,
+                    normalizer_version=package.language.normalizer_version,
+                    monotonic=self._monotonic,
+                    termination_policy=TerminationPolicy(
+                        cooperative_grace_seconds=(
+                            execution_limits.cooperative_shutdown_seconds
+                        ),
+                        term_grace_seconds=execution_limits.term_grace_seconds,
+                        kill_grace_seconds=execution_limits.kill_reap_grace_seconds,
+                        wait_timeout_seconds=execution_limits.kill_reap_grace_seconds,
+                    ),
+                )
+            )
+            loop_semantics = package.language.node_semantics[node.id]["loop"]
+            iteration = int(decision["iteration"])
+            maximum = int(authority.loop_state["max_iterations"])
+            if check.status == "succeeded":
+                final = {"kind": "until_bash_success", "iteration": iteration}
+            elif check.error_code != "process_exit":
+                final = {
+                    "kind": "until_bash_failure",
+                    "iteration": iteration,
+                    "status": check.status,
+                    "error_code": check.error_code,
+                    "error_message": check.error_message,
+                    "archon_terminal_failure": (
+                        check.metadata.get("archon_terminal_failure") is True
+                    ),
+                }
+            elif iteration == maximum:
+                final = {"kind": "hard_limit", "iteration": iteration}
+            elif bool(loop_semantics["effective_interactive"]):
+                message = str(node.value.get("gate_message", ""))
+                final = {
+                    "kind": "ordinary_input",
+                    "iteration": iteration,
+                    "pending_interaction": {
+                        "type": "loop_input",
+                        "interaction_id": hashlib.sha256(
+                            f"{run_id}\0{node.id}\0{iteration}\0{message}".encode()
+                        ).hexdigest(),
+                        "message": message,
+                        "iteration": iteration,
+                    },
+                }
+            else:
+                final = {"kind": "continue", "iteration": iteration}
+            try:
+                self.store.record_loop_decision(
+                    authority.claim,
+                    loop_state={
+                        **{
+                            key: value
+                            for key, value in authority.loop_state.items()
+                            if key != "_pending_loop_decision"
+                        },
+                        "_pending_loop_decision": final,
+                    },
+                )
+            except StaleLoopDecisionError:
+                pass
+            return self._reconcile_recorded_loop_decision(run_id)
+
+        clean_state = dict(authority.loop_state)
+        clean_state.pop("_pending_loop_decision", None)
+        if kind == "continue":
+            return self.store.resume_recorded_loop_continuation(authority) or (
+                self.store.recorded_loop_decision(run_id) is None
+            )
+        pending_interaction = decision.get("pending_interaction")
+        if kind == "signal_success":
+            clean_state["completed_by"] = "signal"
+            result = NodeExecutionResult(
+                "succeeded",
+                (authority.artifact,),
+                metadata={"loop_state": clean_state},
+            )
+        elif kind == "until_bash_success":
+            clean_state["completed_by"] = "until_bash"
+            result = NodeExecutionResult(
+                "succeeded",
+                (authority.artifact,),
+                metadata={"loop_state": clean_state},
+            )
+        elif kind in {"signal_confirmation", "ordinary_input"}:
+            if kind == "signal_confirmation":
+                clean_state["completed_by"] = "signal_pending_confirmation"
+            result = NodeExecutionResult(
+                "paused",
+                (authority.artifact,),
+                metadata={
+                    "loop_state": clean_state,
+                    "pending_interaction": pending_interaction,
+                },
+            )
+        elif kind == "hard_limit":
+            result = NodeExecutionResult(
+                "failed",
+                (authority.artifact,),
+                "loop_max_iterations",
+                f"loop reached its hard limit of {clean_state['max_iterations']} iterations",
+                {
+                    "loop_state": clean_state,
+                    "archon_terminal_failure": True,
+                },
+            )
+        elif kind == "until_bash_failure":
+            result = NodeExecutionResult(
+                str(decision["status"]),
+                (authority.artifact,),
+                str(decision["error_code"]),
+                (
+                    str(decision["error_message"])
+                    if decision["error_message"] is not None
+                    else None
+                ),
+                {
+                    "loop_state": clean_state,
+                    "archon_terminal_failure": decision[
+                        "archon_terminal_failure"
+                    ],
+                },
+            )
+        else:
+            raise ArchonOutputIntegrityError("unsupported journaled loop decision")
+        try:
+            self._persist_result(
+                authority.claim,
+                node,
+                result,
+                execution_limits,
+                language_profile=package.language.effective_profile,
+                execution_semantics=execution_semantics,
+                outward_action=(
+                    node.id in package.sidecar.get("outward_action_nodes", ())
+                ),
+            )
+        except RuntimeError as exc:
+            if "stale node completion" not in str(exc):
+                raise
+        return self.store.recorded_loop_decision(run_id) is None
+
     def _renew_execution_owner(self, run_id: str) -> bool:
         if self.execution_fence is not None:
             try:
@@ -749,6 +1388,59 @@ class RunScheduler:
             raise ValueError(f"workflow value exceeds {limit} bytes: {path}")
         return data.decode("utf-8")
 
+    def _authenticated_loop_input(
+        self,
+        run_id: str,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        relative_path: str,
+    ) -> str:
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, Mapping)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") is None
+            and artifact.get("relative_path") == relative_path
+            and artifact.get("media_type") == "text/plain"
+        ]
+        if len(matches) != 1:
+            raise LoopInputIntegrityError(
+                "loop input artifact identity is ambiguous"
+            )
+        size_bytes = matches[0].get("size_bytes")
+        digest = matches[0].get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= self.store.max_input_bytes
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise LoopInputIntegrityError("loop input artifact identity is invalid")
+        try:
+            content = _read_descriptor_relative(
+                self.store.run_directory(run_id),
+                relative_path,
+                size_bytes=size_bytes,
+            )
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                raise LoopInputIntegrityError("loop input artifact digest changed")
+            return content.decode("utf-8")
+        except LoopInputIntegrityError:
+            raise
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise LoopInputIntegrityError(
+                "loop input artifact is unavailable"
+            ) from exc
+
     def _output_values(
         self,
         projection: Mapping[str, object],
@@ -775,7 +1467,9 @@ class RunScheduler:
                 if node_id in requested
             }
 
-        strict_v3 = snapshot.normalizer_version == 3
+        strict_v3 = supports_phase3_semantics(
+            snapshot.effective_profile, snapshot.normalizer_version
+        )
 
         artifacts = projection.get("artifacts", [])
         nodes = projection.get("nodes", {})
@@ -1270,11 +1964,9 @@ class RunScheduler:
             projection = self.store.load_run(run_id)
             run_directory = self.store.run_directory(run_id)
             language_snapshot = read_language_snapshot(projection.get("language"))
-            strict_v3 = (
-                language_snapshot is not None
-                and language_snapshot.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and language_snapshot.normalizer_version == 3
+            strict_v3 = language_snapshot is not None and supports_phase3_semantics(
+                language_snapshot.effective_profile,
+                language_snapshot.normalizer_version,
             )
             outputs = (
                 None
@@ -1542,10 +2234,8 @@ class RunScheduler:
         sealed_resource_bytes: Mapping[str, bytes] | None,
     ) -> bool | _StrictReferenceSnapshot:
         """Resolve v3 references before claim without rendering Task 7 consumers."""
-        if (
-            package.language.effective_profile
-            is not WorkflowLanguageProfile.ARCHON_2026_07
-            or package.language.normalizer_version != 3
+        if not supports_phase3_semantics(
+            package.language.effective_profile, package.language.normalizer_version
         ):
             return True
         retained_output = self._revalidate_retained_output_resolution(
@@ -1671,11 +2361,15 @@ class RunScheduler:
         run_id: str,
         *,
         read_budget: WorkflowResourceReadBudget | None = None,
+        projection: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowPackage, frozenset[str], Mapping[str, bytes]]:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
-        projection = self.store.load_run(run_id)
+        # A caller that supplies a projection owns its journal corroboration and
+        # receives authentication against those exact bytes without store repair.
+        if projection is None:
+            projection = self.store.load_run(run_id)
         resources_path = run_directory / "resources.json"
         read_budget = read_budget or WorkflowResourceReadBudget(
             max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
@@ -1865,16 +2559,26 @@ class RunScheduler:
                 directly_verified_paths=legacy_direct_paths,
             )
 
-        package = load_workflow_snapshot(
-            definition,
-            workflow_bytes=definition_bytes,
-            sidecar_bytes=policy_bytes if policy.is_file() else None,
-            normalizer_version=(
-                snapshot.normalizer_version
-                if snapshot is not None
-                else WORKFLOW_NORMALIZER_VERSION
-            ),
-        )
+        if projection.get("snapshot_format_version") == 2:
+            if verified_sealed_bytes is None:
+                raise integrity_error("format-2 workflow bytes are missing")
+            package = load_snapshot_format2(
+                run_directory,
+                projection,
+                resources,
+                verified_sealed_bytes,
+            )
+        else:
+            package = load_workflow_snapshot(
+                definition,
+                workflow_bytes=definition_bytes,
+                sidecar_bytes=policy_bytes if policy.is_file() else None,
+                normalizer_version=(
+                    snapshot.normalizer_version
+                    if snapshot is not None
+                    else WORKFLOW_NORMALIZER_VERSION
+                ),
+            )
         if snapshot is None and (
             package.language.effective_profile
             is not WorkflowLanguageProfile.HERMES_LEGACY
@@ -2662,10 +3366,8 @@ class RunScheduler:
                     )
                 )
             semantics = None
-            if (
-                package.language.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and package.language.normalizer_version == 3
+            if supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
             ):
                 try:
                     resources_bytes = sealed_bytes.get("resources.json")
@@ -2957,9 +3659,9 @@ class RunScheduler:
     ) -> int:
         """Reserve selection, winning obligation, and outcome frames up front."""
         if (
-            package.language.effective_profile
-            is not WorkflowLanguageProfile.ARCHON_2026_07
-            or package.language.normalizer_version != 3
+            not supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
+            )
             or node.node_type not in {"command", "prompt"}
             or node.options.get("context") == "fresh"
             or not bool(
@@ -3118,7 +3820,10 @@ class RunScheduler:
                         sealed_resource_bytes=sealed_resource_bytes,
                         output_node_ids=(
                             node.depends_on
-                            if package.language.normalizer_version == 3
+                            if supports_phase3_semantics(
+                                package.language.effective_profile,
+                                package.language.normalizer_version,
+                            )
                             else None
                         ),
                         resolved_outputs=(
@@ -3131,10 +3836,23 @@ class RunScheduler:
                         "loop_user_input_artifact"
                     )
                     if node.node_type == "loop" and isinstance(loop_input, str):
+                        phase4_loop = supports_phase4_semantics(
+                            package.language.effective_profile,
+                            package.language.normalizer_version,
+                        )
                         variables = replace(
                             variables,
-                            loop_user_input=self._read_text(
-                                self.store.run_directory(run_id) / loop_input
+                            loop_user_input=(
+                                self._authenticated_loop_input(
+                                    run_id,
+                                    projection,
+                                    node_id=node.id,
+                                    relative_path=loop_input,
+                                )
+                                if phase4_loop
+                                else self._read_text(
+                                    self.store.run_directory(run_id) / loop_input
+                                )
                             ),
                         )
                     if not self._renew_execution_owner(run_id):
@@ -3152,11 +3870,32 @@ class RunScheduler:
                         if structured_output is not None
                         else None
                     )
+                    runtime_node = node
+                    if (
+                        node.node_type == "loop"
+                        and supports_phase4_semantics(
+                            package.language.effective_profile,
+                            package.language.normalizer_version,
+                        )
+                    ):
+                        node_semantics = package.language.node_semantics.get(node.id)
+                        loop_semantics = (
+                            node_semantics.get("loop")
+                            if isinstance(node_semantics, Mapping)
+                            else None
+                        )
+                        runtime_node = replace(
+                            node,
+                            options={
+                                **dict(node.options),
+                                "_sealed_loop_semantics": loop_semantics,
+                            },
+                        )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
                             run_directory=self.store.run_directory(run_id),
-                            node=node,
+                            node=runtime_node,
                             attempt_id=claim.attempt_id,
                             timeout_seconds=timeout,
                             is_cancelled=lambda: self._cancelled(run_id),
@@ -3167,7 +3906,10 @@ class RunScheduler:
                                 strict_reference_snapshot.resolve
                                 if strict_reference_snapshot is not None
                                 else variables.output_reference
-                                if package.language.normalizer_version == 3
+                                if supports_phase3_semantics(
+                                    package.language.effective_profile,
+                                    package.language.normalizer_version,
+                                )
                                 else None
                             ),
                             predecessor_results=self._predecessor_results(
@@ -3217,6 +3959,12 @@ class RunScheduler:
                                             package.language.effective_profile
                                         ),
                                     ),
+                                    loop_state=state,
+                                )
+                            ),
+                            record_loop_decision=lambda state: (
+                                self.store.record_loop_decision(
+                                    claim,
                                     loop_state=state,
                                 )
                             ),
@@ -3302,6 +4050,16 @@ class RunScheduler:
                         error_message=str(exc),
                         metadata={"archon_terminal_failure": True},
                     )
+                except LoopInputIntegrityError as exc:
+                    result = NodeExecutionResult(
+                        "failed",
+                        error_code="loop_input_invalid",
+                        error_message=str(exc),
+                        metadata={
+                            "archon_terminal_failure": True,
+                            "additional_provider_attempts": 0,
+                        },
+                    )
                 except WorkflowOutputReferenceError as exc:
                     result = NodeExecutionResult(
                         "failed",
@@ -3374,7 +4132,7 @@ class RunScheduler:
         language_profile: WorkflowLanguageProfile,
     ) -> NodeExecutionResult:
         if (
-            result.status != "succeeded"
+            not RunScheduler._retains_declared_primary_output(node, result)
             or result.primary_output is not None
             or language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
             or node.node_type not in {"bash", "script", "loop"}
@@ -3412,6 +4170,21 @@ class RunScheduler:
                 canonicalization_version=1,
                 output_type=str(node.options["output_type"]),
             ),
+        )
+
+    @staticmethod
+    def _retains_declared_primary_output(
+        node: WorkflowNode,
+        result: NodeExecutionResult,
+    ) -> bool:
+        if result.status == "succeeded":
+            return True
+        pending = result.metadata.get("pending_interaction")
+        return (
+            result.status == "paused"
+            and node.node_type == "loop"
+            and isinstance(pending, Mapping)
+            and pending.get("type") == "loop_signal_confirmation"
         )
 
     def _persist_result(
@@ -3498,7 +4271,10 @@ class RunScheduler:
             completion_metadata = dict(result.metadata)
             completion_artifacts = result.artifacts
             retained_candidate = None
-            if result.status == "succeeded" and result.primary_output is not None:
+            if (
+                self._retains_declared_primary_output(node, result)
+                and result.primary_output is not None
+            ):
                 retained_candidate = result.primary_output
                 if (
                     language_profile is WorkflowLanguageProfile.ARCHON_2026_07
@@ -3702,6 +4478,8 @@ class RunScheduler:
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
         self._reconcile_session_registry_update(run_id)
+        if self._reconcile_recorded_loop_decision(run_id):
+            return self.store.load_run(run_id)
         if max_nodes is None:
             advanced = self.advance_all([run_id])
             return advanced.get(run_id, self.store.load_run(run_id))
@@ -3934,8 +4712,15 @@ class RunScheduler:
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
+        recovered_loop_signals = {}
+        pending_run_ids = []
         for run_id in run_ids:
             self._reconcile_session_registry_update(run_id)
+            if self._reconcile_recorded_loop_decision(run_id):
+                recovered_loop_signals[run_id] = self.store.load_run(run_id)
+            else:
+                pending_run_ids.append(run_id)
+        run_ids = pending_run_ids
         authorizations = {}
         preparation_state_versions = {}
         authorized_run_ids = []
@@ -4194,6 +4979,7 @@ class RunScheduler:
             for run_id in run_ids:
                 self._resolve_graph(run_id, packages[run_id].definition.nodes)
             return {
+                **recovered_loop_signals,
                 **package_failures,
                 **{run_id: self.store.load_run(run_id) for run_id in run_ids},
             }

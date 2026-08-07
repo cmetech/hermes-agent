@@ -17,7 +17,9 @@ from plugins.workflow.compat import (
     require_runnable,
 )
 from plugins.workflow.models import RunExecutionLimits
+from plugins.workflow.machine_contract import WorkflowConflict
 from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
@@ -91,22 +93,38 @@ def _parser() -> argparse.ArgumentParser:
         gate.add_argument("--interaction-id", required=True)
         gate.add_argument("--expected-version", type=int, required=True)
         gate.add_argument("--comment" if action == "approve" else "--reason", default="")
+    feedback = actions.add_parser("provide-input", add_help=False)
+    feedback.add_argument("run_id")
+    feedback.add_argument("--interaction-id", required=True)
+    feedback.add_argument("--expected-version", type=int, required=True)
+    feedback.add_argument("--value", required=True)
     return parser
 
 
 def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
-    from plugins.workflow.cli import _resolve, _runtime_config, _store
+    from plugins.workflow.cli import (
+        _admission_compilation,
+        _admission_package_digest,
+        _resolve_compilation,
+        _runtime_config,
+        _store,
+    )
     from plugins.workflow.coordinator_store import CoordinatorStore
 
     command_args = argparse.Namespace(
         hermes_home=str(hermes_home), workdir=str(workdir), name=args.name
     )
-    package = _resolve(command_args, args.name)
+    compilation = _resolve_compilation(command_args, args.name)
+    package = compilation.package
     runtime = _runtime_config(hermes_home, sidecar=package.sidecar)
-    digest = compute_package_digest(package)
+    digest = _admission_package_digest(compilation)
     compatibility = assess_compatibility(package)
     require_runnable(compatibility)
-    risk = build_risk_summary(package, compatibility)
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        compilation=_admission_compilation(compilation),
+    )
     if WorkflowTrustStore(hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
@@ -120,7 +138,11 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
         raise RuntimeError("background execution requires a healthy coordinator")
     prepared = store.prepare_run_snapshot(
         package,
+        compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
+        trusted_package_digest=(
+            digest if _admission_compilation(compilation) is not None else None
+        ),
         execution_limits=RunExecutionLimits.resolve(runtime),
     )
     provenance = gateway_trigger_provenance(
@@ -186,17 +208,63 @@ def workflow_gateway_command(
 
             command_args = argparse.Namespace(hermes_home=str(home))
             store = _store(command_args, _runtime_config(home))
-            response = args.comment if args.action == "approve" else args.reason
-            decision = decide_gateway_run(
-                store,
-                decision="approved" if args.action == "approve" else "rejected",
-                run_id=args.run_id,
-                interaction_id=args.interaction_id,
-                expected_version=args.expected_version,
-                response=response,
-                invocation=invocation,
-            )
-            result = {"action": args.action, **asdict(decision)}
+            if args.action == "provide-input":
+                try:
+                    updated = store.provide_loop_input(
+                        args.run_id,
+                        args.value,
+                        expected_state_version=args.expected_version,
+                        interaction_id=args.interaction_id,
+                        actor=invocation.principal,
+                        channel="gateway",
+                        operator_scope=invocation.operator_scope,
+                    )
+                except WorkflowConflict as exc:
+                    current = store.get_run_status(
+                        args.run_id,
+                        operator_scope=invocation.operator_scope,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": exc.error.code,
+                            "message": str(exc)[:512],
+                            "current": public_run_projection(current),
+                        },
+                        sort_keys=True,
+                    )
+                except ValueError:
+                    current = store.get_run_status(
+                        args.run_id,
+                        operator_scope=invocation.operator_scope,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "invalid_transition",
+                            "message": "workflow input transition is invalid",
+                            "current": public_run_projection(current),
+                        },
+                        sort_keys=True,
+                    )
+                result = {
+                    "action": args.action,
+                    **public_run_projection(updated),
+                }
+            else:
+                response = args.comment if args.action == "approve" else args.reason
+                decision = decide_gateway_run(
+                    store,
+                    decision=(
+                        "approved" if args.action == "approve" else "rejected"
+                    ),
+                    run_id=args.run_id,
+                    interaction_id=args.interaction_id,
+                    expected_version=args.expected_version,
+                    response=response,
+                    invocation=invocation,
+                )
+                result = {"action": args.action, **asdict(decision)}
         return json.dumps({"ok": True, "result": result}, sort_keys=True)
     except WorkflowCompatibilityBlockedError as exc:
         return json.dumps(

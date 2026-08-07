@@ -30,6 +30,7 @@ from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
     entitled_agent_runner,
 )
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -432,9 +433,10 @@ class AgentNodeExecutor:
     ) -> NodeExecutionResult:
         response = initial_result.final_response
         strict_v3 = (
-            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            and isinstance(context.variable_context, VariableContext)
-            and context.variable_context.normalizer_version == 3
+            isinstance(context.variable_context, VariableContext)
+            and supports_phase3_semantics(
+                context.language_profile, context.variable_context.normalizer_version
+            )
         )
         response_bytes = response.encode("utf-8")
         diagnostics = self._bounded_diagnostics(diagnostics)
@@ -715,9 +717,10 @@ class AgentNodeExecutor:
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
         strict_v3 = (
-            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            and isinstance(context.variable_context, VariableContext)
-            and context.variable_context.normalizer_version == 3
+            isinstance(context.variable_context, VariableContext)
+            and supports_phase3_semantics(
+                context.language_profile, context.variable_context.normalizer_version
+            )
         )
         prompt = self._prompt(context) if strict_v3 else None
         materializer: AuthenticatedExecutionMaterializer | None = None

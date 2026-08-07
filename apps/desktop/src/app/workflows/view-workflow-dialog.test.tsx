@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { openModalOwnsKeyboard } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
+import { TRANSLATIONS } from '@/i18n'
 import type * as ProfileStore from '@/store/profile'
 import type { WorkflowDefinition, WorkflowDetail } from '@/types/hermes'
 
@@ -17,6 +18,7 @@ const WORKFLOW_NAME = 'Portable contract'
 const MERMAID_SOURCE = 'flowchart TD\n  start["Start"] --> finish["Finish"]'
 const renderer = vi.hoisted(() => ({ calls: vi.fn<(code: string) => void>() }))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
+const workflowCopy = TRANSLATIONS.en.operations
 
 vi.mock('@/components/assistant-ui/embeds/mermaid-embed', () => ({
   default: ({ code }: { code: string }) => {
@@ -252,7 +254,7 @@ describe('workflow View dialog', () => {
     expect(await within(dialog).findByText('Legacy semantics')).toBeTruthy()
     expect(
       within(dialog).getByText(
-        'Existing Hermes behavior is preserved. Review compatibility findings before migrating to Archon 2026-07.'
+        workflowCopy.workflowLanguageLegacyDescription
       )
     ).toBeTruthy()
     expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
@@ -283,6 +285,78 @@ describe('workflow View dialog', () => {
     const dialog = await openView()
     expect(await within(dialog).findByText('Archon 2026-07')).toBeTruthy()
     expect(within(dialog).queryByText(/Normalizer/)).toBeNull()
+  })
+
+  it('catches authenticated dependency details being discarded or replaced with filesystem data', async () => {
+    currentDetail = detail({
+      compilation: {
+        composite_digest: 'phase4-composite-digest',
+        counts: {
+          dependency_packages: 1,
+          expanded_edges: 1,
+          expanded_nodes: 2
+        },
+        dependencies: [
+          {
+            definition_location: '/private/workflows/child.yaml',
+            package_key: 'profile:surface-child',
+            workflow_name: 'surface-child'
+          }
+        ],
+        include_depth: 1,
+        ignored_policies: [
+          {
+            fields: ['execution_environment', 'required_secrets'],
+            package_key: 'profile:surface-child',
+            sidecar_digest: 'private-sidecar-digest'
+          }
+        ],
+        sources: [
+          {
+            catalog_source: 'project',
+            definition_location: '/private/workflows/root.yaml',
+            package_key: 'project:surface-root',
+            precedence: 1,
+            workflow_name: 'surface-root'
+          },
+          {
+            catalog_source: 'profile',
+            definition_location: '/private/workflows/child.yaml',
+            package_key: 'profile:surface-child',
+            precedence: 2,
+            workflow_name: 'surface-child'
+          }
+        ]
+      }
+    })
+    renderView()
+    const dialog = await openView()
+    const dependencies = await within(dialog).findByRole('region', { name: 'Workflow dependencies' })
+
+    expect(within(dependencies).getByText('surface-root')).toBeTruthy()
+    expect(within(dependencies).getByText('Project')).toBeTruthy()
+    expect(within(dependencies).getByText('surface-child')).toBeTruthy()
+    expect(within(dependencies).getByText('Profile')).toBeTruthy()
+    expect(within(dependencies).getAllByText('Precedence')).toHaveLength(2)
+    expect(within(dependencies).getByText('Dependency packages').nextSibling?.textContent).toBe('1')
+    expect(within(dependencies).getByText('Expanded nodes').nextSibling?.textContent).toBe('2')
+    expect(within(dependencies).getByText('Expanded edges').nextSibling?.textContent).toBe('1')
+    expect(within(dependencies).getByText('Include depth').nextSibling?.textContent).toBe('1')
+    expect(within(dependencies).getByText('phase4-composite-digest')).toBeTruthy()
+    expect(within(dependencies).getByText('Ignored: execution environment').closest('[data-slot="badge"]')).toBeTruthy()
+    expect(within(dependencies).getByText('Ignored: required secrets').closest('[data-slot="badge"]')).toBeTruthy()
+    expect(dependencies.textContent).not.toContain('/private/workflows')
+    expect(dependencies.textContent).not.toContain('private-sidecar-digest')
+  })
+
+  it('catches older workflow details becoming unusable when compilation diagnostics are absent', async () => {
+    currentDetail = detail()
+    renderView()
+    const dialog = await openView()
+
+    expect(await within(dialog).findByTestId('shared-mermaid-renderer')).toBeTruthy()
+    expect(within(dialog).queryByRole('region', { name: 'Workflow dependencies' })).toBeNull()
+    expect(within(dialog).getByRole('button', { name: 'Run' }).hasAttribute('disabled')).toBe(false)
   })
 
   it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
@@ -400,7 +474,7 @@ describe('workflow View dialog', () => {
     [
       'incompatible',
       { compatibility: { findings: [], level: 'unsupported', runnable: false } },
-      'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      workflowCopy.workflowRunIncompatible
     ],
     [
       'unhealthy coordinator',
@@ -426,7 +500,7 @@ describe('workflow View dialog', () => {
       await within(dialog).findByTestId('shared-mermaid-renderer')
       expectDisabledRunReason(
         dialog,
-        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+        workflowCopy.workflowRunIncompatible
       )
     }
   )
@@ -449,7 +523,7 @@ describe('workflow View dialog', () => {
     const dialog = await openView()
 
     await within(dialog).findByTestId('shared-mermaid-renderer')
-    expectDisabledRunReason(dialog, 'This workflow is not compatible with the current Hermes runtime and cannot start.')
+    expectDisabledRunReason(dialog, workflowCopy.workflowRunIncompatible)
   })
 
   it('enables Run when fetched detail is runnable despite a stale untrusted catalog row', async () => {
@@ -494,7 +568,7 @@ describe('workflow View dialog', () => {
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expectDisabledRunReason(
       dialog,
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 
@@ -510,7 +584,7 @@ describe('workflow View dialog', () => {
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expectDisabledRunReason(
       dialog,
-      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      workflowCopy.workflowRunSupportUnavailable
     )
   })
 

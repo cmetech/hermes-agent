@@ -612,7 +612,7 @@ def test_post_runs_rejects_schedule_over_durable_metadata_value_boundary(
     monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
     monkeypatch.setattr(
         api_admission_module,
-        "_catalog_package",
+        "_catalog_compilation",
         lambda *_args, **_kwargs: pytest.fail("oversized schedule loaded a package"),
     )
 
@@ -668,7 +668,7 @@ def test_post_runs_rejects_invalid_schedule_at_before_store_or_package_work(
     monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
     monkeypatch.setattr(
         api_admission_module,
-        "_catalog_package",
+        "_catalog_compilation",
         lambda *_args, **_kwargs: pytest.fail("invalid schedule loaded a package"),
     )
 
@@ -1818,7 +1818,7 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
     store = RunStore(home)
     _healthy_coordinator(store)
 
-    def incompatible(package, _context, *, read_budget=None):
+    def incompatible(package, _context, *, read_budget=None, compilation=None):
         compatibility = CompatibilityReport(
             level=CompatibilityLevel.UNSUPPORTED,
             findings=(
@@ -1835,6 +1835,7 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
             package,
             compatibility,
             read_budget=read_budget,
+            compilation=compilation,
         )
 
     monkeypatch.setattr(
@@ -2211,10 +2212,15 @@ def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
     original_assess = api_admission_module.assess_package_execution
     assessments = 0
 
-    def counted_assess(package, context, *, read_budget=None):
+    def counted_assess(package, context, *, read_budget=None, compilation=None):
         nonlocal assessments
         assessments += 1
-        return original_assess(package, context, read_budget=read_budget)
+        return original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+            compilation=compilation,
+        )
 
     monkeypatch.setattr(
         api_admission_module,
@@ -2899,6 +2905,58 @@ def test_post_runs_discards_snapshot_that_does_not_match_trusted_package(
     assert list(store.staging_root.iterdir()) == []
 
 
+def test_post_runs_maps_final_authenticated_resource_change_to_conflict(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    """Catch a final live-identity race escaping API admission as HTTP 500."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    resource = commands / "identity-race.md"
+    resource.write_text("TRUSTED_RESOURCE", encoding="utf-8")
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-final-identity-race",
+        nodes=[{"id": "identity-race", "command": "identity-race"}],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_package_execution
+
+    def mutate_after_assessment(package, context, *, read_budget=None, compilation=None):
+        assessment = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+            compilation=compilation,
+        )
+        resource.write_text("CHANGED_RESOURCE_WITH_NEW_SIZE", encoding="utf-8")
+        return assessment
+
+    monkeypatch.setattr(
+        api_admission_module,
+        "assess_package_execution",
+        mutate_after_assessment,
+    )
+    response = TestClient(_app(_router()), raise_server_exceptions=False).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-final-identity-race",
+            "values": {},
+            "idempotency_key": "api-final-identity-race",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "workflow_package_changed", "retryable": False}
+    }
+    _assert_no_admission_residue(store)
+
+
 def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -2979,25 +3037,22 @@ def test_post_runs_snapshots_only_sealed_trusted_resource_bytes(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_read = WorkflowResourceReadBudget.read
-    canonical_resource = resource.resolve()
-    trusted_reads = 0
+    original_seal = WorkflowResourceReadBudget.seal_authenticated_snapshot
 
-    def mutate_after_trusted_read(self, path):
-        nonlocal trusted_reads
-        data = original_read(self, path)
-        if path == canonical_resource:
-            trusted_reads += 1
-            if trusted_reads == 2:
-                resource.unlink()
-                if mutation == "symlink":
-                    try:
-                        resource.symlink_to(external)
-                    except OSError:
-                        pytest.skip("symlinks unavailable")
-        return data
+    def mutate_after_snapshot_authority_is_sealed(self):
+        original_seal(self)
+        resource.unlink()
+        if mutation == "symlink":
+            try:
+                resource.symlink_to(external)
+            except OSError:
+                pytest.skip("symlinks unavailable")
 
-    monkeypatch.setattr(WorkflowResourceReadBudget, "read", mutate_after_trusted_read)
+    monkeypatch.setattr(
+        WorkflowResourceReadBudget,
+        "seal_authenticated_snapshot",
+        mutate_after_snapshot_authority_is_sealed,
+    )
     response = TestClient(_app(_router()), raise_server_exceptions=False).post(
         "/api/plugins/workflow/runs",
         json={

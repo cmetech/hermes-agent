@@ -318,10 +318,21 @@ class EvidenceReader:
                     run_id, limit=200, operator_scope=operator_scope
                 )
                 if str(event.get("event_type", "")).startswith("interaction_")
-                or event.get("event_type") == "loop_input_provided"
+                or event.get("event_type")
+                in {
+                    "loop_input_provided",
+                    "loop_signal_confirmation_required",
+                    "loop_signal_accepted",
+                    "loop_feedback_provided",
+                }
             ]
             pending_items = [
-                {"node_id": node_id, **pending}
+                {
+                    "node_id": node_id,
+                    **pending,
+                    "state_version": run.get("state_version"),
+                    "next_actions": run.get("next_actions", []),
+                }
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance((pending := node.get("pending_interaction")), Mapping)

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+import hashlib
+import hmac
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -106,6 +109,314 @@ class WorkflowNode:
     source_index: int
     source_line: int | None
     options: Mapping[str, Any]
+    origin: WorkflowNodeOrigin | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkflowResourceBodies:
+    """Authenticated resource templates normalized for later binding."""
+
+    command_bodies: Mapping[str, str]
+    named_script_bodies: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "command_bodies",
+            MappingProxyType(dict(self.command_bodies)),
+        )
+        object.__setattr__(
+            self,
+            "named_script_bodies",
+            MappingProxyType(dict(self.named_script_bodies)),
+        )
+
+
+_WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
+_WORKFLOW_SOURCE_NAME_MAX_CHARS = 128
+_WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS = (4 * _WORKFLOW_SOURCE_NAME_MAX_CHARS) + 6
+
+
+def _bounded_source_text(value: object, field_name: str, *, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ValueError(f"{field_name} must be bounded non-empty text")
+    return value
+
+
+def _logical_source_location(value: object, field_name: str) -> str:
+    location = _bounded_source_text(
+        value,
+        field_name,
+        limit=_WORKFLOW_SOURCE_METADATA_MAX_CHARS,
+    )
+    candidate = PurePosixPath(location)
+    if (
+        candidate.is_absolute()
+        or ".." in candidate.parts
+        or location.startswith("~")
+        or "\\" in location
+    ):
+        raise ValueError(f"{field_name} must be a contained logical location")
+    return candidate.as_posix()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSourceNode:
+    """One immutable authored node captured before profile normalization."""
+
+    id: str
+    node_type: str
+    value: Any
+    depends_on: tuple[str, ...]
+    source_index: int
+    source_line: int | None
+    options: Mapping[str, Any]
+    field_lines: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    origin: WorkflowNodeOrigin | None = None
+
+    def __post_init__(self) -> None:
+        _bounded_source_text(
+            self.id, "source node id", limit=_WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS
+        )
+        _bounded_source_text(
+            self.node_type,
+            "source node type",
+            limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+        )
+        if (
+            isinstance(self.source_index, bool)
+            or not isinstance(self.source_index, int)
+            or self.source_index < 0
+        ):
+            raise ValueError("source_index must be a non-negative integer")
+        if self.source_line is not None and (
+            isinstance(self.source_line, bool)
+            or not isinstance(self.source_line, int)
+            or self.source_line <= 0
+        ):
+            raise ValueError("source_line must be a positive integer when present")
+        object.__setattr__(self, "value", freeze_value(self.value))
+        object.__setattr__(self, "depends_on", tuple(self.depends_on))
+        object.__setattr__(self, "options", freeze_value(self.options))
+        object.__setattr__(self, "field_lines", freeze_value(self.field_lines))
+        if self.origin is not None and not isinstance(
+            self.origin,
+            WorkflowNodeOrigin,
+        ):
+            raise ValueError("source node origin must be workflow provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSourceDocument:
+    """Bounded authenticated source bytes with no active language authority."""
+
+    name: str
+    description: str
+    nodes: tuple[WorkflowSourceNode, ...]
+    options: Mapping[str, Any]
+    root: Path
+    workflow_path: Path
+    sidecar_path: Path | None
+    sidecar: Mapping[str, Any]
+    source: str
+    precedence: int
+    definition_bytes: bytes
+    sidecar_bytes: bytes | None
+    definition_location: str
+    sidecar_location: str | None
+    field_lines: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        _bounded_source_text(
+            self.name, "workflow source name", limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS
+        )
+        _bounded_source_text(
+            self.description,
+            "workflow source description",
+            limit=2 * 1024 * 1024,
+        )
+        _bounded_source_text(
+            self.source,
+            "workflow catalog source",
+            limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+        )
+        if (
+            isinstance(self.precedence, bool)
+            or not isinstance(self.precedence, int)
+            or not 0 <= self.precedence <= 2**31 - 1
+        ):
+            raise ValueError("workflow precedence must be a bounded non-negative integer")
+        if not isinstance(self.definition_bytes, bytes):
+            raise ValueError("definition_bytes must be immutable bytes")
+        if self.sidecar_bytes is not None and not isinstance(self.sidecar_bytes, bytes):
+            raise ValueError("sidecar_bytes must be immutable bytes when present")
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(self, "options", freeze_value(self.options))
+        object.__setattr__(self, "sidecar", freeze_value(self.sidecar))
+        object.__setattr__(self, "field_lines", freeze_value(self.field_lines))
+        object.__setattr__(
+            self,
+            "definition_location",
+            _logical_source_location(
+                self.definition_location, "definition_location"
+            ),
+        )
+        if self.sidecar_location is not None:
+            object.__setattr__(
+                self,
+                "sidecar_location",
+                _logical_source_location(self.sidecar_location, "sidecar_location"),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowCompilationLimits:
+    """Hard bounds applied to one root's complete include closure."""
+
+    max_include_depth: int
+    max_dependencies: int
+    max_nodes: int
+    max_edges: int
+    max_source_bytes: int
+    max_expanded_bytes: int
+
+    def __post_init__(self) -> None:
+        hard_ceilings = {
+            "max_include_depth": 3,
+            "max_dependencies": 64,
+            "max_nodes": 512,
+            "max_edges": 4096,
+            "max_source_bytes": 2 * 1024 * 1024,
+            "max_expanded_bytes": 2 * 1024 * 1024,
+        }
+        for field_name, hard_ceiling in hard_ceilings.items():
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+            if value > hard_ceiling:
+                raise ValueError(
+                    f"{field_name} exceeds the hard compilation ceiling "
+                    f"of {hard_ceiling}"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowIncludeAlias:
+    """Resolved entry and sink identity for one include instance."""
+
+    entries: tuple[str, ...]
+    sinks: tuple[str, ...]
+    first_sink: str
+
+    def __post_init__(self) -> None:
+        entries = tuple(self.entries)
+        sinks = tuple(self.sinks)
+        if not entries or not sinks or self.first_sink != sinks[0]:
+            raise ValueError("include aliases require ordered entries and sinks")
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "sinks", sinks)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpandedWorkflowSource:
+    """One bounded flattened raw graph compiled under root authority."""
+
+    nodes: tuple[WorkflowSourceNode, ...]
+    include_aliases: Mapping[str, WorkflowIncludeAlias]
+    dependencies: tuple[WorkflowSourceDocument, ...]
+    source_bytes: int
+    canonical_definition_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.source_bytes, bool)
+            or not isinstance(self.source_bytes, int)
+            or self.source_bytes < 0
+        ):
+            raise ValueError("source_bytes must be a non-negative integer")
+        if not isinstance(self.canonical_definition_bytes, bytes):
+            raise ValueError("canonical_definition_bytes must be immutable bytes")
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(
+            self,
+            "include_aliases",
+            MappingProxyType(dict(self.include_aliases)),
+        )
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
+
+    @property
+    def expanded_bytes(self) -> int:
+        return len(self.canonical_definition_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowNodeOrigin:
+    """Bounded logical provenance for one future expanded workflow node."""
+
+    include_instance_path: tuple[str, ...]
+    package_key: str
+    workflow_name: str
+    catalog_source: str
+    precedence: int
+    definition_location: str
+    source_index: int
+    source_line: int | None
+    expanded_node_id: str
+
+    def __post_init__(self) -> None:
+        if len(self.include_instance_path) > 3:
+            raise ValueError("include_instance_path exceeds the bounded include depth")
+        for item in self.include_instance_path:
+            _bounded_source_text(
+                item,
+                "include instance id",
+                limit=_WORKFLOW_SOURCE_NAME_MAX_CHARS,
+            )
+        for field_name in (
+            "package_key",
+            "workflow_name",
+            "catalog_source",
+            "expanded_node_id",
+        ):
+            _bounded_source_text(
+                getattr(self, field_name),
+                field_name,
+                limit=_WORKFLOW_SOURCE_METADATA_MAX_CHARS,
+            )
+        if (
+            isinstance(self.precedence, bool)
+            or not isinstance(self.precedence, int)
+            or not 0 <= self.precedence <= 2**31 - 1
+        ):
+            raise ValueError("origin precedence must be a bounded non-negative integer")
+        if (
+            isinstance(self.source_index, bool)
+            or not isinstance(self.source_index, int)
+            or self.source_index < 0
+        ):
+            raise ValueError("origin source_index must be a non-negative integer")
+        if self.source_line is not None and (
+            isinstance(self.source_line, bool)
+            or not isinstance(self.source_line, int)
+            or self.source_line <= 0
+        ):
+            raise ValueError("origin source_line must be positive when present")
+        object.__setattr__(
+            self,
+            "include_instance_path",
+            tuple(self.include_instance_path),
+        )
+        object.__setattr__(
+            self,
+            "definition_location",
+            _logical_source_location(
+                self.definition_location, "origin definition_location"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -218,6 +529,178 @@ class ApprovalDecision:
     outcome: str
     interaction_id: str
     state_version: int
+
+
+_LOOP_SIGNAL_FIELDS = frozenset({
+    "type",
+    "interaction_id",
+    "message",
+    "iteration",
+    "max_iterations",
+    "result_artifact",
+    "result_sha256",
+})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+LOOP_SIGNAL_MESSAGE_MAX_BYTES = 16_384
+LOOP_SIGNAL_ARTIFACT_PATH_MAX_BYTES = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class LoopSignalConfirmation:
+    """Exact durable contract for accepting or refining one loop result."""
+
+    interaction_id: str
+    message: str
+    iteration: int
+    max_iterations: int
+    result_artifact: str
+    result_sha256: str
+
+    @staticmethod
+    def identity(
+        *,
+        run_id: str,
+        node_id: str,
+        iteration: int,
+        result_sha256: str,
+        message: str,
+    ) -> str:
+        """Bind immutable logical state without host or artifact path state."""
+        values = (run_id, node_id, str(iteration), result_sha256, message)
+        digest = hashlib.sha256(b"hermes.workflow.loop-signal.v1\0")
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("loop signal identity fields must be text")
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("loop signal identity must be valid UTF-8") from exc
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        node_id: str,
+        message: str,
+        iteration: int,
+        max_iterations: int,
+        result_artifact: str,
+        result_sha256: str,
+    ) -> "LoopSignalConfirmation":
+        interaction_id = cls.identity(
+            run_id=run_id,
+            node_id=node_id,
+            iteration=iteration,
+            result_sha256=result_sha256,
+            message=message,
+        )
+        return cls.from_mapping(
+            {
+                "type": "loop_signal_confirmation",
+                "interaction_id": interaction_id,
+                "message": message,
+                "iteration": iteration,
+                "max_iterations": max_iterations,
+                "result_artifact": result_artifact,
+                "result_sha256": result_sha256,
+            },
+            run_id=run_id,
+            node_id=node_id,
+        )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, object],
+        *,
+        run_id: str | None = None,
+        node_id: str | None = None,
+    ) -> "LoopSignalConfirmation":
+        if not isinstance(value, Mapping) or set(value) != _LOOP_SIGNAL_FIELDS:
+            raise ValueError("loop signal confirmation must have an exact field set")
+        if value.get("type") != "loop_signal_confirmation":
+            raise ValueError("loop signal confirmation type is invalid")
+        interaction_id = value.get("interaction_id")
+        result_sha256 = value.get("result_sha256")
+        if (
+            not isinstance(interaction_id, str)
+            or _SHA256_HEX.fullmatch(interaction_id) is None
+            or not isinstance(result_sha256, str)
+            or _SHA256_HEX.fullmatch(result_sha256) is None
+        ):
+            raise ValueError("loop signal confirmation digest is invalid")
+        message = value.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("loop signal confirmation message is required")
+        try:
+            message_bytes = message.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("loop signal confirmation message must be valid UTF-8") from exc
+        if len(message_bytes) > LOOP_SIGNAL_MESSAGE_MAX_BYTES:
+            raise ValueError("loop signal confirmation message is too large")
+        iteration = value.get("iteration")
+        maximum = value.get("max_iterations")
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or isinstance(maximum, bool)
+            or not isinstance(maximum, int)
+            or not 1 <= iteration <= maximum <= 100
+        ):
+            raise ValueError("loop signal confirmation iteration is invalid")
+        result_artifact = value.get("result_artifact")
+        if not isinstance(result_artifact, str) or not result_artifact:
+            raise ValueError("loop signal result artifact is required")
+        try:
+            artifact_bytes = result_artifact.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("loop signal result path must be valid UTF-8") from exc
+        relative = PurePosixPath(result_artifact)
+        if (
+            len(artifact_bytes) > LOOP_SIGNAL_ARTIFACT_PATH_MAX_BYTES
+            or "\\" in result_artifact
+            or "\x00" in result_artifact
+            or relative.is_absolute()
+            or relative.as_posix() != result_artifact
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("loop signal result artifact path is unsafe")
+        if (run_id is None) is not (node_id is None):
+            raise ValueError("loop signal identity context is incomplete")
+        if run_id is not None and node_id is not None:
+            expected = cls.identity(
+                run_id=run_id,
+                node_id=node_id,
+                iteration=iteration,
+                result_sha256=result_sha256,
+                message=message,
+            )
+            if not hmac.compare_digest(interaction_id, expected):
+                raise ValueError("loop signal confirmation identity is invalid")
+        return cls(
+            interaction_id=interaction_id,
+            message=message,
+            iteration=iteration,
+            max_iterations=maximum,
+            result_artifact=result_artifact,
+            result_sha256=result_sha256,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": "loop_signal_confirmation",
+            "interaction_id": self.interaction_id,
+            "message": self.message,
+            "iteration": self.iteration,
+            "max_iterations": self.max_iterations,
+            "result_artifact": self.result_artifact,
+            "result_sha256": self.result_sha256,
+        }
 
 
 def _bounded_seconds(value: float, name: str) -> float:

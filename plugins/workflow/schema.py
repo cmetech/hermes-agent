@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import deque
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 import math
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -31,10 +32,13 @@ from plugins.workflow.language import (
     prove_output_path_impossible,
     resolve_language_profile,
     select_normalizer_version,
+    supports_phase3_semantics,
+    supports_phase4_semantics,
 )
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
+    SOURCE_NODE_TYPES,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
     agent_field_names,
@@ -59,11 +63,15 @@ from plugins.workflow.language_schema import (
 )
 from plugins.workflow.models import (
     ValidationIssue,
+    ValidatedWorkflowResourceBodies,
     WorkflowDefinition,
     WorkflowNode,
+    WorkflowNodeOrigin,
     WorkflowPackage,
     WorkflowLanguageProfile,
     WorkflowRuntimeConfig,
+    WorkflowSourceDocument,
+    WorkflowSourceNode,
     WorkflowValidationError,
     freeze_value,
 )
@@ -137,6 +145,7 @@ _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
+_LITERAL_INCLUDE_NAME = re.compile(r"^[^\s/\\:$?#{}`()]+$")
 
 
 def _issue(
@@ -225,9 +234,9 @@ def is_inline_script(value: str) -> bool:
     return bool(_INLINE_SCRIPT_METACHAR.search(value))
 
 
-def _validate_identifier(value: Any, path: str) -> str:
+def _validate_identifier(value: Any, path: str, *, max_length: int = 128) -> str:
     identifier = _string(value, path)
-    if len(identifier) > 128 or _CONTROL_OR_ANSI.search(identifier):
+    if len(identifier) > max_length or _CONTROL_OR_ANSI.search(identifier):
         _fail(
             path,
             "invalid_identifier",
@@ -476,7 +485,13 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         _validate_relative_resource(mcp, f"{path}.mcp")
 
 
-def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> None:
+def _validate_node_type(
+    node: Mapping[str, Any],
+    node_type: str,
+    path: str,
+    *,
+    phase4_semantics: bool | None = None,
+) -> None:
     value = node[node_type]
     if node_type in {"command", "prompt", "bash", "script", "cancel"}:
         _string(value, f"{path}.{node_type}")
@@ -503,14 +518,29 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
-        unknown = sorted(set(loop) - LOOP_FIELDS)
+        allowed_fields = LOOP_FIELDS
+        if phase4_semantics is False:
+            allowed_fields = allowed_fields - {"command", "signal_completes"}
+        unknown = sorted(set(loop) - allowed_fields)
         if unknown:
             _fail(
                 f"{path}.loop",
                 "unknown_loop_field",
                 f"{path}.loop has unknown execution field: {unknown[0]}",
             )
-        _string(loop.get("prompt"), f"{path}.loop.prompt")
+        if phase4_semantics is False:
+            _string(loop.get("prompt"), f"{path}.loop.prompt")
+        else:
+            prompt_authored = "prompt" in loop
+            command_authored = "command" in loop
+            if prompt_authored is command_authored:
+                _fail(
+                    f"{path}.loop",
+                    "invalid_loop",
+                    f"{path}.loop must define exactly one of prompt or command",
+                )
+            field = "prompt" if prompt_authored else "command"
+            _string(loop[field], f"{path}.loop.{field}")
         _string(loop.get("until"), f"{path}.loop.until")
         iterations = loop.get("max_iterations")
         if (
@@ -523,12 +553,32 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
                 "invalid_loop",
                 f"{path}.loop.max_iterations must be between 1 and 100",
             )
-        if loop.get("interactive") is True and not loop.get("gate_message"):
-            _fail(
-                f"{path}.loop.gate_message",
-                "invalid_loop",
-                f"{path}.loop.gate_message is required when interactive",
+        if phase4_semantics is True:
+            for field in ("interactive", "signal_completes"):
+                if field in loop:
+                    _boolean(loop[field], f"{path}.loop.{field}")
+            if "gate_message" in loop and (
+                not isinstance(loop["gate_message"], str)
+                or not loop["gate_message"].strip()
+            ):
+                _fail(
+                    f"{path}.loop.gate_message",
+                    "invalid_loop",
+                    f"{path}.loop.gate_message must be a nonblank string",
+                )
+        if loop.get("interactive") is True:
+            gate_message = loop.get("gate_message")
+            invalid_gate = (
+                not isinstance(gate_message, str) or not gate_message.strip()
+                if phase4_semantics is True
+                else not gate_message
             )
+            if invalid_gate:
+                _fail(
+                    f"{path}.loop.gate_message",
+                    "invalid_loop",
+                    f"{path}.loop.gate_message is required when interactive",
+                )
     if node_type == "approval":
         approval = _mapping(value, f"{path}.approval")
         unknown = sorted(set(approval) - APPROVAL_FIELDS)
@@ -568,6 +618,7 @@ def _normalize_node(
     *,
     profile: WorkflowLanguageProfile,
     normalizer_version: int,
+    origin: WorkflowNodeOrigin | None = None,
 ) -> WorkflowNode:
     path = f"nodes[{index}]"
     node = _mapping(raw, path)
@@ -592,16 +643,18 @@ def _normalize_node(
             f"{path} has unknown execution field: {unknown[0]}",
             line=lines.get(unknown[0]),
         )
-    node_id = _validate_identifier(node.get("id"), f"{path}.id")
+    expanded_id_limit = (
+        518 if supports_phase4_semantics(profile, normalizer_version) else 128
+    )
+    node_id = _validate_identifier(
+        node.get("id"), f"{path}.id", max_length=expanded_id_limit
+    )
     present_types = [field for field in NODE_TYPES if field in node]
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
     structural_fields = set(structural_node_field_names(node_type))
-    archon_v3 = (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version == 3
-    )
+    archon_v3 = supports_phase3_semantics(profile, normalizer_version)
     if archon_v3 and not is_reference_safe_node_id(node_id):
         _fail(
             f"{path}.id",
@@ -620,7 +673,12 @@ def _normalize_node(
             f"{path}.{field} is not structurally valid for {node_type} nodes",
             line=lines.get(field),
         )
-    _validate_node_type(node, node_type, path)
+    _validate_node_type(
+        node,
+        node_type,
+        path,
+        phase4_semantics=supports_phase4_semantics(profile, normalizer_version),
+    )
     _validate_declared_options(node, path)
     depends = node.get("depends_on", [])
     if not isinstance(depends, list) or any(
@@ -686,6 +744,7 @@ def _normalize_node(
         source_index=index,
         source_line=lines.get("id"),
         options=freeze_value(options),
+        origin=origin,
     )
 
 
@@ -1086,28 +1145,40 @@ def _validate_v3_static_output_references(
     structured_outputs: Mapping[str, object],
     *,
     command_bodies: Mapping[str, str] | None = None,
+    named_script_bodies: Mapping[str, str] | None = None,
+    normalizer_version: int = 3,
 ) -> None:
     """Enforce the closed v3 grammar and direct-dependency reference rule."""
     issues: list[ValidationIssue] = []
+    phase4_templates = supports_phase4_semantics(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version,
+    )
     for node in nodes:
         for surface_path, template in _interpolated_node_templates(
-            node, command_bodies=command_bodies
+            node,
+            command_bodies=command_bodies,
+            named_script_bodies=named_script_bodies,
+            include_phase4_templates=phase4_templates,
         ):
             try:
                 if surface_path.endswith(".when"):
                     references = tuple(
                         iter_when_output_references(
                             template,
-                            normalizer_version=3,
+                            normalizer_version=normalizer_version,
                         )
                     )
-                elif surface_path.endswith(".bash"):
-                    references = bash_output_references(template)
+                elif surface_path.endswith((".bash", ".until_bash")):
+                    references = bash_output_references(
+                        template,
+                        normalizer_version=normalizer_version,
+                    )
                 else:
                     references = tuple(
                         iter_output_references(
                             template,
-                            normalizer_version=3,
+                            normalizer_version=normalizer_version,
                         )
                     )
             except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
@@ -1168,9 +1239,11 @@ def _interpolated_node_templates(
     node: WorkflowNode,
     *,
     command_bodies: Mapping[str, str] | None,
+    named_script_bodies: Mapping[str, str] | None = None,
+    include_phase4_templates: bool = False,
 ) -> Iterable[tuple[str, str]]:
     """Yield only fields rendered by the Phase 2 runtime variable adapter."""
-    prefix = f"nodes[{node.source_index}]"
+    prefix = _logical_node_path(node)
     when = node.options.get("when")
     if isinstance(when, str):
         yield f"{prefix}.when", when
@@ -1187,6 +1260,16 @@ def _interpolated_node_templates(
             value = node.value.get(field)
             if isinstance(value, str):
                 yield f"{prefix}.loop.{field}", value
+        gate_message = node.value.get("gate_message")
+        if include_phase4_templates and isinstance(gate_message, str):
+            yield f"{prefix}.loop.gate_message", gate_message
+        command_body = (
+            command_bodies.get(node.id)
+            if command_bodies is not None
+            else None
+        )
+        if include_phase4_templates and isinstance(command_body, str):
+            yield f"{prefix}.loop.command", command_body
     elif node.node_type == "approval" and isinstance(node.value, Mapping):
         message = node.value.get("message")
         if isinstance(message, str):
@@ -1200,18 +1283,189 @@ def _interpolated_node_templates(
         body = command_bodies.get(node.id)
         if isinstance(body, str):
             yield f"{prefix}.command", body
+    elif (
+        include_phase4_templates
+        and node.node_type == "script"
+        and named_script_bodies is not None
+    ):
+        body = named_script_bodies.get(node.id)
+        if isinstance(body, str):
+            yield f"{prefix}.script", body
+    if not include_phase4_templates:
+        return
+    system_prompt = node.options.get("systemPrompt")
+    if isinstance(system_prompt, str):
+        yield f"{prefix}.systemPrompt", system_prompt
+    agents = node.options.get("agents")
+    if isinstance(agents, Mapping):
+        for agent_id, raw_agent in agents.items():
+            if not isinstance(raw_agent, Mapping):
+                continue
+            for field in ("description", "prompt"):
+                template = raw_agent.get(field)
+                if isinstance(template, str):
+                    yield f"{prefix}.agents.{agent_id}.{field}", template
+    hooks = node.options.get("hooks")
+    if isinstance(hooks, Mapping):
+        for event, entries in hooks.items():
+            if not isinstance(entries, tuple | list):
+                continue
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, Mapping):
+                    continue
+                response = entry.get("response")
+                if not isinstance(response, Mapping):
+                    continue
+                for field in ("systemMessage", "stopReason"):
+                    template = response.get(field)
+                    if isinstance(template, str):
+                        yield (
+                            f"{prefix}.hooks.{event}[{index}].response.{field}",
+                            template,
+                        )
+                specific = response.get("hookSpecificOutput")
+                if not isinstance(specific, Mapping):
+                    continue
+                for field in ("permissionDecisionReason", "additionalContext"):
+                    template = specific.get(field)
+                    if isinstance(template, str):
+                        yield (
+                            f"{prefix}.hooks.{event}[{index}].response."
+                            f"hookSpecificOutput.{field}",
+                            template,
+                        )
 
 
 def validate_authenticated_command_references(
     package: WorkflowPackage,
     command_bodies: Mapping[str, str],
-) -> None:
+) -> ValidatedWorkflowResourceBodies:
     """Validate command bodies already read from authenticated snapshot bytes."""
-    validate_authenticated_resource_references(
+    return validate_authenticated_resource_references(
         package,
         command_bodies=command_bodies,
         named_script_bodies={},
     )
+
+
+class _IncludedResourceReferenceInvalid(ValueError):
+    pass
+
+
+def _logical_node_path(node: WorkflowNode) -> str:
+    if node.origin is not None and node.origin.include_instance_path:
+        instance = "/".join(node.origin.include_instance_path)
+        return (
+            f"include[{instance}]/{node.origin.definition_location}:"
+            f"nodes[{node.origin.source_index}]"
+        )
+    return f"nodes[{node.source_index}]"
+
+
+def _rewrite_authenticated_resource_body(
+    package: WorkflowPackage,
+    node: WorkflowNode,
+    body: str,
+    *,
+    field: str,
+) -> str:
+    origin = node.origin
+    if origin is None:
+        return body
+    namespace = origin.include_instance_path
+    prefix = "__".join(namespace)
+    if prefix:
+        prefix += "__"
+    direct_nodes: dict[str, str] = {}
+    alias_ids: list[str] = []
+    for candidate in package.definition.nodes:
+        candidate_origin = candidate.origin
+        if candidate_origin is None:
+            continue
+        candidate_path = candidate_origin.include_instance_path
+        if candidate_path == namespace and candidate.id.startswith(prefix):
+            direct_nodes[candidate.id[len(prefix) :]] = candidate.id
+        elif (
+            len(candidate_path) > len(namespace)
+            and candidate_path[: len(namespace)] == namespace
+            and candidate_path[len(namespace)] not in alias_ids
+        ):
+            alias_ids.append(candidate_path[len(namespace)])
+
+    aliases: dict[str, str] = {}
+    for alias_id in alias_ids:
+        instance_path = (*namespace, alias_id)
+        instance_nodes = tuple(
+            candidate
+            for candidate in package.definition.nodes
+            if candidate.origin is not None
+            and candidate.origin.include_instance_path[: len(instance_path)]
+            == instance_path
+        )
+        instance_ids = frozenset(candidate.id for candidate in instance_nodes)
+        consumed = {
+            dependency
+            for candidate in instance_nodes
+            for dependency in candidate.depends_on
+            if dependency in instance_ids
+        }
+        sinks = tuple(
+            candidate.id
+            for candidate in instance_nodes
+            if candidate.id not in consumed
+        )
+        if sinks:
+            aliases[alias_id] = sinks[0]
+
+    def rename_node(node_id: str) -> str:
+        target = direct_nodes.get(node_id, aliases.get(node_id))
+        if target is None:
+            if not namespace:
+                return node_id
+            raise _IncludedResourceReferenceInvalid(
+                f"output reference escapes include instance: {node_id}"
+            )
+        return target
+
+    from plugins.workflow.includes import rewrite_reference_tokens
+
+    try:
+        tokens = tuple(
+            iter_output_references(
+                body,
+                normalizer_version=package.language.normalizer_version,
+            )
+        )
+        return rewrite_reference_tokens(body, tokens, rename_node)
+    except WorkflowReferenceSyntaxError as exc:
+        start = exc.start if exc.start is not None else 0
+        if any(
+            body.startswith(f"${alias_id}.", start)
+            and not body.startswith(f"${alias_id}.output", start)
+            for alias_id in aliases
+        ):
+            code = "include_reference_invalid"
+            message = "include output references cannot address a deep child"
+        else:
+            code = exc.code
+            message = str(exc)
+        raise WorkflowValidationError(
+            _issue(
+                f"{_logical_node_path(node)}.{field}",
+                code,
+                message,
+                line=node.source_line,
+            )
+        ) from exc
+    except _IncludedResourceReferenceInvalid as exc:
+        raise WorkflowValidationError(
+            _issue(
+                f"{_logical_node_path(node)}.{field}",
+                "include_reference_invalid",
+                str(exc),
+                line=node.source_line,
+            )
+        ) from exc
 
 
 def validate_authenticated_resource_references(
@@ -1219,22 +1473,80 @@ def validate_authenticated_resource_references(
     *,
     command_bodies: Mapping[str, str],
     named_script_bodies: Mapping[str, str],
-) -> None:
+) -> ValidatedWorkflowResourceBodies:
     """Scan authenticated command and named-script bytes before promotion."""
+    validated = ValidatedWorkflowResourceBodies(
+        command_bodies,
+        named_script_bodies,
+    )
     if package.language.effective_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
-        return
-    if package.language.normalizer_version == 3:
+        return validated
+    if supports_phase3_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            rewritten_commands = dict(validated.command_bodies)
+            rewritten_scripts = dict(validated.named_script_bodies)
+            for node in package.definition.nodes:
+                command_body = rewritten_commands.get(node.id)
+                if command_body is not None:
+                    rewritten_commands[node.id] = (
+                        _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            command_body,
+                            field=(
+                                "loop.command"
+                                if node.node_type == "loop"
+                                else "command"
+                            ),
+                        )
+                    )
+                script_body = rewritten_scripts.get(node.id)
+                if script_body is not None:
+                    rewritten_scripts[node.id] = (
+                        _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            script_body,
+                            field="script",
+                        )
+                    )
+            validated = ValidatedWorkflowResourceBodies(
+                rewritten_commands,
+                rewritten_scripts,
+            )
         _validate_v3_static_output_references(
             package.definition.nodes,
             package.language.structured_outputs,
-            command_bodies=command_bodies,
+            command_bodies=validated.command_bodies,
+            named_script_bodies=(
+                validated.named_script_bodies
+                if supports_phase4_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                )
+                else None
+            ),
+            normalizer_version=package.language.normalizer_version,
         )
+        if supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            return validated
         issues: list[ValidationIssue] = []
         for node in package.definition.nodes:
-            body = named_script_bodies.get(node.id)
+            body = validated.named_script_bodies.get(node.id)
             if body is None:
                 continue
-            if contains_output_reference(body, normalizer_version=3):
+            if contains_output_reference(
+                body,
+                normalizer_version=package.language.normalizer_version,
+            ):
                 issues.append(
                     _issue(
                         f"nodes[{node.source_index}].script",
@@ -1245,12 +1557,13 @@ def validate_authenticated_resource_references(
                 )
         if issues:
             raise WorkflowValidationError(tuple(issues))
-        return
+        return validated
     _validate_structured_output_field_references(
         package.definition.nodes,
         package.language.structured_outputs,
-        command_bodies=command_bodies,
+        command_bodies=validated.command_bodies,
     )
+    return validated
 
 
 def _parse_sidecar(
@@ -1356,15 +1669,41 @@ def _validate_sidecar_node_references(
             )
 
 
-def _load_sidecar(path: Path) -> tuple[Path | None, Mapping[str, Any]]:
-    sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
-    if not sidecar_path.is_file():
-        return None, freeze_value({})
-    try:
-        data = sidecar_path.read_bytes()
-    except OSError as exc:
-        _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
-    return _parse_sidecar(sidecar_path, data)
+def _expand_root_sidecar_node_references(
+    sidecar: Mapping[str, Any],
+    nodes: tuple[WorkflowNode, ...],
+) -> Mapping[str, Any]:
+    """Resolve only root-authored executable and include IDs into final nodes."""
+    root_node_ids = {
+        node.id
+        for node in nodes
+        if node.origin is None or not node.origin.include_instance_path
+    }
+    include_instances: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.origin is None or not node.origin.include_instance_path:
+            continue
+        include_instances.setdefault(
+            node.origin.include_instance_path[0],
+            [],
+        ).append(node.id)
+    expanded: list[str] = []
+    for authored_id in sidecar.get("outward_action_nodes", ()):
+        if authored_id in root_node_ids:
+            expanded.append(authored_id)
+            continue
+        instance_nodes = include_instances.get(authored_id)
+        if instance_nodes is None:
+            _fail(
+                "sidecar.outward_action_nodes",
+                "unknown_sidecar_node",
+                f"outward_action_nodes references unknown node: {authored_id}",
+            )
+        expanded.extend(instance_nodes)
+    rewritten = dict(sidecar)
+    if "outward_action_nodes" in sidecar:
+        rewritten["outward_action_nodes"] = list(dict.fromkeys(expanded))
+    return freeze_value(rewritten)
 
 
 def _package_root(path: Path) -> Path:
@@ -1409,26 +1748,149 @@ def _validate_workflow_options(document: Mapping[str, Any]) -> None:
         _mapping(document["sandbox"], "sandbox")
 
 
-_READ_SIDECAR_FROM_DISK = object()
+def _source_node(
+    raw: Any,
+    index: int,
+    lines: dict[str, int],
+) -> WorkflowSourceNode:
+    """Parse one authored node without consulting its sidecar language profile."""
+    path = f"nodes[{index}]"
+    node = _mapping(raw, path)
+    if "kind" in node:
+        legacy_kind = node.get("kind")
+        replacement = (
+            f"replace `kind: {legacy_kind}` with the `{legacy_kind}: ...` node field"
+            if isinstance(legacy_kind, str) and legacy_kind
+            else "replace the legacy `kind` field with one supported node-type field"
+        )
+        _fail(
+            f"{path}.kind",
+            "legacy_kind_schema",
+            f"legacy workflow node schema is unsupported; {replacement}",
+            line=lines.get("kind"),
+        )
+    unknown = sorted(set(node) - COMMON_NODE_FIELDS)
+    if unknown:
+        _fail(
+            path,
+            "unknown_node_field",
+            f"{path} has unknown execution field: {unknown[0]}",
+            line=lines.get(unknown[0]),
+        )
+    node_id = _validate_identifier(node.get("id"), f"{path}.id")
+    present_types = [field for field in SOURCE_NODE_TYPES if field in node]
+    if len(present_types) != 1:
+        _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
+    node_type = present_types[0]
+    if node_type == "include":
+        invalid_fields = sorted(
+            set(node) - {"id", "include", "depends_on", "trigger_rule"}
+        )
+        if invalid_fields:
+            field = invalid_fields[0]
+            _fail(
+                f"{path}.{field}",
+                "invalid_type_field",
+                f"{path}.{field} is not structurally valid for include directives",
+                line=lines.get(field),
+            )
+        include_target = _string(node["include"], f"{path}.include")
+        if (
+            len(include_target) > 128
+            or _CONTROL_OR_ANSI.search(include_target)
+            or not _LITERAL_INCLUDE_NAME.fullmatch(include_target)
+        ):
+            _fail(
+                f"{path}.include",
+                "invalid_include_target",
+                f"{path}.include must be one literal portable workflow name",
+                line=lines.get("include"),
+            )
+    else:
+        _validate_node_type(node, node_type, path)
+        _validate_declared_options(node, path)
+    depends = node.get("depends_on", [])
+    if not isinstance(depends, list) or any(
+        not isinstance(item, str) or not item for item in depends
+    ):
+        _fail(
+            f"{path}.depends_on",
+            "invalid_dependencies",
+            f"{path}.depends_on must be a list of identifiers",
+        )
+    for dependency in depends:
+        _validate_identifier(dependency, f"{path}.depends_on")
+    trigger = node.get("trigger_rule", "all_success")
+    if trigger not in TRIGGER_RULES:
+        _fail(
+            f"{path}.trigger_rule",
+            "invalid_trigger_rule",
+            f"{path}.trigger_rule is invalid",
+        )
+    if "context" in node and node["context"] not in CONTEXT_VALUES:
+        _fail(
+            f"{path}.context",
+            "invalid_context",
+            f"{path}.context must be fresh or shared",
+        )
+    if "hooks" in node:
+        _validate_hook_fields(node["hooks"], f"{path}.hooks")
+    if "when" in node:
+        _string(node["when"], f"{path}.when")
+    options = {
+        key: value
+        for key, value in node.items()
+        if key not in {"id", node_type, "depends_on"}
+    }
+    return WorkflowSourceNode(
+        id=node_id,
+        node_type=node_type,
+        value=node[node_type],
+        depends_on=tuple(depends),
+        source_index=index,
+        source_line=lines.get("id"),
+        options=options,
+        field_lines=lines,
+    )
 
 
-def _load_workflow_bytes(
-    workflow_path: Path,
-    data: bytes,
+def _logical_source_location(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def parse_workflow_source_bytes(
+    path: str | Path,
     *,
-    sidecar_bytes: bytes | None | object,
-    source: str,
-    precedence: int,
-    normalizer_version: int | None = None,
-) -> WorkflowPackage:
-    if len(data) > MAX_WORKFLOW_DOCUMENT_BYTES:
+    workflow_bytes: bytes,
+    sidecar_bytes: bytes | None,
+    source: str = "explicit",
+    precedence: int = 0,
+) -> WorkflowSourceDocument:
+    """Parse bounded authenticated bytes without selecting language authority."""
+    workflow_path = Path(path).expanduser().absolute()
+    if workflow_path.suffix.lower() not in {".yaml", ".yml"}:
+        _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
+    if not isinstance(workflow_bytes, bytes):
+        _fail("document", "invalid_yaml", "workflow definition must be bytes")
+    if len(workflow_bytes) > MAX_WORKFLOW_DOCUMENT_BYTES:
         _fail(
             "path",
             "workflow_too_large",
             "workflow YAML exceeds the 2 MiB validation limit",
         )
+    if sidecar_bytes is not None and not isinstance(sidecar_bytes, bytes):
+        _fail("sidecar", "invalid_sidecar", "workflow sidecar must be bytes")
+    if sidecar_bytes is not None and len(sidecar_bytes) > MAX_WORKFLOW_DOCUMENT_BYTES:
+        _fail(
+            "sidecar",
+            "invalid_sidecar",
+            "workflow sidecar exceeds the 2 MiB validation limit",
+        )
     try:
-        text = data.decode("utf-8")
+        text = workflow_bytes.decode("utf-8")
         raw = yaml.load(text, Loader=_WorkflowSafeLoader)
     except (UnicodeError, ValueError, yaml.YAMLError) as exc:
         _fail("document", "invalid_yaml", f"invalid workflow YAML: {exc}")
@@ -1448,50 +1910,19 @@ def _load_workflow_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
-    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
-        sidecar_path, sidecar = _load_sidecar(workflow_path)
-    elif sidecar_bytes is None:
-        sidecar_path, sidecar = None, freeze_value({})
+    sidecar_path = (
+        workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        if sidecar_bytes is not None
+        else None
+    )
+    if sidecar_bytes is None:
+        sidecar = freeze_value({})
     else:
-        assert isinstance(sidecar_bytes, bytes)
-        sidecar_path, sidecar = _parse_sidecar(
-            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
-            sidecar_bytes,
-        )
+        _, sidecar = _parse_sidecar(sidecar_path, sidecar_bytes)
     try:
-        selection = resolve_language_profile(sidecar)
+        resolve_language_profile(sidecar)
     except WorkflowLanguageCompatibilityError as exc:
         _fail("sidecar.language_compatibility", exc.code, str(exc))
-    selected_normalizer_version = select_normalizer_version(
-        selection, normalizer_version
-    )
-    unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
-    if (
-        unknown_top
-        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
-    ):
-        raise WorkflowValidationError(
-            tuple(
-                ValidationIssue(
-                    path=field,
-                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
-                    message=f"Archon profile does not support top-level field: {field}",
-                    source_line=top_lines.get(field),
-                )
-                for field in unknown_top
-            )
-        )
-    issues = tuple(
-        ValidationIssue(
-            path=field,
-            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
-            message=f"unknown top-level field: {field}",
-            severity="warning",
-            blocking=False,
-            source_line=top_lines.get(field),
-        )
-        for field in unknown_top
-    )
     name = _validate_identifier(document.get("name"), "name")
     if not _SAFE_NAME.fullmatch(name):
         _fail(
@@ -1505,32 +1936,149 @@ def _load_workflow_bytes(
     if not isinstance(raw_nodes, list) or not raw_nodes:
         _fail("nodes", "invalid_nodes", "nodes must be a non-empty list")
     nodes = tuple(
-        _normalize_node(
+        _source_node(
             node,
             index,
             node_lines[index] if index < len(node_lines) else {},
-            profile=selection.effective_profile,
-            normalizer_version=selected_normalizer_version,
         )
         for index, node in enumerate(raw_nodes)
     )
-    archon_v3 = (
-        selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and selected_normalizer_version == 3
+    root = _package_root(workflow_path)
+    definition_location = _logical_source_location(workflow_path, root)
+    nodes = tuple(
+        replace(
+            node,
+            origin=WorkflowNodeOrigin(
+                include_instance_path=(),
+                package_key=f"{source}:{name}",
+                workflow_name=name,
+                catalog_source=source,
+                precedence=precedence,
+                definition_location=definition_location,
+                source_index=node.source_index,
+                source_line=node.source_line,
+                expanded_node_id=node.id,
+            ),
+        )
+        for node in nodes
     )
-    _validate_graph(nodes, strict_output_references=archon_v3)
     options = {
         key: value
         for key, value in document.items()
         if key not in {"name", "description", "nodes"}
     }
-    definition = WorkflowDefinition(
+    return WorkflowSourceDocument(
         name=name,
         description=description,
         nodes=nodes,
         options=freeze_value(options),
-        source_path=workflow_path,
+        root=root,
+        workflow_path=workflow_path,
+        sidecar_path=sidecar_path,
+        sidecar=sidecar,
+        source=source,
+        precedence=precedence,
+        definition_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        definition_location=definition_location,
+        sidecar_location=(
+            _logical_source_location(sidecar_path, root)
+            if sidecar_path is not None
+            else None
+        ),
+        field_lines=top_lines,
     )
+
+
+def _thaw_source_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_source_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_source_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_source_value(item) for item in value}
+    return value
+
+
+def _source_node_mapping(node: WorkflowSourceNode) -> Mapping[str, Any]:
+    raw: dict[str, Any] = {
+        "id": node.id,
+        node.node_type: _thaw_source_value(node.value),
+    }
+    if node.depends_on:
+        raw["depends_on"] = list(node.depends_on)
+    raw.update(_thaw_source_value(node.options))
+    return raw
+
+
+def _compile_workflow_source_document(
+    source_document: WorkflowSourceDocument,
+    *,
+    normalizer_version: int | None = None,
+) -> WorkflowPackage:
+    """Apply root language/default/policy authority to one parsed source graph."""
+    sidecar = source_document.sidecar
+    try:
+        selection = resolve_language_profile(sidecar)
+    except WorkflowLanguageCompatibilityError as exc:
+        _fail("sidecar.language_compatibility", exc.code, str(exc))
+    selected_normalizer_version = select_normalizer_version(
+        selection, normalizer_version
+    )
+    unknown_top = sorted(set(source_document.options) - TOP_LEVEL_FIELDS)
+    if (
+        unknown_top
+        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowValidationError(
+            tuple(
+                ValidationIssue(
+                    path=field,
+                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+                    message=f"Archon profile does not support top-level field: {field}",
+                    source_line=source_document.field_lines.get(field),
+                )
+                for field in unknown_top
+            )
+        )
+    issues = tuple(
+        ValidationIssue(
+            path=field,
+            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
+            message=f"unknown top-level field: {field}",
+            severity="warning",
+            blocking=False,
+            source_line=source_document.field_lines.get(field),
+        )
+        for field in unknown_top
+    )
+    nodes = tuple(
+        _normalize_node(
+            _source_node_mapping(node),
+            node.source_index,
+            dict(node.field_lines),
+            profile=selection.effective_profile,
+            normalizer_version=selected_normalizer_version,
+            origin=node.origin,
+        )
+        for node in source_document.nodes
+    )
+    archon_v3 = supports_phase3_semantics(
+        selection.effective_profile, selected_normalizer_version
+    )
+    _validate_graph(nodes, strict_output_references=archon_v3)
+    definition = WorkflowDefinition(
+        name=source_document.name,
+        description=source_document.description,
+        nodes=nodes,
+        options=source_document.options,
+        source_path=source_document.workflow_path,
+    )
+    if supports_phase4_semantics(
+        selection.effective_profile,
+        selected_normalizer_version,
+    ):
+        sidecar = _expand_root_sidecar_node_references(sidecar, nodes)
     node_ids = frozenset(node.id for node in nodes)
     _validate_sidecar_node_references(sidecar, node_ids)
     try:
@@ -1553,7 +2101,9 @@ def _load_workflow_bytes(
         )
     if archon_v3:
         _validate_v3_static_output_references(
-            normalized.definition.nodes, normalized.metadata.structured_outputs
+            normalized.definition.nodes,
+            normalized.metadata.structured_outputs,
+            normalizer_version=selected_normalizer_version,
         )
     else:
         _validate_structured_output_field_references(
@@ -1562,12 +2112,12 @@ def _load_workflow_bytes(
     return WorkflowPackage(
         source_definition=definition,
         definition=normalized.definition,
-        root=_package_root(workflow_path),
-        workflow_path=workflow_path,
-        sidecar_path=sidecar_path,
+        root=source_document.root,
+        workflow_path=source_document.workflow_path,
+        sidecar_path=source_document.sidecar_path,
         sidecar=sidecar,
-        source=source,
-        precedence=precedence,
+        source=source_document.source,
+        precedence=source_document.precedence,
         language=normalized.metadata,
         compatibility_findings=language_compatibility_findings(
             definition, normalized.metadata
@@ -1586,13 +2136,23 @@ def load_workflow(
         ".yml",
     }:
         _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
-    return _load_workflow_bytes(
+    workflow_bytes = workflow_path.read_bytes()
+    sidecar_path = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+    try:
+        sidecar_bytes = sidecar_path.read_bytes() if sidecar_path.is_file() else None
+    except OSError as exc:
+        _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
+    source_document = parse_workflow_source_bytes(
         workflow_path,
-        workflow_path.read_bytes(),
-        sidecar_bytes=_READ_SIDECAR_FROM_DISK,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
     )
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    catalog = WorkflowCatalogSnapshot.capture((source_document,))
+    return compile_workflow(source_document, catalog).package
 
 
 def load_workflow_snapshot(
@@ -1608,14 +2168,21 @@ def load_workflow_snapshot(
     workflow_path = Path(path).expanduser().absolute()
     if workflow_path.suffix.lower() not in {".yaml", ".yml"}:
         _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
-    return _load_workflow_bytes(
+    source_document = parse_workflow_source_bytes(
         workflow_path,
-        workflow_bytes,
+        workflow_bytes=workflow_bytes,
         sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
-        normalizer_version=normalizer_version,
     )
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+
+    catalog = WorkflowCatalogSnapshot.capture((source_document,))
+    return compile_workflow(
+        source_document,
+        catalog,
+        normalizer_version=normalizer_version,
+    ).package
 
 
 def validate_package(package: WorkflowPackage) -> tuple[ValidationIssue, ...]:

@@ -24,6 +24,7 @@ from plugins.workflow.entitlement import (
 )
 
 if TYPE_CHECKING:
+    from plugins.workflow.compilation import WorkflowCompilation
     from plugins.workflow.compat import CompatibilityReport
     from plugins.workflow.models import WorkflowPackage
     from plugins.workflow.trust import (
@@ -509,6 +510,7 @@ def assess_package_execution(
     context: ExecutionCapabilityContext,
     *,
     read_budget: "WorkflowResourceReadBudget | None" = None,
+    compilation: "WorkflowCompilation | None" = None,
 ) -> tuple["CompatibilityReport", "WorkflowRiskSummary"]:
     """Recompute compatibility then risk under one immutable context."""
     from plugins.workflow.compat import (
@@ -567,6 +569,7 @@ def assess_package_execution(
         package,
         compatibility,
         read_budget=read_budget,
+        compilation=compilation,
     )
     return compatibility, risk
 

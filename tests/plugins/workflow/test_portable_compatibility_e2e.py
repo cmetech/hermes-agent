@@ -14,7 +14,7 @@ from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.language_schema import NODE_TYPES, workflow_authoring_contract
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.showcase import load_showcase_catalog, run_showcase
 from plugins.workflow.store import RunStore
@@ -100,7 +100,7 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
         package.language.effective_profile
         is WorkflowLanguageProfile.ARCHON_2026_07
     )
-    assert package.language.normalizer_version == 3
+    assert package.language.normalizer_version == 4
     prepare = package.definition.nodes[0]
     assert prepare.options["timeout"] == 120_000
     assert prepare.options["retry"]["max_attempts"] == 1
@@ -242,7 +242,14 @@ def test_official_archon_confirmed_missing_cross_run_session_executes_fresh_once
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
     home = tmp_path / "recovery-home"
     runner = _MissingSessionRunner()
     registry = NodeSessionRegistry(home)
@@ -301,7 +308,14 @@ def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
 
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(
+            f"{workflow.stem}.hermes.yaml"
+        ).read_bytes(),
+        normalizer_version=3,
+    )
 
     assert [node.node_type for node in package.definition.nodes] == [
         "prompt",
@@ -311,3 +325,95 @@ def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(
         assert node.options["mcp"] == "echo.yaml"
         assert node.options["skills"] == ("ascii-art",)
     assert {"mcp", "skills"}.isdisjoint(NODE_TYPES)
+
+
+def test_current_v4_include_loop_matches_the_explicit_contract(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    """Exercise the current and explicit-v4 compatibility path as one relationship."""
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    root_path = workflow_writer(
+        tmp_path / "root/workflows",
+        name="portable-v4-root",
+        interactive=True,
+        nodes=[{"id": "checks", "include": "portable-v4-child"}],
+    )
+    child_path = workflow_writer(
+        tmp_path / "child/workflows",
+        name="portable-v4-child",
+        nodes=[
+            {
+                "id": "refine",
+                "loop": {
+                    "command": "refine",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                    "interactive": True,
+                    "gate_message": "Accept or refine",
+                },
+            }
+        ],
+    )
+    child_commands = child_path.parent.parent / "commands"
+    child_commands.mkdir()
+    child_commands.joinpath("refine.md").write_text(
+        "Refine the result from sealed bytes.\n",
+        encoding="utf-8",
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    root = parse_workflow_source_bytes(
+        root_path,
+        workflow_bytes=root_path.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    child = parse_workflow_source_bytes(
+        child_path,
+        workflow_bytes=child_path.read_bytes(),
+        sidecar_bytes=b"required_secrets: [IGNORED_CHILD_SECRET]\n",
+        source="profile",
+        precedence=2,
+    )
+    compilation = compile_workflow(
+        root,
+        WorkflowCatalogSnapshot.capture((root, child)),
+    )
+    report = assess_compatibility(compilation.package)
+    default_contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07
+    )
+    explicit_contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+
+    assert default_contract["normalizer_version"] == 4
+    assert explicit_contract["normalizer_version"] == 4
+    assert default_contract == explicit_contract
+    assert report.runnable
+    assert [node.id for node in compilation.package.definition.nodes] == [
+        "checks__refine"
+    ]
+    assert compilation.package.language.node_semantics["checks__refine"]["loop"] == {
+        "prompt_source": "command",
+        "command_binding": next(
+            resource.snapshot_path
+            for resource in compilation.dependency_manifest.resources
+            if resource.resource_kind == "loop_command"
+        ),
+        "effective_interactive": True,
+        "signal_completes": False,
+    }
+    finding_codes = {finding.code for finding in report.findings}
+    assert {
+        "phase4_loop_prompt_sealed",
+        "phase4_signal_confirmation",
+    } <= finding_codes
+    assert not any(
+        finding.blocking and finding.code.startswith("phase4_")
+        for finding in report.findings
+    )

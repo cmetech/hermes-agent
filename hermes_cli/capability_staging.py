@@ -379,8 +379,10 @@ def _assert_safe_tree(root: Path, relative: Path, *, label: str) -> Path:
 
 def _verified_workflow_package(
     package_root: Path, digest_manifest: Path
-) -> tuple[tuple[str, str], ...]:
-    from plugins.workflow.schema import load_workflow
+) -> tuple[tuple[str, str, object, object | None], ...]:
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.language import supports_phase4_semantics
+    from plugins.workflow.schema import parse_workflow_source_bytes
     from plugins.workflow.trust import compute_package_digest
 
     if digest_manifest.is_symlink() or not digest_manifest.is_file():
@@ -408,17 +410,48 @@ def _verified_workflow_package(
     )
     if not workflow_paths:
         raise ValueError("workflow package does not contain portable YAML")
-    verified: list[tuple[str, str]] = []
+    sources = []
     for workflow_path in workflow_paths:
-        package = load_workflow(workflow_path)
+        sidecar_path = workflow_path.with_name(
+            f"{workflow_path.stem}.hermes.yaml"
+        )
+        sources.append(
+            parse_workflow_source_bytes(
+                workflow_path,
+                workflow_bytes=workflow_path.read_bytes(),
+                sidecar_bytes=(
+                    sidecar_path.read_bytes() if sidecar_path.is_file() else None
+                ),
+                source="distribution",
+                precedence=1,
+            )
+        )
+    catalog = WorkflowCatalogSnapshot.capture(sources)
+    verified: list[tuple[str, str, object, object | None]] = []
+    for source in sources:
+        compilation = compile_workflow(source, catalog)
+        package = compilation.package
         expected = packages.get(package.definition.name)
-        actual = compute_package_digest(package).sha256
+        phase4 = supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        actual = (
+            compilation.composite_digest
+            if phase4
+            else compute_package_digest(package).sha256
+        )
         if not isinstance(expected, str) or expected != actual:
             raise ValueError(
                 f"workflow package digest mismatch: {package.definition.name}"
             )
-        verified.append((package.definition.name, actual))
-    if set(packages) != {name for name, _digest in verified}:
+        verified.append((
+            package.definition.name,
+            actual,
+            package,
+            compilation if phase4 else None,
+        ))
+    if set(packages) != {name for name, _digest, _package, _compilation in verified}:
         raise ValueError("workflow package digest manifest does not match package names")
     return tuple(verified)
 
@@ -455,7 +488,7 @@ def _stage_workflow_package(
     previously_untrusted: list[str] = []
     try:
         shutil.copytree(source, staged)
-        verified = _verified_workflow_package(staged, staged / digest_inside)
+        _verified_workflow_package(staged, staged / digest_inside)
         fault_injector("before-workflow-package-swap", destination)
         if destination.exists():
             if destination.is_symlink() or not destination.is_dir():
@@ -466,22 +499,22 @@ def _stage_workflow_package(
         published = True
         if trusted_distribution:
             from plugins.workflow.compat import assess_compatibility
-            from plugins.workflow.schema import load_workflow
             from plugins.workflow.trust import WorkflowTrustStore
             from plugins.workflow.trust import build_risk_summary
 
             trust = WorkflowTrustStore(home)
-            published_packages = {
-                package.definition.name: package
-                for path in (destination / "workflows").glob("*.yaml")
-                if not path.name.endswith(".hermes.yaml")
-                for package in (load_workflow(path),)
-            }
-            for name, digest in verified:
+            published = _verified_workflow_package(
+                destination,
+                destination / digest_inside,
+            )
+            for name, digest, package, compilation in published:
                 if trust.check(digest) == "untrusted":
                     previously_untrusted.append(digest)
-                package = published_packages[name]
-                risk = build_risk_summary(package, assess_compatibility(package))
+                risk = build_risk_summary(
+                    package,
+                    assess_compatibility(package),
+                    compilation=compilation,
+                )
                 trust.trust(
                     digest,
                     actor="trusted_distribution",

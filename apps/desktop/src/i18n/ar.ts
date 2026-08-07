@@ -1657,6 +1657,21 @@ export const ar = defineLocale({
       ageMin: 'دقيقة'
     }
   },
+  operations: {
+    workflowDependencies: 'تبعيات سير العمل',
+    workflowDependencySources: 'مصادر التبعيات',
+    workflowDependencyPrecedence: 'الأولوية',
+    workflowDependencyPackages: 'حزم التبعيات',
+    workflowExpandedNodes: 'العقد الموسعة',
+    workflowExpandedEdges: 'الحواف الموسعة',
+    workflowIncludeDepth: 'عمق التضمين',
+    workflowCompositeDigest: 'البصمة المركبة',
+    workflowIgnoredPolicies: 'سياسات فرعية متجاهلة',
+    workflowIgnoredPolicyField: field => `تم تجاهله: ${field}`,
+    acceptResult: 'قبول النتيجة',
+    continueWithFeedback: 'متابعة مع ملاحظات',
+    feedback: 'الملاحظات'
+  },
   composer: {
     message: 'الرسالة',
     wakingProfile: profile => `جار إيقاظ ${profile}`,

@@ -1,24 +1,35 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import threading
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
+from plugins.workflow.sessions import (
+    NodeSessionKey,
+    PersistentSessionRecoverySelection,
+)
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
     RunStore,
+    StorageQuotaError,
     TypedPublicationCandidate,
 )
+from plugins.workflow.trust import WorkflowPackageDigest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -50,6 +61,1572 @@ def _run(store, package, *, idempotency_key="crash"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+class _CountedLoopRunner:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.requests = []
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        self.requests.append(request)
+        return PluginAgentRunResult(
+            final_response=self.response,
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
+class _LeaseClock:
+    def __init__(self, sample: LeaseClockSample) -> None:
+        self.sample = sample
+
+    def __call__(self) -> LeaseClockSample:
+        return self.sample
+
+
+def _phase4_signal_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    downstream: bool = False,
+    loop_overrides: dict[str, object] | None = None,
+    node_overrides: dict[str, object] | None = None,
+    lease_clock=None,
+    admission_overrides: dict[str, object] | None = None,
+):
+    loop = {
+        "prompt": "Refine",
+        "until": "DONE",
+        "max_iterations": 2,
+        "interactive": True,
+        "gate_message": "Accept or refine",
+    }
+    loop.update(loop_overrides or {})
+    nodes = [
+        {
+            "id": "refine",
+            "loop": loop,
+            **(node_overrides or {}),
+        }
+    ]
+    if downstream:
+        nodes.append({
+            "id": "after",
+            "bash": "printf downstream",
+            "depends_on": ["refine"],
+        })
+    workflow = workflow_writer(
+        tmp_path / "signal-crash-source" / "workflows",
+        name="signal-crash",
+        interactive=True,
+        nodes=nodes,
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    home = tmp_path / "signal-crash-home"
+    store = (
+        RunStore(home, lease_clock=lease_clock)
+        if lease_clock is not None
+        else RunStore(home)
+    )
+    prepared = store.prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=WorkflowPackageDigest(
+            compilation.composite_digest,
+            compilation.covered_relative_paths,
+        ),
+    )
+    admission = {
+        "workflow_name": "signal-crash",
+        "definition_digest": prepared.definition_digest,
+        "policy_digest": prepared.policy_digest,
+        "input_manifest_digest": prepared.input_manifest_digest,
+        "trigger_source": "cli",
+        "idempotency_key": "signal-crash",
+        "concurrency_key": "signal-crash",
+    }
+    admission.update(admission_overrides or {})
+    admitted = store.start_run(
+        RunAdmissionRequest(**admission),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return home, store, admitted.run_id
+
+
+def _expired_loop_recovery_scheduler(
+    home,
+    run_id: str,
+    *,
+    agent_runner,
+) -> RunScheduler:
+    restarted = RunStore(home)
+    projection = restarted.load_run(run_id)
+    claims = [
+        node["claim"]
+        for node in projection.get("nodes", {}).values()
+        if isinstance(node, dict)
+        and isinstance(node.get("loop_state"), dict)
+        and node["loop_state"].get("_pending_loop_decision") is not None
+        and isinstance(node.get("claim"), dict)
+    ]
+    if not claims:
+        return RunScheduler(restarted, agent_runner=agent_runner)
+    assert len(claims) == 1
+    claim = claims[0]
+    lease_seconds = float(claim["lease_seconds"])
+    expired_utc = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    expired_monotonic = float(claim["heartbeat_monotonic"]) + lease_seconds + 1
+    return RunScheduler(
+        restarted,
+        agent_runner=agent_runner,
+        utcnow=lambda: expired_utc,
+        monotonic=lambda: expired_monotonic,
+    )
+
+
+def _recorded_loop_recovery_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+):
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated loss before recovery takeover")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="before recovery takeover"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    recorded_claim = store.load_run(run_id)["nodes"]["refine"]["claim"]
+    first_now = LeaseClockSample(
+        datetime.fromisoformat(recorded_claim["lease_expires_at"])
+        + timedelta(seconds=1),
+        float(recorded_claim["heartbeat_monotonic"])
+        + float(recorded_claim["lease_seconds"])
+        + 1.0,
+        "recorded-loop-recovery-boot",
+    )
+    stale = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-a",
+        now=first_now,
+        lease_seconds=1,
+    )
+    assert stale is not None
+    winner_now = LeaseClockSample(
+        first_now.utc_now + timedelta(seconds=2),
+        first_now.monotonic_now + 2.0,
+        first_now.boot_id,
+    )
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-b",
+        now=winner_now,
+        lease_seconds=30,
+    )
+    assert winner is not None
+    return store, run_id, stale, winner, winner_now
+
+
+def _worker_claim_record(
+    store: RunStore,
+    attempt_id: str,
+) -> dict[str, object] | None:
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT owner_id, lease_expires_at FROM worker_claims "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _active_claim_authority_snapshot(
+    store: RunStore,
+    run_id: str,
+    attempt_id: str,
+) -> dict[str, object]:
+    with store._connect() as connection:
+        private_session_rows = connection.execute(
+            "SELECT attempt_id, run_id, authority_json, authority_sha256, "
+            "created_at FROM session_recovery_selection_authority "
+            "WHERE run_id=? ORDER BY attempt_id",
+            (run_id,),
+        ).fetchall()
+    return {
+        "projection": store.load_run(run_id),
+        "events": store.tail_events(run_id),
+        "worker_claim": _worker_claim_record(store, attempt_id),
+        "private_session_authority": tuple(
+            dict(row) for row in private_session_rows
+        ),
+    }
+
+
+def _transferred_active_claim_fixture(
+    tmp_path,
+    workflow_writer,
+    *,
+    session_selected: bool,
+    predicate_pending: bool = False,
+):
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    action_digest = "a" * 64
+    approval_claim = store.claim_node(
+        run_id,
+        "refine",
+        "action-approval-seed",
+    )
+    assert approval_claim is not None
+    store.mark_node_started(approval_claim)
+    store.complete_node(
+        approval_claim,
+        status="paused",
+        metadata={
+            "pending_interaction": {
+                "kind": "approval",
+                "action_digest": action_digest,
+            }
+        },
+    )
+    paused = store.load_run(run_id)
+    store.approve_run(
+        run_id,
+        expected_state_version=int(paused["state_version"]),
+        interaction_id=action_digest,
+    )
+
+    claimed_at = datetime(2026, 8, 6, 14, 0, tzinfo=timezone.utc)
+    stale = store.claim_node(
+        run_id,
+        "refine",
+        "active-authority-owner-a",
+        lease_seconds=1,
+        now=claimed_at,
+        monotonic_now=300.0,
+        executor_id="loop",
+    )
+    assert stale is not None
+    assert store.load_run(run_id)["nodes"]["refine"]["action_grant"] == (
+        action_digest
+    )
+    store.mark_node_started(stale)
+    selection = PersistentSessionRecoverySelection(
+        key=NodeSessionKey(
+            "signal-crash",
+            "refine",
+            "local",
+            "fake-provider",
+            "default",
+        ),
+        expected_generation=0,
+        missing_session_id="missing-session",
+        cache_fingerprint="b" * 64,
+        run_id=run_id,
+        attempt_id=stale.attempt_id,
+    )
+    if session_selected:
+        assert store.record_persistent_session_recovery_selection(stale, selection)
+    executor_nonce = "transferred-provider"
+    assert store.record_spawn_intent(stale, executor_nonce=executor_nonce)
+    process = ProcessIdentity(
+        pid=999_991,
+        start_time=12345.0,
+        group_id=999_991,
+    )
+    assert store.record_process_started(stale, process)
+    assert store.record_provider_dispatch(stale, executor_nonce=executor_nonce)
+    assert store.record_provider_start_delivered(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_provider_execute_received(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_provider_execute_released(
+        stale,
+        executor_nonce=executor_nonce,
+    )
+    assert store.record_process_stopped(stale, process, cleaned=True)
+
+    output = b"draft"
+    relative_path = f"nodes/refine/{stale.attempt_id}/iterations/0001.md"
+    output_path = store.run_directory(run_id) / relative_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(output)
+    artifact = ArtifactRef(
+        relative_path=relative_path,
+        media_type="text/plain",
+        size_bytes=len(output),
+        sha256=hashlib.sha256(output).hexdigest(),
+    )
+    pending_decision = (
+        {
+            "kind": "until_bash_pending",
+            "iteration": 1,
+            "until_bash_sha256": "c" * 64,
+        }
+        if predicate_pending
+        else {
+            "kind": "signal_success",
+            "iteration": 1,
+        }
+    )
+    loop_state = {
+        "iteration": 1,
+        "max_iterations": 2,
+        "fresh_context": False,
+        "output_artifact": artifact.relative_path,
+        "output_size_bytes": artifact.size_bytes,
+        "output_sha256": artifact.sha256,
+        "_pending_loop_decision": pending_decision,
+    }
+    store.record_loop_iteration(
+        stale,
+        artifacts=(artifact,),
+        loop_state=loop_state,
+    )
+    winner_now = LeaseClockSample(
+        claimed_at + timedelta(seconds=2),
+        302.0,
+        "active-authority-takeover-boot",
+    )
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="active-authority-owner-b",
+        now=winner_now,
+        lease_seconds=30,
+    )
+    assert winner is not None
+    return {
+        "store": store,
+        "run_id": run_id,
+        "stale": stale,
+        "winner": winner.claim,
+        "selection": selection,
+        "executor_nonce": executor_nonce,
+        "process": process,
+        "winner_now": winner_now,
+        "action_digest": action_digest,
+        "artifact": artifact,
+        "loop_state": loop_state,
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "response",
+        "loop_overrides",
+        "expected_status",
+        "pending_type",
+    ),
+    [
+        (
+            "signal-immediate",
+            "draft <promise>DONE</promise>",
+            {"signal_completes": True},
+            "succeeded",
+            None,
+        ),
+        (
+            "signal-confirmation",
+            "draft <promise>DONE</promise>",
+            {},
+            "paused",
+            "loop_signal_confirmation",
+        ),
+        ("ordinary-input", "draft", {}, "paused", "loop_input"),
+        (
+            "until-bash",
+            "draft",
+            {"until_bash": "exit 0"},
+            "succeeded",
+            None,
+        ),
+        (
+            "until-bash-input",
+            "draft",
+            {"until_bash": "exit 1"},
+            "paused",
+            "loop_input",
+        ),
+        (
+            "hard-limit",
+            "draft",
+            {"max_iterations": 1},
+            "failed",
+            None,
+        ),
+    ],
+)
+def test_restart_publishes_every_recorded_v4_loop_decision_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    case: str,
+    response: str,
+    loop_overrides: dict[str, object],
+    expected_status: str,
+    pending_type: str | None,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path / case,
+        workflow_writer,
+        loop_overrides=loop_overrides,
+    )
+    runner = _CountedLoopRunner(response)
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_iteration_record,
+    )
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+    assert len(runner.requests) == 1
+    assert len(store.load_run(run_id)["artifacts"]) == 1
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("restart replayed a recorded loop provider result")
+
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
+
+    assert recovered["status"] == expected_status
+    assert len(recovered["artifacts"]) == 1
+    pending = recovered["nodes"]["refine"].get("pending_interaction")
+    if pending_type is None:
+        assert pending is None
+    else:
+        assert pending["type"] == pending_type
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize("mutation", ("foreign_attempt", "extra_field"))
+def test_restart_rejects_malformed_or_foreign_loop_decision_authority(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path / mutation,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    run_path = store.run_directory(run_id) / "run.json"
+    projection = json.loads(run_path.read_text())
+    decision = projection["nodes"]["refine"]["loop_state"][
+        "_pending_loop_decision"
+    ]
+    if mutation == "foreign_attempt":
+        decision["attempt_id"] = "foreign-attempt"
+    else:
+        decision["unexpected"] = True
+    run_path.write_text(json.dumps(projection), encoding="utf-8")
+
+    with pytest.raises(JournalRecoveryError, match="journaled loop decision"):
+        RunStore(home).recorded_loop_decision(run_id)
+
+
+def test_concurrent_restart_publishes_recorded_loop_decision_once(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("concurrent recovery replayed the loop provider")
+
+    def recover() -> str:
+        recovered = _expired_loop_recovery_scheduler(
+            home,
+            run_id,
+            agent_runner=NoReplayRunner(),
+        ).advance(run_id)
+        return str(recovered["status"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = tuple(pool.map(lambda _: recover(), range(2)))
+
+    assert statuses == ("succeeded", "succeeded")
+    assert len(runner.requests) == 1
+    events = RunStore(home).tail_events(run_id)
+    assert sum(event["event_type"] == "node_succeeded" for event in events) == 1
+
+
+def test_scheduler_recovers_recorded_decision_across_claim_expiry_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+    )
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+        ).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    node = recorded["nodes"]["refine"]
+    claim = dict(node["claim"])
+    decision = dict(node["loop_state"]["_pending_loop_decision"])
+    expired_at = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    expired_monotonic = (
+        float(claim["heartbeat_monotonic"])
+        + float(claim["lease_seconds"])
+        + 1
+    )
+
+    assert store.expire_stale_claims(
+        run_id,
+        now=expired_at,
+        monotonic_now=expired_monotonic,
+    ) == ()
+    preserved = store.load_run(run_id)
+    assert preserved["status"] == "running"
+    assert preserved["nodes"]["refine"]["claim"] == claim
+    assert (
+        preserved["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+        == decision
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("expired recorded decision replayed the loop provider")
+
+    recovered = RunScheduler(
+        RunStore(home),
+        agent_runner=NoReplayRunner(),
+        utcnow=lambda: expired_at,
+        monotonic=lambda: expired_monotonic,
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"] == (
+        claim["attempt_id"]
+    )
+
+
+def test_foreground_adoption_routes_recorded_decision_through_recovery_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    started_at = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        lease_clock=clock,
+        admission_overrides={
+            "execution_mode": "foreground",
+            "foreground_owner_id": "foreground-loop-owner",
+            "foreground_lease_seconds": 1,
+        },
+    )
+    foreground = store.load_run(run_id)
+    foreground_epoch = int(foreground["foreground_epoch"])
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated foreground loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="foreground loss"):
+        RunScheduler(
+            store,
+            owner_id="foreground-loop-worker",
+            execution_owner_id="foreground-loop-owner",
+            execution_owner_epoch=foreground_epoch,
+            agent_runner=_CountedLoopRunner("draft <promise>DONE</promise>"),
+            utcnow=lambda: started_at,
+            monotonic=lambda: 100.0,
+        ).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    claim = dict(recorded["nodes"]["refine"]["claim"])
+    decision = dict(
+        recorded["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+    )
+    adopted_at = datetime.fromisoformat(
+        str(recorded["foreground_lease_expires_at"])
+    ) + timedelta(seconds=1)
+    adopted_monotonic = (
+        float(recorded["foreground_heartbeat_monotonic"])
+        + float(recorded["foreground_lease_seconds"])
+        + 1.0
+    )
+    clock.sample = LeaseClockSample(
+        adopted_at,
+        adopted_monotonic,
+        "boot-a",
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="recorded-loop-adopter",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-adopter-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database, clock=clock).try_acquire(
+        identity,
+        now=adopted_at,
+        lease_seconds=30,
+    )
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+
+    adopted = store.adopt_expired_foreground(run_id, fence, adopted_at)
+
+    assert adopted["execution_mode"] == "background"
+    assert adopted["status"] == "running"
+    assert adopted["nodes"]["refine"]["claim"]["attempt_id"] == claim[
+        "attempt_id"
+    ]
+    assert (
+        adopted["nodes"]["refine"]["loop_state"]["_pending_loop_decision"]
+        == decision
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("foreground adoption replayed the recorded loop provider")
+
+    recovered = RunScheduler(
+        store,
+        execution_fence=fence,
+        agent_runner=NoReplayRunner(),
+        utcnow=lambda: adopted_at,
+        monotonic=lambda: adopted_monotonic,
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"] == claim[
+        "attempt_id"
+    ]
+
+
+def test_stale_recorded_loop_recoverer_cannot_schedule_retry_after_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    store, run_id, stale, winner, winner_now = _recorded_loop_recovery_takeover(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+
+    with pytest.raises(RuntimeError, match="stale node completion"):
+        store.schedule_retry(
+            stale.claim,
+            next_attempt_at=winner_now.utc_now + timedelta(seconds=30),
+            error_code="provider_error",
+        )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    worker = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker is not None
+    assert worker["owner_id"] == winner.claim.owner_id
+    assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
+
+
+def test_stale_recorded_loop_recoverer_cannot_block_cleanup_after_takeover(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    store, run_id, stale, winner, _ = _recorded_loop_recovery_takeover(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+
+    with pytest.raises(RuntimeError, match="stale cleanup failure"):
+        store.block_cleanup_failed(
+            stale.claim,
+            error_message="stale recoverer cleanup failed",
+        )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    worker = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker is not None
+    assert worker["owner_id"] == winner.claim.owner_id
+    assert worker["lease_expires_at"] == winner.claim.lease_expires_at.isoformat()
+
+
+def test_stale_fenced_executor_cannot_release_recorded_loop_recovery_winner(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    started_at = datetime(2026, 8, 6, 13, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 200.0, "boot-a"))
+    _, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        lease_clock=clock,
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity_a = CoordinatorIdentity(
+        owner_id="recorded-loop-coordinator-a",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-host-a",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    leadership_a = coordinator.try_acquire(
+        identity_a,
+        now=started_at,
+        lease_seconds=1,
+    )
+    assert leadership_a.is_leader
+    fence_a = ExecutionFence(identity_a.owner_id, leadership_a.lease.epoch)
+    claims = []
+    original_claim = store.claim_node
+
+    def capture_claim(*args, **kwargs):
+        claim = original_claim(*args, **kwargs)
+        if claim is not None:
+            claims.append(claim)
+        return claim
+
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated stale coordinator before publication")
+
+    monkeypatch.setattr(store, "claim_node", capture_claim)
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    scheduler_a = RunScheduler(
+        store,
+        owner_id="recorded-loop-worker-a",
+        execution_fence=fence_a,
+        agent_runner=runner,
+        utcnow=lambda: started_at,
+        monotonic=lambda: 200.0,
+    )
+    with pytest.raises(SystemExit, match="stale coordinator"):
+        scheduler_a.advance(run_id)
+    assert len(claims) == 1
+    assert len(runner.requests) == 1
+
+    recorded = store.load_run(run_id)
+    prepared = scheduler_a._prepare_run_package(
+        run_id,
+        None,
+        expected_state_version=int(recorded["state_version"]),
+    )
+    assert prepared is not None
+    package, execution_limits, resource_paths, resource_bytes, semantics = prepared
+    node = next(node for node in package.definition.nodes if node.id == "refine")
+
+    takeover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(takeover_at, 202.0, "boot-a")
+    identity_b = CoordinatorIdentity(
+        owner_id="recorded-loop-coordinator-b",
+        host_kind="gateway",
+        host_instance_id="recorded-loop-host-b",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership_b = coordinator.try_acquire(
+        identity_b,
+        now=takeover_at,
+        lease_seconds=30,
+    )
+    assert leadership_b.is_leader
+    fence_b = ExecutionFence(identity_b.owner_id, leadership_b.lease.epoch)
+    winner = store.recorded_loop_decision(
+        run_id,
+        recovery_owner_id="recorded-loop-recoverer-b",
+        now=clock.sample,
+        lease_seconds=30,
+        execution_fence=fence_b,
+    )
+    assert winner is not None
+    before = store.load_run(run_id)
+    events_before = store.tail_events(run_id)
+    worker_before = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker_before is not None
+
+    scheduler_a._execute_claim(
+        run_id,
+        claims[0],
+        node,
+        package,
+        recorded,
+        None,
+        execution_limits,
+        semantics,
+        resource_paths,
+        resource_bytes,
+    )
+
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == events_before
+    worker_after = _worker_claim_record(store, winner.claim.attempt_id)
+    assert worker_after is not None
+    assert worker_after == worker_before
+    assert worker_after["owner_id"] == winner.claim.owner_id
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "stale_raises", "winner_result"),
+    [
+        ("release_before_execution", False, False),
+        ("mark_started", True, None),
+        ("session_selection", False, True),
+        ("session_outcome", False, True),
+        ("spawn_intent", False, False),
+        ("spawn_failed", False, False),
+        ("process_started", False, True),
+        ("process_stopped", False, True),
+        ("provider_dispatch", False, True),
+        ("provider_start_delivered", False, True),
+        ("provider_execute_received", False, True),
+        ("provider_execute_released", False, True),
+        ("complete_node", True, None),
+        ("loop_iteration", True, None),
+        ("loop_decision", True, None),
+        ("block_cleanup_failed", True, None),
+        ("schedule_retry", True, None),
+        ("renew_claim", False, True),
+        ("release_or_expire", False, True),
+        ("consume_action_grant", True, "action_digest"),
+    ],
+)
+def test_transferred_claim_rejects_every_stale_active_authority_helper(
+    tmp_path,
+    workflow_writer,
+    case: str,
+    stale_raises: bool,
+    winner_result: object,
+) -> None:
+    context = _transferred_active_claim_fixture(
+        tmp_path,
+        workflow_writer,
+        session_selected=case == "session_outcome",
+        predicate_pending=case == "loop_decision",
+    )
+    store = context["store"]
+    run_id = context["run_id"]
+    stale = context["stale"]
+    winner = context["winner"]
+
+    def invoke(claim):
+        if case == "release_before_execution":
+            return store.release_claim_before_execution(claim)
+        if case == "mark_started":
+            return store.mark_node_started(claim)
+        if case == "session_selection":
+            return store.record_persistent_session_recovery_selection(
+                claim,
+                context["selection"],
+            )
+        if case == "session_outcome":
+            return store.record_persistent_session_recovery_outcome(
+                claim,
+                outcome="fresh_execution_failed",
+            )
+        if case == "spawn_intent":
+            return store.record_spawn_intent(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "spawn_failed":
+            return store.record_spawn_failed(
+                claim,
+                executor_nonce=context["executor_nonce"],
+                error_code="injected_spawn_failure",
+            )
+        if case == "process_started":
+            return store.record_process_started(claim, context["process"])
+        if case == "process_stopped":
+            return store.record_process_stopped(
+                claim,
+                context["process"],
+                cleaned=True,
+            )
+        if case == "provider_dispatch":
+            return store.record_provider_dispatch(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_start_delivered":
+            return store.record_provider_start_delivered(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_execute_received":
+            return store.record_provider_execute_received(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "provider_execute_released":
+            return store.record_provider_execute_released(
+                claim,
+                executor_nonce=context["executor_nonce"],
+            )
+        if case == "complete_node":
+            return store.complete_node(claim, status="succeeded")
+        if case == "loop_iteration":
+            return store.record_loop_iteration(
+                claim,
+                artifacts=(context["artifact"],),
+                loop_state=context["loop_state"],
+            )
+        if case == "loop_decision":
+            decided = dict(context["loop_state"])
+            decided["_pending_loop_decision"] = {
+                "kind": "until_bash_success",
+                "iteration": 1,
+            }
+            return store.record_loop_decision(claim, loop_state=decided)
+        if case == "block_cleanup_failed":
+            return store.block_cleanup_failed(
+                claim,
+                error_message="injected cleanup failure",
+            )
+        if case == "schedule_retry":
+            return store.schedule_retry(
+                claim,
+                next_attempt_at=context["winner_now"].utc_now
+                + timedelta(seconds=30),
+                error_code="provider_error",
+            )
+        if case == "renew_claim":
+            winner_now = context["winner_now"]
+            return store.renew_claim(
+                claim,
+                now=winner_now.utc_now + timedelta(seconds=6),
+                monotonic_now=winner_now.monotonic_now + 6.0,
+                lease_seconds=30,
+                heartbeat_interval_seconds=5,
+            )
+        if case == "release_or_expire":
+            return store.release_or_expire_claim(claim)
+        if case == "consume_action_grant":
+            return store.consume_action_grant(claim)
+        raise AssertionError(f"unhandled active authority case: {case}")
+
+    before = _active_claim_authority_snapshot(
+        store,
+        run_id,
+        stale.attempt_id,
+    )
+    if stale_raises:
+        with pytest.raises(RuntimeError, match="stale"):
+            invoke(stale)
+    else:
+        assert invoke(stale) is False
+    assert _active_claim_authority_snapshot(
+        store,
+        run_id,
+        stale.attempt_id,
+    ) == before
+
+    result = invoke(winner)
+    if winner_result == "action_digest":
+        assert result == context["action_digest"]
+    else:
+        assert result == winner_result
+
+
+def test_fresh_recorded_loop_decision_cannot_be_taken_over_from_live_executor(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/live-predicate"; exit 1',
+        },
+    )
+    original_runner = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+    iteration_recorded = threading.Event()
+    release_original = threading.Event()
+
+    def block_live_executor_after_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        iteration_recorded.set()
+        assert release_original.wait(timeout=10)
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        block_live_executor_after_record,
+    )
+    original_scheduler = RunScheduler(store, agent_runner=original_runner)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        original = pool.submit(original_scheduler.advance, run_id)
+        assert iteration_recorded.wait(timeout=10)
+        before = store.load_run(run_id)
+        attempt_id = before["nodes"]["refine"]["claim"]["attempt_id"]
+        takeover_runner = _CountedLoopRunner("must not run")
+        try:
+            observed = RunScheduler(
+                RunStore(home),
+                agent_runner=takeover_runner,
+            ).advance(run_id)
+
+            assert observed["status"] == "running"
+            assert observed["nodes"]["refine"]["claim"]["attempt_id"] == attempt_id
+            assert takeover_runner.requests == []
+            assert not (
+                store.run_directory(run_id) / "artifacts" / "live-predicate"
+            ).exists()
+            assert not any(
+                event["event_type"]
+                in {
+                    "loop_predicate_recovery_prepared",
+                    "loop_decision_recorded",
+                    "loop_continuation_recovered",
+                    "node_paused",
+                    "node_succeeded",
+                }
+                for event in store.tail_events(run_id)
+            )
+        finally:
+            release_original.set()
+        completed = original.result(timeout=10)
+
+    assert completed["status"] == "paused"
+    assert (
+        store.run_directory(run_id) / "artifacts" / "live-predicate"
+    ).read_bytes() == b"x"
+    assert len(original_runner.requests) == 1
+
+
+def test_restart_preserves_typed_loop_publication_attempt_authority(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"signal_completes": True},
+        node_overrides={"output_type": "LoopReport"},
+    )
+    runner = _CountedLoopRunner("typed <promise>DONE</promise>")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    recovery_runner = _CountedLoopRunner("must not run")
+    recovered = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=recovery_runner,
+    ).advance(run_id)
+
+    attempt_id = recovered["nodes"]["refine"]["attempts"][-1]["attempt_id"]
+    publication = next(
+        artifact
+        for artifact in recovered["artifacts"]
+        if artifact.get("publication_id")
+    )
+    assert recovered["status"] == "succeeded"
+    assert publication["attempt_id"] == attempt_id
+    assert publication["output_type"] == "LoopReport"
+    assert recovery_runner.requests == []
+
+
+def test_restart_continues_after_recorded_noninteractive_iteration_without_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={"interactive": False, "signal_completes": True},
+    )
+    first = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+
+    def crash_after_iteration_record(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated process loss after iteration journal")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_after_iteration_record)
+    with pytest.raises(SystemExit, match="after iteration journal"):
+        RunScheduler(store, agent_runner=first).advance(run_id)
+
+    second = _CountedLoopRunner("refined <promise>DONE</promise>")
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=second,
+    )
+    recovered = scheduler.advance(run_id)
+
+    assert recovered["status"] == "running"
+    assert recovered["nodes"]["refine"]["state"] == "ready"
+    assert len(second.requests) == 0
+
+    completed = RunScheduler(
+        scheduler.store,
+        agent_runner=second,
+    ).advance(run_id)
+
+    assert completed["status"] == "succeeded"
+    assert len(first.requests) == 1
+    assert len(second.requests) == 1
+
+
+@pytest.mark.parametrize("crash_after_final_decision", (False, True))
+def test_restart_reconciles_until_bash_crash_window_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    crash_after_final_decision: bool,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/predicate-count"',
+        },
+    )
+    runner = _CountedLoopRunner("draft")
+    original_decision = store.record_loop_decision
+
+    def crash_at_decision(*args, **kwargs):
+        if crash_after_final_decision:
+            original_decision(*args, **kwargs)
+        raise SystemExit("simulated process loss around predicate decision")
+
+    monkeypatch.setattr(store, "record_loop_decision", crash_at_decision)
+    with pytest.raises(SystemExit, match="around predicate decision"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    counter = store.run_directory(run_id) / "artifacts" / "predicate-count"
+    assert counter.read_bytes() == b"x"
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("predicate recovery replayed the loop provider")
+
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert counter.read_bytes() == (b"x" if crash_after_final_decision else b"xx")
+    assert len(runner.requests) == 1
+    recovery_events = [
+        event
+        for event in restarted.tail_events(run_id)
+        if event["event_type"] == "loop_predicate_recovery_prepared"
+    ]
+    assert len(recovery_events) == (0 if crash_after_final_decision else 1)
+
+
+def test_until_bash_recovery_propagates_decision_storage_failure_without_redispatch(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": 'printf x >> "$ARTIFACTS_DIR/predicate-quota-count"',
+        },
+    )
+    runner = _CountedLoopRunner("draft")
+    original_record = store.record_loop_iteration
+
+    def crash_before_predicate(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise SystemExit("simulated loss before quota predicate")
+
+    monkeypatch.setattr(store, "record_loop_iteration", crash_before_predicate)
+    with pytest.raises(SystemExit, match="before quota predicate"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    recorded_claim = store.load_run(run_id)["nodes"]["refine"]["claim"]
+    expired_at = datetime.fromisoformat(
+        recorded_claim["lease_expires_at"]
+    ) + timedelta(seconds=1)
+    expired_monotonic = (
+        float(recorded_claim["heartbeat_monotonic"])
+        + float(recorded_claim["lease_seconds"])
+        + 1.0
+    )
+    restarted = RunStore(home)
+
+    def fail_decision_journal(*_args, **_kwargs):
+        raise StorageQuotaError("injected loop decision quota failure")
+
+    monkeypatch.setattr(restarted, "record_loop_decision", fail_decision_journal)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("decision storage failure replayed the loop provider")
+
+    with pytest.raises(StorageQuotaError, match="injected loop decision"):
+        RunScheduler(
+            restarted,
+            agent_runner=NoReplayRunner(),
+            utcnow=lambda: expired_at,
+            monotonic=lambda: expired_monotonic,
+        ).advance(run_id)
+
+    counter = store.run_directory(run_id) / "artifacts" / "predicate-quota-count"
+    assert counter.read_bytes() == b"x"
+    assert len(runner.requests) == 1
+    failed_closed = restarted.load_run(run_id)
+    assert (
+        failed_closed["nodes"]["refine"]["loop_state"][
+            "_pending_loop_decision"
+        ]["kind"]
+        == "until_bash_pending"
+    )
+
+
+def test_until_bash_recovery_authenticates_one_shot_feedback_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": "test $LOOP_USER_INPUT = 'accept predicate'",
+        },
+    )
+    first = RunScheduler(
+        store,
+        agent_runner=_CountedLoopRunner("draft"),
+    ).advance(run_id)
+    pending = first["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == "loop_input"
+    ready = store.provide_loop_input(
+        run_id,
+        "accept predicate",
+        expected_state_version=first["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    feedback_path = ready["nodes"]["refine"]["loop_user_input_artifact"]
+    second_runner = _CountedLoopRunner("refined")
+    original_record = store.record_loop_iteration
+
+    def crash_after_second_iteration(*args, **kwargs):
+        original_record(*args, **kwargs)
+        if kwargs["loop_state"]["iteration"] == 2:
+            raise SystemExit("simulated loss before feedback predicate")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_second_iteration,
+    )
+    with pytest.raises(SystemExit, match="before feedback predicate"):
+        RunScheduler(store, agent_runner=second_runner).advance(run_id)
+
+    recorded = store.load_run(run_id)
+    assert recorded["nodes"]["refine"]["loop_user_input_artifact"] == feedback_path
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("feedback predicate recovery replayed the provider")
+
+    recovered = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["nodes"]["refine"]["loop_state"]["completed_by"] == (
+        "until_bash"
+    )
+    assert recovered["nodes"]["refine"].get("loop_user_input_artifact") is None
+    assert len(second_runner.requests) == 1
+
+
+@pytest.mark.parametrize("mutation", ("same_size_digest", "symlink"))
+def test_until_bash_recovery_rejects_changed_feedback_before_predicate_dispatch(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        loop_overrides={
+            "until_bash": (
+                'printf x >> "$ARTIFACTS_DIR/feedback-predicate-count"; '
+                "test $LOOP_USER_INPUT = 'accept predicate'"
+            ),
+        },
+    )
+    first = RunScheduler(
+        store,
+        agent_runner=_CountedLoopRunner("draft"),
+    ).advance(run_id)
+    ready = store.provide_loop_input(
+        run_id,
+        "accept predicate",
+        expected_state_version=first["state_version"],
+        interaction_id=first["nodes"]["refine"]["pending_interaction"][
+            "interaction_id"
+        ],
+    )
+    relative_path = ready["nodes"]["refine"]["loop_user_input_artifact"]
+    original_record = store.record_loop_iteration
+
+    def crash_after_second_iteration(*args, **kwargs):
+        original_record(*args, **kwargs)
+        if kwargs["loop_state"]["iteration"] == 2:
+            raise SystemExit("simulated loss before feedback predicate")
+
+    monkeypatch.setattr(
+        store,
+        "record_loop_iteration",
+        crash_after_second_iteration,
+    )
+    with pytest.raises(SystemExit, match="before feedback predicate"):
+        RunScheduler(
+            store,
+            agent_runner=_CountedLoopRunner("refined"),
+        ).advance(run_id)
+
+    feedback_path = store.run_directory(run_id) / relative_path
+    if mutation == "same_size_digest":
+        feedback_path.write_text("reject predicate", encoding="utf-8")
+    else:
+        replacement = tmp_path / "foreign-feedback.txt"
+        replacement.write_text("accept predicate", encoding="utf-8")
+        feedback_path.unlink()
+        feedback_path.symlink_to(replacement)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("changed feedback recovery replayed the provider")
+
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    )
+    with pytest.raises(JournalRecoveryError, match="loop feedback"):
+        scheduler.advance(run_id)
+
+    predicate_count = (
+        store.run_directory(run_id) / "artifacts" / "feedback-predicate-count"
+    )
+    assert predicate_count.read_bytes() == b"x"
+    assert "accept predicate" not in json.dumps(store.tail_events(run_id))
+
+
+def test_restart_publishes_journaled_loop_signal_without_provider_replay(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    home, store, run_id = _phase4_signal_run(tmp_path, workflow_writer)
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    original_complete = store.complete_node
+
+    def crash_before_pause_publication(*args, **kwargs):
+        if kwargs.get("status") == "paused":
+            raise SystemExit("simulated process loss after iteration journal")
+        return original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(store, "complete_node", crash_before_pause_publication)
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        RunScheduler(store, agent_runner=runner).advance(run_id)
+    assert len(runner.requests) == 1
+    assert any(
+        event["event_type"] == "loop_iteration_completed"
+        for event in store.tail_events(run_id)
+    )
+
+    monkeypatch.setattr(store, "complete_node", original_complete)
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("restart replayed a journaled provider result")
+
+    scheduler = _expired_loop_recovery_scheduler(
+        home,
+        run_id,
+        agent_runner=NoReplayRunner(),
+    )
+    restarted = scheduler.store
+    recovered = scheduler.advance(run_id)
+
+    assert recovered["status"] == "paused"
+    pending = recovered["nodes"]["refine"]["pending_interaction"]
+    assert pending["type"] == "loop_signal_confirmation"
+    assert len(recovered["artifacts"]) == 1
+    restarted.approve_run(
+        run_id,
+        expected_state_version=recovered["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+    assert restarted.get_run_status(run_id)["status"] == "succeeded"
+    assert len(runner.requests) == 1
+
+
+def test_restart_schedules_downstream_once_after_signal_acceptance(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home, store, run_id = _phase4_signal_run(
+        tmp_path,
+        workflow_writer,
+        downstream=True,
+    )
+    runner = _CountedLoopRunner("draft <promise>DONE</promise>")
+    paused = RunScheduler(store, agent_runner=runner).advance(run_id)
+    pending = paused["nodes"]["refine"]["pending_interaction"]
+
+    store.approve_run(
+        run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    class NoReplayRunner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("accepted signal replayed the loop provider")
+
+    restarted = RunStore(home)
+    completed = RunScheduler(
+        restarted,
+        agent_runner=NoReplayRunner(),
+    ).advance(run_id)
+
+    assert completed["status"] == "succeeded"
+    assert completed["nodes"]["refine"]["state"] == "succeeded"
+    assert completed["nodes"]["after"]["state"] == "succeeded"
+    assert len(completed["nodes"]["after"]["attempts"]) == 1
+    assert len(runner.requests) == 1
 
 
 def test_expired_lease_interrupts_and_stale_completion_cannot_win(

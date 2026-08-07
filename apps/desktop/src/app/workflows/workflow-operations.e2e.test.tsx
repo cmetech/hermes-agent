@@ -49,8 +49,17 @@ describe('workflow operations mounted adapter flow', () => {
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
 
-  it('constructs a mutation, refreshes a conflict, and repaints from authoritative REST state', async () => {
-    let current = snapshot()
+  it('catches signal acceptance losing its label, wire action, or authoritative 409 refresh', async () => {
+    let current = snapshot({
+      next_actions: ['approve', 'provide-input', 'cancel'],
+      pending_interaction: {
+        interaction_id: 'interaction-1',
+        iteration: 1,
+        max_iterations: 2,
+        type: 'loop_signal_confirmation'
+      }
+    })
+
     api.mockImplementation(async (request: ApiRequest) => {
       if (request.path.startsWith('/api/plugins/workflow/runs?')) {
         return { next_cursor: null, runs: [current], schema_version: 1 }
@@ -92,7 +101,7 @@ describe('workflow operations mounted adapter flow', () => {
     )
     fireEvent.click(await screen.findByRole('tab', { name: 'Active board' }))
     $workflowSelectedRunId.set('run-1')
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Accept result' }))
 
     await waitFor(() =>
       expect(api).toHaveBeenCalledWith(
@@ -105,7 +114,78 @@ describe('workflow operations mounted adapter flow', () => {
     )
     const cancel = await screen.findByRole('button', { name: 'Cancel' })
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
-    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Accept result' })).toBeNull()
+  })
+
+  it('catches signal feedback losing its gated control or existing provide-input wire payload', async () => {
+    let current = snapshot({
+      next_actions: ['approve', 'provide-input', 'cancel'],
+      pending_interaction: {
+        interaction_id: 'interaction-1',
+        iteration: 1,
+        max_iterations: 2,
+        type: 'loop_signal_confirmation'
+      }
+    })
+
+    api.mockImplementation(async (request: ApiRequest) => {
+      if (request.path.startsWith('/api/plugins/workflow/runs?')) {
+        return { next_cursor: null, runs: [current], schema_version: 1 }
+      }
+
+      if (request.path === '/api/plugins/workflow/attention') {
+        return { items: [], next_cursor: null, schema_version: 1 }
+      }
+
+      if (request.path.includes('/events?')) {
+        return { cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 }
+      }
+
+      if (request.path === '/api/plugins/workflow/runs/run-1/provide-input') {
+        current = snapshot({
+          next_actions: ['cancel'],
+          pending_interaction: null,
+          state_version: 2,
+          status: 'running'
+        })
+
+        return current
+      }
+
+      if (request.path === '/api/plugins/workflow/runs/run-1') {
+        return current
+      }
+
+      throw new Error(`unexpected workflow request: ${request.path}`)
+    })
+
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })}
+      >
+        <WorkflowsView />
+      </QueryClientProvider>
+    )
+    fireEvent.click(await screen.findByRole('tab', { name: 'Active board' }))
+    $workflowSelectedRunId.set('run-1')
+
+    expect(
+      ((await screen.findByRole('button', { name: 'Continue with feedback' })) as HTMLButtonElement).disabled
+    ).toBe(true)
+    fireEvent.change(screen.getByLabelText('Feedback'), { target: { value: 'Tighten it' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with feedback' }))
+
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: { expected_version: 1, interaction_id: 'interaction-1', value: 'Tighten it' },
+          method: 'POST',
+          path: '/api/plugins/workflow/runs/run-1/provide-input'
+        })
+      )
+    )
+    expect(((await screen.findByRole('button', { name: 'Cancel' })) as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByLabelText('Feedback')).toBeNull()
   })
 
   it('cancels a scheduled wait through the existing mutation and repaints terminal state', async () => {

@@ -25,7 +25,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import AbstractSet, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -36,7 +36,11 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.language import make_language_snapshot
+from plugins.workflow.language import (
+    make_language_snapshot,
+    supports_phase3_semantics,
+    supports_phase4_semantics,
+)
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
@@ -54,6 +58,7 @@ from plugins.workflow.lease_clock import (
 from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
+    LoopSignalConfirmation,
     RunExecutionLimits,
     TerminalJournalReserve,
     WorkflowLanguageProfile,
@@ -65,6 +70,7 @@ from plugins.workflow.provenance import (
 )
 from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
 from plugins.workflow.output_resolution import (
+    PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
     ArchonOutputIntegrityError,
     ArchonOutputUnavailableError,
     _RETRYABLE_READ_ERRNOS,
@@ -72,6 +78,7 @@ from plugins.workflow.output_resolution import (
     _safe_component,
     canonical_output_publication_identity,
     output_publication_identity_sha256,
+    primary_output_candidate_from_identity,
     write_archon_output_exclusive,
 )
 from plugins.workflow.schedule_time import (
@@ -101,6 +108,26 @@ from plugins.workflow.trust import (
 )
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
+if TYPE_CHECKING:
+    from plugins.workflow.compilation import WorkflowCompilation
+
+
+def _language_has_phase3_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 3 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase3_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
+
 
 class InputSnapshotError(ValueError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
@@ -114,6 +141,10 @@ class StorageQuotaError(RuntimeError):
 
 class JournalRecoveryError(RuntimeError):
     pass
+
+
+class StaleLoopDecisionError(RuntimeError):
+    """A loop decision lost its exact active attempt-owner comparison."""
 
 
 class PublicationNotFoundError(LookupError):
@@ -177,12 +208,34 @@ class NodeClaim:
     execution_fence: ExecutionFence | None = None
 
 
+def _active_claim_matches(
+    active: object,
+    claim: NodeClaim,
+) -> bool:
+    """Return whether *claim* owns the exact active attempt authority."""
+    return (
+        isinstance(active, Mapping)
+        and active.get("attempt_id") == claim.attempt_id
+        and active.get("owner_id") == claim.owner_id
+    )
+
+
 @dataclass(frozen=True)
 class ArtifactRef:
     relative_path: str
     media_type: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class RecordedLoopDecision:
+    """Authenticated private authority for one un-published loop outcome."""
+
+    claim: NodeClaim
+    loop_state: Mapping[str, object]
+    decision: Mapping[str, object]
+    artifact: ArtifactRef
 
 
 def _session_registry_candidate_payload(
@@ -642,6 +695,36 @@ class TypedPublicationCandidate:
     schema_fingerprint: str | None
     canonicalization_version: int
     session_id: str | None
+
+
+def _typed_publication_candidate_from_metadata(
+    metadata: object,
+) -> TypedPublicationCandidate | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw_candidate = metadata.get(PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY)
+    if raw_candidate is None:
+        return None
+    retained = primary_output_candidate_from_identity(raw_candidate)
+    if retained.output_type is None:
+        raise ArchonOutputIntegrityError(
+            "staged typed publication has no output type"
+        )
+    session_id = metadata.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise ArchonOutputIntegrityError(
+            "staged typed publication session identity is invalid"
+        )
+    return TypedPublicationCandidate(
+        attempt_relative_path=retained.attempt_relative_path,
+        output_type=retained.output_type,
+        media_type=retained.media_type,
+        size_bytes=retained.size_bytes,
+        sha256=retained.sha256,
+        schema_fingerprint=retained.schema_fingerprint,
+        canonicalization_version=retained.canonicalization_version,
+        session_id=session_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1820,12 +1903,10 @@ def _sealed_typed_output_declarations(
             raise JournalRecoveryError(
                 "typed publication sealed definition is unsafe"
             )
-        document = yaml.safe_load(
-            _read_descriptor_relative(
-                directory,
-                "definition.yaml",
-                size_bytes=observed.st_size,
-            )
+        definition_bytes = _read_descriptor_relative(
+            directory,
+            "definition.yaml",
+            size_bytes=observed.st_size,
         )
     except ArchonOutputUnavailableError:
         raise
@@ -1837,7 +1918,19 @@ def _sealed_typed_output_declarations(
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc
-    except (ArchonOutputIntegrityError, yaml.YAMLError) as exc:
+    except ArchonOutputIntegrityError as exc:
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    return _typed_output_declarations_from_definition_bytes(definition_bytes)
+
+
+def _typed_output_declarations_from_definition_bytes(
+    definition_bytes: bytes,
+) -> dict[str, _DeclaredTypedOutput]:
+    try:
+        document = yaml.safe_load(definition_bytes)
+    except (UnicodeError, yaml.YAMLError) as exc:
         raise JournalRecoveryError(
             "typed publication sealed definition is unavailable"
         ) from exc
@@ -1874,6 +1967,65 @@ def _sealed_typed_output_declarations(
     return declarations
 
 
+def _structured_output_authority(
+    projection: Mapping[str, object],
+) -> Mapping[str, object]:
+    language = projection.get("language")
+    if (
+        not isinstance(language, Mapping)
+        or language.get("effective_profile") != "archon-2026-07"
+    ):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    structured_outputs = language.get("structured_outputs")
+    if language.get("normalizer_version") == 1:
+        structured_outputs = {}
+    elif not isinstance(structured_outputs, Mapping):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    return structured_outputs
+
+
+def _typed_output_requirement(
+    projection: Mapping[str, object],
+    *,
+    node_id: str,
+    declaration: _DeclaredTypedOutput,
+) -> _RequiredTypedPublication:
+    structured_outputs = _structured_output_authority(projection)
+    structured = structured_outputs.get(node_id)
+    if declaration.has_structured_schema:
+        if not isinstance(structured, Mapping):
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+        fingerprint = structured.get("schema_fingerprint")
+        version = structured.get("canonicalization_version")
+        if (
+            not isinstance(fingerprint, str)
+            or _SHA256_PATTERN.fullmatch(fingerprint) is None
+            or isinstance(version, bool)
+            or version != 1
+        ):
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+    else:
+        if structured is not None:
+            raise JournalRecoveryError(
+                "typed publication schema authority is invalid"
+            )
+        fingerprint = None
+        version = 1
+    return _RequiredTypedPublication(
+        output_type=declaration.output_type,
+        schema_fingerprint=fingerprint,
+        canonicalization_version=version,
+    )
+
+
 def _journaled_typed_publications(
     projection: Mapping[str, object],
     declared_outputs: Mapping[str, _DeclaredTypedOutput],
@@ -1890,11 +2042,8 @@ def _journaled_typed_publications(
         isinstance(language, Mapping)
         and language.get("effective_profile") == "archon-2026-07"
     )
-    structured_outputs = language.get("structured_outputs") if archon else None
-    if archon and not isinstance(structured_outputs, Mapping):
-        raise JournalRecoveryError(
-            "typed publication language authority is invalid"
-        )
+    if archon:
+        _structured_output_authority(projection)
     requirements: dict[str, _RequiredTypedPublication] = {}
     for node_id, declaration in declared_outputs.items():
         node = nodes.get(node_id)
@@ -1904,34 +2053,10 @@ def _journaled_typed_publications(
             )
         if not archon or node.get("state") != "succeeded":
             continue
-        structured = structured_outputs.get(node_id)
-        if declaration.has_structured_schema:
-            if not isinstance(structured, Mapping):
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-            fingerprint = structured.get("schema_fingerprint")
-            version = structured.get("canonicalization_version")
-            if (
-                not isinstance(fingerprint, str)
-                or _SHA256_PATTERN.fullmatch(fingerprint) is None
-                or isinstance(version, bool)
-                or version != 1
-            ):
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-        else:
-            if structured is not None:
-                raise JournalRecoveryError(
-                    "typed publication schema authority is invalid"
-                )
-            fingerprint = None
-            version = 1
-        requirements[node_id] = _RequiredTypedPublication(
-            output_type=declaration.output_type,
-            schema_fingerprint=fingerprint,
-            canonicalization_version=version,
+        requirements[node_id] = _typed_output_requirement(
+            projection,
+            node_id=node_id,
+            declaration=declaration,
         )
     descriptors: list[_JournaledTypedPublication] = []
     publication_ids: set[str] = set()
@@ -5001,8 +5126,7 @@ class RunStore:
             if (
                 has_unframed_selection
                 and event.get("event_type") == "node_succeeded"
-                and isinstance(language, Mapping)
-                and language.get("normalizer_version") == 3
+                and _language_has_phase3_semantics(language)
                 and isinstance(recoveries, list)
                 and any(
                     isinstance(recovery, Mapping)
@@ -5318,10 +5442,7 @@ class RunStore:
                 ):
                     return False
         language = projection.get("language")
-        strict_recovery = (
-            isinstance(language, Mapping)
-            and language.get("normalizer_version") == 3
-        )
+        strict_recovery = _language_has_phase3_semantics(language)
         if strict_recovery:
             for node in nodes.values():
                 recoveries = (
@@ -5422,6 +5543,7 @@ class RunStore:
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
         execution_limits: RunExecutionLimits | None = None,
+        compilation: WorkflowCompilation | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -5444,15 +5566,47 @@ class RunStore:
                     store_limit=self.max_input_bytes,
                 )
 
-            package_digest = trusted_package_digest or compute_package_digest(
-                package, read_budget=resource_read_budget
-            )
+            dependency_manifest_digest = None
+            snapshot_format_version = 1
+            if compilation is not None:
+                from plugins.workflow.compilation import WorkflowCompilation
+
+                if not isinstance(compilation, WorkflowCompilation):
+                    raise InputSnapshotError(
+                        "workflow compilation must be immutable and exact"
+                    )
+                if package is not compilation.package:
+                    raise InputSnapshotError(
+                        "workflow package differs from its admitted compilation"
+                    )
+                if not supports_phase4_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                ):
+                    raise InputSnapshotError(
+                        "format-2 snapshots require explicit v4 semantics"
+                    )
+                expected_package_digest = WorkflowPackageDigest(
+                    compilation.composite_digest,
+                    compilation.covered_relative_paths,
+                )
+                if (
+                    trusted_package_digest is not None
+                    and trusted_package_digest != expected_package_digest
+                ):
+                    raise InputSnapshotError(
+                        "trusted workflow identity differs from its compilation"
+                    )
+                package_digest = expected_package_digest
+                snapshot_format_version = 2
+            else:
+                package_digest = trusted_package_digest or compute_package_digest(
+                    package, read_budget=resource_read_budget
+                )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
             phase3_execution_semantics = None
-            if (
-                package.language.effective_profile
-                is WorkflowLanguageProfile.ARCHON_2026_07
-                and package.language.normalizer_version == 3
+            if supports_phase3_semantics(
+                package.language.effective_profile, package.language.normalizer_version
             ):
                 from plugins.workflow.execution_semantics import (
                     build_phase3_execution_semantics,
@@ -5468,32 +5622,45 @@ class RunStore:
                     return path.read_bytes()
                 return resource_read_budget.read_cached(path)
 
-            definition_data = read_package_file(package.workflow_path)
-            (staging / "definition.yaml").write_bytes(definition_data)
-            policy_data = b"{}\n"
-            if package.sidecar_path is not None:
-                policy_data = read_package_file(package.sidecar_path)
+            if compilation is not None:
+                definition_data = compilation.definition_bytes
+                policy_data = compilation.active_policy_bytes
+                (staging / "definition.yaml").write_bytes(definition_data)
                 (staging / "policy.yaml").write_bytes(policy_data)
-            package_root = Path(os.path.abspath(package.root))
-            workflow_relative = (
-                Path(os.path.abspath(package.workflow_path))
-                .relative_to(package_root)
-                .as_posix()
-            )
-            sidecar_relative = (
-                Path(os.path.abspath(package.sidecar_path))
-                .relative_to(package_root)
-                .as_posix()
-                if package.sidecar_path is not None
-                else None
-            )
-            for relative in package_digest.covered_relative_paths:
-                if relative in {workflow_relative, sidecar_relative}:
-                    continue
-                source = package.root / relative
-                target = staging / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(read_package_file(source))
+                dependencies_data = compilation.dependency_manifest.canonical_bytes()
+                dependency_manifest_digest = _sha256(dependencies_data)
+                (staging / "dependencies.json").write_bytes(dependencies_data)
+                for relative, data in compilation.sealed_files.items():
+                    target = staging / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+            else:
+                definition_data = read_package_file(package.workflow_path)
+                (staging / "definition.yaml").write_bytes(definition_data)
+                policy_data = b"{}\n"
+                if package.sidecar_path is not None:
+                    policy_data = read_package_file(package.sidecar_path)
+                    (staging / "policy.yaml").write_bytes(policy_data)
+                package_root = Path(os.path.abspath(package.root))
+                workflow_relative = (
+                    Path(os.path.abspath(package.workflow_path))
+                    .relative_to(package_root)
+                    .as_posix()
+                )
+                sidecar_relative = (
+                    Path(os.path.abspath(package.sidecar_path))
+                    .relative_to(package_root)
+                    .as_posix()
+                    if package.sidecar_path is not None
+                    else None
+                )
+                for relative in package_digest.covered_relative_paths:
+                    if relative in {workflow_relative, sidecar_relative}:
+                        continue
+                    source = package.root / relative
+                    target = staging / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(read_package_file(source))
             node_skill_digests: dict[str, str] = {}
             node_agent_skill_digests: dict[str, str] = {}
             for node in package.definition.nodes:
@@ -5672,6 +5839,11 @@ class RunStore:
                 "language": language,
                 "sealed_paths": sealed_paths,
             }
+            if dependency_manifest_digest is not None:
+                snapshot_resources["snapshot_format_version"] = 2
+                snapshot_resources["dependency_manifest_digest"] = (
+                    dependency_manifest_digest
+                )
             if phase3_execution_semantics is not None:
                 snapshot_resources["phase3_execution_semantics"] = (
                     phase3_execution_semantics
@@ -5721,6 +5893,8 @@ class RunStore:
                 ),
                 language=language,
                 sealed_snapshot_digest=snapshot_digest,
+                snapshot_format_version=snapshot_format_version,
+                dependency_manifest_digest=dependency_manifest_digest,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -5955,6 +6129,8 @@ class RunStore:
             snapshot.outward_action_nodes,
             dict(snapshot.language) if snapshot.language is not None else None,
             snapshot.sealed_snapshot_digest,
+            snapshot.snapshot_format_version,
+            snapshot.dependency_manifest_digest,
         )
 
     @staticmethod
@@ -6459,7 +6635,7 @@ class RunStore:
             "run_id": run_id,
             "workflow": request.workflow_name,
             "workflow_version": snapshot.workflow_version,
-            "snapshot_format_version": 1,
+            "snapshot_format_version": snapshot.snapshot_format_version,
             "definition_digest": request.definition_digest,
             "policy_digest": request.policy_digest,
             "input_manifest_digest": request.input_manifest_digest,
@@ -6508,6 +6684,17 @@ class RunStore:
             "last_error": None,
             "pending_interaction": None,
         }
+        if snapshot.snapshot_format_version == 2:
+            if snapshot.dependency_manifest_digest is None:
+                raise InputSnapshotError(
+                    "format-2 snapshot is missing dependency manifest identity"
+                )
+            projection["dependency_manifest_digest"] = (
+                snapshot.dependency_manifest_digest
+            )
+            projection["expanded_nodes"] = [
+                str(node["id"]) for node in snapshot.nodes
+            ]
         event = {
             "sequence": 1,
             "timestamp": now,
@@ -7145,6 +7332,29 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
+            pending_interaction = node.get("pending_interaction")
+            if (
+                isinstance(pending_interaction, Mapping)
+                and pending_interaction.get("type")
+                == "loop_signal_confirmation"
+            ):
+                try:
+                    confirmation = self._loop_signal_confirmation(
+                        pending_interaction,
+                        run_id=run_id,
+                        node_id=node_id,
+                    )
+                except ValueError:
+                    return False
+                loop_state = node.get("loop_state")
+                if (
+                    node.get("state") != "paused"
+                    or not node["attempts"]
+                    or node["attempts"][-1].get("state") != "paused"
+                    or not isinstance(loop_state, Mapping)
+                    or loop_state.get("iteration") != confirmation.iteration
+                ):
+                    return False
         next_registry_update_at = value.get("next_registry_update_at")
         try:
             pending = _pending_session_registry_payloads(value)
@@ -9007,6 +9217,38 @@ class RunStore:
                 releasable_attempts: list[str] = []
                 for node_id, node, attempt, attempt_id in claimed_attempts:
                     claim = node["claim"]
+                    loop_state = node.get("loop_state")
+                    if (
+                        isinstance(loop_state, Mapping)
+                        and loop_state.get("_pending_loop_decision") is not None
+                    ):
+                        previous_lease_expires_at = claim.get("lease_expires_at")
+                        owner_id = claim.get("owner_id")
+                        if not isinstance(previous_lease_expires_at, str) or not isinstance(
+                            owner_id, str
+                        ):
+                            raise ForegroundExecutionConflict(
+                                "foreground owner conflict: recorded loop claim is malformed"
+                            )
+                        updated_claim = connection.execute(
+                            "UPDATE worker_claims SET lease_expires_at=? "
+                            "WHERE attempt_id=? AND run_id=? AND node_id=? "
+                            "AND owner_id=? AND lease_expires_at=?",
+                            (
+                                instant.isoformat(),
+                                attempt_id,
+                                run_id,
+                                node_id,
+                                owner_id,
+                                previous_lease_expires_at,
+                            ),
+                        ).rowcount
+                        if updated_claim != 1:
+                            raise ForegroundExecutionConflict(
+                                "foreground owner conflict: recorded loop claim changed"
+                            )
+                        claim["lease_expires_at"] = instant.isoformat()
+                        continue
                     observation = self._observe_attempt(attempt)
                     effect_classification = str(
                         attempt.get(
@@ -9384,16 +9626,27 @@ class RunStore:
             and node.get("state") == "waiting_retry"
             and isinstance(node.get("next_attempt_at"), str)
         ]
-        pending_interaction = next(
+        pending_entry = next(
             (
-                {**pending, "node_id": node.get("id")}
-                if isinstance(pending, dict)
-                else {"type": pending, "node_id": node.get("id")}
+                (pending, node.get("id"))
                 for node in node_values
                 if isinstance(node, dict)
                 and (pending := node.get("pending_interaction")) is not None
             ),
             None,
+        )
+        pending_for_actions = pending_entry[0] if pending_entry is not None else None
+        pending_interaction = (
+            {
+                **(
+                    pending_for_actions
+                    if isinstance(pending_for_actions, dict)
+                    else {"type": pending_for_actions}
+                ),
+                "node_id": pending_entry[1],
+            }
+            if pending_entry is not None
+            else None
         )
         current_nodes = [
             node["id"]
@@ -9533,7 +9786,15 @@ class RunStore:
             "pending_interaction": pending_interaction,
             "next_actions": available_actions(
                 status,
-                pending_interaction,
+                (
+                    pending_for_actions
+                    if isinstance(pending_for_actions, Mapping)
+                    else (
+                        {"type": pending_for_actions}
+                        if pending_for_actions is not None
+                        else None
+                    )
+                ),
                 health=health,
                 archived=bool(run.get("archived_at")),
                 can_resume=blocking_reason != "foreground_owner_unavailable",
@@ -9984,7 +10245,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 return False
             attempt = node.get("attempts", [])[-1]
             if (
@@ -10039,7 +10300,7 @@ class RunStore:
                 raise RuntimeError("stale node start for terminal run")
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale node claim")
             node["state"] = "running"
             node["attempts"][-1]["state"] = "running"
@@ -10079,7 +10340,7 @@ class RunStore:
                 active = node.get("claim", {})
                 if (
                     projection.get("status") != "running"
-                    or active.get("attempt_id") != claim.attempt_id
+                    or not _active_claim_matches(active, claim)
                     or selection.key.workflow != projection.get("workflow")
                     or selection.key.scope
                     != str(projection.get("operator_scope_digest") or "local")
@@ -10197,7 +10458,7 @@ class RunStore:
                 active = node.get("claim", {})
                 if (
                     projection.get("status") != "running"
-                    or active.get("attempt_id") != claim.attempt_id
+                    or not _active_claim_matches(active, claim)
                 ):
                     return False
                 recoveries = node.get("session_recoveries")
@@ -10264,7 +10525,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10335,7 +10596,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10395,7 +10656,7 @@ class RunStore:
                 if (
                     projection["status"] != "running"
                     or projection.get("desired_status") is not None
-                    or active.get("attempt_id") != claim.attempt_id
+                    or not _active_claim_matches(active, claim)
                 ):
                     return False
                 serialized = {
@@ -10467,8 +10728,14 @@ class RunStore:
                 ):
                     return False
                 event_type = "process_reaped" if cleaned else "cleanup_failed"
-                active_attempt = active.get("attempt_id") == claim.attempt_id
-                if active_attempt and cleaned:
+                active_attempt = (
+                    isinstance(active, Mapping)
+                    and active.get("attempt_id") == claim.attempt_id
+                )
+                if active_attempt and not _active_claim_matches(active, claim):
+                    return False
+                active_authority = _active_claim_matches(active, claim)
+                if active_authority and cleaned:
                     active.pop("process_identity", None)
                 attempt["process_stop"] = {
                     "recorded_at": _utc_now(),
@@ -10493,11 +10760,13 @@ class RunStore:
                     attempt_id=claim.attempt_id,
                     defer_notification=fence_connection is not None,
                     terminal_reserve_attempt_id=(
-                        claim.attempt_id if cleaned and not active_attempt else None
+                        claim.attempt_id
+                        if cleaned and not active_authority
+                        else None
                     ),
                     reserve_connection=fence_connection,
                 )
-                if cleaned and not active_attempt:
+                if cleaned and not active_authority:
                     with (
                         nullcontext(fence_connection)
                         if fence_connection is not None
@@ -10543,7 +10812,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10621,7 +10890,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10693,7 +10962,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -10762,7 +11031,7 @@ class RunStore:
                     return False
                 node = projection["nodes"][claim.node_id]
                 active = node.get("claim", {})
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 attempt = next(
                     (
@@ -11831,6 +12100,33 @@ class RunStore:
         }:
             raise ValueError(f"invalid node completion state: {status}")
         artifacts = tuple(artifacts)
+        pending_candidate = (metadata or {}).get("pending_interaction")
+        confirmation = None
+        if (
+            isinstance(pending_candidate, Mapping)
+            and pending_candidate.get("type") == "loop_signal_confirmation"
+        ):
+            if status != "paused":
+                raise ValueError("loop signal confirmation requires a paused node")
+            confirmation = self._loop_signal_confirmation(
+                pending_candidate,
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+            )
+            loop_state = (metadata or {}).get("loop_state")
+            if (
+                not isinstance(loop_state, Mapping)
+                or loop_state.get("iteration") != confirmation.iteration
+            ):
+                raise ValueError("loop signal iteration state is inconsistent")
+            matches = [
+                artifact
+                for artifact in artifacts
+                if artifact.relative_path == confirmation.result_artifact
+                and artifact.sha256 == confirmation.result_sha256
+            ]
+            if len(matches) != 1:
+                raise ValueError("loop signal result artifact identity is missing")
         directory = self.run_directory(claim.run_id)
         with (
             self._terminal_completion_guard(claim),
@@ -11843,7 +12139,12 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
+                if (
+                    isinstance(active, Mapping)
+                    and active.get("attempt_id") == claim.attempt_id
+                ):
+                    raise RuntimeError("stale node completion")
                 stale_attempt = next(
                     (
                         candidate
@@ -11967,11 +12268,65 @@ class RunStore:
                     }
             publication_ref = None
             publication_artifact = None
-            if status == "succeeded" and typed_publication is not None:
+            staged_confirmation = status == "paused" and confirmation is not None
+            staged_publication = (
+                _typed_publication_candidate_from_metadata(metadata)
+                if staged_confirmation
+                else None
+            )
+            if staged_confirmation and staged_publication != typed_publication:
+                raise ArchonOutputIntegrityError(
+                    "paused typed publication does not match its staged identity"
+                )
+            if (
+                staged_confirmation
+                and staged_publication is None
+                and claim.node_id
+                in _sealed_typed_output_declarations(directory, projection)
+            ):
+                raise ArchonOutputIntegrityError(
+                    "declared loop output has no staged typed publication"
+                )
+            if typed_publication is not None and (
+                status == "succeeded" or staged_confirmation
+            ):
                 publication_artifact = _canonical_typed_publication_artifact(
                     artifacts,
                     typed_publication,
                 )
+                if staged_confirmation and (
+                    publication_artifact.relative_path
+                    != confirmation.result_artifact
+                    or publication_artifact.sha256 != confirmation.result_sha256
+                ):
+                    raise ArchonOutputIntegrityError(
+                        "staged typed publication is not the confirmed loop result"
+                    )
+                if staged_confirmation:
+                    declaration = _sealed_typed_output_declarations(
+                        directory,
+                        projection,
+                    ).get(claim.node_id)
+                    if declaration is None:
+                        raise ArchonOutputIntegrityError(
+                            "typed publication has no sealed output authority"
+                        )
+                    requirement = _typed_output_requirement(
+                        projection,
+                        node_id=claim.node_id,
+                        declaration=declaration,
+                    )
+                    if (
+                        typed_publication.output_type
+                        != requirement.output_type
+                        or typed_publication.schema_fingerprint
+                        != requirement.schema_fingerprint
+                        or typed_publication.canonicalization_version
+                        != requirement.canonicalization_version
+                    ):
+                        raise ArchonOutputIntegrityError(
+                            "typed publication conflicts with sealed output authority"
+                        )
                 projected_matches = [
                     entry
                     for entry in projection["artifacts"]
@@ -11990,15 +12345,16 @@ class RunStore:
                     raise ArchonOutputIntegrityError(
                         "projected artifact conflicts with typed publication"
                     )
-                publication_ref = self._publish_typed_bundle_locked(
-                    directory,
-                    projection,
-                    run_id=claim.run_id,
-                    node_id=claim.node_id,
-                    attempt_id=claim.attempt_id,
-                    artifact=publication_artifact,
-                    candidate=typed_publication,
-                )
+                if status == "succeeded":
+                    publication_ref = self._publish_typed_bundle_locked(
+                        directory,
+                        projection,
+                        run_id=claim.run_id,
+                        node_id=claim.node_id,
+                        attempt_id=claim.attempt_id,
+                        artifact=publication_artifact,
+                        candidate=typed_publication,
+                    )
             node["state"] = status
             node.pop("claim", None)
             safe_error_message = _sanitize_diagnostic(error_message)
@@ -12010,6 +12366,17 @@ class RunStore:
             })
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
+            loop_input_consumed = safe_metadata.pop(
+                "_loop_input_consumed", False
+            )
+            language = projection.get("language")
+            if loop_input_consumed is True and (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            ):
+                node.pop("loop_user_input_artifact", None)
             node["attempts"][-1]["metadata"] = safe_metadata
             if session_registry_update is not None:
                 node["attempts"][-1]["session_registry_authority"] = (
@@ -12091,6 +12458,30 @@ class RunStore:
                 _set_pending_session_registry_update(
                     projection,
                     session_registry_update,
+                )
+            if (
+                isinstance(pending_candidate, Mapping)
+                and pending_candidate.get("type")
+                == "loop_signal_confirmation"
+            ):
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_signal_confirmation_required",
+                    {
+                        "iteration": pending_candidate.get("iteration"),
+                        "max_iterations": pending_candidate.get("max_iterations"),
+                        "result_artifact": pending_candidate.get(
+                            "result_artifact"
+                        ),
+                        "result_sha256": pending_candidate.get("result_sha256"),
+                        "interaction_id": pending_candidate.get("interaction_id"),
+                    },
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
                 )
             self._append_locked(
                 directory,
@@ -12472,6 +12863,7 @@ class RunStore:
         now: LeaseClockSample | None = None,
     ) -> None:
         """Persist one completed loop iteration before evaluating continuation."""
+        artifacts = tuple(artifacts)
         directory = self.run_directory(claim.run_id)
         with workflow_lock(
             self._run_lock_path(claim.run_id)
@@ -12481,10 +12873,56 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale loop iteration")
             safe_state = dict(_sanitize(dict(loop_state)))
+            language = projection.get("language")
+            phase4 = (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            )
+            feedback_binding = None
+            if phase4:
+                output_path = safe_state.get("output_artifact")
+                output_size = safe_state.get("output_size_bytes")
+                output_digest = safe_state.get("output_sha256")
+                matches = [
+                    artifact
+                    for artifact in artifacts
+                    if artifact.relative_path == output_path
+                    and artifact.size_bytes == output_size
+                    and artifact.sha256 == output_digest
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "phase 4 loop iteration output identity is inconsistent"
+                    )
+                decision = safe_state.get("_pending_loop_decision")
+                feedback_path = node.get("loop_user_input_artifact")
+                if (
+                    isinstance(decision, Mapping)
+                    and decision.get("kind") == "until_bash_pending"
+                    and isinstance(feedback_path, str)
+                ):
+                    feedback_binding = self._authenticated_loop_feedback_binding(
+                        directory,
+                        projection,
+                        node_id=claim.node_id,
+                        relative_path=feedback_path,
+                    )
+                safe_state["_pending_loop_decision"] = (
+                    self._bound_loop_decision(
+                        claim,
+                        safe_state,
+                        decision,
+                        feedback_binding=feedback_binding,
+                    )
+                )
             node["loop_state"] = safe_state
+            if phase4 and feedback_binding is None:
+                node.pop("loop_user_input_artifact", None)
             existing = {
                 (entry.get("attempt_id"), entry.get("relative_path"))
                 for entry in projection["artifacts"]
@@ -12516,6 +12954,835 @@ class RunStore:
                 defer_notification=fence_connection is not None,
             )
 
+    def record_loop_decision(
+        self,
+        claim: NodeClaim,
+        *,
+        loop_state: Mapping[str, object],
+        now: LeaseClockSample | None = None,
+    ) -> None:
+        """CAS-journal the outcome of one previously recorded v4 predicate."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if not _active_claim_matches(active, claim):
+                raise StaleLoopDecisionError("stale loop decision")
+            current = node.get("loop_state")
+            if not isinstance(current, Mapping):
+                raise RuntimeError("recorded loop iteration is missing")
+            current_decision = self._validated_bound_loop_decision(
+                current.get("_pending_loop_decision"),
+                claim=claim,
+                loop_state=current,
+            )
+            if current_decision["kind"] != "until_bash_pending":
+                raise RuntimeError("recorded loop predicate is no longer pending")
+            feedback_path = current_decision.get("feedback_artifact")
+            if feedback_path is not None:
+                if node.get("loop_user_input_artifact") != feedback_path:
+                    raise JournalRecoveryError(
+                        "journaled loop feedback projection changed"
+                    )
+                feedback_binding = self._authenticated_loop_feedback_binding(
+                    directory,
+                    projection,
+                    node_id=claim.node_id,
+                    relative_path=str(feedback_path),
+                )
+                if any(
+                    current_decision.get(key) != value
+                    for key, value in feedback_binding.items()
+                ):
+                    raise JournalRecoveryError(
+                        "journaled loop feedback binding changed"
+                    )
+            safe_state = dict(_sanitize(dict(loop_state)))
+            for key in (
+                "iteration",
+                "max_iterations",
+                "fresh_context",
+                "output_artifact",
+                "output_size_bytes",
+                "output_sha256",
+            ):
+                if safe_state.get(key) != current.get(key):
+                    raise ValueError("recorded loop decision changed iteration identity")
+            decision = self._bound_loop_decision(
+                claim,
+                safe_state,
+                safe_state.get("_pending_loop_decision"),
+            )
+            if decision["kind"] == "until_bash_pending":
+                raise ValueError("recorded loop predicate outcome is still pending")
+            safe_state["_pending_loop_decision"] = decision
+            node["loop_state"] = safe_state
+            node.pop("loop_user_input_artifact", None)
+            self._append_locked(
+                directory,
+                projection,
+                "loop_decision_recorded",
+                {
+                    "iteration": safe_state["iteration"],
+                    "kind": decision["kind"],
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
+            )
+
+    def recorded_loop_decision(
+        self,
+        run_id: str,
+        *,
+        recovery_owner_id: str | None = None,
+        now: LeaseClockSample | None = None,
+        lease_seconds: float = 30.0,
+        execution_fence: ExecutionFence | None = None,
+    ) -> RecordedLoopDecision | None:
+        """Authenticate, and optionally CAS-claim, one un-published v4 outcome."""
+        if recovery_owner_id is not None and (
+            not recovery_owner_id or len(recovery_owner_id) > 256
+        ):
+            raise ValueError("loop recovery owner must be bounded text")
+        if not math.isfinite(float(lease_seconds)) or lease_seconds <= 0:
+            raise ValueError("loop recovery lease must be positive and finite")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            language = projection.get("language")
+            if not (
+                isinstance(language, Mapping)
+                and language.get("effective_profile")
+                == WorkflowLanguageProfile.ARCHON_2026_07.value
+                and language.get("normalizer_version") == 4
+            ):
+                return None
+            candidates = []
+            for node_id, node in projection.get("nodes", {}).items():
+                loop_state = node.get("loop_state") if isinstance(node, dict) else None
+                decision = (
+                    loop_state.get("_pending_loop_decision")
+                    if isinstance(loop_state, Mapping)
+                    else None
+                )
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if decision is not None and isinstance(claim, Mapping):
+                    candidates.append((node_id, node, loop_state, claim, decision))
+            if not candidates:
+                return None
+            if len(candidates) != 1:
+                raise JournalRecoveryError(
+                    "multiple loop decisions require recovery"
+                )
+            node_id, node, loop_state, raw_claim, raw_decision = candidates[0]
+            if not isinstance(raw_claim, dict):
+                raise JournalRecoveryError("journaled loop claim is malformed")
+            attempt_id = raw_claim.get("attempt_id")
+            owner_id = raw_claim.get("owner_id")
+            lease_expires_at = raw_claim.get("lease_expires_at")
+            if (
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or not isinstance(owner_id, str)
+                or not owner_id
+                or not isinstance(lease_expires_at, str)
+            ):
+                raise JournalRecoveryError("journaled loop claim is malformed")
+            try:
+                claim = NodeClaim(
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    owner_id=owner_id,
+                    lease_expires_at=datetime.fromisoformat(lease_expires_at),
+                )
+            except ValueError as exc:
+                raise JournalRecoveryError("journaled loop lease is malformed") from exc
+            bound_attempt_id = (
+                raw_decision.get("attempt_id")
+                if isinstance(raw_decision, Mapping)
+                else None
+            )
+            if bound_attempt_id != attempt_id:
+                prior_attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", ())
+                        if isinstance(candidate, Mapping)
+                        and candidate.get("attempt_id") == bound_attempt_id
+                    ),
+                    None,
+                )
+                current_attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", ())
+                        if isinstance(candidate, Mapping)
+                        and candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+                if (
+                    not isinstance(bound_attempt_id, str)
+                    or not bound_attempt_id
+                    or prior_attempt is None
+                    or current_attempt is None
+                    or prior_attempt.get("state")
+                    not in {"cancelled", "failed", "interrupted"}
+                    or current_attempt.get("state") not in {"claimed", "running"}
+                ):
+                    raise JournalRecoveryError(
+                        "journaled loop decision binding changed"
+                    )
+                prior_claim = NodeClaim(
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=bound_attempt_id,
+                    owner_id=owner_id,
+                    lease_expires_at=claim.lease_expires_at,
+                )
+                self._validated_bound_loop_decision(
+                    raw_decision,
+                    claim=prior_claim,
+                    loop_state=loop_state,
+                )
+                clean_state = dict(loop_state)
+                clean_state.pop("_pending_loop_decision", None)
+                node["loop_state"] = clean_state
+                node.pop("loop_user_input_artifact", None)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_decision_superseded",
+                    {"reason_code": "attempt_replaced"},
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                )
+                with self._connect() as connection:
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="loop_decision_superseded",
+                    )
+                self._notify_coordinator()
+                return None
+            decision = self._validated_bound_loop_decision(
+                raw_decision,
+                claim=claim,
+                loop_state=loop_state,
+            )
+            feedback_path = decision.get("feedback_artifact")
+            if feedback_path is not None:
+                if node.get("loop_user_input_artifact") != feedback_path:
+                    raise JournalRecoveryError(
+                        "journaled loop feedback projection changed"
+                    )
+                feedback_binding = self._authenticated_loop_feedback_binding(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    relative_path=str(feedback_path),
+                )
+                if any(
+                    decision.get(key) != value
+                    for key, value in feedback_binding.items()
+                ):
+                    raise JournalRecoveryError(
+                        "journaled loop feedback binding changed"
+                    )
+            confirmation = LoopSignalConfirmation.create(
+                run_id=run_id,
+                node_id=node_id,
+                message="Recorded loop decision",
+                iteration=int(decision["iteration"]),
+                max_iterations=int(loop_state.get("max_iterations", 0)),
+                result_artifact=str(decision["output_artifact"]),
+                result_sha256=str(decision["output_sha256"]),
+            )
+            self._verify_pending_loop_result(
+                directory,
+                projection,
+                node_id=node_id,
+                node=node,
+                confirmation=confirmation,
+            )
+            matches = [
+                entry
+                for entry in projection.get("artifacts", ())
+                if isinstance(entry, Mapping)
+                and entry.get("node_id") == node_id
+                and entry.get("attempt_id") == attempt_id
+                and entry.get("relative_path") == decision["output_artifact"]
+                and entry.get("size_bytes") == decision["output_size_bytes"]
+                and entry.get("sha256") == decision["output_sha256"]
+                and isinstance(entry.get("media_type"), str)
+            ]
+            if len(matches) != 1:
+                raise JournalRecoveryError(
+                    "journaled loop artifact identity is ambiguous"
+                )
+            artifact = ArtifactRef(
+                relative_path=str(matches[0]["relative_path"]),
+                media_type=str(matches[0]["media_type"]),
+                size_bytes=int(matches[0]["size_bytes"]),
+                sha256=str(matches[0]["sha256"]),
+            )
+            if recovery_owner_id is not None:
+                recovery_claim = self._claim_recorded_loop_recovery_locked(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    raw_claim=raw_claim,
+                    recovery_owner_id=recovery_owner_id,
+                    now=now or self._lease_clock(),
+                    lease_seconds=float(lease_seconds),
+                    execution_fence=execution_fence,
+                )
+                if recovery_claim is None:
+                    return None
+                claim = recovery_claim
+            return RecordedLoopDecision(
+                claim=claim,
+                loop_state=dict(loop_state),
+                decision=decision,
+                artifact=artifact,
+            )
+
+    @staticmethod
+    def _recorded_loop_claim_is_fresh(
+        raw_claim: Mapping[str, object],
+        sample: LeaseClockSample,
+    ) -> bool:
+        try:
+            expires_at = datetime.fromisoformat(str(raw_claim["lease_expires_at"]))
+            heartbeat_at = datetime.fromisoformat(str(raw_claim["heartbeat_at"]))
+            lease_seconds = float(raw_claim["lease_seconds"])
+        except (KeyError, TypeError, ValueError):
+            raise JournalRecoveryError("journaled loop lease evidence is malformed")
+        if expires_at.tzinfo is None or heartbeat_at.tzinfo is None:
+            raise JournalRecoveryError("journaled loop lease evidence is naive")
+        heartbeat_monotonic = raw_claim.get("heartbeat_monotonic")
+        if (
+            isinstance(heartbeat_monotonic, bool)
+            or not isinstance(heartbeat_monotonic, int | float)
+            or not math.isfinite(float(heartbeat_monotonic))
+            or not math.isfinite(lease_seconds)
+            or lease_seconds <= 0
+        ):
+            raise JournalRecoveryError("journaled loop lease evidence is malformed")
+        utc_elapsed = (
+            sample.utc_now.astimezone(timezone.utc) - heartbeat_at
+        ).total_seconds()
+        monotonic_elapsed = sample.monotonic_now - float(heartbeat_monotonic)
+        return (
+            expires_at > sample.utc_now.astimezone(timezone.utc)
+            and monotonic_elapsed < lease_seconds
+            and abs(utc_elapsed - monotonic_elapsed) <= lease_seconds
+        )
+
+    @classmethod
+    def _recorded_loop_attempt_stop_observation(
+        cls,
+        attempt: Mapping[str, object],
+    ) -> str | None:
+        process_stop = attempt.get("process_stop")
+        if (
+            isinstance(process_stop, Mapping)
+            and process_stop.get("identity_matched") is True
+            and process_stop.get("cleaned") is True
+        ):
+            return "known_stopped"
+        process_identity = attempt.get("process_identity")
+        if isinstance(process_identity, Mapping):
+            return (
+                "known_stopped"
+                if cls._observe_process_identity(process_identity) == "known_stopped"
+                else None
+            )
+        spawn = attempt.get("spawn")
+        if not isinstance(spawn, Mapping):
+            return "not_started"
+        return "spawn_failed" if spawn.get("state") == "failed" else None
+
+    def _claim_recorded_loop_recovery_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        *,
+        node_id: str,
+        node: dict[str, object],
+        raw_claim: dict[str, object],
+        recovery_owner_id: str,
+        now: LeaseClockSample,
+        lease_seconds: float,
+        execution_fence: ExecutionFence | None,
+    ) -> NodeClaim | None:
+        """CAS-transfer an expired, stopped loop claim to one recoverer."""
+        attempt_id = str(raw_claim["attempt_id"])
+        current_owner_id = str(raw_claim["owner_id"])
+        attempt = next(
+            (
+                candidate
+                for candidate in reversed(node.get("attempts", []))
+                if candidate.get("attempt_id") == attempt_id
+            ),
+            None,
+        )
+        if not isinstance(attempt, dict):
+            raise JournalRecoveryError("journaled loop attempt is missing")
+        current_fence = raw_claim.get("execution_fence")
+        requested_fence = (
+            {
+                "owner_id": execution_fence.owner_id,
+                "owner_epoch": execution_fence.owner_epoch,
+            }
+            if execution_fence is not None
+            else None
+        )
+        superseded_fence = (
+            execution_fence is not None
+            and isinstance(current_fence, Mapping)
+            and dict(current_fence) != requested_fence
+        )
+        already_owned = (
+            raw_claim.get("loop_recovery_owner_id") == recovery_owner_id
+            and current_owner_id == recovery_owner_id
+        )
+        fresh = self._recorded_loop_claim_is_fresh(raw_claim, now)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if execution_fence is not None:
+                self.assert_execution_fence(connection, execution_fence, now)
+            worker = connection.execute(
+                "SELECT owner_id, lease_expires_at FROM worker_claims "
+                "WHERE attempt_id=? AND run_id=? AND node_id=?",
+                (attempt_id, projection["run_id"], node_id),
+            ).fetchone()
+            if (
+                worker is None
+                or worker["owner_id"] != current_owner_id
+                or worker["lease_expires_at"] != raw_claim["lease_expires_at"]
+            ):
+                connection.rollback()
+                return None
+            if already_owned and fresh:
+                connection.rollback()
+                return NodeClaim(
+                    str(projection["run_id"]),
+                    node_id,
+                    attempt_id,
+                    recovery_owner_id,
+                    datetime.fromisoformat(str(raw_claim["lease_expires_at"])),
+                    execution_fence,
+                )
+            if fresh and not superseded_fence:
+                connection.rollback()
+                return None
+            observation = self._recorded_loop_attempt_stop_observation(attempt)
+            if observation is None:
+                connection.rollback()
+                return None
+
+            recoveries = attempt.setdefault("loop_recovery_takeovers", [])
+            if not isinstance(recoveries, list) or len(recoveries) >= 8:
+                raise JournalRecoveryError("journaled loop recovery bound is exhausted")
+            expires_at = now.utc_now.astimezone(timezone.utc) + timedelta(
+                seconds=lease_seconds
+            )
+            recovery_count = len(recoveries) + 1
+            recoveries.append({
+                "claimed_at": now.utc_now.astimezone(timezone.utc).isoformat(),
+                "prior_owner_sha256": _sha256(current_owner_id.encode("utf-8")),
+                "observation": observation,
+                "recovery_count": recovery_count,
+            })
+            raw_claim.update({
+                "owner_id": recovery_owner_id,
+                "owner_epoch": (
+                    f"coordinator:{execution_fence.owner_id}:{execution_fence.owner_epoch}"
+                    if execution_fence is not None
+                    else recovery_owner_id
+                ),
+                "lease_expires_at": expires_at.isoformat(),
+                "heartbeat_at": now.utc_now.astimezone(timezone.utc).isoformat(),
+                "heartbeat_monotonic": now.monotonic_now,
+                "lease_seconds": lease_seconds,
+                "execution_fence": requested_fence,
+                "loop_recovery_owner_id": recovery_owner_id,
+            })
+            updated = connection.execute(
+                "UPDATE worker_claims SET owner_id=?, lease_expires_at=? "
+                "WHERE attempt_id=? AND run_id=? AND node_id=? "
+                "AND owner_id=? AND lease_expires_at=?",
+                (
+                    recovery_owner_id,
+                    expires_at.isoformat(),
+                    attempt_id,
+                    projection["run_id"],
+                    node_id,
+                    current_owner_id,
+                    worker["lease_expires_at"],
+                ),
+            ).rowcount
+            if updated != 1:
+                connection.rollback()
+                return None
+            self._append_locked(
+                directory,
+                projection,
+                "loop_recovery_claimed",
+                {
+                    "recovery_count": recovery_count,
+                    "lease_expires_at": expires_at.isoformat(),
+                },
+                node_id=node_id,
+                attempt_id=attempt_id,
+                reserve_connection=connection,
+            )
+            self._sync_integrity_index(
+                connection,
+                projection=projection,
+                journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+            )
+            connection.commit()
+            return NodeClaim(
+                str(projection["run_id"]),
+                node_id,
+                attempt_id,
+                recovery_owner_id,
+                expires_at,
+                execution_fence,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def resume_recorded_loop_continuation(
+        self,
+        authority: RecordedLoopDecision,
+    ) -> bool:
+        """CAS-release a recorded continuation for its next provider iteration."""
+        claim = authority.claim
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection.get("nodes", {}).get(claim.node_id)
+            if not isinstance(node, dict):
+                return False
+            active = node.get("claim")
+            current_state = node.get("loop_state")
+            if (
+                not _active_claim_matches(active, claim)
+                or not isinstance(current_state, Mapping)
+                or current_state.get("_pending_loop_decision")
+                != authority.decision
+                or authority.decision.get("kind") != "continue"
+            ):
+                return False
+            clean_state = dict(current_state)
+            clean_state.pop("_pending_loop_decision", None)
+            node["loop_state"] = clean_state
+            node.pop("claim", None)
+            node["state"] = "ready"
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(node.get("attempts", []))
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop continuation attempt is missing"
+                )
+            attempt.update({
+                "state": "interrupted",
+                "error_code": "recorded_loop_continuation",
+                "error_message": None,
+                "completed_at": _utc_now(),
+                "metadata": {"loop_state": clean_state},
+            })
+            self._append_locked(
+                directory,
+                projection,
+                "loop_continuation_recovered",
+                {"iteration": authority.decision["iteration"]},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
+            )
+            with self._connect() as connection:
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(
+                    claim.attempt_id, connection=connection
+                )
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (claim.attempt_id,),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=claim.run_id,
+                    reason_code="loop_continuation_recovered",
+                )
+            self._notify_coordinator()
+            return True
+
+    def prepare_recorded_loop_predicate_recovery(
+        self,
+        authority: RecordedLoopDecision,
+    ) -> bool:
+        """Prove any prior predicate process stopped before a bounded re-evaluation."""
+        claim = authority.claim
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection.get("nodes", {}).get(claim.node_id)
+            if not isinstance(node, dict):
+                return False
+            active = node.get("claim")
+            loop_state = node.get("loop_state")
+            if (
+                not _active_claim_matches(active, claim)
+                or not isinstance(loop_state, Mapping)
+                or loop_state.get("_pending_loop_decision")
+                != authority.decision
+                or authority.decision.get("kind") != "until_bash_pending"
+            ):
+                return False
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(node.get("attempts", []))
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop predicate attempt is missing"
+                )
+            spawn = attempt.get("spawn")
+            if not isinstance(spawn, Mapping):
+                return True
+            process_identity = attempt.get("process_identity")
+            process_stop = attempt.get("process_stop")
+            stopped = (
+                isinstance(process_stop, Mapping)
+                and process_stop.get("cleaned") is True
+            ) or self._observe_attempt(attempt) == "known_stopped"
+            spawn_failed = (
+                spawn.get("state") == "failed" and process_identity is None
+            )
+            if not stopped and not spawn_failed:
+                raise JournalRecoveryError(
+                    "journaled loop predicate process outcome is unresolved"
+                )
+            history = attempt.setdefault("loop_predicate_recoveries", [])
+            if not isinstance(history, list) or len(history) >= 8:
+                raise JournalRecoveryError(
+                    "journaled loop predicate recovery bound is exhausted"
+                )
+            history.append({
+                "spawn": dict(_sanitize(dict(spawn))),
+                "process_identity": _sanitize(process_identity),
+                "process_stop": _sanitize(process_stop),
+                "observation": (
+                    "spawn_failed" if spawn_failed else "known_stopped"
+                ),
+            })
+            for key in (
+                "spawn",
+                "process_identity",
+                "process_started_at",
+                "process_stop",
+            ):
+                attempt.pop(key, None)
+                active.pop(key, None)
+            self._append_locked(
+                directory,
+                projection,
+                "loop_predicate_recovery_prepared",
+                {
+                    "iteration": authority.decision["iteration"],
+                    "recovery_count": len(history),
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return True
+
+    def reconcile_recorded_loop_signal(self, run_id: str) -> bool:
+        """Publish one journaled v4 signal decision without provider replay."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            candidates = []
+            for node_id, node in projection.get("nodes", {}).items():
+                loop_state = node.get("loop_state") if isinstance(node, dict) else None
+                pending = (
+                    loop_state.get("_pending_signal_confirmation")
+                    if isinstance(loop_state, Mapping)
+                    else None
+                )
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if pending is not None and isinstance(claim, Mapping):
+                    candidates.append((node_id, node, loop_state, claim, pending))
+            if not candidates:
+                return False
+            if len(candidates) != 1:
+                raise JournalRecoveryError(
+                    "multiple loop signal transitions require recovery"
+                )
+            node_id, node, loop_state, claim, pending = candidates[0]
+            confirmation = self._loop_signal_confirmation(
+                pending,
+                run_id=run_id,
+                node_id=node_id,
+            )
+            self._verify_pending_loop_result(
+                directory,
+                projection,
+                node_id=node_id,
+                node=node,
+                confirmation=confirmation,
+            )
+            attempt_id = claim.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt identity is missing"
+                )
+            attempts = node.get("attempts")
+            if not isinstance(attempts, list) or not attempts:
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt is missing"
+                )
+            attempt = next(
+                (
+                    item
+                    for item in reversed(attempts)
+                    if item.get("attempt_id") == attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                raise JournalRecoveryError(
+                    "journaled loop signal attempt is ambiguous"
+                )
+            clean_state = dict(loop_state)
+            clean_state.pop("_pending_signal_confirmation", None)
+            clean_state["completed_by"] = "signal_pending_confirmation"
+            node["loop_state"] = clean_state
+            node["pending_interaction"] = confirmation.to_dict()
+            node["state"] = "paused"
+            node.pop("claim", None)
+            attempt.update({
+                "state": "paused",
+                "error_code": None,
+                "error_message": None,
+                "completed_at": _utc_now(),
+                "metadata": {
+                    "loop_state": clean_state,
+                    "pending_interaction": confirmation.to_dict(),
+                },
+            })
+            projection["status"] = "paused"
+            required_payload = {
+                "iteration": confirmation.iteration,
+                "max_iterations": confirmation.max_iterations,
+                "result_artifact": confirmation.result_artifact,
+                "result_sha256": confirmation.result_sha256,
+                "interaction_id": confirmation.interaction_id,
+            }
+            self._append_locked(
+                directory,
+                projection,
+                "loop_signal_confirmation_required",
+                required_payload,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "node_paused",
+                {
+                    "artifacts": [],
+                    "error_code": None,
+                    "metadata": {
+                        "loop_state": clean_state,
+                        "pending_interaction": confirmation.to_dict(),
+                    },
+                },
+                node_id=node_id,
+                attempt_id=attempt_id,
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "run_paused",
+                terminal_reserve_attempt_id=attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(attempt_id, connection=connection)
+                connection.execute(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    (attempt_id,),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="loop_signal_confirmation_required",
+                )
+            self._notify_coordinator()
+            return True
+
     def block_cleanup_failed(
         self,
         claim: NodeClaim,
@@ -12542,7 +13809,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale cleanup failure")
             safe_metadata = None
             if metadata is not None:
@@ -12764,19 +14031,12 @@ class RunStore:
             from plugins.workflow.notifications import (
                 NotificationOutbox,
                 notification_kind,
+                projected_pending_interaction,
             )
 
             kind = notification_kind(event_type, projection)
             if kind is not None:
-                pending = next(
-                    (
-                        node.get("pending_interaction")
-                        for node in projection.get("nodes", {}).values()
-                        if isinstance(node, Mapping)
-                        and isinstance(node.get("pending_interaction"), Mapping)
-                    ),
-                    None,
-                )
+                pending = projected_pending_interaction(projection)
                 NotificationOutbox(self).record(
                     run_id=str(projection["run_id"]),
                     kind=kind,
@@ -12862,11 +14122,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("v3 condition transition requires an Archon v3 run")
             if projection.get("status") != "running":
                 return False
@@ -12923,11 +14179,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("v3 reference transition requires an Archon v3 run")
             if projection.get("status") != "running":
                 return False
@@ -13011,11 +14263,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if (
-                not isinstance(language, Mapping)
-                or language.get("effective_profile") != "archon-2026-07"
-                or language.get("normalizer_version") != 3
-            ):
+            if not _language_has_phase3_semantics(language):
                 raise ValueError("output resolution waits require an Archon v3 run")
             if projection.get("status") != "running":
                 return False
@@ -13215,7 +14463,8 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
-            if node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+            active = node.get("claim", {})
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale node completion")
             if projection["status"] in {"cancelled", "abandoned", "interrupted"}:
                 raise RuntimeError("stale completion for terminal run")
@@ -13377,7 +14626,7 @@ class RunStore:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"].get(claim.node_id)
                 active = node.get("claim", {}) if node else {}
-                if active.get("attempt_id") != claim.attempt_id:
+                if not _active_claim_matches(active, claim):
                     return False
                 heartbeat_at = datetime.fromisoformat(active["heartbeat_at"])
                 utc_elapsed = (instant - heartbeat_at).total_seconds()
@@ -13492,6 +14741,12 @@ class RunStore:
                     datetime.fromisoformat(claim["lease_expires_at"]) > instant
                     and monotonic_elapsed < lease_seconds
                     and not clock_gap
+                ):
+                    continue
+                loop_state = node.get("loop_state")
+                if (
+                    isinstance(loop_state, Mapping)
+                    and loop_state.get("_pending_loop_decision") is not None
                 ):
                     continue
                 attempt_id = claim["attempt_id"]
@@ -14027,7 +15282,7 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"].get(claim.node_id)
-            if not node or node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+            if not node or not _active_claim_matches(node.get("claim"), claim):
                 return False
             active = node["claim"]
             attempt = next(
@@ -14621,6 +15876,459 @@ class RunStore:
         value = pending.get("interaction_id") or pending.get("action_digest")
         return str(value) if isinstance(value, str) and value else None
 
+    @staticmethod
+    def _loop_signal_confirmation(
+        pending: object,
+        *,
+        run_id: str,
+        node_id: str,
+    ) -> LoopSignalConfirmation:
+        if not isinstance(pending, Mapping):
+            raise ValueError("loop signal confirmation is malformed")
+        return LoopSignalConfirmation.from_mapping(
+            pending,
+            run_id=run_id,
+            node_id=node_id,
+        )
+
+    @classmethod
+    def _bound_loop_decision(
+        cls,
+        claim: NodeClaim,
+        loop_state: Mapping[str, object],
+        raw: object,
+        *,
+        feedback_binding: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(raw, Mapping):
+            raise ValueError("phase 4 loop decision is missing")
+        kind = raw.get("kind")
+        iteration = raw.get("iteration")
+        if (
+            not isinstance(kind, str)
+            or isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or iteration < 1
+            or iteration != loop_state.get("iteration")
+        ):
+            raise ValueError("phase 4 loop decision identity is invalid")
+        common = {"kind", "iteration"}
+        allowed = {
+            "signal_success": common,
+            "signal_confirmation": common | {"pending_interaction"},
+            "ordinary_input": common | {"pending_interaction"},
+            "until_bash_pending": common | {"until_bash_sha256"},
+            "until_bash_success": common,
+            "until_bash_failure": common
+            | {
+                "status",
+                "error_code",
+                "error_message",
+                "archon_terminal_failure",
+            },
+            "continue": common,
+            "hard_limit": common,
+        }
+        expected_keys = allowed.get(kind)
+        if expected_keys is None or set(raw) != expected_keys:
+            raise ValueError("phase 4 loop decision shape is invalid")
+        decision: dict[str, object] = {"kind": kind, "iteration": iteration}
+        if kind == "signal_confirmation":
+            confirmation = cls._loop_signal_confirmation(
+                raw.get("pending_interaction"),
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+            )
+            if (
+                confirmation.iteration != iteration
+                or confirmation.result_artifact != loop_state.get("output_artifact")
+                or confirmation.result_sha256 != loop_state.get("output_sha256")
+            ):
+                raise ValueError("phase 4 loop confirmation identity is invalid")
+            decision["pending_interaction"] = confirmation.to_dict()
+        elif kind == "ordinary_input":
+            interaction = raw.get("pending_interaction")
+            if not isinstance(interaction, Mapping) or set(interaction) != {
+                "type",
+                "interaction_id",
+                "message",
+                "iteration",
+            }:
+                raise ValueError("phase 4 loop input decision is malformed")
+            message = interaction.get("message")
+            interaction_id = interaction.get("interaction_id")
+            if (
+                interaction.get("type") != "loop_input"
+                or interaction.get("iteration") != iteration
+                or not isinstance(message, str)
+                or len(message) > 64_000
+                or not isinstance(interaction_id, str)
+                or _SHA256_PATTERN.fullmatch(interaction_id) is None
+                or not hmac.compare_digest(
+                    interaction_id,
+                    _sha256(
+                        f"{claim.run_id}\0{claim.node_id}\0{iteration}\0{message}".encode()
+                    ),
+                )
+            ):
+                raise ValueError("phase 4 loop input decision identity is invalid")
+            decision["pending_interaction"] = dict(interaction)
+        elif kind == "until_bash_pending":
+            digest = raw.get("until_bash_sha256")
+            if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError("phase 4 loop predicate identity is invalid")
+            decision["until_bash_sha256"] = digest
+            if feedback_binding is not None:
+                if set(feedback_binding) != {
+                    "feedback_artifact",
+                    "feedback_size_bytes",
+                    "feedback_sha256",
+                }:
+                    raise ValueError("phase 4 loop feedback binding is malformed")
+                feedback_path = feedback_binding.get("feedback_artifact")
+                feedback_size = feedback_binding.get("feedback_size_bytes")
+                feedback_digest = feedback_binding.get("feedback_sha256")
+                if (
+                    not isinstance(feedback_path, str)
+                    or not feedback_path
+                    or isinstance(feedback_size, bool)
+                    or not isinstance(feedback_size, int)
+                    or feedback_size < 0
+                    or not isinstance(feedback_digest, str)
+                    or _SHA256_PATTERN.fullmatch(feedback_digest) is None
+                ):
+                    raise ValueError("phase 4 loop feedback identity is invalid")
+                decision.update(dict(feedback_binding))
+        elif feedback_binding is not None:
+            raise ValueError("phase 4 loop feedback is bound to a non-predicate decision")
+        elif kind == "until_bash_failure":
+            status = raw.get("status")
+            error_code = raw.get("error_code")
+            error_message = raw.get("error_message")
+            terminal = raw.get("archon_terminal_failure")
+            if (
+                status not in {"failed", "cancelled", "interrupted"}
+                or
+                not isinstance(error_code, str)
+                or not error_code
+                or len(error_code) > 256
+                or (error_message is not None and not isinstance(error_message, str))
+                or not isinstance(terminal, bool)
+            ):
+                raise ValueError("phase 4 loop predicate failure is malformed")
+            safe_message = _sanitize_diagnostic(error_message)
+            if safe_message != error_message:
+                raise ValueError("phase 4 loop predicate failure is not canonical")
+            decision.update({
+                "status": status,
+                "error_code": error_code,
+                "error_message": safe_message,
+                "archon_terminal_failure": terminal,
+            })
+        output_path = loop_state.get("output_artifact")
+        output_size = loop_state.get("output_size_bytes")
+        output_digest = loop_state.get("output_sha256")
+        if (
+            not isinstance(output_path, str)
+            or not output_path
+            or isinstance(output_size, bool)
+            or not isinstance(output_size, int)
+            or output_size < 0
+            or not isinstance(output_digest, str)
+            or _SHA256_PATTERN.fullmatch(output_digest) is None
+        ):
+            raise ValueError("phase 4 loop output identity is invalid")
+        decision.update({
+            "node_id": claim.node_id,
+            "attempt_id": claim.attempt_id,
+            "output_artifact": output_path,
+            "output_size_bytes": output_size,
+            "output_sha256": output_digest,
+        })
+        return decision
+
+    @classmethod
+    def _validated_bound_loop_decision(
+        cls,
+        raw: object,
+        *,
+        claim: NodeClaim,
+        loop_state: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(raw, Mapping):
+            raise JournalRecoveryError("journaled loop decision is malformed")
+        binding_keys = {
+            "node_id",
+            "attempt_id",
+            "output_artifact",
+            "output_size_bytes",
+            "output_sha256",
+        }
+        if not binding_keys.issubset(raw):
+            raise JournalRecoveryError("journaled loop decision binding is missing")
+        feedback_keys = {
+            "feedback_artifact",
+            "feedback_size_bytes",
+            "feedback_sha256",
+        }
+        present_feedback_keys = feedback_keys.intersection(raw)
+        if present_feedback_keys and present_feedback_keys != feedback_keys:
+            raise JournalRecoveryError(
+                "journaled loop feedback binding is incomplete"
+            )
+        unbound = {
+            key: value
+            for key, value in raw.items()
+            if key not in binding_keys | feedback_keys
+        }
+        feedback_binding = (
+            {key: raw[key] for key in feedback_keys}
+            if present_feedback_keys
+            else None
+        )
+        try:
+            canonical = cls._bound_loop_decision(
+                claim,
+                loop_state,
+                unbound,
+                feedback_binding=feedback_binding,
+            )
+        except ValueError as exc:
+            raise JournalRecoveryError("journaled loop decision is invalid") from exc
+        if dict(raw) != canonical:
+            raise JournalRecoveryError("journaled loop decision binding changed")
+        return canonical
+
+    def _authenticated_loop_feedback_binding(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        relative_path: str,
+    ) -> dict[str, object]:
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, Mapping)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") is None
+            and artifact.get("relative_path") == relative_path
+            and artifact.get("media_type") == "text/plain"
+        ]
+        if len(matches) != 1:
+            raise JournalRecoveryError(
+                "journaled loop feedback identity is ambiguous"
+            )
+        size_bytes = matches[0].get("size_bytes")
+        digest = matches[0].get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= self.max_input_bytes
+            or not isinstance(digest, str)
+            or _SHA256_PATTERN.fullmatch(digest) is None
+        ):
+            raise JournalRecoveryError("journaled loop feedback identity is invalid")
+        try:
+            content = _read_descriptor_relative(
+                directory,
+                relative_path,
+                size_bytes=size_bytes,
+            )
+            content.decode("utf-8")
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise JournalRecoveryError(
+                "journaled loop feedback artifact is unavailable"
+            ) from exc
+        if len(content) != size_bytes or not hmac.compare_digest(
+            _sha256(content), digest
+        ):
+            raise JournalRecoveryError("journaled loop feedback digest changed")
+        return {
+            "feedback_artifact": relative_path,
+            "feedback_size_bytes": size_bytes,
+            "feedback_sha256": digest,
+        }
+
+    @staticmethod
+    def _verify_pending_loop_result(
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        node: Mapping[str, object],
+        confirmation: LoopSignalConfirmation,
+    ) -> None:
+        attempts = node.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ValueError("loop signal result attempt is missing")
+        attempt_id = attempts[-1].get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("loop signal result attempt is malformed")
+        relative = PurePosixPath(confirmation.result_artifact)
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component(
+                    "attempt",
+                    f"{attempt_id}/iteration-{confirmation.iteration:04d}",
+                ),
+            ),
+        }
+        if (
+            len(relative.parts) <= 3
+            or relative.parts[:3] not in owned_prefixes
+        ):
+            raise ValueError("loop signal result is not owned by the paused attempt")
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, Mapping)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") == attempt_id
+            and artifact.get("relative_path") == confirmation.result_artifact
+            and artifact.get("sha256") == confirmation.result_sha256
+        ]
+        if len(matches) != 1:
+            raise ValueError("loop signal result artifact identity is ambiguous")
+        size_bytes = matches[0].get("size_bytes")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise ValueError("loop signal result artifact size is invalid")
+        try:
+            content = _read_descriptor_relative(
+                directory,
+                confirmation.result_artifact,
+                size_bytes=size_bytes,
+            )
+        except (OSError, ArchonOutputIntegrityError, ArchonOutputUnavailableError) as exc:
+            raise ValueError("loop signal result artifact is unavailable") from exc
+        if (
+            len(content) != size_bytes
+            or not hmac.compare_digest(
+                _sha256(content), confirmation.result_sha256
+            )
+        ):
+            raise ValueError("loop signal result artifact digest changed")
+
+    def _staged_loop_typed_publication(
+        self,
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        node: Mapping[str, object],
+        confirmation: LoopSignalConfirmation,
+        authenticated_definition_bytes: bytes,
+    ) -> tuple[dict[str, object], ArtifactRef, TypedPublicationCandidate] | None:
+        attempts = node.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is missing"
+            )
+        attempt = attempts[-1]
+        if not isinstance(attempt, Mapping):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is malformed"
+            )
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt.get("state") != "paused"
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication attempt is not the paused attempt"
+            )
+        staged = _typed_publication_candidate_from_metadata(
+            attempt.get("metadata")
+        )
+        declaration = _typed_output_declarations_from_definition_bytes(
+            authenticated_definition_bytes
+        ).get(node_id)
+        if declaration is None:
+            if staged is not None:
+                raise ArchonOutputIntegrityError(
+                    "staged typed publication has no sealed output authority"
+                )
+            return None
+        if staged is None:
+            raise ArchonOutputIntegrityError(
+                "declared loop output has no staged typed publication"
+            )
+        requirement = _typed_output_requirement(
+            projection,
+            node_id=node_id,
+            declaration=declaration,
+        )
+        if (
+            staged.output_type != requirement.output_type
+            or staged.schema_fingerprint != requirement.schema_fingerprint
+            or staged.canonicalization_version
+            != requirement.canonicalization_version
+            or staged.attempt_relative_path != confirmation.result_artifact
+            or staged.sha256 != confirmation.result_sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication conflicts with its durable authority"
+            )
+        matches = [
+            artifact
+            for artifact in projection.get("artifacts", ())
+            if isinstance(artifact, dict)
+            and artifact.get("node_id") == node_id
+            and artifact.get("attempt_id") == attempt_id
+            and artifact.get("relative_path") == staged.attempt_relative_path
+        ]
+        if len(matches) != 1:
+            raise ArchonOutputIntegrityError(
+                "staged typed publication artifact identity is ambiguous"
+            )
+        projected = matches[0]
+        typed_markers = {
+            "typed_publication_version",
+            "publication_id",
+            "content_name",
+            "metadata_sha256",
+            "produced_at",
+        }
+        if typed_markers.intersection(projected):
+            raise ArchonOutputIntegrityError(
+                "paused loop result is already a typed publication"
+            )
+        artifact = ArtifactRef(
+            relative_path=staged.attempt_relative_path,
+            media_type=staged.media_type,
+            size_bytes=staged.size_bytes,
+            sha256=staged.sha256,
+        )
+        _canonical_typed_publication_artifact((artifact,), staged)
+        if (
+            projected.get("media_type") != artifact.media_type
+            or projected.get("size_bytes") != artifact.size_bytes
+            or projected.get("sha256") != artifact.sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "staged typed publication conflicts with its projected artifact"
+            )
+        return projected, artifact, staged
+
     def _already_decided(
         self,
         projection: Mapping[str, object],
@@ -14712,16 +16420,74 @@ class RunStore:
         if len(response.encode("utf-8")) > min(self.max_input_bytes, 64 * 1024):
             raise InputSnapshotError("approval response exceeds the configured limit")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        from plugins.workflow.schema import load_workflow
+        preliminary = json.loads((directory / "run.json").read_text())
+        has_signal_confirmation = any(
+            isinstance(node, Mapping)
+            and (
+                (
+                    node.get("state") == "paused"
+                    and isinstance(node.get("pending_interaction"), Mapping)
+                    and node["pending_interaction"].get("type")
+                    == "loop_signal_confirmation"
+                )
+                or (
+                    isinstance(node.get("approval_last_decision"), Mapping)
+                    and node["approval_last_decision"].get("type")
+                    == "loop_signal_confirmation"
+                    and node["approval_last_decision"].get("interaction_id")
+                    == interaction_id
+                )
+            )
+            for node in preliminary.get("nodes", {}).values()
+        )
+        definitions = None
+        from plugins.workflow.scheduler import RunScheduler
 
-        package = load_workflow(directory / "definition.yaml")
-        definitions = {node.id: node for node in package.definition.nodes}
+        scheduler = RunScheduler(self)
+        if not has_signal_confirmation:
+            package = scheduler._load_run_package(run_id)
+            definitions = {node.id: node for node in package.definition.nodes}
+
+        def authenticated_signal_bytes(
+            projection: Mapping[str, object],
+        ) -> Mapping[str, bytes]:
+            if not has_signal_confirmation:
+                raise ArchonOutputIntegrityError(
+                    "loop signal confirmation changed before authentication"
+                )
+            if not self._journal_matches_projection(
+                directory,
+                projection=projection,
+                run_id=run_id,
+            ):
+                raise ArchonOutputIntegrityError(
+                    "staged loop result is not corroborated by the journal"
+                )
+            _package, _sealed_paths, authenticated_bytes = (
+                scheduler._load_verified_run_package(
+                    run_id,
+                    projection=projection,
+                )
+            )
+            return authenticated_bytes
+
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),
         ):
             projection = json.loads((directory / "run.json").read_text())
             duplicate = self._already_decided(projection, interaction_id)
+            duplicate_signal_confirmation = any(
+                isinstance(candidate, Mapping)
+                and isinstance(candidate.get("approval_last_decision"), Mapping)
+                and candidate["approval_last_decision"].get("type")
+                == "loop_signal_confirmation"
+                and candidate["approval_last_decision"].get("interaction_id")
+                == interaction_id
+                for candidate in projection.get("nodes", {}).values()
+            )
+            if duplicate is not None and duplicate_signal_confirmation:
+                authenticated_signal_bytes(projection)
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
@@ -14746,23 +16512,61 @@ class RunStore:
             assert resolved_id is not None
             pending = node["pending_interaction"]
             pending_type = str(pending.get("type") or pending.get("kind") or "")
+            confirmation = None
+            staged_loop_publication = None
+            if pending_type == "loop_signal_confirmation":
+                if decision != "approved":
+                    raise ValueError("loop signal confirmation is not rejectable")
+                if expected_state_version is None:
+                    raise ValueError(
+                        "expected state version is required for loop signal confirmation"
+                    )
+                confirmation = self._loop_signal_confirmation(
+                    pending,
+                    run_id=run_id,
+                    node_id=node_id,
+                )
+                authenticated_bytes = authenticated_signal_bytes(projection)
+                self._verify_pending_loop_result(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    confirmation=confirmation,
+                )
+                staged_loop_publication = self._staged_loop_typed_publication(
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    confirmation=confirmation,
+                    authenticated_definition_bytes=authenticated_bytes[
+                        "definition.yaml"
+                    ],
+                )
+            elif definitions is None:
+                raise WorkflowConflict("pending interaction changed during decision")
             safe_response = (_sanitize_diagnostic(response.strip()) or "")[:64_000]
             record = {
                 "decision": decision,
                 "interaction_id": resolved_id,
             }
+            if pending_type == "loop_signal_confirmation":
+                record["type"] = pending_type
             node["approval_last_decision"] = record
             node.pop("pending_interaction", None)
             event_payload: dict[str, object] = {
                 "decision": decision,
                 "interaction_id": resolved_id,
             }
+            if pending_type == "loop_signal_confirmation" and safe_response:
+                event_payload["comment"] = safe_response
             if actor:
                 event_payload["actor"] = _sanitize_diagnostic(actor)
             if channel:
                 event_payload["channel"] = _sanitize_diagnostic(channel)
 
             terminal = False
+            activated_publication_ref = None
             if decision == "approved":
                 if pending_type == "workflow_approval":
                     definition = definitions[node_id]
@@ -14851,9 +16655,38 @@ class RunStore:
                 elif pending_type == "approval":
                     node["state"] = "ready"
                     node["action_grant"] = resolved_id
+                elif pending_type == "loop_signal_confirmation":
+                    assert confirmation is not None
+                    if staged_loop_publication is not None:
+                        (
+                            projected_artifact,
+                            publication_artifact,
+                            publication_candidate,
+                        ) = staged_loop_publication
+                        attempt_id = str(node["attempts"][-1]["attempt_id"])
+                        activated_publication_ref = (
+                            self._publish_typed_bundle_locked(
+                                directory,
+                                projection,
+                                run_id=run_id,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                artifact=publication_artifact,
+                                candidate=publication_candidate,
+                            )
+                        )
+                        projected_artifact.update(
+                            _typed_publication_fields(
+                                activated_publication_ref
+                            )
+                        )
+                    node["state"] = "succeeded"
+                    if node.get("attempts"):
+                        node["attempts"][-1]["state"] = "succeeded"
                 else:
                     raise ValueError("pending interaction is not approvable")
             else:
+                assert definitions is not None
                 definition = definitions[node_id]
                 approval = (
                     definition.value if definition.node_type == "approval" else {}
@@ -14882,13 +16715,31 @@ class RunStore:
             self._append_locked(
                 directory,
                 projection,
-                f"interaction_{decision}",
+                (
+                    "loop_signal_accepted"
+                    if pending_type == "loop_signal_confirmation"
+                    else f"interaction_{decision}"
+                ),
                 event_payload,
                 node_id=node_id,
             )
+            if activated_publication_ref is not None:
+                verified_content = self._recover_typed_publications_locked(
+                    directory,
+                    projection,
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    projection,
+                    verified_content,
+                )
             if terminal:
                 self._append_locked(directory, projection, "run_cancelled")
                 with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
+                    )
                     self._sync_integrity_index(
                         connection,
                         projection=projection,
@@ -14906,11 +16757,58 @@ class RunStore:
                     )
                 self._notify_coordinator()
             else:
-                projection = self._request_runnable_locked(
-                    directory,
-                    projection,
-                    reason=f"interaction_{decision}",
-                )
+                states = {
+                    candidate["state"]
+                    for candidate in projection["nodes"].values()
+                }
+                terminal_status = None
+                if (
+                    pending_type == "loop_signal_confirmation"
+                    and states
+                    and states
+                    <= {
+                        "succeeded",
+                        "failed",
+                        "skipped",
+                        "cancelled",
+                        "interrupted",
+                    }
+                ):
+                    terminal_status = (
+                        "failed" if "failed" in states else "succeeded"
+                    )
+                if terminal_status is not None:
+                    projection["status"] = terminal_status
+                    event_type = f"run_{terminal_status}"
+                    self._append_locked(directory, projection, event_type)
+                    with self._connect() as connection:
+                        connection.execute(
+                            "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                            (
+                                projection["status"],
+                                projection["updated_at"],
+                                run_id,
+                            ),
+                        )
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=_sha256(
+                                (directory / "events.jsonl").read_bytes()
+                            ),
+                        )
+                        self._record_coordinator_wake(
+                            connection,
+                            run_id=run_id,
+                            reason_code=event_type,
+                        )
+                    self._notify_coordinator()
+                else:
+                    projection = self._request_runnable_locked(
+                        directory,
+                        projection,
+                        reason=f"interaction_{decision}",
+                    )
             return ApprovalDecision(
                 run_id=run_id,
                 node_id=node_id,
@@ -14933,7 +16831,7 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            if active.get("attempt_id") != claim.attempt_id:
+            if not _active_claim_matches(active, claim):
                 raise RuntimeError("stale action grant consumer")
             digest = node.pop("action_grant", None)
             if digest is None:
@@ -14982,13 +16880,30 @@ class RunStore:
                 for node_id, node in projection["nodes"].items()
                 if node.get("state") == "paused"
                 and isinstance(node.get("pending_interaction"), dict)
-                and node["pending_interaction"].get("type") == "loop_input"
+                and node["pending_interaction"].get("type")
+                in {"loop_input", "loop_signal_confirmation"}
                 and self._interaction_identity(node) == interaction_id
             ]
             if len(candidates) != 1:
                 raise ValueError("run does not have exactly one pending loop input")
             node_id, node = candidates[0]
-            generation = int(node.get("loop_state", {}).get("iteration", 0))
+            pending = node["pending_interaction"]
+            pending_type = str(pending.get("type") or "")
+            if pending_type == "loop_signal_confirmation":
+                confirmation = self._loop_signal_confirmation(
+                    pending,
+                    run_id=run_id,
+                    node_id=node_id,
+                )
+                if not user_input.strip():
+                    raise ValueError("loop signal feedback must not be empty")
+                if confirmation.iteration >= confirmation.max_iterations:
+                    raise ValueError(
+                        "loop signal feedback is unavailable on the final iteration"
+                    )
+                generation = confirmation.iteration
+            else:
+                generation = int(node.get("loop_state", {}).get("iteration", 0))
             relative = (
                 Path("nodes")
                 / node_id
@@ -15009,6 +16924,12 @@ class RunStore:
             node["state"] = "ready"
             node.pop("pending_interaction", None)
             node["loop_user_input_artifact"] = relative.as_posix()
+            if pending_type == "loop_signal_confirmation":
+                node["approval_last_decision"] = {
+                    "decision": "feedback",
+                    "interaction_id": interaction_id,
+                    "type": pending_type,
+                }
             event_payload: dict[str, object] = {
                 "artifact": artifact,
                 "iteration": generation,
@@ -15021,7 +16942,11 @@ class RunStore:
             self._append_locked(
                 directory,
                 projection,
-                "loop_input_provided",
+                (
+                    "loop_feedback_provided"
+                    if pending_type == "loop_signal_confirmation"
+                    else "loop_input_provided"
+                ),
                 event_payload,
                 node_id=node_id,
             )
@@ -15751,6 +17676,7 @@ __all__ = [
     "PublicationNotFoundError",
     "PublicationUnavailableError",
     "RunStore",
+    "StaleLoopDecisionError",
     "StorageQuotaError",
     "TypedPublicationCandidate",
     "TypedPublicationRef",

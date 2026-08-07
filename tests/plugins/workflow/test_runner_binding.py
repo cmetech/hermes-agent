@@ -23,6 +23,7 @@ from plugins.workflow.api_admission import (
 from plugins.workflow.catalog_api import (
     build_workflow_catalog,
     build_workflow_detail,
+    resolve_workflow_catalog_compilation,
 )
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
@@ -604,7 +605,15 @@ def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    package = _structured_package(home, workflow_writer, name="sealed-provider-drift")
+    _structured_package(home, workflow_writer, name="sealed-provider-drift")
+    compilation = resolve_workflow_catalog_compilation(
+        "sealed-provider-drift",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     current = {"runtime": _direct_openai_runtime()}
     binding = _runtime_binding(
         current["runtime"], runtime_provider=lambda: current["runtime"]
@@ -614,11 +623,13 @@ def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
         entitlement=AIEntitlementResolution("real"),
     )
     compatibility, risk = runner_binding_module.assess_package_execution(
-        package, admitted_context
+        package,
+        admitted_context,
+        compilation=compilation,
     )
     assert compatibility.runnable is True
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="runner-binding-test",
         risk_digest=risk.risk_digest,
     )
@@ -704,7 +715,15 @@ def test_unsupported_structured_output_blocks_before_provider_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    package = _structured_package(home, workflow_writer, name="unsupported-output")
+    _structured_package(home, workflow_writer, name="unsupported-output")
+    compilation = resolve_workflow_catalog_compilation(
+        "unsupported-output",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     unsupported_runtime = ExecutionRuntimeCapabilities(
         api_mode="chat_completions",
         hermes_managed_tool_loop=True,
@@ -719,11 +738,13 @@ def test_unsupported_structured_output_blocks_before_provider_request(
         entitlement=AIEntitlementResolution("real"),
     )
     compatibility, risk = runner_binding_module.assess_package_execution(
-        package, context
+        package,
+        context,
+        compilation=compilation,
     )
     assert compatibility.runnable is False
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="runner-binding-test",
         risk_digest=risk.risk_digest,
     )
@@ -761,7 +782,7 @@ def test_overlong_structured_decision_metadata_blocks_without_residue(
     workflow_writer,
 ) -> None:
     home = tmp_path / "home"
-    package = _structured_route_package(
+    _structured_route_package(
         home,
         workflow_writer,
         name="overlong-structured-metadata",
@@ -774,16 +795,26 @@ def test_overlong_structured_decision_metadata_blocks_without_residue(
             }
         ],
     )
+    compilation = resolve_workflow_catalog_compilation(
+        "overlong-structured-metadata",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     binding = _runtime_binding(_direct_openai_runtime())
     context = binding.execution_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
     )
     compatibility, risk = runner_binding_module.assess_package_execution(
-        package, context
+        package,
+        context,
+        compilation=compilation,
     )
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="runner-binding-test",
         risk_digest=risk.risk_digest,
     )
@@ -850,12 +881,15 @@ def test_verified_showcase_cache_contains_authenticated_raw_material_only() -> N
 
     package = verified["ai-extensions"]
     assert len(package.package_digest) == 64
-    assert set(package.__slots__) == {
-        "scenario",
-        "package",
-        "package_digest",
-        "bundle_digest",
-    }
+    assert package.compilation.package is package.package
+    assert package.compilation.dependency_manifest.root.workflow_name == (
+        package.package.definition.name
+    )
+    assert package.compilation.covered_relative_paths
+    assert all(
+        isinstance(package.compilation.sealed_files[path], bytes)
+        for path in package.compilation.covered_relative_paths
+    )
     assert not hasattr(package, "compatibility")
     assert not hasattr(package, "risk")
 

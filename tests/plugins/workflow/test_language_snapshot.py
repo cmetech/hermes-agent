@@ -293,7 +293,7 @@ def test_admission_seals_package_bound_language_metadata(tmp_path, workflow_writ
     resources = json.loads((prepared.staging_directory / "resources.json").read_text())
 
     assert resources["language"]["effective_profile"] == "archon-2026-07"
-    assert resources["language"]["normalizer_version"] == 3
+    assert resources["language"]["normalizer_version"] == 4
     assert resources["language"]["structured_outputs"] == {
         "producer": {
             "canonical_schema": {
@@ -456,7 +456,12 @@ def test_v3_command_reference_is_checked_before_snapshot_promotion(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
     store = RunStore(tmp_path / "home")
 
     with pytest.raises(WorkflowValidationError) as exc_info:

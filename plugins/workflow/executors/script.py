@@ -19,7 +19,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionResult,
     process_tree_active,
 )
-from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.language import supports_phase3_semantics
 from plugins.workflow.resources import (
     ResourceResolver,
     VariableContext,
@@ -172,9 +172,10 @@ class ScriptExecutor:
                 error_message="script node exceeded its timeout",
             )
         strict_v3 = (
-            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
-            and isinstance(context.variable_context, VariableContext)
-            and context.variable_context.normalizer_version == 3
+            isinstance(context.variable_context, VariableContext)
+            and supports_phase3_semantics(
+                context.language_profile, context.variable_context.normalizer_version
+            )
         )
         execution_plan = None
         if strict_v3:

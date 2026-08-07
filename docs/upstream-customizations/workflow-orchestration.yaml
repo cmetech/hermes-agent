@@ -3896,26 +3896,97 @@ upstream_changes:
   - workflow-builder idle_timeout profile-unit decision
   - workflow language backend-version floor guidance
   - OTTO V1 incompatible authoring-skill guidance
+  owned_invariants:
+  - historical Phase 1 workflow-language authoring-reference provenance
+  - 'workflow language authority superseded by: workflow-phase4-language-contracts'
   tests:
   - tests/plugins/workflow/test_language_schema.py
   - tests/agent/test_workflow_builder_skill.py
   expected_commit_subject: 'docs(workflow): publish language authoring contract'
   upstream_candidate: true
-  merge_guidance: Preserve the generated workflow schema as the authoring authority,
-    the declared archon-2026-07 default for new first-party packages, and unversioned
-    hermes-legacy behavior for bytes consumed by pre-Phase-1 backends that reject
-    unknown companion fields. Keep deferred Archon fields as explicit two-choice authoring
-    stops rather than silent legacy downgrades, including legacy idle_timeout seconds
-    versus Phase 3-deferred Archon millisecond normalization. Retain validate/doctor
-    and digest-bound trust gates, keep legacy scratch/state compatibility explicit
-    while recommending ARTIFACTS_DIR and denying added run-root files any execution
-    authority, and keep the global create-workflow skill's OTTO V1 steps, produces,
-    context_from, verify, and iterate shapes explicitly outside the Hermes authoring
-    contract. Documentation may summarize generated inventory but must be checked
-    against both profile schema envelopes and must not claim Phase 2+ execution.
-  removal_condition: Remove when upstream ships an equivalent profile-aware generated-contract
-    reference and first-party workflow authoring skill with legacy preservation, mixed-version
-    backend guidance, deferred-field choice gates, and explicit OTTO V1 incompatibility.
+  merge_guidance: Preserve this entry's historical Phase 1 authoring-reference provenance,
+    but defer all live language-version guidance to workflow-phase4-language-contracts.
+    Current/default archon-2026-07 uses v4, hermes-legacy uses v2, and explicit/sealed
+    v1-v3 readers remain compatible. Phase 3 millisecond timeout, retry, structured-output,
+    and reference semantics are inherited by current v4 rather than deferred. Keep only
+    fields that the generated current contract marks blocking behind the explicit two-choice
+    authoring stop; later runtime child workflows, include.with, loop_group, portable
+    budget/sandbox guarantees, and provider portability remain unavailable without
+    turning that bounded list into a blanket phase threshold. Retain validate/doctor,
+    digest-bound trust, legacy scratch/state compatibility with ARTIFACTS_DIR guidance,
+    and the explicit exclusion of OTTO V1 steps, produces, context_from, verify, and
+    iterate shapes from the Hermes contract.
+  removal_condition: Remove this historical Phase 1 entry when upstream provides an
+    equivalent profile-aware generated-contract reference, first-party authoring skill,
+    legacy preservation, mixed-version backend guidance, current blocking-field choice
+    gates, and explicit OTTO V1 incompatibility. Current language-authority removal remains
+    governed by workflow-phase4-language-contracts, not by this older entry.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase4-language-contracts
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/compat.py
+  - pyproject.toml
+  - website/docs/user-guide/features/workflow-yaml-reference.md
+  - website/docs/user-guide/features/workflows.md
+  - skills/software-development/workflow-builder/references/portable-schema.md
+  - skills/software-development/workflow-builder/references/authoring-checklist.md
+  - tests/plugins/workflow/test_phase4_code_catalog.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/agent/test_workflow_builder_skill.py
+  - tests/skills/test_workflow_operator_behavior.py
+  owned_symbols:
+  - CURRENT_NORMALIZER_BY_PROFILE
+  - PHASE4_DURABLE_CODES
+  - compatibility_code_catalog
+  - contract_documentation
+  - phase4_loop_prompt_sealed
+  - phase4_signal_confirmation
+  owned_invariants:
+  - current/default normalizer v4 generation and explicit/sealed v1-v3 compatibility
+  - ordinary-loops-and-includes generated documentation topic
+  - installed workflow-builder reference data files
+  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":4,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4]}'
+  - include is compile-only and absent from executable node kinds
+  - root-only policy and authenticated ignored child sidecars
+  - exact bounded include closure guidance
+  - ordered entry, sink, and first-sink alias guidance
+  - logical-origin sealed-resource and source-deletion-safe resume guidance
+  - existing signal wire actions and final-iteration restriction
+  - later runtime child workflow, include.with, and loop_group omissions
+  tests:
+  - tests/plugins/workflow/test_phase4_code_catalog.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/agent/test_workflow_builder_skill.py
+  - tests/skills/test_workflow_operator_behavior.py
+  expected_commit_subject: 'feat(workflow): publish phase 4 language contracts'
+  upstream_candidate: true
+  merge_guidance: Preserve normalizer v4 as the current/default archon-2026-07
+    contract, hermes-legacy at v2, and explicit/sealed v1-v3 reader compatibility.
+    The original publication staged v4 behind explicit selection while v3 remained
+    current; retain that provenance in historical evidence without restoring stale
+    operator guidance. Publish the complete v4 syntax, structured ordinary-loop/include
+    documentation topic, and behavior-backed stable include codes. Keep include compile-only, root policy authoritative,
+    child companions authenticated but ignored, closure limits exact, include aliases
+    ordered, and named resources bound to logical child origins in immutable snapshots.
+    Reuse only existing approval, input, cancel, status, and event actions for loop
+    signal confirmation; omit provide-input on the final iteration and never replay
+    the provider on approval. Keep runtime child workflows, include.with, and loop_group
+    explicitly outside this phase. Installed wheels and sdists must retain the workflow-builder
+    reference documents that teach this contract.
+  removal_condition: Remove when upstream publishes an equivalent current-v4 Archon
+    authoring/admission contract, legacy-v2 default, explicit/sealed v1-v3 compatibility,
+    code catalog, installed reference assets, and operator guidance.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: workflow-language-regression-gates
   change_class: workflow-testing

@@ -1705,6 +1705,16 @@ export interface Translations {
     workflowLanguageLegacyDescription: string
     workflowLanguageNormalizer: string
     workflowLanguageDigest: string
+    workflowDependencies: string
+    workflowDependencySources: string
+    workflowDependencyPrecedence: string
+    workflowDependencyPackages: string
+    workflowExpandedNodes: string
+    workflowExpandedEdges: string
+    workflowIncludeDepth: string
+    workflowCompositeDigest: string
+    workflowIgnoredPolicies: string
+    workflowIgnoredPolicyField: (field: string) => string
     workflowRequiresAi: string
     workflowNoInputs: string
     workflowInputCount: (count: number) => string
@@ -1836,6 +1846,9 @@ export interface Translations {
     artifactPreviewIncomplete: string
     artifactTextPreviewTruncated: string
     artifactDownloadOnly: string
+    acceptResult: string
+    continueWithFeedback: string
+    feedback: string
     provideInput: string
     inputValue: string
     reconcile: string

@@ -13,7 +13,7 @@ import pytest
 from plugins.workflow.models import ExecutionFence, RunExecutionLimits
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
-from plugins.workflow.cli import _runtime_config, register_cli
+from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.gateway_command import workflow_gateway_command
@@ -120,7 +120,7 @@ def test_effective_execution_semantics_round_trip_exact_schema_and_caps(
     assert decoded == semantics
     assert semantics.to_dict() == {
         "schema_version": 1,
-        "normalizer_version": 3,
+        "normalizer_version": 4,
         "limits": {
             "ai_idle_timeout_seconds": 200.0,
             "ai_wall_timeout_seconds": 400.0,
@@ -335,10 +335,18 @@ def test_gateway_admission_seals_resolved_profile_execution_authority(
         }),
         encoding="utf-8",
     )
-    package = load_workflow(path)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compilation = _resolve_compilation(
+        argparse.Namespace(workdir=tmp_path, hermes_home=home),
+        str(path),
+    )
+    package = compilation.package
+    risk = build_risk_summary(
+        package,
+        assess_compatibility(package),
+        compilation=compilation,
+    )
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="test",
         risk_digest=risk.risk_digest,
     )
@@ -392,6 +400,8 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     monkeypatch,
     capsys,
 ) -> None:
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
     home = tmp_path / "profile"
     monkeypatch.setenv("HERMES_HOME", str(home))
     path = workflow_writer(
@@ -460,15 +470,35 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
         ),
         encoding="utf-8",
     )
-    package = load_workflow(path)
+    profile_compilation = resolve_workflow_catalog_compilation(
+        path.stem,
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert profile_compilation is not None
+    explicit_compilation = _resolve_compilation(
+        argparse.Namespace(workdir=tmp_path, hermes_home=home),
+        str(path),
+    )
+    package = profile_compilation.package
     binding = production_workflow_runner_binding()
     context = background_execution_context(binding, requires_ai=True)
-    _compatibility, risk = assess_package_execution(package, context)
-    WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
-        actor="test",
-        risk_digest=risk.risk_digest,
-    )
+    trust_store = WorkflowTrustStore(home)
+    risks = {}
+    for compilation in (profile_compilation, explicit_compilation):
+        _compatibility, compilation_risk = assess_package_execution(
+            compilation.package,
+            context,
+            compilation=compilation,
+        )
+        trust_store.trust(
+            compilation.composite_digest,
+            actor="test",
+            risk_digest=compilation_risk.risk_digest,
+        )
+        risks[compilation.composite_digest] = compilation_risk
+    risk = risks[profile_compilation.composite_digest]
     store = RunStore(home)
     now = datetime.now(timezone.utc)
     coordinator = CoordinatorStore(store.database)
@@ -588,7 +618,11 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
         "load_showcase_catalog",
         lambda: {scenario.id: scenario},
     )
-    monkeypatch.setattr(showcase_module, "_scenario_package", lambda _scenario: package)
+    monkeypatch.setattr(
+        showcase_module,
+        "_scenario_package",
+        lambda _scenario, **_kwargs: package,
+    )
     monkeypatch.setattr(
         showcase_module,
         "preflight_showcase",
@@ -617,22 +651,50 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     resolved = RunExecutionLimits.resolve(
         _runtime_config(home, sidecar=package.sidecar)
     )
-    direct = store.prepare_run_snapshot(
+    profile_direct = store.prepare_run_snapshot(
         package,
         values=values,
         execution_limits=resolved,
+        compilation=profile_compilation,
     )
-    direct_resources = (direct.staging_directory / "resources.json").read_bytes()
-    expected_digest = hashlib.sha256(direct_resources).hexdigest()
+    explicit_direct = store.prepare_run_snapshot(
+        explicit_compilation.package,
+        values=values,
+        execution_limits=resolved,
+        compilation=explicit_compilation,
+    )
+    profile_resources = (
+        profile_direct.staging_directory / "resources.json"
+    ).read_bytes()
+    explicit_resources = (
+        explicit_direct.staging_directory / "resources.json"
+    ).read_bytes()
+    expected_resources = {
+        "scheduled": profile_resources,
+        "api": profile_resources,
+        "showcase": profile_resources,
+        "cli": explicit_resources,
+        "gateway": explicit_resources,
+    }
+    assert hashlib.sha256(profile_resources).digest() != hashlib.sha256(
+        explicit_resources
+    ).digest()
     expected_semantics = json.dumps(
-        json.loads(direct_resources)["phase3_execution_semantics"],
+        json.loads(profile_resources)["phase3_execution_semantics"],
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
+    assert json.dumps(
+        json.loads(explicit_resources)["phase3_execution_semantics"],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode() == expected_semantics
 
     for surface, run_id in run_ids.items():
         run_directory = store.run_directory(run_id)
         resource_bytes = (run_directory / "resources.json").read_bytes()
+        expected_resource_bytes = expected_resources[surface]
+        expected_digest = hashlib.sha256(expected_resource_bytes).hexdigest()
         semantics_bytes = json.dumps(
             json.loads(resource_bytes)["phase3_execution_semantics"],
             sort_keys=True,
@@ -709,7 +771,7 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     }
     assert (
         restarted_store.run_directory(run_ids["scheduled"]) / "resources.json"
-    ).read_bytes() == direct_resources
+    ).read_bytes() == profile_resources
     assert len(restarted_store.issued_scheduled_authorizations) == 1
     with pytest.raises(RuntimeError, match="already consumed"):
         restarted_store._consume_scheduled_promotion_authorization(
@@ -920,18 +982,32 @@ def test_scheduled_promotion_preserves_execution_semantics_mismatch(
     workflow_writer,
     monkeypatch,
 ) -> None:
+    from plugins.workflow.catalog_api import resolve_workflow_catalog_compilation
+
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    package = _archon_package(
+    _archon_package(
         home / "workflows",
         workflow_writer,
         nodes=[{"id": "shell", "bash": "true"}],
     )
+    compilation = resolve_workflow_catalog_compilation(
+        "phase3-execution",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    assert compilation is not None
+    package = compilation.package
     binding = production_workflow_runner_binding()
     context = background_execution_context(binding, requires_ai=False)
-    _compatibility, risk = assess_package_execution(package, context)
+    _compatibility, risk = assess_package_execution(
+        package,
+        context,
+        compilation=compilation,
+    )
     WorkflowTrustStore(home).trust(
-        compute_package_digest(package).sha256,
+        compilation.composite_digest,
         actor="test",
         risk_digest=risk.risk_digest,
     )
