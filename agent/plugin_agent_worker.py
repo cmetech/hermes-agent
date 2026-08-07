@@ -2137,7 +2137,7 @@ def _run(
                 )
 
                 child_request = PluginAgentRunRequest(
-                    prompt=prompt,
+                    prompt=request.prompt,
                     provider=str(fallback["provider"]),
                     model=str(fallback["model"]),
                     context_mode="fresh",
@@ -2161,7 +2161,7 @@ def _run(
                     sealed_fallback_route=None,
                     ephemeral_system_prompt=request.ephemeral_system_prompt,
                     request_overrides=dict(fallback["request_overrides"]),
-                    structured_output=request.structured_output,
+                    structured_output=fallback["structured_output"],
                     max_budget_usd=request.max_budget_usd,
                     _cost_budget_authority=request._cost_budget_authority,
                     _cost_budget_contract=request._cost_budget_contract,

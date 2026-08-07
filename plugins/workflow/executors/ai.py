@@ -25,7 +25,12 @@ from agent.structured_output import (
     parse_validate_canonicalize,
     require_structured_output_validator,
 )
-from hermes_cli.provider_capabilities import encode_provider_option_transport
+from hermes_cli.provider_capabilities import (
+    CapabilityDisposition,
+    WorkflowProviderFeature,
+    encode_provider_option_transport,
+)
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.entitlement import (
     AIExecutionIntegrityError,
@@ -216,11 +221,13 @@ class AgentNodeExecutor:
     @staticmethod
     def _structured_request(
         context: NodeExecutionContext,
+        *,
+        decision: StructuredOutputCapabilityDecision | None = None,
     ) -> StructuredOutputRequest | None:
         if context.language_profile is not WorkflowLanguageProfile.ARCHON_2026_07:
             return None
         declared = context.structured_output
-        decision = context.structured_output_decision
+        decision = decision or context.structured_output_decision
         if declared is None:
             if context.node.options.get("output_format") is not None:
                 raise ValueError("admitted structured-output schema is missing")
@@ -240,6 +247,65 @@ class AgentNodeExecutor:
             adapter_version=decision.adapter_version,
             output_bytes_limit=MAX_OUTPUT_BYTES,
             canonicalization_version=declared.canonicalization_version,
+        )
+
+    @staticmethod
+    def _fallback_structured_output_decision(
+        context: NodeExecutionContext,
+        route,
+    ) -> StructuredOutputCapabilityDecision | None:
+        declared = context.structured_output
+        if declared is None:
+            return None
+        authority = context.sealed_provider_authority
+        if authority is None:
+            raise ValueError("sealed fallback structured-output authority is missing")
+        matches = tuple(
+            item.decision
+            for item in authority.obligations
+            if item.route_id == route.route_id
+            and item.decision.feature is WorkflowProviderFeature.STRUCTURED_OUTPUT
+        )
+        if len(matches) != 1:
+            raise ValueError("sealed fallback structured-output decision is missing")
+        central = matches[0]
+        strategy = central.effective_semantics.get("strategy")
+        if (
+            central.disposition
+            not in {
+                CapabilityDisposition.NATIVE,
+                CapabilityDisposition.HERMES_ADAPTER,
+            }
+            or central.provider != route.provider
+            or central.model != route.model
+            or central.requested_semantics.get("schema_fingerprint")
+            != declared.schema_fingerprint
+            or central.effective_semantics.get("schema_fingerprint")
+            != declared.schema_fingerprint
+        ):
+            raise ValueError("sealed fallback structured-output decision is contradictory")
+        try:
+            parsed_strategy = StructuredOutputStrategy(strategy)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "sealed fallback structured-output strategy is invalid"
+            ) from exc
+        if parsed_strategy is StructuredOutputStrategy.UNSUPPORTED:
+            raise ValueError("sealed fallback structured-output strategy is invalid")
+        adapter_version = central.adapter_version
+        if adapter_version is not None and (
+            type(adapter_version) is not int or adapter_version <= 0
+        ):
+            raise ValueError("sealed fallback structured-output adapter is invalid")
+        return StructuredOutputCapabilityDecision(
+            strategy=parsed_strategy,
+            effective_provider=route.provider,
+            model=route.model,
+            api_mode=route.api_mode,
+            declaration_source=central.declaration_source,
+            adapter_version=adapter_version or 1,
+            schema_fingerprint=declared.schema_fingerprint,
+            rationale=central.rationale,
         )
 
     @staticmethod
@@ -1293,6 +1359,7 @@ class AgentNodeExecutor:
                     request_overrides["web_search_mode"] = web_mode
 
             sealed_fallback_route = None
+            fallback_structured_decision = None
             fallback_model = node.options.get(
                 "fallbackModel", context.workflow_options.get("fallbackModel")
             )
@@ -1326,6 +1393,27 @@ class AgentNodeExecutor:
                             "archon_terminal_failure": True,
                         },
                     )
+                try:
+                    fallback_structured_decision = (
+                        self._fallback_structured_output_decision(
+                            context, fallback_route
+                        )
+                    )
+                    fallback_structured_request = self._structured_request(
+                        context,
+                        decision=fallback_structured_decision,
+                    )
+                except ValueError as exc:
+                    return NodeExecutionResult(
+                        "failed",
+                        error_code="provider_capability_drift",
+                        error_message=str(exc),
+                        metadata={
+                            "provider_attempts": 0,
+                            "known_no_effect": True,
+                            "archon_terminal_failure": True,
+                        },
+                    )
                 sealed_fallback_route = {
                     "provider": fallback_route.provider,
                     "model": fallback_route.model,
@@ -1343,6 +1431,7 @@ class AgentNodeExecutor:
                     "request_overrides": _thaw(
                         fallback_transport.request_overrides
                     ),
+                    "structured_output": fallback_structured_request,
                 }
             request = PluginAgentRunRequest(
                 prompt=prompt if prompt is not None else self._prompt(context),
@@ -1763,21 +1852,43 @@ class AgentNodeExecutor:
             )
             metadata["cache_fingerprint"] = fingerprint
         structured_counts: tuple[int, int] | None = None
+        result_structured_request = structured_request
+        result_structured_decision = context.structured_output_decision
+        if result.audit.get("fallback_used") is True:
+            result_structured_request = (
+                sealed_fallback_route.get("structured_output")
+                if isinstance(sealed_fallback_route, Mapping)
+                else None
+            )
+            result_structured_decision = fallback_structured_decision
+            if structured_request is not None and (
+                result_structured_request is None
+                or result_structured_decision is None
+            ):
+                metadata["archon_terminal_failure"] = True
+                return with_recovery_failure(
+                    NodeExecutionResult(
+                        "failed",
+                        error_code="structured_output_capability_drift",
+                        error_message="fallback structured-output authority is missing",
+                        metadata=metadata,
+                    )
+                )
         negotiation_failure = str(result.audit.get("failure_kind", ""))
-        if structured_request is not None and negotiation_failure in {
+        if result_structured_request is not None and negotiation_failure in {
             "structured_output_capability_drift",
             "structured_output_unsupported",
         }:
             try:
                 if result.status != "failed":
                     raise ValueError("structured output negotiation status is invalid")
-                assert context.structured_output_decision is not None
+                assert result_structured_decision is not None
                 negotiation_counts = self._structured_counts(
                     result,
-                    structured_request,
-                    context.structured_output_decision,
+                    result_structured_request,
+                    result_structured_decision,
                     declaration_source=(
-                        context.structured_output_decision.declaration_source
+                        result_structured_decision.declaration_source
                     ),
                     provider_limit=granted_provider_attempts,
                     model_limit=request.max_iterations,
@@ -1811,14 +1922,17 @@ class AgentNodeExecutor:
                     metadata=metadata,
                 )
             )
-        if structured_request is not None and result.structured_output is not None:
+        if (
+            result_structured_request is not None
+            and result.structured_output is not None
+        ):
             try:
                 structured_counts = self._structured_counts(
                     result,
-                    structured_request,
-                    context.structured_output_decision,
+                    result_structured_request,
+                    result_structured_decision,
                     declaration_source=(
-                        context.structured_output_decision.declaration_source
+                        result_structured_decision.declaration_source
                     ),
                     provider_limit=granted_provider_attempts,
                     model_limit=request.max_iterations,

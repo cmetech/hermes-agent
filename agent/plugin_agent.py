@@ -551,7 +551,9 @@ class PluginAgentRunRequest:
             "inline_agents": _wire_json(self.inline_agents),
             "reasoning_config": _wire_json(self.reasoning_config),
             "fallback_model": self.fallback_model,
-            "sealed_fallback_route": _wire_json(self.sealed_fallback_route),
+            "sealed_fallback_route": _sealed_fallback_route_to_wire(
+                self.sealed_fallback_route
+            ),
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "request_overrides": _wire_json(self.request_overrides),
             "structured_output": (
@@ -662,6 +664,14 @@ class PluginAgentRunRequest:
             data["structured_output"] = _structured_output_from_wire(
                 data["structured_output"]
             )
+        fallback = data.get("sealed_fallback_route")
+        if isinstance(fallback, Mapping):
+            fallback_data = dict(fallback)
+            if fallback_data.get("structured_output") is not None:
+                fallback_data["structured_output"] = _structured_output_from_wire(
+                    fallback_data["structured_output"]
+                )
+            data["sealed_fallback_route"] = fallback_data
         try:
             return cls(**data)
         except TypeError as exc:
@@ -779,6 +789,18 @@ def _structured_output_to_wire(request: StructuredOutputRequest) -> dict[str, An
         "output_bytes_limit": request.output_bytes_limit,
         "canonicalization_version": request.canonicalization_version,
     }
+
+
+def _sealed_fallback_route_to_wire(
+    route: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if route is None:
+        return None
+    payload = dict(route)
+    structured = payload.get("structured_output")
+    if structured is not None:
+        payload["structured_output"] = _structured_output_to_wire(structured)
+    return _wire_json(payload)
 
 
 def _structured_output_from_wire(value: object) -> StructuredOutputRequest:
@@ -926,6 +948,14 @@ def _correlate_structured_result(
     request: PluginAgentRunRequest, result: PluginAgentRunResult
 ) -> None:
     admitted = request.structured_output
+    if result.audit.get("fallback_used") is True:
+        fallback = request.sealed_fallback_route
+        if (
+            not isinstance(fallback, Mapping)
+            or result.audit.get("fallback_context") != "fresh"
+        ):
+            raise RuntimeError("fallback structured output authority is missing")
+        admitted = fallback.get("structured_output")
     evidence = result.structured_output
     if admitted is None:
         if evidence is not None:
@@ -1224,6 +1254,7 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             "expected_runtime_identity",
             "reasoning_config",
             "request_overrides",
+            "structured_output",
         }
         if (
             not isinstance(fallback, Mapping)
@@ -1235,11 +1266,31 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             or not fallback.get("model")
             or not isinstance(fallback.get("reasoning_config"), Mapping)
             or not isinstance(fallback.get("request_overrides"), Mapping)
+            or (
+                fallback.get("structured_output") is not None
+                and not isinstance(
+                    fallback.get("structured_output"), StructuredOutputRequest
+                )
+            )
             or request.intended_authority_digest is None
             or request.sealed_provider_attempt_grant is not True
             or request.fallback_model is not None
         ):
             raise ValueError("sealed fallback route is malformed")
+        fallback_structured = fallback.get("structured_output")
+        if (fallback_structured is None) != (request.structured_output is None):
+            raise ValueError("sealed fallback route is malformed")
+        if fallback_structured is not None and request.structured_output is not None:
+            _validate_structured_output(fallback_structured)
+            if (
+                fallback_structured.schema.schema_fingerprint
+                != request.structured_output.schema.schema_fingerprint
+                or fallback_structured.output_bytes_limit
+                != request.structured_output.output_bytes_limit
+                or fallback_structured.canonicalization_version
+                != request.structured_output.canonicalization_version
+            ):
+                raise ValueError("sealed fallback route is malformed")
         identity = fallback.get("expected_runtime_identity")
         expected_runtime_fields = {
             "provider",

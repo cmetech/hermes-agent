@@ -87,13 +87,18 @@ def _hook_operations_supported(event: str, operations: object) -> bool:
     }
     if len(action_names) > 1:
         return False
-    action_effective = (
+    reason_effective = (
         values.get("continue") is False
-        or values.get("continue") is True
-        or values.get("decision") in {"approve", "block"}
-        or values.get("permission_decision") in {"allow", "deny", "ask"}
+        or values.get("decision") == "block"
+        or values.get("permission_decision") in {"deny", "ask"}
     )
-    if "stop_reason" in values and not action_effective:
+    action_effective = (
+        reason_effective
+        or values.get("continue") is True
+        or values.get("decision") == "approve"
+        or values.get("permission_decision") == "allow"
+    )
+    if "stop_reason" in values and not reason_effective:
         return False
     if "permission_decision_reason" in values and not (
         values.get("permission_decision") in {"deny", "ask"}

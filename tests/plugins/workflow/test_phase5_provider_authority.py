@@ -319,6 +319,18 @@ def test_approval_rework_blocks_options_its_executor_cannot_apply(
         ),
         ("PreToolUse", {"systemMessage": "ignored"}),
         ("PreToolUse", {"stopReason": "ignored"}),
+        ("PreToolUse", {"continue": True, "stopReason": "ignored"}),
+        ("PreToolUse", {"decision": "approve", "stopReason": "ignored"}),
+        (
+            "PreToolUse",
+            {
+                "stopReason": "ignored",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                },
+            },
+        ),
         (
             "PreToolUse",
             {

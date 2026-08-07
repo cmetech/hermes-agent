@@ -5,6 +5,11 @@ from types import MappingProxyType
 
 from agent.plugin_agent import PluginAgentRunResult
 from agent.plugin_agent import PluginAgentRunRequest
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
 from agent.transports.chat_completions import ChatCompletionsTransport
 from hermes_cli.provider_capabilities import (
     CapabilityDisposition,
@@ -12,8 +17,9 @@ from hermes_cli.provider_capabilities import (
     WorkflowProviderFeature,
     encode_provider_option_transport,
 )
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.executors.ai import AgentNodeExecutor
-from plugins.workflow.models import freeze_value
+from plugins.workflow.models import WorkflowStructuredOutput, freeze_value
 from plugins.workflow.provider_authority import (
     WorkflowCapabilityObligation,
     WorkflowProviderAuthority,
@@ -71,7 +77,10 @@ def _decision(
     )
 
 
-def _authority(*routes: WorkflowResolvedProviderRoute) -> WorkflowProviderAuthority:
+def _authority(
+    *routes: WorkflowResolvedProviderRoute,
+    extra_obligations: tuple[WorkflowCapabilityObligation, ...] = (),
+) -> WorkflowProviderAuthority:
     obligations = tuple(
         WorkflowCapabilityObligation(
             path=f"{route.route_id}.effort",
@@ -91,7 +100,7 @@ def _authority(*routes: WorkflowResolvedProviderRoute) -> WorkflowProviderAuthor
         )
         for route in routes
         if "effort" in route.provider_options
-    )
+    ) + extra_obligations
     return WorkflowProviderAuthority(
         config_fingerprint="6" * 64,
         routes=MappingProxyType({route.route_id: route for route in routes}),
@@ -233,6 +242,154 @@ def test_phase5_fallback_is_sealed_as_a_fresh_worker_route(tmp_path) -> None:
     assert request.sealed_fallback_route["request_overrides"] == {"verbosity": "high"}
 
 
+def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -> None:
+    schema = normalize_schema({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    })
+    primary = _route("primary")
+    fallback = _route(
+        "fallback",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    def structured_obligation(
+        route: WorkflowResolvedProviderRoute,
+        disposition: CapabilityDisposition,
+        strategy: StructuredOutputStrategy,
+        declaration_source: str,
+    ) -> WorkflowCapabilityObligation:
+        return WorkflowCapabilityObligation(
+            path="nodes[0].output_format",
+            route_id=route.route_id,
+            decision=ProviderCapabilityDecision(
+                feature=WorkflowProviderFeature.STRUCTURED_OUTPUT,
+                disposition=disposition,
+                provider=route.provider,
+                model=route.model,
+                option="json_schema",
+                requested_semantics={
+                    "schema_fingerprint": schema.schema_fingerprint,
+                },
+                effective_semantics={
+                    "strategy": strategy.value,
+                    "schema_fingerprint": schema.schema_fingerprint,
+                },
+                adapter_version=(
+                    1
+                    if disposition is not CapabilityDisposition.NATIVE
+                    else None
+                ),
+                declaration_source=declaration_source,
+                registration_provenance_digest=(
+                    route.registration_provenance_digest
+                ),
+                code="sealed-structured-output-test",
+                rationale="test route-specific structured output",
+            ),
+        )
+
+    authority = _authority(
+        primary,
+        fallback,
+        extra_obligations=(
+            structured_obligation(
+                primary,
+                CapabilityDisposition.HERMES_ADAPTER,
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+                "managed_loop_default",
+            ),
+            structured_obligation(
+                fallback,
+                CapabilityDisposition.NATIVE,
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "provider_profile",
+            ),
+        ),
+    )
+    context = _context(tmp_path)
+    node = replace(
+        context.node,
+        options=freeze_value({
+            **dict(context.node.options),
+            "fallbackModel": "@recovery",
+            "output_format": dict(schema.canonical_schema),
+        }),
+    )
+    declared = WorkflowStructuredOutput(
+        canonical_schema=schema.canonical_schema,
+        schema_fingerprint=schema.schema_fingerprint,
+    )
+    primary_decision = StructuredOutputCapabilityDecision(
+        strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+        effective_provider=primary.provider,
+        model=primary.model,
+        api_mode=primary.api_mode,
+        declaration_source="managed_loop_default",
+        adapter_version=1,
+        schema_fingerprint=schema.schema_fingerprint,
+        rationale="test primary strategy",
+    )
+
+    class FallbackStructuredRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            evidence = {
+                "strategy": StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
+                "adapter_version": 1,
+                "schema_fingerprint": schema.schema_fingerprint,
+                "declaration_source": "provider_profile",
+                "provider_attempts": 2,
+                "model_calls": 1,
+            }
+            return PluginAgentRunResult(
+                final_response='{"answer":"ok"}',
+                session_id="fallback-session",
+                provider=fallback.provider,
+                model=fallback.model,
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    **evidence,
+                    "api_mode": fallback.api_mode,
+                    "fallback_used": True,
+                    "fallback_context": "fresh",
+                    "intended_authority_digest": "a" * 64,
+                    "model_visible_prefix_digest": "9" * 64,
+                },
+                structured_output=evidence,
+            )
+
+    runner = FallbackStructuredRunner()
+    result = AgentNodeExecutor(runner).execute(
+        replace(
+            context,
+            node=node,
+            sealed_provider_route=primary,
+            sealed_provider_authority=authority,
+            structured_output=declared,
+            structured_output_decision=primary_decision,
+        )
+    )
+
+    assert result.status == "succeeded", (
+        result.error_code,
+        result.error_message,
+        result.metadata,
+    )
+    sealed_fallback = runner.requests[0].sealed_fallback_route
+    assert sealed_fallback["structured_output"].strategy is (
+        StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    )
+
+
 def test_phase5_sandbox_blocks_before_runner_with_isolation_recommendation(tmp_path) -> None:
     runner = _FallbackRunner()
     context = _context(tmp_path)
@@ -328,6 +485,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         "base_url_trust_class": "trusted_direct",
         "registration_provenance_digest": "5" * 64,
     }
+    structured_schema = normalize_schema({"type": "object"})
     request = PluginAgentRunRequest(
         prompt="immutable user turn",
         provider="openrouter",
@@ -337,6 +495,11 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         sandbox_policy={"mode": "provider_native"},
         workdir=tmp_path,
         sealed_provider_attempt_grant=True,
+        structured_output=StructuredOutputRequest(
+            schema=structured_schema,
+            strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            adapter_version=1,
+        ),
         sealed_fallback_route={
             "provider": "openrouter",
             "model": "anthropic/claude-sonnet-4.6",
@@ -344,6 +507,11 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
             "expected_runtime_identity": identity,
             "reasoning_config": {"enabled": True, "effort": "high"},
             "request_overrides": {"verbosity": "high"},
+            "structured_output": StructuredOutputRequest(
+                schema=structured_schema,
+                strategy=StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                adapter_version=1,
+            ),
         },
     )
 
@@ -364,6 +532,10 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.expected_runtime_identity == identity
     assert child.reasoning_config == {"enabled": True, "effort": "high"}
     assert child.request_overrides == {"verbosity": "high"}
+    assert child.structured_output is not None
+    assert child.structured_output.strategy is (
+        StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    )
     assert child.fallback_model is None
     assert child.sealed_fallback_route is None
     assert child.sandbox_policy == {"mode": "provider_native"}
