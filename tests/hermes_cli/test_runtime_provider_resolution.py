@@ -1,11 +1,48 @@
 import base64
 import json
+import socket
+import subprocess
 import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 
+from hermes_cli import providers as provider_definitions
 from hermes_cli import runtime_provider as rp
+import providers as provider_profiles
+
+
+def test_bundled_profile_api_modes_round_trip_without_runtime_io(monkeypatch):
+    """Every declarative profile spelling must survive the legacy adapter."""
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("provider classification performed runtime I/O")
+
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
+
+    mismatches = []
+    for profile in provider_profiles.list_providers():
+        provider_def = provider_definitions._provider_def_from_plugin_profile(profile)
+        actual_mode = provider_definitions.TRANSPORT_TO_API_MODE.get(provider_def.transport)
+        if actual_mode != profile.api_mode:
+            mismatches.append((profile.name, profile.api_mode, provider_def.transport, actual_mode))
+            continue
+
+        model = profile.fallback_models[0] if profile.fallback_models else "test-model"
+        prospective = rp.classify_execution_runtime(
+            provider=profile.name,
+            model_config={"provider": profile.name, "default": model},
+            provider_config={"api_mode": profile.api_mode},
+        )
+        resolved = rp.classify_resolved_execution_runtime(
+            {"provider": profile.name, "model": model, "api_mode": profile.api_mode}
+        )
+        assert prospective == resolved, profile.name
+
+    assert mismatches == []
 
 
 def test_moa_resolution_preserves_legacy_no_config_read_short_circuit(monkeypatch):

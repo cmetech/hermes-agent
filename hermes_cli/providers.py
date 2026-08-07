@@ -849,6 +849,9 @@ def resolve_custom_provider(
 _API_MODE_TO_TRANSPORT: Dict[str, str] = {
     "chat_completions": "openai_chat",
     "anthropic_messages": "anthropic_messages",
+    "bedrock_converse": "bedrock_converse",
+    "codex_responses": "codex_responses",
+    # Historical spelling retained for out-of-tree profiles.
     "responses": "codex_responses",
 }
 

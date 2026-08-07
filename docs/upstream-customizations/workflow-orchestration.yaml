@@ -45,6 +45,38 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: provider-runtime-deterministic-authority
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/providers.py
+  - providers/__init__.py
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  owned_symbols:
+  - canonical profile api-mode to transport adapter
+  - loader-authored provider registration provenance and code-closure digest
+  - bundled, legacy-compatible, and user-plugin registration precedence
+  - bounded public-safe provider collision diagnostics
+  tests:
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/providers/test_plugin_discovery.py
+  - tests/providers/test_provider_registry.py
+  expected_commit_subject: 'fix(providers): make runtime authority deterministic'
+  upstream_candidate: true
+  merge_guidance: Preserve canonical round-tripping for every declared provider
+    API mode, including codex responses and Bedrock converse. Provider origin,
+    distribution identity, and bounded code-closure identity must be authored by
+    the loader rather than accepted from profile data. Discovery precedence must
+    remain bundled below legacy-compatible below user plugins, while collisions
+    remain bounded and free of local paths or provider payloads.
+  removal_condition: Remove when upstream exposes an equivalent deterministic
+    provider-registration authority with immutable loader provenance, closure
+    identity, and canonical transport round-tripping.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration
