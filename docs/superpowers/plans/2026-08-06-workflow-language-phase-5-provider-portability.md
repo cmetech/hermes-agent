@@ -786,7 +786,7 @@ PHASE5_AUDIT_DIR="$(mktemp -d)"
 trap 'if test -n "${PHASE5_AUDIT_DIR:-}" && test -d "$PHASE5_AUDIT_DIR"; then rm -rf -- "$PHASE5_AUDIT_DIR"; fi' EXIT
 phase5_snapshot_external_state() {
   local snapshot_label="$1"
-  local source_remote source_remote_url
+  local source_remote source_remote_url brand_slug releases_repo
   mkdir -p "$PHASE5_AUDIT_DIR/$snapshot_label"
   git worktree list --porcelain > "$PHASE5_AUDIT_DIR/$snapshot_label/worktrees"
   git branch --show-current > "$PHASE5_AUDIT_DIR/$snapshot_label/branch"
@@ -806,10 +806,15 @@ phase5_snapshot_external_state before
 HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/run_tests.sh
 PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_merge_gate.sh --phase base
 PHASE5_TESTED_SHA="$(git rev-parse HEAD)"
-PHASE5_BRANDS="$(node --input-type=module -e 'import fs from "node:fs"; import {loadDescriptor} from "./scripts/brand/descriptor.mjs"; for (const file of fs.readdirSync("brands").filter(name => /^[a-z][a-z0-9-]*\.json$/.test(name) && name !== "schema.json")) { const slug=file.slice(0,-5); loadDescriptor(slug,{root:process.cwd()}); console.log(slug); }')"
-for brand_slug in $PHASE5_BRANDS; do
-  PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_merge_gate.sh --phase brand --brand "$brand_slug" --tested-base-sha "$PHASE5_TESTED_SHA"
-done
+while IFS= read -r brand_slug; do
+  PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_upstream_merge.sh \
+    --upstream-ref origin/main \
+    --base-ref "$PHASE5_TESTED_SHA" \
+    --brand-ref "origin/$brand_slug" \
+    --report-dir "$PHASE5_AUDIT_DIR/rehearsal-$brand_slug"
+  phase5_snapshot_external_state "after-$brand_slug"
+  diff -ru "$PHASE5_AUDIT_DIR/before" "$PHASE5_AUDIT_DIR/after-$brand_slug"
+done < <(node --input-type=module -e 'import fs from "node:fs"; import {loadDescriptor} from "./scripts/brand/descriptor.mjs"; for (const file of fs.readdirSync("brands").filter(name => /^[a-z][a-z0-9-]*\.json$/.test(name) && name !== "schema.json").sort()) { const slug=file.slice(0,-5); loadDescriptor(slug,{root:process.cwd()}); console.log(slug); }')
 phase5_snapshot_external_state after
 diff -ru "$PHASE5_AUDIT_DIR/before" "$PHASE5_AUDIT_DIR/after"
 git diff --check

@@ -79,6 +79,13 @@ The plan's original standalone rehearsal example used the obsolete
 contract. That corrected rehearsal is part of the pending clean-tree gate; the
 argument-validation failure is not counted as product-test evidence.
 
+The original Step 4 brand loop also invoked the brand-only gate from the
+neutral feature checkout. That gate correctly rejected the missing generated
+LOOP24 overlay and changed no state. Step 4 now uses the controlled upstream
+rehearsal in a detached temporary worktree once per dynamically validated brand
+and compares external state after each run. The neutral-checkout rejection is
+not counted as branded regression evidence.
+
 ## Pending gates
 
 The following evidence will be appended after it exists:
