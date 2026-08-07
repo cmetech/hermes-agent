@@ -213,13 +213,13 @@ upstream_changes:
   - plugins/workflow/sessions.py
   - plugins/workflow/store.py
   owned_symbols:
-  - model_visible_prefix_digest canonical prompt and ordered tool-schema identity
-  - AIAgent.seal_model_visible_prefix and verify_model_visible_prefix
-  - PluginAgentRunRequest Phase 5 intended prefix and runtime identities
+  - model_visible_prefix_digest
+  - AIAgent.seal_model_visible_prefix
+  - AIAgent.verify_model_visible_prefix
+  - PluginAgentRunRequest
   - phase5_node_intended_authority_digest
   - phase5_session_cache_fingerprint
-  - NodeSessionRecord paired Phase 5 identity columns
-  - scheduler authenticated provider authority execution binding
+  - NodeSessionRecord
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
@@ -338,10 +338,9 @@ upstream_changes:
   - plugins/workflow/compat.py
   - plugins/workflow/executors/ai.py
   owned_symbols:
-  - PluginAgentRunRequest absolute wall idle and provider deadlines
-  - _build_inline_agent_handler inherited cancellation and deadline authority
+  - PluginAgentRunRequest
+  - _build_inline_agent_handler
   - _tool_policy_incompatible_failure
-  - normalizer-v5 inline-agent tool-policy compatibility finding
   owned_invariants:
   - omitted allowed_tools remains distinct from an explicit empty allow set
   - Phase 5 never auto-adds workflow_agent or overrides a deny rule
@@ -385,10 +384,10 @@ upstream_changes:
   - AuthoritativeSettlementContract
   - AuthoritativeCostFact
   - authoritative_cost_fact
-  - reserve_provider_transport_attempt cost lease ordering
+  - reserve_provider_transport_attempt
   - settle_provider_transport_attempt
   - poison_provider_transport_attempt
-  - PluginAgentRunRequest private cost authority and contract
+  - PluginAgentRunRequest
   owned_invariants:
   - hard budgets use bounded exact decimal settlement and never binary-float pricing estimates
   - only a complete code-owned provider settlement contract can create an authoritative cost fact
@@ -433,11 +432,10 @@ upstream_changes:
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
   owned_symbols:
-  - ProviderOptionTransport and encode_provider_option_transport
-  - NodeExecutionContext sealed provider authority
-  - PluginAgentRunRequest sealed fallback route
-  - route-specific option obligations for primary fallback and inline-agent models
-  - worker-local fresh sealed fallback launch
+  - ProviderOptionTransport
+  - encode_provider_option_transport
+  - NodeExecutionContext
+  - PluginAgentRunRequest
   owned_invariants:
   - every accepted provider option has one reviewed exact transport encoder or blocks before transport
   - route-specific effort decisions cannot be inherited from a different provider or model
@@ -482,10 +480,12 @@ upstream_changes:
   - apps/desktop/src/app/workflows/catalog-run-policy.ts
   - apps/desktop/src/app/workflows/review-run-dialog.tsx
   owned_symbols:
-  - public_display_identifier and public_provider_capability_projection
-  - WorkflowProviderCapabilityProjection REST and Desktop contracts
-  - Phase 5 Desktop provider authority run gate and fresh pre-submit revalidation
-  - closed provider authority and cost-budget attempt evidence
+  - public_display_identifier
+  - public_provider_capability_projection
+  - WorkflowProviderRouteProjection
+  - WorkflowProviderDecisionProjection
+  - WorkflowProviderCapabilityProjection
+  - isDesktopProviderCapabilityProjection
   owned_invariants:
   - catalog projects only bounded capability summary while detail adds bounded routes and decisions
   - unsafe provider and model identifiers are replaced wholesale by a stable digest label
