@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 import re
@@ -508,6 +508,13 @@ class ExecutionRuntimeCapabilities:
     base_url_trust_class: str = "unknown"
     declared_structured_output_strategy: str | None = None
     structured_output_declaration_source: str | None = None
+    # Additive Phase 5 authority metadata. These fields intentionally do not
+    # alter legacy runtime-capability equality; Phase 5 seals them through the
+    # explicit provider authority digest instead.
+    registration_origin_kind: str = field(default="", compare=False)
+    registration_distribution_id: str = field(default="", compare=False)
+    registration_provenance_digest: str = field(default="", compare=False)
+    registration_provenance_complete: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,6 +687,13 @@ def _classify_execution_api_mode(
         api_mode=normalized,
         base_url=normalized_base_url,
     )
+    try:
+        from providers import get_provider_registration
+
+        registration = get_provider_registration(normalized_provider)
+    except Exception:
+        registration = None
+    provenance = registration.provenance if registration is not None else None
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
         hermes_managed_tool_loop=(
@@ -690,6 +704,16 @@ def _classify_execution_api_mode(
         base_url_trust_class=trust_class,
         declared_structured_output_strategy=declared_strategy,
         structured_output_declaration_source=declaration_source,
+        registration_origin_kind=(provenance.origin_kind if provenance else ""),
+        registration_distribution_id=(
+            provenance.distribution_id if provenance else ""
+        ),
+        registration_provenance_digest=(
+            provenance.code_closure_digest if provenance else ""
+        ),
+        registration_provenance_complete=(
+            provenance.code_closure_complete if provenance else False
+        ),
     )
 
 
@@ -864,6 +888,12 @@ def classify_configured_execution_route(
             StructuredOutputStrategy.UNSUPPORTED.value
         ),
         structured_output_declaration_source="route_query_unclassified",
+        registration_origin_kind=classified.registration_origin_kind,
+        registration_distribution_id=classified.registration_distribution_id,
+        registration_provenance_digest=classified.registration_provenance_digest,
+        registration_provenance_complete=(
+            classified.registration_provenance_complete
+        ),
     )
 
 
@@ -890,48 +920,31 @@ def resolve_structured_output_capability(
     model: str | None = None,
 ) -> StructuredOutputCapabilityDecision:
     """Seal one structured-output strategy from explicit runtime authority."""
-    declared = runtime.declared_structured_output_strategy
-    if declared == StructuredOutputStrategy.UNSUPPORTED.value:
-        strategy = StructuredOutputStrategy.UNSUPPORTED
-        if runtime.structured_output_declaration_source == (
-            "route_query_unclassified"
-        ):
-            source = "route_query_unclassified"
-            rationale = "provider route query cannot be classified without secrets"
-        else:
-            source = "explicit_unsupported"
-            rationale = "provider explicitly forbids structured-output adaptation"
-    elif not runtime.hermes_managed_tool_loop:
-        strategy = StructuredOutputStrategy.UNSUPPORTED
-        source = "delegated_runtime"
-        rationale = "delegated runtime has no Hermes structured-output contract"
-    elif (
-        runtime.base_url_trust_class == "trusted_direct"
-        and declared
-        in {
-            StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
-            StructuredOutputStrategy.NATIVE_JSON_MODE.value,
-        }
-    ):
-        strategy = StructuredOutputStrategy(declared)
-        source = runtime.structured_output_declaration_source or "provider_profile"
-        rationale = "trusted direct provider explicitly declares native support"
-    else:
-        strategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA
-        source = "managed_loop_default"
-        rationale = (
-            "Hermes-managed loop uses prompt schema adaptation without a trusted "
-            "direct native declaration"
+    from hermes_cli.provider_capabilities import (
+        WorkflowProviderFeature,
+        resolve_provider_capability,
+    )
+
+    central = resolve_provider_capability(
+        runtime,
+        feature=WorkflowProviderFeature.STRUCTURED_OUTPUT,
+        option="json_schema",
+        requested_semantics={"schema_fingerprint": schema_fingerprint},
+    )
+    strategy = StructuredOutputStrategy(
+        central.effective_semantics.get(
+            "strategy", StructuredOutputStrategy.UNSUPPORTED.value
         )
+    )
     return StructuredOutputCapabilityDecision(
         strategy=strategy,
         effective_provider=runtime.effective_provider,
         model=(model.strip() if isinstance(model, str) else runtime.model),
         api_mode=runtime.api_mode,
-        declaration_source=source,
-        adapter_version=_STRUCTURED_OUTPUT_ADAPTER_VERSION,
+        declaration_source=central.declaration_source,
+        adapter_version=central.adapter_version or _STRUCTURED_OUTPUT_ADAPTER_VERSION,
         schema_fingerprint=schema_fingerprint,
-        rationale=_structured_output_rationale(rationale),
+        rationale=_structured_output_rationale(central.rationale),
     )
 
 

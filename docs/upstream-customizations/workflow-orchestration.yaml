@@ -45,6 +45,44 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: provider-workflow-capability-authority
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/provider_capabilities.py
+  - hermes_cli/runtime_provider.py
+  - plugins/model-providers/openrouter/__init__.py
+  - providers/base.py
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  owned_symbols:
+  - CapabilityDisposition and WorkflowProviderFeature closed inventories
+  - ProviderCapabilityDecision immutable public projection
+  - resolve_provider_capability pure central decision engine
+  - capability_authority_digest canonical decision identity
+  - ProviderProfile workflow capability declaration seam
+  - ExecutionRuntimeCapabilities additive registration provenance
+  - OpenRouter model-aware effort and explicit unsupported security declarations
+  tests:
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_provider_compat.py
+  - tests/plugins/workflow/test_runner_binding.py
+  expected_commit_subject: 'feat(providers): centralize workflow capability decisions'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact eleven-feature and four-disposition closed
+    inventories. Provider profiles may declare pure exact native or translated
+    facts, but only the central resolver may grant versioned Hermes adapters.
+    Loader provenance must bind declarations; incomplete closures lose provider
+    claims while retaining wholly Hermes-enforced adapters. User plugins cannot
+    assert authoritative billing or provider-native sandbox guarantees, and all
+    public decisions remain bounded, immutable, credential-free JSON.
+  removal_condition: Remove when upstream provides an equivalent single pure
+    provider capability matrix with loader-bound declarations, central adapter
+    policy, canonical identity, installed-distribution coverage, and unchanged
+    legacy runtime-capability equality.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: provider-runtime-deterministic-authority
   change_class: provider-runtime-generic
   owner: workflow-orchestration

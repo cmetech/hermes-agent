@@ -103,6 +103,48 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     assert probe.returncode == 0, probe.stderr
     assert Path(probe.stdout.strip()).is_relative_to(site.resolve())
 
+    provider_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, providers; "
+                "from hermes_cli import provider_capabilities as pc; "
+                "profile = providers.get_provider_profile('openrouter'); "
+                "declaration = profile.declare_workflow_capability("
+                "'effort_thinking', model='anthropic/claude-sonnet-4.6', "
+                "option='effort'); "
+                "print(json.dumps({'provider_file': str(pathlib.Path("
+                "providers.__file__).resolve()), 'authority_file': str(pathlib.Path("
+                "pc.__file__).resolve()), 'features': sorted(x.value for x in "
+                "pc.WorkflowProviderFeature), 'disposition': declaration['disposition']}))"
+            ),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert provider_probe.returncode == 0, provider_probe.stderr
+    provider_contract = json.loads(provider_probe.stdout)
+    assert Path(provider_contract["provider_file"]).is_relative_to(site.resolve())
+    assert Path(provider_contract["authority_file"]).is_relative_to(site.resolve())
+    assert set(provider_contract["features"]) == {
+        "structured_output",
+        "session_resumption",
+        "tool_restrictions",
+        "hooks",
+        "mcp",
+        "skills_inline_agents",
+        "effort_thinking",
+        "fallback_models",
+        "web_execution",
+        "cost_budgets",
+        "provider_native_sandbox",
+    }
+    assert provider_contract["disposition"] == "degraded_with_explicit_semantics"
+
     command = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "workflow", "list", "--json"],
         cwd=tmp_path,
