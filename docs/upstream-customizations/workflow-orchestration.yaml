@@ -4349,3 +4349,25 @@ upstream_changes:
     manifest and evidence repository paths with equivalent normalization and length
     bounds.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-schema-dotenv-startup-bypass
+  change_class: workflow-cli
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/main.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - _WORKFLOW_SCHEMA_READONLY_STARTUP dotenv bypass
+  owned_invariants:
+  - exact workflow schema introspection completes before dotenv, secret-source,
+    terminal-config, logging, recovery, or ordinary runtime startup side effects
+  tests:
+  - tests/plugins/workflow/test_cli.py
+  expected_commit_subject: 'fix(workflow): keep schema startup ahead of dotenv'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact schema-owned early path ahead of dotenv loading.
+    Dotenv loading can sanitize files, invoke configured secret sources, and bridge
+    terminal config through the canonical behavioral loader, so it is part of normal
+    startup and must remain outside read-only schema introspection.
+  removal_condition: Remove when upstream provides an equivalent dependency-bounded,
+    side-effect-free workflow schema entry point ahead of every normal startup seam.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
