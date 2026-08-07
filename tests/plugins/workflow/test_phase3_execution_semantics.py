@@ -901,7 +901,7 @@ def test_scheduler_resume_uses_sealed_limits_after_current_configuration_changes
         scheduler.shutdown(deadline_seconds=2)
 
     assert loaded is not None
-    resumed_limits = loaded[1]
+    resumed_limits = loaded.execution_limits
     assert (
         resumed_limits.ai_idle_timeout_seconds,
         resumed_limits.ai_wall_timeout_seconds,

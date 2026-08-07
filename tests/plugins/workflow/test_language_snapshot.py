@@ -792,7 +792,7 @@ def test_concurrent_same_run_preparation_returns_independent_sealed_paths(
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
-    sealed_path_sets = tuple(result[2] for result in results)
+    sealed_path_sets = tuple(result.sealed_resource_paths for result in results)
     assert sealed_path_sets[0] is not None
     assert sealed_path_sets[0] == sealed_path_sets[1]
     run_directory = store.run_directory(admitted.run_id)

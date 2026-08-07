@@ -1658,7 +1658,7 @@ def test_showcase_admission_reuses_signature_checked_verified_cache(
     verification_calls = 0
     projection_calls = 0
     original_verify = showcase_module._verify_and_cache_showcase_packages
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
 
     def counted_verify(*args, **kwargs):
         nonlocal verification_calls
@@ -1677,7 +1677,7 @@ def test_showcase_admission_reuses_signature_checked_verified_cache(
     )
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         counted_assess,
     )
     monkeypatch.setattr(
