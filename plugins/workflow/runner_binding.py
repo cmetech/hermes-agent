@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable, Literal, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Callable, Literal, Mapping
 
 from hermes_cli.config import read_raw_config
 from hermes_cli import managed_scope
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from plugins.workflow.provider_authority import (
         ProviderAuthorityEnvironment,
         WorkflowProviderAuthority,
+        WorkflowProviderAuthorityError,
     )
     from plugins.workflow.trust import (
         WorkflowResourceReadBudget,
@@ -377,9 +378,14 @@ class ExecutionCapabilityContext:
         """Return the package-independent runtime identity for early checks."""
         return self._identity_digest((self._structured_output_runtime_identity,))
 
-    def identity_digest_for(self, package: "WorkflowPackage") -> str:
+    def identity_digest_for(
+        self,
+        package: "WorkflowPackage",
+        *,
+        provider_authority: "WorkflowProviderAuthority | None" = None,
+    ) -> str:
         """Return the identity sealing complete actual per-node decisions."""
-        authority = self.provider_authority(package)
+        authority = provider_authority or self.provider_authority(package)
         return self._identity_digest(
             self.structured_output_identity_material(package),
             provider_authority_digest=(
@@ -585,6 +591,11 @@ def assess_package_execution(
     *,
     read_budget: "WorkflowResourceReadBudget | None" = None,
     compilation: "WorkflowCompilation | None" = None,
+    provider_authority: "WorkflowProviderAuthority | None" = None,
+    provider_authority_error: "WorkflowProviderAuthorityError | None" = None,
+    available_tools: "AbstractSet[str] | None" = None,
+    available_services: "AbstractSet[str] | None" = None,
+    isolated_workdir: bool = False,
 ) -> tuple["CompatibilityReport", "WorkflowRiskSummary"]:
     """Recompute compatibility then risk under one immutable context."""
     from plugins.workflow.compat import (
@@ -595,13 +606,37 @@ def assess_package_execution(
     )
     from plugins.workflow.trust import build_risk_summary
 
-    provider_authority = context.provider_authority(package)
+    if provider_authority_error is None:
+        provider_authority = provider_authority or context.provider_authority(package)
     compatibility = assess_compatibility(
         package,
+        available_tools=available_tools,
+        available_services=available_services,
+        isolated_workdir=isolated_workdir,
         mcp_available=context.mcp_available,
         structured_output_decisions=context.structured_output_decisions(package),
         provider_authority=provider_authority,
     )
+    if provider_authority_error is not None:
+        compatibility = CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                *(
+                    finding
+                    for finding in compatibility.findings
+                    if finding.code != "provider_authority_missing"
+                ),
+                CompatibilityFinding(
+                    path=provider_authority_error.path,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message=str(provider_authority_error),
+                    blocking=True,
+                    code=provider_authority_error.code,
+                    effective_profile=package.language.effective_profile,
+                ),
+            ),
+            runnable=False,
+        )
     try:
         context.structured_output_run_metadata(package)
     except StructuredOutputMetadataCapacityError as exc:

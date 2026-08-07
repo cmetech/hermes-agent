@@ -105,6 +105,7 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
     from plugins.workflow.cli import (
         _admission_compilation,
         _admission_package_digest,
+        _phase5_admission_assessment,
         _resolve_compilation,
         _runtime_config,
         _store,
@@ -117,14 +118,20 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
     compilation = _resolve_compilation(command_args, args.name)
     package = compilation.package
     runtime = _runtime_config(hermes_home, sidecar=package.sidecar)
-    digest = _admission_package_digest(compilation)
-    compatibility = assess_compatibility(package)
+    assessment = _phase5_admission_assessment(compilation)
+    if assessment is None:
+        digest = _admission_package_digest(compilation)
+        compatibility = assess_compatibility(package)
+        risk = build_risk_summary(
+            package,
+            compatibility,
+            compilation=_admission_compilation(compilation),
+        )
+    else:
+        digest = assessment.package_digest
+        compatibility = assessment.compatibility
+        risk = assessment.risk
     require_runnable(compatibility)
-    risk = build_risk_summary(
-        package,
-        compatibility,
-        compilation=_admission_compilation(compilation),
-    )
     if WorkflowTrustStore(hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
@@ -144,6 +151,9 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
             digest if _admission_compilation(compilation) is not None else None
         ),
         execution_limits=RunExecutionLimits.resolve(runtime),
+        provider_authority=(
+            assessment.provider_authority if assessment is not None else None
+        ),
     )
     provenance = gateway_trigger_provenance(
         invocation, intent_key=args.idempotency_key
