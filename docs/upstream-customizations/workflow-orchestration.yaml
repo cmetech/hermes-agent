@@ -410,8 +410,6 @@ upstream_changes:
   - plugins/workflow/executors/ai.py
   owned_symbols:
   - PluginAgentRunRequest
-  - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
-  - _hook_operations_supported
   - _build_inline_agent_handler
   - _tool_policy_incompatible_failure
   owned_invariants:
@@ -513,6 +511,8 @@ upstream_changes:
   - ProviderOptionTransport
   - encode_provider_option_transport
   - resolve_workflow_provider_authority
+  - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
+  - _hook_operations_supported
   - NodeExecutionContext
   - PluginAgentRunRequest
   owned_invariants:
