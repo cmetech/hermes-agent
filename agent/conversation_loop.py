@@ -4056,10 +4056,17 @@ def run_conversation(
                     and hasattr(agent, '_anthropic_api_key')
                     and not _retry.anthropic_auth_retry_attempted
                 ):
-                    _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
                     from agent.azure_identity_adapter import is_token_provider
-                    if agent._try_refresh_anthropic_client_credentials():
+                    refresh_status = agent._refresh_anthropic_credentials_for_turn(
+                        credential_recovery_state
+                    )
+                    if refresh_status in {
+                        _CredentialRefreshStatus.ADOPTED,
+                        _CredentialRefreshStatus.ACQUISITION_FAILED,
+                    }:
+                        _retry.anthropic_auth_retry_attempted = True
+                    if refresh_status is _CredentialRefreshStatus.ADOPTED:
                         print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info

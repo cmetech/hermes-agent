@@ -5340,7 +5340,10 @@ class TestAnthropicCredentialRefresh:
 
         old_client.close.assert_called_once()
         rebuild.assert_called_once_with(
-            "sk-ant-oat01-fresh-token", "https://api.anthropic.com", timeout=None,
+            "sk-ant-oat01-fresh-token",
+            "https://api.anthropic.com",
+            timeout=None,
+            drop_context_1m_beta=False,
         )
         assert agent._anthropic_client is new_client
         assert agent._anthropic_api_key == "sk-ant-oat01-fresh-token"
@@ -6141,4 +6144,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

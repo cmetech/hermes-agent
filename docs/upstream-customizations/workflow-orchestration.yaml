@@ -319,11 +319,14 @@ upstream_changes:
   - AIAgent private execution_route_constraint transport pin
   - AIAgent._assert_execution_route_constraint
   - AIAgent._replace_primary_openai_client atomic candidate-state adoption
+  - AIAgent._publish_pending_anthropic_candidate atomic candidate-state adoption
+  - AIAgent._refresh_anthropic_credentials_for_turn sealed acquisition owner
   - AIAgent generation-scoped pending sealed credential adoption lifecycle
   - _PendingSealedCredentialAdoption immutable private candidate snapshot
   - _CredentialRecoveryTurnState turn-owned authentication retry accounting
   - _CredentialRefreshStatus and _CandidateAttemptResult adoption outcomes
   - candidate-safe OpenAI construction close and retirement diagnostics
+  - candidate-safe Anthropic construction close and retirement diagnostics
   - recover_with_credential_pool explicit client-adoption result
   - ProviderCapabilityDriftError bounded pre-transport failure
   - execution_endpoint_sha256 effective SDK endpoint reconstruction
@@ -356,6 +359,8 @@ upstream_changes:
   - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
   - sealed environment refresh compares route eligibility through the canonical endpoint digest and advances its seen baseline only after concrete client adoption
   - sealed Vertex and credential-pool candidates publish their client credentials endpoint kwargs pool identity and retry markers only after concrete construction and exact-route validation succeed
+  - sealed native and pooled Anthropic candidates publish the concrete client Anthropic credential endpoint OAuth identity generic credential endpoint and pool identity together before post-lock retirement
+  - sealed Anthropic request-local construction uses only the published credential while direct 401 recovery exclusively owns live token resolution and success-only retry guards
   - one acquired sealed candidate owns one initial construction and at most one identical-candidate retry before another credential source or fallback may run
   - pending sealed adoption is generation-bound and cleared on success bounded failure route drift cancellation disposal fallback transition and every turn exit
   - fallback credential resolution waits for pending adoption and invalidates the captured generation immediately before route publication
@@ -380,6 +385,7 @@ upstream_changes:
   - tests/plugins/workflow/test_typed_publication_recovery.py
   - tests/plugins/workflow/test_phase4_loops.py
   - tests/run_agent/test_env_credential_turn_refresh.py
+  - tests/run_agent/test_sealed_anthropic_credential_adoption.py
   - tests/run_agent/test_credential_pool_interrupt.py
   - tests/run_agent/test_fallback_credential_isolation.py
   - tests/run_agent/test_primary_runtime_restore.py

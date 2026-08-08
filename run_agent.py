@@ -5129,6 +5129,154 @@ class AIAgent:
             retirement_kind="openai",
         )
 
+    def _publish_pending_anthropic_candidate(
+        self,
+        candidate: "_PendingSealedCredentialAdoption",
+    ) -> "_CandidateAttemptResult":
+        """Build, validate, and atomically publish one Anthropic candidate.
+
+        The caller owns ``_client_lock`` for the complete operation.  The
+        exact immutable candidate is retained by the Task 1A transaction
+        across its one permitted re-adoption attempt; no credential source is
+        consulted here.
+        """
+        from agent.credential_adoption import (
+            _CandidateAttemptResult,
+            _CandidateAttemptStatus,
+            _materialize_candidate_client_kwargs,
+        )
+
+        current = getattr(self, "_pending_sealed_credential_adoption", None)
+        generation = candidate.generation
+        if (
+            current is not candidate
+            or getattr(self, "_credential_recovery_active_generation", None)
+            != generation
+            or getattr(self, "_interrupt_requested", False)
+        ):
+            return _CandidateAttemptResult(_CandidateAttemptStatus.INVALIDATED)
+        if (
+            candidate.route_constraint.api_mode != "anthropic_messages"
+            or getattr(self, "_execution_route_constraint", None)
+            is not candidate.route_constraint
+        ):
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_changed"
+            )
+            raise ProviderCapabilityDriftError()
+
+        build_kwargs = _materialize_candidate_client_kwargs(
+            candidate.client_kwargs
+        )
+        new_client = None
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+
+            new_client = build_anthropic_client(
+                candidate.api_key,
+                candidate.base_url,
+                timeout=build_kwargs.get("timeout"),
+                drop_context_1m_beta=bool(
+                    build_kwargs.get("drop_context_1m_beta", False)
+                ),
+            )
+            self._assert_execution_route_constraint()
+            self._assert_execution_route_constraint(
+                new_client,
+                base_url=candidate.base_url,
+            )
+        except ProviderCapabilityDriftError:
+            if new_client is not None:
+                try:
+                    new_client.close()
+                except Exception as exc:
+                    logger.warning(
+                        "sealed credential candidate cleanup failed "
+                        "reason=%s error_type=%s",
+                        "anthropic_route_drift",
+                        type(exc).__name__,
+                    )
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_drift"
+            )
+            raise
+        except Exception as exc:
+            if new_client is not None:
+                try:
+                    new_client.close()
+                except Exception as close_exc:
+                    logger.warning(
+                        "sealed credential candidate cleanup failed "
+                        "reason=%s error_type=%s",
+                        "anthropic_build_failure",
+                        type(close_exc).__name__,
+                    )
+            logger.warning(
+                "sealed credential adoption failed reason=%s error_type=%s",
+                "client_build",
+                type(exc).__name__,
+            )
+            return _CandidateAttemptResult(
+                _CandidateAttemptStatus.RETRYABLE_BUILD_FAILURE
+            )
+
+        current = getattr(self, "_pending_sealed_credential_adoption", None)
+        if (
+            current is not candidate
+            or getattr(self, "_credential_recovery_active_generation", None)
+            != generation
+            or getattr(self, "_interrupt_requested", False)
+        ):
+            try:
+                new_client.close()
+            except Exception as exc:
+                logger.warning(
+                    "sealed credential candidate cleanup failed "
+                    "reason=%s error_type=%s",
+                    "anthropic_generation_changed",
+                    type(exc).__name__,
+                )
+            if current is candidate:
+                self._clear_pending_sealed_credential_locked(
+                    generation, reason="invalidated"
+                )
+            return _CandidateAttemptResult(_CandidateAttemptStatus.INVALIDATED)
+        if (
+            getattr(self, "_execution_route_constraint", None)
+            is not candidate.route_constraint
+        ):
+            try:
+                new_client.close()
+            except Exception as exc:
+                logger.warning(
+                    "sealed credential candidate cleanup failed "
+                    "reason=%s error_type=%s",
+                    "anthropic_route_changed",
+                    type(exc).__name__,
+                )
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_changed"
+            )
+            raise ProviderCapabilityDriftError()
+
+        prior_client = getattr(self, "_anthropic_client", None)
+        self._anthropic_client = new_client
+        self._anthropic_api_key = candidate.api_key
+        self._anthropic_base_url = candidate.base_url
+        self._is_anthropic_oauth = bool(candidate.is_anthropic_oauth)
+        self.api_key = candidate.api_key
+        self.base_url = candidate.base_url
+        self._credential_pool_entry_id = candidate.pool_entry_id
+        self._pending_sealed_credential_adoption = None
+        self._credential_transition_epoch = int(
+            getattr(self, "_credential_transition_epoch", 0)
+        ) + 1
+        return _CandidateAttemptResult(
+            _CandidateAttemptStatus.ADOPTED,
+            prior_client=prior_client,
+            retirement_kind="anthropic",
+        )
+
     def _retire_adopted_prior_client(
         self,
         prior_client: Any,
@@ -5142,6 +5290,15 @@ class AIAgent:
                 reason="replace:sealed_credential_adoption",
                 candidate_safe=candidate_safe,
             )
+        elif retirement_kind == "anthropic":
+            try:
+                prior_client.close()
+            except Exception as exc:
+                logger.warning(
+                    "sealed credential retirement failed reason=%s error_type=%s",
+                    "anthropic_client_close",
+                    type(exc).__name__,
+                )
 
     def _adopt_pending_sealed_openai_candidate(self, candidate):
         from agent.credential_adoption import (
@@ -5155,10 +5312,22 @@ class AIAgent:
         with self._openai_client_lock():
             if self._install_pending_sealed_credential_locked(candidate):
                 for attempt in range(2):
-                    result = self._attempt_pending_openai_candidate_locked(
-                        candidate.generation,
-                        attempt_number=attempt + 1,
+                    pending = getattr(
+                        self, "_pending_sealed_credential_adoption", None
                     )
+                    if (
+                        pending is not None
+                        and pending.route_constraint.api_mode
+                        == "anthropic_messages"
+                    ):
+                        result = self._publish_pending_anthropic_candidate(
+                            pending
+                        )
+                    else:
+                        result = self._attempt_pending_openai_candidate_locked(
+                            candidate.generation,
+                            attempt_number=attempt + 1,
+                        )
                     if result.status is _CandidateAttemptStatus.ADOPTED:
                         refresh_status = _CredentialRefreshStatus.ADOPTED
                         retirement = result
@@ -5776,7 +5945,10 @@ class AIAgent:
         1M-beta drop) but returns a fresh client instead of swapping the shared
         one.
         """
-        if self.api_mode == "anthropic_messages":
+        if (
+            self.api_mode == "anthropic_messages"
+            and getattr(self, "_execution_route_constraint", None) is None
+        ):
             self._try_refresh_anthropic_client_credentials()
         _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
         if getattr(self, "provider", None) == "bedrock":
@@ -6525,12 +6697,115 @@ class AIAgent:
         logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return True
 
+    def _refresh_anthropic_credentials_for_turn(
+        self, credential_recovery_state
+    ):
+        """Acquire and adopt one native Anthropic credential for this turn."""
+        from agent.credential_adoption import (
+            _CredentialRefreshStatus,
+            _PendingSealedCredentialAdoption,
+            _snapshot_candidate_client_kwargs,
+        )
+
+        if (
+            self.api_mode != "anthropic_messages"
+            or self.provider != "anthropic"
+            or not hasattr(self, "_anthropic_api_key")
+        ):
+            return _CredentialRefreshStatus.NOT_APPLICABLE
+        if (
+            getattr(self, "_execution_route_constraint", None) is None
+            or credential_recovery_state is None
+        ):
+            return (
+                _CredentialRefreshStatus.ADOPTED
+                if self._try_refresh_anthropic_client_credentials()
+                else _CredentialRefreshStatus.ACQUISITION_FAILED
+            )
+        if "azure.com" in (getattr(self, "_anthropic_base_url", "") or ""):
+            return _CredentialRefreshStatus.NOT_APPLICABLE
+
+        reservation = self._reserve_sealed_credential_acquisition(
+            credential_recovery_state.generation,
+            source="anthropic_direct",
+        )
+        if reservation is None:
+            return _CredentialRefreshStatus.INVALIDATED
+        try:
+            route_constraint = self._assert_execution_route_constraint()
+            if route_constraint is None:
+                return _CredentialRefreshStatus.INVALIDATED
+
+            try:
+                from agent.anthropic_adapter import (
+                    _is_oauth_token,
+                    resolve_anthropic_token,
+                )
+                from hermes_cli.runtime_provider import execution_sdk_endpoint
+
+                token = resolve_anthropic_token()
+                candidate_base_url = execution_sdk_endpoint(
+                    base_url=route_constraint.base_url
+                ).base_url.rstrip("/")
+            except Exception as exc:
+                logger.debug(
+                    "Anthropic credential refresh failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return _CredentialRefreshStatus.ACQUISITION_FAILED
+
+            if not isinstance(token, str) or not token.strip():
+                return _CredentialRefreshStatus.ACQUISITION_FAILED
+            candidate_api_key = token.strip()
+            if candidate_api_key == self._anthropic_api_key:
+                return _CredentialRefreshStatus.ACQUISITION_FAILED
+            try:
+                snapshot = _snapshot_candidate_client_kwargs(
+                    {
+                        "timeout": get_provider_request_timeout(
+                            self.provider, self.model
+                        ),
+                        "drop_context_1m_beta": bool(
+                            getattr(self, "_oauth_1m_beta_disabled", False)
+                        ),
+                    }
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "sealed credential acquisition failed "
+                    "reason=%s error_type=%s",
+                    "candidate_snapshot",
+                    type(exc).__name__,
+                )
+                return _CredentialRefreshStatus.ACQUISITION_FAILED
+
+            candidate = _PendingSealedCredentialAdoption(
+                generation=credential_recovery_state.generation,
+                source="anthropic_direct",
+                route_constraint=route_constraint,
+                api_key=candidate_api_key,
+                base_url=candidate_base_url,
+                client_kwargs=snapshot,
+                pool_entry_id=getattr(
+                    self, "_credential_pool_entry_id", None
+                ),
+                is_anthropic_oauth=_is_oauth_token(candidate_api_key),
+            )
+            return self._adopt_pending_sealed_openai_candidate(candidate)
+        finally:
+            self._release_sealed_credential_acquisition(reservation)
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
         # Only refresh credentials for the native Anthropic provider.
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
+            return False
+        # A sealed conversation has exactly one credential-acquisition owner:
+        # the 401 recovery branch above.  Request-local client construction
+        # must use the currently published credential without live resolution.
+        if getattr(self, "_execution_route_constraint", None) is not None:
             return False
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
         # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
@@ -6563,6 +6838,9 @@ class AIAgent:
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                drop_context_1m_beta=bool(
+                    getattr(self, "_oauth_1m_beta_disabled", False)
+                ),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6690,6 +6968,12 @@ class AIAgent:
     def _swap_credential(
         self, entry, *, credential_recovery_state=None
     ) -> bool:
+        # These transports have no credential-pool publication row.  Reject
+        # before route resolution so they cannot fall through to either the
+        # OpenAI-compatible or Anthropic transaction.
+        if self.api_mode in {"bedrock_converse", "codex_app_server"}:
+            return False
+
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         runtime_base = AIAgent._credential_refresh_base_url(self, runtime_base)
@@ -6700,27 +6984,6 @@ class AIAgent:
             runtime_base
         )
 
-        if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
-
-            try:
-                self._anthropic_client.close()
-            except Exception:
-                pass
-
-            self._anthropic_api_key = runtime_key
-            self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-            self._anthropic_client = build_anthropic_client(
-                runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
-            self.api_key = runtime_key
-            self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-            self._credential_pool_entry_id = candidate_pool_entry_id
-            AIAgent._assert_execution_route_constraint(self)
-            return True
-
         route_constraint = AIAgent._assert_execution_route_constraint(self)
         if route_constraint is not None and credential_recovery_state is not None:
             from agent.credential_adoption import (
@@ -6729,21 +6992,44 @@ class AIAgent:
                 _snapshot_candidate_client_kwargs,
             )
 
-            if self.api_mode not in {"chat_completions", "codex_responses"}:
+            if self.api_mode not in {
+                "chat_completions",
+                "codex_responses",
+                "anthropic_messages",
+            }:
                 return False
             candidate_base_url = (
                 runtime_base.rstrip("/")
                 if isinstance(runtime_base, str)
                 else runtime_base
             )
-            candidate_client_kwargs = dict(self._client_kwargs)
-            candidate_client_kwargs["api_key"] = runtime_key
-            candidate_client_kwargs["base_url"] = candidate_base_url
-            self._reapply_route_client_config(
-                route_changed=route_changed,
-                client_kwargs=candidate_client_kwargs,
-                base_url=candidate_base_url,
-            )
+            if self.api_mode == "anthropic_messages":
+                from agent.anthropic_adapter import _is_oauth_token
+
+                candidate_client_kwargs = {
+                    "timeout": get_provider_request_timeout(
+                        self.provider, self.model
+                    ),
+                    "drop_context_1m_beta": bool(
+                        getattr(self, "_oauth_1m_beta_disabled", False)
+                    ),
+                }
+                candidate_is_anthropic_oauth = (
+                    _is_oauth_token(runtime_key)
+                    if self.provider == "anthropic"
+                    and isinstance(runtime_key, str)
+                    else False
+                )
+            else:
+                candidate_client_kwargs = dict(self._client_kwargs)
+                candidate_client_kwargs["api_key"] = runtime_key
+                candidate_client_kwargs["base_url"] = candidate_base_url
+                self._reapply_route_client_config(
+                    route_changed=route_changed,
+                    client_kwargs=candidate_client_kwargs,
+                    base_url=candidate_base_url,
+                )
+                candidate_is_anthropic_oauth = None
             try:
                 snapshot = _snapshot_candidate_client_kwargs(
                     candidate_client_kwargs
@@ -6763,11 +7049,41 @@ class AIAgent:
                 base_url=candidate_base_url,
                 client_kwargs=snapshot,
                 pool_entry_id=candidate_pool_entry_id,
+                is_anthropic_oauth=candidate_is_anthropic_oauth,
             )
             return (
                 self._adopt_pending_sealed_openai_candidate(candidate)
                 is _CredentialRefreshStatus.ADOPTED
             )
+
+        if self.api_mode == "anthropic_messages":
+            # Preserve the pre-sealing pool-swap behavior for ordinary agents.
+            # The only additive requirement is carrying the session's reactive
+            # 1M-beta disable into every newly adopted Anthropic client.
+            if route_constraint is not None:
+                return False
+            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+
+            try:
+                self._anthropic_client.close()
+            except Exception:
+                pass
+
+            self._anthropic_api_key = runtime_key
+            self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+            self._anthropic_client = build_anthropic_client(
+                runtime_key, self._anthropic_base_url,
+                timeout=get_provider_request_timeout(self.provider, self.model),
+                drop_context_1m_beta=bool(
+                    getattr(self, "_oauth_1m_beta_disabled", False)
+                ),
+            )
+            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
+            self.api_key = runtime_key
+            self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+            self._credential_pool_entry_id = candidate_pool_entry_id
+            AIAgent._assert_execution_route_constraint(self)
+            return True
 
         if route_constraint is not None:
             candidate_base_url = (
@@ -6865,7 +7181,8 @@ class AIAgent:
         if (
             credential_recovery_state is not None
             and getattr(self, "_execution_route_constraint", None) is not None
-            and self.api_mode in {"chat_completions", "codex_responses"}
+            and self.api_mode
+            in {"chat_completions", "codex_responses", "anthropic_messages"}
         ):
             reservation = self._reserve_sealed_credential_acquisition(
                 credential_recovery_state.generation,
@@ -6897,7 +7214,11 @@ class AIAgent:
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
-        if client is None and self.api_mode == "anthropic_messages":
+        if (
+            client is None
+            and self.api_mode == "anthropic_messages"
+            and getattr(self, "_execution_route_constraint", None) is None
+        ):
             self._try_refresh_anthropic_client_credentials()
         # Defensive: strip Responses-only kwargs that can leak in under an
         # api_mode-flip race (the Anthropic SDK raises a non-retryable

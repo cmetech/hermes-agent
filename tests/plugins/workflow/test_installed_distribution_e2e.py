@@ -229,6 +229,169 @@ finally:
 
 
 @pytest.mark.integration
+def test_installed_distribution_runs_sealed_anthropic_credential_transaction(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, base_env, _wheels = installed_distribution
+    probe_path = tmp_path / "sealed_anthropic_transaction_probe.py"
+    probe_path.write_text(
+        r'''
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import agent.credential_adoption as credential_adoption
+import run_agent
+from agent import anthropic_adapter
+from agent.credential_adoption import (
+    _CredentialRefreshStatus,
+    _PendingSealedCredentialAdoption,
+    _snapshot_candidate_client_kwargs,
+)
+from hermes_cli import runtime_provider as rp
+from run_agent import AIAgent
+
+base_url = "https://api.anthropic.com"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+runtime = rp.classify_execution_runtime(
+    provider=provider,
+    model_config={"provider": provider, "default": model},
+    provider_config={"api_mode": "anthropic_messages", "base_url": base_url},
+)
+identity = rp.execution_runtime_identity(runtime)
+constraint = rp.CredentialFreeExecutionRouteConstraint(
+    route_fingerprint="e" * 64,
+    requested_provider=provider,
+    model=model,
+    api_mode="anthropic_messages",
+    base_url=base_url,
+    provider_config={},
+    identity=identity,
+)
+
+old_key = "sk-ant-api03-old-installed-key"
+fresh_key = "sk-ant-api03-fresh-installed-key"
+old_client = anthropic_adapter.build_anthropic_client(old_key, base_url)
+agent = object.__new__(AIAgent)
+agent.provider = provider
+agent.requested_provider = provider
+agent.model = model
+agent.api_mode = "anthropic_messages"
+agent.base_url = base_url
+agent.api_key = old_key
+agent._client_kwargs = {}
+agent._anthropic_client = old_client
+agent._anthropic_api_key = old_key
+agent._anthropic_base_url = base_url
+agent._is_anthropic_oauth = False
+agent._credential_pool_entry_id = "old-entry"
+agent._execution_route_constraint = constraint
+agent._interrupt_requested = False
+agent._oauth_1m_beta_disabled = True
+
+state = agent._begin_credential_recovery_turn()
+candidate = _PendingSealedCredentialAdoption(
+    generation=state.generation,
+    source="pool",
+    route_constraint=constraint,
+    api_key=fresh_key,
+    base_url=base_url,
+    client_kwargs=_snapshot_candidate_client_kwargs(
+        {"timeout": None, "drop_context_1m_beta": True}
+    ),
+    pool_entry_id="fresh-entry",
+    is_anthropic_oauth=False,
+)
+sdk = anthropic_adapter._get_anthropic_sdk()
+real_anthropic = sdk.Anthropic
+constructor_keys = []
+published_clients = []
+
+def deterministic_anthropic(**kwargs):
+    key = kwargs.get("api_key") or kwargs.get("auth_token")
+    if key == fresh_key:
+        constructor_keys.append(key)
+        if len(constructor_keys) == 1:
+            raise RuntimeError("first candidate construction fails")
+    client = real_anthropic(**kwargs)
+    if key == fresh_key:
+        published_clients.append(client)
+    return client
+
+sdk.Anthropic = deterministic_anthropic
+try:
+    status = agent._adopt_pending_sealed_openai_candidate(candidate)
+    payload = {
+        "run_agent_file": str(Path(run_agent.__file__).resolve()),
+        "credential_module_file": str(Path(credential_adoption.__file__).resolve()),
+        "status": status.value,
+        "constructor_keys": constructor_keys,
+        "published_concrete": (
+            len(published_clients) == 1
+            and agent._anthropic_client is published_clients[0]
+        ),
+        "anthropic_key": agent._anthropic_api_key,
+        "anthropic_base_url": agent._anthropic_base_url,
+        "anthropic_oauth": agent._is_anthropic_oauth,
+        "generic_key": agent.api_key,
+        "generic_base_url": agent.base_url,
+        "published_entry": agent._credential_pool_entry_id,
+        "retired_old": old_client.is_closed(),
+        "pending_cleared": (
+            getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        ),
+    }
+    assert status is _CredentialRefreshStatus.ADOPTED
+    print(json.dumps(payload))
+finally:
+    sdk.Anthropic = real_anthropic
+    agent._end_credential_recovery_turn(state.generation)
+    if agent._anthropic_client is not old_client:
+        agent._anthropic_client.close()
+    if not old_client.is_closed():
+        old_client.close()
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    env = base_env.copy()
+    env["HERMES_HOME"] = str(tmp_path / "home")
+    result = subprocess.run(
+        [sys.executable, str(probe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["run_agent_file"]).is_relative_to(site.resolve())
+    assert Path(payload["credential_module_file"]).is_relative_to(site.resolve())
+    assert payload == {
+        "run_agent_file": payload["run_agent_file"],
+        "credential_module_file": payload["credential_module_file"],
+        "status": "adopted",
+        "constructor_keys": [
+            "sk-ant-api03-fresh-installed-key",
+            "sk-ant-api03-fresh-installed-key",
+        ],
+        "published_concrete": True,
+        "anthropic_key": "sk-ant-api03-fresh-installed-key",
+        "anthropic_base_url": "https://api.anthropic.com",
+        "anthropic_oauth": False,
+        "generic_key": "sk-ant-api03-fresh-installed-key",
+        "generic_base_url": "https://api.anthropic.com",
+        "published_entry": "fresh-entry",
+        "retired_old": True,
+        "pending_cleared": True,
+    }
+
+
+@pytest.mark.integration
 def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     tmp_path: Path,
     installed_distribution,
