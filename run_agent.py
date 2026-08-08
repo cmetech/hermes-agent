@@ -411,6 +411,15 @@ class _StreamErrorEvent(Exception):
         }
 
 
+class ProviderCapabilityDriftError(RuntimeError):
+    """Bounded failure for a sealed route that changed before transport."""
+
+    failure_kind = "provider_capability_drift"
+
+    def __init__(self) -> None:
+        super().__init__(self.failure_kind)
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -433,6 +442,46 @@ class AIAgent:
         self._base_url = value
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
+
+    def _assert_execution_route_constraint(self):
+        constraint = getattr(self, "_execution_route_constraint", None)
+        if constraint is None:
+            return None
+        from hermes_cli.runtime_provider import (
+            CredentialFreeExecutionRouteConstraint,
+        )
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        if not isinstance(constraint, CredentialFreeExecutionRouteConstraint):
+            raise ProviderCapabilityDriftError()
+        expected_base = normalize_route_base_url(constraint.base_url)
+        state_matches = (
+            self.requested_provider == constraint.requested_provider
+            and self.provider == constraint.identity.provider
+            and self.model == constraint.model
+            and self.api_mode == constraint.api_mode
+            and normalize_route_base_url(self.base_url) == expected_base
+        )
+        client_kwargs = getattr(self, "_client_kwargs", None)
+        if isinstance(client_kwargs, dict) and "base_url" in client_kwargs:
+            state_matches = state_matches and (
+                normalize_route_base_url(client_kwargs["base_url"])
+                == expected_base
+            )
+        anthropic_base = getattr(self, "_anthropic_base_url", None)
+        if anthropic_base is not None:
+            state_matches = state_matches and (
+                normalize_route_base_url(anthropic_base) == expected_base
+            )
+        if not state_matches:
+            raise ProviderCapabilityDriftError()
+        return constraint
+
+    def _credential_refresh_base_url(self, candidate) -> str:
+        constraint = AIAgent._assert_execution_route_constraint(self)
+        if constraint is not None:
+            return constraint.base_url
+        return str(candidate or "").strip().rstrip("/")
 
     def __init__(
         self,
@@ -509,6 +558,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        execution_route_constraint=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -593,7 +643,9 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            execution_route_constraint=execution_route_constraint,
         )
+        self._assert_execution_route_constraint()
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -5358,13 +5410,14 @@ class AIAgent:
             return False
 
         self.api_key = api_key.strip()
-        self.base_url = base_url.strip().rstrip("/")
+        self.base_url = self._credential_refresh_base_url(base_url)
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
         if not self._replace_primary_openai_client(reason=f"{self.provider}_credential_refresh"):
             return False
 
+        self._assert_execution_route_constraint()
         return True
 
     def _try_refresh_nous_client_credentials(
@@ -5399,12 +5452,13 @@ class AIAgent:
             return False
 
         self.api_key = api_key.strip()
-        self.base_url = base_url.strip().rstrip("/")
+        self.base_url = self._credential_refresh_base_url(base_url)
 
         if self.api_mode == "anthropic_messages":
             self._anthropic_api_key = self.api_key
             self._anthropic_base_url = self.base_url
             self._rebuild_anthropic_client()
+            self._assert_execution_route_constraint()
             return True
 
         self._client_kwargs["api_key"] = self.api_key
@@ -5415,6 +5469,7 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
             return False
 
+        self._assert_execution_route_constraint()
         return True
 
     def _try_refresh_env_client_credentials(self) -> bool:
@@ -5514,6 +5569,11 @@ class AIAgent:
         else:
             return False
 
+        route_constraint = self._assert_execution_route_constraint()
+        if route_constraint is not None:
+            base_url = route_constraint.base_url
+            default_base = route_constraint.base_url
+
         if not base_url:
             return False
 
@@ -5571,12 +5631,19 @@ class AIAgent:
             self._client_kwargs.update(prior_client_kwargs)
             return False
 
+        self._assert_execution_route_constraint()
         self._env_creds_seen = resolved
-        logger.info(
-            "Applied updated .env credentials for %s: endpoint %s",
-            self.provider,
-            self.base_url,
-        )
+        if route_constraint is not None:
+            logger.info(
+                "Applied updated .env credentials for %s on sealed endpoint",
+                self.provider,
+            )
+        else:
+            logger.info(
+                "Applied updated .env credentials for %s: endpoint %s",
+                self.provider,
+                self.base_url,
+            )
         return True
 
     def _try_refresh_vertex_client_credentials(self) -> bool:
@@ -5592,10 +5659,17 @@ class AIAgent:
         if self.api_mode != "chat_completions" or self.provider != "vertex":
             return False
 
+        route_constraint = self._assert_execution_route_constraint()
         try:
-            from agent.vertex_adapter import get_vertex_config
+            if route_constraint is not None:
+                from agent.vertex_adapter import get_vertex_credentials
 
-            token, base_url = get_vertex_config()
+                token, _credential_project = get_vertex_credentials()
+                base_url = route_constraint.base_url
+            else:
+                from agent.vertex_adapter import get_vertex_config
+
+                token, base_url = get_vertex_config()
         except Exception as exc:
             logger.debug("Vertex credential refresh failed: %s", exc)
             return False
@@ -5613,6 +5687,7 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="vertex_credential_refresh"):
             return False
 
+        self._assert_execution_route_constraint()
         logger.info("Vertex AI OAuth token refreshed")
         return True
 
@@ -5657,16 +5732,18 @@ class AIAgent:
         # exchange itself is unavailable (network blip) — a client rebuild on the
         # raw token still clears stale client state and may recover on enterprise
         # seats where headers matter.
+        enterprise_base_url = None
         try:
             evict_cached_exchanged_token(new_token)
             api_token, enterprise_base_url = get_copilot_api_token(new_token)
             if isinstance(api_token, str) and api_token.strip():
                 new_token = api_token.strip()
-                if enterprise_base_url:
-                    self.base_url = enterprise_base_url.rstrip("/")
         except Exception as exc:
             logger.debug("Copilot 401 re-exchange failed, using resolved token: %s", exc)
 
+        self.base_url = self._credential_refresh_base_url(
+            enterprise_base_url or self.base_url
+        )
         self.api_key = new_token
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
@@ -5675,6 +5752,7 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="copilot_credential_refresh"):
             return False
 
+        self._assert_execution_route_constraint()
         logger.info("Copilot credentials refreshed from %s", token_source)
         return True
 
@@ -5732,8 +5810,9 @@ class AIAgent:
             return False
 
         self.api_key = api_token.strip()
-        if enterprise_base_url:
-            self.base_url = enterprise_base_url.rstrip("/")
+        self.base_url = self._credential_refresh_base_url(
+            enterprise_base_url or self.base_url
+        )
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._apply_client_headers_for_base_url(str(self.base_url or ""))
@@ -5741,6 +5820,7 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="copilot_stale_credential_recovery"):
             return False
 
+        self._assert_execution_route_constraint()
         logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return True
 
@@ -5756,6 +5836,7 @@ class AIAgent:
         _base = getattr(self, "_anthropic_base_url", "") or ""
         if "azure.com" in _base:
             return False
+        self._assert_execution_route_constraint()
 
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
@@ -5793,6 +5874,7 @@ class AIAgent:
         # identity-injection guard).
         from agent.anthropic_adapter import _is_oauth_token
         self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
+        self._assert_execution_route_constraint()
         return True
 
     def _apply_client_headers_for_base_url(
@@ -5902,6 +5984,7 @@ class AIAgent:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        runtime_base = AIAgent._credential_refresh_base_url(self, runtime_base)
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
 
@@ -5926,6 +6009,7 @@ class AIAgent:
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
             self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+            AIAgent._assert_execution_route_constraint(self)
             return
 
         self.api_key = runtime_key
@@ -5934,6 +6018,7 @@ class AIAgent:
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
+        AIAgent._assert_execution_route_constraint(self)
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs for the current ``self.base_url``.

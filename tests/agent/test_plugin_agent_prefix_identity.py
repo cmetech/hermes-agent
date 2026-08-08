@@ -552,6 +552,104 @@ def test_phase5_worker_passes_selected_alias_constraint_to_credential_resolver(
     assert result["audit"]["mismatched_fields"] == ["api_mode"]
 
 
+def test_phase5_worker_passes_private_route_constraint_into_ai_agent(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "gmi", "default": "other-model"},
+        "model_aliases": {
+            "review": {
+                "provider": "gmi",
+                "model": "sealed-model",
+                "base_url": "https://sealed-gmi.example/v1",
+            }
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "@review"
+    )
+    expected = {
+        "provider": route.provider,
+        "model": route.model,
+        "api_mode": route.api_mode,
+        "base_url_trust_class": route.base_url_trust_class,
+        "endpoint_sha256": route.endpoint_sha256,
+        "registration_provenance_digest": route.registration_provenance_digest,
+    }
+    captured = []
+
+    class FakeDB:
+        def close(self):
+            return None
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            self.session_id = "session-1"
+            self.provider = "gmi"
+            self.model = route.model
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._interrupt_requested = False
+
+        def seal_model_visible_prefix(self):
+            return "c" * 64
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "done", "api_calls": 0}
+
+    monkeypatch.setattr(config_mod, "read_raw_config_readonly", lambda: config)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+
+    def resolve(**kwargs):
+        constraint = kwargs["route_constraint"]
+        return {
+            "provider": "gmi",
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url": constraint.base_url,
+            "api_key": "credential",
+        }
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+
+    result = worker._run({
+        "plugin_id": "workflow",
+        "request": PluginAgentRunRequest(
+            prompt="continue",
+            provider=route.provider,
+            model=route.model,
+            allowed_tools=(),
+            intended_authority_digest="a" * 64,
+            expected_runtime_identity=expected,
+            expected_runtime_route_fingerprint=route.route_fingerprint,
+            expected_runtime_route_options={},
+        ).to_wire(),
+    })
+
+    assert result["status"] == "completed"
+    assert len(captured) == 1
+    constraint = captured[0]["execution_route_constraint"]
+    assert captured[0]["requested_provider"] == route.provider
+    assert constraint.route_fingerprint == route.route_fingerprint
+    assert "sealed-gmi.example" not in repr(constraint)
+
+
 def test_prefix_expectation_without_sealed_authority_is_rejected() -> None:
     request = PluginAgentRunRequest(
         prompt="continue",

@@ -284,6 +284,7 @@ upstream_changes:
   owner: workflow-orchestration
   overlap_policy: owned_symbol
   files:
+  - agent/agent_init.py
   - agent/conversation_loop.py
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
@@ -300,6 +301,9 @@ upstream_changes:
   - model_visible_prefix_digest
   - AIAgent.seal_model_visible_prefix
   - AIAgent.verify_model_visible_prefix
+  - AIAgent private execution_route_constraint transport pin
+  - AIAgent._assert_execution_route_constraint
+  - ProviderCapabilityDriftError bounded pre-transport failure
   - PluginAgentRunRequest
   - phase5_node_intended_authority_digest
   - phase5_session_cache_fingerprint
@@ -322,6 +326,9 @@ upstream_changes:
   - runtime drift diagnostics expose only stable field names and never endpoint or provenance digest values
   - one exact live route fingerprint selects the provider model API mode endpoint and bounded dynamic endpoint config used by credential resolution
   - Vertex credentials supply only an OAuth token while config supplies project and region; Bedrock config or us-east-1 supplies region while AWS credentials cannot change it
+  - the selected route constraint remains private and immutable inside AIAgent for the full provider attempt
+  - sealed credential refresh and client recreation may update credentials but never provider model API mode or endpoint
+  - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_phase5_execution_context.py
@@ -332,13 +339,17 @@ upstream_changes:
   - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_typed_publication_recovery.py
   - tests/plugins/workflow/test_phase4_loops.py
+  - tests/run_agent/test_env_credential_turn_refresh.py
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true
   merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
     expected runtime identity and paired cache identities. Compute the runtime prefix
     only after prompt contributors and final tool filtering, but before session reads
-    and provider calls. Preserve exact legacy recovery encodings and never resolve
-    workflow aliases or provider capabilities inside clients.
+    and provider calls. Carry the private selected route constraint into AIAgent
+    for the whole attempt, reassert it around every credential refresh and client
+    recreation, and keep sealed Vertex recovery token-only. Preserve exact legacy
+    recovery encodings and never resolve workflow aliases or provider capabilities
+    inside clients.
   removal_condition: Remove when upstream provides equivalent two-stage immutable
     provider and model-visible-prefix authority with crash-safe paired recovery and
     pre-transport drift rejection.

@@ -16,23 +16,32 @@ failover legitimately move the session off the env credential, and config
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from run_agent import AIAgent
+from run_agent import AIAgent, ProviderCapabilityDriftError
 
 DEFAULT_BASE = "https://api.openai.com/v1"
 LOCAL_BASE = "http://127.0.0.1:39080"
+GMI_BASE = "https://api.gmi-serving.com/v1"
 
 
-def _make_agent(*, provider="openai-api", base_url=DEFAULT_BASE, api_key="sk-old"):
+def _make_agent(
+    *,
+    provider="openai-api",
+    base_url=DEFAULT_BASE,
+    api_key="sk-old",
+    api_mode="chat_completions",
+):
     agent = object.__new__(AIAgent)
     agent.provider = provider
     agent.requested_provider = provider
-    agent.api_mode = "chat_completions"
+    agent.model = "test-model"
+    agent.api_mode = api_mode
     agent.base_url = base_url
     agent.api_key = api_key
     agent._client_kwargs = {"base_url": base_url, "api_key": api_key}
@@ -40,6 +49,35 @@ def _make_agent(*, provider="openai-api", base_url=DEFAULT_BASE, api_key="sk-old
     agent._replace_primary_openai_client = MagicMock(return_value=True)
     agent._reapply_route_client_config = MagicMock()
     return agent
+
+
+def _sealed_route_constraint(
+    *,
+    provider="openai-api",
+    base_url=DEFAULT_BASE,
+    api_mode="chat_completions",
+):
+    from hermes_cli import runtime_provider as rp
+
+    identity = rp.execution_runtime_identity(
+        rp.classify_execution_runtime(
+            provider=provider,
+            model_config={"provider": provider, "default": "test-model"},
+            provider_config={
+                "api_mode": api_mode,
+                "base_url": base_url,
+            },
+        )
+    )
+    return rp.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="f" * 64,
+        requested_provider=provider,
+        model="test-model",
+        api_mode=api_mode,
+        base_url=base_url,
+        provider_config={},
+        identity=identity,
+    )
 
 
 @pytest.fixture
@@ -55,6 +93,32 @@ def env(monkeypatch):
 
 
 class TestAdoptsEnvEdits:
+    def test_sealed_route_refreshes_key_without_adopting_env_endpoint(
+        self, env, caplog
+    ):
+        caplog.set_level("INFO")
+        agent = _make_agent(provider="gmi", base_url=GMI_BASE)
+        agent._execution_route_constraint = _sealed_route_constraint(
+            provider="gmi", base_url=GMI_BASE
+        )
+        env["GMI_API_KEY"] = "sk-new"
+        env["GMI_BASE_URL"] = LOCAL_BASE
+
+        assert agent._try_refresh_env_client_credentials() is True
+        assert agent.api_key == "sk-new"
+        assert agent.base_url == GMI_BASE
+        assert agent._client_kwargs == {
+            "base_url": GMI_BASE,
+            "api_key": "sk-new",
+        }
+        assert (agent.provider, agent.model, agent.api_mode) == (
+            "gmi",
+            "test-model",
+            "chat_completions",
+        )
+        assert GMI_BASE not in caplog.text
+        assert LOCAL_BASE not in caplog.text
+
     def test_boot_default_adopts_override_on_first_look(self, env):
         """The reported scenario: worker spawned before the user saved the
         override — first turn after the save must switch to the local URL."""
@@ -188,6 +252,178 @@ class TestRouteConfigRefresh:
         env["OPENAI_API_KEY"] = "sk-new"
         assert agent._try_refresh_env_client_credentials() is True
         agent._reapply_route_client_config.assert_called_once_with(route_changed=False)
+
+
+class TestVertexRefresh:
+    def test_sealed_route_refreshes_token_without_deriving_endpoint(
+        self, monkeypatch
+    ):
+        import agent.vertex_adapter as vertex_adapter
+
+        sealed_base = (
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
+            "config-project/locations/us-central1/endpoints/openapi"
+        )
+        agent = _make_agent(
+            provider="vertex",
+            base_url=sealed_base,
+            api_key="expired-token",
+        )
+        agent._execution_route_constraint = _sealed_route_constraint(
+            provider="vertex",
+            base_url=sealed_base,
+        )
+        monkeypatch.setattr(
+            vertex_adapter,
+            "get_vertex_credentials",
+            lambda: ("fresh-token", "credential-project"),
+        )
+        monkeypatch.setattr(
+            vertex_adapter,
+            "get_vertex_config",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("sealed refresh derived a Vertex endpoint")
+            ),
+        )
+
+        assert agent._try_refresh_vertex_client_credentials() is True
+        assert agent.api_key == "fresh-token"
+        assert agent.base_url == sealed_base
+        assert agent._client_kwargs == {
+            "base_url": sealed_base,
+            "api_key": "fresh-token",
+        }
+        assert (agent.provider, agent.model, agent.api_mode) == (
+            "vertex",
+            "test-model",
+            "chat_completions",
+        )
+
+    def test_unsealed_refresh_retains_endpoint_derivation_behavior(self, monkeypatch):
+        import agent.vertex_adapter as vertex_adapter
+
+        refreshed_base = (
+            "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/"
+            "credential-project/locations/europe-west4/endpoints/openapi"
+        )
+        agent = _make_agent(
+            provider="vertex",
+            base_url="https://old-vertex.example/v1",
+            api_key="expired-token",
+        )
+        monkeypatch.setattr(
+            vertex_adapter,
+            "get_vertex_config",
+            lambda: ("fresh-token", refreshed_base),
+        )
+
+        assert agent._try_refresh_vertex_client_credentials() is True
+        assert agent.api_key == "fresh-token"
+        assert agent.base_url == refreshed_base
+        assert agent._client_kwargs["base_url"] == refreshed_base
+
+
+def test_conversation_blocks_sealed_route_mutation_before_turn_setup(monkeypatch):
+    import agent.conversation_loop as conversation_loop
+
+    agent = _make_agent(provider="gmi", base_url=GMI_BASE)
+    agent._execution_route_constraint = _sealed_route_constraint(
+        provider="gmi", base_url=GMI_BASE
+    )
+    agent._last_compaction_in_place = False
+    agent._last_compression_attempt_recorded = False
+    agent._last_compression_attempt_in_place = None
+
+    def mutate_route():
+        agent.base_url = LOCAL_BASE
+        agent._client_kwargs["base_url"] = LOCAL_BASE
+        return True
+
+    agent._try_refresh_env_client_credentials = mutate_route
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("turn setup reached after sealed route mutation")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="provider_capability_drift"):
+        conversation_loop.run_conversation(agent, "hello")
+
+
+def test_sealed_route_malformed_runtime_endpoint_has_bounded_failure() -> None:
+    agent = _make_agent(provider="gmi", base_url=GMI_BASE)
+    agent._execution_route_constraint = _sealed_route_constraint(
+        provider="gmi", base_url=GMI_BASE
+    )
+    private_endpoint = "https://[private-endpoint"
+    agent._client_kwargs["base_url"] = private_endpoint
+
+    with pytest.raises(ProviderCapabilityDriftError) as caught:
+        agent._assert_execution_route_constraint()
+
+    assert str(caught.value) == "provider_capability_drift"
+    assert private_endpoint not in str(caught.value)
+
+
+def test_sealed_credential_rotation_updates_key_without_endpoint() -> None:
+    agent = _make_agent(provider="gmi", base_url=GMI_BASE)
+    agent._execution_route_constraint = _sealed_route_constraint(
+        provider="gmi", base_url=GMI_BASE
+    )
+    entry = SimpleNamespace(
+        id="rotated",
+        runtime_api_key="sk-rotated",
+        runtime_base_url=LOCAL_BASE,
+    )
+
+    agent._swap_credential(entry)
+
+    assert agent.api_key == "sk-rotated"
+    assert agent.base_url == GMI_BASE
+    assert agent._client_kwargs["base_url"] == GMI_BASE
+    agent._replace_primary_openai_client.assert_called_once_with(
+        reason="credential_rotation"
+    )
+
+
+def test_sealed_codex_refresh_recreates_client_without_endpoint_drift(
+    monkeypatch,
+) -> None:
+    import hermes_cli.auth as auth
+
+    sealed_base = "https://chatgpt.com/backend-api/codex"
+    agent = _make_agent(
+        provider="openai-codex",
+        base_url=sealed_base,
+        api_key="old-token",
+        api_mode="codex_responses",
+    )
+    agent._execution_route_constraint = _sealed_route_constraint(
+        provider="openai-codex",
+        base_url=sealed_base,
+        api_mode="codex_responses",
+    )
+
+    def resolve_codex_runtime_credentials(**kwargs):
+        if kwargs.get("force_refresh"):
+            return {"api_key": "new-token", "base_url": LOCAL_BASE}
+        return {"api_key": "old-token", "base_url": sealed_base}
+
+    monkeypatch.setattr(
+        auth,
+        "resolve_codex_runtime_credentials",
+        resolve_codex_runtime_credentials,
+    )
+
+    assert agent._try_refresh_codex_client_credentials(force=True) is True
+    assert agent.api_key == "new-token"
+    assert agent.base_url == sealed_base
+    assert agent._client_kwargs["base_url"] == sealed_base
+    agent._replace_primary_openai_client.assert_called_once_with(
+        reason="openai-codex_credential_refresh"
+    )
 
 
 CUSTOM_BASE = "https://api.longcat.example/openai/v1"

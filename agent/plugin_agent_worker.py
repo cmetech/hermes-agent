@@ -1983,12 +1983,18 @@ def _run(
                 model=model,
                 max_iterations=request.max_iterations,
                 provider=runtime.get("provider"),
+                requested_provider=(
+                    route_constraint.requested_provider
+                    if route_constraint is not None
+                    else request.provider
+                ),
                 base_url=runtime.get("base_url"),
                 api_key=runtime.get("api_key"),
                 api_mode=runtime.get("api_mode"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                execution_route_constraint=route_constraint,
                 ephemeral_system_prompt=request.ephemeral_system_prompt,
                 reasoning_config=dict(request.reasoning_config or {}),
                 fallback_model=(

@@ -530,6 +530,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    execution_route_constraint=None,
 ):
     """
     Initialize the AI Agent.
@@ -640,6 +641,7 @@ def init_agent(
         else agent.provider
     )
     agent._credential_pool = credential_pool
+    agent._execution_route_constraint = execution_route_constraint
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
