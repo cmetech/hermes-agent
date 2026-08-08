@@ -420,6 +420,9 @@ class ProviderCapabilityDriftError(RuntimeError):
         super().__init__(self.failure_kind)
 
 
+_PRESERVE_PUBLISHED_OPENAI_STATE = object()
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -443,7 +446,13 @@ class AIAgent:
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
 
-    def _assert_execution_route_constraint(self, transport: Any = None):
+    def _assert_execution_route_constraint(
+        self,
+        transport: Any = None,
+        *,
+        base_url: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+        client_kwargs: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+    ):
         constraint = getattr(self, "_execution_route_constraint", None)
         if constraint is None:
             return None
@@ -468,7 +477,10 @@ class AIAgent:
             except (TypeError, ValueError):
                 return False
 
-        client_kwargs = getattr(self, "_client_kwargs", None)
+        if base_url is _PRESERVE_PUBLISHED_OPENAI_STATE:
+            base_url = self.base_url
+        if client_kwargs is _PRESERVE_PUBLISHED_OPENAI_STATE:
+            client_kwargs = getattr(self, "_client_kwargs", None)
         default_query = (
             client_kwargs.get("default_query")
             if isinstance(client_kwargs, dict)
@@ -480,7 +492,7 @@ class AIAgent:
             self.model == constraint.model,
             self.api_mode == constraint.api_mode,
             matches_endpoint(constraint.base_url),
-            matches_endpoint(self.base_url, default_query),
+            matches_endpoint(base_url, default_query),
         ))
         if isinstance(client_kwargs, dict) and "base_url" in client_kwargs:
             state_matches = state_matches and matches_endpoint(
@@ -4976,13 +4988,45 @@ class AIAgent:
                 exc,
             )
 
-    def _replace_primary_openai_client(self, *, reason: str) -> bool:
+    def _replace_primary_openai_client(
+        self,
+        *,
+        reason: str,
+        client_kwargs: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+        api_key: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+        base_url: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+        credential_pool_entry_id: Any = _PRESERVE_PUBLISHED_OPENAI_STATE,
+    ) -> bool:
+        """Build, validate, and optionally publish one client transaction."""
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
+            candidate_client_kwargs = dict(
+                self._client_kwargs
+                if client_kwargs is _PRESERVE_PUBLISHED_OPENAI_STATE
+                else client_kwargs
+            )
+            candidate_api_key = (
+                self.api_key
+                if api_key is _PRESERVE_PUBLISHED_OPENAI_STATE
+                else api_key
+            )
+            candidate_base_url = (
+                self.base_url
+                if base_url is _PRESERVE_PUBLISHED_OPENAI_STATE
+                else base_url
+            )
             new_client = None
             try:
-                new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
-                self._assert_execution_route_constraint(new_client)
+                new_client = self._create_openai_client(
+                    candidate_client_kwargs,
+                    reason=reason,
+                    shared=True,
+                )
+                self._assert_execution_route_constraint(
+                    new_client,
+                    base_url=candidate_base_url,
+                    client_kwargs=candidate_client_kwargs,
+                )
             except ProviderCapabilityDriftError:
                 if new_client is not None:
                     self._close_openai_client(
@@ -4992,6 +5036,12 @@ class AIAgent:
                     )
                 raise
             except Exception as exc:
+                if new_client is not None:
+                    self._close_openai_client(
+                        new_client,
+                        reason=f"rejected:{reason}",
+                        shared=False,
+                    )
                 logger.warning(
                     "Failed to rebuild shared OpenAI client (%s) %s error=%s",
                     reason,
@@ -4999,6 +5049,13 @@ class AIAgent:
                     exc,
                 )
                 return False
+            if client_kwargs is not _PRESERVE_PUBLISHED_OPENAI_STATE:
+                self.api_key = candidate_api_key
+                self.base_url = candidate_base_url
+                self._client_kwargs.clear()
+                self._client_kwargs.update(candidate_client_kwargs)
+            if credential_pool_entry_id is not _PRESERVE_PUBLISHED_OPENAI_STATE:
+                self._credential_pool_entry_id = credential_pool_entry_id
             self.client = new_client
         # #70773: never hard-close the replaced shared client from here — the
         # caller may not be the thread whose request is still unwinding on the
@@ -5781,19 +5838,25 @@ class AIAgent:
         if not isinstance(base_url, str) or not base_url.strip():
             return False
 
-        self.api_key = token.strip()
-        self.base_url = base_url.strip().rstrip("/")
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
+        candidate_api_key = token.strip()
+        candidate_base_url = base_url.strip().rstrip("/")
+        candidate_client_kwargs = dict(self._client_kwargs)
+        candidate_client_kwargs["api_key"] = candidate_api_key
+        candidate_client_kwargs["base_url"] = candidate_base_url
         if route_constraint is not None:
             if sdk_endpoint.query_items:
-                self._client_kwargs["default_query"] = (
+                candidate_client_kwargs["default_query"] = (
                     sdk_endpoint.default_query
                 )
             else:
-                self._client_kwargs.pop("default_query", None)
+                candidate_client_kwargs.pop("default_query", None)
 
-        if not self._replace_primary_openai_client(reason="vertex_credential_refresh"):
+        if not self._replace_primary_openai_client(
+            reason="vertex_credential_refresh",
+            client_kwargs=candidate_client_kwargs,
+            api_key=candidate_api_key,
+            base_url=candidate_base_url,
+        ):
             return False
 
         self._assert_execution_route_constraint(getattr(self, "client", None))
@@ -5991,39 +6054,41 @@ class AIAgent:
         base_url: str,
         *,
         apply_user_headers: bool = True,
+        client_kwargs: Optional[dict] = None,
     ) -> None:
         from agent.auxiliary_client import (
             _AI_GATEWAY_HEADERS,
             build_nvidia_nim_headers,
             build_or_headers,
         )
+        target_kwargs = self._client_kwargs if client_kwargs is None else client_kwargs
 
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = build_or_headers()
+            target_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
-            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
+            target_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-            self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
+            target_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
-            self._client_kwargs["default_headers"] = _routermint_headers()
+            target_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
-            self._client_kwargs["default_headers"] = copilot_default_headers()
+            target_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            target_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
-            self._client_kwargs["default_headers"] = _qwen_portal_headers()
+            target_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
-            self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
-                self._client_kwargs.get("api_key", "")
+            target_kwargs["default_headers"] = _codex_cloudflare_headers(
+                target_kwargs.get("api_key", "")
             )
         elif base_url_host_matches(base_url, "x.ai"):
             # Cover both provider=xai and provider=xai-oauth (api.x.ai).
             from tools.xai_http import hermes_xai_default_headers
 
-            self._client_kwargs["default_headers"] = hermes_xai_default_headers()
+            target_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
@@ -6035,14 +6100,14 @@ class AIAgent:
             except Exception:
                 pass
             if _ph_headers:
-                self._client_kwargs["default_headers"] = _ph_headers
+                target_kwargs["default_headers"] = _ph_headers
             else:
-                self._client_kwargs.pop("default_headers", None)
+                target_kwargs.pop("default_headers", None)
 
         # User-configured overrides win over URL/profile defaults for the same
         # route. A credential swap to another endpoint must not inherit them.
         if apply_user_headers:
-            self._apply_user_default_headers()
+            self._apply_user_default_headers(client_kwargs=target_kwargs)
 
         # Per-provider extra HTTP headers (providers.<name>.extra_headers /
         # custom_providers[].extra_headers) — applied last so the most
@@ -6055,12 +6120,14 @@ class AIAgent:
                 )
 
                 apply_custom_provider_extra_headers_to_client_kwargs(
-                    self._client_kwargs, base_url,
+                    target_kwargs, base_url,
                 )
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
-    def _apply_user_default_headers(self) -> None:
+    def _apply_user_default_headers(
+        self, *, client_kwargs: Optional[dict] = None
+    ) -> None:
         """Merge user-configured request headers onto the OpenAI client.
 
         Reads ``model.default_headers`` from config.yaml and merges it onto
@@ -6086,15 +6153,16 @@ class AIAgent:
         from agent.auxiliary_client import (
             _apply_user_default_headers as _merge_user_headers,
         )
-        merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+        target_kwargs = self._client_kwargs if client_kwargs is None else client_kwargs
+        merged = _merge_user_headers(target_kwargs.get("default_headers"))
         if merged:
-            self._client_kwargs["default_headers"] = merged
+            target_kwargs["default_headers"] = merged
 
-    def _swap_credential(self, entry) -> None:
+    def _swap_credential(self, entry) -> bool:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         runtime_base = AIAgent._credential_refresh_base_url(self, runtime_base)
-        self._credential_pool_entry_id = getattr(entry, "id", None)
+        candidate_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
 
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
@@ -6118,18 +6186,55 @@ class AIAgent:
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
             self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+            self._credential_pool_entry_id = candidate_pool_entry_id
             AIAgent._assert_execution_route_constraint(self)
-            return
+            return True
 
+        route_constraint = AIAgent._assert_execution_route_constraint(self)
+        if route_constraint is not None:
+            candidate_base_url = (
+                runtime_base.rstrip("/")
+                if isinstance(runtime_base, str)
+                else runtime_base
+            )
+            candidate_client_kwargs = dict(self._client_kwargs)
+            candidate_client_kwargs["api_key"] = runtime_key
+            candidate_client_kwargs["base_url"] = candidate_base_url
+            self._reapply_route_client_config(
+                route_changed=route_changed,
+                client_kwargs=candidate_client_kwargs,
+                base_url=candidate_base_url,
+            )
+            rebuilt = self._replace_primary_openai_client(
+                reason="credential_rotation",
+                client_kwargs=candidate_client_kwargs,
+                api_key=runtime_key,
+                base_url=candidate_base_url,
+                credential_pool_entry_id=candidate_pool_entry_id,
+            )
+            if not rebuilt:
+                return False
+            AIAgent._assert_execution_route_constraint(self, self.client)
+            return True
+
+        self._credential_pool_entry_id = candidate_pool_entry_id
         self.api_key = runtime_key
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
-        self._replace_primary_openai_client(reason="credential_rotation")
+        if not self._replace_primary_openai_client(reason="credential_rotation"):
+            return False
         AIAgent._assert_execution_route_constraint(self)
+        return True
 
-    def _reapply_route_client_config(self, *, route_changed: bool) -> None:
+    def _reapply_route_client_config(
+        self,
+        *,
+        route_changed: bool,
+        client_kwargs: Optional[dict] = None,
+        base_url: Optional[str] = None,
+    ) -> None:
         """Recompute route-derived client kwargs for the current ``self.base_url``.
 
         TLS material (``ssl_verify``/``ssl_ca_cert``) and default headers are
@@ -6139,8 +6244,10 @@ class AIAgent:
         credential-pool rotation and the per-turn env refresh so the two
         paths cannot drift.
         """
-        self._client_kwargs.pop("ssl_verify", None)
-        self._client_kwargs.pop("ssl_ca_cert", None)
+        target_kwargs = self._client_kwargs if client_kwargs is None else client_kwargs
+        target_base_url = self.base_url if base_url is None else base_url
+        target_kwargs.pop("ssl_verify", None)
+        target_kwargs.pop("ssl_ca_cert", None)
         try:
             from hermes_cli.config import (
                 apply_custom_provider_tls_to_client_kwargs,
@@ -6149,8 +6256,8 @@ class AIAgent:
             )
 
             apply_custom_provider_tls_to_client_kwargs(
-                self._client_kwargs,
-                str(self.base_url or ""),
+                target_kwargs,
+                str(target_base_url or ""),
                 get_compatible_custom_providers(load_config_readonly()),
             )
         except Exception:
@@ -6159,8 +6266,9 @@ class AIAgent:
                 exc_info=True,
             )
         self._apply_client_headers_for_base_url(
-            self.base_url,
+            target_base_url,
             apply_user_headers=not route_changed,
+            client_kwargs=target_kwargs,
         )
 
     def _recover_with_credential_pool(

@@ -1029,6 +1029,11 @@ def recover_with_credential_pool(
             kwargs["failure_reason"] = effective_reason.value
         return pool.mark_exhausted_and_rotate(**kwargs)
 
+    def _adopt_pool_entry(entry) -> bool:
+        # ``None`` remains compatible with lightweight legacy agent doubles;
+        # the real AIAgent returns explicit False when concrete adoption fails.
+        return agent._swap_credential(entry) is not False
+
     effective_reason = classified_reason
     if effective_reason is None:
         if status_code == 402:
@@ -1069,8 +1074,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, has_retried_429
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
@@ -1107,8 +1113,9 @@ def recover_with_credential_pool(
                     rotate_status,
                     getattr(next_entry, "id", "?"),
                 )
-                agent._swap_credential(next_entry)
-                return True, False
+                if _adopt_pool_entry(next_entry):
+                    return True, False
+                return False, True
             return False, True
 
         usage_limit_reached = False
@@ -1131,8 +1138,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, True
         return False, True
 
     if effective_reason == FailoverReason.auth:
@@ -1213,20 +1221,24 @@ def recover_with_credential_pool(
                 refresh_counts = getattr(agent, "_auth_pool_refresh_counts", None)
                 if refresh_counts is None:
                     refresh_counts = {}
-                    agent._auth_pool_refresh_counts = refresh_counts
                 refresh_key = (agent.provider, refreshed_id)
-                refresh_counts[refresh_key] = refresh_counts.get(refresh_key, 0) + 1
-                if refresh_counts[refresh_key] > _MAX_AUTH_REFRESH_ATTEMPTS:
+                next_refresh_count = refresh_counts.get(refresh_key, 0) + 1
+                if next_refresh_count > _MAX_AUTH_REFRESH_ATTEMPTS:
                     _ra().logger.warning(
                         "Credential auth failure persists after %s refreshes for "
                         "pool entry %s — treating as unrecoverable and allowing "
                         "fallback to activate.",
-                        refresh_counts[refresh_key] - 1,
+                        next_refresh_count - 1,
                         refreshed_id,
                     )
                     return False, has_retried_429
             _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
-            agent._swap_credential(refreshed)
+            if not _adopt_pool_entry(refreshed):
+                return False, has_retried_429
+            if refreshed_id is not None:
+                if getattr(agent, "_auth_pool_refresh_counts", None) is None:
+                    agent._auth_pool_refresh_counts = refresh_counts
+                refresh_counts[refresh_key] = next_refresh_count
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by the refresh attempt.
@@ -1238,8 +1250,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, has_retried_429
 
     return False, has_retried_429
 
@@ -2306,12 +2319,14 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # constructs a fresh one — no stale closed transport can be reused.
     # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
+    owned_http_client = None
     if "http_client" not in client_kwargs:
         keepalive_http = agent._build_keepalive_http_client(
             client_kwargs.get("base_url", ""), verify=httpx_verify,
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+            owned_http_client = keepalive_http
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop,
     # which honors Retry-After and applies adaptive/jittered backoff. The OpenAI
     # SDK default (max_retries=2) uses its own 1-2s backoff that ignores
@@ -2348,7 +2363,21 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
-    client = _ra().OpenAI(**client_kwargs)
+    try:
+        client = _ra().OpenAI(**client_kwargs)
+    except Exception:
+        # The SDK never took ownership when its constructor failed. Close only
+        # the transport created in this function; caller-supplied clients remain
+        # caller-owned.
+        if owned_http_client is not None:
+            try:
+                owned_http_client.close()
+            except Exception:
+                _ra().logger.debug(
+                    "Failed to close rejected OpenAI constructor transport",
+                    exc_info=True,
+                )
+        raise
     _ra().logger.info(
         "OpenAI client created (%s, shared=%s) %s",
         reason,

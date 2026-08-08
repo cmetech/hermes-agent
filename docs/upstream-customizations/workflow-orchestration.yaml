@@ -290,6 +290,7 @@ upstream_changes:
   overlap_policy: owned_symbol
   files:
   - agent/agent_init.py
+  - agent/agent_runtime_helpers.py
   - agent/anthropic_adapter.py
   - agent/bedrock_adapter.py
   - agent/chat_completion_helpers.py
@@ -315,6 +316,8 @@ upstream_changes:
   - AIAgent.verify_model_visible_prefix
   - AIAgent private execution_route_constraint transport pin
   - AIAgent._assert_execution_route_constraint
+  - AIAgent._replace_primary_openai_client atomic candidate-state adoption
+  - recover_with_credential_pool explicit client-adoption result
   - ProviderCapabilityDriftError bounded pre-transport failure
   - execution_endpoint_sha256 effective SDK endpoint reconstruction
   - sealed Bedrock endpoint-pinned client construction
@@ -345,6 +348,8 @@ upstream_changes:
   - sealed credential refresh and client recreation may update credentials but never provider model API mode or endpoint
   - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
   - sealed environment refresh compares route eligibility through the canonical endpoint digest and advances its seen baseline only after concrete client adoption
+  - sealed Vertex and credential-pool candidates publish their client credentials endpoint kwargs pool identity and retry markers only after concrete construction and exact-route validation succeed
+  - failed sealed client adoption preserves the prior live client and published state so the same candidate remains retryable while any rejected concrete candidate is closed
   - repeated approved structural query values survive real initialization and credential-only client recreation without duplication or collapse
   - a recreated sealed OpenAI client is endpoint-validated before replacing the live shared client
   - every sealed provider reservation reasserts the concrete SDK client endpoint at the last pre-network seam before accounting or provider I/O
@@ -373,7 +378,9 @@ upstream_changes:
     and provider calls. Carry the private selected route constraint into AIAgent
     for the whole attempt, reassert it around every credential refresh and client
     recreation and at every concrete SDK transport reservation, and keep sealed
-    Vertex recovery token-only. Treat route drift as terminal before accounting,
+    Vertex recovery token-only. Publish refreshed sealed client and credential state
+    as one validated transaction; failed adoption must preserve retry eligibility
+    and the prior live state. Treat route drift as terminal before accounting,
     fallback, repair, retry, or provider I/O. Preserve exact legacy recovery
     encodings and never resolve workflow aliases or provider capabilities inside
     clients.

@@ -16,6 +16,7 @@ failover legitimately move the session off the env credential, and config
 
 import os
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,7 @@ REPEATED_DEFAULT_QUERY = {
     "deployment": ("blue", "green"),
     "api-version": "2025-04-01-preview",
 }
+_MISSING = object()
 
 
 def _make_agent(
@@ -116,6 +118,79 @@ def _real_sealed_query_agent(
             skip_memory=True,
         )
     return agent, constraint
+
+
+def _published_openai_state(agent):
+    auth_pool_refresh_counts = getattr(
+        agent, "_auth_pool_refresh_counts", _MISSING
+    )
+    return {
+        "client": agent.client,
+        "api_key": agent.api_key,
+        "base_url": agent.base_url,
+        "client_kwargs": deepcopy(agent._client_kwargs),
+        "credential_pool_entry_id": getattr(
+            agent, "_credential_pool_entry_id", _MISSING
+        ),
+        "env_creds_seen": getattr(agent, "_env_creds_seen", _MISSING),
+        "auth_pool_refresh_counts": (
+            _MISSING
+            if auth_pool_refresh_counts is _MISSING
+            else deepcopy(auth_pool_refresh_counts)
+        ),
+    }
+
+
+def _assert_published_openai_state(agent, expected) -> None:
+    assert agent.client is expected["client"]
+    assert agent.api_key == expected["api_key"]
+    assert agent.base_url == expected["base_url"]
+    assert agent._client_kwargs == expected["client_kwargs"]
+    assert (
+        getattr(agent, "_credential_pool_entry_id", _MISSING)
+        == expected["credential_pool_entry_id"]
+    )
+    assert getattr(agent, "_env_creds_seen", _MISSING) == expected["env_creds_seen"]
+    assert (
+        getattr(agent, "_auth_pool_refresh_counts", _MISSING)
+        == expected["auth_pool_refresh_counts"]
+    )
+
+
+def _fail_first_openai_construction(monkeypatch, agent):
+    import run_agent
+
+    concrete_openai = run_agent.OpenAI
+    attempts = []
+
+    def construct(**kwargs):
+        attempts.append(
+            {
+                "api_key": kwargs.get("api_key"),
+                "base_url": str(kwargs.get("base_url") or ""),
+                "default_query": deepcopy(kwargs.get("default_query")),
+                "http_client": kwargs.get("http_client"),
+                "published_client": agent.client,
+                "published_api_key": agent.api_key,
+                "published_base_url": agent.base_url,
+                "published_client_kwargs": deepcopy(agent._client_kwargs),
+                "published_pool_entry_id": getattr(
+                    agent, "_credential_pool_entry_id", _MISSING
+                ),
+                "published_env_creds_seen": getattr(
+                    agent, "_env_creds_seen", _MISSING
+                ),
+                "published_auth_pool_refresh_counts": deepcopy(
+                    getattr(agent, "_auth_pool_refresh_counts", _MISSING)
+                ),
+            }
+        )
+        if len(attempts) == 1:
+            raise RuntimeError("deterministic SDK constructor failure")
+        return concrete_openai(**kwargs)
+
+    monkeypatch.setattr(run_agent, "OpenAI", construct)
+    return attempts
 
 
 @pytest.fixture
@@ -293,50 +368,6 @@ class TestRouteConfigRefresh:
 
 
 class TestVertexRefresh:
-    def test_sealed_route_refreshes_token_without_deriving_endpoint(
-        self, monkeypatch
-    ):
-        import agent.vertex_adapter as vertex_adapter
-
-        sealed_base = (
-            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
-            "config-project/locations/us-central1/endpoints/openapi"
-        )
-        agent = _make_agent(
-            provider="vertex",
-            base_url=sealed_base,
-            api_key="expired-token",
-        )
-        agent._execution_route_constraint = _sealed_route_constraint(
-            provider="vertex",
-            base_url=sealed_base,
-        )
-        monkeypatch.setattr(
-            vertex_adapter,
-            "get_vertex_credentials",
-            lambda: ("fresh-token", "credential-project"),
-        )
-        monkeypatch.setattr(
-            vertex_adapter,
-            "get_vertex_config",
-            lambda: (_ for _ in ()).throw(
-                AssertionError("sealed refresh derived a Vertex endpoint")
-            ),
-        )
-
-        assert agent._try_refresh_vertex_client_credentials() is True
-        assert agent.api_key == "fresh-token"
-        assert agent.base_url == sealed_base
-        assert agent._client_kwargs == {
-            "base_url": sealed_base,
-            "api_key": "fresh-token",
-        }
-        assert (agent.provider, agent.model, agent.api_mode) == (
-            "vertex",
-            "test-model",
-            "chat_completions",
-        )
-
     def test_unsealed_refresh_retains_endpoint_derivation_behavior(self, monkeypatch):
         import agent.vertex_adapter as vertex_adapter
 
@@ -344,21 +375,38 @@ class TestVertexRefresh:
             "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/"
             "credential-project/locations/europe-west4/endpoints/openapi"
         )
-        agent = _make_agent(
-            provider="vertex",
-            base_url="https://old-vertex.example/v1",
-            api_key="expired-token",
-        )
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+        ):
+            agent = AIAgent(
+                provider="vertex",
+                requested_provider="vertex",
+                model="test-model",
+                api_mode="chat_completions",
+                base_url="https://old-vertex.example/v1",
+                api_key="expired-token",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        old_client = agent.client
         monkeypatch.setattr(
             vertex_adapter,
             "get_vertex_config",
             lambda: ("fresh-token", refreshed_base),
         )
 
-        assert agent._try_refresh_vertex_client_credentials() is True
-        assert agent.api_key == "fresh-token"
-        assert agent.base_url == refreshed_base
-        assert agent._client_kwargs["base_url"] == refreshed_base
+        try:
+            assert agent._try_refresh_vertex_client_credentials() is True
+            assert agent.client is not old_client
+            assert agent.client.api_key == "fresh-token"
+            assert agent.api_key == "fresh-token"
+            assert agent.base_url == refreshed_base
+            assert agent._client_kwargs["base_url"] == refreshed_base
+        finally:
+            agent.client.close()
+            old_client.close()
 
 
 def test_conversation_blocks_sealed_route_mutation_before_turn_setup(monkeypatch):
@@ -403,27 +451,6 @@ def test_sealed_route_malformed_runtime_endpoint_has_bounded_failure() -> None:
 
     assert str(caught.value) == "provider_capability_drift"
     assert private_endpoint not in str(caught.value)
-
-
-def test_sealed_credential_rotation_updates_key_without_endpoint() -> None:
-    agent = _make_agent(provider="gmi", base_url=GMI_BASE)
-    agent._execution_route_constraint = _sealed_route_constraint(
-        provider="gmi", base_url=GMI_BASE
-    )
-    entry = SimpleNamespace(
-        id="rotated",
-        runtime_api_key="sk-rotated",
-        runtime_base_url=LOCAL_BASE,
-    )
-
-    agent._swap_credential(entry)
-
-    assert agent.api_key == "sk-rotated"
-    assert agent.base_url == GMI_BASE
-    assert agent._client_kwargs["base_url"] == GMI_BASE
-    agent._replace_primary_openai_client.assert_called_once_with(
-        reason="credential_rotation"
-    )
 
 
 def test_sealed_codex_refresh_recreates_client_without_endpoint_drift(
@@ -610,6 +637,88 @@ def test_real_sealed_vertex_refresh_preserves_query_without_duplication(
         old_client.close()
 
 
+def test_sealed_vertex_constructor_failure_is_atomic_and_retries_same_token(
+    monkeypatch,
+) -> None:
+    import agent.vertex_adapter as vertex_adapter
+
+    agent, constraint = _real_sealed_query_agent(
+        provider="vertex",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="expired-token",
+    )
+    old_client = agent.client
+    agent._credential_pool_entry_id = "original-entry"
+    agent._env_creds_seen = (constraint.identity.endpoint_sha256, "expired-token")
+    agent._auth_pool_refresh_counts = {("vertex", "original-entry"): 1}
+    original_state = _published_openai_state(agent)
+    credential_reads = []
+
+    def get_vertex_credentials():
+        credential_reads.append("fresh-token")
+        return "fresh-token", "credential-project"
+
+    monkeypatch.setattr(
+        vertex_adapter,
+        "get_vertex_credentials",
+        get_vertex_credentials,
+    )
+    monkeypatch.setattr(
+        vertex_adapter,
+        "get_vertex_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("sealed refresh derived a Vertex endpoint")
+        ),
+    )
+    attempts = _fail_first_openai_construction(monkeypatch, agent)
+
+    try:
+        assert agent._try_refresh_vertex_client_credentials() is False
+
+        _assert_published_openai_state(agent, original_state)
+        assert agent._is_openai_client_closed(old_client) is False
+        assert attempts[0]["http_client"].is_closed is True
+
+        assert agent._try_refresh_vertex_client_credentials() is True
+
+        assert credential_reads == ["fresh-token", "fresh-token"]
+        assert [attempt["api_key"] for attempt in attempts] == [
+            "fresh-token",
+            "fresh-token",
+        ]
+        assert all(
+            attempt["published_client"] is old_client
+            and attempt["published_api_key"] == original_state["api_key"]
+            and attempt["published_base_url"] == original_state["base_url"]
+            and attempt["published_client_kwargs"]
+            == original_state["client_kwargs"]
+            and attempt["published_pool_entry_id"] == "original-entry"
+            and attempt["published_env_creds_seen"]
+            == original_state["env_creds_seen"]
+            and attempt["published_auth_pool_refresh_counts"]
+            == original_state["auth_pool_refresh_counts"]
+            for attempt in attempts
+        )
+        assert agent.client is not old_client
+        assert agent.client.api_key == "fresh-token"
+        assert agent.api_key == "fresh-token"
+        assert agent.base_url == original_state["base_url"]
+        assert agent._client_kwargs["default_query"] == REPEATED_DEFAULT_QUERY
+        assert agent.client.default_query == REPEATED_DEFAULT_QUERY
+        assert agent._credential_pool_entry_id == "original-entry"
+        assert agent._env_creds_seen == original_state["env_creds_seen"]
+        assert agent._auth_pool_refresh_counts == original_state[
+            "auth_pool_refresh_counts"
+        ]
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        if attempts and not attempts[0]["http_client"].is_closed:
+            attempts[0]["http_client"].close()
+        if agent.client is not old_client:
+            agent.client.close()
+        old_client.close()
+
+
 def test_sealed_query_endpoint_rejects_unauthorized_default_query_change() -> None:
     agent, _constraint = _real_sealed_query_agent()
     try:
@@ -672,10 +781,17 @@ def test_repeated_approved_query_rejects_changed_value_before_transport() -> Non
         agent.client.close()
 
 
-def test_sealed_query_credential_rotation_keeps_split_transport_endpoint() -> None:
-    agent, constraint = _real_sealed_query_agent()
+def test_sealed_pool_constructor_failure_is_atomic_and_retries_same_entry(
+    monkeypatch,
+) -> None:
+    agent, constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
     old_client = agent.client
-    agent._replace_primary_openai_client = MagicMock(return_value=True)
+    agent._credential_pool_entry_id = "original-entry"
+    agent._env_creds_seen = (constraint.identity.endpoint_sha256, "test-credential")
+    agent._auth_pool_refresh_counts = None
+    original_state = _published_openai_state(agent)
     entry = SimpleNamespace(
         id="rotated",
         runtime_api_key="rotated-credential",
@@ -684,19 +800,131 @@ def test_sealed_query_credential_rotation_keeps_split_transport_endpoint() -> No
             "?api-version=2026-01-01"
         ),
     )
-    try:
-        agent._swap_credential(entry)
+    attempted_entries = []
 
+    class RetrySameCandidatePool:
+        provider = "azure-foundry"
+
+        @staticmethod
+        def current():
+            return SimpleNamespace(
+                id="original-entry",
+                runtime_api_key="test-credential",
+            )
+
+        @staticmethod
+        def entries():
+            return []
+
+        @staticmethod
+        def try_refresh_matching(**_kwargs):
+            attempted_entries.append(entry.id)
+            return entry
+
+    agent._credential_pool = RetrySameCandidatePool()
+    attempts = _fail_first_openai_construction(monkeypatch, agent)
+
+    try:
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=401,
+            has_retried_429=False,
+        )
+
+        assert recovered is False
+        assert retry_same is False
+        _assert_published_openai_state(agent, original_state)
+        assert agent._is_openai_client_closed(old_client) is False
+        assert attempts[0]["http_client"].is_closed is True
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=401,
+            has_retried_429=False,
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert attempted_entries == ["rotated", "rotated"]
+        assert [attempt["api_key"] for attempt in attempts] == [
+            "rotated-credential",
+            "rotated-credential",
+        ]
+        assert all(
+            attempt["published_client"] is old_client
+            and attempt["published_api_key"] == original_state["api_key"]
+            and attempt["published_base_url"] == original_state["base_url"]
+            and attempt["published_client_kwargs"]
+            == original_state["client_kwargs"]
+            and attempt["published_pool_entry_id"] == "original-entry"
+            and attempt["published_env_creds_seen"]
+            == original_state["env_creds_seen"]
+            and attempt["published_auth_pool_refresh_counts"]
+            == original_state["auth_pool_refresh_counts"]
+            for attempt in attempts
+        )
+        assert agent.client is not old_client
+        assert agent.client.api_key == "rotated-credential"
         assert agent.api_key == "rotated-credential"
         assert agent.base_url == (
             "https://tenant.openai.azure.com/openai/deployments/review"
         )
         assert agent._client_kwargs["base_url"] == agent.base_url
-        assert agent._client_kwargs["default_query"] == {
-            "api-version": "2025-04-01-preview"
+        assert agent._client_kwargs["default_query"] == REPEATED_DEFAULT_QUERY
+        assert agent.client.default_query == REPEATED_DEFAULT_QUERY
+        assert agent._credential_pool_entry_id == "rotated"
+        assert agent._env_creds_seen == original_state["env_creds_seen"]
+        assert agent._auth_pool_refresh_counts == {
+            ("azure-foundry", "rotated"): 1
         }
-        assert agent._assert_execution_route_constraint() is constraint
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
     finally:
+        if attempts and not attempts[0]["http_client"].is_closed:
+            attempts[0]["http_client"].close()
+        if agent.client is not old_client:
+            agent.client.close()
+        old_client.close()
+
+
+def test_drifted_concrete_replacement_is_closed_and_never_published() -> None:
+    import httpx
+
+    agent, _constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
+    old_client = agent.client
+    agent._credential_pool_entry_id = "original-entry"
+    original_state = _published_openai_state(agent)
+    candidate_http_client = httpx.Client()
+    candidate_kwargs = deepcopy(agent._client_kwargs)
+    candidate_kwargs.update(
+        {
+            "api_key": "private-candidate-token",
+            "default_query": {
+                "deployment": ("blue", "red"),
+                "api-version": "2025-04-01-preview",
+            },
+            "http_client": candidate_http_client,
+        }
+    )
+
+    try:
+        with pytest.raises(ProviderCapabilityDriftError) as caught:
+            agent._replace_primary_openai_client(
+                reason="drifted_candidate_test",
+                client_kwargs=candidate_kwargs,
+                api_key="private-candidate-token",
+                base_url=agent.base_url,
+                credential_pool_entry_id="candidate-entry",
+            )
+
+        assert str(caught.value) == "provider_capability_drift"
+        assert "private-candidate-token" not in str(caught.value)
+        assert REPEATED_QUERY_ENDPOINT not in str(caught.value)
+        _assert_published_openai_state(agent, original_state)
+        assert candidate_http_client.is_closed is True
+        assert agent._is_openai_client_closed(old_client) is False
+    finally:
+        if not candidate_http_client.is_closed:
+            candidate_http_client.close()
         old_client.close()
 
 
