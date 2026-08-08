@@ -812,6 +812,45 @@ class AgentNodeExecutor:
                 metadata=metadata,
             )
 
+        if (
+            phase5
+            and repair_result.status == "failed"
+            and repair_result.audit.get("failure_kind") == "budget_exhausted"
+            and type(repair_result.audit.get("provider_attempts")) is int
+            and repair_result.audit.get("provider_attempts") == 0
+            and type(repair_result.audit.get("model_calls")) is int
+            and repair_result.audit.get("model_calls") == 0
+            and repair_result.audit.get("known_no_effect") is True
+        ):
+            metadata["usage"] = _aggregate_usage(
+                initial_result.usage,
+                repair_result.usage,
+            )
+            aggregate_audit = dict(initial_result.audit)
+            aggregate_audit.update({
+                "provider_attempts": first_provider_attempts,
+                "model_calls": first_model_calls,
+                "api_calls": first_model_calls,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "repair_accounting": "exact",
+                "provider_attempts_exact": True,
+                "model_calls_exact": True,
+                "api_calls_exact": True,
+                "repair_failure_kind": "budget_exhausted",
+            })
+            metadata["audit"] = aggregate_audit
+            metadata["provider_attempts"] = max(0, first_provider_attempts - 1)
+            metadata["provider_attempts_exact"] = True
+            metadata["repair_disposition"] = "budget_exhausted"
+            return NodeExecutionResult(
+                "failed",
+                error_code="budget_exhausted",
+                error_message="structured repair budget exhausted",
+                metadata=metadata,
+            )
+
         metadata["usage"] = _aggregate_usage(initial_result.usage, repair_result.usage)
         repair_counts: tuple[int, int] | None = None
         if repair_result.structured_output is not None:

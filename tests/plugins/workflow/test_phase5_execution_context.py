@@ -474,6 +474,75 @@ def test_phase5_budget_exhaustion_is_terminal_and_never_repairs(tmp_path) -> Non
     assert len(runner.requests) == 1
 
 
+def test_phase5_repair_budget_exhaustion_preserves_exact_primary_accounting(
+    tmp_path,
+) -> None:
+    context = _structured_context(tmp_path)
+
+    class RepairBudgetExhaustedRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            if len(self.requests) == 2:
+                return PluginAgentRunResult(
+                    final_response="",
+                    session_id=None,
+                    provider=request.expected_runtime_identity["provider"],
+                    model=request.model or "",
+                    status="failed",
+                    pending_interaction=None,
+                    usage={},
+                    audit={
+                        "failure_kind": "budget_exhausted",
+                        "provider_attempts": 0,
+                        "model_calls": 0,
+                        "known_no_effect": True,
+                    },
+                )
+            evidence = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": "test",
+            }
+            return PluginAgentRunResult(
+                final_response='{"answer":"invalid"} trailing',
+                session_id="primary-session",
+                provider=request.expected_runtime_identity["provider"],
+                model=request.model or "",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    **evidence,
+                    "api_mode": request.expected_runtime_identity["api_mode"],
+                    "intended_authority_digest": request.intended_authority_digest,
+                    "model_visible_prefix_digest": "9" * 64,
+                },
+                structured_output=evidence,
+            )
+
+    runner = RepairBudgetExhaustedRunner()
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "budget_exhausted"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.metadata["provider_attempts"] == 0
+    assert result.metadata["provider_attempts_exact"] is True
+    assert result.metadata["audit"]["provider_attempts"] == 1
+    assert result.metadata["audit"]["provider_attempts_exact"] is True
+    assert result.metadata["audit"]["model_calls"] == 1
+    assert result.metadata["audit"]["model_calls_exact"] is True
+    assert len(runner.requests) == 2
+
+
 def test_phase5_repair_decision_contradiction_blocks_before_repair_launch(
     tmp_path,
 ) -> None:
