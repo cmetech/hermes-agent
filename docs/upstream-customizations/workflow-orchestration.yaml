@@ -274,6 +274,7 @@ upstream_changes:
   - _ProviderAliasRegistration loader-authored alias provenance
   - canonical-first provider token lookup and alias collision arbitration
   - registry-first public provider and authentication resolution
+  - registration-gated Bedrock and Vertex synthetic endpoint derivation
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -283,6 +284,7 @@ upstream_changes:
   - replacing a canonical registration removes only that registration's stale alias claims
   - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
   - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
+  - Bedrock and Vertex endpoint synthesis requires a bundled winner or no registration for legacy compatibility; non-bundled same-name winners use their registered profile endpoint
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -305,8 +307,11 @@ upstream_changes:
     retain last-writer compatibility. Public provider and authentication
     resolution must consume that same registry winner before static aliases or
     built-in metadata while preserving exact user-config provider priority and
-    agreed bundled overlay metadata. Diagnostics remain bounded and free of local
-    paths, credentials, or provider payloads.
+    agreed bundled overlay metadata. Bedrock and Vertex regional endpoint
+    synthesis is bundled authority (with an unregistered legacy fallback), so a
+    non-bundled same-name winner must retain its profile endpoint and provenance.
+    Diagnostics remain bounded and free of local paths, credentials, or provider
+    payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic
     provider-registration authority with immutable loader provenance, closure
     identity, and canonical transport round-tripping.

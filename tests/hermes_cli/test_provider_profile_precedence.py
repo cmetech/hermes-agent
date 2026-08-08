@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 from pathlib import Path
 import sys
 
@@ -453,3 +454,115 @@ def test_credential_free_runtime_uses_registry_winner_not_hardcoded_alias(
         api_mode="chat_completions",
         base_url="https://user-aws.example/v1",
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "bundled_aliases", "profile_base_url", "provider_config"),
+    [
+        (
+            "bedrock",
+            ("aws",),
+            "https://user-bedrock.example/v1",
+            {"api_mode": "chat_completions", "region": "eu-west-1"},
+        ),
+        (
+            "vertex",
+            ("google-vertex",),
+            "https://user-vertex.example/v1",
+            {"api_mode": "chat_completions"},
+        ),
+    ],
+    ids=("bedrock-user-override", "vertex-user-override"),
+)
+def test_same_name_user_cloud_provider_uses_registered_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+    provider: str,
+    bundled_aliases: tuple[str, ...],
+    profile_base_url: str,
+    provider_config: dict[str, str],
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        f"{provider}-bundled-probe",
+        registered_name=provider,
+        marker=f"bundled-{provider}",
+        aliases=bundled_aliases,
+    )
+    _write_plugin(
+        user_root,
+        f"{provider}-user-probe",
+        registered_name=provider,
+        marker=f"user-{provider}",
+        aliases=(),
+        base_url=profile_base_url,
+    )
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    from hermes_cli.runtime_provider import classify_execution_runtime
+
+    runtime = classify_execution_runtime(
+        provider=provider,
+        model_config={"provider": provider, "default": "user-model"},
+        provider_config=provider_config,
+    )
+    expected_endpoint = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0" + profile_base_url.encode("utf-8")
+    ).hexdigest()
+
+    assert runtime.effective_provider == provider
+    assert runtime.registration_origin_kind == "user_plugin"
+    assert runtime.base_url_trust_class == "unknown"
+    assert runtime.endpoint_sha256 == expected_endpoint
+    assert runtime.endpoint_identity_error is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "provider_config", "legacy_endpoint"),
+    [
+        (
+            "bedrock",
+            {"api_mode": "bedrock_converse", "region": "eu-central-1"},
+            "https://bedrock-runtime.eu-central-1.amazonaws.com",
+        ),
+        (
+            "vertex",
+            {
+                "api_mode": "chat_completions",
+                "project_id": "legacy-project",
+                "region": "europe-west4",
+            },
+            "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/"
+            "legacy-project/locations/europe-west4/endpoints/openapi",
+        ),
+    ],
+    ids=("bedrock-unregistered", "vertex-unregistered"),
+)
+def test_unregistered_legacy_cloud_provider_keeps_endpoint_synthesis(
+    isolated_provider_registry: None,
+    provider: str,
+    provider_config: dict[str, str],
+    legacy_endpoint: str,
+) -> None:
+    from hermes_cli.runtime_provider import classify_execution_runtime
+
+    runtime = classify_execution_runtime(
+        provider=provider,
+        model_config={"provider": provider, "default": "legacy-model"},
+        provider_config=provider_config,
+    )
+    expected_endpoint = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0" + legacy_endpoint.encode("utf-8")
+    ).hexdigest()
+
+    assert runtime.registration_origin_kind == ""
+    assert runtime.endpoint_sha256 == expected_endpoint
+    assert runtime.endpoint_identity_error is None

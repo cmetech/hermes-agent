@@ -1010,6 +1010,19 @@ def _configured_execution_endpoint(
 
     canonical = _canonical_execution_provider(provider)
     config = provider_config if isinstance(provider_config, Mapping) else {}
+    if canonical in {"bedrock", "vertex"}:
+        requested = provider.strip().lower() if isinstance(provider, str) else ""
+        try:
+            from providers import get_provider_registration
+
+            registration = get_provider_registration(requested)
+        except Exception:
+            return "", None
+        if (
+            registration is not None
+            and registration.provenance.origin_kind != "bundled"
+        ):
+            return "", None
     if canonical == "bedrock":
         region = _endpoint_config_segment(config.get("region", "us-east-1"))
         if not region:
