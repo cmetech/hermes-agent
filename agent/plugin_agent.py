@@ -1059,30 +1059,13 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             "expected model-visible prefix requires sealed intended authority"
         )
     if request.expected_runtime_identity is not None:
-        expected_runtime_fields = {
-            "provider",
-            "model",
-            "api_mode",
-            "base_url_trust_class",
-            "registration_provenance_digest",
-        }
-        if (
-            not isinstance(request.expected_runtime_identity, Mapping)
-            or set(request.expected_runtime_identity) != expected_runtime_fields
-            or any(
-                not isinstance(request.expected_runtime_identity[field], str)
-                or not request.expected_runtime_identity[field]
-                for field in expected_runtime_fields
-            )
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                request.expected_runtime_identity[
-                    "registration_provenance_digest"
-                ],
-            )
-            is None
-        ):
-            raise ValueError("expected runtime identity is malformed")
+        from hermes_cli.runtime_provider import (
+            execution_runtime_identity_from_sealed_route,
+        )
+
+        execution_runtime_identity_from_sealed_route(
+            request.expected_runtime_identity
+        )
         if request.intended_authority_digest is None:
             raise ValueError(
                 "expected runtime identity requires sealed intended authority"
@@ -1295,27 +1278,18 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             ):
                 raise ValueError("sealed fallback route is malformed")
         identity = fallback.get("expected_runtime_identity")
-        expected_runtime_fields = {
-            "provider",
-            "model",
-            "api_mode",
-            "base_url_trust_class",
-            "registration_provenance_digest",
-        }
+        try:
+            from hermes_cli.runtime_provider import (
+                execution_runtime_identity_from_sealed_route,
+            )
+
+            fallback_identity = execution_runtime_identity_from_sealed_route(identity)
+        except (TypeError, ValueError):
+            fallback_identity = None
         if (
-            not isinstance(identity, Mapping)
-            or set(identity) != expected_runtime_fields
-            or identity.get("provider") != fallback.get("effective_provider")
-            or identity.get("model") != fallback.get("model")
-            or any(
-                not isinstance(identity.get(field), str) or not identity.get(field)
-                for field in expected_runtime_fields
-            )
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                str(identity.get("registration_provenance_digest", "")),
-            )
-            is None
+            fallback_identity is None
+            or fallback_identity.provider != fallback.get("effective_provider")
+            or fallback_identity.model != fallback.get("model")
         ):
             raise ValueError("sealed fallback route is malformed")
     if request.ephemeral_system_prompt is not None and not isinstance(

@@ -47,6 +47,7 @@ def _route(
         model=model,
         api_mode="chat_completions",
         route_fingerprint=("3" if role == "primary" else "4") * 64,
+        endpoint_sha256="6" * 64,
         registration_provenance_digest="5" * 64,
         provider_options=options or {},
         config_scope="profile",
@@ -512,6 +513,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         "model": "anthropic/claude-sonnet-4.6",
         "api_mode": "chat_completions",
         "base_url_trust_class": "trusted_direct",
+        "endpoint_sha256": "6" * 64,
         "registration_provenance_digest": "5" * 64,
     }
     structured_schema = normalize_schema({"type": "object"})

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
 import logging
 import os
 import re
@@ -122,6 +123,19 @@ _CREDENTIAL_ROUTE_QUERY_KEYS = frozenset({
     "x-amz-signedheaders",
 })
 _UNCLASSIFIED_ROUTE_QUERY = "unclassified_query_parameter"
+_PROVIDER_ENDPOINT_IDENTITY_INVALID = "provider_endpoint_identity_invalid"
+_EXECUTION_ENDPOINT_IDENTITY_DOMAIN = b"hermes-execution-endpoint-v1\0"
+_NO_EXECUTION_ENDPOINT_SENTINEL = b"no-endpoint-v1"
+_ENDPOINTLESS_EXECUTION_API_MODES = frozenset({"codex_app_server"})
+_RUNTIME_IDENTITY_FIELDS = frozenset({
+    "provider",
+    "model",
+    "api_mode",
+    "base_url_trust_class",
+    "endpoint_sha256",
+    "registration_provenance_digest",
+})
+_LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class _UnclassifiedRouteQuery(ValueError):
@@ -164,6 +178,53 @@ def _credential_free_route_url(value: object) -> str:
     return urlunsplit(
         (scheme, normalized_host, parsed.path or "", structural_query, "")
     ).rstrip("/")
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionEndpointIdentity:
+    endpoint_sha256: str
+    error_code: str | None
+
+
+def _execution_endpoint_identity(
+    *,
+    provider: str,
+    api_mode: str,
+    base_url: str,
+) -> _ExecutionEndpointIdentity:
+    """Bind execution identity to normalized, credential-free route structure."""
+    effective_base_url = base_url.strip() if isinstance(base_url, str) else ""
+    if not effective_base_url:
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(provider.strip().lower())
+        except Exception:
+            profile = None
+        if profile is not None:
+            effective_base_url = str(getattr(profile, "base_url", "") or "").strip()
+
+    if effective_base_url:
+        try:
+            normalized_endpoint = _credential_free_route_url(effective_base_url)
+        except _UnclassifiedRouteQuery:
+            return _ExecutionEndpointIdentity("", _UNCLASSIFIED_ROUTE_QUERY)
+        if not normalized_endpoint:
+            return _ExecutionEndpointIdentity(
+                "", _PROVIDER_ENDPOINT_IDENTITY_INVALID
+            )
+        endpoint_material = normalized_endpoint.encode("utf-8")
+    elif api_mode in _ENDPOINTLESS_EXECUTION_API_MODES:
+        endpoint_material = _NO_EXECUTION_ENDPOINT_SENTINEL
+    else:
+        return _ExecutionEndpointIdentity("", _PROVIDER_ENDPOINT_IDENTITY_INVALID)
+
+    return _ExecutionEndpointIdentity(
+        hashlib.sha256(
+            _EXECUTION_ENDPOINT_IDENTITY_DOMAIN + endpoint_material
+        ).hexdigest(),
+        None,
+    )
 
 
 def _loopback_hostname(host: str) -> bool:
@@ -515,6 +576,73 @@ class ExecutionRuntimeCapabilities:
     registration_distribution_id: str = field(default="", compare=False)
     registration_provenance_digest: str = field(default="", compare=False)
     registration_provenance_complete: bool = field(default=False, compare=False)
+    endpoint_sha256: str = field(default="", compare=False)
+    endpoint_identity_error: str | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class ExecutionRuntimeIdentity:
+    provider: str
+    model: str
+    api_mode: str
+    base_url_trust_class: str
+    endpoint_sha256: str
+    registration_provenance_digest: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "api_mode": self.api_mode,
+            "base_url_trust_class": self.base_url_trust_class,
+            "endpoint_sha256": self.endpoint_sha256,
+            "registration_provenance_digest": self.registration_provenance_digest,
+        }
+
+
+def execution_runtime_identity(
+    capabilities: ExecutionRuntimeCapabilities,
+) -> ExecutionRuntimeIdentity:
+    if not isinstance(capabilities, ExecutionRuntimeCapabilities):
+        raise TypeError("capabilities must be ExecutionRuntimeCapabilities")
+    if capabilities.endpoint_identity_error or not capabilities.endpoint_sha256:
+        raise ValueError(
+            capabilities.endpoint_identity_error
+            or _PROVIDER_ENDPOINT_IDENTITY_INVALID
+        )
+    return ExecutionRuntimeIdentity(
+        provider=capabilities.effective_provider,
+        model=capabilities.model,
+        api_mode=capabilities.api_mode,
+        base_url_trust_class=capabilities.base_url_trust_class,
+        endpoint_sha256=capabilities.endpoint_sha256,
+        registration_provenance_digest=(
+            capabilities.registration_provenance_digest
+        ),
+    )
+
+
+def execution_runtime_identity_from_sealed_route(
+    route: Mapping[str, object],
+) -> ExecutionRuntimeIdentity:
+    """Decode the exact private six-field identity carried on the worker wire."""
+    if not isinstance(route, Mapping) or set(route) != _RUNTIME_IDENTITY_FIELDS:
+        raise ValueError("expected runtime identity is malformed")
+    if any(not isinstance(route[field], str) or not route[field] for field in route):
+        raise ValueError("expected runtime identity is malformed")
+    for digest_field in ("endpoint_sha256", "registration_provenance_digest"):
+        if _LOWERCASE_SHA256_RE.fullmatch(str(route[digest_field])) is None:
+            raise ValueError("expected runtime identity is malformed")
+    return ExecutionRuntimeIdentity(
+        provider=str(route["provider"]),
+        model=str(route["model"]),
+        api_mode=str(route["api_mode"]),
+        base_url_trust_class=str(route["base_url_trust_class"]),
+        endpoint_sha256=str(route["endpoint_sha256"]),
+        registration_provenance_digest=str(
+            route["registration_provenance_digest"]
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -694,6 +822,11 @@ def _classify_execution_api_mode(
     except Exception:
         registration = None
     provenance = registration.provenance if registration is not None else None
+    endpoint_identity = _execution_endpoint_identity(
+        provider=normalized_provider,
+        api_mode=normalized,
+        base_url=normalized_base_url,
+    )
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
         hermes_managed_tool_loop=(
@@ -714,6 +847,8 @@ def _classify_execution_api_mode(
         registration_provenance_complete=(
             provenance.code_closure_complete if provenance else False
         ),
+        endpoint_sha256=endpoint_identity.endpoint_sha256,
+        endpoint_identity_error=endpoint_identity.error_code,
     )
 
 
@@ -894,6 +1029,8 @@ def classify_configured_execution_route(
         registration_provenance_complete=(
             classified.registration_provenance_complete
         ),
+        endpoint_sha256="",
+        endpoint_identity_error=route.route_evidence_error,
     )
 
 

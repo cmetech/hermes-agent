@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import socket
 import subprocess
@@ -11,6 +12,149 @@ import requests
 from hermes_cli import providers as provider_definitions
 from hermes_cli import runtime_provider as rp
 import providers as provider_profiles
+
+
+def _runtime_identity(
+    base_url: str,
+    *,
+    provider: str = "custom",
+    api_mode: str = "chat_completions",
+):
+    return rp.execution_runtime_identity(
+        rp.classify_execution_runtime(
+            provider=provider,
+            model_config={"provider": provider, "default": "test-model"},
+            provider_config={"api_mode": api_mode, "base_url": base_url},
+        )
+    )
+
+
+def test_runtime_identity_accepts_normalization_equivalent_endpoint() -> None:
+    left = _runtime_identity("https://EXAMPLE.test:443/v1/")
+    right = _runtime_identity("https://example.test/v1")
+
+    assert left.endpoint_sha256 == right.endpoint_sha256
+    assert left.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://example.test/v1"
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "https://example.test/v2",
+        "https://other.test/v1",
+        "http://example.test/v1",
+        "https://example.test:8443/v1",
+    ],
+)
+def test_runtime_identity_distinguishes_structural_endpoint_changes(changed) -> None:
+    assert _runtime_identity(changed).endpoint_sha256 != _runtime_identity(
+        "https://example.test/v1"
+    ).endpoint_sha256
+
+
+def test_runtime_identity_query_evidence_is_structural_and_credential_free() -> None:
+    baseline = _runtime_identity(
+        "https://example.test/v1?region=us-east-1&token=first-secret"
+    )
+    changed_region = _runtime_identity(
+        "https://example.test/v1?region=eu-west-1&token=first-secret"
+    )
+    changed_token = _runtime_identity(
+        "https://example.test/v1?region=us-east-1&token=second-secret"
+    )
+
+    assert changed_region.endpoint_sha256 != baseline.endpoint_sha256
+    assert changed_token.endpoint_sha256 == baseline.endpoint_sha256
+    assert "first-secret" not in repr(baseline)
+    assert "first-secret" not in json.dumps(baseline.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_error"),
+    [
+        ("https://example.test/v1?unknown=secret-value", "unclassified_query_parameter"),
+        ("https://example.test:invalid/v1", "provider_endpoint_identity_invalid"),
+        ("ftp://example.test/v1", "provider_endpoint_identity_invalid"),
+        ("not-a-url", "provider_endpoint_identity_invalid"),
+    ],
+)
+def test_runtime_identity_blocks_unresolvable_endpoint(base_url, expected_error) -> None:
+    capabilities = rp.classify_execution_runtime(
+        provider="custom",
+        model_config={"provider": "custom", "default": "test-model"},
+        provider_config={"api_mode": "chat_completions", "base_url": base_url},
+    )
+
+    assert capabilities.endpoint_sha256 == ""
+    assert capabilities.endpoint_identity_error == expected_error
+    assert "secret-value" not in repr(capabilities)
+
+
+def test_runtime_identity_uses_provider_profile_default_when_route_omits_base_url(
+    monkeypatch,
+) -> None:
+    profile = SimpleNamespace(
+        name="sealed-provider",
+        base_url="https://PROFILE.example:443/v1/",
+        structured_output_strategy=None,
+    )
+    monkeypatch.setattr(
+        provider_profiles,
+        "get_provider_profile",
+        lambda name: profile if name == "sealed-provider" else None,
+    )
+
+    admission = rp.classify_execution_runtime(
+        provider="sealed-provider",
+        model_config={"provider": "sealed-provider", "default": "sealed-model"},
+        provider_config={"api_mode": "chat_completions"},
+    )
+    worker = rp.classify_resolved_execution_runtime({
+        "provider": "sealed-provider",
+        "model": "sealed-model",
+        "api_mode": "chat_completions",
+    })
+
+    assert rp.execution_runtime_identity(admission) == rp.execution_runtime_identity(worker)
+    assert admission.endpoint_identity_error is None
+
+
+def test_runtime_identity_uses_versioned_sentinel_only_for_endpointless_mode() -> None:
+    assert rp._ENDPOINTLESS_EXECUTION_API_MODES == frozenset({"codex_app_server"})
+    endpointless = rp.classify_execution_runtime(
+        provider="provider-without-profile",
+        model_config={"provider": "provider-without-profile", "default": "model"},
+        provider_config={"api_mode": "codex_app_server"},
+    )
+    concrete = rp.classify_execution_runtime(
+        provider="provider-without-profile",
+        model_config={"provider": "provider-without-profile", "default": "model"},
+        provider_config={
+            "api_mode": "codex_app_server",
+            "base_url": "https://endpoint.test/v1",
+        },
+    )
+
+    assert endpointless.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0no-endpoint-v1"
+    ).hexdigest()
+    assert endpointless.endpoint_identity_error is None
+    assert concrete.endpoint_sha256 != endpointless.endpoint_sha256
+
+
+def test_runtime_identity_to_dict_is_exact_six_field_codec() -> None:
+    identity = _runtime_identity("https://example.test/v1")
+
+    assert set(identity.to_dict()) == {
+        "provider",
+        "model",
+        "api_mode",
+        "base_url_trust_class",
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    }
 
 
 def test_bundled_profile_api_modes_round_trip_without_runtime_io(monkeypatch):

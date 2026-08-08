@@ -146,7 +146,46 @@ def test_v5_format2_seals_exact_canonical_provider_authority(tmp_path, workflow_
     assert resources["provider_resolution_sha256"] == digest
     assert prepared.provider_resolution_sha256 == digest
     assert projection["provider_resolution_sha256"] == digest
+    assert prepared.snapshot_format_version == 2
+    assert recovered.schema_version == 2
+    assert recovered.resolver_version == 2
+    assert all(route.endpoint_sha256 for route in recovered.routes.values())
     verify_sealed_snapshot(projection, run_directory=run_directory)
+
+
+@pytest.mark.parametrize("mutation", ["tamper_endpoint", "delete_endpoint"])
+def test_v5_endpoint_digest_mutation_fails_closed(
+    tmp_path, workflow_writer, mutation
+):
+    compilation = _v5_compilation(tmp_path, workflow_writer)
+    encoded = _authority(compilation.package).canonical_bytes()
+    record = json.loads(encoded)
+    route = record["routes"][0]
+    if mutation == "tamper_endpoint":
+        route["endpoint_sha256"] = "0" * 64
+    else:
+        del route["endpoint_sha256"]
+    mutated = json.dumps(
+        record, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="provider (authority digest changed|route fields are invalid)"):
+        read_workflow_provider_authority_bytes(mutated)
+
+
+def test_unmerged_v5_schema1_provider_authority_requires_readmission(
+    tmp_path, workflow_writer
+):
+    compilation = _v5_compilation(tmp_path, workflow_writer)
+    record = json.loads(_authority(compilation.package).canonical_bytes())
+    record["schema_version"] = 1
+    record["resolver_version"] = 1
+    encoded = json.dumps(
+        record, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="provider authority version is unsupported"):
+        read_workflow_provider_authority_bytes(encoded)
 
 
 def test_v5_restart_recovers_authority_only_from_authenticated_snapshot_bytes(

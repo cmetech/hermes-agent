@@ -31,6 +31,7 @@ def _authority(*, provider: str = "openrouter", model: str = "openai/gpt-5.4"):
         model=model,
         api_mode="chat_completions",
         route_fingerprint="2" * 64,
+        endpoint_sha256="6" * 64,
         registration_provenance_digest="3" * 64,
         provider_options=MappingProxyType({"effort": "high"}),
         config_scope="profile",

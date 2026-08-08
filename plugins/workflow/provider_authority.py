@@ -22,11 +22,14 @@ from hermes_cli.provider_capabilities import (
 )
 from hermes_cli.runtime_provider import (
     ExecutionRuntimeCapabilities,
+    ExecutionRuntimeIdentity,
     classify_execution_runtime,
+    execution_runtime_identity_from_sealed_route,
 )
 from hermes_cli.workflow_model_resolution import (
     ModelResolutionError,
     ResolvedModelRoute,
+    WORKFLOW_MODEL_RESOLVER_VERSION,
     WorkflowModelConfigSnapshot,
     resolve_workflow_model_reference,
 )
@@ -35,8 +38,8 @@ from plugins.workflow.models import WorkflowPackage, freeze_value
 from plugins.workflow.sanitize import public_display_identifier, sanitize_text
 
 
-_AUTHORITY_SCHEMA_VERSION = 1
-_AUTHORITY_RESOLVER_VERSION = 1
+_AUTHORITY_SCHEMA_VERSION = 2
+_AUTHORITY_RESOLVER_VERSION = WORKFLOW_MODEL_RESOLVER_VERSION
 _AUTHORITY_MAX_BYTES = 1024 * 1024
 _AUTHORITY_MAX_ROUTES = 512
 _AUTHORITY_MAX_OBLIGATIONS = 4096
@@ -170,6 +173,7 @@ class WorkflowResolvedProviderRoute:
     model: str
     api_mode: str
     route_fingerprint: str
+    endpoint_sha256: str
     registration_provenance_digest: str
     provider_options: Mapping[str, Any]
     config_scope: str
@@ -181,6 +185,8 @@ class WorkflowResolvedProviderRoute:
             raise ValueError("requested model reference digest is invalid")
         if not _valid_digest(self.route_fingerprint):
             raise ValueError("provider route fingerprint is invalid")
+        if not _valid_digest(self.endpoint_sha256):
+            raise ValueError("provider endpoint digest is invalid")
         if not self.effective_provider:
             object.__setattr__(self, "effective_provider", self.provider)
         object.__setattr__(
@@ -202,11 +208,25 @@ class WorkflowResolvedProviderRoute:
             "model": self.model,
             "api_mode": self.api_mode,
             "route_fingerprint": self.route_fingerprint,
+            "endpoint_sha256": self.endpoint_sha256,
             "registration_provenance_digest": (self.registration_provenance_digest),
             "provider_options": _thaw(self.provider_options),
             "config_scope": self.config_scope,
             "base_url_trust_class": self.base_url_trust_class,
         }
+
+    def execution_runtime_identity(self) -> ExecutionRuntimeIdentity:
+        """Return the exact private identity sent to an execution worker."""
+        return execution_runtime_identity_from_sealed_route({
+            "provider": self.effective_provider,
+            "model": self.model,
+            "api_mode": self.api_mode,
+            "base_url_trust_class": self.base_url_trust_class,
+            "endpoint_sha256": self.endpoint_sha256,
+            "registration_provenance_digest": (
+                self.registration_provenance_digest
+            ),
+        })
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +479,7 @@ def _read_route(value: object) -> WorkflowResolvedProviderRoute:
             "model",
             "api_mode",
             "route_fingerprint",
+            "endpoint_sha256",
             "registration_provenance_digest",
             "provider_options",
             "config_scope",
@@ -492,6 +513,9 @@ def _read_route(value: object) -> WorkflowResolvedProviderRoute:
         api_mode=_bounded_text(record["api_mode"], "API mode", allow_empty=True),
         route_fingerprint=_bounded_text(
             record["route_fingerprint"], "route fingerprint"
+        ),
+        endpoint_sha256=_bounded_text(
+            record["endpoint_sha256"], "provider endpoint digest"
         ),
         registration_provenance_digest=_bounded_text(
             record["registration_provenance_digest"],
@@ -712,10 +736,17 @@ def _runtime_for_route(
         },
         target_model=route.model,
     )
+    if runtime.endpoint_identity_error or not runtime.endpoint_sha256:
+        raise WorkflowProviderAuthorityError(
+            runtime.endpoint_identity_error or "provider_endpoint_identity_invalid",
+            "provider_resolution",
+            "provider endpoint identity cannot be resolved",
+        )
     if (
         runtime.api_mode != route.api_mode
         or runtime.model != route.model
         or runtime.base_url_trust_class != route.base_url_trust_class
+        or runtime.endpoint_sha256 != route.endpoint_sha256
         or runtime.registration_provenance_digest
         != route.registration_provenance_digest
     ):
@@ -786,6 +817,7 @@ def _resolved_route(
         model=resolved.model,
         api_mode=resolved.api_mode,
         route_fingerprint=resolved.route_fingerprint,
+        endpoint_sha256=resolved.endpoint_sha256,
         registration_provenance_digest=(resolved.registration_provenance_digest),
         provider_options=resolved.provider_options,
         config_scope=resolved.config_scope,

@@ -816,15 +816,9 @@ class AgentNodeExecutor:
                     "intended_authority_digest": (
                         context.intended_authority_digest
                     ),
-                    "expected_runtime_identity": {
-                        "provider": route.effective_provider,
-                        "model": route.model,
-                        "api_mode": route.api_mode,
-                        "base_url_trust_class": route.base_url_trust_class,
-                        "registration_provenance_digest": (
-                            route.registration_provenance_digest
-                        ),
-                    },
+                    "expected_runtime_identity": (
+                        route.execution_runtime_identity().to_dict()
+                    ),
                     "reasoning_config": dict(transport.reasoning_config),
                     "request_overrides": _thaw(transport.request_overrides),
                 })
@@ -1419,15 +1413,9 @@ class AgentNodeExecutor:
                     "effective_provider": fallback_route.effective_provider,
                     "model": fallback_route.model,
                     "context_mode": "fresh",
-                    "expected_runtime_identity": {
-                        "provider": fallback_route.effective_provider,
-                        "model": fallback_route.model,
-                        "api_mode": fallback_route.api_mode,
-                        "base_url_trust_class": fallback_route.base_url_trust_class,
-                        "registration_provenance_digest": (
-                            fallback_route.registration_provenance_digest
-                        ),
-                    },
+                    "expected_runtime_identity": (
+                        fallback_route.execution_runtime_identity().to_dict()
+                    ),
                     "reasoning_config": dict(fallback_transport.reasoning_config),
                     "request_overrides": _thaw(
                         fallback_transport.request_overrides
@@ -1458,17 +1446,7 @@ class AgentNodeExecutor:
                     intended_authority_digest if phase5 else None
                 ),
                 expected_runtime_identity=(
-                    {
-                        "provider": sealed_route.effective_provider,
-                        "model": sealed_route.model,
-                        "api_mode": sealed_route.api_mode,
-                        "base_url_trust_class": (
-                            sealed_route.base_url_trust_class
-                        ),
-                        "registration_provenance_digest": (
-                            sealed_route.registration_provenance_digest
-                        ),
-                    }
+                    sealed_route.execution_runtime_identity().to_dict()
                     if phase5
                     else None
                 ),

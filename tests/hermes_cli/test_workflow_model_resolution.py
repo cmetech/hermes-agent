@@ -6,12 +6,34 @@ from pathlib import Path
 
 import pytest
 
+import hermes_cli.workflow_model_resolution as model_resolution
 from hermes_cli.workflow_model_resolution import (
     ModelResolutionError,
     load_workflow_model_config_snapshot,
     parse_workflow_model_config,
     resolve_workflow_model_reference,
 )
+
+
+def test_route_fingerprint_uses_version2_normalized_endpoint_identity() -> None:
+    assert model_resolution.WORKFLOW_MODEL_RESOLVER_VERSION == 2
+    first = _config()
+    first["model_aliases"]["review"]["base_url"] = (
+        "https://OPENROUTER.ai:443/api/v1/"
+    )
+    second = _config()
+    second["model_aliases"]["review"]["base_url"] = (
+        "https://openrouter.ai/api/v1"
+    )
+
+    first_route = resolve_workflow_model_reference(
+        parse_workflow_model_config(first), "@review"
+    )
+    second_route = resolve_workflow_model_reference(
+        parse_workflow_model_config(second), "@review"
+    )
+
+    assert first_route.endpoint_sha256 == second_route.endpoint_sha256
 
 
 def _config() -> dict[str, object]:

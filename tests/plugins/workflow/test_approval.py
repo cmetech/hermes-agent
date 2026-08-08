@@ -496,6 +496,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         model="sealed-model",
         api_mode="chat_completions",
         route_fingerprint="2" * 64,
+        endpoint_sha256="d" * 64,
         registration_provenance_digest="3" * 64,
         provider_options={},
         config_scope="profile",
@@ -512,6 +513,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         model="sealed-fallback-model",
         api_mode="chat_completions",
         route_fingerprint="7" * 64,
+        endpoint_sha256="9" * 64,
         registration_provenance_digest="8" * 64,
         provider_options={},
         config_scope="profile",
@@ -583,6 +585,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         "model": "sealed-model",
         "api_mode": "chat_completions",
         "base_url_trust_class": "provider_default",
+        "endpoint_sha256": "d" * 64,
         "registration_provenance_digest": "3" * 64,
     }
     assert request.sealed_provider_attempt_grant is True
@@ -599,6 +602,7 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
             "model": "sealed-fallback-model",
             "api_mode": "chat_completions",
             "base_url_trust_class": "provider_default",
+            "endpoint_sha256": "9" * 64,
             "registration_provenance_digest": "8" * 64,
         },
         "reasoning_config": {},

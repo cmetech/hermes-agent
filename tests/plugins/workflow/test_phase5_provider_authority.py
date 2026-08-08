@@ -12,6 +12,7 @@ from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.provider_authority import (
     ProviderAuthorityEnvironment,
     WorkflowProviderAuthority,
+    WorkflowProviderAuthorityError,
     resolve_workflow_provider_authority,
 )
 from plugins.workflow.entitlement import AIEntitlementResolution
@@ -137,6 +138,8 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
     authority = _authority(_load_v5(path))
 
     assert isinstance(authority, WorkflowProviderAuthority)
+    assert authority.schema_version == 2
+    assert authority.resolver_version == 2
     assert set(authority.routes) == {
         "ask:primary",
         "ask:fallback",
@@ -149,6 +152,9 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
     assert authority.routes["ask:inline_agent:reviewer"].model == (
         "anthropic/claude-opus-4.1"
     )
+    assert all(
+        len(route.endpoint_sha256) == 64 for route in authority.routes.values()
+    )
     assert {warning.code for warning in authority.warnings} == {
         "model_reference_provider_overridden"
     }
@@ -157,7 +163,7 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
         authority.authority_digest = "0" * 64  # type: ignore[misc]
 
 
-def test_fallback_route_classifies_inherited_capabilities_before_execution(
+def test_fallback_route_with_unresolvable_endpoint_blocks_authority_creation(
     tmp_path, workflow_writer
 ):
     config = parse_workflow_model_config({
@@ -190,22 +196,10 @@ def test_fallback_route_classifies_inherited_capabilities_before_execution(
     )
     package = _load_v5(path)
 
-    authority = _authority(package, config=config)
-    decisions = authority.obligations_by_path["nodes[0].allowed_tools"]
-    report = assess_compatibility(package, provider_authority=authority)
+    with pytest.raises(WorkflowProviderAuthorityError) as exc_info:
+        _authority(package, config=config)
 
-    assert {item.route_id for item in decisions} == {
-        "ask:primary",
-        "ask:fallback",
-    }
-    fallback = next(item for item in decisions if item.route_id == "ask:fallback")
-    assert fallback.decision.disposition.value == "unsupported"
-    assert fallback.decision.code == "hermes_managed_loop_required"
-    assert any(
-        item.path == "nodes[0].allowed_tools"
-        and item.code == "hermes_managed_loop_required"
-        for item in report.blocking_findings
-    )
+    assert exc_info.value.code == "provider_endpoint_identity_invalid"
 
 
 def test_provider_routes_cover_only_nodes_that_can_call_the_provider(

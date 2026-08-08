@@ -41,6 +41,7 @@ _SECRET_KEY_PARTS = (
     "header",
     "environment",
 )
+WORKFLOW_MODEL_RESOLVER_VERSION = 2
 
 
 class ModelResolutionError(ValueError):
@@ -154,6 +155,7 @@ class ResolvedModelRoute:
     model: str
     api_mode: str
     route_fingerprint: str
+    endpoint_sha256: str
     registration_provenance_digest: str
     provider_options: Mapping[str, Any]
     config_scope: Literal["profile", "managed"]
@@ -173,6 +175,7 @@ class ResolvedModelRoute:
             "model": self.model,
             "api_mode": self.api_mode,
             "route_fingerprint": self.route_fingerprint,
+            "endpoint_sha256": self.endpoint_sha256,
             "registration_provenance_digest": self.registration_provenance_digest,
             "provider_options": _thaw(self.provider_options),
             "config_scope": self.config_scope,
@@ -721,7 +724,7 @@ def resolve_workflow_model_reference(
         },
     )
     route_material = {
-        "resolver_version": 1,
+        "resolver_version": WORKFLOW_MODEL_RESOLVER_VERSION,
         "requested_reference_sha256": hashlib.sha256(
             reference.encode("utf-8")
         ).hexdigest(),
@@ -730,11 +733,7 @@ def resolve_workflow_model_reference(
         "model": model,
         "api_mode": runtime.api_mode,
         "base_url_trust_class": runtime.base_url_trust_class,
-        "base_url_sha256": (
-            hashlib.sha256(base_url.encode("utf-8")).hexdigest()
-            if base_url
-            else ""
-        ),
+        "endpoint_sha256": runtime.endpoint_sha256,
         "registration_provenance_digest": runtime.registration_provenance_digest,
         "provider_options": _thaw(options),
         "config_scope": config_scope,
@@ -753,6 +752,7 @@ def resolve_workflow_model_reference(
         model=model,
         api_mode=runtime.api_mode,
         route_fingerprint=route_fingerprint,
+        endpoint_sha256=runtime.endpoint_sha256,
         registration_provenance_digest=runtime.registration_provenance_digest,
         provider_options=options,
         config_scope=config_scope,

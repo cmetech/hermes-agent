@@ -45,6 +45,7 @@ def _route(*, model: str = "sealed-model") -> WorkflowResolvedProviderRoute:
         model=model,
         api_mode="chat_completions",
         route_fingerprint="2" * 64,
+        endpoint_sha256="d" * 64,
         registration_provenance_digest="3" * 64,
         provider_options={"effort": "high"},
         config_scope="profile",
@@ -205,6 +206,7 @@ def test_phase5_executor_uses_only_sealed_route_and_returns_both_identities(
         "model": "sealed-model",
         "api_mode": "chat_completions",
         "base_url_trust_class": "provider_default",
+        "endpoint_sha256": "d" * 64,
         "registration_provenance_digest": "3" * 64,
     }
     assert result.metadata["intended_authority_digest"] == "a" * 64

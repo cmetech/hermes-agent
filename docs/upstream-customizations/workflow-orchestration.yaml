@@ -161,10 +161,12 @@ upstream_changes:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   owned_symbols:
   - optional model_aliases and model_tiers config roots
+  - WORKFLOW_MODEL_RESOLVER_VERSION
   - WorkflowModelConfigSnapshot and ConfiguredModelEntry immutable parser output
   - ResolvedModelRoute credential-free model authority
   - parse_workflow_model_config profile and managed leaf precedence
   - resolve_workflow_model_reference tier alias literal and option precedence
+  - normalized endpoint digest in credential-free route fingerprints
   - model_switch shared portable alias parser integration
   tests:
   - tests/hermes_cli/test_config_validation.py
@@ -180,6 +182,8 @@ upstream_changes:
     alias authority or environment expansion is accepted. Resolution must remain
     pure and independent of catalog, credential, and mutable global alias caches.
     Public projections include only route URL digests, never URLs or secrets.
+    Route fingerprints use the centralized normalized endpoint digest rather
+    than hashing raw URL spelling or credential-bearing values.
   removal_condition: Remove when upstream has an equivalent bounded immutable
     profile/managed parser shared with interactive aliases and a credential-free
     workflow route resolver with identical precedence, provenance, warnings, and
@@ -202,6 +206,8 @@ upstream_changes:
   - capability_authority_digest canonical decision identity
   - ProviderProfile workflow capability declaration seam
   - ExecutionRuntimeCapabilities additive registration provenance
+  - ExecutionRuntimeIdentity exact six-field endpoint-bound private codec
+  - execution_runtime_identity centralized admission and worker builder
   - OpenRouter model-aware effort and explicit unsupported security declarations
   - execution-adapter availability is an explicit fail-closed resolver precondition that provider declarations cannot override
   tests:
@@ -218,7 +224,10 @@ upstream_changes:
     Loader provenance must bind declarations; incomplete closures lose provider
     claims while retaining wholly Hermes-enforced adapters. User plugins cannot
     assert authoritative billing or provider-native sandbox guarantees, and all
-    public decisions remain bounded, immutable, credential-free JSON.
+    public decisions remain bounded, immutable, credential-free JSON. Private
+    execution identity hashes only normalized structural endpoint evidence;
+    malformed or unresolvable HTTP routes fail closed and only explicitly
+    enumerated endpointless API modes receive the versioned sentinel.
   removal_condition: Remove when upstream provides an equivalent single pure
     provider capability matrix with loader-bound declarations, central adapter
     policy, canonical identity, installed-distribution coverage, and unchanged
@@ -235,9 +244,11 @@ upstream_changes:
   - tests/hermes_cli/test_runtime_provider_resolution.py
   owned_symbols:
   - canonical profile api-mode to transport adapter
+  - _ExecutionEndpointIdentity and endpointless execution API-mode inventory
   - loader-authored provider registration provenance and code-closure digest
   - bundled, legacy-compatible, and user-plugin registration precedence
   - bounded public-safe provider collision diagnostics
+  - explicit route then provider-profile endpoint precedence
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_provider_profile_precedence.py
@@ -286,6 +297,7 @@ upstream_changes:
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
+  - current normalized endpoint digest must exactly match sealed authority before MCP startup agent construction fallback or provider transport
   - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
   - any intended authority or model-visible prefix drift selects fresh context before provider transport rather than mutating a cached prefix
   - persistent and same-run resumption require both paired Phase 5 identities
@@ -295,6 +307,7 @@ upstream_changes:
   - normalizer-v5 approval rejection rework uses its sealed route and returns paired worker execution identities
   - prefix verification runs again at every sealed provider-attempt reservation
   - no prompts tools credentials provider payloads or local paths enter public identity evidence
+  - runtime drift diagnostics expose only stable field names and never endpoint or provenance digest values
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_phase5_execution_context.py
@@ -511,6 +524,7 @@ upstream_changes:
   - ProviderOptionTransport
   - encode_provider_option_transport
   - resolve_workflow_provider_authority
+  - WorkflowResolvedProviderRoute schema-2 endpoint identity
   - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
   - _hook_operations_supported
   - NodeExecutionContext
@@ -532,6 +546,8 @@ upstream_changes:
   - Phase 5 fallback uses a fresh child context with its own sealed provider model runtime and option identity
   - primary fallback and inline agents share attempt cost deadline workdir resource and cancellation authorities
   - legacy fallback request behavior remains wire-compatible and unchanged
+  - v5 provider authority schema and model resolver version advance together and schema-1 v5 records require re-admission
+  - every sealed primary fallback and inline-agent route integrity-binds one normalized endpoint digest while snapshot format remains 2
   tests:
   - tests/plugins/workflow/test_phase5_provider_options.py
   - tests/plugins/workflow/test_phase5_provider_authority.py

@@ -6,6 +6,16 @@ import run_agent
 from agent.plugin_agent import PluginAgentRunRequest, _validate_request
 
 
+_SIX_FIELD_RUNTIME_IDENTITY = {
+    "provider": "sealed-provider",
+    "model": "sealed-model",
+    "api_mode": "chat_completions",
+    "base_url_trust_class": "provider_default",
+    "endpoint_sha256": "d" * 64,
+    "registration_provenance_digest": "c" * 64,
+}
+
+
 def test_model_visible_prefix_digest_binds_exact_prompt_tool_schema_and_order() -> None:
     digest = model_tools.model_visible_prefix_digest
     first_tools = [
@@ -100,11 +110,7 @@ def test_plugin_agent_request_round_trips_both_phase5_session_identities() -> No
         intended_authority_digest="a" * 64,
         expected_model_visible_prefix_digest="b" * 64,
         expected_runtime_identity={
-            "provider": "sealed-provider",
-            "model": "sealed-model",
-            "api_mode": "chat_completions",
-            "base_url_trust_class": "provider_default",
-            "registration_provenance_digest": "c" * 64,
+            **_SIX_FIELD_RUNTIME_IDENTITY,
         },
     )
 
@@ -114,6 +120,28 @@ def test_plugin_agent_request_round_trips_both_phase5_session_identities() -> No
     assert decoded.intended_authority_digest == "a" * 64
     assert decoded.expected_model_visible_prefix_digest == "b" * 64
     assert decoded.expected_runtime_identity == request.expected_runtime_identity
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: {key: item for key, item in value.items() if key != "endpoint_sha256"},
+        lambda value: {**value, "endpoint_sha256": ""},
+        lambda value: {**value, "endpoint_sha256": 7},
+        lambda value: {**value, "extra": "field"},
+    ],
+)
+def test_plugin_agent_runtime_identity_reader_rejects_nonexact_six_field_codec(
+    mutation,
+) -> None:
+    request = PluginAgentRunRequest(
+        prompt="continue",
+        intended_authority_digest="a" * 64,
+        expected_runtime_identity=mutation(_SIX_FIELD_RUNTIME_IDENTITY),
+    )
+
+    with pytest.raises(ValueError, match="expected runtime identity is malformed"):
+        _validate_request(request)
 
 
 def test_phase5_worker_blocks_runtime_identity_drift_before_agent_construction(
@@ -169,11 +197,7 @@ def test_phase5_worker_blocks_runtime_identity_drift_before_agent_construction(
             allowed_tools=(),
             intended_authority_digest="a" * 64,
             expected_runtime_identity={
-                "provider": "sealed-provider",
-                "model": "sealed-model",
-                "api_mode": "chat_completions",
-                "base_url_trust_class": "provider_default",
-                "registration_provenance_digest": "c" * 64,
+                **_SIX_FIELD_RUNTIME_IDENTITY,
             },
         ).to_wire(),
     })
@@ -181,6 +205,72 @@ def test_phase5_worker_blocks_runtime_identity_drift_before_agent_construction(
     assert constructed == []
     assert result["audit"]["failure_kind"] == "provider_capability_drift"
     assert result["audit"]["provider_attempts"] == 0
+
+
+def test_phase5_worker_blocks_same_trust_endpoint_drift_before_any_side_effect(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    from tools import mcp_tool
+
+    mcp_started = []
+    agent_constructed = []
+    provider_called = []
+    admitted = runtime_provider.classify_execution_runtime(
+        provider="openrouter",
+        model_config={"provider": "openrouter", "default": "sealed-model"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://endpoint-a.test/v1",
+        },
+    )
+
+    class ForbiddenAgent:
+        def __init__(self, **_kwargs):
+            agent_constructed.append(True)
+            raise AssertionError("agent constructed after endpoint drift")
+
+    monkeypatch.setattr(run_agent, "AIAgent", ForbiddenAgent)
+    monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "openrouter",
+            "model": "sealed-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://endpoint-b.test/v1",
+            "api_key": "credential",
+        },
+    )
+    monkeypatch.setattr(
+        mcp_tool, "discover_mcp_tools", lambda: mcp_started.append(True)
+    )
+
+    result = worker._run(
+        {
+            "plugin_id": "workflow",
+            "request": PluginAgentRunRequest(
+                prompt="continue",
+                provider="openrouter",
+                model="sealed-model",
+                allowed_tools=(),
+                mcp_servers={"test": {"command": "unused"}},
+                intended_authority_digest="a" * 64,
+                expected_runtime_identity=(
+                    runtime_provider.execution_runtime_identity(admitted).to_dict()
+                ),
+            ).to_wire(),
+        },
+        provider_start_gate=lambda: provider_called.append(True),
+    )
+
+    assert result["audit"]["failure_kind"] == "provider_capability_drift"
+    assert result["audit"]["mismatched_fields"] == ["endpoint_sha256"]
+    assert mcp_started == []
+    assert agent_constructed == []
+    assert provider_called == []
 
 
 def test_prefix_expectation_without_sealed_authority_is_rejected() -> None:

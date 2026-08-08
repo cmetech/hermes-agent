@@ -1382,6 +1382,7 @@ def _runtime_identity_mismatch_failure(
     plugin_id: str,
     *,
     intended_authority_digest: str,
+    mismatched_fields: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
         "final_response": "",
@@ -1398,6 +1399,11 @@ def _runtime_identity_mismatch_failure(
             "model_calls": 0,
             "known_no_effect": True,
             "intended_authority_digest": intended_authority_digest,
+            **(
+                {"mismatched_fields": list(mismatched_fields)}
+                if mismatched_fields
+                else {}
+            ),
         },
         "structured_output": None,
     }
@@ -1608,6 +1614,8 @@ def _run(
 
         from hermes_cli.runtime_provider import (
             classify_resolved_execution_runtime,
+            execution_runtime_identity,
+            execution_runtime_identity_from_sealed_route,
             resolve_runtime_provider,
             resolve_structured_output_capability,
         )
@@ -1620,25 +1628,34 @@ def _run(
             )
             runtime_capabilities = classify_resolved_execution_runtime(runtime)
             if request.expected_runtime_identity is not None:
-                actual_runtime_identity = {
-                    "provider": runtime_capabilities.effective_provider,
-                    "model": runtime_capabilities.model,
-                    "api_mode": runtime_capabilities.api_mode,
-                    "base_url_trust_class": (
-                        runtime_capabilities.base_url_trust_class
-                    ),
-                    "registration_provenance_digest": (
-                        runtime_capabilities.registration_provenance_digest
-                    ),
-                }
-                if actual_runtime_identity != dict(
-                    request.expected_runtime_identity
-                ):
+                expected_runtime_identity = (
+                    execution_runtime_identity_from_sealed_route(
+                        request.expected_runtime_identity
+                    )
+                )
+                try:
+                    actual_runtime_identity = execution_runtime_identity(
+                        runtime_capabilities
+                    )
+                except ValueError:
+                    actual_runtime_identity = None
+                if actual_runtime_identity != expected_runtime_identity:
+                    mismatched_fields = (
+                        ("endpoint_sha256",)
+                        if actual_runtime_identity is None
+                        else tuple(
+                            field
+                            for field in expected_runtime_identity.__dataclass_fields__
+                            if getattr(actual_runtime_identity, field)
+                            != getattr(expected_runtime_identity, field)
+                        )
+                    )
                     return _runtime_identity_mismatch_failure(
                         plugin_id,
                         intended_authority_digest=(
                             request.intended_authority_digest or ""
                         ),
+                        mismatched_fields=mismatched_fields,
                     )
             if (
                 enabled_mcp_names
