@@ -209,6 +209,8 @@ def test_phase5_executor_uses_only_sealed_route_and_returns_both_identities(
         "endpoint_sha256": "d" * 64,
         "registration_provenance_digest": "3" * 64,
     }
+    assert request.expected_runtime_route_fingerprint == "2" * 64
+    assert request.expected_runtime_route_options == {"effort": "high"}
     assert result.metadata["intended_authority_digest"] == "a" * 64
     assert result.metadata["model_visible_prefix_digest"] == "9" * 64
 

@@ -185,6 +185,156 @@ def test_dynamic_provider_endpoint_identity_is_derived_without_credentials(
     assert "private-project-7" not in repr(capabilities)
 
 
+def test_vertex_sealed_route_uses_config_endpoint_and_credentials_only_supply_token(
+    monkeypatch,
+) -> None:
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "vertex", "default": "gemini-3.6-flash"},
+        "vertex": {
+            "project_id": "config-private-project",
+            "region": "europe-west4",
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "gemini-3.6-flash"
+    )
+    constraint = rp.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+    assert constraint is not None
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(config["model"]))
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_credentials",
+        lambda: ("fresh-token", "credential-private-project"),
+    )
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_config",
+        lambda: (
+            _ for _ in ()
+        ).throw(AssertionError("sealed Vertex route asked credentials for routing")),
+    )
+
+    runtime = rp.resolve_runtime_provider(
+        requested="vertex",
+        target_model=route.model,
+        route_constraint=constraint,
+    )
+
+    assert runtime["api_key"] == "fresh-token"
+    assert runtime["base_url"].endswith(
+        "/projects/config-private-project/locations/europe-west4/endpoints/openapi"
+    )
+    assert "credential-private-project" not in runtime["base_url"]
+
+
+@pytest.mark.parametrize(
+    ("bedrock_config", "expected_region"),
+    [({}, "us-east-1"), ({"region": "eu-west-2"}, "eu-west-2")],
+    ids=("sealed-default", "sealed-nondefault"),
+)
+def test_bedrock_sealed_route_ignores_environment_region(
+    monkeypatch, bedrock_config, expected_region
+) -> None:
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "bedrock", "default": "amazon.nova-pro-v1:0"},
+        "bedrock": bedrock_config,
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "amazon.nova-pro-v1:0"
+    )
+    constraint = rp.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+    assert constraint is not None
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(config["model"]))
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+
+    runtime = rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model=route.model,
+        route_constraint=constraint,
+    )
+
+    assert runtime["region"] == expected_region
+    assert runtime["base_url"] == (
+        f"https://bedrock-runtime.{expected_region}.amazonaws.com"
+    )
+
+
+def test_sealed_route_constrains_inputs_seen_by_credential_resolver(monkeypatch) -> None:
+    identity = _runtime_identity("https://sealed.example/v1")
+    constraint = rp.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="f" * 64,
+        requested_provider="custom",
+        model="test-model",
+        api_mode="chat_completions",
+        base_url="https://sealed.example/v1",
+        provider_config={},
+        identity=identity,
+    )
+    captured = {}
+
+    def unclassified(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "custom",
+            "model": "test-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://sealed.example/v1",
+            "api_key": "credential-only",
+        }
+
+    monkeypatch.setattr(rp, "_resolve_runtime_provider_unclassified", unclassified)
+
+    runtime = rp.resolve_runtime_provider(
+        requested="mutable-provider",
+        target_model="mutable-model",
+        route_constraint=constraint,
+    )
+
+    assert captured["requested"] == "custom"
+    assert captured["target_model"] == "test-model"
+    assert captured["explicit_base_url"] == "https://sealed.example/v1"
+    assert runtime["api_key"] == "credential-only"
+
+
 def test_runtime_identity_to_dict_is_exact_six_field_codec() -> None:
     identity = _runtime_identity("https://example.test/v1")
 

@@ -589,6 +589,14 @@ class AgentNodeExecutor:
             model=decision.model,
             context_mode="fresh",
             session_id=None,
+            intended_authority_digest=initial_request.intended_authority_digest,
+            expected_runtime_identity=initial_request.expected_runtime_identity,
+            expected_runtime_route_fingerprint=(
+                initial_request.expected_runtime_route_fingerprint
+            ),
+            expected_runtime_route_options=(
+                initial_request.expected_runtime_route_options
+            ),
             enabled_toolsets=(),
             allowed_tools=(),
             denied_tools=("delegate_task", "workflow_agent"),
@@ -818,6 +826,10 @@ class AgentNodeExecutor:
                     ),
                     "expected_runtime_identity": (
                         route.execution_runtime_identity().to_dict()
+                    ),
+                    "expected_runtime_route_fingerprint": route.route_fingerprint,
+                    "expected_runtime_route_options": _thaw(
+                        route.provider_options
                     ),
                     "reasoning_config": dict(transport.reasoning_config),
                     "request_overrides": _thaw(transport.request_overrides),
@@ -1416,6 +1428,12 @@ class AgentNodeExecutor:
                     "expected_runtime_identity": (
                         fallback_route.execution_runtime_identity().to_dict()
                     ),
+                    "expected_runtime_route_fingerprint": (
+                        fallback_route.route_fingerprint
+                    ),
+                    "expected_runtime_route_options": _thaw(
+                        fallback_route.provider_options
+                    ),
                     "reasoning_config": dict(fallback_transport.reasoning_config),
                     "request_overrides": _thaw(
                         fallback_transport.request_overrides
@@ -1449,6 +1467,12 @@ class AgentNodeExecutor:
                     sealed_route.execution_runtime_identity().to_dict()
                     if phase5
                     else None
+                ),
+                expected_runtime_route_fingerprint=(
+                    sealed_route.route_fingerprint if phase5 else None
+                ),
+                expected_runtime_route_options=(
+                    _thaw(sealed_route.provider_options) if phase5 else None
                 ),
                 expected_mcp_runtime_identity_digest=(
                     context.sealed_mcp_runtime_identity_digest

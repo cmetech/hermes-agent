@@ -263,6 +263,12 @@ class ApprovalExecutor:
                     "expected_runtime_identity": (
                         fallback_route.execution_runtime_identity().to_dict()
                     ),
+                    "expected_runtime_route_fingerprint": (
+                        fallback_route.route_fingerprint
+                    ),
+                    "expected_runtime_route_options": _thaw(
+                        fallback_route.provider_options
+                    ),
                     "reasoning_config": dict(fallback_transport.reasoning_config),
                     "request_overrides": _thaw(
                         fallback_transport.request_overrides
@@ -288,6 +294,12 @@ class ApprovalExecutor:
                 sealed_route.execution_runtime_identity().to_dict()
                 if phase5
                 else None
+            ),
+            expected_runtime_route_fingerprint=(
+                sealed_route.route_fingerprint if phase5 else None
+            ),
+            expected_runtime_route_options=(
+                _thaw(sealed_route.provider_options) if phase5 else None
             ),
             reasoning_config=reasoning_config,
             request_overrides=request_overrides,

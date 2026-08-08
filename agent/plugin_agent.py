@@ -484,6 +484,11 @@ class PluginAgentRunRequest:
     intended_authority_digest: str | None = None
     expected_model_visible_prefix_digest: str | None = None
     expected_runtime_identity: Mapping[str, str] | None = None
+    expected_runtime_route_fingerprint: str | None = None
+    expected_runtime_route_options: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
     expected_mcp_runtime_identity_digest: str | None = None
     enabled_toolsets: tuple[str, ...] | None = None
     allowed_tools: tuple[str, ...] | None = None
@@ -539,6 +544,12 @@ class PluginAgentRunRequest:
                 self.expected_model_visible_prefix_digest
             ),
             "expected_runtime_identity": _wire_json(self.expected_runtime_identity),
+            "expected_runtime_route_fingerprint": (
+                self.expected_runtime_route_fingerprint
+            ),
+            "expected_runtime_route_options": _wire_json(
+                self.expected_runtime_route_options
+            ),
             "expected_mcp_runtime_identity_digest": (
                 self.expected_mcp_runtime_identity_digest
             ),
@@ -608,6 +619,8 @@ class PluginAgentRunRequest:
             "intended_authority_digest",
             "expected_model_visible_prefix_digest",
             "expected_runtime_identity",
+            "expected_runtime_route_fingerprint",
+            "expected_runtime_route_options",
             "expected_mcp_runtime_identity_digest",
             "enabled_toolsets",
             "allowed_tools",
@@ -1025,6 +1038,23 @@ def _validate_name_list(label: str, values: tuple[str, ...] | None) -> None:
         raise ValueError(f"{label} must contain non-empty strings")
 
 
+def _valid_runtime_route_options(value: object) -> bool:
+    if not isinstance(value, Mapping) or len(value) > 16:
+        return False
+    if any(not isinstance(key, str) for key in value):
+        return False
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(encoded) <= 2048
+
+
 def _validate_request(request: PluginAgentRunRequest) -> None:
     if not isinstance(request, PluginAgentRunRequest):
         raise TypeError("request must be PluginAgentRunRequest")
@@ -1048,6 +1078,10 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             "expected MCP runtime identity",
             request.expected_mcp_runtime_identity_digest,
         ),
+        (
+            "expected runtime route fingerprint",
+            request.expected_runtime_route_fingerprint,
+        ),
     ):
         if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise ValueError(f"{label} digest must be lowercase SHA-256")
@@ -1070,6 +1104,24 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             raise ValueError(
                 "expected runtime identity requires sealed intended authority"
             )
+        if request.expected_runtime_route_fingerprint is None:
+            raise ValueError(
+                "expected runtime identity requires route fingerprint"
+            )
+        if not _valid_runtime_route_options(
+            request.expected_runtime_route_options
+        ):
+            raise ValueError("expected runtime identity requires route options")
+    if (
+        request.expected_runtime_route_fingerprint is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError("route fingerprint requires expected runtime identity")
+    if (
+        request.expected_runtime_route_options is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError("route options require expected runtime identity")
     if (
         request.expected_mcp_runtime_identity_digest is not None
         and request.intended_authority_digest is None
@@ -1236,6 +1288,8 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             "model",
             "context_mode",
             "expected_runtime_identity",
+            "expected_runtime_route_fingerprint",
+            "expected_runtime_route_options",
             "reasoning_config",
             "request_overrides",
             "structured_output",
@@ -1252,6 +1306,14 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             or not fallback.get("model")
             or not isinstance(fallback.get("reasoning_config"), Mapping)
             or not isinstance(fallback.get("request_overrides"), Mapping)
+            or not _valid_runtime_route_options(
+                fallback.get("expected_runtime_route_options")
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(fallback.get("expected_runtime_route_fingerprint") or ""),
+            )
+            is None
             or (
                 fallback.get("structured_output") is not None
                 and not isinstance(

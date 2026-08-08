@@ -1151,6 +1151,12 @@ def _build_inline_agent_handler(
             expected_runtime_identity=definition.get(
                 "expected_runtime_identity"
             ),
+            expected_runtime_route_fingerprint=definition.get(
+                "expected_runtime_route_fingerprint"
+            ),
+            expected_runtime_route_options=definition.get(
+                "expected_runtime_route_options"
+            ),
             expected_mcp_runtime_identity_digest=getattr(
                 parent, "expected_mcp_runtime_identity_digest", None
             ),
@@ -1501,6 +1507,7 @@ def _run(
     if not plugin_id:
         raise ValueError("plugin_id is missing")
 
+    route_constraint = None
     # Phase 5 binds the request to a pure view of the live configured route
     # before this process loads dotenv, opens SessionDB, mutates tool globals,
     # finalizes MCP config, or resolves credentials. A drifted request must be
@@ -1509,24 +1516,39 @@ def _run(
         from hermes_cli import managed_scope
         from hermes_cli.config import read_raw_config_readonly
         from hermes_cli.runtime_provider import (
-            classify_credential_free_execution_runtime,
-            execution_runtime_identity,
             execution_runtime_identity_from_sealed_route,
+            select_credential_free_execution_route,
         )
 
         expected_runtime_identity = execution_runtime_identity_from_sealed_route(
             request.expected_runtime_identity
         )
-        live_capabilities = classify_credential_free_execution_runtime(
-            read_raw_config_readonly(),
+        if (
+            expected_runtime_identity.provider == "bedrock"
+            and expected_runtime_identity.api_mode == "anthropic_messages"
+            and bool(os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip())
+        ):
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest or "",
+                mismatched_fields=("api_mode",),
+            )
+        raw_config = read_raw_config_readonly()
+        managed_config = managed_scope.load_managed_config()
+        route_constraint = select_credential_free_execution_route(
+            raw_config,
             requested_provider=request.provider,
             target_model=request.model,
-            managed_config=managed_scope.load_managed_config(),
+            route_fingerprint=request.expected_runtime_route_fingerprint,
+            expected_runtime_identity=expected_runtime_identity,
+            provider_options=request.expected_runtime_route_options,
+            managed_config=managed_config,
         )
-        try:
-            live_runtime_identity = execution_runtime_identity(live_capabilities)
-        except ValueError:
-            live_runtime_identity = None
+        live_runtime_identity = (
+            route_constraint.execution_runtime_identity()
+            if route_constraint is not None
+            else None
+        )
         if live_runtime_identity != expected_runtime_identity:
             return _runtime_identity_mismatch_failure(
                 plugin_id,
@@ -1669,7 +1691,9 @@ def _run(
         runtime = None
         if enabled_mcp_names or request.expected_runtime_identity is not None:
             runtime = resolve_runtime_provider(
-                requested=request.provider, target_model=model or None
+                requested=request.provider,
+                target_model=model or None,
+                route_constraint=route_constraint,
             )
             runtime_capabilities = classify_resolved_execution_runtime(runtime)
             if request.expected_runtime_identity is not None:
@@ -2199,6 +2223,12 @@ def _run(
                     intended_authority_digest=request.intended_authority_digest,
                     expected_runtime_identity=dict(
                         fallback["expected_runtime_identity"]
+                    ),
+                    expected_runtime_route_fingerprint=str(
+                        fallback["expected_runtime_route_fingerprint"]
+                    ),
+                    expected_runtime_route_options=dict(
+                        fallback["expected_runtime_route_options"]
                     ),
                     expected_mcp_runtime_identity_digest=(
                         request.expected_mcp_runtime_identity_digest

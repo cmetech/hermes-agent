@@ -112,6 +112,8 @@ def test_plugin_agent_request_round_trips_both_phase5_session_identities() -> No
         expected_runtime_identity={
             **_SIX_FIELD_RUNTIME_IDENTITY,
         },
+        expected_runtime_route_fingerprint="c" * 64,
+        expected_runtime_route_options={"effort": "high"},
     )
 
     decoded = PluginAgentRunRequest.from_wire(request.to_wire())
@@ -120,6 +122,8 @@ def test_plugin_agent_request_round_trips_both_phase5_session_identities() -> No
     assert decoded.intended_authority_digest == "a" * 64
     assert decoded.expected_model_visible_prefix_digest == "b" * 64
     assert decoded.expected_runtime_identity == request.expected_runtime_identity
+    assert decoded.expected_runtime_route_fingerprint == "c" * 64
+    assert decoded.expected_runtime_route_options == {"effort": "high"}
 
 
 @pytest.mark.parametrize(
@@ -138,9 +142,21 @@ def test_plugin_agent_runtime_identity_reader_rejects_nonexact_six_field_codec(
         prompt="continue",
         intended_authority_digest="a" * 64,
         expected_runtime_identity=mutation(_SIX_FIELD_RUNTIME_IDENTITY),
+        expected_runtime_route_fingerprint="c" * 64,
     )
 
     with pytest.raises(ValueError, match="expected runtime identity is malformed"):
+        _validate_request(request)
+
+
+def test_phase5_runtime_identity_requires_route_fingerprint_to_avoid_guessing() -> None:
+    request = PluginAgentRunRequest(
+        prompt="continue",
+        intended_authority_digest="a" * 64,
+        expected_runtime_identity=dict(_SIX_FIELD_RUNTIME_IDENTITY),
+    )
+
+    with pytest.raises(ValueError, match="route fingerprint"):
         _validate_request(request)
 
 
@@ -199,6 +215,8 @@ def test_phase5_worker_blocks_runtime_identity_drift_before_agent_construction(
             expected_runtime_identity={
                 **_SIX_FIELD_RUNTIME_IDENTITY,
             },
+            expected_runtime_route_fingerprint="e" * 64,
+            expected_runtime_route_options={},
         ).to_wire(),
     })
 
@@ -261,6 +279,8 @@ def test_phase5_worker_blocks_same_trust_endpoint_drift_before_any_side_effect(
                 expected_runtime_identity=(
                     runtime_provider.execution_runtime_identity(admitted).to_dict()
                 ),
+                expected_runtime_route_fingerprint="e" * 64,
+                expected_runtime_route_options={},
             ).to_wire(),
         },
         provider_start_gate=lambda: provider_called.append(True),
@@ -365,6 +385,8 @@ def test_phase5_worker_checks_credential_free_route_before_every_side_effect(
                 mcp_servers={"test": {"command": "unused"}},
                 intended_authority_digest="a" * 64,
                 expected_runtime_identity=expected_identity,
+                expected_runtime_route_fingerprint="e" * 64,
+                expected_runtime_route_options={},
             ).to_wire(),
         },
         provider_start_gate=lambda: calls.append("provider_dispatch"),
@@ -377,6 +399,157 @@ def test_phase5_worker_checks_credential_free_route_before_every_side_effect(
     assert tool_search.load_config is original_tool_search_config
     assert timeout_mod.get_provider_request_timeout is original_timeout
     assert registry_mod.registry._generation == original_generation
+
+
+def test_phase5_bedrock_auth_route_drift_rejects_before_every_side_effect(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.config as config_mod
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.runtime_provider as runtime_provider
+    from tools import mcp_tool
+
+    calls = []
+    admitted = runtime_provider.classify_execution_runtime(
+        provider="bedrock",
+        model_config={
+            "provider": "bedrock",
+            "default": "global.anthropic.claude-sonnet-4-6",
+        },
+        provider_config={},
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config_readonly",
+        lambda: {
+            "model": {
+                "provider": "bedrock",
+                "default": "global.anthropic.claude-sonnet-4-6",
+            }
+        },
+    )
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "private-bearer")
+    monkeypatch.setattr(
+        env_loader, "load_hermes_dotenv", lambda: calls.append("dotenv")
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "_interpolate_env_vars",
+        lambda value: calls.append("mcp_interpolate") or value,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_finalize_authenticated_mcp_config",
+        lambda *args, **kwargs: calls.append("mcp_finalize") or args[0],
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: calls.append("credential_resolution")
+        or {
+            "provider": "bedrock",
+            "model": "global.anthropic.claude-sonnet-4-6",
+            "api_mode": "bedrock_converse",
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key": "credential",
+        },
+    )
+
+    result = worker._run({
+        "plugin_id": "workflow",
+        "request": PluginAgentRunRequest(
+            prompt="continue",
+            provider="bedrock",
+            model="global.anthropic.claude-sonnet-4-6",
+            allowed_tools=(),
+            mcp_servers={"test": {"command": "unused"}},
+            intended_authority_digest="a" * 64,
+            expected_runtime_identity=(
+                runtime_provider.execution_runtime_identity(admitted).to_dict()
+            ),
+            expected_runtime_route_fingerprint="e" * 64,
+            expected_runtime_route_options={},
+        ).to_wire(),
+    })
+
+    assert result["audit"]["failure_kind"] == "provider_capability_drift"
+    assert result["audit"]["mismatched_fields"] == ["api_mode"]
+    assert calls == []
+
+
+def test_phase5_worker_passes_selected_alias_constraint_to_credential_resolver(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as runtime_provider
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_aliases": {
+            "review": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://private-alias.example/anthropic",
+                "options": {"effort": "medium"},
+            }
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config),
+        "@review",
+        node_options={"effort": "high"},
+    )
+    expected = {
+        "provider": "anthropic",
+        "model": route.model,
+        "api_mode": route.api_mode,
+        "base_url_trust_class": route.base_url_trust_class,
+        "endpoint_sha256": route.endpoint_sha256,
+        "registration_provenance_digest": route.registration_provenance_digest,
+    }
+    captured = []
+    monkeypatch.setattr(config_mod, "read_raw_config_readonly", lambda: config)
+
+    def credential_resolver(**kwargs):
+        captured.append(kwargs.get("route_constraint"))
+        return {
+            "provider": "anthropic",
+            "model": route.model,
+            "api_mode": "codex_responses",
+            "base_url": "https://private-alias.example/anthropic",
+            "api_key": "credential",
+        }
+
+    monkeypatch.setattr(
+        runtime_provider, "resolve_runtime_provider", credential_resolver
+    )
+
+    result = worker._run({
+        "plugin_id": "workflow",
+        "request": PluginAgentRunRequest(
+            prompt="continue",
+            provider=route.provider,
+            model=route.model,
+            allowed_tools=(),
+            intended_authority_digest="a" * 64,
+            expected_runtime_identity=expected,
+            expected_runtime_route_fingerprint=route.route_fingerprint,
+            expected_runtime_route_options=dict(route.provider_options),
+        ).to_wire(),
+    })
+
+    assert len(captured) == 1
+    assert captured[0] is not None
+    assert captured[0].route_fingerprint == route.route_fingerprint
+    assert dict(route.provider_options) == {"effort": "high"}
+    assert "private-alias.example" not in repr(captured[0])
+    assert result["audit"]["mismatched_fields"] == ["api_mode"]
 
 
 def test_prefix_expectation_without_sealed_authority_is_rejected() -> None:

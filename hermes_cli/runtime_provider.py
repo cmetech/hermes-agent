@@ -604,6 +604,33 @@ class ExecutionRuntimeIdentity:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CredentialFreeExecutionRouteConstraint:
+    """Private local route authority selected before credential resolution."""
+
+    route_fingerprint: str
+    requested_provider: str
+    model: str
+    api_mode: str
+    base_url: str = field(repr=False)
+    provider_config: Mapping[str, object] = field(repr=False)
+    identity: ExecutionRuntimeIdentity
+
+    def __post_init__(self) -> None:
+        if _LOWERCASE_SHA256_RE.fullmatch(self.route_fingerprint) is None:
+            raise ValueError("route constraint fingerprint is invalid")
+        if not self.requested_provider or not self.model or not self.api_mode:
+            raise ValueError("route constraint is incomplete")
+        if len(self.base_url) > 2048:
+            raise ValueError("route constraint endpoint is invalid")
+        object.__setattr__(
+            self, "provider_config", MappingProxyType(dict(self.provider_config))
+        )
+
+    def execution_runtime_identity(self) -> ExecutionRuntimeIdentity:
+        return self.identity
+
+
 def execution_runtime_identity(
     capabilities: ExecutionRuntimeCapabilities,
 ) -> ExecutionRuntimeIdentity:
@@ -1161,6 +1188,163 @@ def classify_credential_free_execution_runtime(
         model_config=model_config,
         provider_config=provider_config,
         target_model=target_model,
+    )
+
+
+def select_credential_free_execution_route(
+    config: Mapping[str, object] | object,
+    *,
+    requested_provider: object,
+    target_model: object,
+    route_fingerprint: object,
+    expected_runtime_identity: Mapping[str, object] | ExecutionRuntimeIdentity,
+    provider_options: Mapping[str, object] | object | None = None,
+    managed_config: Mapping[str, object] | object | None = None,
+) -> CredentialFreeExecutionRouteConstraint | None:
+    """Select exactly one sealed workflow route without loading credentials."""
+    if (
+        not isinstance(route_fingerprint, str)
+        or _LOWERCASE_SHA256_RE.fullmatch(route_fingerprint) is None
+        or not isinstance(target_model, str)
+        or not target_model.strip()
+    ):
+        return None
+    expected = (
+        expected_runtime_identity
+        if isinstance(expected_runtime_identity, ExecutionRuntimeIdentity)
+        else execution_runtime_identity_from_sealed_route(expected_runtime_identity)
+    )
+
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    profile = config if isinstance(config, Mapping) else {}
+    managed = managed_config if isinstance(managed_config, Mapping) else {}
+    options = provider_options if isinstance(provider_options, Mapping) else {}
+    snapshot = parse_workflow_model_config(profile, managed_config=managed)
+    matches: list[CredentialFreeExecutionRouteConstraint] = []
+    try:
+        literal_route = resolve_workflow_model_reference(
+            snapshot,
+            target_model.strip(),
+            node_provider=(
+                requested_provider.strip()
+                if isinstance(requested_provider, str)
+                else None
+            ),
+            node_options=options,
+        )
+    except ValueError:
+        literal_route = None
+    if (
+        literal_route is not None
+        and literal_route.route_fingerprint == route_fingerprint
+    ):
+        constraint = _workflow_route_constraint(
+            snapshot=snapshot,
+            route=literal_route,
+            configured_base_url=(
+                snapshot.active_base_url
+                if literal_route.provider == snapshot.active_provider
+                else ""
+            ),
+            expected=expected,
+        )
+        if constraint is not None:
+            matches.append(constraint)
+    candidates = [
+        (f"@{name}", entry) for name, entry in snapshot.aliases.items()
+    ] + list(snapshot.tiers.items())
+    for reference, entry in candidates:
+        if entry.model != target_model.strip():
+            continue
+        try:
+            route = resolve_workflow_model_reference(
+                snapshot,
+                reference,
+                node_options=options,
+            )
+        except ValueError:
+            continue
+        if _canonical_execution_provider(route.provider) != (
+            _canonical_execution_provider(requested_provider)
+        ):
+            continue
+        if route.route_fingerprint != route_fingerprint:
+            continue
+        constraint = _workflow_route_constraint(
+            snapshot=snapshot,
+            route=route,
+            configured_base_url=entry.base_url,
+            expected=expected,
+        )
+        if constraint is not None:
+            matches.append(constraint)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _workflow_route_constraint(
+    *,
+    snapshot: Any,
+    route: Any,
+    configured_base_url: str,
+    expected: ExecutionRuntimeIdentity,
+) -> CredentialFreeExecutionRouteConstraint | None:
+    endpoint_provider_config = snapshot.provider_endpoint_config.get(
+        _canonical_execution_provider(route.provider), {}
+    )
+    provider_config = {
+        **dict(endpoint_provider_config),
+        **({"base_url": configured_base_url} if configured_base_url else {}),
+        "api_mode": route.api_mode,
+    }
+    canonical_provider = _canonical_execution_provider(route.provider)
+    if canonical_provider == "bedrock" and "region" not in provider_config:
+        provider_config["region"] = "us-east-1"
+    model_config = {"provider": route.provider, "default": route.model}
+    runtime = classify_execution_runtime(
+        provider=route.provider,
+        model_config=model_config,
+        provider_config=provider_config,
+        target_model=route.model,
+    )
+    try:
+        identity = execution_runtime_identity(runtime)
+    except ValueError:
+        return None
+    if identity != expected:
+        return None
+    base_url, endpoint_error = _configured_execution_endpoint(
+        provider=route.provider,
+        model_config=model_config,
+        provider_config=provider_config,
+    )
+    if endpoint_error is not None:
+        return None
+    if not base_url:
+        try:
+            from providers import get_provider_profile
+
+            profile_record = get_provider_profile(route.provider)
+        except Exception:
+            profile_record = None
+        base_url = str(
+            getattr(profile_record, "base_url", "") or ""
+        ).strip().rstrip("/")
+    return CredentialFreeExecutionRouteConstraint(
+        route_fingerprint=route.route_fingerprint,
+        requested_provider=route.provider,
+        model=route.model,
+        api_mode=route.api_mode,
+        base_url=base_url,
+        provider_config={
+            key: provider_config[key]
+            for key in ("project_id", "region")
+            if key in provider_config
+        },
+        identity=identity,
     )
 
 
@@ -2633,6 +2817,7 @@ def _resolve_runtime_provider_unclassified(
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
     model_cfg_loader: Optional[Callable[[], Dict[str, Any]]] = None,
+    route_constraint: CredentialFreeExecutionRouteConstraint | None = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -2736,9 +2921,15 @@ def _resolve_runtime_provider_unclassified(
     # margin) by get_vertex_config(); mid-session expiry is additionally
     # recovered on 401 by run_agent._try_refresh_vertex_client_credentials().
     if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
-        from agent.vertex_adapter import get_vertex_config
+        if route_constraint is not None:
+            from agent.vertex_adapter import get_vertex_credentials
 
-        token, base_url = get_vertex_config()
+            token, _credential_project = get_vertex_credentials()
+            base_url = route_constraint.base_url
+        else:
+            from agent.vertex_adapter import get_vertex_config
+
+            token, base_url = get_vertex_config()
         if not token or not base_url:
             raise AuthError(
                 "Vertex AI credentials could not be resolved. Vertex uses "
@@ -3110,7 +3301,12 @@ def _resolve_runtime_provider_unclassified(
         # Read bedrock-specific config from config.yaml
         _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
-        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
+        region = (
+            str(route_constraint.provider_config.get("region") or "").strip()
+            if route_constraint is not None
+            else (_bedrock_cfg.get("region") or "").strip()
+            or resolve_bedrock_region()
+        )
         auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
@@ -3253,6 +3449,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    route_constraint: CredentialFreeExecutionRouteConstraint | None = None,
 ) -> Dict[str, Any]:
     """Resolve credentials and normalize the actual effective API mode.
 
@@ -3268,12 +3465,30 @@ def resolve_runtime_provider(
             cached_model_cfg = _get_model_config()
         return cached_model_cfg
 
+    if route_constraint is not None and not isinstance(
+        route_constraint, CredentialFreeExecutionRouteConstraint
+    ):
+        raise TypeError(
+            "route_constraint must be CredentialFreeExecutionRouteConstraint"
+        )
+    constrained_requested = (
+        route_constraint.requested_provider
+        if route_constraint is not None
+        else requested
+    )
+    constrained_model = (
+        route_constraint.model if route_constraint is not None else target_model
+    )
+    constrained_base_url = (
+        route_constraint.base_url if route_constraint is not None else explicit_base_url
+    )
     runtime = _resolve_runtime_provider_unclassified(
-        requested=requested,
+        requested=constrained_requested,
         explicit_api_key=explicit_api_key,
-        explicit_base_url=explicit_base_url,
-        target_model=target_model,
+        explicit_base_url=constrained_base_url,
+        target_model=constrained_model,
         model_cfg_loader=get_model_cfg,
+        route_constraint=route_constraint,
     )
     resolved_provider = str(runtime.get("provider") or "").strip().lower()
     model_cfg = (
@@ -3285,10 +3500,29 @@ def resolve_runtime_provider(
         provider=resolved_provider,
         model_config=model_cfg,
         provider_config=runtime,
-        target_model=target_model,
+        target_model=constrained_model,
     )
     if runtime.get("api_mode") != effective_mode:
         runtime["api_mode"] = effective_mode
+    if route_constraint is not None:
+        actual_provider = _canonical_execution_provider(runtime.get("provider"))
+        expected_provider = route_constraint.identity.provider
+        if actual_provider != expected_provider:
+            raise AuthError(
+                "resolved provider does not match sealed workflow route",
+                code="provider_capability_drift",
+            )
+        if runtime.get("api_mode") != route_constraint.api_mode:
+            raise AuthError(
+                "resolved API mode does not match sealed workflow route",
+                code="provider_capability_drift",
+            )
+        runtime["provider"] = expected_provider
+        runtime["model"] = route_constraint.model
+        runtime["api_mode"] = route_constraint.api_mode
+        runtime["base_url"] = route_constraint.base_url
+        if expected_provider == "bedrock":
+            runtime["region"] = route_constraint.provider_config["region"]
     return runtime
 
 

@@ -259,6 +259,12 @@ def test_phase5_fallback_is_sealed_as_a_fresh_worker_route(tmp_path) -> None:
     assert request.sealed_fallback_route["provider"] == "openrouter"
     assert request.sealed_fallback_route["model"] == "anthropic/claude-sonnet-4.6"
     assert request.sealed_fallback_route["context_mode"] == "fresh"
+    assert request.sealed_fallback_route["expected_runtime_route_fingerprint"] == (
+        fallback.route_fingerprint
+    )
+    assert request.sealed_fallback_route["expected_runtime_route_options"] == {
+        "effort": "high"
+    }
     assert request.sealed_fallback_route["request_overrides"] == {"verbosity": "high"}
 
 
@@ -415,6 +421,9 @@ def test_phase5_fallback_consumes_its_own_structured_output_strategy(tmp_path) -
         "provider"
     ] == "openai"
     sealed_fallback = runner.requests[0].sealed_fallback_route
+    assert sealed_fallback["expected_runtime_route_fingerprint"] == (
+        fallback.route_fingerprint
+    )
     assert sealed_fallback["structured_output"].strategy is (
         StructuredOutputStrategy.NATIVE_JSON_SCHEMA
     )
@@ -536,6 +545,8 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
             "effective_provider": "openrouter",
             "model": "anthropic/claude-sonnet-4.6",
             "context_mode": "fresh",
+            "expected_runtime_route_fingerprint": "7" * 64,
+            "expected_runtime_route_options": {},
             "expected_runtime_identity": identity,
             "reasoning_config": {"enabled": True, "effort": "high"},
             "request_overrides": {"verbosity": "high"},
@@ -562,6 +573,8 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.provider == "openrouter"
     assert child.model == "anthropic/claude-sonnet-4.6"
     assert child.expected_runtime_identity == identity
+    assert child.expected_runtime_route_fingerprint == "7" * 64
+    assert child.expected_runtime_route_options == {}
     assert child.reasoning_config == {"enabled": True, "effort": "high"}
     assert child.request_overrides == {"verbosity": "high"}
     assert child.structured_output is not None

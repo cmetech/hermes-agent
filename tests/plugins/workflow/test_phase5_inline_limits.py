@@ -121,6 +121,12 @@ def test_phase5_omitted_tool_allowlist_keeps_declared_inline_agent_reachable(tmp
     assert len(runner.requests) == 1
     assert runner.requests[0].allowed_tools is None
     assert set(runner.requests[0].inline_agents) == {"reviewer"}
+    assert runner.requests[0].inline_agents["reviewer"][
+        "expected_runtime_route_fingerprint"
+    ] == "d" * 64
+    assert runner.requests[0].inline_agents["reviewer"][
+        "expected_runtime_route_options"
+    ] == {"effort": "high"}
 
 
 def test_phase5_inline_agent_deny_rule_is_not_overridden(tmp_path):

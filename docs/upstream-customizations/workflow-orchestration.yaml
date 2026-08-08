@@ -187,6 +187,8 @@ upstream_changes:
     than hashing raw URL spelling or credential-bearing values. Dynamic
     Bedrock region and Vertex project/location authority is frozen privately,
     fingerprinted digest-only, and shared by admission and worker preflight.
+    Active literals, configured aliases, and tiers retain one route fingerprint
+    that the worker can match exactly without reconstructing the authored reference.
   removal_condition: Remove when upstream has an equivalent bounded immutable
     profile/managed parser shared with interactive aliases and a credential-free
     workflow route resolver with identical precedence, provenance, warnings, and
@@ -213,6 +215,8 @@ upstream_changes:
   - execution_runtime_identity centralized admission and worker builder
   - classify_credential_free_execution_runtime live preflight classifier
   - credential_free_provider_endpoint_config bounded dynamic route selector
+  - CredentialFreeExecutionRouteConstraint private selected route authority
+  - select_credential_free_execution_route exact live route selector
   - OpenRouter model-aware effort and explicit unsupported security declarations
   - execution-adapter availability is an explicit fail-closed resolver precondition that provider declarations cannot override
   tests:
@@ -316,6 +320,8 @@ upstream_changes:
   - prefix verification runs again at every sealed provider-attempt reservation
   - no prompts tools credentials provider payloads or local paths enter public identity evidence
   - runtime drift diagnostics expose only stable field names and never endpoint or provenance digest values
+  - one exact live route fingerprint selects the provider model API mode endpoint and bounded dynamic endpoint config used by credential resolution
+  - Vertex credentials supply only an OAuth token while config supplies project and region; Bedrock config or us-east-1 supplies region while AWS credentials cannot change it
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_phase5_execution_context.py
@@ -1141,6 +1147,7 @@ upstream_changes:
   - PluginAgentRunResult
   - PluginAgentRunner
   - _exchange_worker
+  - PluginAgentRunRequest expected_runtime_route_fingerprint and bounded route options
   - ToolRegistry.scoped_names
   - PluginContext.agent
   tests:
@@ -1155,7 +1162,10 @@ upstream_changes:
     policy, semantic-progress framing that excludes stderr, and the exact-digest one-shot
     approval grant, node-local hook/MCP inputs, and bounded synchronous inline-agent
     dispatcher so a workflow scheduler can remain the sole retry and lifecycle authority
-    without granting a different action or exposing process-global resources.
+    without granting a different action or exposing process-global resources. Preserve
+    the digest-only sealed-route fingerprint and bounded secret-free provider options
+    on primary, approval, repair, fallback, and inline-child requests so exact option
+    precedence can be replayed without raw endpoint authority crossing the wire.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
@@ -3337,7 +3347,8 @@ upstream_changes:
     adapter, and treat both Claude Messages and non-Claude Converse paths as Hermes-managed
     tool loops. Phase 5 workers compare the credential-free live route before
     dotenv, SessionDB, MCP finalization, registry mutation, credential refresh,
-    or token minting. Preserve legacy no-config-read resolver short-circuits before loading
+    or token minting, then pass the privately selected route constraint through
+    credential resolution and transport construction. Preserve legacy no-config-read resolver short-circuits before loading
     optional model metadata. The isolated worker must own discovery, registration,
     tool-policy ordering, and process reaping from one outer cleanup boundary while
     restoring loader, timeout, callbacks, hooks, inline tools, session state, and

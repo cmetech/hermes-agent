@@ -78,6 +78,258 @@ def test_workflow_snapshot_binds_dynamic_provider_endpoint_privately(
     assert provider_config.get("project_id", "private-project-9") not in public_snapshot
 
 
+def test_live_alias_route_selects_one_private_constraint_by_fingerprint() -> None:
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_aliases": {
+            "review": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://private-alias.example/anthropic",
+            }
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "@review"
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": "anthropic",
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is not None
+    assert constraint.route_fingerprint == route.route_fingerprint
+    assert constraint.execution_runtime_identity().endpoint_sha256 == (
+        route.endpoint_sha256
+    )
+    assert "private-alias.example" not in repr(constraint)
+
+
+def test_live_alias_route_rejects_mismatched_requested_provider() -> None:
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_aliases": {
+            "review": {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "@review"
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider="openrouter",
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is None
+
+
+def test_live_alias_route_rejects_fingerprint_after_endpoint_change() -> None:
+    admitted_config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_aliases": {
+            "review": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://admitted.example/anthropic",
+            }
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(admitted_config), "@review"
+    )
+    changed_config = {
+        **admitted_config,
+        "model_aliases": {
+            "review": {
+                **admitted_config["model_aliases"]["review"],
+                "base_url": "https://changed.example/anthropic",
+            }
+        },
+    }
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        changed_config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is None
+
+
+def test_live_alias_route_replays_node_option_precedence() -> None:
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_aliases": {
+            "review": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "options": {"effort": "medium"},
+            }
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config),
+        "@review",
+        node_options={"effort": "high"},
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+        provider_options=route.provider_options,
+    )
+
+    assert constraint is not None
+
+
+def test_live_tier_route_selects_dynamic_vertex_constraint() -> None:
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "model_tiers": {
+            "small": {"provider": "vertex", "model": "gemini-3.6-flash"}
+        },
+        "vertex": {"project_id": "private-tier-project", "region": "asia-east1"},
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "small"
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is not None
+    assert constraint.route_fingerprint == route.route_fingerprint
+    assert "private-tier-project" not in repr(constraint)
+
+
+def test_live_active_literal_selects_nondefault_bedrock_constraint() -> None:
+    config = {
+        "model": {"provider": "bedrock", "default": "amazon.nova-pro-v1:0"},
+        "bedrock": {"region": "eu-west-2"},
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "amazon.nova-pro-v1:0"
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is not None
+    assert constraint.api_mode == "bedrock_converse"
+    assert "eu-west-2" not in repr(constraint)
+
+
+def test_live_node_provider_literal_selects_configured_bedrock_constraint() -> None:
+    config = {
+        "model": {"provider": "openrouter", "default": "other-model"},
+        "bedrock": {"region": "ap-southeast-2"},
+    }
+    snapshot = parse_workflow_model_config(config)
+    route = resolve_workflow_model_reference(
+        snapshot,
+        "amazon.nova-pro-v1:0",
+        node_provider="bedrock",
+    )
+
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+
+    assert constraint is not None
+    assert constraint.route_fingerprint == route.route_fingerprint
+    assert "ap-southeast-2" not in repr(constraint)
+
+
 def _config() -> dict[str, object]:
     return {
         "model": {

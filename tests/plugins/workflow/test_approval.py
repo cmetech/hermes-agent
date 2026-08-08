@@ -588,6 +588,8 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         "endpoint_sha256": "d" * 64,
         "registration_provenance_digest": "3" * 64,
     }
+    assert request.expected_runtime_route_fingerprint == "2" * 64
+    assert request.expected_runtime_route_options == {}
     assert request.sealed_provider_attempt_grant is True
     assert request.allowed_tools == ()
     assert request.denied_tools == ("terminal",)
@@ -597,6 +599,8 @@ def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
         "effective_provider": "sealed-fallback-provider",
         "model": "sealed-fallback-model",
         "context_mode": "fresh",
+        "expected_runtime_route_fingerprint": "7" * 64,
+        "expected_runtime_route_options": {},
         "expected_runtime_identity": {
             "provider": "sealed-fallback-provider",
             "model": "sealed-fallback-model",
