@@ -383,13 +383,17 @@ precedence, cleanup, and redaction are not.
 - Create: `agent/credential_adoption.py`
 - Modify: `run_agent.py`
 - Modify: `agent/agent_runtime_helpers.py`
+- Modify: `agent/chat_completion_helpers.py`
 - Modify: `agent/conversation_loop.py`
 - Modify: `agent/turn_retry_state.py`
 - Modify: `tests/run_agent/test_env_credential_turn_refresh.py`
 - Modify: `tests/run_agent/test_credential_pool_interrupt.py`
+- Modify: `tests/run_agent/test_fallback_credential_isolation.py`
+- Modify: `tests/run_agent/test_primary_runtime_restore.py`
 - Create: `tests/agent/test_credential_adoption.py`
 - Modify: `tests/agent/test_turn_retry_state.py`
 - Modify: `tests/agent/test_credential_pool_routing.py`
+- Modify: `tests/plugins/workflow/test_installed_distribution_e2e.py`
 - Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
 
 **Interfaces:**
@@ -413,8 +417,7 @@ precedence, cleanup, and redaction are not.
   class _PendingSealedCredentialAdoption:
       generation: int
       source: Literal["vertex", "pool", "anthropic_direct"]
-      route_identity: tuple[str, str, str, str, str, str]
-      api_mode: str
+      route_constraint: CredentialFreeExecutionRouteConstraint = field(repr=False)
       api_key: str = field(repr=False)
       base_url: str = field(repr=False)
       client_kwargs: Mapping[str, Any] = field(repr=False, compare=False)
@@ -427,17 +430,31 @@ precedence, cleanup, and redaction are not.
       ADOPTED = "adopted"
       ACQUISITION_FAILED = "acquisition_failed"
       ADOPTION_FAILED = "adoption_failed"
+      INVALIDATED = "invalidated"
+      NOT_APPLICABLE = "not_applicable"
+
+
+  class _CandidateAttemptStatus(StrEnum):
+      ADOPTED = "adopted"
+      RETRYABLE_BUILD_FAILURE = "retryable_build_failure"
+      INVALIDATED = "invalidated"
   ```
 
   `_PendingSealedCredentialAdoption`, `_CredentialRefreshStatus`,
   `_snapshot_candidate_client_kwargs()`, and
   `_materialize_candidate_client_kwargs()` live in the dependency-light
   `agent/credential_adoption.py`; `_CredentialRecoveryTurnState` lives in
-  `agent/turn_retry_state.py`. The snapshot helper recursively copies mutable
-  configuration, exposes a read-only mapping, and excludes `http_client`, live
-  SDK clients, and transports. The materializer returns a fresh dict for each
-  construction attempt. The candidate never retains a mutable
-  `PooledCredential` and exposes no public API or wire type.
+  `agent/turn_retry_state.py`. The candidate stores the frozen authoritative
+  `CredentialFreeExecutionRouteConstraint`; it does not handwrite or duplicate
+  provider/model/API/endpoint identity. The snapshot helper accepts only
+  `None`, booleans, numbers, strings, bytes, nested string-key mappings,
+  lists/tuples/sets/frozensets of supported values, and `httpx.Timeout` or
+  `httpx.Limits` reconstructed from their scalar settings. It rejects cycles,
+  callables, SDK clients, transports, custom mutable objects, and unsupported
+  values before candidate installation with `ACQUISITION_FAILED`. It exposes a
+  read-only deep copy and excludes `http_client`. The materializer returns a
+  fresh dict for each construction attempt. The candidate never retains a
+  mutable `PooledCredential` and exposes no public API or wire type.
 
 - [ ] **Step 1: Add RED real-path pool and Vertex reproductions.**
 
@@ -467,9 +484,15 @@ precedence, cleanup, and redaction are not.
       assert result.get("failed") is not True
   ```
 
-  Add separate failures for two rejected adoption attempts, acquisition empty,
-  and acquisition exception. Assert no third constructor call and no repeated
-  credential-source call after acquisition itself fails.
+  Add
+  `test_sealed_pool_two_adoption_failures_clear_candidate`,
+  `test_sealed_vertex_acquisition_empty_is_bounded`, and
+  `test_sealed_vertex_acquisition_error_is_bounded`. Assert no third
+  constructor call and no repeated credential-source call after acquisition
+  itself fails. Define `_build_real_sealed_openai_agent`,
+  `_sealed_route_constraint`, `_LowestConstructorBarrier`, and
+  `_drive_provider_error` in this test file; all later Task 1A integration
+  tests reuse those exact helpers.
 
   In `tests/agent/test_credential_adoption.py`, add pure RED tests requiring
   the new type, secret-safe representation, defensive nested snapshots, and
@@ -486,15 +509,7 @@ precedence, cleanup, and redaction are not.
       candidate = _PendingSealedCredentialAdoption(
           generation=1,
           source="pool",
-          route_identity=(
-              "provider",
-              "model",
-              "chat_completions",
-              "trusted_direct",
-              "endpoint-digest",
-              "registration-digest",
-          ),
-          api_mode="chat_completions",
+          route_constraint=_sealed_route_constraint(),
           api_key="TOKEN_CANARY",
           base_url="https://route.test/v1",
           client_kwargs=_snapshot_candidate_client_kwargs(original),
@@ -509,19 +524,35 @@ precedence, cleanup, and redaction are not.
       assert materialized["default_headers"]["Authorization"] == "HEADER_CANARY"
   ```
 
+  Parameterize the pure test with a callable, cycle, arbitrary mutable object,
+  SDK client, and caller-owned transport; each must fail before a candidate is
+  installed. Add positive rows for nested mappings, `httpx.Timeout`, and
+  `httpx.Limits`, and assert two materializations do not share mutable values.
+
 - [ ] **Step 2: Run the real-path tests RED.**
 
-  Run:
+  First run only the existing-file behavioral reproductions so the new module
+  cannot mask them with a collection error:
 
   ```bash
   scripts/run_tests.sh \
-    tests/agent/test_credential_adoption.py \
     tests/run_agent/test_env_credential_turn_refresh.py \
-    tests/run_agent/test_credential_pool_interrupt.py -q
+    -k "sealed_pool_constructor_failure_retries_same_real_oauth_token_once or sealed_vertex_constructor_failure_reads_credentials_once or sealed_pool_two_adoption_failures_clear_candidate or sealed_vertex_acquisition_empty_is_bounded or sealed_vertex_acquisition_error_is_bounded" \
+    -q
   ```
 
-  Expected: FAIL because a real pool force-refreshes again, Vertex rereads the
-  token, and retry guards are consumed before adoption succeeds.
+  Expected: FAIL on behavioral assertions because the real pool force-refreshes
+  again, the existing Vertex guard prevents the identical-candidate retry, and
+  retry state is not transaction-aware.
+
+  Then run the pure new-module RED separately:
+
+  ```bash
+  scripts/run_tests.sh tests/agent/test_credential_adoption.py -q
+  ```
+
+  Expected: FAIL at import because `agent.credential_adoption` and its private
+  types do not exist. Record both RED results independently.
 
 - [ ] **Step 3: Add turn ownership and locked pending-candidate lifecycle.**
 
@@ -553,7 +584,9 @@ precedence, cleanup, and redaction are not.
 
   Implement private AIAgent methods that acquire `_openai_client_lock()` for
   every pending inspect/install/clear and use a monotonically increasing
-  generation. `close()` performs the same idempotent clear. Remove the
+  generation. `_end_credential_recovery_turn()` and `close()` deactivate and
+  advance the generation under that lock before clearing, so a late publisher
+  cannot revive the candidate. `close()` performs the same idempotent clear. Remove the
   per-turn `_auth_pool_refresh_counts` mutation from shared agent state and
   pass `recovery_state` explicitly through `_recover_with_credential_pool()`.
 
@@ -561,36 +594,50 @@ precedence, cleanup, and redaction are not.
 
   Build one immutable snapshot after the credential source releases its lock.
   Never call a pool or provider credential resolver while holding the client
-  lock. The owning branch performs at most two complete adoption attempts:
+  lock. Install the candidate once. The owning branch performs at most two
+  complete adoption attempts:
 
   ```python
-  for attempt in range(2):
-      pending = replace(candidate, adoption_attempts=attempt + 1)
-      self._install_pending_sealed_credential(pending)
-      try:
-          if self._publish_pending_openai_candidate(pending):
-              self._clear_pending_sealed_credential(
-                  pending.generation,
-                  reason="adopted",
+  with self._openai_client_lock():
+      if not self._install_pending_sealed_credential_locked(candidate):
+          return _CredentialRefreshStatus.INVALIDATED
+      for attempt in range(2):
+          try:
+              status = self._attempt_pending_openai_candidate_locked(
+                  candidate.generation,
+                  attempt_number=attempt + 1,
               )
-              return _CredentialRefreshStatus.ADOPTED
-      except ProviderCapabilityDriftError:
-          self._clear_pending_sealed_credential(
-              pending.generation,
-              reason="route_drift",
-          )
-          raise
-  self._clear_pending_sealed_credential(
-      candidate.generation,
-      reason="adoption_exhausted",
-  )
-  return _CredentialRefreshStatus.ADOPTION_FAILED
+              if status is _CandidateAttemptStatus.ADOPTED:
+                  return _CredentialRefreshStatus.ADOPTED
+              if status is _CandidateAttemptStatus.INVALIDATED:
+                  return _CredentialRefreshStatus.INVALIDATED
+              if attempt == 0:
+                  self._record_pending_adoption_failure_locked(
+                      candidate.generation,
+                      attempt_number=1,
+                  )
+                  continue
+          except ProviderCapabilityDriftError:
+              raise
+      self._clear_pending_sealed_credential_locked(
+          candidate.generation,
+          reason="adoption_exhausted",
+      )
+      return _CredentialRefreshStatus.ADOPTION_FAILED
   ```
 
-  Before publication, recheck generation, cancellation, and all sealed route
-  fields under the client lock. If invalidation wins the lock, reject the new
-  client. If publication wins, commit client/API key/base/default query/AIAgent
-  pool-entry identity consistently, then let invalidation observe that state.
+  The owning branch holds the client lock across install and both bounded
+  attempts, so another credential source or fallback cannot interleave.
+  `_attempt_pending_openai_candidate_locked()` constructs and route-validates
+  under that lock. Before publication it rechecks generation, cancellation,
+  the exact stored `CredentialFreeExecutionRouteConstraint`, and pending
+  identity. On success it publishes client/API key/base/default query/AIAgent
+  pool-entry identity and clears pending before releasing the same lock. A
+  retryable constructor/build failure retains pending. Invalidation closes the
+  unpublished client and returns `INVALIDATED`; it is never reinstalled or
+  retried. Route drift closes and clears under the lock, then raises the exact
+  terminal exception. If publication wins, later invalidation observes one
+  consistent committed state.
 
 - [ ] **Step 5: Defer conversation-owned retry markers until success.**
 
@@ -608,13 +655,20 @@ precedence, cleanup, and redaction are not.
       continue
   if status is _CredentialRefreshStatus.ACQUISITION_FAILED:
       _retry.vertex_auth_retry_attempted = True
+  if status in {
+      _CredentialRefreshStatus.INVALIDATED,
+      _CredentialRefreshStatus.NOT_APPLICABLE,
+  }:
+      pass
   ```
 
   In pool recovery, update `auth_pool_refresh_counts` and return a consumed
   `has_retried_429` only after `_swap_credential()` reports successful sealed
   adoption. For a candidate that fails both adoption attempts, return the
   incoming marker unchanged. Preserve the existing marker behavior when no
-  candidate is acquired.
+  candidate is acquired. `bedrock_converse` and `codex_app_server` return
+  `NOT_APPLICABLE` before candidate installation and do not mutate retry
+  guards.
 
 - [ ] **Step 6: Run the candidate and turn-state tests GREEN.**
 
@@ -638,14 +692,31 @@ precedence, cleanup, and redaction are not.
   Drive real `run_conversation()` failures with deterministic barriers:
 
   ```python
-  def test_pending_pool_candidate_blocks_vertex_and_fallback_until_resolved(
+  def test_fallback_waits_for_pending_candidate_then_runs_once_after_exhaustion(
       tmp_path, monkeypatch
   ):
-      result = drive_mixed_source_401(agent)
+      barrier = _LowestConstructorBarrier(failures=2)
+      recovery_thread = start_pool_recovery(agent, barrier)
+      barrier.wait_until_first_failure()
+      fallback_thread = start_fallback_activation(agent)
       assert pool_refresh_calls == 1
-      assert vertex_refresh_calls == 0
-      assert fallback_calls == 0
-      assert result.get("failed") is True
+      assert fallback_resolution_calls == 0
+      barrier.release_second_attempt()
+      recovery_thread.join()
+      fallback_thread.join()
+      assert fallback_resolution_calls == 1
+
+
+  @pytest.mark.parametrize(
+      "later_source",
+      ["vertex", "anthropic", "nous", "codex"],
+  )
+  def test_pending_pool_candidate_precedes_every_later_source(
+      later_source, tmp_path, monkeypatch
+  ):
+      barrier = _LowestConstructorBarrier(failures=1)
+      drive_mixed_source_401(agent, later_source, barrier)
+      assert source_calls[later_source] == 0
 
 
   @pytest.mark.parametrize(
@@ -660,37 +731,83 @@ precedence, cleanup, and redaction are not.
   ```
 
   Add both cancellation-before-publication and publication-before-cancellation
-  schedules. Assert provider-attempt and budget ledgers are unchanged by local
-  client construction, route drift stays terminal, and fallback is not entered
-  while a pending candidate exists.
+  schedules. Add named real-conversation tests
+  `test_sealed_pool_ordinary_429_markers_change_only_after_adoption`,
+  `test_sealed_pool_preexhausted_429_markers_change_only_after_adoption`, and
+  `test_pending_candidate_accepts_reordered_repeated_query_identity`.
+  Assert provider-attempt and budget ledgers are unchanged by local client
+  construction, route drift stays terminal, fallback performs no credential
+  resolution while pending, and fallback becomes eligible exactly once after
+  the second adoption failure clears pending.
 
 - [ ] **Step 8: Make exclusivity and cleanup GREEN.**
 
-  At the start of every credential recovery/fallback selection, resolve a
-  matching pending candidate before consulting another source. Invalidate
-  under the client lock before provider/model/API-mode/fallback mutation.
+  At the start of every credential recovery/fallback selection, acquire the
+  client lock and wait for the owning pending adoption to resolve before
+  consulting another source. Add this gate at `try_activate_fallback()` in
+  `agent/chat_completion_helpers.py` before fallback credential lookup or
+  client construction. Immediately before fallback publication, invalidate
+  under the client lock before provider/model/API-mode mutation.
   Reuse the AIAgent forwarder's existing outer `finally`; do not add partial
   cleanup to only `finalize_turn()`.
 
   ```python
-  pending_status = agent._resolve_pending_sealed_credential(
-      credential_recovery_state
+  transition_generation = agent._credential_transition_generation()
+  if transition_generation is None:
+      return False
+  fb_client, _resolved_fb_model = resolve_provider_client(
+      fb_provider,
+      model=fb_model,
+      raw_codex=True,
+      explicit_base_url=fb_base_url_hint,
+      explicit_api_key=fb_api_key_hint,
   )
-  if pending_status is _CredentialRefreshStatus.ADOPTED:
-      continue
-  if pending_status is _CredentialRefreshStatus.ADOPTION_FAILED:
-      recovered_with_pool = False
+  if not agent._invalidate_for_route_transition(
+      transition_generation,
+      fallback_client=fb_client,
+  ):
+      agent._close_openai_client(
+          fb_client,
+          reason="rejected:fallback_generation_changed",
+          shared=False,
+      )
+      return False
+  agent.model = fb_model
+  agent.provider = fb_provider
+  agent.requested_provider = fb_provider
+  agent.base_url = fb_base_url
+  agent.api_mode = fb_api_mode
   ```
 
-  Run the Step 7 selected tests. Expected: PASS in both race orderings and all
-  exit paths.
+  `_credential_transition_generation()` waits for the client lock, returns only
+  after pending adoption has resolved, and captures the active generation.
+  `_invalidate_for_route_transition()` reacquires the lock immediately before
+  route mutation; it rejects a changed generation or new pending candidate and
+  otherwise invalidates the old generation before the existing mode-specific
+  fallback publication continues.
+
+  Run:
+
+  ```bash
+  scripts/run_tests.sh \
+    tests/run_agent/test_env_credential_turn_refresh.py \
+    tests/run_agent/test_fallback_credential_isolation.py \
+    tests/run_agent/test_primary_runtime_restore.py \
+    -k "pending or sealed_pool_ordinary_429 or sealed_pool_preexhausted_429 or reordered_repeated_query" \
+    -q
+  ```
+
+  Expected: PASS in both race orderings, all source rows, both 429 states, the
+  canonical query case, and all exit paths.
 
 - [ ] **Step 9: Add RED privacy and resource-ownership canaries.**
 
   Supply canaries in the token, structural endpoint, exception text, endpoint
   digest, and temporary path. Exercise constructor failure, second adoption
-  failure, route drift, rejected-client close, and prior-client retirement
-  failure.
+  failure, route drift, nested `_create_openai_client` failure, nested
+  `_close_openai_client` failure, rejected-client close, and prior-client
+  retirement failure. Name these tests with the shared substring
+  `sealed_candidate_redaction`.
 
   ```python
   combined = caplog.text + json.dumps(public_result, sort_keys=True)
@@ -703,8 +820,11 @@ precedence, cleanup, and redaction are not.
 
 - [ ] **Step 10: Replace raw candidate-path logging and run privacy GREEN.**
 
-  Candidate paths log only a stable reason token and `type(exc).__name__`.
-  Never interpolate `base_url`, `str(exc)`, the candidate, token, or digest.
+  Add `candidate_safe: bool = False` to the private construction, close, and
+  retirement helpers reached by pending adoption. Candidate calls pass true;
+  in that mode every nested helper logs only a stable reason token and
+  `type(exc).__name__`. Never interpolate `_client_log_context()`, `base_url`,
+  `str(exc)`, the candidate, token, or digest.
 
   ```python
   logger.warning(
@@ -714,10 +834,28 @@ precedence, cleanup, and redaction are not.
   )
   ```
 
-  Run `test_env_credential_turn_refresh.py` and the focused canary tests.
-  Expected: PASS with bounded logs and correct transport ownership.
+  Run:
+
+  ```bash
+  scripts/run_tests.sh \
+    tests/run_agent/test_env_credential_turn_refresh.py \
+    tests/run_agent/test_fallback_credential_isolation.py \
+    -k "sealed_candidate_redaction or rejected_owned_transport or caller_owned_transport or retirement_failure" \
+    -q
+  ```
+
+  Expected: PASS with bounded nested logs and correct transport ownership.
 
 - [ ] **Step 11: Prove sealed and legacy compatibility.**
+
+  Extend `test_installed_distribution_e2e.py` with
+  `test_installed_distribution_runs_sealed_openai_credential_transaction`.
+  Build/install the wheel through its existing fixture, import
+  `agent.credential_adoption` and `AIAgent` from that installed environment,
+  replace only the SDK constructor with a deterministic first-failure/second-
+  success factory, and assert one candidate produces two identical keys and
+  one published concrete client. The subprocess must assert its imported
+  module paths are outside the checkout.
 
   Run:
 
@@ -736,6 +874,10 @@ precedence, cleanup, and redaction are not.
     tests/agent/test_provider_attempt_transport.py \
     tests/plugins/workflow/test_phase5_cost_budget.py \
     tests/plugins/workflow/test_retry.py -q
+
+  scripts/run_tests.sh \
+    tests/plugins/workflow/test_installed_distribution_e2e.py \
+    -m integration -q
   ```
 
   Expected: PASS with sealed transactional behavior and unsealed behavior
@@ -760,13 +902,17 @@ precedence, cleanup, and redaction are not.
     run_agent.py \
     agent/credential_adoption.py \
     agent/agent_runtime_helpers.py \
+    agent/chat_completion_helpers.py \
     agent/conversation_loop.py \
     agent/turn_retry_state.py \
     tests/run_agent/test_env_credential_turn_refresh.py \
     tests/run_agent/test_credential_pool_interrupt.py \
+    tests/run_agent/test_fallback_credential_isolation.py \
+    tests/run_agent/test_primary_runtime_restore.py \
     tests/agent/test_credential_adoption.py \
     tests/agent/test_turn_retry_state.py \
     tests/agent/test_credential_pool_routing.py \
+    tests/plugins/workflow/test_installed_distribution_e2e.py \
     docs/upstream-customizations/workflow-orchestration.yaml
   git commit -m "fix(workflow): bind sealed credential retry ownership"
   ```
@@ -783,10 +929,12 @@ mutate the live client before replacement succeeds.
 
 - Modify: `run_agent.py`
 - Modify: `agent/agent_runtime_helpers.py`
+- Modify: `agent/conversation_loop.py`
 - Create: `tests/run_agent/test_sealed_anthropic_credential_adoption.py`
 - Modify: `tests/run_agent/test_anthropic_third_party_oauth_guard.py`
 - Modify: `tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py`
 - Modify: `tests/run_agent/test_run_agent.py`
+- Modify: `tests/plugins/workflow/test_installed_distribution_e2e.py`
 - Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
 
 **Interfaces:**
@@ -801,7 +949,7 @@ mutate the live client before replacement succeeds.
   ```text
   AIAgent._publish_pending_anthropic_candidate(
       candidate: _PendingSealedCredentialAdoption,
-  ) -> bool
+  ) -> _CandidateAttemptStatus
   ```
 
   On success it publishes `_anthropic_client`, `_anthropic_api_key`,
@@ -813,14 +961,17 @@ mutate the live client before replacement succeeds.
 
   Use real initialized sealed agents and concrete Anthropic SDK clients. Patch
   only the native token resolver/OAuth endpoint and lowest Anthropic client
-  constructor boundary.
+  constructor boundary. Define `_build_real_sealed_anthropic_agent`,
+  `_snapshot_anthropic_state`, `_AnthropicConstructorBarrier`, and
+  `_drive_native_anthropic_401`, and `_drive_pool_adoption_failure` in the new
+  test file.
 
   ```python
   def test_sealed_anthropic_direct_refresh_is_atomic_and_reuses_token(
       tmp_path, monkeypatch
   ):
-      old = snapshot_anthropic_state(agent)
-      result = drive_native_anthropic_401(agent)
+      old = _snapshot_anthropic_state(agent)
+      result = _drive_native_anthropic_401(agent)
       assert token_reads == 1
       assert constructor_tokens == [fresh_token, fresh_token]
       assert result.get("failed") is not True
@@ -830,15 +981,19 @@ mutate the live client before replacement succeeds.
   def test_sealed_anthropic_pool_failure_preserves_all_mode_fields(
       tmp_path, monkeypatch
   ):
-      old = snapshot_anthropic_state(agent)
-      drive_pool_adoption_failure(agent)
-      assert snapshot_anthropic_state(agent) == old
+      old = _snapshot_anthropic_state(agent)
+      _drive_pool_adoption_failure(agent)
+      assert _snapshot_anthropic_state(agent) == old
       assert not old.client.closed
   ```
 
   Include route drift, cancellation at the barrier, second failure, old-client
   close failure, third-party Anthropic-compatible provider identity, and pool
-  entry publication.
+  entry publication. Add conversation-level
+  `test_sealed_anthropic_acquisition_empty_consumes_existing_guard`,
+  `test_sealed_anthropic_acquisition_error_consumes_existing_guard`,
+  `test_sealed_anthropic_first_build_failure_then_success_sets_guard`, and
+  `test_sealed_anthropic_two_build_failures_leave_success_guard_clear`.
 
 - [ ] **Step 2: Run Anthropic RED.**
 
@@ -856,6 +1011,19 @@ mutate the live client before replacement succeeds.
   mutate before the replacement is constructed and route-validated.
 
 - [ ] **Step 3: Implement the Anthropic publication row.**
+
+  Add `_refresh_anthropic_credentials_for_turn()` returning
+  `_CredentialRefreshStatus`. The 401 branch in `conversation_loop.py` sets
+  `anthropic_auth_retry_attempted` only on `ADOPTED` or
+  `ACQUISITION_FAILED`; `ADOPTION_FAILED`, `INVALIDATED`, and
+  `NOT_APPLICABLE` do not consume the success guard.
+
+  For sealed routes, `_create_request_anthropic_client()` and the shared-client
+  fallback inside `_anthropic_messages_create()` use the currently published
+  credential and do not call the credential resolver proactively. The 401
+  recovery branch is the sole owner of sealed direct credential acquisition
+  and pending adoption. Preserve the current proactive refresh behavior for
+  unsealed agents exactly as recorded at `e1c7ca745`.
 
   Construct the candidate client while the old client stays live. Recheck
   generation, cancellation, provider/model/API mode, and sealed route under the
@@ -888,11 +1056,26 @@ mutate the live client before replacement succeeds.
 
 - [ ] **Step 4: Run Anthropic GREEN and redaction checks.**
 
-  Run the Step 2 command. Expected: PASS with exact state preservation on
-  failure, identical-token retry, no third attempt, and canaries absent from
-  logs/results.
+  Run:
+
+  ```bash
+  scripts/run_tests.sh \
+    tests/run_agent/test_sealed_anthropic_credential_adoption.py \
+    tests/run_agent/test_anthropic_third_party_oauth_guard.py \
+    tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py \
+    tests/run_agent/test_run_agent.py -q
+  ```
+
+  Expected: PASS with exact state preservation on failure, identical-token
+  retry, no third attempt, and canaries absent from logs/results.
 
 - [ ] **Step 5: Run installed, transport, and historical closure.**
+
+  Extend the installed-distribution transaction probe with a sealed
+  `anthropic_messages` row. It must construct a real installed Anthropic client,
+  fail the first lowest-boundary construction, adopt the exact same token on
+  the second construction, and assert every generic and Anthropic field is
+  consistent before the installed subprocess exits.
 
   Run:
 
@@ -931,10 +1114,12 @@ mutate the live client before replacement succeeds.
   git add \
     run_agent.py \
     agent/agent_runtime_helpers.py \
+    agent/conversation_loop.py \
     tests/run_agent/test_sealed_anthropic_credential_adoption.py \
     tests/run_agent/test_anthropic_third_party_oauth_guard.py \
     tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py \
     tests/run_agent/test_run_agent.py \
+    tests/plugins/workflow/test_installed_distribution_e2e.py \
     docs/upstream-customizations/workflow-orchestration.yaml
   git commit -m "fix(workflow): make sealed anthropic adoption atomic"
   ```
