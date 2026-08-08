@@ -1,6 +1,6 @@
 # Workflow Language Phase 5: Adversarial Remediation Design
 
-**Status:** Approved architecture; implementation is not yet authorized
+**Status:** Approved architecture; implementation authorized and in progress
 
 **Date:** 2026-08-08
 
@@ -404,6 +404,149 @@ Normalization-equivalent endpoint spellings compare equal. Different hosts,
 ports, paths, structural query values, or transitions between absent and
 concrete endpoints compare unequal.
 
+## Review-driven addendum: sealed credential adoption transaction
+
+### Why the transaction boundary must include retry ownership
+
+The endpoint-bound runtime identity is not sufficient if credential refresh
+publishes related execution state in separate steps. Review of the implemented
+Task 1 candidate found four coupled state classes:
+
+- the concrete provider client and canonical SDK endpoint configuration;
+- the live API credential and AIAgent credential-pool entry identity;
+- agent-owned auth-refresh counters; and
+- turn-local Vertex and 429 recovery guards.
+
+Publishing the first two under the client lock while updating the latter two
+later can expose a client/state mismatch or consume the only bounded recovery
+opportunity after client construction fails. Calling the OAuth pool again is
+not an equivalent retry: the pool deliberately force-refreshes and may consume
+a different single-use token.
+
+### Approaches considered
+
+1. **AIAgent-owned pending sealed candidate — selected.** Retain the exact
+   credential candidate in memory, construct and validate an unpublished
+   client, and publish agent-owned shared state under the existing client lock.
+   Turn-local guards change synchronously only after the transaction reports
+   success. This is the smallest seam that can retry the identical token.
+2. **Distributed caller rollback — rejected.** Caller snapshots can restore
+   fields, but the next Vertex or OAuth resolution may return a different
+   token. The approach duplicates rollback and marker ownership across every
+   recovery branch and cannot meet identical-candidate retry semantics.
+3. **Transactional CredentialPool lease API — rejected for Phase 5.** A pool
+   lease would affect cross-process refresh locks, auth-store synchronization,
+   persistence, proactive refresh, rotation, and crash consistency. OAuth token
+   minting is externally irreversible, so a pool-wide transaction still cannot
+   be atomic with client adoption without a materially broader product policy.
+
+### State ownership
+
+A private `_PendingSealedCredentialAdoption` belongs to one live `AIAgent`.
+It is never serialized, persisted, included in evidence, logged, or exposed on
+the plugin-agent wire. Secret-bearing members use `repr=False`. It contains:
+
+- a source kind and the sealed provider/model/API-mode/route identity;
+- the exact candidate token or pool entry;
+- canonical candidate base URL and SDK client kwargs;
+- the deferred AIAgent pool-entry identity, when applicable;
+- deferred agent-owned auth-refresh counter changes; and
+- a bounded local construction-attempt count.
+
+`CredentialPool` retains its existing authority to mint and persist refreshed
+credentials. Its persisted token and internal selection are credential-source
+state, not published execution state. “Atomic pool identity” in this design
+means the AIAgent `_credential_pool_entry_id` paired with the live client. Phase
+5 does not introduce a rollback or lease protocol for the credential store.
+
+Turn retry state remains conversation-owned. It is not shared agent state and
+does not move under the client lock. The conversation updates a turn-local
+guard in the same synchronous branch only after sealed adoption returns true.
+
+### Candidate lifecycle and invalidation
+
+Pending adoption is enabled only when an immutable sealed route constraint is
+present. Legacy unsealed refresh and rotation retain their behavior as recorded
+at `e1c7ca745`, before the review-driven atomic-adoption commits.
+
+One candidate may receive at most two local construction attempts: its initial
+attempt and one identical-candidate re-adoption attempt. A constructor failure
+retains the candidate and leaves published state and success guards unchanged.
+The next recovery for the same source and sealed route consumes the pending
+candidate before reading Vertex credentials, calling `try_refresh_matching()`,
+or rotating the pool again. A second construction failure clears the candidate
+and returns the existing bounded recovery failure so normal fallback policy may
+continue without an infinite local loop.
+
+The pending candidate is cleared on:
+
+- successful adoption;
+- terminal route drift;
+- provider, model, API mode, fallback route, or sealed route-identity change;
+- cancellation or agent disposal; or
+- bounded end-of-turn cleanup.
+
+A concurrent credential-store refresh or newer environment edit does not
+replace a matching pending Vertex/pool candidate before its one permitted
+re-adoption attempt. Environment credential reload already has an atomic
+concrete-client path and does not acquire pending-candidate semantics here.
+
+If credential acquisition itself returns empty or raises before a candidate
+exists, existing bounded acquisition guards remain unchanged. Success-only
+publication applies after a concrete candidate exists; it does not authorize
+repeated calls to a failing credential source.
+
+### Atomic publication and failure behavior
+
+For a sealed candidate, the existing client lock protects steps 1–5:
+
+1. derive candidate configuration without mutating published agent state;
+2. construct a concrete unpublished client;
+3. verify its canonical endpoint against the sealed route identity;
+4. publish the client, API key, canonical base/default-query kwargs, AIAgent
+   pool-entry identity, and deferred agent-owned auth-refresh counter changes;
+5. clear the pending candidate; and
+6. after releasing the lock, retire the prior client according to existing
+   shared-client ownership rules.
+
+Constructor failure or a false rebuild result preserves the previous live
+client and every published field and marker. Hermes closes only transports it
+created for the rejected unpublished candidate; caller-owned and old live
+resources remain untouched. Route drift closes and clears the candidate, then
+raises the existing bounded terminal `provider_capability_drift`; it never
+becomes fallback, repair, retry, or a completed partial result.
+
+The pre-exhausted 429 and ordinary pool-recovery helpers return their incoming
+retry marker unchanged when a concrete candidate fails adoption. They report a
+consumed success guard only after adoption succeeds. Vertex turn state follows
+the same rule.
+
+### Privacy and diagnostics
+
+Candidate failures log only a stable reason token and exception type. Raw base
+URLs, exception text, tokens, credentials, endpoint or registration digests,
+provider responses, and candidate representations are prohibited. Public
+results retain the existing bounded failure vocabulary.
+
+### Required behavioral proof
+
+Tests use a real initialized `AIAgent`, concrete SDK clients, and a real
+`CredentialPool` OAuth refresh path. They prove:
+
+- the real pool refreshes once when the first client construction fails, and
+  the second adoption uses the exact retained token without another refresh;
+- Vertex reads credentials once and retries the identical pending token;
+- client, API key, endpoint kwargs, AIAgent pool identity, auth counters, and
+  turn-local guards change only after successful adoption;
+- constructor failure, false rebuild, route drift, and rejected-client cleanup
+  preserve previous state and retry eligibility;
+- ordinary and pre-exhausted 429 recovery consume markers only on adoption;
+- query-bearing and repeated-query endpoints remain canonically identical;
+- pending state is invalidated on route change, cancellation, and end-of-turn;
+- logs and bounded results exclude credential, endpoint, digest, exception-
+  text, and path canaries; and
+- unsealed Vertex and credential-pool characterization remains unchanged.
+
 ## Combined execution flow
 
 ```text
@@ -561,6 +704,17 @@ The user approved the following product decisions on 2026-08-08:
    unmerged experimental schema-1 v5 authorities.
 6. Preserve snapshot format 2, normalizer v5, v1-v4 compatibility, and all
    public wire contracts.
+7. Treat CredentialPool persistence as credential-source state; the atomic
+   execution boundary covers AIAgent live client state and its published pool
+   identity, not a new pool lease protocol.
+8. Retain one sealed credential candidate in memory for one bounded identical-
+   candidate re-adoption attempt within the current turn.
+9. Commit agent-owned refresh counters with the shared client transaction and
+   update turn-local guards only after that transaction succeeds.
+10. Preserve pre-candidate acquisition guards and legacy unsealed behavior.
+11. Clear pending state on success, terminal drift, route change, cancellation,
+    disposal, or bounded end-of-turn cleanup.
+12. Log only stable reason tokens and exception types on candidate failure.
 
 ## Self-review
 
@@ -578,5 +732,7 @@ The user approved the following product decisions on 2026-08-08:
 - **Scope:** no unrelated refactor, feature, provider enablement, or Phase 6
   work is included.
 - **Ambiguity:** identity purposes, alias precedence, repair inheritance,
-  endpoint normalization, schema migration, and failure behavior are explicit.
+  endpoint normalization, schema migration, credential-source versus execution
+  state, pending-candidate lifetime, retry bounds, and failure behavior are
+  explicit.
 - **Placeholders:** none.
