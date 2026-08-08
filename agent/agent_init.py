@@ -28,7 +28,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
@@ -1180,16 +1180,14 @@ def init_agent(
             # Extract query params (e.g. Azure api-version) from base_url
             # and pass via default_query to prevent loss during SDK URL
             # joining (httpx drops query string when joining paths).
-            _parsed_url = urlparse(base_url)
-            if _parsed_url.query:
-                _clean_url = urlunparse(_parsed_url._replace(query=""))
-                _query_params = {
-                    k: v[0] for k, v in parse_qs(_parsed_url.query).items()
-                }
+            from hermes_cli.runtime_provider import execution_sdk_endpoint
+
+            _sdk_endpoint = execution_sdk_endpoint(base_url=base_url)
+            if _sdk_endpoint.query_items:
                 client_kwargs = {
                     "api_key": api_key,
-                    "base_url": _clean_url,
-                    "default_query": _query_params,
+                    "base_url": _sdk_endpoint.base_url,
+                    "default_query": _sdk_endpoint.default_query,
                 }
             else:
                 client_kwargs = {"api_key": api_key, "base_url": base_url}

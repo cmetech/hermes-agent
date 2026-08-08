@@ -213,6 +213,7 @@ upstream_changes:
   - ExecutionRuntimeCapabilities additive registration provenance
   - ExecutionRuntimeIdentity exact six-field endpoint-bound private codec
   - execution_runtime_identity centralized admission and worker builder
+  - ExecutionSdkEndpoint and execution_sdk_endpoint lossless SDK route representation
   - execution_endpoint_sha256 canonical SDK transport endpoint builder
   - classify_credential_free_execution_runtime live preflight classifier
   - credential_free_provider_endpoint_config bounded dynamic route selector
@@ -241,8 +242,9 @@ upstream_changes:
     region and Vertex project/location derive their real execution endpoint
     without resolving credentials, and incomplete provider registration
     provenance cannot create sealed authority. SDK-split base URLs and default
-    query mappings must recompose through this same credential-free digest;
-    never introduce a parallel transport URL hash.
+    query mappings, including repeated approved keys and values, must round-trip
+    without loss and recompose through this same credential-free digest; never
+    introduce a parallel transport URL hash.
   removal_condition: Remove when upstream provides an equivalent single pure
     provider capability matrix with loader-bound declarations, central adapter
     policy, canonical identity, installed-distribution coverage, and unchanged
@@ -342,9 +344,13 @@ upstream_changes:
   - the selected route constraint remains private and immutable inside AIAgent for the full provider attempt
   - sealed credential refresh and client recreation may update credentials but never provider model API mode or endpoint
   - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
+  - sealed environment refresh compares route eligibility through the canonical endpoint digest and advances its seen baseline only after concrete client adoption
+  - repeated approved structural query values survive real initialization and credential-only client recreation without duplication or collapse
+  - a recreated sealed OpenAI client is endpoint-validated before replacing the live shared client
   - every sealed provider reservation reasserts the concrete SDK client endpoint at the last pre-network seam before accounting or provider I/O
   - SDK default_query is part of effective endpoint identity, including after credential-only client recreation
   - provider capability drift is terminal and cannot activate retry fallback structured repair or another provider attempt
+  - Codex app-server propagates the exact capability-drift exception instead of returning a generic partial result
   - sealed boto3 and AnthropicBedrock clients receive the selected endpoint explicitly while unsealed boto3 construction retains region-only SDK resolution
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
@@ -3266,6 +3272,7 @@ upstream_changes:
   - reservation refusal propagates before provider I/O
   - sealed route mismatch propagates before cost acquisition attempt reservation fallback retry repair or provider I/O
   - effective SDK route comparison includes default_query and uses the centralized credential-free endpoint digest
+  - Codex app-server preserves reservation-time capability drift identity through worker terminal classification without a partial result
   - sealed Bedrock clients receive the selected endpoint_url while unsealed construction omits it and retains SDK resolution
   tests:
   - tests/agent/test_provider_attempt_transport.py
@@ -3288,7 +3295,7 @@ upstream_changes:
     For sealed requests, the same seam must verify the concrete SDK client's
     effective endpoint (base URL plus default query) against the selected route
     before accounting. Capability drift is a bounded terminal result and may not
-    enter recovery or fallback.
+    enter app-server partial-result recovery, retry, repair, or fallback.
   removal_condition: Remove when upstream provides equivalent request-scoped, pre-transport
     provider-attempt authority across every supported provider path with a release-gated
     regression contract.

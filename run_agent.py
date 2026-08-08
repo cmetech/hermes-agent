@@ -517,18 +517,11 @@ class AIAgent:
     def _credential_refresh_base_url(self, candidate) -> str:
         constraint = AIAgent._assert_execution_route_constraint(self)
         if constraint is not None:
-            client_kwargs = getattr(self, "_client_kwargs", None)
-            if (
-                isinstance(client_kwargs, dict)
-                and "default_query" in client_kwargs
-            ):
-                from urllib.parse import urlsplit, urlunsplit
+            from hermes_cli.runtime_provider import execution_sdk_endpoint
 
-                parsed = urlsplit(constraint.base_url)
-                return urlunsplit(
-                    (parsed.scheme, parsed.netloc, parsed.path, "", "")
-                ).rstrip("/")
-            return constraint.base_url
+            return execution_sdk_endpoint(
+                base_url=constraint.base_url
+            ).base_url.rstrip("/")
         return str(candidate or "").strip().rstrip("/")
 
     def __init__(
@@ -4986,8 +4979,18 @@ class AIAgent:
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
+            new_client = None
             try:
                 new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
+                self._assert_execution_route_constraint(new_client)
+            except ProviderCapabilityDriftError:
+                if new_client is not None:
+                    self._close_openai_client(
+                        new_client,
+                        reason=f"rejected:{reason}",
+                        shared=False,
+                    )
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to rebuild shared OpenAI client (%s) %s error=%s",
@@ -5633,7 +5636,31 @@ class AIAgent:
         if not base_url:
             return False
 
-        resolved = (base_url, api_key)
+        resolved_route: str = base_url
+        current_route_matches = True
+        if route_constraint is not None:
+            from hermes_cli.runtime_provider import (
+                execution_endpoint_sha256,
+                execution_sdk_endpoint,
+            )
+
+            sdk_endpoint = execution_sdk_endpoint(
+                base_url=route_constraint.base_url
+            )
+            base_url = sdk_endpoint.base_url.rstrip("/")
+            default_base = base_url
+            resolved_route = route_constraint.identity.endpoint_sha256
+            try:
+                current_route_matches = execution_endpoint_sha256(
+                    provider=str(self.provider or ""),
+                    api_mode=str(self.api_mode or ""),
+                    base_url=self.base_url,
+                    default_query=self._client_kwargs.get("default_query"),
+                ) == resolved_route
+            except (TypeError, ValueError):
+                current_route_matches = False
+
+        resolved = (resolved_route, api_key)
         prev = getattr(self, "_env_creds_seen", None)
         current_base = (self.base_url or "").strip().rstrip("/")
 
@@ -5641,7 +5668,7 @@ class AIAgent:
             # First look — no baseline to diff against. Adopt only the
             # boot-default case (worker spawned before the user saved an
             # override); anything else is unattributable on turn one.
-            adopt = current_base == default_base and not (
+            adopt = current_route_matches and current_base == default_base and not (
                 base_url == current_base and api_key == self.api_key
             )
         else:
@@ -5651,7 +5678,11 @@ class AIAgent:
             # default or the previously-seen env value.
             adopt = (
                 resolved != prev
-                and current_base in {default_base, prev[0]}
+                and current_route_matches
+                and (
+                    route_constraint is not None
+                    or current_base in {default_base, prev[0]}
+                )
                 and not (base_url == current_base and api_key == self.api_key)
             )
 
@@ -5677,7 +5708,17 @@ class AIAgent:
         # as on credential-pool rotation.
         self._reapply_route_client_config(route_changed=route_changed)
 
-        if not self._replace_primary_openai_client(reason="env_credential_refresh"):
+        try:
+            rebuilt = self._replace_primary_openai_client(
+                reason="env_credential_refresh"
+            )
+        except ProviderCapabilityDriftError:
+            self.api_key = prior_api_key
+            self.base_url = prior_base_url
+            self._client_kwargs.clear()
+            self._client_kwargs.update(prior_client_kwargs)
+            raise
+        if not rebuilt:
             # Leave the baseline un-advanced so the unchanged edit is
             # retried next turn, and roll the agent back so its state keeps
             # matching the still-live old client.
@@ -5687,7 +5728,7 @@ class AIAgent:
             self._client_kwargs.update(prior_client_kwargs)
             return False
 
-        self._assert_execution_route_constraint()
+        self._assert_execution_route_constraint(getattr(self, "client", None))
         self._env_creds_seen = resolved
         if route_constraint is not None:
             logger.info(
@@ -5721,7 +5762,12 @@ class AIAgent:
                 from agent.vertex_adapter import get_vertex_credentials
 
                 token, _credential_project = get_vertex_credentials()
-                base_url = route_constraint.base_url
+                from hermes_cli.runtime_provider import execution_sdk_endpoint
+
+                sdk_endpoint = execution_sdk_endpoint(
+                    base_url=route_constraint.base_url
+                )
+                base_url = sdk_endpoint.base_url.rstrip("/")
             else:
                 from agent.vertex_adapter import get_vertex_config
 
@@ -5739,11 +5785,18 @@ class AIAgent:
         self.base_url = base_url.strip().rstrip("/")
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
+        if route_constraint is not None:
+            if sdk_endpoint.query_items:
+                self._client_kwargs["default_query"] = (
+                    sdk_endpoint.default_query
+                )
+            else:
+                self._client_kwargs.pop("default_query", None)
 
         if not self._replace_primary_openai_client(reason="vertex_credential_refresh"):
             return False
 
-        self._assert_execution_route_constraint()
+        self._assert_execution_route_constraint(getattr(self, "client", None))
         logger.info("Vertex AI OAuth token refreshed")
         return True
 

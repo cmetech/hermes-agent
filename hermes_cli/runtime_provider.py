@@ -190,6 +190,65 @@ class _ExecutionEndpointIdentity:
     error_code: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionSdkEndpoint:
+    """Lossless endpoint representation for SDK base/query splitting."""
+
+    base_url: str
+    query_items: tuple[tuple[str, object], ...]
+
+    @property
+    def default_query(self) -> dict[str, object]:
+        grouped: dict[str, list[object]] = {}
+        for key, value in self.query_items:
+            grouped.setdefault(key, []).append(value)
+        return {
+            key: values[0] if len(values) == 1 else tuple(values)
+            for key, values in grouped.items()
+        }
+
+    def recompose(self) -> str:
+        parsed = urlparse(self.base_url)
+        return urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path.rstrip("/"),
+            urlencode(self.query_items, doseq=False),
+            "",
+        ))
+
+
+def execution_sdk_endpoint(
+    *, base_url: object, default_query: object = None
+) -> ExecutionSdkEndpoint:
+    """Split or recompose one effective SDK endpoint without query loss."""
+
+    effective_base_url = str(base_url or "").strip()
+    try:
+        parsed = urlparse(effective_base_url)
+        query_items: list[tuple[str, object]] = list(
+            parse_qsl(parsed.query, keep_blank_values=True)
+        )
+        if default_query is not None:
+            if not isinstance(default_query, Mapping):
+                raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
+            for key, value in default_query.items():
+                if not isinstance(key, str):
+                    raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
+                if isinstance(value, (list, tuple)):
+                    query_items.extend((key, item) for item in value)
+                else:
+                    query_items.append((key, value))
+        return ExecutionSdkEndpoint(
+            base_url=urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, "", "")
+            ),
+            query_items=tuple(query_items),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID) from exc
+
+
 def _execution_endpoint_identity(
     *,
     provider: str,
@@ -246,33 +305,10 @@ def execution_endpoint_sha256(
     before delegating to the same credential-free endpoint identity primitive
     used by planning and runtime classification.
     """
-    effective_base_url = str(base_url or "").strip()
-    if default_query is not None:
-        if not isinstance(default_query, Mapping):
-            raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
-        try:
-            parsed = urlparse(effective_base_url)
-            query_items: list[tuple[str, object]] = list(
-                parse_qsl(parsed.query, keep_blank_values=True)
-            )
-            for key, value in default_query.items():
-                if not isinstance(key, str):
-                    raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
-                if isinstance(value, (list, tuple)):
-                    query_items.extend((key, item) for item in value)
-                else:
-                    query_items.append((key, value))
-            effective_base_url = urlunsplit(
-                (
-                    parsed.scheme,
-                    parsed.netloc,
-                    parsed.path.rstrip("/"),
-                    urlencode(query_items, doseq=True),
-                    "",
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID) from exc
+    effective_base_url = execution_sdk_endpoint(
+        base_url=base_url,
+        default_query=default_query,
+    ).recompose()
 
     identity = _execution_endpoint_identity(
         provider=provider,

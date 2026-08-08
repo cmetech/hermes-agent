@@ -28,6 +28,14 @@ from run_agent import AIAgent, ProviderCapabilityDriftError
 DEFAULT_BASE = "https://api.openai.com/v1"
 LOCAL_BASE = "http://127.0.0.1:39080"
 GMI_BASE = "https://api.gmi-serving.com/v1"
+REPEATED_QUERY_ENDPOINT = (
+    "https://tenant.openai.azure.com/openai/deployments/review"
+    "?deployment=blue&api-version=2025-04-01-preview&deployment=green"
+)
+REPEATED_DEFAULT_QUERY = {
+    "deployment": ("blue", "green"),
+    "api-version": "2025-04-01-preview",
+}
 
 
 def _make_agent(
@@ -80,13 +88,15 @@ def _sealed_route_constraint(
     )
 
 
-def _real_sealed_query_agent():
-    endpoint = (
+def _real_sealed_query_agent(
+    *, provider="azure-foundry", endpoint=None, api_key="test-credential"
+):
+    endpoint = endpoint or (
         "https://tenant.openai.azure.com/openai/deployments/review"
         "?api-version=2025-04-01-preview"
     )
     constraint = _sealed_route_constraint(
-        provider="azure-foundry",
+        provider=provider,
         base_url=endpoint,
     )
     with (
@@ -94,12 +104,12 @@ def _real_sealed_query_agent():
         patch("run_agent.check_toolset_requirements", return_value={}),
     ):
         agent = AIAgent(
-            provider="azure-foundry",
-            requested_provider="azure-foundry",
+            provider=provider,
+            requested_provider=provider,
             model="test-model",
             api_mode="chat_completions",
             base_url=endpoint,
-            api_key="test-credential",
+            api_key=api_key,
             execution_route_constraint=constraint,
             quiet_mode=True,
             skip_context_files=True,
@@ -468,6 +478,138 @@ def test_real_agent_init_preserves_sealed_query_endpoint_identity() -> None:
         agent.client.close()
 
 
+def test_real_init_preserves_repeated_approved_query_values() -> None:
+    agent, constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
+    try:
+        assert agent.base_url == (
+            "https://tenant.openai.azure.com/openai/deployments/review"
+        )
+        assert agent._client_kwargs["default_query"] == REPEATED_DEFAULT_QUERY
+        assert agent.client.default_query == REPEATED_DEFAULT_QUERY
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        agent.client.close()
+
+
+def test_real_recreated_client_preserves_repeated_query_and_adopts_env_key(
+    env,
+) -> None:
+    from hermes_cli.runtime_provider import execution_endpoint_sha256
+
+    agent, constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
+    old_client = agent.client
+    env["AZURE_FOUNDRY_API_KEY"] = "rotated-credential"
+    env["AZURE_FOUNDRY_BASE_URL"] = (
+        "https://attacker.invalid/openai/deployments/review"
+        "?deployment=red&api-version=2026-01-01"
+    )
+    try:
+        assert agent._try_refresh_env_client_credentials() is True
+
+        assert agent.api_key == "rotated-credential"
+        assert agent.client is not old_client
+        assert agent.client.api_key == "rotated-credential"
+        assert agent._client_kwargs["default_query"] == REPEATED_DEFAULT_QUERY
+        assert agent.client.default_query == REPEATED_DEFAULT_QUERY
+        assert execution_endpoint_sha256(
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+            base_url=agent.client.base_url,
+            default_query=agent.client.default_query,
+        ) == constraint.identity.endpoint_sha256
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        agent.client.close()
+        old_client.close()
+
+
+def test_failed_drifted_env_recreation_does_not_advance_seen_credentials(
+    env, monkeypatch
+) -> None:
+    agent, _constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
+    old_client = agent.client
+    original_create = agent._create_openai_client
+    rejected_clients = []
+
+    def create_drifted(client_kwargs, *, reason, shared):
+        drifted_kwargs = dict(client_kwargs)
+        drifted_kwargs["default_query"] = {
+            "deployment": ("blue", "red"),
+            "api-version": "2025-04-01-preview",
+        }
+        client = original_create(
+            drifted_kwargs, reason=reason, shared=shared
+        )
+        rejected_clients.append(client)
+        return client
+
+    monkeypatch.setattr(agent, "_create_openai_client", create_drifted)
+    env["AZURE_FOUNDRY_API_KEY"] = "rotated-credential"
+
+    try:
+        with pytest.raises(ProviderCapabilityDriftError) as caught:
+            agent._try_refresh_env_client_credentials()
+
+        assert caught.value.failure_kind == "provider_capability_drift"
+        assert not hasattr(agent, "_env_creds_seen")
+        assert agent.api_key == "test-credential"
+        assert agent.client is old_client
+        assert len(rejected_clients) == 1
+    finally:
+        for client in rejected_clients:
+            client.close()
+        old_client.close()
+
+
+def test_real_sealed_vertex_refresh_preserves_query_without_duplication(
+    monkeypatch,
+) -> None:
+    import agent.vertex_adapter as vertex_adapter
+    from hermes_cli.runtime_provider import execution_endpoint_sha256
+
+    agent, constraint = _real_sealed_query_agent(
+        provider="vertex",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="expired-token",
+    )
+    old_client = agent.client
+    monkeypatch.setattr(
+        vertex_adapter,
+        "get_vertex_credentials",
+        lambda: ("fresh-token", "credential-project"),
+    )
+    monkeypatch.setattr(
+        vertex_adapter,
+        "get_vertex_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("sealed refresh derived a Vertex endpoint")
+        ),
+    )
+    try:
+        assert agent._try_refresh_vertex_client_credentials() is True
+
+        assert agent.client is not old_client
+        assert agent.api_key == "fresh-token"
+        assert agent._client_kwargs["default_query"] == REPEATED_DEFAULT_QUERY
+        assert agent.client.default_query == REPEATED_DEFAULT_QUERY
+        assert execution_endpoint_sha256(
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+            base_url=agent.client.base_url,
+            default_query=agent.client.default_query,
+        ) == constraint.identity.endpoint_sha256
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        agent.client.close()
+        old_client.close()
+
+
 def test_sealed_query_endpoint_rejects_unauthorized_default_query_change() -> None:
     agent, _constraint = _real_sealed_query_agent()
     try:
@@ -493,6 +635,32 @@ def test_sealed_query_endpoint_rejects_actual_sdk_query_disagreement() -> None:
             "https://tenant.openai.azure.com/openai/deployments/review"
         ),
         default_query={"api-version": "2026-01-01"},
+    )
+    try:
+        with pytest.raises(ProviderCapabilityDriftError) as caught:
+            agent._assert_execution_route_constraint(unauthorized_client)
+
+        assert str(caught.value) == "provider_capability_drift"
+    finally:
+        unauthorized_client.close()
+        agent.client.close()
+
+
+def test_repeated_approved_query_rejects_changed_value_before_transport() -> None:
+    from openai import OpenAI
+
+    agent, _constraint = _real_sealed_query_agent(
+        endpoint=REPEATED_QUERY_ENDPOINT
+    )
+    unauthorized_client = OpenAI(
+        api_key="test-credential",
+        base_url=(
+            "https://tenant.openai.azure.com/openai/deployments/review"
+        ),
+        default_query={
+            "deployment": ("blue", "red"),
+            "api-version": "2025-04-01-preview",
+        },
     )
     try:
         with pytest.raises(ProviderCapabilityDriftError) as caught:

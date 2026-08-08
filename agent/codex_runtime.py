@@ -699,6 +699,10 @@ def run_codex_app_server_turn(
         reserve_provider_transport_attempt(agent)
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        from run_agent import ProviderCapabilityDriftError
+
+        if isinstance(exc, ProviderCapabilityDriftError):
+            raise
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.

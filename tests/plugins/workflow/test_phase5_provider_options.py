@@ -590,13 +590,15 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
 def test_worker_treats_provider_capability_drift_as_terminal(
     monkeypatch, tmp_path
 ) -> None:
+    import agent.codex_runtime as codex_runtime
     import agent.plugin_agent as plugin_agent
     import agent.plugin_agent_worker as worker
     import hermes_cli.runtime_provider as runtime_provider
     import hermes_state
     import run_agent
 
-    fallback_calls: list[bool] = []
+    drift = run_agent.ProviderCapabilityDriftError()
+    side_effects: list[str] = []
 
     class FakeDB:
         def close(self):
@@ -607,6 +609,7 @@ def test_worker_treats_provider_capability_drift_as_terminal(
             self.session_id = "primary-session"
             self.provider = kwargs["provider"]
             self.model = kwargs["model"]
+            self._codex_session = self.Session()
             self.tools = []
             self.valid_tool_names = set()
             self.session_input_tokens = 0
@@ -616,18 +619,35 @@ def test_worker_treats_provider_capability_drift_as_terminal(
             self._interrupt_requested = False
             self._api_call_count = 0
 
+        class Session:
+            def run_turn(self, **_kwargs):
+                side_effects.append("transport")
+                raise AssertionError("provider transport must remain unreachable")
+
+            def close(self):
+                side_effects.append("session_recovery")
+
+        def _assert_execution_route_constraint(self, _transport=None):
+            raise drift
+
         def seal_model_visible_prefix(self):
             return "8" * 64
 
         def run_conversation(self, _prompt, conversation_history=None):
-            raise run_agent.ProviderCapabilityDriftError()
+            return codex_runtime.run_codex_app_server_turn(
+                self,
+                user_message=_prompt,
+                original_user_message=_prompt,
+                messages=[{"role": "user", "content": _prompt}],
+                effective_task_id="workflow-task",
+            )
 
     class ChildRunner:
         def __init__(self, plugin_id):
             assert plugin_id == "workflow"
 
         def run(self, request, **kwargs):
-            fallback_calls.append(True)
+            side_effects.append("fallback")
             return PluginAgentRunResult(
                 final_response="must not run",
                 session_id="fallback-session",
@@ -689,8 +709,9 @@ def test_worker_treats_provider_capability_drift_as_terminal(
     assert result["final_response"] == ""
     assert result["audit"]["failure_kind"] == "provider_capability_drift"
     assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["model_calls"] == 0
     assert result["audit"]["known_no_effect"] is True
-    assert fallback_calls == []
+    assert side_effects == []
     public_result = str(result)
     assert "private-credential" not in public_result
     assert "https://openrouter.ai/api/v1" not in public_result

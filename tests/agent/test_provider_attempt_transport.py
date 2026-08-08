@@ -203,6 +203,44 @@ def test_codex_app_server_reserves_before_transport() -> None:
     assert events == ["reserve", "transport"]
 
 
+def test_codex_app_server_propagates_route_drift_before_accounting_or_transport(
+) -> None:
+    drift = ProviderCapabilityDriftError()
+    events: list[str] = []
+
+    class Session:
+        def run_turn(self, **_kwargs):
+            events.append("transport")
+            raise AssertionError("provider transport must remain unreachable")
+
+        def close(self):
+            events.append("session_recovery")
+
+    def reject_route(_transport=None):
+        raise drift
+
+    agent = SimpleNamespace(
+        _codex_session=Session(),
+        _interrupt_requested=False,
+        _assert_execution_route_constraint=reject_route,
+        _cost_budget_acquire_callback=lambda: events.append("cost"),
+        _provider_attempt_reservation_callback=lambda: events.append("attempt"),
+        _try_activate_fallback=lambda *_args, **_kwargs: events.append("fallback"),
+    )
+
+    with pytest.raises(ProviderCapabilityDriftError) as caught:
+        run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task",
+        )
+
+    assert caught.value is drift
+    assert events == []
+
+
 def _call_counts(path: str, call_name: str) -> dict[str, int]:
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     parents: dict[ast.AST, ast.AST] = {}
