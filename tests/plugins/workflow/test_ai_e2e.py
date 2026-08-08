@@ -81,30 +81,14 @@ class RecordingRunner:
         )
 
 
-def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
-    tmp_path,
-    workflow_writer,
-) -> None:
+def _admit_phase5_run(tmp_path, workflow_writer, *, name, nodes):
     path = workflow_writer(
-        tmp_path / "package/source/workflows",
-        name="phase5-shared-context",
-        filename="phase5-shared-context.yaml",
+        tmp_path / name / "source/workflows",
+        name=name,
+        filename=f"{name}.yaml",
         provider="openrouter",
         model="openai/gpt-5.4",
-        nodes=[
-            {
-                "id": "first",
-                "prompt": "first user turn",
-                "allowed_tools": ["terminal"],
-            },
-            {
-                "id": "second",
-                "prompt": "second user turn",
-                "depends_on": ["first"],
-                "context": "shared",
-                "allowed_tools": ["terminal"],
-            },
-        ],
+        nodes=nodes,
     )
     sidecar = path.with_name(f"{path.stem}.hermes.yaml")
     sidecar.write_text(
@@ -152,7 +136,7 @@ def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
             authoritative_cost_available=False,
         ),
     )
-    store = RunStore(tmp_path / "home")
+    store = RunStore(tmp_path / f"{name}-home")
     prepared = store.prepare_run_snapshot(
         package,
         compilation=compilation,
@@ -169,14 +153,75 @@ def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
             policy_digest=prepared.policy_digest,
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
-            idempotency_key="phase5-shared-context",
+            idempotency_key=name,
             concurrency_key=package.definition.name,
         ),
         immutable_snapshot=prepared,
     )
     assert admitted.run_id is not None
+    return store, admitted.run_id
+
+
+class _Phase5OutcomeRunner:
+    def __init__(self, *, status: str, failure_kind: str = "") -> None:
+        self.status = status
+        self.failure_kind = failure_kind
+        self.before_return = None
+
+    def run(self, request, **_kwargs):
+        if self.before_return is not None:
+            self.before_return()
+        return PluginAgentRunResult(
+            final_response="outcome",
+            session_id="outcome-session",
+            provider=request.provider or "fake",
+            model=request.model or "fake",
+            status=self.status,
+            pending_interaction=(
+                {"type": "clarification", "question": "continue?"}
+                if self.status == "paused"
+                else None
+            ),
+            usage={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+                **(
+                    {"failure_kind": self.failure_kind}
+                    if self.failure_kind
+                    else {}
+                ),
+            },
+        )
+
+
+def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-shared-context",
+        nodes=[
+            {
+                "id": "first",
+                "prompt": "first user turn",
+                "allowed_tools": ["terminal"],
+            },
+            {
+                "id": "second",
+                "prompt": "second user turn",
+                "depends_on": ["first"],
+                "context": "shared",
+                "allowed_tools": ["terminal"],
+            },
+        ],
+    )
     runner = RecordingRunner()
-    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    result = RunScheduler(store, agent_runner=runner).advance(run_id)
 
     assert result["status"] == "succeeded", result
     assert len(runner.requests) == 2
@@ -199,6 +244,75 @@ def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
     assert second_metadata["shared_context_compatibility_digest"] == (
         first_metadata["shared_context_compatibility_digest"]
     )
+    for field in (
+        "intended_authority_digest",
+        "model_visible_prefix_digest",
+        "shared_context_compatibility_digest",
+        "cache_fingerprint",
+    ):
+        value = second_metadata[field]
+        assert isinstance(value, str)
+        assert len(value) == 64
+        assert not set(value) - set("0123456789abcdef")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "failure_kind", "node_options", "expected_state"),
+    (
+        pytest.param("failed", "validation", {}, "failed", id="failed"),
+        pytest.param(
+            "failed",
+            "network_disconnect",
+            {
+                "retry": {
+                    "max_attempts": 2,
+                    "delay_ms": 1000,
+                    "on_error": "all",
+                }
+            },
+            "waiting_retry",
+            id="retry-scheduled",
+        ),
+        pytest.param("paused", "", {}, "paused", id="paused"),
+        pytest.param("cancelled", "", {}, "cancelled", id="cancelled"),
+        pytest.param("interrupted", "", {}, "interrupted", id="interrupted"),
+    ),
+)
+def test_phase5_nonwinning_attempt_never_persists_shared_handoff_identity(
+    tmp_path,
+    workflow_writer,
+    outcome,
+    failure_kind,
+    node_options,
+    expected_state,
+) -> None:
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name=f"phase5-nonwinner-{expected_state}",
+        nodes=[{
+            "id": "ask",
+            "prompt": "one turn",
+            "allowed_tools": ["terminal"],
+            **node_options,
+        }],
+    )
+    runner = _Phase5OutcomeRunner(
+        status="cancelled" if outcome == "interrupted" else outcome,
+        failure_kind=failure_kind,
+    )
+    scheduler = RunScheduler(store, agent_runner=runner)
+    if outcome == "interrupted":
+        runner.before_return = scheduler._shutdown.set
+
+    result = scheduler.advance(run_id)
+    attempt = result["nodes"]["ask"]["attempts"][-1]
+
+    assert result["nodes"]["ask"]["state"] == expected_state
+    assert "intended_authority_digest" not in attempt["metadata"]
+    assert "model_visible_prefix_digest" not in attempt["metadata"]
+    assert "shared_context_compatibility_digest" not in attempt["metadata"]
+    assert "cache_fingerprint" not in attempt["metadata"]
 
 
 def test_command_node_runs_from_immutable_snapshot_through_scheduler(

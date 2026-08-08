@@ -350,6 +350,7 @@ upstream_changes:
   - same-node intended-authority or model-visible-prefix drift selects fresh context before provider transport rather than mutating a cached prefix
   - distinct same-run nodes may resume only when their sealed cross-node compatibility digests match and the predecessor cache fingerprint recomputes from its own intended authority and exact prefix
   - persistent recovery keeps node-bound intended authority separate from cross-node compatibility authority
+  - only a succeeded winning attempt persists the complete Phase 5 handoff identity; failed retry-scheduled paused cancelled and interrupted outcomes strip all top-level handoff and cache fields at the scheduler persistence boundary
   - durable recovery reads the complete lowercase identity triple only from the unique winning succeeded attempt while failed superseded missing or tampered metadata fails closed
   - legacy session and recovery records remain byte-compatible and the new identity fields stay private attempt metadata rather than public run fields
   - normalizer v5 ordinary loops inherit v4 authenticated decision recovery and consumed-input cleanup

@@ -4336,6 +4336,22 @@ class RunScheduler:
                 raise RuntimeError(
                     "persistent session recovery outcome lost its active claim"
                 )
+        phase5_identity_fields = (
+            "intended_authority_digest",
+            "model_visible_prefix_digest",
+            "shared_context_compatibility_digest",
+        )
+        if result.status != "succeeded" and any(
+            field in result.metadata for field in phase5_identity_fields
+        ):
+            result = replace(
+                result,
+                metadata={
+                    key: value
+                    for key, value in result.metadata.items()
+                    if key not in {*phase5_identity_fields, "cache_fingerprint"}
+                },
+            )
         projection: dict[str, object] | None = None
         retry_grant: RetryLedgerGrant | None = None
         retry_charge = None
