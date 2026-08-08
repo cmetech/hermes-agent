@@ -1400,6 +1400,28 @@ class _LockOrderProbe:
         assert owned() is False
 
 
+class _ReservationWaitProbe:
+    """Expose positive proof that fallback entered the reservation wait."""
+
+    def __init__(self, released: threading.Event) -> None:
+        self._released = released
+        self.wait_entered = threading.Event()
+
+    def wait(self, timeout=None):
+        self.wait_entered.set()
+        return self._released.wait(timeout)
+
+    def set(self) -> None:
+        self._released.set()
+
+
+def _install_reservation_wait_probe(agent) -> _ReservationWaitProbe:
+    reservation = agent._sealed_credential_acquisition
+    probe = _ReservationWaitProbe(reservation.released)
+    object.__setattr__(reservation, "released", probe)
+    return probe
+
+
 def test_sealed_openai_retirement_starts_after_client_lock_release(
     monkeypatch,
 ) -> None:
@@ -1548,9 +1570,10 @@ def test_sealed_pool_acquisition_owns_transition_before_source_returns(
     fallback_thread = threading.Thread(target=activate_fallback)
     recovery_thread.start()
     assert source_entered.wait(timeout=5)
+    wait_probe = _install_reservation_wait_probe(agent)
     fallback_thread.start()
-    fallback_thread.join(timeout=0.2)
     try:
+        assert wait_probe.wait_entered.wait(timeout=5)
         assert fallback_thread.is_alive()
         assert fallback_resolution_calls == []
         release_source.set()
@@ -1632,9 +1655,10 @@ def test_sealed_vertex_acquisition_owns_transition_before_source_returns(
     fallback_thread = threading.Thread(target=activate_fallback)
     refresh_thread.start()
     assert source_entered.wait(timeout=5)
+    wait_probe = _install_reservation_wait_probe(agent)
     fallback_thread.start()
-    fallback_thread.join(timeout=0.2)
     try:
+        assert wait_probe.wait_entered.wait(timeout=5)
         assert fallback_thread.is_alive()
         assert fallback_resolution_calls == []
         release_source.set()
