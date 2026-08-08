@@ -276,6 +276,7 @@ upstream_changes:
   - registry-first public provider and authentication resolution
   - registration-gated Bedrock and Vertex synthetic endpoint derivation
   - _ExecutionProviderAuthority shared runtime registration resolution
+  - _static_execution_provider credential-free compatibility canonicalization
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -286,7 +287,8 @@ upstream_changes:
   - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
   - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
   - Bedrock and Vertex endpoint synthesis requires a bundled winner or no registration for legacy compatibility; non-bundled same-name winners use their registered profile endpoint
-  - runtime registration resolution checks the raw token first then the existing authentication canonical target once and shares that winner across endpoint fallback trust and provenance
+  - runtime registration resolution checks the raw token first then the existing static compatibility canonical target once and shares that winner across endpoint fallback trust and provenance
+  - credential-free runtime classification canonicalizes registry misses with static compatibility aliases only and never consults config auth stores credential pools environment secrets or credential probes; auto remains unresolved
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -313,9 +315,11 @@ upstream_changes:
     synthesis is bundled authority (with an unregistered legacy fallback), so a
     non-bundled same-name winner must retain its profile endpoint and provenance.
     Resolve runtime registration once, preferring the raw registry token before
-    consulting the existing authentication compatibility target; endpoint
+    consulting the static compatibility target; endpoint
     eligibility, profile fallback, trust, and provenance must consume that same
-    result rather than rebuilding aliases independently.
+    result rather than rebuilding aliases independently. This classification
+    path must not call the credential-aware provider resolver or inspect ambient
+    provider, authentication, or credential state; `auto` remains unresolved.
     Diagnostics remain bounded and free of local paths, credentials, or provider
     payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic

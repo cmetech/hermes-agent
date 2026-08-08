@@ -982,14 +982,36 @@ def _classify_execution_api_mode(
     )
 
 
-def _canonical_execution_provider(provider: object) -> str:
+def _static_execution_provider(provider: object) -> str:
     requested = provider.strip().lower() if isinstance(provider, str) else ""
     if not requested:
         return ""
     try:
-        return auth_mod.resolve_provider(requested)
-    except AuthError:
+        from hermes_cli.models import normalize_provider
+
+        return normalize_provider(requested)
+    except Exception:
         return requested
+
+
+def _canonical_execution_provider(provider: object) -> str:
+    """Resolve registry identity, then static aliases, without runtime state."""
+    requested = provider.strip().lower() if isinstance(provider, str) else ""
+    if not requested:
+        return ""
+    try:
+        from providers import get_provider_registration
+
+        registration = get_provider_registration(requested)
+    except Exception:
+        registration = None
+    if registration is not None:
+        profile_name = str(
+            getattr(registration.profile, "name", "") or ""
+        ).strip().lower()
+        if profile_name:
+            return profile_name
+    return _static_execution_provider(requested)
 
 
 def _resolve_execution_provider_authority(
@@ -1006,7 +1028,7 @@ def _resolve_execution_provider_authority(
 
         registration = get_provider_registration(requested)
         if registration is None:
-            canonical = _canonical_execution_provider(requested) or requested
+            canonical = _static_execution_provider(requested) or requested
             if canonical != requested:
                 registration = get_provider_registration(canonical)
         if registration is not None:
@@ -1024,7 +1046,7 @@ def _resolve_execution_provider_authority(
             profile = get_provider_profile(canonical)
         return _ExecutionProviderAuthority(canonical, None, profile, True)
     except Exception:
-        canonical = _canonical_execution_provider(requested) or requested
+        canonical = _static_execution_provider(requested) or requested
         return _ExecutionProviderAuthority(canonical, None, None, False)
 
 

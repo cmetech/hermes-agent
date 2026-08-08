@@ -29,6 +29,117 @@ def _runtime_identity(
     )
 
 
+def _forbid_preflight_provider_state(monkeypatch) -> list[str]:
+    accessed: list[str] = []
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            accessed.append(name)
+            raise AssertionError(
+                f"credential-free runtime classification accessed {name}"
+            )
+
+        return fail
+
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "resolve_provider",
+        forbidden("the credential-aware auth resolver"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        forbidden("config.yaml"),
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_auth_store",
+        forbidden("the auth store"),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        forbidden("the credential pool"),
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "has_usable_secret",
+        forbidden("credential environment probes"),
+    )
+    monkeypatch.setattr(
+        "agent.bedrock_adapter.has_aws_credentials",
+        forbidden("the AWS credential chain"),
+    )
+    return accessed
+
+
+def test_prospective_unknown_explicit_route_is_credential_free(monkeypatch) -> None:
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_execution_runtime(
+        provider="prospective-unknown",
+        model_config={
+            "provider": "prospective-unknown",
+            "default": "test-model",
+        },
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://prospective-unknown.example/v1",
+        },
+    )
+
+    assert capabilities.effective_provider == "prospective-unknown"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://prospective-unknown.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
+def test_resolved_unknown_explicit_route_is_credential_free(monkeypatch) -> None:
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_resolved_execution_runtime(
+        {
+            "provider": "resolved-unknown",
+            "model": "test-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://resolved-unknown.example/v1",
+        }
+    )
+
+    assert capabilities.effective_provider == "resolved-unknown"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://resolved-unknown.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
+def test_auto_explicit_route_stays_unresolved_and_credential_free(monkeypatch) -> None:
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_execution_runtime(
+        provider="auto",
+        model_config={"provider": "auto", "default": "test-model"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://auto-explicit.example/v1",
+        },
+    )
+
+    assert capabilities.effective_provider == "auto"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://auto-explicit.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
 def test_runtime_identity_accepts_normalization_equivalent_endpoint() -> None:
     left = _runtime_identity("https://EXAMPLE.test:443/v1/")
     right = _runtime_identity("https://example.test/v1")
