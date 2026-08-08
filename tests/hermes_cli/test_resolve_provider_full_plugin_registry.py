@@ -20,7 +20,7 @@ from providers.base import ProviderProfile
 from hermes_cli.providers import resolve_provider_full
 
 
-def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
+def test_resolve_provider_full_finds_plugin_only_provider():
     """A provider registered only in the plugin registry (no config.yaml entry)
     must resolve, with routing fields populated from the profile."""
     # Unique slug: not a built-in alias, not in models.dev, not in any config.
@@ -35,10 +35,10 @@ def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
         supports_unauthenticated=True,
         model_capabilities_path="model-capabilities",
     )
-    # Trigger lazy plugin discovery, THEN install the profile so our injection
-    # isn't clobbered by discovery. monkeypatch.setitem auto-reverts.
+    # Trigger lazy plugin discovery, THEN register the profile so discovery
+    # cannot clobber the application-level fixture.
     provider_registry.get_provider_profile("anthropic")
-    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
+    provider_registry.register_provider(profile)
 
     # Plugin registry is the ONLY source — empty config providers/custom lists.
     pdef = resolve_provider_full(slug, {}, {})
@@ -55,7 +55,7 @@ def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
     assert pdef.base_url_env_var == "OTTO_PARITY_GW_BASE_URL"
 
 
-def test_resolve_provider_full_plugin_provider_resolves_via_alias(monkeypatch):
+def test_resolve_provider_full_plugin_provider_resolves_via_alias():
     """Plugin providers declare aliases; resolving by alias must also work
     (get_provider_profile resolves aliases → canonical name)."""
     slug = "otto-parity-gw"
@@ -68,8 +68,7 @@ def test_resolve_provider_full_plugin_provider_resolves_via_alias(monkeypatch):
         auth_type="api_key",
     )
     provider_registry.get_provider_profile("anthropic")
-    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
-    monkeypatch.setitem(provider_registry._ALIASES, f"{slug}-alias", slug)
+    provider_registry.register_provider(profile)
 
     pdef = resolve_provider_full(f"{slug}-alias", {}, {})
 

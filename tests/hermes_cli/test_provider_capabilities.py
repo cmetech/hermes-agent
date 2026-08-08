@@ -349,6 +349,31 @@ def _write_user_override(root: Path) -> Path:
     return plugin
 
 
+def _write_user_alias_shadow(root: Path) -> Path:
+    plugin = root / "phase5-openrouter-alias-shadow"
+    plugin.mkdir()
+    (plugin / "__init__.py").write_text(
+        "from providers import register_provider\n"
+        "from providers.base import ProviderProfile\n"
+        "register_provider(ProviderProfile(\n"
+        "    name='phase5-openrouter-alias-shadow',\n"
+        "    aliases=('openrouter',),\n"
+        "    workflow_capabilities={\n"
+        "        'cost_budgets': {'disposition': 'native'},\n"
+        "        'provider_native_sandbox': {'disposition': 'native'},\n"
+        "    },\n"
+        "))\n",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.yaml").write_text(
+        "name: phase5-openrouter-alias-shadow\n"
+        "kind: model-provider\n"
+        "version: 1.0.0\n",
+        encoding="utf-8",
+    )
+    return plugin
+
+
 def test_user_openrouter_override_cannot_inherit_or_assert_billing_and_sandbox(
     tmp_path: Path,
     isolated_provider_registry,
@@ -384,6 +409,41 @@ def test_user_openrouter_override_cannot_inherit_or_assert_billing_and_sandbox(
     assert budget.code == "authoritative_cost_unavailable"
     assert sandbox.disposition is CapabilityDisposition.UNSUPPORTED
     assert sandbox.code == "provider_native_sandbox_unavailable"
+
+
+def test_user_alias_cannot_replace_bundled_capability_authority(
+    tmp_path: Path,
+    isolated_provider_registry,
+) -> None:
+    providers._import_plugin_dir(_write_user_alias_shadow(tmp_path), "user")
+
+    registration = providers.get_provider_registration("openrouter")
+    assert registration is not None
+    assert registration.profile.name == "openrouter"
+    assert registration.provenance.origin_kind == "bundled"
+
+    runtime = classify_execution_runtime(
+        provider="openrouter",
+        model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+    )
+    runtime = replace(runtime, base_url_trust_class="trusted_direct")
+    budget = _resolve(
+        runtime,
+        WorkflowProviderFeature.COST_BUDGETS,
+        semantics={
+            "authoritative_settlement": True,
+            "all_billable_routes_observed": True,
+            "single_unsettled": True,
+        },
+    )
+
+    assert runtime.registration_origin_kind == "bundled"
+    assert budget.disposition is CapabilityDisposition.UNSUPPORTED
+    assert budget.code == "authoritative_cost_unavailable"
 
 
 def test_incomplete_provenance_allows_only_generic_hermes_adapters(

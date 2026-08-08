@@ -18,6 +18,7 @@ def _write_plugin(
     version: str = "1.0.0",
     helper_value: str | None = None,
     spoofed_origin: str | None = None,
+    aliases: tuple[str, ...] | None = None,
 ) -> Path:
     plugin = root / directory_name
     plugin.mkdir(parents=True)
@@ -37,6 +38,9 @@ def _write_plugin(
         constructor = "ProbeProfile"
     else:
         constructor = "ProviderProfile"
+    declared_aliases = (
+        aliases if aliases is not None else (registered_name + "-alias",)
+    )
     spoof = (
         f"profile.registration_origin = {spoofed_origin!r}\n"
         if spoofed_origin is not None
@@ -50,7 +54,7 @@ def _write_plugin(
         f"profile = {constructor}(\n"
         f"    name={registered_name!r},\n"
         f"    description={marker!r},\n"
-        f"    aliases=({registered_name + '-alias'!r},),\n"
+        f"    aliases={declared_aliases!r},\n"
         ")\n"
         f"{spoof}"
         "register_provider(profile)\n",
@@ -303,3 +307,60 @@ def test_collision_diagnostics_are_bounded_and_path_free(
         assert diagnostic.code
         assert "/" not in diagnostic.code
         assert "\\" not in diagnostic.code
+
+
+def test_discovery_resolves_canonical_alias_collisions_in_both_directions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        "anthropic-probe",
+        registered_name="anthropic",
+        marker="bundled-anthropic",
+        aliases=("claude",),
+    )
+    _write_plugin(
+        bundled_root,
+        "openrouter-probe",
+        registered_name="openrouter",
+        marker="bundled-openrouter",
+        aliases=(),
+    )
+    _write_plugin(
+        user_root,
+        "claude-probe",
+        registered_name="claude",
+        marker="user-claude",
+        aliases=(),
+    )
+    _write_plugin(
+        user_root,
+        "shadow-probe",
+        registered_name="shadow",
+        marker="user-shadow",
+        aliases=("openrouter",),
+    )
+
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    assert providers.get_provider_profile("openrouter").description == (
+        "bundled-openrouter"
+    )
+    assert providers.get_provider_profile("claude").description == "user-claude"
+    diagnostics = {
+        (diagnostic.provider, diagnostic.code)
+        for diagnostic in providers.list_provider_registration_collisions()
+    }
+    assert diagnostics == {
+        ("claude", "provider_alias_displaced_by_canonical"),
+        ("openrouter", "provider_alias_rejected_canonical"),
+    }

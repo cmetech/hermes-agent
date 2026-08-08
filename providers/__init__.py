@@ -48,7 +48,6 @@ from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
 logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, ProviderProfile] = {}
-_ALIASES: dict[str, str] = {}
 _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
 
@@ -71,6 +70,15 @@ class ProviderRegistrationProvenance:
     distribution_version: str
     code_closure_digest: str
     code_closure_complete: bool
+
+
+@dataclass(frozen=True)
+class _ProviderAliasRegistration:
+    canonical_name: str
+    provenance: ProviderRegistrationProvenance
+
+
+_ALIASES: dict[str, _ProviderAliasRegistration] = {}
 
 
 @dataclass(frozen=True)
@@ -299,13 +307,49 @@ def register_provider(profile: ProviderProfile) -> None:
         )
         _record_collision(profile.name, code)
 
-    for alias, canonical in tuple(_ALIASES.items()):
-        if canonical == profile.name:
+    for alias, alias_registration in tuple(_ALIASES.items()):
+        if alias_registration.canonical_name == profile.name:
             _ALIASES.pop(alias, None)
+
+    if profile.name in _ALIASES:
+        _ALIASES.pop(profile.name)
+        _record_collision(profile.name, "provider_alias_displaced_by_canonical")
+
     _REGISTRY[profile.name] = profile
     _REGISTRATIONS[profile.name] = registration
+
+    seen_aliases: set[str] = set()
     for alias in profile.aliases:
-        _ALIASES[alias] = profile.name
+        if alias in seen_aliases:
+            continue
+        seen_aliases.add(alias)
+        if alias in _REGISTRY:
+            _record_collision(alias, "provider_alias_rejected_canonical")
+            continue
+
+        previous_alias = _ALIASES.get(alias)
+        if previous_alias is not None:
+            previous_rank = _ORIGIN_PRECEDENCE[
+                previous_alias.provenance.origin_kind
+            ]
+            new_rank = _ORIGIN_PRECEDENCE[provenance.origin_kind]
+            if new_rank < previous_rank:
+                _record_collision(
+                    alias,
+                    "provider_alias_lower_precedence_ignored",
+                )
+                continue
+            code = (
+                "provider_alias_higher_precedence_replaced"
+                if new_rank > previous_rank
+                else "provider_alias_same_precedence_replaced"
+            )
+            _record_collision(alias, code)
+
+        _ALIASES[alias] = _ProviderAliasRegistration(
+            canonical_name=profile.name,
+            provenance=provenance,
+        )
     _PROVIDER_LIST_CACHE = None
 
 
@@ -314,8 +358,11 @@ def get_provider_registration(name: str) -> ProviderRegistration | None:
 
     if not _discovered:
         _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    return _current_registration(canonical)
+    canonical = _current_registration(name)
+    if canonical is not None:
+        return canonical
+    alias = _ALIASES.get(name)
+    return _current_registration(alias.canonical_name) if alias else None
 
 
 def list_provider_registration_collisions() -> list[ProviderRegistrationCollision]:
@@ -331,8 +378,11 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
     """
     if not _discovered:
         _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    return _REGISTRY.get(canonical)
+    profile = _REGISTRY.get(name)
+    if profile is not None:
+        return profile
+    alias = _ALIASES.get(name)
+    return _REGISTRY.get(alias.canonical_name) if alias else None
 
 
 def list_providers() -> list[ProviderProfile]:
@@ -342,7 +392,7 @@ def list_providers() -> list[ProviderProfile]:
         _discover_providers()
     if _PROVIDER_LIST_CACHE is not None:
         return list(_PROVIDER_LIST_CACHE)
-    # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
+    # Deduplicate defensive direct inserts; aliases never enter _REGISTRY.
     seen: set[int] = set()
     result: list[ProviderProfile] = []
     for profile in _REGISTRY.values():

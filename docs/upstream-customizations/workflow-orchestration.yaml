@@ -257,29 +257,50 @@ upstream_changes:
   - hermes_cli/providers.py
   - providers/__init__.py
   - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_inventory.py
+  - tests/hermes_cli/test_provider_capabilities.py
   - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/hermes_cli/test_web_server.py
+  - tests/providers/test_plugin_discovery.py
+  - tests/providers/test_provider_registry.py
   owned_symbols:
   - canonical profile api-mode to transport adapter
   - _ExecutionEndpointIdentity and endpointless execution API-mode inventory
   - loader-authored provider registration provenance and code-closure digest
   - bundled, legacy-compatible, and user-plugin registration precedence
+  - _ProviderAliasRegistration loader-authored alias provenance
+  - canonical-first provider token lookup and alias collision arbitration
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
+  owned_invariants:
+  - canonical provider tokens always outrank aliases regardless of origin or import order
+  - canonical collisions and alias collisions use bundled below legacy-compatible below user-plugin precedence
+  - equal-precedence alias collisions preserve last-writer compatibility with one bounded diagnostic
+  - replacing a canonical registration removes only that registration's stale alias claims
+  - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_inventory.py
+  - tests/hermes_cli/test_provider_capabilities.py
   - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/hermes_cli/test_web_server.py
   - tests/providers/test_plugin_discovery.py
   - tests/providers/test_provider_registry.py
-  expected_commit_subject: 'fix(providers): make runtime authority deterministic'
+  expected_commit_subject: 'fix(providers): enforce canonical alias precedence'
   upstream_candidate: true
   merge_guidance: Preserve canonical round-tripping for every declared provider
     API mode, including codex responses and Bedrock converse. Provider origin,
     distribution identity, and bounded code-closure identity must be authored by
     the loader rather than accepted from profile data. Discovery precedence must
-    remain bundled below legacy-compatible below user plugins, while collisions
-    remain bounded and free of local paths or provider payloads.
+    remain bundled below legacy-compatible below user plugins for both canonical
+    and alias claims. Canonical tokens always outrank aliases; replacing a
+    canonical registration removes its stale aliases; equal-rank collisions
+    retain last-writer compatibility. Diagnostics remain bounded and free of
+    local paths, credentials, or provider payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic
     provider-registration authority with immutable loader provenance, closure
     identity, and canonical transport round-tripping.

@@ -148,8 +148,6 @@ def _moa_contract_profile():
 
     name = "moa-contract-test"
     alias = "moa-contract-alias"
-    prior_profile = providers._REGISTRY.get(name)
-    prior_alias = providers._ALIASES.get(alias)
     profile = ProviderProfile(
         name=name,
         aliases=(alias,),
@@ -159,17 +157,7 @@ def _moa_contract_profile():
     )
     profile.fetch_models = lambda **_kwargs: []  # type: ignore[method-assign]
     providers.register_provider(profile)
-    try:
-        yield profile
-    finally:
-        if prior_profile is None:
-            providers._REGISTRY.pop(name, None)
-        else:
-            providers._REGISTRY[name] = prior_profile
-        if prior_alias is None:
-            providers._ALIASES.pop(alias, None)
-        else:
-            providers._ALIASES[alias] = prior_alias
+    yield profile
 
 
 @pytest.fixture
@@ -179,16 +167,9 @@ def _moa_legacy_profile():
     from providers.base import ProviderProfile
 
     name = "moa-legacy-test"
-    prior_profile = providers._REGISTRY.get(name)
     profile = ProviderProfile(name=name)
     providers.register_provider(profile)
-    try:
-        yield profile
-    finally:
-        if prior_profile is None:
-            providers._REGISTRY.pop(name, None)
-        else:
-            providers._REGISTRY[name] = prior_profile
+    yield profile
 
 
 # ---------------------------------------------------------------------------
@@ -1511,15 +1492,13 @@ class TestWebServerEndpoints:
         ]
         assert config_path.read_bytes() == before
 
-    def test_put_moa_unregistered_gateway_name_is_legacy_compatible(
+    def test_put_moa_unregistered_provider_name_is_legacy_compatible(
         self, monkeypatch
     ):
-        import providers
         from hermes_cli import model_eligibility
         from hermes_cli.config import get_config_path, load_config
 
-        monkeypatch.delitem(providers._REGISTRY, "gateway", raising=False)
-        monkeypatch.delitem(providers._ALIASES, "gateway", raising=False)
+        provider = "unregistered-gateway-test"
         real_validate = model_eligibility.validate_provider_model_selection
         calls = []
 
@@ -1544,7 +1523,7 @@ class TestWebServerEndpoints:
             "/api/model/moa",
             json={
                 "reference_models": [
-                    {"provider": "gateway", "model": "legacy-auto"}
+                    {"provider": provider, "model": "legacy-auto"}
                 ],
                 "aggregator": {
                     "provider": "openrouter",
@@ -1556,7 +1535,7 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert calls == []
         assert load_config()["moa"]["reference_models"] == [
-            {"provider": "gateway", "model": "legacy-auto", "enabled": True}
+            {"provider": provider, "model": "legacy-auto", "enabled": True}
         ]
 
     @pytest.mark.parametrize(
