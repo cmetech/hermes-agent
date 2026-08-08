@@ -213,6 +213,7 @@ upstream_changes:
   - ExecutionRuntimeCapabilities additive registration provenance
   - ExecutionRuntimeIdentity exact six-field endpoint-bound private codec
   - execution_runtime_identity centralized admission and worker builder
+  - execution_endpoint_sha256 canonical SDK transport endpoint builder
   - classify_credential_free_execution_runtime live preflight classifier
   - credential_free_provider_endpoint_config bounded dynamic route selector
   - CredentialFreeExecutionRouteConstraint private selected route authority
@@ -239,7 +240,9 @@ upstream_changes:
     enumerated endpointless API modes receive the versioned sentinel. Bedrock
     region and Vertex project/location derive their real execution endpoint
     without resolving credentials, and incomplete provider registration
-    provenance cannot create sealed authority.
+    provenance cannot create sealed authority. SDK-split base URLs and default
+    query mappings must recompose through this same credential-free digest;
+    never introduce a parallel transport URL hash.
   removal_condition: Remove when upstream provides an equivalent single pure
     provider capability matrix with loader-bound declarations, central adapter
     policy, canonical identity, installed-distribution coverage, and unchanged
@@ -285,9 +288,16 @@ upstream_changes:
   overlap_policy: owned_symbol
   files:
   - agent/agent_init.py
+  - agent/anthropic_adapter.py
+  - agent/bedrock_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/codex_runtime.py
   - agent/conversation_loop.py
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
+  - agent/provider_attempts.py
+  - agent/relay_llm.py
+  - hermes_cli/runtime_provider.py
   - model_tools.py
   - run_agent.py
   - plugins/workflow/execution_semantics.py
@@ -304,6 +314,9 @@ upstream_changes:
   - AIAgent private execution_route_constraint transport pin
   - AIAgent._assert_execution_route_constraint
   - ProviderCapabilityDriftError bounded pre-transport failure
+  - execution_endpoint_sha256 effective SDK endpoint reconstruction
+  - sealed Bedrock endpoint-pinned client construction
+  - Relay managed stream callback error identity preservation
   - PluginAgentRunRequest
   - phase5_node_intended_authority_digest
   - phase5_session_cache_fingerprint
@@ -329,6 +342,10 @@ upstream_changes:
   - the selected route constraint remains private and immutable inside AIAgent for the full provider attempt
   - sealed credential refresh and client recreation may update credentials but never provider model API mode or endpoint
   - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
+  - every sealed provider reservation reasserts the concrete SDK client endpoint at the last pre-network seam before accounting or provider I/O
+  - SDK default_query is part of effective endpoint identity, including after credential-only client recreation
+  - provider capability drift is terminal and cannot activate retry fallback structured repair or another provider attempt
+  - sealed boto3 and AnthropicBedrock clients receive the selected endpoint explicitly while unsealed boto3 construction retains region-only SDK resolution
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_phase5_execution_context.py
@@ -340,6 +357,8 @@ upstream_changes:
   - tests/plugins/workflow/test_typed_publication_recovery.py
   - tests/plugins/workflow/test_phase4_loops.py
   - tests/run_agent/test_env_credential_turn_refresh.py
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/plugins/workflow/test_phase5_provider_options.py
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true
   merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
@@ -347,9 +366,11 @@ upstream_changes:
     only after prompt contributors and final tool filtering, but before session reads
     and provider calls. Carry the private selected route constraint into AIAgent
     for the whole attempt, reassert it around every credential refresh and client
-    recreation, and keep sealed Vertex recovery token-only. Preserve exact legacy
-    recovery encodings and never resolve workflow aliases or provider capabilities
-    inside clients.
+    recreation and at every concrete SDK transport reservation, and keep sealed
+    Vertex recovery token-only. Treat route drift as terminal before accounting,
+    fallback, repair, retry, or provider I/O. Preserve exact legacy recovery
+    encodings and never resolve workflow aliases or provider capabilities inside
+    clients.
   removal_condition: Remove when upstream provides equivalent two-stage immutable
     provider and model-visible-prefix authority with crash-safe paired recovery and
     pre-transport drift rejection.
@@ -483,6 +504,7 @@ upstream_changes:
   files:
   - agent/cost_budget.py
   - agent/provider_attempts.py
+  - agent/relay_llm.py
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
   - agent/conversation_loop.py
@@ -3222,12 +3244,17 @@ upstream_changes:
   files:
   - run_agent.py
   - agent/anthropic_adapter.py
+  - agent/bedrock_adapter.py
   - agent/chat_completion_helpers.py
   - agent/codex_runtime.py
   - agent/provider_attempts.py
   - tests/agent/test_provider_attempt_transport.py
   owned_symbols:
   - reserve_provider_transport_attempt
+  - reservation-time concrete transport route assertion
+  - endpoint-keyed sealed Bedrock runtime client cache
+  - optional AnthropicBedrock base_url pin
+  - ManagedLlmStream provider callback error unwrapping
   - AIAgent._anthropic_messages_create before_transport bridge
   - chat-completions, Bedrock, MoA, and summary transport reservations
   - create_anthropic_message per-transport before_transport callback
@@ -3237,10 +3264,17 @@ upstream_changes:
   - each retry or stream-to-create fallback receives a distinct reservation
   - an absent request-local callback preserves ordinary Hermes behavior
   - reservation refusal propagates before provider I/O
+  - sealed route mismatch propagates before cost acquisition attempt reservation fallback retry repair or provider I/O
+  - effective SDK route comparison includes default_query and uses the centralized credential-free endpoint digest
+  - sealed Bedrock clients receive the selected endpoint_url while unsealed construction omits it and retains SDK resolution
   tests:
   - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_bedrock_adapter.py
+  - tests/agent/test_anthropic_adapter.py
   - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_env_credential_turn_refresh.py
   - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_phase5_provider_options.py
   expected_commit_subject: 'test(workflow): gate provider attempt transport seams'
   upstream_candidate: true
   merge_guidance: Preserve the optional request-local reservation callback at every
@@ -3251,6 +3285,10 @@ upstream_changes:
     I/O. Keep the hook optional so ordinary non-workflow conversations retain their
     existing behavior. Any upstream refactor that moves or adds provider launches
     must update the focused transport contract and retain equivalent pre-launch accounting.
+    For sealed requests, the same seam must verify the concrete SDK client's
+    effective endpoint (base URL plus default query) against the selected route
+    before accounting. Capability drift is a bounded terminal result and may not
+    enter recovery or fallback.
   removal_condition: Remove when upstream provides equivalent request-scoped, pre-transport
     provider-attempt authority across every supported provider path with a release-gated
     regression contract.

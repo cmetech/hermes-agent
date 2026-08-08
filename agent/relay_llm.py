@@ -547,6 +547,13 @@ class ManagedLlmStream(Iterator[Any]):
                 self._logical = None
             loop.close()
             self._loop = None
+            if (
+                self._callback_error is not None
+                and relay_runtime._is_relay_wrapped_callback_error(
+                    exc, self._callback_error
+                )
+            ):
+                raise self._callback_error
             raise
 
     def __iter__(self) -> "ManagedLlmStream":

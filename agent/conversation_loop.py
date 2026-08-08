@@ -3541,6 +3541,10 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if isinstance(
+                    api_error, _ra().ProviderCapabilityDriftError
+                ):
+                    raise
                 if poison_provider_transport_attempt(
                     agent, "authoritative_settlement_ambiguous"
                 ):

@@ -1273,7 +1273,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
-            reserve_provider_transport_attempt(agent)
+            reserve_provider_transport_attempt(agent, active_client)
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

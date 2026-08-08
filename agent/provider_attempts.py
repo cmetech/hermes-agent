@@ -11,7 +11,7 @@ from agent.cost_budget import CostBudgetPoisoned
 _COST_STATE_LOCK = threading.RLock()
 
 
-def reserve_provider_transport_attempt(agent: Any) -> None:
+def reserve_provider_transport_attempt(agent: Any, transport: Any = None) -> None:
     """Reserve one actual provider call when a sealed caller installed a guard."""
 
     with _COST_STATE_LOCK:
@@ -38,6 +38,10 @@ def reserve_provider_transport_attempt(agent: Any) -> None:
             "a second provider transport started before authoritative settlement",
             failure_code="authoritative_settlement_ambiguous",
         )
+
+    route_assertion = getattr(agent, "_assert_execution_route_constraint", None)
+    if callable(route_assertion):
+        route_assertion(transport)
 
     cost_callback = getattr(agent, "_cost_budget_acquire_callback", None)
     cost_attempt_id = cost_callback() if cost_callback is not None else None

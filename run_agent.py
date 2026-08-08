@@ -443,36 +443,73 @@ class AIAgent:
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
 
-    def _assert_execution_route_constraint(self):
+    def _assert_execution_route_constraint(self, transport: Any = None):
         constraint = getattr(self, "_execution_route_constraint", None)
         if constraint is None:
             return None
         from hermes_cli.runtime_provider import (
             CredentialFreeExecutionRouteConstraint,
+            execution_endpoint_sha256,
         )
-        from hermes_cli.route_identity import normalize_route_base_url
 
         if not isinstance(constraint, CredentialFreeExecutionRouteConstraint):
             raise ProviderCapabilityDriftError()
-        expected_base = normalize_route_base_url(constraint.base_url)
-        state_matches = (
-            self.requested_provider == constraint.requested_provider
-            and self.provider == constraint.identity.provider
-            and self.model == constraint.model
-            and self.api_mode == constraint.api_mode
-            and normalize_route_base_url(self.base_url) == expected_base
-        )
+
+        expected_digest = constraint.identity.endpoint_sha256
+
+        def matches_endpoint(base_url: object, default_query: object = None) -> bool:
+            try:
+                return execution_endpoint_sha256(
+                    provider=str(self.provider or ""),
+                    api_mode=str(self.api_mode or ""),
+                    base_url=base_url,
+                    default_query=default_query,
+                ) == expected_digest
+            except (TypeError, ValueError):
+                return False
+
         client_kwargs = getattr(self, "_client_kwargs", None)
+        default_query = (
+            client_kwargs.get("default_query")
+            if isinstance(client_kwargs, dict)
+            else None
+        )
+        state_matches = all((
+            self.requested_provider == constraint.requested_provider,
+            self.provider == constraint.identity.provider,
+            self.model == constraint.model,
+            self.api_mode == constraint.api_mode,
+            matches_endpoint(constraint.base_url),
+            matches_endpoint(self.base_url, default_query),
+        ))
         if isinstance(client_kwargs, dict) and "base_url" in client_kwargs:
-            state_matches = state_matches and (
-                normalize_route_base_url(client_kwargs["base_url"])
-                == expected_base
+            state_matches = state_matches and matches_endpoint(
+                client_kwargs["base_url"], default_query
             )
         anthropic_base = getattr(self, "_anthropic_base_url", None)
         if anthropic_base is not None:
-            state_matches = state_matches and (
-                normalize_route_base_url(anthropic_base) == expected_base
-            )
+            state_matches = state_matches and matches_endpoint(anthropic_base)
+
+        if transport is not None:
+            transport_base = None
+            transport_query = None
+            meta = getattr(transport, "meta", None)
+            if meta is not None:
+                transport_base = getattr(meta, "endpoint_url", None)
+            if transport_base is None:
+                transport_base = getattr(transport, "base_url", None)
+            if transport_base is None:
+                transport_base = getattr(transport, "_base_url", None)
+            if transport_base is not None:
+                transport_query = getattr(transport, "default_query", None)
+                if transport_query is None:
+                    transport_query = getattr(transport, "_custom_query", None)
+                state_matches = state_matches and matches_endpoint(
+                    transport_base, transport_query
+                )
+            else:
+                state_matches = False
+
         if not state_matches:
             raise ProviderCapabilityDriftError()
         return constraint
@@ -480,6 +517,17 @@ class AIAgent:
     def _credential_refresh_base_url(self, candidate) -> str:
         constraint = AIAgent._assert_execution_route_constraint(self)
         if constraint is not None:
+            client_kwargs = getattr(self, "_client_kwargs", None)
+            if (
+                isinstance(client_kwargs, dict)
+                and "default_query" in client_kwargs
+            ):
+                from urllib.parse import urlsplit, urlunsplit
+
+                parsed = urlsplit(constraint.base_url)
+                return urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, "", "")
+                ).rstrip("/")
             return constraint.base_url
         return str(candidate or "").strip().rstrip("/")
 
@@ -5236,7 +5284,15 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            client = build_anthropic_bedrock_client(region)
+            client = build_anthropic_bedrock_client(
+                region,
+                base_url=(
+                    getattr(self, "_anthropic_base_url", None)
+                    if getattr(self, "_execution_route_constraint", None)
+                    is not None
+                    else None
+                ),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
             client = build_anthropic_client(
@@ -6084,12 +6140,15 @@ class AIAgent:
         # TypeError on them). See #31673.
         from agent.anthropic_adapter import create_anthropic_message
         from agent.provider_attempts import reserve_provider_transport_attempt
+        active_client = client or self._anthropic_client
         return create_anthropic_message(
-            client or self._anthropic_client,
+            active_client,
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
-            before_transport=lambda: reserve_provider_transport_attempt(self),
+            before_transport=lambda: reserve_provider_transport_attempt(
+                self, active_client
+            ),
             # Rate-limit + credits state live in response headers, which the
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
@@ -6112,7 +6171,15 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
+            self._anthropic_client = build_anthropic_bedrock_client(
+                region,
+                base_url=(
+                    getattr(self, "_anthropic_base_url", None)
+                    if getattr(self, "_execution_route_constraint", None)
+                    is not None
+                    else None
+                ),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
             self._anthropic_client = build_anthropic_client(

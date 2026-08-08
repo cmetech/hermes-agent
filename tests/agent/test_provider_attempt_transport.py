@@ -14,10 +14,67 @@ from agent.provider_attempts import (
     reserve_provider_transport_attempt,
     settle_provider_transport_attempt,
 )
-from run_agent import AIAgent
+from run_agent import AIAgent, ProviderCapabilityDriftError
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def _sealed_route_constraint(
+    *,
+    provider: str,
+    model: str,
+    api_mode: str,
+    base_url: str,
+):
+    from hermes_cli import runtime_provider as rp
+
+    identity = rp.execution_runtime_identity(
+        rp.classify_execution_runtime(
+            provider=provider,
+            model_config={"provider": provider, "default": model},
+            provider_config={
+                "api_mode": api_mode,
+                "base_url": base_url,
+            },
+        )
+    )
+    return rp.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="f" * 64,
+        requested_provider=provider,
+        model=model,
+        api_mode=api_mode,
+        base_url=base_url,
+        provider_config=(
+            {"region": "us-west-2"} if provider == "bedrock" else {}
+        ),
+        identity=identity,
+    )
+
+
+def _sealed_agent(
+    *,
+    provider: str,
+    model: str,
+    api_mode: str,
+    base_url: str,
+):
+    agent = object.__new__(AIAgent)
+    agent.provider = provider
+    agent.requested_provider = provider
+    agent.model = model
+    agent.api_mode = api_mode
+    agent.base_url = base_url
+    agent._client_kwargs = (
+        {} if api_mode == "bedrock_converse" else {"base_url": base_url}
+    )
+    agent._execution_route_constraint = _sealed_route_constraint(
+        provider=provider,
+        model=model,
+        api_mode=api_mode,
+        base_url=base_url,
+    )
+    return agent
 
 
 def test_chat_completion_reserves_before_transport() -> None:
@@ -214,6 +271,225 @@ def test_reservation_helper_is_optional_but_never_swallows_refusal() -> None:
     agent = SimpleNamespace(_provider_attempt_reservation_callback=refuse)
     with pytest.raises(RuntimeError, match="provider grant exhausted"):
         reserve_provider_transport_attempt(agent)
+
+
+def test_sealed_bedrock_transport_pins_actual_boto_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import bedrock_adapter
+
+    endpoint = "https://bedrock-runtime.us-west-2.amazonaws.com"
+    agent = _sealed_agent(
+        provider="bedrock",
+        model="amazon.nova-pro-v1:0",
+        api_mode="bedrock_converse",
+        base_url=endpoint,
+    )
+    agent._bedrock_region = "us-west-2"
+    constructions: list[tuple[str, dict[str, object]]] = []
+    converse_calls: list[dict[str, object]] = []
+
+    class FakeBoto3:
+        __version__ = "1.40.0"
+
+        @staticmethod
+        def client(service: str, **kwargs):
+            constructions.append((service, dict(kwargs)))
+            actual_endpoint = str(
+                kwargs.get("endpoint_url")
+                or "https://sdk-default.invalid"
+            )
+            return SimpleNamespace(
+                meta=SimpleNamespace(endpoint_url=actual_endpoint),
+                converse=lambda **call_kwargs: (
+                    converse_calls.append(dict(call_kwargs))
+                    or {"output": {"message": {"content": []}}}
+                ),
+            )
+
+    bedrock_adapter.reset_client_cache()
+    monkeypatch.setattr(bedrock_adapter, "_require_boto3", lambda: FakeBoto3)
+    monkeypatch.setattr(
+        bedrock_adapter,
+        "normalize_converse_response",
+        lambda response: response,
+    )
+
+    result = _dispatch_nonstreaming_api_request(
+        agent,
+        {
+            "__bedrock_region__": "us-west-2",
+            "__bedrock_converse__": True,
+            "modelId": agent.model,
+            "messages": [],
+        },
+        make_client=lambda *_args, **_kwargs: None,
+    )
+
+    assert result == {"output": {"message": {"content": []}}}
+    assert constructions == [
+        (
+            "bedrock-runtime",
+            {"region_name": "us-west-2", "endpoint_url": endpoint},
+        )
+    ]
+    assert converse_calls == [{"modelId": agent.model, "messages": []}]
+
+
+def test_sealed_bedrock_transport_rejects_actual_endpoint_disagreement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import bedrock_adapter
+
+    endpoint = "https://bedrock-runtime.us-west-2.amazonaws.com"
+    agent = _sealed_agent(
+        provider="bedrock",
+        model="amazon.nova-pro-v1:0",
+        api_mode="bedrock_converse",
+        base_url=endpoint,
+    )
+    converse_calls: list[dict[str, object]] = []
+    client = SimpleNamespace(
+        meta=SimpleNamespace(
+            endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com"
+        ),
+        converse=lambda **kwargs: converse_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        bedrock_adapter,
+        "_get_bedrock_runtime_client",
+        lambda *_args, **_kwargs: client,
+    )
+
+    with pytest.raises(ProviderCapabilityDriftError) as caught:
+        _dispatch_nonstreaming_api_request(
+            agent,
+            {
+                "__bedrock_region__": "us-west-2",
+                "__bedrock_converse__": True,
+                "modelId": agent.model,
+                "messages": [],
+            },
+            make_client=lambda *_args, **_kwargs: None,
+        )
+
+    assert str(caught.value) == "provider_capability_drift"
+    assert converse_calls == []
+
+
+def test_unsealed_bedrock_transport_retains_sdk_endpoint_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import bedrock_adapter
+
+    constructions: list[tuple[str, dict[str, object]]] = []
+
+    class FakeBoto3:
+        __version__ = "1.40.0"
+
+        @staticmethod
+        def client(service: str, **kwargs):
+            constructions.append((service, dict(kwargs)))
+            return SimpleNamespace(
+                meta=SimpleNamespace(
+                    endpoint_url=(
+                        "https://bedrock-runtime.us-west-2.amazonaws.com"
+                    )
+                ),
+                converse=lambda **_kwargs: {"ok": True},
+            )
+
+    bedrock_adapter.reset_client_cache()
+    monkeypatch.setattr(bedrock_adapter, "_require_boto3", lambda: FakeBoto3)
+    monkeypatch.setattr(
+        bedrock_adapter,
+        "normalize_converse_response",
+        lambda response: response,
+    )
+    agent = SimpleNamespace(api_mode="bedrock_converse", provider="bedrock")
+
+    result = _dispatch_nonstreaming_api_request(
+        agent,
+        {
+            "__bedrock_region__": "us-west-2",
+            "__bedrock_converse__": True,
+            "modelId": "amazon.nova-pro-v1:0",
+            "messages": [],
+        },
+        make_client=lambda *_args, **_kwargs: None,
+    )
+
+    assert result == {"ok": True}
+    assert constructions == [
+        ("bedrock-runtime", {"region_name": "us-west-2"})
+    ]
+
+
+def test_relay_stream_preserves_terminal_route_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import relay_llm, relay_runtime
+
+    drift = ProviderCapabilityDriftError()
+
+    class Request:
+        def __init__(self, headers, content):
+            self.headers = headers
+            self.content = content
+
+    class LLM:
+        async def stream_execute(
+            self,
+            _name,
+            request,
+            provider_stream,
+            _observe_chunk,
+            _finalizer,
+            **_kwargs,
+        ):
+            try:
+                async for _chunk in provider_stream(request):
+                    pass
+            except Exception as exc:
+                raise RuntimeError(
+                    f"internal error: {type(exc).__name__}: {exc} (retried 3x)"
+                ) from None
+
+    class Runtime:
+        relay = SimpleNamespace(LLMRequest=Request, llm=LLM())
+
+        @staticmethod
+        def managed_execution_enabled():
+            return True
+
+        @staticmethod
+        async def run_in_session_async(_session, callback, *args, **kwargs):
+            return await callback(*args, **kwargs)
+
+    monkeypatch.setattr(
+        relay_runtime,
+        "resolve_execution_context",
+        lambda _session_id: (Runtime(), object(), None),
+    )
+    monkeypatch.setattr(relay_llm, "_logical_parent", lambda *_a, **_k: None)
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        relay_llm,
+        "_codec_round_trip_request_body",
+        lambda *_a, **_k: None,
+    )
+
+    with pytest.raises(ProviderCapabilityDriftError) as caught:
+        relay_llm.stream(
+            {"model": "test-model", "messages": []},
+            lambda _request: (_ for _ in ()).throw(drift),
+            session_id="session-1",
+            name="test-provider",
+            model_name="test-model",
+            finalizer=dict,
+        )
+
+    assert caught.value is drift
 
 
 def test_cost_lease_precedes_attempt_reservation_and_releases_when_no_transport():

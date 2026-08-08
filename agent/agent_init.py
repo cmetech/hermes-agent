@@ -1050,7 +1050,15 @@ def init_agent(
             _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
             _br_region = _region_match.group(1) if _region_match else "us-east-1"
             agent._bedrock_region = _br_region
-            agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
+            agent._anthropic_client = build_anthropic_bedrock_client(
+                _br_region,
+                base_url=(
+                    base_url
+                    if getattr(agent, "_execution_route_constraint", None)
+                    is not None
+                    else None
+                ),
+            )
             agent._anthropic_api_key = "aws-sdk"
             agent._anthropic_base_url = base_url
             agent._is_anthropic_oauth = False

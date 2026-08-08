@@ -56,7 +56,7 @@ except Exception:
 # This keeps startup fast for users who don't use Bedrock.
 # ---------------------------------------------------------------------------
 
-_bedrock_runtime_client_cache: Dict[str, Any] = {}
+_bedrock_runtime_client_cache: Dict[object, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
@@ -90,17 +90,25 @@ def _require_boto3():
     return boto3
 
 
-def _get_bedrock_runtime_client(region: str):
+def _get_bedrock_runtime_client(
+    region: str, *, endpoint_url: Optional[str] = None
+):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
+    cache_key: object = (
+        region if endpoint_url is None else (region, endpoint_url)
+    )
+    if cache_key not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+        client_kwargs: Dict[str, Any] = {"region_name": region}
+        if endpoint_url is not None:
+            client_kwargs["endpoint_url"] = endpoint_url
+        _bedrock_runtime_client_cache[cache_key] = boto3.client(
+            "bedrock-runtime", **client_kwargs
         )
-    return _bedrock_runtime_client_cache[region]
+    return _bedrock_runtime_client_cache[cache_key]
 
 
 def _get_bedrock_control_client(region: str):
@@ -119,7 +127,9 @@ def reset_client_cache():
     _bedrock_control_client_cache.clear()
 
 
-def invalidate_runtime_client(region: str) -> bool:
+def invalidate_runtime_client(
+    region: str, *, endpoint_url: Optional[str] = None
+) -> bool:
     """Evict the cached ``bedrock-runtime`` client for a single region.
 
     Per-region counterpart to :func:`reset_client_cache`. Used by the converse
@@ -130,8 +140,11 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
+    cache_key: object = (
+        region if endpoint_url is None else (region, endpoint_url)
+    )
+    existed = cache_key in _bedrock_runtime_client_cache
+    _bedrock_runtime_client_cache.pop(cache_key, None)
     return existed
 
 

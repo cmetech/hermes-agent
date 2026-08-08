@@ -10,7 +10,7 @@ import logging
 import os
 import re
 from types import MappingProxyType
-from urllib.parse import parse_qsl, quote, urlparse, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunsplit
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -229,6 +229,61 @@ def _execution_endpoint_identity(
         ).hexdigest(),
         None,
     )
+
+
+def execution_endpoint_sha256(
+    *,
+    provider: str,
+    api_mode: str,
+    base_url: object,
+    default_query: object = None,
+) -> str:
+    """Return the canonical endpoint digest for an effective SDK transport.
+
+    OpenAI-compatible clients intentionally keep structural query parameters
+    (notably Azure's ``api-version``) in ``default_query`` because URL joining
+    drops a query attached directly to ``base_url``. Recompose that SDK split
+    before delegating to the same credential-free endpoint identity primitive
+    used by planning and runtime classification.
+    """
+    effective_base_url = str(base_url or "").strip()
+    if default_query is not None:
+        if not isinstance(default_query, Mapping):
+            raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
+        try:
+            parsed = urlparse(effective_base_url)
+            query_items: list[tuple[str, object]] = list(
+                parse_qsl(parsed.query, keep_blank_values=True)
+            )
+            for key, value in default_query.items():
+                if not isinstance(key, str):
+                    raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID)
+                if isinstance(value, (list, tuple)):
+                    query_items.extend((key, item) for item in value)
+                else:
+                    query_items.append((key, value))
+            effective_base_url = urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path.rstrip("/"),
+                    urlencode(query_items, doseq=True),
+                    "",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(_PROVIDER_ENDPOINT_IDENTITY_INVALID) from exc
+
+    identity = _execution_endpoint_identity(
+        provider=provider,
+        api_mode=api_mode,
+        base_url=effective_base_url,
+    )
+    if identity.error_code or not identity.endpoint_sha256:
+        raise ValueError(
+            identity.error_code or _PROVIDER_ENDPOINT_IDENTITY_INVALID
+        )
+    return identity.endpoint_sha256
 
 
 def _loopback_hostname(host: str) -> bool:

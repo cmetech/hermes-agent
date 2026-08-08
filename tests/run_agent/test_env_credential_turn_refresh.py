@@ -17,7 +17,7 @@ failover legitimately move the session off the env credential, and config
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -78,6 +78,34 @@ def _sealed_route_constraint(
         provider_config={},
         identity=identity,
     )
+
+
+def _real_sealed_query_agent():
+    endpoint = (
+        "https://tenant.openai.azure.com/openai/deployments/review"
+        "?api-version=2025-04-01-preview"
+    )
+    constraint = _sealed_route_constraint(
+        provider="azure-foundry",
+        base_url=endpoint,
+    )
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+    ):
+        agent = AIAgent(
+            provider="azure-foundry",
+            requested_provider="azure-foundry",
+            model="test-model",
+            api_mode="chat_completions",
+            base_url=endpoint,
+            api_key="test-credential",
+            execution_route_constraint=constraint,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    return agent, constraint
 
 
 @pytest.fixture
@@ -424,6 +452,159 @@ def test_sealed_codex_refresh_recreates_client_without_endpoint_drift(
     agent._replace_primary_openai_client.assert_called_once_with(
         reason="openai-codex_credential_refresh"
     )
+
+
+def test_real_agent_init_preserves_sealed_query_endpoint_identity() -> None:
+    agent, constraint = _real_sealed_query_agent()
+    try:
+        assert agent.base_url == (
+            "https://tenant.openai.azure.com/openai/deployments/review"
+        )
+        assert agent._client_kwargs["default_query"] == {
+            "api-version": "2025-04-01-preview"
+        }
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        agent.client.close()
+
+
+def test_sealed_query_endpoint_rejects_unauthorized_default_query_change() -> None:
+    agent, _constraint = _real_sealed_query_agent()
+    try:
+        agent._client_kwargs["default_query"] = {
+            "api-version": "2026-01-01"
+        }
+
+        with pytest.raises(ProviderCapabilityDriftError) as caught:
+            agent._assert_execution_route_constraint()
+
+        assert str(caught.value) == "provider_capability_drift"
+    finally:
+        agent.client.close()
+
+
+def test_sealed_query_endpoint_rejects_actual_sdk_query_disagreement() -> None:
+    from openai import OpenAI
+
+    agent, _constraint = _real_sealed_query_agent()
+    unauthorized_client = OpenAI(
+        api_key="test-credential",
+        base_url=(
+            "https://tenant.openai.azure.com/openai/deployments/review"
+        ),
+        default_query={"api-version": "2026-01-01"},
+    )
+    try:
+        with pytest.raises(ProviderCapabilityDriftError) as caught:
+            agent._assert_execution_route_constraint(unauthorized_client)
+
+        assert str(caught.value) == "provider_capability_drift"
+    finally:
+        unauthorized_client.close()
+        agent.client.close()
+
+
+def test_sealed_query_credential_rotation_keeps_split_transport_endpoint() -> None:
+    agent, constraint = _real_sealed_query_agent()
+    old_client = agent.client
+    agent._replace_primary_openai_client = MagicMock(return_value=True)
+    entry = SimpleNamespace(
+        id="rotated",
+        runtime_api_key="rotated-credential",
+        runtime_base_url=(
+            "https://attacker.invalid/openai/deployments/review"
+            "?api-version=2026-01-01"
+        ),
+    )
+    try:
+        agent._swap_credential(entry)
+
+        assert agent.api_key == "rotated-credential"
+        assert agent.base_url == (
+            "https://tenant.openai.azure.com/openai/deployments/review"
+        )
+        assert agent._client_kwargs["base_url"] == agent.base_url
+        assert agent._client_kwargs["default_query"] == {
+            "api-version": "2025-04-01-preview"
+        }
+        assert agent._assert_execution_route_constraint() is constraint
+    finally:
+        old_client.close()
+
+
+def test_conversation_route_mutation_at_reservation_is_terminal(
+    monkeypatch,
+) -> None:
+    endpoint = "https://api.gmi-serving.com/v1"
+    constraint = _sealed_route_constraint(provider="gmi", base_url=endpoint)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            provider="gmi",
+            requested_provider="gmi",
+            model="test-model",
+            api_mode="chat_completions",
+            base_url=endpoint,
+            api_key="test-credential",
+            execution_route_constraint=constraint,
+            fallback_model={"provider": "openrouter", "model": "fallback"},
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent._cached_system_prompt = "You are helpful."
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent._disable_streaming = True
+    agent._try_refresh_env_client_credentials = lambda: False
+    transport_calls: list[bool] = []
+    request_client_builds: list[bool] = []
+    fallback_calls: list[bool] = []
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="done", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model="test-model",
+        usage=None,
+    )
+    request_client = SimpleNamespace(
+        base_url=endpoint,
+        default_query={},
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: transport_calls.append(True) or response
+            )
+        ),
+    )
+
+    def mutate_after_turn_checks(*, reason, api_kwargs=None):
+        request_client_builds.append(True)
+        agent._client_kwargs["base_url"] = "https://changed.invalid/v1"
+        return request_client
+
+    agent._create_request_openai_client = mutate_after_turn_checks
+    agent._try_activate_fallback = (
+        lambda *args, **kwargs: fallback_calls.append(True) or True
+    )
+    monkeypatch.setattr(agent, "_persist_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent, "_save_trajectory", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        agent, "_cleanup_task_resources", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(ProviderCapabilityDriftError) as caught:
+        agent.run_conversation("hello")
+
+    assert str(caught.value) == "provider_capability_drift"
+    assert request_client_builds == [True]
+    assert transport_calls == []
+    assert fallback_calls == []
 
 
 CUSTOM_BASE = "https://api.longcat.example/openai/v1"

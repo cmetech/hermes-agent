@@ -912,7 +912,9 @@ def build_anthropic_client(
     return client
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(
+    region: str, *, base_url: Optional[str] = None
+):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -941,14 +943,19 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
-    return _anthropic_sdk.AnthropicBedrock(
-        aws_region=region,
-        timeout=Timeout(timeout=900.0, connect=10.0),
+    kwargs: Dict[str, Any] = {
+        "aws_region": region,
+        "timeout": Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
-        max_retries=0,
-        default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
-    )
+        "max_retries": 0,
+        "default_headers": {
+            "anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])
+        },
+    }
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    return _anthropic_sdk.AnthropicBedrock(**kwargs)
 
 
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:

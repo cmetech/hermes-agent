@@ -585,3 +585,112 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.sealed_fallback_route is None
     assert child.sandbox_policy == {"mode": "provider_native"}
     assert kwargs["is_cancelled"]() is False
+
+
+def test_worker_treats_provider_capability_drift_as_terminal(
+    monkeypatch, tmp_path
+) -> None:
+    import agent.plugin_agent as plugin_agent
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    fallback_calls: list[bool] = []
+
+    class FakeDB:
+        def close(self):
+            pass
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "primary-session"
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._interrupt_requested = False
+            self._api_call_count = 0
+
+        def seal_model_visible_prefix(self):
+            return "8" * 64
+
+        def run_conversation(self, _prompt, conversation_history=None):
+            raise run_agent.ProviderCapabilityDriftError()
+
+    class ChildRunner:
+        def __init__(self, plugin_id):
+            assert plugin_id == "workflow"
+
+        def run(self, request, **kwargs):
+            fallback_calls.append(True)
+            return PluginAgentRunResult(
+                final_response="must not run",
+                session_id="fallback-session",
+                provider=request.provider or "",
+                model=request.model or "",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(plugin_agent, "PluginAgentRunner", ChildRunner)
+    monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "private-credential",
+        },
+    )
+    request = PluginAgentRunRequest(
+        prompt="immutable user turn",
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        intended_authority_digest="a" * 64,
+        allowed_tools=(),
+        workdir=tmp_path,
+        sealed_provider_attempt_grant=True,
+        sealed_fallback_route={
+            "provider": "openrouter",
+            "effective_provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "context_mode": "fresh",
+            "expected_runtime_route_fingerprint": "7" * 64,
+            "expected_runtime_route_options": {},
+            "expected_runtime_identity": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "api_mode": "chat_completions",
+                "base_url_trust_class": "trusted_direct",
+                "endpoint_sha256": "6" * 64,
+                "registration_provenance_digest": "5" * 64,
+            },
+            "reasoning_config": {},
+            "request_overrides": {},
+            "structured_output": None,
+        },
+    )
+
+    result = worker._run({"plugin_id": "workflow", "request": request.to_wire()})
+
+    assert result["status"] == "failed"
+    assert result["final_response"] == ""
+    assert result["audit"]["failure_kind"] == "provider_capability_drift"
+    assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["known_no_effect"] is True
+    assert fallback_calls == []
+    public_result = str(result)
+    assert "private-credential" not in public_result
+    assert "https://openrouter.ai/api/v1" not in public_result

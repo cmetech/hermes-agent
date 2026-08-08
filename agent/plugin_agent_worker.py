@@ -1769,7 +1769,7 @@ def _run(
         # Import the agent only after the request loader is installed and
         # required MCP servers have registered their tools. Construction stays
         # below runtime classification and tool-policy validation.
-        from run_agent import AIAgent
+        from run_agent import AIAgent, ProviderCapabilityDriftError
 
         pending: list[dict[str, str]] = []
         approved_action_consumed = False
@@ -2391,6 +2391,41 @@ def _run(
                             cost_evidence
                             or snapshot_cost_budget(cost_authority)
                         ),
+                        **(
+                            {
+                                "intended_authority_digest": (
+                                    request.intended_authority_digest
+                                ),
+                                "model_visible_prefix_digest": (
+                                    model_visible_prefix_digest
+                                ),
+                            }
+                            if model_visible_prefix_digest is not None
+                            else {}
+                        ),
+                    },
+                    "structured_output": None,
+                }
+            except ProviderCapabilityDriftError as exc:
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {},
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": exc.failure_kind,
+                        "provider_attempts": shared_attempts,
+                        "model_calls": model_calls,
+                        "known_no_effect": shared_attempts == 0,
                         **(
                             {
                                 "intended_authority_digest": (
