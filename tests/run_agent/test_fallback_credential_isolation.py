@@ -258,6 +258,108 @@ def test_fallback_waits_for_pending_candidate_then_runs_once_after_exhaustion(
         agent.close()
 
 
+def test_post_adoption_auth_failure_runs_exactly_one_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    import run_agent
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        CredentialPool,
+        PooledCredential,
+    )
+    from tests.run_agent.test_env_credential_turn_refresh import (
+        _LowestConstructorBarrier,
+        _build_real_sealed_openai_agent,
+        _drive_provider_error,
+    )
+
+    endpoint = "https://route.test/v1"
+    expired_token = "expired-oauth-token"
+    fresh_token = "fresh-oauth-token"
+    entry = PooledCredential(
+        provider="anthropic",
+        id="oauth-entry",
+        label="OAuth entry",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:test",
+        access_token=expired_token,
+        refresh_token="refresh-token",
+        base_url=endpoint,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    original_refresh = pool.try_refresh_matching
+    pool_refresh_calls: list[bool] = []
+
+    def refresh_pool_once(**kwargs):
+        pool_refresh_calls.append(True)
+        if len(pool_refresh_calls) > 1:
+            return None
+        return original_refresh(**kwargs)
+
+    monkeypatch.setattr(pool, "try_refresh_matching", refresh_pool_once)
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="anthropic",
+        endpoint=endpoint,
+        api_key=expired_token,
+        credential_pool=pool,
+    )
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "openrouter/auto"}
+    ]
+    fallback_resolution_calls: list[str] = []
+
+    def refresh_oauth(_refresh_token, **_kwargs):
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "rotated-refresh-token",
+            "expires_at_ms": 9_999_999_999_000,
+        }
+
+    def resolve_fallback(*_args, **_kwargs):
+        fallback_resolution_calls.append("openrouter")
+        return SimpleNamespace(
+            api_key="fallback-token",
+            base_url="https://openrouter.ai/api/v1",
+            _custom_headers={},
+        ), "openrouter/auto"
+
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=0,
+        unauthorized_tokens={expired_token, fresh_token},
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        refresh_oauth,
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        resolve_fallback,
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: None)
+
+    try:
+        try:
+            _drive_provider_error(agent)
+        except run_agent.ProviderCapabilityDriftError:
+            # The sealed route correctly rejects transport on the distinct
+            # fallback endpoint; this test owns only fallback eligibility.
+            pass
+
+        assert fallback_resolution_calls == ["openrouter"]
+        assert pool_refresh_calls == [True, True]
+        assert barrier.constructor_tokens == [fresh_token]
+        assert agent.provider == "openrouter"
+    finally:
+        agent.close()
+
+
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────
 
 class TestRecoveryProviderGuard:

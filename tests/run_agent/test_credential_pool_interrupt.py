@@ -124,10 +124,21 @@ def test_sealed_candidate_cancellation_before_publication_wins(monkeypatch):
     ) = _start_paused_sealed_adoption(monkeypatch)
     agent, _constraint, _current, _candidate, recovery_state, barrier, _calls = prepared
     old_client = agent.client
+    client_lock = agent._openai_client_lock()
+    interrupt_published = threading.Event()
+
+    def probed_client_lock():
+        if agent._interrupt_requested:
+            interrupt_published.set()
+        return client_lock
+
+    monkeypatch.setattr(agent, "_openai_client_lock", probed_client_lock)
     interrupt_thread = threading.Thread(
         target=lambda: agent.interrupt(hard_cancel=True)
     )
     interrupt_thread.start()
+    assert interrupt_published.wait(timeout=5)
+    assert agent._interrupt_requested is True
     barrier.release_second_attempt()
     recovery_thread.join(timeout=5)
     interrupt_thread.join(timeout=5)

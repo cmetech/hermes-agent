@@ -172,6 +172,7 @@ class _LowestConstructorBarrier:
         pause_before_second: bool = False,
         before_candidate_return=None,
         failure_message: str = "deterministic SDK constructor failure",
+        unauthorized_tokens: set[str] | None = None,
     ) -> None:
         self._concrete_openai = concrete_openai
         self._agent = agent
@@ -181,6 +182,7 @@ class _LowestConstructorBarrier:
         self._pause_before_second = pause_before_second
         self._before_candidate_return = before_candidate_return
         self._failure_message = failure_message
+        self._unauthorized_tokens = unauthorized_tokens or {expired_token}
         self.constructor_tokens: list[str] = []
         self.clients: list[object] = []
         self._first_failure = threading.Event()
@@ -218,7 +220,7 @@ class _LowestConstructorBarrier:
             supplied_http_client.close()
 
         def handle_request(_request: httpx.Request) -> httpx.Response:
-            if token == self._expired_token:
+            if token in self._unauthorized_tokens:
                 return httpx.Response(
                     401,
                     json={"error": {"message": "expired", "type": "auth"}},
@@ -1230,6 +1232,7 @@ def _prepare_pending_pool_recovery(
     endpoint: str = REPEATED_QUERY_ENDPOINT,
     before_candidate_return=None,
     failure_message: str = "deterministic SDK constructor failure",
+    before_pool_return=None,
 ):
     import run_agent
 
@@ -1267,6 +1270,8 @@ def _prepare_pending_pool_recovery(
         @staticmethod
         def try_refresh_matching(**_kwargs):
             source_calls.append("pool")
+            if before_pool_return is not None:
+                before_pool_return()
             return candidate
 
     agent._credential_pool = _Pool()
@@ -1486,40 +1491,240 @@ def test_sealed_candidate_build_does_not_consume_provider_or_budget_ledgers(
         agent.close()
 
 
-@pytest.mark.parametrize("later_source", ["vertex", "anthropic", "nous", "codex"])
-def test_pending_pool_candidate_precedes_every_later_source(
-    later_source,
+def test_sealed_pool_acquisition_owns_transition_before_source_returns(
     monkeypatch,
 ) -> None:
+    source_entered = threading.Event()
+    release_source = threading.Event()
+
+    def block_pool_source() -> None:
+        source_entered.set()
+        assert release_source.wait(timeout=5)
+
     (
         agent,
         _constraint,
         _current,
-        candidate,
+        _candidate,
         recovery_state,
-        barrier,
-        source_calls,
-    ) = _prepare_pending_pool_recovery(monkeypatch, failures=1)
-    later_source_calls: list[str] = []
-    try:
-        recovered, _marker = agent._recover_with_credential_pool(
-            status_code=401,
-            has_retried_429=False,
-            credential_recovery_state=recovery_state,
-        )
-        if not recovered:
-            later_source_calls.append(later_source)
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=0,
+        before_pool_return=block_pool_source,
+    )
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "openrouter/auto"}
+    ]
+    fallback_resolution_calls: list[str] = []
+    recovery_results: list[tuple[bool, bool]] = []
+    fallback_results: list[bool] = []
+    errors: list[BaseException] = []
 
-        assert recovered is True
-        assert source_calls == ["pool"]
-        assert barrier.constructor_tokens == [
-            "fresh-pool-token",
-            "fresh-pool-token",
-        ]
-        assert later_source_calls == []
-        assert agent._credential_pool_entry_id == candidate.id
+    def recover() -> None:
+        try:
+            recovery_results.append(
+                agent._recover_with_credential_pool(
+                    status_code=401,
+                    has_retried_429=False,
+                    credential_recovery_state=recovery_state,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    def activate_fallback() -> None:
+        try:
+            fallback_results.append(agent._try_activate_fallback())
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: fallback_resolution_calls.append("openrouter"),
+    )
+    recovery_thread = threading.Thread(target=recover)
+    fallback_thread = threading.Thread(target=activate_fallback)
+    recovery_thread.start()
+    assert source_entered.wait(timeout=5)
+    fallback_thread.start()
+    fallback_thread.join(timeout=0.2)
+    try:
+        assert fallback_thread.is_alive()
+        assert fallback_resolution_calls == []
+        release_source.set()
+        recovery_thread.join(timeout=5)
+        fallback_thread.join(timeout=5)
+
+        assert not recovery_thread.is_alive()
+        assert not fallback_thread.is_alive()
+        assert errors == []
+        assert recovery_results == [(True, False)]
+        assert fallback_results == [False]
+        assert fallback_resolution_calls == []
     finally:
+        release_source.set()
         agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_vertex_acquisition_owns_transition_before_source_returns(
+    monkeypatch,
+) -> None:
+    import run_agent
+    from agent.credential_adoption import _CredentialRefreshStatus
+
+    expired_token = "expired-vertex-token"
+    fresh_token = "fresh-vertex-token"
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="vertex",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key=expired_token,
+    )
+    recovery_state = agent._begin_credential_recovery_turn()
+    source_entered = threading.Event()
+    release_source = threading.Event()
+    fallback_resolution_calls: list[str] = []
+    refresh_results: list[object] = []
+    fallback_results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def get_vertex_credentials():
+        source_entered.set()
+        assert release_source.wait(timeout=5)
+        return fresh_token, "credential-project"
+
+    def refresh() -> None:
+        try:
+            refresh_results.append(
+                agent._refresh_vertex_credentials_for_turn(recovery_state)
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    def activate_fallback() -> None:
+        try:
+            fallback_results.append(agent._try_activate_fallback())
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=0,
+    )
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "openrouter/auto"}
+    ]
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_credentials",
+        get_vertex_credentials,
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: fallback_resolution_calls.append("openrouter"),
+    )
+    refresh_thread = threading.Thread(target=refresh)
+    fallback_thread = threading.Thread(target=activate_fallback)
+    refresh_thread.start()
+    assert source_entered.wait(timeout=5)
+    fallback_thread.start()
+    fallback_thread.join(timeout=0.2)
+    try:
+        assert fallback_thread.is_alive()
+        assert fallback_resolution_calls == []
+        release_source.set()
+        refresh_thread.join(timeout=5)
+        fallback_thread.join(timeout=5)
+
+        assert not refresh_thread.is_alive()
+        assert not fallback_thread.is_alive()
+        assert errors == []
+        assert refresh_results == [_CredentialRefreshStatus.ADOPTED]
+        assert fallback_results == [False]
+        assert fallback_resolution_calls == []
+    finally:
+        release_source.set()
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+@pytest.mark.parametrize(
+    ("source", "provider", "api_mode"),
+    [
+        ("vertex", "vertex", "chat_completions"),
+        ("anthropic", "anthropic", "anthropic_messages"),
+        ("nous", "nous", "chat_completions"),
+        ("codex", "openai-codex", "codex_responses"),
+    ],
+)
+def test_real_conversation_reaches_provider_source_after_pool_declines(
+    source,
+    provider,
+    api_mode,
+    monkeypatch,
+) -> None:
+    """Exercise the real conversation branches, not a local source-order list."""
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="azure-foundry",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="expired-token",
+    )
+    agent._execution_route_constraint = None
+    agent.provider = provider
+    agent.requested_provider = provider
+    agent.api_mode = api_mode
+    agent._credential_pool = None
+    source_calls: list[str] = []
+
+    class _UnauthorizedError(RuntimeError):
+        status_code = 401
+
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        MagicMock(side_effect=_UnauthorizedError("unauthorized")),
+    )
+    if source == "vertex":
+        monkeypatch.setattr(
+            "agent.vertex_adapter.get_vertex_config",
+            lambda: source_calls.append(source) or ("", DEFAULT_BASE),
+        )
+    elif source == "anthropic":
+        agent._anthropic_api_key = "expired-token"
+        agent._anthropic_base_url = "https://api.anthropic.com"
+        agent._anthropic_client = MagicMock()
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            lambda: source_calls.append(source) or "",
+        )
+    elif source == "nous":
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_nous_runtime_credentials",
+            lambda **_kwargs: source_calls.append(source) or {},
+        )
+    else:
+        def resolve_codex_credentials(**kwargs):
+            source_calls.append(source)
+            if kwargs.get("force_refresh"):
+                return {}
+            return {"api_key": "expired-token", "base_url": DEFAULT_BASE}
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_codex_runtime_credentials",
+            resolve_codex_credentials,
+        )
+
+    try:
+        result = agent.run_conversation("hello")
+
+        assert result.get("failed") is True
+        assert source_calls
+    finally:
         agent.close()
 
 

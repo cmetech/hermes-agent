@@ -4829,12 +4829,20 @@ class AIAgent:
         from agent.turn_retry_state import _CredentialRecoveryTurnState
 
         with self._openai_client_lock():
+            prior_acquisition = getattr(
+                self, "_sealed_credential_acquisition", None
+            )
+            if prior_acquisition is not None:
+                self._sealed_credential_acquisition = None
+                prior_acquisition.released.set()
             generation = int(
                 getattr(self, "_credential_recovery_generation", 0)
             ) + 1
             self._credential_recovery_generation = generation
             self._credential_recovery_active_generation = generation
-            self._credential_recovery_adopted_generation = None
+            self._credential_transition_epoch = int(
+                getattr(self, "_credential_transition_epoch", 0)
+            )
             self._pending_sealed_credential_adoption = None
         return _CredentialRecoveryTurnState(generation=generation)
 
@@ -4843,6 +4851,10 @@ class AIAgent:
             pending = getattr(self, "_pending_sealed_credential_adoption", None)
             if pending is not None and pending.generation == generation:
                 self._pending_sealed_credential_adoption = None
+            acquisition = getattr(self, "_sealed_credential_acquisition", None)
+            if acquisition is not None and acquisition.generation == generation:
+                self._sealed_credential_acquisition = None
+                acquisition.released.set()
             if (
                 getattr(self, "_credential_recovery_active_generation", None)
                 == generation
@@ -4852,41 +4864,86 @@ class AIAgent:
                     generation,
                 ) + 1
                 self._credential_recovery_active_generation = None
-            if (
-                getattr(self, "_credential_recovery_adopted_generation", None)
-                == generation
-            ):
-                self._credential_recovery_adopted_generation = None
 
     def _deactivate_credential_recovery_locked(self) -> None:
+        acquisition = getattr(self, "_sealed_credential_acquisition", None)
+        if acquisition is not None:
+            self._sealed_credential_acquisition = None
+            acquisition.released.set()
         self._credential_recovery_generation = int(
             getattr(self, "_credential_recovery_generation", 0)
         ) + 1
         self._credential_recovery_active_generation = None
-        self._credential_recovery_adopted_generation = None
         self._pending_sealed_credential_adoption = None
 
-    def _credential_transition_generation(self) -> int | None:
-        """Wait for credential adoption and capture the route generation."""
+    def _reserve_sealed_credential_acquisition(
+        self, generation: int, *, source: str
+    ):
+        """Reserve route-transition ownership before reading a credential source."""
+        from agent.credential_adoption import _CredentialAcquisitionReservation
+
+        while True:
+            with self._openai_client_lock():
+                if (
+                    getattr(self, "_credential_recovery_active_generation", None)
+                    != generation
+                    or getattr(self, "_interrupt_requested", False)
+                ):
+                    return None
+                existing = getattr(self, "_sealed_credential_acquisition", None)
+                if existing is None:
+                    reservation = _CredentialAcquisitionReservation(
+                        generation=generation,
+                        transition_epoch=int(
+                            getattr(self, "_credential_transition_epoch", 0)
+                        ),
+                        source=source,
+                    )
+                    self._sealed_credential_acquisition = reservation
+                    return reservation
+                released = existing.released
+            released.wait()
+
+    def _release_sealed_credential_acquisition(self, reservation) -> None:
         with self._openai_client_lock():
-            active_generation = getattr(
-                self, "_credential_recovery_active_generation", None
+            if getattr(self, "_sealed_credential_acquisition", None) is reservation:
+                self._sealed_credential_acquisition = None
+                reservation.released.set()
+
+    def _credential_transition_generation(self):
+        """Capture a route epoch, waiting behind any credential acquisition."""
+        from agent.credential_adoption import _CredentialTransitionToken
+
+        with self._openai_client_lock():
+            token = _CredentialTransitionToken(
+                generation=int(
+                    getattr(self, "_credential_recovery_generation", 0)
+                ),
+                transition_epoch=int(
+                    getattr(self, "_credential_transition_epoch", 0)
+                ),
             )
+            acquisition = getattr(self, "_sealed_credential_acquisition", None)
+            released = acquisition.released if acquisition is not None else None
+        if released is not None:
+            released.wait()
+        with self._openai_client_lock():
             if (
-                active_generation is not None
-                and getattr(
-                    self, "_credential_recovery_adopted_generation", None
-                )
-                == active_generation
+                int(getattr(self, "_credential_recovery_generation", 0))
+                != token.generation
+                or int(getattr(self, "_credential_transition_epoch", 0))
+                != token.transition_epoch
+                or getattr(self, "_sealed_credential_acquisition", None)
+                is not None
+                or getattr(self, "_pending_sealed_credential_adoption", None)
+                is not None
             ):
                 return None
-            if getattr(self, "_pending_sealed_credential_adoption", None) is not None:
-                return None
-            return int(getattr(self, "_credential_recovery_generation", 0))
+            return token
 
     def _invalidate_for_route_transition(
         self,
-        generation: int,
+        transition_token,
         *,
         fallback_client: Any = None,
     ) -> bool:
@@ -4895,20 +4952,13 @@ class AIAgent:
         with self._openai_client_lock():
             if (
                 int(getattr(self, "_credential_recovery_generation", 0))
-                != generation
+                != transition_token.generation
+                or int(getattr(self, "_credential_transition_epoch", 0))
+                != transition_token.transition_epoch
+                or getattr(self, "_sealed_credential_acquisition", None)
+                is not None
                 or getattr(self, "_pending_sealed_credential_adoption", None)
                 is not None
-            ):
-                return False
-            active_generation = getattr(
-                self, "_credential_recovery_active_generation", None
-            )
-            if (
-                active_generation is not None
-                and getattr(
-                    self, "_credential_recovery_adopted_generation", None
-                )
-                == active_generation
             ):
                 return False
             self._deactivate_credential_recovery_locked()
@@ -5070,7 +5120,9 @@ class AIAgent:
         self._credential_pool_entry_id = candidate.pool_entry_id
         self.client = new_client
         self._pending_sealed_credential_adoption = None
-        self._credential_recovery_adopted_generation = generation
+        self._credential_transition_epoch = int(
+            getattr(self, "_credential_transition_epoch", 0)
+        ) + 1
         return _CandidateAttemptResult(
             _CandidateAttemptStatus.ADOPTED,
             prior_client=prior_client,
@@ -6187,22 +6239,44 @@ class AIAgent:
         return True
 
     def _refresh_vertex_credentials_for_turn(self, credential_recovery_state):
+        from agent.credential_adoption import _CredentialRefreshStatus
+
+        if self.api_mode != "chat_completions" or self.provider != "vertex":
+            return _CredentialRefreshStatus.NOT_APPLICABLE
+        if (
+            getattr(self, "_execution_route_constraint", None) is None
+            or credential_recovery_state is None
+        ):
+            return (
+                _CredentialRefreshStatus.ADOPTED
+                if self._try_refresh_vertex_client_credentials()
+                else _CredentialRefreshStatus.ACQUISITION_FAILED
+            )
+        reservation = self._reserve_sealed_credential_acquisition(
+            credential_recovery_state.generation,
+            source="vertex",
+        )
+        if reservation is None:
+            return _CredentialRefreshStatus.INVALIDATED
+        try:
+            return self._refresh_reserved_vertex_credentials_for_turn(
+                credential_recovery_state
+            )
+        finally:
+            self._release_sealed_credential_acquisition(reservation)
+
+    def _refresh_reserved_vertex_credentials_for_turn(
+        self, credential_recovery_state
+    ):
         from agent.credential_adoption import (
             _CredentialRefreshStatus,
             _PendingSealedCredentialAdoption,
             _snapshot_candidate_client_kwargs,
         )
 
-        if self.api_mode != "chat_completions" or self.provider != "vertex":
-            return _CredentialRefreshStatus.NOT_APPLICABLE
-
         route_constraint = self._assert_execution_route_constraint()
-        if route_constraint is None or credential_recovery_state is None:
-            return (
-                _CredentialRefreshStatus.ADOPTED
-                if self._try_refresh_vertex_client_credentials()
-                else _CredentialRefreshStatus.ACQUISITION_FAILED
-            )
+        if route_constraint is None:
+            return _CredentialRefreshStatus.INVALIDATED
 
         try:
             from agent.vertex_adapter import get_vertex_credentials
@@ -6786,14 +6860,31 @@ class AIAgent:
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(
-            self,
-            status_code=status_code,
-            has_retried_429=has_retried_429,
-            classified_reason=classified_reason,
-            error_context=error_context,
-            credential_recovery_state=credential_recovery_state,
-        )
+
+        reservation = None
+        if (
+            credential_recovery_state is not None
+            and getattr(self, "_execution_route_constraint", None) is not None
+            and self.api_mode in {"chat_completions", "codex_responses"}
+        ):
+            reservation = self._reserve_sealed_credential_acquisition(
+                credential_recovery_state.generation,
+                source="pool",
+            )
+            if reservation is None:
+                return False, has_retried_429
+        try:
+            return recover_with_credential_pool(
+                self,
+                status_code=status_code,
+                has_retried_429=has_retried_429,
+                classified_reason=classified_reason,
+                error_context=error_context,
+                credential_recovery_state=credential_recovery_state,
+            )
+        finally:
+            if reservation is not None:
+                self._release_sealed_credential_acquisition(reservation)
 
     def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""

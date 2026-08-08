@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -24,6 +25,24 @@ class _PendingSealedCredentialAdoption:
     pool_entry_id: str | None = None
     is_anthropic_oauth: bool | None = None
     adoption_attempts: int = 0
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CredentialAcquisitionReservation:
+    generation: int
+    transition_epoch: int
+    source: Literal["vertex", "pool"]
+    released: threading.Event = field(
+        default_factory=threading.Event,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialTransitionToken:
+    generation: int
+    transition_epoch: int
 
 
 class _CredentialRefreshStatus(StrEnum):
@@ -177,7 +196,9 @@ def _materialize_candidate_client_kwargs(
 __all__ = [
     "_CandidateAttemptResult",
     "_CandidateAttemptStatus",
+    "_CredentialAcquisitionReservation",
     "_CredentialRefreshStatus",
+    "_CredentialTransitionToken",
     "_PendingSealedCredentialAdoption",
     "_materialize_candidate_client_kwargs",
     "_snapshot_candidate_client_kwargs",

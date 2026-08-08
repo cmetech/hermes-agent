@@ -1721,8 +1721,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    transition_generation = agent._credential_transition_generation()
-    if transition_generation is None:
+    transition_token = agent._credential_transition_generation()
+    if transition_token is None:
         return False
 
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
@@ -1901,7 +1901,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         if not agent._invalidate_for_route_transition(
-            transition_generation,
+            transition_token,
             fallback_client=fb_client,
         ):
             agent._close_openai_client(
