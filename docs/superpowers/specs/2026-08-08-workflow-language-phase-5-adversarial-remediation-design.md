@@ -414,8 +414,8 @@ Task 1 candidate found four coupled state classes:
 
 - the concrete provider client and canonical SDK endpoint configuration;
 - the live API credential and AIAgent credential-pool entry identity;
-- agent-owned auth-refresh counters; and
-- turn-local Vertex and 429 recovery guards.
+- per-turn auth-refresh counts; and
+- per-API-call Vertex and 429 recovery guards.
 
 Publishing the first two under the client lock while updating the latter two
 later can expose a client/state mismatch or consume the only bounded recovery
@@ -442,16 +442,18 @@ a different single-use token.
 
 ### State ownership
 
-A private `_PendingSealedCredentialAdoption` belongs to one live `AIAgent`.
+A private immutable `_PendingSealedCredentialAdoption` belongs to one live
+`AIAgent` and one turn generation.
 It is never serialized, persisted, included in evidence, logged, or exposed on
-the plugin-agent wire. Secret-bearing members use `repr=False`. It contains:
+the plugin-agent wire. Secret-bearing members use `repr=False`. It snapshots
+only the runtime values needed for adoption; it never retains a live mutable
+`PooledCredential`. It contains:
 
 - a source kind and the sealed provider/model/API-mode/route identity;
-- the exact candidate token or pool entry;
+- the exact candidate token, pool-entry ID, and required nonsecret metadata;
 - canonical candidate base URL and SDK client kwargs;
-- the deferred AIAgent pool-entry identity, when applicable;
-- deferred agent-owned auth-refresh counter changes; and
-- a bounded local construction-attempt count.
+- the deferred AIAgent pool-entry identity, when applicable; and
+- a bounded local adoption-attempt count.
 
 `CredentialPool` retains its existing authority to mint and persist refreshed
 credentials. Its persisted token and internal selection are credential-source
@@ -459,9 +461,16 @@ state, not published execution state. “Atomic pool identity” in this design
 means the AIAgent `_credential_pool_entry_id` paired with the live client. Phase
 5 does not introduce a rollback or lease protocol for the credential store.
 
-Turn retry state remains conversation-owned. It is not shared agent state and
-does not move under the client lock. The conversation updates a turn-local
-guard in the same synchronous branch only after sealed adoption returns true.
+Auth-refresh counts move into a private `_CredentialRecoveryTurnState` created
+once by `run_conversation()` and passed to credential-pool recovery across the
+per-API-call `TurnRetryState` instances. They are not stored as mutable shared
+AIAgent execution state and are not part of shared-client publication. Counts
+update synchronously only after sealed adoption returns true.
+
+The existing `TurnRetryState` one-shot guards remain conversation-owned. They
+do not move under the client lock and change only in the synchronous success
+branch after adoption. Credential acquisition that returns empty or raises
+before producing a candidate retains its existing bounded guard behavior.
 
 ### Candidate lifecycle and invalidation
 
@@ -469,18 +478,21 @@ Pending adoption is enabled only when an immutable sealed route constraint is
 present. Legacy unsealed refresh and rotation retain their behavior as recorded
 at `e1c7ca745`, before the review-driven atomic-adoption commits.
 
-One candidate may receive at most two local construction attempts: its initial
-attempt and one identical-candidate re-adoption attempt. A constructor failure
-retains the candidate and leaves published state and success guards unchanged.
-The next recovery for the same source and sealed route consumes the pending
-candidate before reading Vertex credentials, calling `try_refresh_matching()`,
-or rotating the pool again. A second construction failure clears the candidate
+One candidate may receive at most two complete adoption attempts: its initial
+attempt and one identical-candidate re-adoption attempt. The owning recovery
+branch performs the bounded re-adoption before it returns control to any other
+credential source or fallback path. It never reads Vertex credentials, calls
+`try_refresh_matching()`, or rotates the pool again between those attempts. A
+constructor failure retains the immutable snapshot and leaves published state
+and success guards unchanged. A second adoption failure clears the candidate
 and returns the existing bounded recovery failure so normal fallback policy may
-continue without an infinite local loop.
+continue without an infinite local loop. Terminal route drift is not an
+adoption failure: it clears immediately and raises without a second attempt.
 
 The pending candidate is cleared on:
 
 - successful adoption;
+- the second non-drift adoption failure;
 - terminal route drift;
 - provider, model, API mode, fallback route, or sealed route-identity change;
 - cancellation or agent disposal; or
@@ -496,6 +508,37 @@ exists, existing bounded acquisition guards remain unchanged. Success-only
 publication applies after a concrete candidate exists; it does not authorize
 repeated calls to a failing credential source.
 
+### Exclusivity, locking, and cleanup
+
+Candidate inspect/install/consume/clear operations use the existing client
+lock. CredentialPool refresh and persistence finish and release every pool lock
+before AIAgent takes the client lock; code must never call the pool while
+holding the client lock. The immutable snapshot is the handoff between the two
+owners.
+
+A matching pending candidate has exclusive precedence across pool recovery,
+Vertex, Anthropic, Nous, Codex, and fallback selection until adoption succeeds,
+the second adoption fails, or invalidation clears it. Because the owning branch
+exhausts the bounded re-adoption before returning, a later source cannot publish
+a different credential while an older pending snapshot remains replayable.
+
+Turn entry assigns a monotonically changing private generation and defensively
+clears stale pending state under the client lock. The candidate records that
+generation and exact sealed route identity. Immediately before publication,
+the transaction rechecks generation, cancellation, and route identity while
+holding the lock.
+
+Cancellation and route/fallback changes invalidate under the same lock. If
+invalidation obtains the lock first, publication is rejected. If publication
+already committed, cancellation or the route transition observes the new
+consistent state and then invalidates future reuse. Every provider/model/API-
+mode/fallback mutation invalidates before changing route fields. The candidate-capable
+portion of `run_conversation()` is enclosed by a `try/finally` that performs
+idempotent generation-checked cleanup on every normal return, direct return,
+and propagated exception. `AIAgent.close()` performs the same idempotent locked
+clear. Cancellation is therefore safe both through immediate invalidation and
+the guaranteed final cleanup path.
+
 ### Atomic publication and failure behavior
 
 For a sealed candidate, the existing client lock protects steps 1–5:
@@ -504,7 +547,7 @@ For a sealed candidate, the existing client lock protects steps 1–5:
 2. construct a concrete unpublished client;
 3. verify its canonical endpoint against the sealed route identity;
 4. publish the client, API key, canonical base/default-query kwargs, AIAgent
-   pool-entry identity, and deferred agent-owned auth-refresh counter changes;
+   pool-entry identity, and mode-specific client state;
 5. clear the pending candidate; and
 6. after releasing the lock, retire the prior client according to existing
    shared-client ownership rules.
@@ -516,10 +559,32 @@ resources remain untouched. Route drift closes and clears the candidate, then
 raises the existing bounded terminal `provider_capability_drift`; it never
 becomes fallback, repair, retry, or a completed partial result.
 
+The publication matrix is explicit:
+
+- `chat_completions` and `codex_responses` publish the OpenAI-compatible
+  concrete client, generic API key/base URL, canonical client kwargs, and
+  AIAgent pool-entry identity;
+- `anthropic_messages` constructs the Anthropic client while the old client is
+  still live, route-validates the unpublished candidate, then publishes
+  `_anthropic_client`, `_anthropic_api_key`, `_anthropic_base_url`,
+  `_is_anthropic_oauth`, generic API key/base URL, and AIAgent pool-entry
+  identity together before retiring the old client. Both native Anthropic
+  direct refresh and credential-pool adoption use this row; and
+- `bedrock_converse` and `codex_app_server` do not acquire credential-pool
+  candidates through this transaction. Any future enablement requires a new
+  explicit publication row and invariant tests; it cannot fall through to the
+  OpenAI-compatible path.
+
 The pre-exhausted 429 and ordinary pool-recovery helpers return their incoming
 retry marker unchanged when a concrete candidate fails adoption. They report a
 consumed success guard only after adoption succeeds. Vertex turn state follows
-the same rule.
+the same rule. Per-turn auth-refresh counts update only after success and are
+owned by `_CredentialRecoveryTurnState`; they are not committed under the
+shared-client lock.
+
+Prior-client retirement is best-effort after successful publication. A close
+failure does not roll back the new consistent state and logs only a stable
+reason plus exception type.
 
 ### Privacy and diagnostics
 
@@ -531,7 +596,8 @@ results retain the existing bounded failure vocabulary.
 ### Required behavioral proof
 
 Tests use a real initialized `AIAgent`, concrete SDK clients, and a real
-`CredentialPool` OAuth refresh path. They prove:
+`CredentialPool` OAuth refresh path. Integration coverage drives actual 401 and
+429 failures through `run_conversation()`, not only helper calls. Tests prove:
 
 - the real pool refreshes once when the first client construction fails, and
   the second adoption uses the exact retained token without another refresh;
@@ -542,7 +608,21 @@ Tests use a real initialized `AIAgent`, concrete SDK clients, and a real
   preserve previous state and retry eligibility;
 - ordinary and pre-exhausted 429 recovery consume markers only on adoption;
 - query-bearing and repeated-query endpoints remain canonically identical;
-- pending state is invalidated on route change, cancellation, and end-of-turn;
+- acquisition-empty and acquisition-error paths retain their existing bounded
+  source-call behavior;
+- two failed adoption attempts clear the candidate and never perform a third;
+- mixed pool/provider-source recovery never bypasses a pending candidate;
+- pending state is invalidated on route change, fallback, cancellation, every
+  normal/direct/exceptional turn exit, and `AIAgent.close()`;
+- deterministic barriers prove both cancellation-before-publication and
+  publication-before-cancellation outcomes remain consistent;
+- concrete Anthropic SDK/pool adoption publishes every field atomically and
+  retires the prior client only after success, and native direct Anthropic
+  refresh follows the same transaction;
+- old-client retirement failure leaves the new published state consistent and
+  emits only bounded redacted diagnostics;
+- provider-attempt, cost-budget, fallback, retry, and terminal-drift accounting
+  remain unchanged and no candidate construction consumes a provider attempt;
 - logs and bounded results exclude credential, endpoint, digest, exception-
   text, and path canaries; and
 - unsealed Vertex and credential-pool characterization remains unchanged.
@@ -707,14 +787,20 @@ The user approved the following product decisions on 2026-08-08:
 7. Treat CredentialPool persistence as credential-source state; the atomic
    execution boundary covers AIAgent live client state and its published pool
    identity, not a new pool lease protocol.
-8. Retain one sealed credential candidate in memory for one bounded identical-
-   candidate re-adoption attempt within the current turn.
-9. Commit agent-owned refresh counters with the shared client transaction and
-   update turn-local guards only after that transaction succeeds.
+8. Retain one immutable sealed credential snapshot in memory for one immediate,
+   bounded identical-candidate re-adoption attempt within the current turn.
+9. Keep auth-refresh counts and retry guards conversation-owned and update them
+   only after the shared client transaction succeeds.
 10. Preserve pre-candidate acquisition guards and legacy unsealed behavior.
 11. Clear pending state on success, terminal drift, route change, cancellation,
     disposal, or bounded end-of-turn cleanup.
 12. Log only stable reason tokens and exception types on candidate failure.
+13. Give a matching pending candidate exclusive precedence across every
+    credential source and fallback until its bounded adoption resolves.
+14. Use generation-checked client locking, whole-turn `try/finally`, and locked
+    agent teardown for pending-state cleanup.
+15. Apply the transaction explicitly to OpenAI-compatible and Anthropic modes;
+    Bedrock and Codex app-server remain outside pool adoption.
 
 ## Self-review
 
@@ -733,6 +819,7 @@ The user approved the following product decisions on 2026-08-08:
   work is included.
 - **Ambiguity:** identity purposes, alias precedence, repair inheritance,
   endpoint normalization, schema migration, credential-source versus execution
-  state, pending-candidate lifetime, retry bounds, and failure behavior are
-  explicit.
+  state, pending-candidate lifetime, retry bounds, cross-source precedence,
+  concurrency, cleanup ownership, API-mode publication, and failure behavior
+  are explicit.
 - **Placeholders:** none.
