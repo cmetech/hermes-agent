@@ -418,6 +418,86 @@ class AgentNodeExecutor:
                 best = bounded
         return best
 
+    def _phase5_structured_repair_request(
+        self,
+        *,
+        initial_request: PluginAgentRunRequest,
+        repair_prompt: str,
+        remaining_provider_attempts: int,
+        remaining_timeout_seconds: float,
+    ) -> PluginAgentRunRequest:
+        """Narrow a sealed Phase 5 primary request without recreating authority."""
+
+        return replace(
+            initial_request,
+            prompt=repair_prompt,
+            context_mode="fresh",
+            session_id=None,
+            expected_model_visible_prefix_digest=None,
+            expected_mcp_runtime_identity_digest=None,
+            enabled_toolsets=(),
+            allowed_tools=(),
+            denied_tools=("delegate_task", "workflow_agent"),
+            skills=(),
+            hooks=(),
+            mcp_servers=None,
+            inline_agents={},
+            fallback_model=None,
+            sealed_fallback_route=None,
+            ephemeral_system_prompt=None,
+            approved_action_digest=None,
+            max_iterations=1,
+            max_api_attempts=remaining_provider_attempts,
+            idle_timeout_seconds=min(
+                initial_request.idle_timeout_seconds,
+                remaining_timeout_seconds,
+            ),
+            wall_timeout_seconds=min(
+                initial_request.wall_timeout_seconds,
+                remaining_timeout_seconds,
+            ),
+            provider_request_timeout_seconds=min(
+                initial_request.provider_request_timeout_seconds,
+                remaining_timeout_seconds,
+            ),
+        )
+
+    @staticmethod
+    def _phase5_structured_repair_matches_admission(
+        initial_request: PluginAgentRunRequest,
+        structured_request: StructuredOutputRequest,
+        decision: StructuredOutputCapabilityDecision,
+    ) -> bool:
+        from hermes_cli.runtime_provider import (
+            execution_runtime_identity_from_sealed_route,
+        )
+
+        try:
+            runtime_identity = execution_runtime_identity_from_sealed_route(
+                initial_request.expected_runtime_identity
+            )
+        except (TypeError, ValueError):
+            return False
+        admitted_structured = initial_request.structured_output
+        return bool(
+            initial_request.intended_authority_digest
+            and initial_request.expected_runtime_route_fingerprint
+            and initial_request.expected_runtime_route_options is not None
+            and admitted_structured is not None
+            and runtime_identity.provider == decision.effective_provider
+            and runtime_identity.model == decision.model
+            and runtime_identity.api_mode == decision.api_mode
+            and initial_request.model == decision.model
+            and admitted_structured.strategy is decision.strategy
+            and admitted_structured.adapter_version == decision.adapter_version
+            and admitted_structured.schema.schema_fingerprint
+            == decision.schema_fingerprint
+            and structured_request.strategy is decision.strategy
+            and structured_request.adapter_version == decision.adapter_version
+            and structured_request.schema.schema_fingerprint
+            == decision.schema_fingerprint
+        )
+
     @staticmethod
     def _write_archon_output(
         context: NodeExecutionContext,
@@ -514,6 +594,10 @@ class AgentNodeExecutor:
                 context.language_profile, context.variable_context.normalizer_version
             )
         )
+        phase5 = supports_phase5_semantics(
+            context.language_profile,
+            context.normalizer_version,
+        )
         response_bytes = response.encode("utf-8")
         diagnostics = self._bounded_diagnostics(diagnostics)
         metadata.update({
@@ -583,61 +667,93 @@ class AgentNodeExecutor:
 
         decision = context.structured_output_decision
         assert decision is not None
-        repair_template = PluginAgentRunRequest(
-            prompt="",
-            provider=initial_request.provider,
-            model=decision.model,
-            context_mode="fresh",
-            session_id=None,
-            intended_authority_digest=initial_request.intended_authority_digest,
-            expected_runtime_identity=initial_request.expected_runtime_identity,
-            expected_runtime_route_fingerprint=(
-                initial_request.expected_runtime_route_fingerprint
-            ),
-            expected_runtime_route_options=(
-                initial_request.expected_runtime_route_options
-            ),
-            enabled_toolsets=(),
-            allowed_tools=(),
-            denied_tools=("delegate_task", "workflow_agent"),
-            skills=(),
-            hooks=(),
-            mcp_servers=None,
-            inline_agents={},
-            reasoning_config=None,
-            fallback_model=None,
-            ephemeral_system_prompt=None,
-            request_overrides={},
-            structured_output=structured_request,
-            max_budget_usd=initial_request.max_budget_usd,
-            _cost_budget_authority=initial_request._cost_budget_authority,
-            _cost_budget_contract=initial_request._cost_budget_contract,
-            sandbox_policy=None,
-            approved_action_digest=None,
-            workdir=context.run_directory,
-            max_iterations=1,
-            max_api_attempts=remaining_provider_attempts,
-            sealed_provider_attempt_grant=(
-                initial_request.sealed_provider_attempt_grant
-            ),
-            idle_timeout_seconds=min(
-                initial_request.idle_timeout_seconds, remaining_wall
-            ),
-            wall_timeout_seconds=remaining_wall,
-            provider_request_timeout_seconds=min(
-                initial_request.provider_request_timeout_seconds,
-                remaining_wall,
-            ),
-            absolute_wall_deadline=initial_request.absolute_wall_deadline,
-            absolute_idle_deadline=initial_request.absolute_idle_deadline,
-            absolute_provider_deadline=initial_request.absolute_provider_deadline,
-            max_process_tree_rss_bytes=initial_request.max_process_tree_rss_bytes,
-            max_process_tree_cpu_seconds=(initial_request.max_process_tree_cpu_seconds),
-            max_descendants=initial_request.max_descendants,
-            cooperative_shutdown_seconds=(initial_request.cooperative_shutdown_seconds),
-            term_grace_seconds=initial_request.term_grace_seconds,
-            kill_reap_grace_seconds=initial_request.kill_reap_grace_seconds,
-        )
+        if phase5:
+            if not self._phase5_structured_repair_matches_admission(
+                initial_request,
+                structured_request,
+                decision,
+            ):
+                metadata["repair_disposition"] = "ineligible_provider_capability_drift"
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="provider_capability_drift",
+                    error_message="sealed structured repair authority is contradictory",
+                    metadata=metadata,
+                )
+            repair_template = self._phase5_structured_repair_request(
+                initial_request=initial_request,
+                repair_prompt=self._repair_prompt(
+                    structured_request,
+                    response,
+                    diagnostics,
+                ),
+                remaining_provider_attempts=remaining_provider_attempts,
+                remaining_timeout_seconds=remaining_wall,
+            )
+        else:
+            repair_template = PluginAgentRunRequest(
+                prompt="",
+                provider=initial_request.provider,
+                model=decision.model,
+                context_mode="fresh",
+                session_id=None,
+                intended_authority_digest=initial_request.intended_authority_digest,
+                expected_runtime_identity=initial_request.expected_runtime_identity,
+                expected_runtime_route_fingerprint=(
+                    initial_request.expected_runtime_route_fingerprint
+                ),
+                expected_runtime_route_options=(
+                    initial_request.expected_runtime_route_options
+                ),
+                enabled_toolsets=(),
+                allowed_tools=(),
+                denied_tools=("delegate_task", "workflow_agent"),
+                skills=(),
+                hooks=(),
+                mcp_servers=None,
+                inline_agents={},
+                reasoning_config=None,
+                fallback_model=None,
+                ephemeral_system_prompt=None,
+                request_overrides={},
+                structured_output=structured_request,
+                max_budget_usd=initial_request.max_budget_usd,
+                _cost_budget_authority=initial_request._cost_budget_authority,
+                _cost_budget_contract=initial_request._cost_budget_contract,
+                sandbox_policy=None,
+                approved_action_digest=None,
+                workdir=context.run_directory,
+                max_iterations=1,
+                max_api_attempts=remaining_provider_attempts,
+                sealed_provider_attempt_grant=(
+                    initial_request.sealed_provider_attempt_grant
+                ),
+                idle_timeout_seconds=min(
+                    initial_request.idle_timeout_seconds, remaining_wall
+                ),
+                wall_timeout_seconds=remaining_wall,
+                provider_request_timeout_seconds=min(
+                    initial_request.provider_request_timeout_seconds,
+                    remaining_wall,
+                ),
+                absolute_wall_deadline=initial_request.absolute_wall_deadline,
+                absolute_idle_deadline=initial_request.absolute_idle_deadline,
+                absolute_provider_deadline=(
+                    initial_request.absolute_provider_deadline
+                ),
+                max_process_tree_rss_bytes=(
+                    initial_request.max_process_tree_rss_bytes
+                ),
+                max_process_tree_cpu_seconds=(
+                    initial_request.max_process_tree_cpu_seconds
+                ),
+                max_descendants=initial_request.max_descendants,
+                cooperative_shutdown_seconds=(
+                    initial_request.cooperative_shutdown_seconds
+                ),
+                term_grace_seconds=initial_request.term_grace_seconds,
+                kill_reap_grace_seconds=initial_request.kill_reap_grace_seconds,
+            )
         repair_request = self._bounded_repair_request(
             repair_template,
             structured_request,
@@ -657,6 +773,44 @@ class AgentNodeExecutor:
         except (OSError, RuntimeError, ValueError):
             conservatively_account()
             return failed("repair_failed")
+
+        if (
+            repair_result.status == "failed"
+            and repair_result.audit.get("failure_kind")
+            == "provider_capability_drift"
+            and repair_result.audit.get("provider_attempts") == 0
+            and repair_result.audit.get("model_calls") == 0
+            and repair_result.audit.get("known_no_effect") is True
+        ):
+            metadata["usage"] = _aggregate_usage(
+                initial_result.usage,
+                repair_result.usage,
+            )
+            aggregate_audit = dict(initial_result.audit)
+            aggregate_audit.update({
+                "provider_attempts": first_provider_attempts,
+                "model_calls": first_model_calls,
+                "api_calls": first_model_calls,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "repair_accounting": "exact",
+                "provider_attempts_exact": True,
+                "model_calls_exact": True,
+                "api_calls_exact": True,
+                "repair_failure_kind": "provider_capability_drift",
+            })
+            metadata["audit"] = aggregate_audit
+            metadata["provider_attempts"] = max(0, first_provider_attempts - 1)
+            if strict_v3:
+                metadata["provider_attempts_exact"] = True
+            metadata["repair_disposition"] = "provider_capability_drift"
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_capability_drift",
+                error_message="structured repair provider capability drifted",
+                metadata=metadata,
+            )
 
         metadata["usage"] = _aggregate_usage(initial_result.usage, repair_result.usage)
         repair_counts: tuple[int, int] | None = None
@@ -2017,6 +2171,9 @@ class AgentNodeExecutor:
             elif failure_kind == "provider_attempt_grant_exhausted":
                 error_code = "provider_attempt_grant_exhausted"
                 metadata["known_no_effect"] = True
+            elif phase5 and failure_kind == "budget_exhausted":
+                error_code = "budget_exhausted"
+                metadata["archon_terminal_failure"] = True
             elif (
                 "unknown_side_effect" in failure_kind
                 or "outcome_unknown" in failure_kind

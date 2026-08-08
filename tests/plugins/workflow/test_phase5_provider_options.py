@@ -124,6 +124,46 @@ def test_sealed_effort_encoder_emits_only_the_declared_request_field() -> None:
     }
 
 
+def test_phase5_structured_repair_preserves_degraded_option_transport(tmp_path) -> None:
+    route = _route("primary", options={"effort": "high"})
+    encoded = encode_provider_option_transport(route, _authority(route).obligations)
+    schema = normalize_schema({"type": "object"})
+    structured = StructuredOutputRequest(
+        schema=schema,
+        strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+        adapter_version=1,
+    )
+    initial = PluginAgentRunRequest(
+        prompt="primary",
+        provider=route.provider,
+        model=route.model,
+        intended_authority_digest="a" * 64,
+        expected_runtime_identity=route.execution_runtime_identity().to_dict(),
+        expected_runtime_route_fingerprint=route.route_fingerprint,
+        expected_runtime_route_options=dict(route.provider_options),
+        reasoning_config=dict(encoded.reasoning_config),
+        request_overrides=dict(encoded.request_overrides),
+        structured_output=structured,
+        allowed_tools=("read_file",),
+        workdir=tmp_path,
+        sealed_provider_attempt_grant=True,
+    )
+
+    repair = AgentNodeExecutor(_FallbackRunner())._phase5_structured_repair_request(
+        initial_request=initial,
+        repair_prompt="repair",
+        remaining_provider_attempts=1,
+        remaining_timeout_seconds=10,
+    )
+
+    assert repair.reasoning_config == {"enabled": True, "effort": "high"}
+    assert repair.request_overrides == {
+        "extra_body": {"reasoning": {"effort": "high"}}
+    }
+    assert repair.expected_runtime_route_options == {"effort": "high"}
+    assert repair.allowed_tools == ()
+
+
 def test_option_encoder_compares_decisions_to_effective_provider() -> None:
     route = replace(
         _route(

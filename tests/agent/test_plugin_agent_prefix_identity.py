@@ -293,6 +293,95 @@ def test_phase5_worker_blocks_same_trust_endpoint_drift_before_any_side_effect(
     assert provider_called == []
 
 
+def test_phase5_repair_blocks_registration_drift_before_agent_or_transport(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+
+    expected = runtime_provider.execution_runtime_identity_from_sealed_route(
+        _SIX_FIELD_RUNTIME_IDENTITY
+    )
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="e" * 64,
+        requested_provider="sealed-provider",
+        model="sealed-model",
+        api_mode="chat_completions",
+        base_url="https://sealed.example/v1",
+        provider_config={},
+        identity=expected,
+    )
+    agent_constructions = []
+    provider_calls = []
+
+    class ForbiddenAgent:
+        def __init__(self, **_kwargs):
+            agent_constructions.append(True)
+            raise AssertionError("repair agent constructed after registration drift")
+
+    monkeypatch.setattr(run_agent, "AIAgent", ForbiddenAgent)
+    monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": expected.provider,
+            "model": expected.model,
+            "api_mode": expected.api_mode,
+            "base_url": "https://sealed.example/v1",
+            "api_key": "private",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "classify_resolved_execution_runtime",
+        lambda _runtime: runtime_provider.ExecutionRuntimeCapabilities(
+            api_mode=expected.api_mode,
+            hermes_managed_tool_loop=True,
+            effective_provider=expected.provider,
+            model=expected.model,
+            base_url_trust_class=expected.base_url_trust_class,
+            endpoint_sha256=expected.endpoint_sha256,
+            registration_provenance_digest="f" * 64,
+            registration_provenance_complete=True,
+        ),
+    )
+
+    result = worker._run(
+        {
+            "plugin_id": "workflow",
+            "request": PluginAgentRunRequest(
+                prompt="repair only the invalid JSON",
+                provider="sealed-provider",
+                model="sealed-model",
+                allowed_tools=(),
+                denied_tools=("delegate_task", "workflow_agent"),
+                intended_authority_digest="a" * 64,
+                expected_runtime_identity=dict(_SIX_FIELD_RUNTIME_IDENTITY),
+                expected_runtime_route_fingerprint="e" * 64,
+                expected_runtime_route_options={},
+            ).to_wire(),
+        },
+        provider_start_gate=lambda: provider_calls.append(True),
+    )
+
+    assert result["status"] == "failed"
+    assert result["audit"]["failure_kind"] == "provider_capability_drift"
+    assert result["audit"]["mismatched_fields"] == [
+        "registration_provenance_digest"
+    ]
+    assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["model_calls"] == 0
+    assert result["audit"]["known_no_effect"] is True
+    assert agent_constructions == []
+    assert provider_calls == []
+
+
 def test_phase5_worker_checks_credential_free_route_before_every_side_effect(
     monkeypatch,
 ) -> None:

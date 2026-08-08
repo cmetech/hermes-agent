@@ -333,6 +333,7 @@ upstream_changes:
   - sealed Bedrock endpoint-pinned client construction
   - Relay managed stream callback error identity preservation
   - PluginAgentRunRequest
+  - _phase5_structured_repair_matches_admission
   - phase5_node_intended_authority_digest
   - phase5_session_cache_fingerprint
   - NodeSessionRecord
@@ -372,10 +373,13 @@ upstream_changes:
   - every sealed provider reservation reasserts the concrete SDK client endpoint at the last pre-network seam before accounting or provider I/O
   - SDK default_query is part of effective endpoint identity, including after credential-only client recreation
   - provider capability drift is terminal and cannot activate retry fallback structured repair or another provider attempt
+  - Phase 5 structured repair revalidates the admitted effective provider model API mode strategy adapter and schema fingerprint before construction or transport
+  - contradictory structured repair authority fails terminally before a repair request or provider attempt is created
   - Codex app-server propagates the exact capability-drift exception instead of returning a generic partial result
   - sealed boto3 and AnthropicBedrock clients receive the selected endpoint explicitly while unsealed boto3 construction retains region-only SDK resolution
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_phase5_provider_snapshot.py
   - tests/plugins/workflow/test_approval.py
@@ -568,6 +572,7 @@ upstream_changes:
   - one authenticated in-flight lease serializes parent repair retry fallback and inline transports
   - duplicate settlements are idempotent while contradictions route spoofing and missing settlement poison terminally
   - a settled call may overrun once but exhaustion starts no later transport and cannot be retried or reset
+  - Phase 5 structured repair preserves the primary request's provider-attempt and authoritative cost-budget authorities and contracts without minting replacement authority
   - provider-attempt refusal releases a cost lease only with proof that transport did not start
   - timeout cancellation disconnect and ambiguous transport failure never reopen the authority
   - public evidence is a closed bounded credential-free ledger without raw usage or provider payloads
@@ -583,6 +588,7 @@ upstream_changes:
   - tests/agent/test_cron_inline_api_call_62151.py
   - tests/cron/test_cron_direct_api_call_62151.py
   - tests/plugins/workflow/test_phase5_cost_budget.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_retry.py
   expected_commit_subject: 'feat(agent): enforce shared authoritative cost budgets'
@@ -619,6 +625,7 @@ upstream_changes:
   - _hook_operations_supported
   - NodeExecutionContext
   - PluginAgentRunRequest
+  - _phase5_structured_repair_request
   owned_invariants:
   - every accepted provider option has one reviewed exact transport encoder or blocks before transport
   - every provider-calling prompt command or ordinary loop node receives a sealed primary route
@@ -634,12 +641,15 @@ upstream_changes:
   - unsupported thinking shapes and every current provider-native sandbox request block without provider use
   - Hermes web execution is admitted only when the service and exact web_search tool policy are reachable
   - Phase 5 fallback uses a fresh child context with its own sealed provider model runtime and option identity
+  - Phase 5 structured repair is derived with dataclasses.replace from the sealed primary request so its six-field runtime identity and exact reasoning and request-override option transport remain unchanged
+  - Phase 5 structured repair clears cache and MCP reuse extensions tools fallback approval and ephemeral prompt authority while preserving sandbox workdir deadline resource and execution authorities
   - primary fallback and inline agents share attempt cost deadline workdir resource and cancellation authorities
   - legacy fallback request behavior remains wire-compatible and unchanged
   - v5 provider authority schema and model resolver version advance together and schema-1 v5 records require re-admission
   - every sealed primary fallback and inline-agent route integrity-binds one normalized endpoint digest while snapshot format remains 2
   tests:
   - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_phase5_provider_authority.py
   - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_approval.py
@@ -1228,6 +1238,8 @@ upstream_changes:
   - PluginContext.agent
   tests:
   - tests/agent/test_plugin_agent.py
+  - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/plugins/workflow/test_ai_executor.py
   - tests/tools/test_registry.py
   expected_commit_subject: 'feat(workflow): enforce per-node agent resources'
   upstream_candidate: true
@@ -1241,7 +1253,9 @@ upstream_changes:
     without granting a different action or exposing process-global resources. Preserve
     the digest-only sealed-route fingerprint and bounded secret-free provider options
     on primary, approval, repair, fallback, and inline-child requests so exact option
-    precedence can be replayed without raw endpoint authority crossing the wire.
+    precedence can be replayed without raw endpoint authority crossing the wire. Derive
+    Phase 5 structured repair by narrowing the admitted request so future authority and
+    limit fields cannot be silently omitted.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
@@ -3364,6 +3378,7 @@ upstream_changes:
   - conservative_provider_retry_count
   - validated_provider_retry_count
   - loaded-gate scheduler fairness barrier regression
+  - Phase 5 structured repair inherits the primary request's absolute deadlines workdir resource ceilings termination policy and shared attempt authority while tightening only its remaining per-repair bounds
   tests:
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_ai_executor.py
