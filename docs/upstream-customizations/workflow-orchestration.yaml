@@ -335,7 +335,10 @@ upstream_changes:
   - PluginAgentRunRequest
   - _phase5_structured_repair_matches_admission
   - phase5_node_intended_authority_digest
+  - phase5_shared_context_compatibility_digest
   - phase5_session_cache_fingerprint
+  - NodeExecutionContext.shared_context_compatibility_digest
+  - RunScheduler._predecessor_results winning-attempt identity reader
   - NodeSessionRecord
   - _language_has_phase4_semantics
   - ApprovalExecutor.execute
@@ -344,9 +347,11 @@ upstream_changes:
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
   - current normalized endpoint digest must exactly match sealed authority before MCP startup agent construction fallback or provider transport
   - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
-  - any intended authority or model-visible prefix drift selects fresh context before provider transport rather than mutating a cached prefix
-  - persistent and same-run resumption require both paired Phase 5 identities
-  - durable recovery journals both private identities while legacy session and recovery records remain byte-compatible
+  - same-node intended-authority or model-visible-prefix drift selects fresh context before provider transport rather than mutating a cached prefix
+  - distinct same-run nodes may resume only when their sealed cross-node compatibility digests match and the predecessor cache fingerprint recomputes from its own intended authority and exact prefix
+  - persistent recovery keeps node-bound intended authority separate from cross-node compatibility authority
+  - durable recovery reads the complete lowercase identity triple only from the unique winning succeeded attempt while failed superseded missing or tampered metadata fails closed
+  - legacy session and recovery records remain byte-compatible and the new identity fields stay private attempt metadata rather than public run fields
   - normalizer v5 ordinary loops inherit v4 authenticated decision recovery and consumed-input cleanup
   - provider-free nodes carry no fabricated provider route or provider execution identity
   - normalizer-v5 approval rejection rework uses its sealed route and returns paired worker execution identities
@@ -380,12 +385,14 @@ upstream_changes:
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
   - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_phase5_execution_context.py
   - tests/plugins/workflow/test_phase5_provider_snapshot.py
   - tests/plugins/workflow/test_approval.py
   - tests/plugins/workflow/test_persistent_session_recovery.py
   - tests/plugins/workflow/test_crash_recovery.py
   - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduler.py
   - tests/plugins/workflow/test_typed_publication_recovery.py
   - tests/plugins/workflow/test_phase4_loops.py
   - tests/run_agent/test_env_credential_turn_refresh.py
@@ -402,7 +409,8 @@ upstream_changes:
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true
   merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
-    expected runtime identity and paired cache identities. Compute the runtime prefix
+    expected runtime identity, node-bound intended authority, exact prefix identity,
+    and the separate cross-node compatibility digest. Compute the runtime prefix
     only after prompt contributors and final tool filtering, but before session reads
     and provider calls. Carry the private selected route constraint into AIAgent
     for the whole attempt, reassert it around every credential refresh and client

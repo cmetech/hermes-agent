@@ -277,6 +277,95 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
     )
 
 
+def test_predecessor_results_uses_only_winning_successful_attempt_identity() -> None:
+    winner = {
+        "intended_authority_digest": "a" * 64,
+        "model_visible_prefix_digest": "b" * 64,
+        "shared_context_compatibility_digest": "c" * 64,
+    }
+    projection = {
+        "nodes": {
+            "before": {
+                "state": "succeeded",
+                "session_id": "winning-session",
+                "cache_fingerprint": "d" * 64,
+                "attempts": [
+                    {
+                        "state": "failed",
+                        "metadata": {
+                            key: "e" * 64 for key in winner
+                        },
+                    },
+                    {
+                        "state": "superseded",
+                        "metadata": {
+                            key: "f" * 64 for key in winner
+                        },
+                    },
+                    {"state": "succeeded", "metadata": winner},
+                ],
+            }
+        }
+    }
+
+    evidence = RunScheduler._predecessor_results(
+        projection,
+        ("before",),
+        {},
+    )["before"]
+
+    assert evidence == {
+        "session_id": "winning-session",
+        "cache_fingerprint": "d" * 64,
+        **winner,
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        {
+            "intended_authority_digest": "a" * 64,
+            "model_visible_prefix_digest": "b" * 64,
+        },
+        {
+            "intended_authority_digest": "A" * 64,
+            "model_visible_prefix_digest": "b" * 64,
+            "shared_context_compatibility_digest": "c" * 64,
+        },
+        {
+            "intended_authority_digest": "a" * 64,
+            "model_visible_prefix_digest": "malformed",
+            "shared_context_compatibility_digest": "c" * 64,
+        },
+    ),
+)
+def test_predecessor_results_fails_closed_for_incomplete_or_tampered_identity(
+    metadata,
+) -> None:
+    projection = {
+        "nodes": {
+            "before": {
+                "state": "succeeded",
+                "session_id": "winning-session",
+                "cache_fingerprint": "d" * 64,
+                "attempts": [{"state": "succeeded", "metadata": metadata}],
+            }
+        }
+    }
+
+    evidence = RunScheduler._predecessor_results(
+        projection,
+        ("before",),
+        {},
+    )["before"]
+
+    assert evidence == {
+        "session_id": "winning-session",
+        "cache_fingerprint": "d" * 64,
+    }
+
+
 @pytest.mark.parametrize("candidate_state", ("missing", "disagrees"))
 def test_archon_ai_requires_correlated_primary_candidate(
     tmp_path, candidate_state

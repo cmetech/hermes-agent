@@ -351,6 +351,48 @@ def _run_once(store, package, runner, registry, key):
     return admitted.run_id, result
 
 
+def test_phase5_successful_attempt_retains_shared_context_handoff_metadata(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "phase5-shared-handoff",
+    )
+    store = RunStore(tmp_path / "phase5-shared-handoff-home")
+    admitted = _admit(store, package, "phase5-shared-handoff")
+    assert admitted.run_id is not None
+    claim = store.claim_node(admitted.run_id, "analyze", "handoff-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = {
+        "intended_authority_digest": "a" * 64,
+        "model_visible_prefix_digest": "b" * 64,
+        "shared_context_compatibility_digest": "c" * 64,
+    }
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": "phase5-session",
+            "cache_fingerprint": "d" * 64,
+            **identity,
+        },
+    )
+
+    evidence = RunScheduler._predecessor_results(
+        store.load_run(admitted.run_id),
+        ("analyze",),
+        {},
+    )["analyze"]
+
+    assert evidence == {
+        "session_id": "phase5-session",
+        "cache_fingerprint": "d" * 64,
+        **identity,
+    }
+
+
 def _rewrite_latest_projection(
     store: RunStore,
     run_id: str,

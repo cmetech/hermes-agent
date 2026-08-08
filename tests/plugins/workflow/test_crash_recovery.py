@@ -64,6 +64,49 @@ def _run(store, package, *, idempotency_key="crash"):
     )
 
 
+def test_restart_never_reconstructs_shared_identity_from_failed_attempt(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "failed-shared-identity-home"
+    store = RunStore(home)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "failed-shared-identity-package",
+            name="failed-shared-identity",
+        )
+    )
+    admitted = _run(store, package, idempotency_key="failed-shared-identity")
+    assert admitted.run_id is not None
+    claim = store.claim_node(admitted.run_id, "start", "failed-identity-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="failed",
+        error_code="expected_failure",
+        metadata={
+            "session_id": "failed-session",
+            "cache_fingerprint": "d" * 64,
+            "intended_authority_digest": "a" * 64,
+            "model_visible_prefix_digest": "b" * 64,
+            "shared_context_compatibility_digest": "c" * 64,
+        },
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+
+    recovered = RunStore(home).load_run(admitted.run_id)
+    evidence = RunScheduler._predecessor_results(
+        recovered,
+        ("start",),
+        {},
+    )["start"]
+
+    assert "intended_authority_digest" not in evidence
+    assert "model_visible_prefix_digest" not in evidence
+    assert "shared_context_compatibility_digest" not in evidence
+
+
 class _CountedLoopRunner:
     def __init__(self, response: str) -> None:
         self.response = response

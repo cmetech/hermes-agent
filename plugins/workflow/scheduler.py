@@ -36,6 +36,7 @@ from plugins.workflow.execution_semantics import (
     WorkflowExecutionSemanticsError,
     phase5_node_mcp_runtime_identity_digest,
     phase5_node_intended_authority_digest,
+    phase5_shared_context_compatibility_digest,
     read_phase3_execution_semantics,
 )
 from plugins.workflow.executors.ai import AgentNodeExecutor
@@ -1959,6 +1960,33 @@ class RunScheduler:
                 for field in ("session_id", "cache_fingerprint")
                 if field in state
             }
+            if state.get("state") == "succeeded":
+                attempts = state.get("attempts")
+                winning_attempts = (
+                    [
+                        attempt
+                        for attempt in attempts
+                        if isinstance(attempt, Mapping)
+                        and attempt.get("state") == "succeeded"
+                    ]
+                    if isinstance(attempts, list)
+                    else []
+                )
+                if len(winning_attempts) == 1:
+                    metadata = winning_attempts[0].get("metadata")
+                    identity_fields = (
+                        "intended_authority_digest",
+                        "model_visible_prefix_digest",
+                        "shared_context_compatibility_digest",
+                    )
+                    if isinstance(metadata, Mapping) and all(
+                        isinstance(metadata.get(field), str)
+                        and _SHA256.fullmatch(metadata[field]) is not None
+                        for field in identity_fields
+                    ):
+                        evidence.update({
+                            field: metadata[field] for field in identity_fields
+                        })
             output = outputs.get(dependency)
             if isinstance(output, ResolvedNodeOutput):
                 evidence["output_evidence"] = MappingProxyType({
@@ -3955,6 +3983,28 @@ class RunScheduler:
                     sealed_node_authority = (
                         provider_authority if sealed_node_route is not None else None
                     )
+                    sealed_closure_digest = str(
+                        projection.get("definition_digest") or ""
+                    )
+                    intended_authority_digest = (
+                        phase5_node_intended_authority_digest(
+                            sealed_node_authority,
+                            node_id=node.id,
+                            sealed_closure_digest=sealed_closure_digest,
+                        )
+                        if sealed_node_authority is not None
+                        else None
+                    )
+                    shared_context_compatibility_digest = (
+                        phase5_shared_context_compatibility_digest(
+                            package,
+                            sealed_node_authority,
+                            node_id=node.id,
+                            sealed_closure_digest=sealed_closure_digest,
+                        )
+                        if sealed_node_authority is not None
+                        else None
+                    )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -4088,16 +4138,9 @@ class RunScheduler:
                             normalizer_version=package.language.normalizer_version,
                             sealed_provider_route=sealed_node_route,
                             sealed_provider_authority=sealed_node_authority,
-                            intended_authority_digest=(
-                                phase5_node_intended_authority_digest(
-                                    sealed_node_authority,
-                                    node_id=node.id,
-                                    sealed_closure_digest=str(
-                                        projection.get("definition_digest") or ""
-                                    ),
-                                )
-                                if sealed_node_authority is not None
-                                else None
+                            intended_authority_digest=intended_authority_digest,
+                            shared_context_compatibility_digest=(
+                                shared_context_compatibility_digest
                             ),
                             sealed_mcp_runtime_identity_digest=(
                                 phase5_node_mcp_runtime_identity_digest(

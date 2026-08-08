@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -17,8 +18,11 @@ from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.models import (
+    WorkflowDefinition,
     WorkflowLanguageProfile,
+    WorkflowLanguageMetadata,
     WorkflowNode,
+    WorkflowPackage,
     WorkflowStructuredOutput,
     freeze_value,
 )
@@ -90,6 +94,355 @@ def _authority(*, model: str = "sealed-model") -> WorkflowProviderAuthority:
     )
 
 
+def _compatibility_route(
+    node_id: str,
+    role: str = "primary",
+    *,
+    inline_agent_id: str | None = None,
+) -> WorkflowResolvedProviderRoute:
+    suffix = {
+        "primary": "primary",
+        "fallback": "fallback",
+    }.get(role, f"inline_agent:{inline_agent_id}")
+    return WorkflowResolvedProviderRoute(
+        route_id=f"{node_id}:{suffix}",
+        node_id=node_id,
+        role=role,
+        inline_agent_id=inline_agent_id,
+        reference_kind="configured_alias",
+        requested_reference_sha256="1" * 64,
+        provider="sealed-provider",
+        model=("fallback-model" if role == "fallback" else "sealed-model"),
+        api_mode="chat_completions",
+        route_fingerprint=("8" if role == "fallback" else "2") * 64,
+        endpoint_sha256="d" * 64,
+        registration_provenance_digest="3" * 64,
+        provider_options={"effort": "high", "thinking": {"budget": 64}},
+        config_scope="profile",
+        base_url_trust_class="provider_default",
+    )
+
+
+def _compatibility_decision(
+    route: WorkflowResolvedProviderRoute,
+    feature: WorkflowProviderFeature,
+    *,
+    option: str | None,
+    requested: dict[str, object],
+    adapter_version: int = 1,
+) -> ProviderCapabilityDecision:
+    return ProviderCapabilityDecision(
+        feature=feature,
+        disposition=CapabilityDisposition.HERMES_ADAPTER,
+        provider=route.provider,
+        model=route.model,
+        option=option,
+        requested_semantics=requested,
+        effective_semantics={"contract": feature.value, "version": 1},
+        adapter_version=adapter_version,
+        declaration_source="test",
+        registration_provenance_digest=route.registration_provenance_digest,
+        code=f"test_{feature.value}",
+        rationale=f"test {feature.value} contract",
+    )
+
+
+def _compatibility_fixture() -> tuple[WorkflowPackage, WorkflowProviderAuthority]:
+    semantic_options = {
+        "provider": "sealed-provider",
+        "model": "@primary",
+        "effort": "high",
+        "thinking": {"budget": 64},
+        "allowed_tools": ("terminal", "mcp_echo"),
+        "denied_tools": ("browser_navigate",),
+        "mcp": "echo",
+        "skills": ("review.md",),
+        "agents": {
+            "reviewer": {
+                "description": "Review the answer",
+                "prompt": "Review it",
+                "model": "@primary",
+                "tools": ("terminal",),
+                "disallowedTools": ("browser_navigate",),
+                "skills": ("review.md",),
+                "maxTurns": 3,
+            }
+        },
+        "systemPrompt": "Follow the sealed workflow policy.",
+        "fallbackModel": "fallback-model",
+        "maxBudgetUsd": 2.5,
+        "sandbox": {"kind": "native", "network": False},
+        "context": "shared",
+        "retry": {"max_attempts": 2, "delay_ms": 5, "on_error": "transient"},
+        "idle_timeout": 30.0,
+        "persist_session": True,
+        "when": "always",
+        "trigger_rule": "all_success",
+        "always_run": False,
+    }
+    node_a = WorkflowNode(
+        id="ask",
+        node_type="prompt",
+        value="first user turn",
+        depends_on=("seed-a",),
+        source_index=0,
+        source_line=10,
+        options=freeze_value(semantic_options),
+    )
+    node_b = WorkflowNode(
+        id="followup",
+        node_type="prompt",
+        value="second user turn",
+        depends_on=("ask",),
+        source_index=7,
+        source_line=90,
+        options=freeze_value(semantic_options),
+    )
+    definition = WorkflowDefinition(
+        name="shared-context",
+        description="shared context fixture",
+        nodes=(node_a, node_b),
+        options=freeze_value({"persist_sessions": True}),
+        source_path=Path("definition.yaml"),
+    )
+    structured = WorkflowStructuredOutput(
+        canonical_schema=freeze_value({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }),
+        schema_fingerprint="e" * 64,
+        canonicalization_version=1,
+    )
+    hook_contract = freeze_value({
+        "provider_portability": {
+            "hooks": ({
+                "event": "PreToolUse",
+                "hermes_event": "pre_tool_call",
+                "matcher": "terminal",
+                "operations": ({"name": "permissionDecision", "value": "allow"},),
+                "timeout_seconds": 5.0,
+            },),
+            "mcp_reference": "echo",
+        }
+    })
+    language = WorkflowLanguageMetadata(
+        declared_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=5,
+        normalized_definition_digest="f" * 64,
+        structured_outputs=freeze_value({
+            "ask": structured,
+            "followup": structured,
+        }),
+        node_semantics=freeze_value({
+            "ask": hook_contract,
+            "followup": hook_contract,
+        }),
+    )
+    package = WorkflowPackage(
+        source_definition=definition,
+        definition=definition,
+        root=Path("."),
+        workflow_path=Path("definition.yaml"),
+        sidecar_path=Path("definition.hermes.yaml"),
+        sidecar=freeze_value({"language_compatibility": "archon-2026-07"}),
+        source="test",
+        precedence=0,
+        language=language,
+        compatibility_findings=(),
+    )
+
+    routes: dict[str, WorkflowResolvedProviderRoute] = {}
+    obligations: list[WorkflowCapabilityObligation] = []
+    decisions = (
+        (WorkflowProviderFeature.EFFORT_THINKING, "effort", {"value": "high"}),
+        (
+            WorkflowProviderFeature.TOOL_RESTRICTIONS,
+            "allowed_tools",
+            {"hermes_schema_selection": True, "hermes_dispatch": True},
+        ),
+        (
+            WorkflowProviderFeature.HOOKS,
+            "PreToolUse",
+            {"normalized": True, "events_supported": True},
+        ),
+        (
+            WorkflowProviderFeature.MCP,
+            "stdio",
+            {
+                "sealed_definition": True,
+                "runtime_identity_digest": "9" * 64,
+                "import_policy_version": 1,
+            },
+        ),
+        (
+            WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
+            "inline_agents",
+            {"declared_worker_tool": True, "shared_limits": True},
+        ),
+        (
+            WorkflowProviderFeature.STRUCTURED_OUTPUT,
+            "json_schema",
+            {"schema_fingerprint": structured.schema_fingerprint},
+        ),
+        (
+            WorkflowProviderFeature.FALLBACK_MODELS,
+            None,
+            {"route_resolved": True, "fresh_context": True},
+        ),
+        (
+            WorkflowProviderFeature.COST_BUDGETS,
+            "maxBudgetUsd",
+            {"authoritative_settlement": True, "single_unsettled": True},
+        ),
+        (
+            WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
+            "sandbox",
+            {"value": {"kind": "native", "network": False}},
+        ),
+    )
+    for node_index, node_id in enumerate(("ask", "followup")):
+        primary = _compatibility_route(node_id)
+        fallback = _compatibility_route(node_id, "fallback")
+        inline = _compatibility_route(
+            node_id,
+            "inline_agent",
+            inline_agent_id="reviewer",
+        )
+        routes.update({
+            primary.route_id: primary,
+            fallback.route_id: fallback,
+            inline.route_id: inline,
+        })
+        obligations.extend(
+            WorkflowCapabilityObligation(
+                path=f"nodes[{node_index}].{option or feature.value}",
+                route_id=primary.route_id,
+                decision=_compatibility_decision(
+                    primary,
+                    feature,
+                    option=option,
+                    requested=requested,
+                ),
+            )
+            for feature, option, requested in decisions
+        )
+    authority = WorkflowProviderAuthority(
+        config_fingerprint="4" * 64,
+        routes=routes,
+        obligations=tuple(obligations),
+        warnings=(),
+        authority_digest="5" * 64,
+    )
+    return package, authority
+
+
+def _replace_compatibility_node(
+    package: WorkflowPackage,
+    node_id: str,
+    **changes: object,
+) -> WorkflowPackage:
+    nodes = tuple(
+        replace(node, **changes) if node.id == node_id else node
+        for node in package.definition.nodes
+    )
+    definition = replace(package.definition, nodes=nodes)
+    return replace(
+        package,
+        definition=definition,
+        source_definition=replace(package.source_definition, nodes=nodes),
+    )
+
+
+def _node_option_mutation(field: str, value: object):
+    def mutate(package, authority, closure):
+        node = next(node for node in package.definition.nodes if node.id == "ask")
+        options = dict(node.options)
+        options[field] = value
+        return (
+            _replace_compatibility_node(
+                package,
+                "ask",
+                options=freeze_value(options),
+            ),
+            authority,
+            closure,
+        )
+
+    return mutate
+
+
+def _route_mutation(field: str, value: object, *, role: str = "primary"):
+    def mutate(package, authority, closure):
+        route_id = f"ask:{role}"
+        routes = dict(authority.routes)
+        routes[route_id] = replace(routes[route_id], **{field: value})
+        return package, replace(authority, routes=routes), closure
+
+    return mutate
+
+
+def _decision_mutation(feature: WorkflowProviderFeature, **changes: object):
+    def mutate(package, authority, closure):
+        obligations = tuple(
+            replace(item, decision=replace(item.decision, **changes))
+            if item.route_id == "ask:primary" and item.decision.feature is feature
+            else item
+            for item in authority.obligations
+        )
+        return package, replace(authority, obligations=obligations), closure
+
+    return mutate
+
+
+def _node_semantics_mutation(package, authority, closure):
+    semantics_by_node = dict(package.language.node_semantics)
+    semantics = dict(semantics_by_node["ask"])
+    portability = dict(semantics["provider_portability"])
+    hooks = list(portability["hooks"])
+    hooks[0] = freeze_value({**dict(hooks[0]), "matcher": "read_file"})
+    portability["hooks"] = tuple(hooks)
+    semantics["provider_portability"] = freeze_value(portability)
+    semantics_by_node["ask"] = freeze_value(semantics)
+    return (
+        replace(
+            package,
+            language=replace(
+                package.language,
+                node_semantics=freeze_value(semantics_by_node),
+            ),
+        ),
+        authority,
+        closure,
+    )
+
+
+def _structured_output_mutation(package, authority, closure):
+    outputs = dict(package.language.structured_outputs)
+    outputs["ask"] = replace(
+        outputs["ask"],
+        schema_fingerprint="0" * 64,
+        canonicalization_version=2,
+    )
+    return (
+        replace(
+            package,
+            language=replace(
+                package.language,
+                structured_outputs=freeze_value(outputs),
+            ),
+        ),
+        authority,
+        closure,
+    )
+
+
+def _sealed_closure_mutation(package, authority, _closure):
+    return package, authority, "6" * 64
+
+
 def test_intended_authority_identity_binds_sealed_route_and_full_closure() -> None:
     digest = semantics.phase5_node_intended_authority_digest
 
@@ -116,6 +469,286 @@ def test_intended_authority_identity_binds_sealed_route_and_full_closure() -> No
             node_id="ask",
             sealed_closure_digest="7" * 64,
         )
+
+
+def test_phase5_shared_compatibility_is_distinct_from_node_authority() -> None:
+    package, authority = _compatibility_fixture()
+
+    intended_a = semantics.phase5_node_intended_authority_digest(
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
+    intended_b = semantics.phase5_node_intended_authority_digest(
+        authority,
+        node_id="followup",
+        sealed_closure_digest="7" * 64,
+    )
+    shared_a = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
+    shared_b = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="followup",
+        sealed_closure_digest="7" * 64,
+    )
+
+    assert intended_a != intended_b
+    assert shared_a == shared_b
+
+
+@pytest.mark.parametrize(
+    ("semantic_input", "mutate"),
+    (
+        pytest.param(
+            "endpoint",
+            _route_mutation("endpoint_sha256", "0" * 64),
+            id="endpoint",
+        ),
+        pytest.param(
+            "provider selector",
+            _route_mutation("provider", "other-provider"),
+            id="provider",
+        ),
+        pytest.param(
+            "effective provider",
+            _route_mutation("effective_provider", "effective-other"),
+            id="effective-provider",
+        ),
+        pytest.param(
+            "model",
+            _route_mutation("model", "other-model"),
+            id="model",
+        ),
+        pytest.param(
+            "API mode",
+            _route_mutation("api_mode", "responses"),
+            id="api-mode",
+        ),
+        pytest.param(
+            "provider options and reasoning",
+            _route_mutation(
+                "provider_options",
+                {"effort": "low", "thinking": {"budget": 32}},
+            ),
+            id="provider-options-reasoning",
+        ),
+        pytest.param(
+            "allowed tools",
+            _node_option_mutation("allowed_tools", ("terminal",)),
+            id="allowed-tools",
+        ),
+        pytest.param(
+            "denied tools",
+            _node_option_mutation("denied_tools", ("browser_navigate", "web_search")),
+            id="denied-tools",
+        ),
+        pytest.param("hooks", _node_semantics_mutation, id="hooks"),
+        pytest.param(
+            "MCP definition and tool contract",
+            _node_option_mutation("mcp", "other-echo"),
+            id="mcp-definition-tools",
+        ),
+        pytest.param(
+            "MCP import policy",
+            _decision_mutation(
+                WorkflowProviderFeature.MCP,
+                requested_semantics={
+                    "sealed_definition": True,
+                    "runtime_identity_digest": "9" * 64,
+                    "import_policy_version": 2,
+                },
+            ),
+            id="mcp-import-policy",
+        ),
+        pytest.param(
+            "skills",
+            _node_option_mutation("skills", ("other-skill.md",)),
+            id="skills",
+        ),
+        pytest.param(
+            "inline agents",
+            _node_option_mutation(
+                "agents",
+                {
+                    "reviewer": {
+                        "description": "Review the answer",
+                        "prompt": "Review more strictly",
+                        "model": "@primary",
+                        "tools": ("terminal",),
+                        "disallowedTools": ("browser_navigate",),
+                        "skills": ("review.md",),
+                        "maxTurns": 3,
+                    }
+                },
+            ),
+            id="inline-agents",
+        ),
+        pytest.param(
+            "system prompt configuration",
+            _node_option_mutation("systemPrompt", "Use the other sealed policy."),
+            id="system-prompt",
+        ),
+        pytest.param(
+            "fallback route",
+            _route_mutation("model", "other-fallback", role="fallback"),
+            id="fallback",
+        ),
+        pytest.param(
+            "structured output schema",
+            _structured_output_mutation,
+            id="structured-output",
+        ),
+        pytest.param(
+            "budget decision",
+            _node_option_mutation("maxBudgetUsd", 3.5),
+            id="budget",
+        ),
+        pytest.param(
+            "sandbox decision",
+            _node_option_mutation(
+                "sandbox",
+                {"kind": "native", "network": True},
+            ),
+            id="sandbox",
+        ),
+        pytest.param(
+            "adapter version",
+            _decision_mutation(
+                WorkflowProviderFeature.STRUCTURED_OUTPUT,
+                adapter_version=2,
+            ),
+            id="adapter-version",
+        ),
+        pytest.param(
+            "registration provenance",
+            _route_mutation("registration_provenance_digest", "0" * 64),
+            id="registration-provenance",
+        ),
+        pytest.param(
+            "route trust class",
+            _route_mutation("base_url_trust_class", "custom"),
+            id="route-trust-class",
+        ),
+        pytest.param(
+            "sealed closure",
+            _sealed_closure_mutation,
+            id="sealed-closure",
+        ),
+    ),
+)
+def test_phase5_shared_compatibility_changes_for_cache_semantics(
+    semantic_input,
+    mutate,
+) -> None:
+    package, authority = _compatibility_fixture()
+    baseline = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
+
+    changed_package, changed_authority, changed_closure = mutate(
+        package,
+        authority,
+        "7" * 64,
+    )
+
+    assert baseline != semantics.phase5_shared_context_compatibility_digest(
+        changed_package,
+        changed_authority,
+        node_id="ask",
+        sealed_closure_digest=changed_closure,
+    ), semantic_input
+
+
+@pytest.mark.parametrize(
+    ("structural_input", "changes"),
+    (
+        pytest.param("source path", {"source_path": Path("moved.yaml")}, id="path"),
+        pytest.param("source index", {"source_index": 42}, id="source-index"),
+        pytest.param("source line", {"source_line": 420}, id="source-line"),
+        pytest.param(
+            "dependency and graph position",
+            {"depends_on": ("some-other-node",)},
+            id="dependency-graph-position",
+        ),
+        pytest.param("node prompt", {"value": "different next user turn"}, id="prompt"),
+    ),
+)
+def test_phase5_shared_compatibility_excludes_node_location_and_turn_fields(
+    structural_input,
+    changes,
+) -> None:
+    package, authority = _compatibility_fixture()
+    baseline = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
+    if "source_path" in changes:
+        definition = replace(package.definition, source_path=changes["source_path"])
+        changed = replace(
+            package,
+            definition=definition,
+            source_definition=replace(
+                package.source_definition,
+                source_path=changes["source_path"],
+            ),
+        )
+    else:
+        changed = _replace_compatibility_node(package, "ask", **changes)
+
+    assert baseline == semantics.phase5_shared_context_compatibility_digest(
+        changed,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    ), structural_input
+
+
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        pytest.param("context", "fresh", id="context"),
+        pytest.param(
+            "retry",
+            {"max_attempts": 4, "delay_ms": 100, "on_error": "all"},
+            id="retry",
+        ),
+        pytest.param("idle_timeout", 99.0, id="timeout"),
+        pytest.param("persist_session", False, id="persistence"),
+        pytest.param("when", "success", id="schedule-when"),
+        pytest.param("trigger_rule", "all_done", id="schedule-trigger"),
+        pytest.param("always_run", True, id="schedule-always-run"),
+    ),
+)
+def test_phase5_shared_compatibility_excludes_execution_controls(control, value) -> None:
+    package, authority = _compatibility_fixture()
+    baseline = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
+    changed_package, _, _ = _node_option_mutation(control, value)(
+        package,
+        authority,
+        "7" * 64,
+    )
+
+    assert baseline == semantics.phase5_shared_context_compatibility_digest(
+        changed_package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest="7" * 64,
+    )
 
 
 class _Runner:
@@ -172,21 +805,120 @@ def _context(tmp_path, *, route=True, shared=False) -> NodeExecutionContext:
         sealed_provider_route=_route() if route else None,
         sealed_provider_authority=_authority() if route else None,
         intended_authority_digest="a" * 64,
+        shared_context_compatibility_digest="c" * 64,
         predecessor_results=(
             {
                 "before": {
                     "session_id": "predecessor-session",
                     "cache_fingerprint": semantics.phase5_session_cache_fingerprint(
-                        "a" * 64,
+                        "d" * 64,
                         "b" * 64,
                     ),
-                    "intended_authority_digest": "a" * 64,
+                    "intended_authority_digest": "d" * 64,
                     "model_visible_prefix_digest": "b" * 64,
+                    "shared_context_compatibility_digest": "c" * 64,
                 }
             }
             if shared
             else {}
         ),
+    )
+
+
+def _distinct_node_shared_context(tmp_path) -> tuple[NodeExecutionContext, str]:
+    package, authority = _compatibility_fixture()
+    for node_id in ("ask", "followup"):
+        original = next(
+            node for node in package.definition.nodes if node.id == node_id
+        )
+        options = {
+            key: value
+            for key, value in original.options.items()
+            if key
+            not in {
+                "agents",
+                "effort",
+                "fallbackModel",
+                "maxBudgetUsd",
+                "mcp",
+                "sandbox",
+                "skills",
+                "thinking",
+            }
+        }
+        package = _replace_compatibility_node(
+            package,
+            node_id,
+            options=freeze_value(options),
+        )
+    authority = replace(
+        authority,
+        routes={
+            route_id: replace(route, provider_options={})
+            for route_id, route in authority.routes.items()
+        },
+    )
+    node = next(node for node in package.definition.nodes if node.id == "followup")
+    closure = "7" * 64
+    predecessor_intended = semantics.phase5_node_intended_authority_digest(
+        authority,
+        node_id="ask",
+        sealed_closure_digest=closure,
+    )
+    current_intended = semantics.phase5_node_intended_authority_digest(
+        authority,
+        node_id="followup",
+        sealed_closure_digest=closure,
+    )
+    predecessor_shared = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="ask",
+        sealed_closure_digest=closure,
+    )
+    current_shared = semantics.phase5_shared_context_compatibility_digest(
+        package,
+        authority,
+        node_id="followup",
+        sealed_closure_digest=closure,
+    )
+    prefix = "b" * 64
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    return (
+        NodeExecutionContext(
+            run_id="run-1",
+            run_directory=run_directory,
+            node=node,
+            attempt_id="attempt-followup",
+            workflow_name=package.definition.name,
+            workflow_options=package.definition.options,
+            variable_context=VariableContext(
+                arguments="",
+                workflow_id="run-1",
+                normalizer_version=5,
+            ),
+            predecessor_results={
+                "ask": {
+                    "session_id": "predecessor-session",
+                    "cache_fingerprint": semantics.phase5_session_cache_fingerprint(
+                        predecessor_intended,
+                        prefix,
+                    ),
+                    "intended_authority_digest": predecessor_intended,
+                    "model_visible_prefix_digest": prefix,
+                    "shared_context_compatibility_digest": predecessor_shared,
+                }
+            },
+            ai_entitlement=AIEntitlementResolution("real"),
+            language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version=5,
+            sealed_provider_route=authority.routes["followup:primary"],
+            sealed_provider_authority=authority,
+            intended_authority_digest=current_intended,
+            shared_context_compatibility_digest=current_shared,
+        ),
+        predecessor_intended,
     )
 
 
@@ -264,7 +996,7 @@ def test_phase5_executor_uses_only_sealed_route_and_returns_both_identities(
 
     result = AgentNodeExecutor(runner).execute(_context(tmp_path))
 
-    assert result.status == "succeeded"
+    assert result.status == "succeeded", result
     assert len(runner.requests) == 1
     request = runner.requests[0]
     assert request.provider == "sealed-provider"
@@ -602,19 +1334,80 @@ def test_phase5_repair_decision_contradiction_blocks_before_repair_launch(
     assert len(runner.requests) == 1
 
 
-def test_phase5_shared_context_requires_and_forwards_both_predecessor_identities(
+def test_phase5_shared_context_uses_compatible_distinct_node_authorities(
     tmp_path,
 ) -> None:
     runner = _Runner()
+    context, predecessor_intended = _distinct_node_shared_context(tmp_path)
 
-    result = AgentNodeExecutor(runner).execute(_context(tmp_path, shared=True))
+    result = AgentNodeExecutor(runner).execute(context)
 
-    assert result.status == "succeeded"
+    assert result.status == "succeeded", result
     request = runner.requests[0]
     assert request.context_mode == "shared"
     assert request.session_id == "predecessor-session"
-    assert request.intended_authority_digest == "a" * 64
+    assert request.intended_authority_digest == context.intended_authority_digest
+    assert request.intended_authority_digest != predecessor_intended
     assert request.expected_model_visible_prefix_digest == "b" * 64
+    assert context.predecessor_results["ask"]["cache_fingerprint"] == (
+        semantics.phase5_session_cache_fingerprint(
+            predecessor_intended,
+            "b" * 64,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("shared_compatibility", "predecessor_cache"),
+)
+def test_phase5_shared_context_mismatch_blocks_before_worker(
+    tmp_path,
+    mutation,
+) -> None:
+    runner = _Runner()
+    context, _ = _distinct_node_shared_context(tmp_path)
+    predecessor = dict(context.predecessor_results["ask"])
+    if mutation == "shared_compatibility":
+        predecessor["shared_context_compatibility_digest"] = "0" * 64
+    else:
+        predecessor["cache_fingerprint"] = semantics.phase5_session_cache_fingerprint(
+            str(context.intended_authority_digest),
+            str(predecessor["model_visible_prefix_digest"]),
+        )
+    context = replace(context, predecessor_results={"ask": predecessor})
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_incompatible"
+    assert runner.requests == []
+
+
+def test_phase5_fresh_context_never_consumes_predecessor_session(tmp_path) -> None:
+    runner = _Runner()
+    context, _ = _distinct_node_shared_context(tmp_path)
+    context = replace(
+        context,
+        node=replace(
+            context.node,
+            options=freeze_value({**dict(context.node.options), "context": "fresh"}),
+        ),
+        predecessor_results={
+            "ask": {
+                "session_id": "must-not-be-used",
+                "cache_fingerprint": "malformed",
+            }
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded", result
+    request = runner.requests[0]
+    assert request.context_mode == "fresh"
+    assert request.session_id is None
+    assert request.expected_model_visible_prefix_digest is None
 
 
 def test_runtime_prefix_drift_selects_fresh_context_before_provider_use(

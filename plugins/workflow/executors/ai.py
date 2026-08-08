@@ -1041,6 +1041,9 @@ class AgentNodeExecutor:
         sealed_route = context.sealed_provider_route
         sealed_authority = context.sealed_provider_authority
         intended_authority_digest = context.intended_authority_digest
+        shared_context_compatibility_digest = (
+            context.shared_context_compatibility_digest
+        )
         if phase5 and (
             sealed_route is None
             or sealed_authority is None
@@ -1052,6 +1055,12 @@ class AgentNodeExecutor:
             or any(
                 character not in "0123456789abcdef"
                 for character in intended_authority_digest
+            )
+            or not isinstance(shared_context_compatibility_digest, str)
+            or len(shared_context_compatibility_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in shared_context_compatibility_digest
             )
         ):
             return NodeExecutionResult(
@@ -1277,6 +1286,9 @@ class AgentNodeExecutor:
                 predecessor_prefix = predecessor.get(
                     "model_visible_prefix_digest"
                 )
+                predecessor_shared_compatibility = predecessor.get(
+                    "shared_context_compatibility_digest"
+                )
                 try:
                     predecessor_fingerprint = phase5_session_cache_fingerprint(
                         str(predecessor_intended or ""),
@@ -1285,7 +1297,8 @@ class AgentNodeExecutor:
                 except ValueError:
                     predecessor_fingerprint = None
                 compatible = (
-                    predecessor_intended == intended_authority_digest
+                    predecessor_shared_compatibility
+                    == shared_context_compatibility_digest
                     and predecessor.get("cache_fingerprint")
                     == predecessor_fingerprint
                 )
@@ -2042,6 +2055,9 @@ class AgentNodeExecutor:
                 )
             metadata["intended_authority_digest"] = observed_intended
             metadata["model_visible_prefix_digest"] = observed_prefix
+            metadata["shared_context_compatibility_digest"] = (
+                shared_context_compatibility_digest
+            )
             fingerprint = phase5_session_cache_fingerprint(
                 observed_intended,
                 observed_prefix,
