@@ -191,6 +191,14 @@ class _ExecutionEndpointIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExecutionProviderAuthority:
+    canonical_provider: str
+    registration: Any | None
+    profile: Any | None
+    registration_lookup_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionSdkEndpoint:
     """Lossless endpoint representation for SDK base/query splitting."""
 
@@ -254,18 +262,14 @@ def _execution_endpoint_identity(
     provider: str,
     api_mode: str,
     base_url: str,
+    provider_profile: Any | None,
 ) -> _ExecutionEndpointIdentity:
     """Bind execution identity to normalized, credential-free route structure."""
     effective_base_url = base_url.strip() if isinstance(base_url, str) else ""
-    if not effective_base_url:
-        try:
-            from providers import get_provider_profile
-
-            profile = get_provider_profile(provider.strip().lower())
-        except Exception:
-            profile = None
-        if profile is not None:
-            effective_base_url = str(getattr(profile, "base_url", "") or "").strip()
+    if not effective_base_url and provider_profile is not None:
+        effective_base_url = str(
+            getattr(provider_profile, "base_url", "") or ""
+        ).strip()
 
     if effective_base_url:
         try:
@@ -309,11 +313,15 @@ def execution_endpoint_sha256(
         base_url=base_url,
         default_query=default_query,
     ).recompose()
+    provider_profile = None
+    if not effective_base_url:
+        provider_profile = _resolve_execution_provider_authority(provider).profile
 
     identity = _execution_endpoint_identity(
         provider=provider,
         api_mode=api_mode,
         base_url=effective_base_url,
+        provider_profile=provider_profile,
     )
     if identity.error_code or not identity.endpoint_sha256:
         raise ValueError(
@@ -845,15 +853,11 @@ def _structured_output_runtime_declaration(
     provider: str,
     api_mode: str,
     base_url: str,
+    provider_authority: _ExecutionProviderAuthority,
 ) -> tuple[str, str, str | None, str | None]:
     """Return effective provider, URL trust, declaration, and its authority."""
     normalized_provider = provider.strip().lower()
-    try:
-        from providers import get_provider_profile
-
-        profile = get_provider_profile(normalized_provider)
-    except Exception:
-        profile = None
+    profile = provider_authority.profile
     effective_provider = normalized_provider
     if profile is not None and normalized_provider != "custom":
         profile_name = str(getattr(profile, "name", "") or "").strip().lower()
@@ -925,6 +929,7 @@ def _classify_execution_api_mode(
     model: object = "",
     base_url: object = "",
     endpoint_identity_error: str | None = None,
+    provider_authority: _ExecutionProviderAuthority,
 ) -> ExecutionRuntimeCapabilities:
     """Classify one already-derived API mode."""
     normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
@@ -940,18 +945,15 @@ def _classify_execution_api_mode(
         provider=normalized_provider,
         api_mode=normalized,
         base_url=normalized_base_url,
+        provider_authority=provider_authority,
     )
-    try:
-        from providers import get_provider_registration
-
-        registration = get_provider_registration(normalized_provider)
-    except Exception:
-        registration = None
+    registration = provider_authority.registration
     provenance = registration.provenance if registration is not None else None
     endpoint_identity = _execution_endpoint_identity(
         provider=normalized_provider,
         api_mode=normalized,
         base_url=normalized_base_url,
+        provider_profile=provider_authority.profile,
     )
     if endpoint_identity_error is not None:
         endpoint_identity = _ExecutionEndpointIdentity("", endpoint_identity_error)
@@ -990,6 +992,42 @@ def _canonical_execution_provider(provider: object) -> str:
         return requested
 
 
+def _resolve_execution_provider_authority(
+    provider: object,
+) -> _ExecutionProviderAuthority:
+    """Resolve one registry authority, preferring the raw token over aliases."""
+    requested = provider.strip().lower() if isinstance(provider, str) else ""
+    if not requested:
+        return _ExecutionProviderAuthority("", None, None, True)
+
+    canonical = requested
+    try:
+        from providers import get_provider_profile, get_provider_registration
+
+        registration = get_provider_registration(requested)
+        if registration is None:
+            canonical = _canonical_execution_provider(requested) or requested
+            if canonical != requested:
+                registration = get_provider_registration(canonical)
+        if registration is not None:
+            profile = registration.profile
+            profile_name = str(getattr(profile, "name", "") or "").strip().lower()
+            return _ExecutionProviderAuthority(
+                profile_name or canonical,
+                registration,
+                profile,
+                True,
+            )
+
+        profile = get_provider_profile(requested)
+        if profile is None and canonical != requested:
+            profile = get_provider_profile(canonical)
+        return _ExecutionProviderAuthority(canonical, None, profile, True)
+    except Exception:
+        canonical = _canonical_execution_provider(requested) or requested
+        return _ExecutionProviderAuthority(canonical, None, None, False)
+
+
 def _endpoint_config_segment(value: object) -> str:
     if not isinstance(value, str):
         return ""
@@ -1002,22 +1040,19 @@ def _configured_execution_endpoint(
     provider: object,
     model_config: Mapping[str, Any] | object,
     provider_config: Mapping[str, Any] | object | None,
+    provider_authority: _ExecutionProviderAuthority,
 ) -> tuple[str, str | None]:
     """Derive a credential-free endpoint from immutable route authority."""
     explicit = _execution_base_url(model_config, provider_config)
     if explicit:
         return explicit, None
 
-    canonical = _canonical_execution_provider(provider)
+    canonical = provider_authority.canonical_provider
     config = provider_config if isinstance(provider_config, Mapping) else {}
     if canonical in {"bedrock", "vertex"}:
-        requested = provider.strip().lower() if isinstance(provider, str) else ""
-        try:
-            from providers import get_provider_registration
-
-            registration = get_provider_registration(requested)
-        except Exception:
+        if not provider_authority.registration_lookup_complete:
             return "", None
+        registration = provider_authority.registration
         if (
             registration is not None
             and registration.provenance.origin_kind != "bundled"
@@ -1082,6 +1117,7 @@ def classify_execution_runtime(
     contract; the worker classifies its actual resolved mapping with
     :func:`classify_resolved_execution_runtime`.
     """
+    provider_authority = _resolve_execution_provider_authority(provider)
     api_mode = _effective_execution_api_mode(
         provider=provider,
         model_config=model_config,
@@ -1092,6 +1128,7 @@ def classify_execution_runtime(
         provider=provider,
         model_config=model_config,
         provider_config=provider_config,
+        provider_authority=provider_authority,
     )
     return _classify_execution_api_mode(
         api_mode,
@@ -1099,6 +1136,7 @@ def classify_execution_runtime(
         model=_execution_model(model_config, provider_config, target_model),
         base_url=base_url,
         endpoint_identity_error=endpoint_error,
+        provider_authority=provider_authority,
     )
 
 
@@ -1420,20 +1458,17 @@ def _workflow_route_constraint(
         return None
     if identity != expected:
         return None
+    provider_authority = _resolve_execution_provider_authority(route.provider)
     base_url, endpoint_error = _configured_execution_endpoint(
         provider=route.provider,
         model_config=model_config,
         provider_config=provider_config,
+        provider_authority=provider_authority,
     )
     if endpoint_error is not None:
         return None
     if not base_url:
-        try:
-            from providers import get_provider_profile
-
-            profile_record = get_provider_profile(route.provider)
-        except Exception:
-            profile_record = None
+        profile_record = provider_authority.profile
         base_url = str(
             getattr(profile_record, "base_url", "") or ""
         ).strip().rstrip("/")
@@ -1459,12 +1494,17 @@ def classify_resolved_execution_runtime(
 ) -> ExecutionRuntimeCapabilities:
     """Classify the API mode on an already-resolved runtime mapping."""
     if not isinstance(runtime, Mapping):
-        return _classify_execution_api_mode(None)
+        return _classify_execution_api_mode(
+            None,
+            provider_authority=_resolve_execution_provider_authority(""),
+        )
+    provider = runtime.get("provider")
     return _classify_execution_api_mode(
         runtime.get("api_mode"),
-        provider=runtime.get("provider"),
+        provider=provider,
         model=_execution_model({}, runtime, target_model),
         base_url=runtime.get("base_url"),
+        provider_authority=_resolve_execution_provider_authority(provider),
     )
 
 

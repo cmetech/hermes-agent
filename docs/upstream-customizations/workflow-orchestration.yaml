@@ -275,6 +275,7 @@ upstream_changes:
   - canonical-first provider token lookup and alias collision arbitration
   - registry-first public provider and authentication resolution
   - registration-gated Bedrock and Vertex synthetic endpoint derivation
+  - _ExecutionProviderAuthority shared runtime registration resolution
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -285,6 +286,7 @@ upstream_changes:
   - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
   - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
   - Bedrock and Vertex endpoint synthesis requires a bundled winner or no registration for legacy compatibility; non-bundled same-name winners use their registered profile endpoint
+  - runtime registration resolution checks the raw token first then the existing authentication canonical target once and shares that winner across endpoint fallback trust and provenance
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -310,6 +312,10 @@ upstream_changes:
     agreed bundled overlay metadata. Bedrock and Vertex regional endpoint
     synthesis is bundled authority (with an unregistered legacy fallback), so a
     non-bundled same-name winner must retain its profile endpoint and provenance.
+    Resolve runtime registration once, preferring the raw registry token before
+    consulting the existing authentication compatibility target; endpoint
+    eligibility, profile fallback, trust, and provenance must consume that same
+    result rather than rebuilding aliases independently.
     Diagnostics remain bounded and free of local paths, credentials, or provider
     payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic

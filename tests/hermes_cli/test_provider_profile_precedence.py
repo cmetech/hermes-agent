@@ -566,3 +566,97 @@ def test_unregistered_legacy_cloud_provider_keeps_endpoint_synthesis(
     assert runtime.registration_origin_kind == ""
     assert runtime.endpoint_sha256 == expected_endpoint
     assert runtime.endpoint_identity_error is None
+
+
+def test_legacy_aws_alias_uses_user_bedrock_canonical_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        "bedrock-legacy-alias-bundled",
+        registered_name="bedrock",
+        marker="bundled-bedrock",
+        aliases=("aws",),
+    )
+    _write_plugin(
+        user_root,
+        "bedrock-legacy-alias-user",
+        registered_name="bedrock",
+        marker="user-bedrock",
+        aliases=(),
+        base_url="https://user-bedrock-alias.example/v1",
+    )
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    from hermes_cli.runtime_provider import classify_execution_runtime
+
+    runtime = classify_execution_runtime(
+        provider="aws",
+        model_config={"provider": "aws", "default": "user-model"},
+        provider_config={"api_mode": "chat_completions", "region": "eu-west-1"},
+    )
+    expected_endpoint = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://user-bedrock-alias.example/v1"
+    ).hexdigest()
+
+    assert runtime.effective_provider == "bedrock"
+    assert runtime.registration_origin_kind == "user_plugin"
+    assert runtime.base_url_trust_class == "unknown"
+    assert runtime.endpoint_sha256 == expected_endpoint
+    assert runtime.endpoint_identity_error is None
+
+
+def test_registered_vertex_alias_uses_user_vertex_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        "vertex-registry-alias-bundled",
+        registered_name="vertex",
+        marker="bundled-vertex",
+        aliases=("google-vertex",),
+    )
+    _write_plugin(
+        user_root,
+        "vertex-registry-alias-user",
+        registered_name="vertex",
+        marker="user-vertex",
+        aliases=("google-vertex",),
+        base_url="https://user-vertex-alias.example/v1",
+    )
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    from hermes_cli.runtime_provider import classify_execution_runtime
+
+    runtime = classify_execution_runtime(
+        provider="google-vertex",
+        model_config={"provider": "google-vertex", "default": "user-model"},
+        provider_config={"api_mode": "chat_completions"},
+    )
+    expected_endpoint = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://user-vertex-alias.example/v1"
+    ).hexdigest()
+
+    assert runtime.effective_provider == "vertex"
+    assert runtime.registration_origin_kind == "user_plugin"
+    assert runtime.base_url_trust_class == "unknown"
+    assert runtime.endpoint_sha256 == expected_endpoint
+    assert runtime.endpoint_identity_error is None
