@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import sys
 
 import pytest
@@ -161,6 +161,39 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
     assert not hasattr(authority, "__dict__")
     with pytest.raises(FrozenInstanceError):
         authority.authority_digest = "0" * 64  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("digest", ["", "not-a-digest", "A" * 64])
+def test_provider_route_rejects_malformed_registration_provenance_digest(
+    tmp_path, workflow_writer, digest
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{"id": "ask", "prompt": "hello"}],
+    )
+    route = _authority(_load_v5(path)).routes["ask:primary"]
+
+    with pytest.raises(ValueError, match="registration provenance digest is invalid"):
+        replace(route, registration_provenance_digest=digest)
+
+
+def test_authority_creation_rejects_incomplete_registration_provenance(
+    monkeypatch, tmp_path, workflow_writer
+) -> None:
+    import providers
+
+    path = workflow_writer(
+        tmp_path,
+        model="@primary",
+        nodes=[{"id": "ask", "prompt": "hello"}],
+    )
+    monkeypatch.setattr(providers, "get_provider_registration", lambda _name: None)
+
+    with pytest.raises(WorkflowProviderAuthorityError) as exc_info:
+        _authority(_load_v5(path))
+
+    assert exc_info.value.code == "provider_capability_drift"
 
 
 def test_fallback_route_with_unresolvable_endpoint_blocks_authority_creation(
@@ -770,23 +803,23 @@ def test_configured_provider_alias_may_classify_to_a_distinct_effective_provider
     )
     config = parse_workflow_model_config({
         "model": {
-            "provider": "openai-api",
-            "default": "gpt-5.4",
-            "base_url": "https://api.openai.com/v1",
-            "api_mode": "chat_completions",
+            "provider": "claude",
+            "default": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
         },
         "model_aliases": {
             "primary": {
-                "provider": "openai-api",
-                "model": "gpt-5.4",
-                "base_url": "https://api.openai.com/v1",
+                "provider": "claude",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://api.anthropic.com",
             }
         },
     })
     runtime = classify_execution_runtime(
-        provider="openai-api",
-        model_config={"provider": "openai-api", "default": "gpt-5.4"},
-        provider_config={"base_url": "https://api.openai.com/v1"},
+        provider="claude",
+        model_config={"provider": "claude", "default": "claude-sonnet-4-6"},
+        provider_config={"base_url": "https://api.anthropic.com"},
     )
 
     authority = resolve_workflow_provider_authority(
@@ -796,5 +829,5 @@ def test_configured_provider_alias_may_classify_to_a_distinct_effective_provider
         environment=_environment(),
     )
 
-    assert authority.routes["ask:primary"].provider == "openai-api"
-    assert authority.routes["ask:primary"].effective_provider == "openai"
+    assert authority.routes["ask:primary"].provider == "claude"
+    assert authority.routes["ask:primary"].effective_provider == "anthropic"

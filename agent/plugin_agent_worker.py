@@ -1409,6 +1409,16 @@ def _runtime_identity_mismatch_failure(
     }
 
 
+def _runtime_identity_mismatched_fields(expected, actual) -> tuple[str, ...]:
+    if actual is None:
+        return ("endpoint_sha256",)
+    return tuple(
+        field
+        for field in expected.__dataclass_fields__
+        if getattr(actual, field) != getattr(expected, field)
+    )
+
+
 def _tool_policy_incompatible_failure(
     plugin_id: str,
     *,
@@ -1490,6 +1500,41 @@ def _run(
     plugin_id = str(payload.get("plugin_id") or "")
     if not plugin_id:
         raise ValueError("plugin_id is missing")
+
+    # Phase 5 binds the request to a pure view of the live configured route
+    # before this process loads dotenv, opens SessionDB, mutates tool globals,
+    # finalizes MCP config, or resolves credentials. A drifted request must be
+    # observationally equivalent to never having entered provider execution.
+    if request.expected_runtime_identity is not None:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import read_raw_config_readonly
+        from hermes_cli.runtime_provider import (
+            classify_credential_free_execution_runtime,
+            execution_runtime_identity,
+            execution_runtime_identity_from_sealed_route,
+        )
+
+        expected_runtime_identity = execution_runtime_identity_from_sealed_route(
+            request.expected_runtime_identity
+        )
+        live_capabilities = classify_credential_free_execution_runtime(
+            read_raw_config_readonly(),
+            requested_provider=request.provider,
+            target_model=request.model,
+            managed_config=managed_scope.load_managed_config(),
+        )
+        try:
+            live_runtime_identity = execution_runtime_identity(live_capabilities)
+        except ValueError:
+            live_runtime_identity = None
+        if live_runtime_identity != expected_runtime_identity:
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest or "",
+                mismatched_fields=_runtime_identity_mismatched_fields(
+                    expected_runtime_identity, live_runtime_identity
+                ),
+            )
 
     worker_mcp = None
     original_mcp_loader = None
@@ -1640,22 +1685,14 @@ def _run(
                 except ValueError:
                     actual_runtime_identity = None
                 if actual_runtime_identity != expected_runtime_identity:
-                    mismatched_fields = (
-                        ("endpoint_sha256",)
-                        if actual_runtime_identity is None
-                        else tuple(
-                            field
-                            for field in expected_runtime_identity.__dataclass_fields__
-                            if getattr(actual_runtime_identity, field)
-                            != getattr(expected_runtime_identity, field)
-                        )
-                    )
                     return _runtime_identity_mismatch_failure(
                         plugin_id,
                         intended_authority_digest=(
                             request.intended_authority_digest or ""
                         ),
-                        mismatched_fields=mismatched_fields,
+                        mismatched_fields=_runtime_identity_mismatched_fields(
+                            expected_runtime_identity, actual_runtime_identity
+                        ),
                     )
             if (
                 enabled_mcp_names

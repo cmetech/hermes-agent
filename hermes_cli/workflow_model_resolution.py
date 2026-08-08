@@ -107,12 +107,21 @@ class WorkflowModelConfigSnapshot:
     active_provider_scope: Literal["profile", "managed"]
     active_base_url: str = field(repr=False)
     active_api_mode: str
+    provider_endpoint_config: Mapping[str, Mapping[str, Any]] = field(repr=False)
     config_fingerprint: str
     issues: tuple[ModelResolutionIssue, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tiers", MappingProxyType(dict(self.tiers)))
         object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
+        object.__setattr__(
+            self,
+            "provider_endpoint_config",
+            MappingProxyType({
+                name: MappingProxyType(dict(values))
+                for name, values in self.provider_endpoint_config.items()
+            }),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a credential-free projection; route URLs remain digest-only."""
@@ -134,6 +143,18 @@ class WorkflowModelConfigSnapshot:
                 else ""
             ),
             "active_api_mode": self.active_api_mode,
+            "provider_endpoint_config_sha256": hashlib.sha256(
+                json.dumps(
+                    {
+                        name: dict(values)
+                        for name, values in sorted(
+                            self.provider_endpoint_config.items()
+                        )
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             "config_fingerprint": self.config_fingerprint,
             "issues": [
                 {
@@ -397,6 +418,7 @@ def _fingerprint_payload(
     active_provider_scope: str,
     active_base_url: str,
     active_api_mode: str,
+    provider_endpoint_config: Mapping[str, Mapping[str, Any]],
     issues: tuple[ModelResolutionIssue, ...],
 ) -> dict[str, Any]:
     return {
@@ -415,6 +437,16 @@ def _fingerprint_payload(
             else ""
         ),
         "active_api_mode": active_api_mode,
+        "provider_endpoint_config_sha256": hashlib.sha256(
+            json.dumps(
+                {
+                    name: dict(values)
+                    for name, values in sorted(provider_endpoint_config.items())
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
         "issues": [
             {"code": issue.code, "path": issue.path, "severity": issue.severity}
             for issue in issues
@@ -454,6 +486,18 @@ def parse_workflow_model_config(
             active_base_url = value.strip().rstrip("/")
             break
     active_api_mode = str(model_section.get("api_mode") or "").strip().lower()
+    provider_endpoint_config: dict[str, Mapping[str, Any]] = {}
+    for provider_name, keys in (
+        ("bedrock", ("region",)),
+        ("vertex", ("project_id", "region")),
+    ):
+        section = merged.get(provider_name)
+        if isinstance(section, Mapping):
+            provider_endpoint_config[provider_name] = {
+                key: section[key] if isinstance(section[key], str) else None
+                for key in keys
+                if key in section
+            }
     managed_model = managed.get("model")
     active_provider_scope: Literal["profile", "managed"] = (
         "managed"
@@ -553,6 +597,7 @@ def parse_workflow_model_config(
         active_provider_scope=active_provider_scope,
         active_base_url=active_base_url,
         active_api_mode=active_api_mode,
+        provider_endpoint_config=provider_endpoint_config,
         issues=issue_tuple,
     )
     fingerprint = hashlib.sha256(
@@ -565,6 +610,7 @@ def parse_workflow_model_config(
         active_provider_scope=active_provider_scope,
         active_base_url=active_base_url,
         active_api_mode=active_api_mode,
+        provider_endpoint_config=provider_endpoint_config,
         config_fingerprint=fingerprint,
         issues=issue_tuple,
     )
@@ -707,12 +753,20 @@ def resolve_workflow_model_reference(
             "model_reference_options_invalid", "model options are invalid"
         )
 
-    from hermes_cli.runtime_provider import classify_execution_runtime
+    from hermes_cli.runtime_provider import (
+        _canonical_execution_provider,
+        classify_execution_runtime,
+    )
+
+    endpoint_provider_config = snapshot.provider_endpoint_config.get(
+        _canonical_execution_provider(provider), {}
+    )
 
     runtime = classify_execution_runtime(
         provider=provider,
         model_config={"provider": provider, "default": model},
         provider_config={
+            **dict(endpoint_provider_config),
             **({"base_url": base_url} if base_url else {}),
             **(
                 {"api_mode": snapshot.active_api_mode}

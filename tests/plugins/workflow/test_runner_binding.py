@@ -298,6 +298,17 @@ def _direct_openai_runtime():
     )
 
 
+def _direct_anthropic_runtime():
+    return classify_execution_runtime(
+        provider="anthropic",
+        model_config={
+            "provider": "anthropic",
+            "default": "claude-sonnet-4-6",
+        },
+        provider_config={"api_mode": "anthropic_messages"},
+    )
+
+
 def test_package_identity_seals_complete_actual_structured_output_decisions(
     tmp_path: Path,
     workflow_writer,
@@ -636,7 +647,7 @@ def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
     )
     assert compilation is not None
     package = compilation.package
-    current = {"runtime": _direct_openai_runtime()}
+    current = {"runtime": _direct_anthropic_runtime()}
     binding = _runtime_binding(
         current["runtime"], runtime_provider=lambda: current["runtime"]
     )
@@ -746,14 +757,26 @@ def test_unsupported_structured_output_blocks_before_provider_request(
     )
     assert compilation is not None
     package = compilation.package
-    unsupported_runtime = ExecutionRuntimeCapabilities(
-        api_mode="chat_completions",
-        hermes_managed_tool_loop=True,
-        effective_provider="locked-provider",
-        model="locked-model",
-        declared_structured_output_strategy="unsupported",
-        structured_output_declaration_source="provider_profile",
+    import hermes_cli.runtime_provider as runtime_provider_module
+
+    original_declaration = (
+        runtime_provider_module._structured_output_runtime_declaration
     )
+    monkeypatch.setattr(
+        runtime_provider_module,
+        "_structured_output_runtime_declaration",
+        lambda **kwargs: (
+            (
+                "anthropic",
+                "trusted_direct",
+                "unsupported",
+                "provider_profile",
+            )
+            if kwargs["provider"] == "anthropic"
+            else original_declaration(**kwargs)
+        ),
+    )
+    unsupported_runtime = _direct_anthropic_runtime()
     binding = _runtime_binding(unsupported_runtime)
     context = binding.execution_context(
         surface="background",
@@ -825,7 +848,7 @@ def test_overlong_structured_decision_metadata_blocks_without_residue(
     )
     assert compilation is not None
     package = compilation.package
-    binding = _runtime_binding(_direct_openai_runtime())
+    binding = _runtime_binding(_direct_anthropic_runtime())
     context = binding.execution_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),

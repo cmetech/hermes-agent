@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 import hermes_cli.workflow_model_resolution as model_resolution
+import hermes_cli.runtime_provider as runtime_provider
 from hermes_cli.workflow_model_resolution import (
     ModelResolutionError,
     load_workflow_model_config_snapshot,
@@ -34,6 +36,46 @@ def test_route_fingerprint_uses_version2_normalized_endpoint_identity() -> None:
     )
 
     assert first_route.endpoint_sha256 == second_route.endpoint_sha256
+
+
+@pytest.mark.parametrize(
+    ("provider", "provider_config", "expected_url"),
+    [
+        (
+            "bedrock",
+            {"region": "ap-southeast-2"},
+            "https://bedrock-runtime.ap-southeast-2.amazonaws.com",
+        ),
+        (
+            "vertex",
+            {"project_id": "private-project-9", "region": "us-central1"},
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
+            "private-project-9/locations/us-central1/endpoints/openapi",
+        ),
+    ],
+)
+def test_workflow_snapshot_binds_dynamic_provider_endpoint_privately(
+    provider, provider_config, expected_url
+) -> None:
+    config = {
+        "model": {"provider": provider, "default": "test-model"},
+        provider: provider_config,
+    }
+    snapshot = parse_workflow_model_config(config)
+    route = resolve_workflow_model_reference(snapshot, "test-model")
+
+    expected = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0" + expected_url.encode("utf-8")
+    ).hexdigest()
+    assert route.endpoint_sha256 == expected
+    assert expected == runtime_provider.classify_credential_free_execution_runtime(
+        config,
+        requested_provider=provider,
+        target_model="test-model",
+    ).endpoint_sha256
+    public_snapshot = json.dumps(snapshot.to_dict(), sort_keys=True)
+    assert provider_config["region"] not in public_snapshot
+    assert provider_config.get("project_id", "private-project-9") not in public_snapshot
 
 
 def _config() -> dict[str, object]:

@@ -167,6 +167,7 @@ upstream_changes:
   - parse_workflow_model_config profile and managed leaf precedence
   - resolve_workflow_model_reference tier alias literal and option precedence
   - normalized endpoint digest in credential-free route fingerprints
+  - private Bedrock and Vertex endpoint-authority config snapshot
   - model_switch shared portable alias parser integration
   tests:
   - tests/hermes_cli/test_config_validation.py
@@ -183,7 +184,9 @@ upstream_changes:
     pure and independent of catalog, credential, and mutable global alias caches.
     Public projections include only route URL digests, never URLs or secrets.
     Route fingerprints use the centralized normalized endpoint digest rather
-    than hashing raw URL spelling or credential-bearing values.
+    than hashing raw URL spelling or credential-bearing values. Dynamic
+    Bedrock region and Vertex project/location authority is frozen privately,
+    fingerprinted digest-only, and shared by admission and worker preflight.
   removal_condition: Remove when upstream has an equivalent bounded immutable
     profile/managed parser shared with interactive aliases and a credential-free
     workflow route resolver with identical precedence, provenance, warnings, and
@@ -208,6 +211,8 @@ upstream_changes:
   - ExecutionRuntimeCapabilities additive registration provenance
   - ExecutionRuntimeIdentity exact six-field endpoint-bound private codec
   - execution_runtime_identity centralized admission and worker builder
+  - classify_credential_free_execution_runtime live preflight classifier
+  - credential_free_provider_endpoint_config bounded dynamic route selector
   - OpenRouter model-aware effort and explicit unsupported security declarations
   - execution-adapter availability is an explicit fail-closed resolver precondition that provider declarations cannot override
   tests:
@@ -227,7 +232,10 @@ upstream_changes:
     public decisions remain bounded, immutable, credential-free JSON. Private
     execution identity hashes only normalized structural endpoint evidence;
     malformed or unresolvable HTTP routes fail closed and only explicitly
-    enumerated endpointless API modes receive the versioned sentinel.
+    enumerated endpointless API modes receive the versioned sentinel. Bedrock
+    region and Vertex project/location derive their real execution endpoint
+    without resolving credentials, and incomplete provider registration
+    provenance cannot create sealed authority.
   removal_condition: Remove when upstream provides an equivalent single pure
     provider capability matrix with loader-bound declarations, central adapter
     policy, canonical identity, installed-distribution coverage, and unchanged
@@ -3301,6 +3309,7 @@ upstream_changes:
   owned_symbols:
   - ExecutionRuntimeCapabilities
   - classify_execution_runtime
+  - classify_credential_free_execution_runtime
   - classify_resolved_execution_runtime
   - _effective_execution_api_mode
   - is_anthropic_bedrock_model
@@ -3326,7 +3335,9 @@ upstream_changes:
     the actual worker runtime before starting any required request MCP. Keep prospective
     Bedrock model routing in side-effect-free metadata rather than importing the lazy-installing
     adapter, and treat both Claude Messages and non-Claude Converse paths as Hermes-managed
-    tool loops. Preserve legacy no-config-read resolver short-circuits before loading
+    tool loops. Phase 5 workers compare the credential-free live route before
+    dotenv, SessionDB, MCP finalization, registry mutation, credential refresh,
+    or token minting. Preserve legacy no-config-read resolver short-circuits before loading
     optional model metadata. The isolated worker must own discovery, registration,
     tool-policy ordering, and process reaping from one outer cleanup boundary while
     restoring loader, timeout, callbacks, hooks, inline tools, session state, and

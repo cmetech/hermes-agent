@@ -173,6 +173,23 @@ def test_v5_endpoint_digest_mutation_fails_closed(
         read_workflow_provider_authority_bytes(mutated)
 
 
+@pytest.mark.parametrize("digest", ["", "tampered", "A" * 64])
+def test_v5_registration_digest_mutation_fails_route_integrity(
+    tmp_path, workflow_writer, digest
+):
+    compilation = _v5_compilation(tmp_path, workflow_writer)
+    record = json.loads(_authority(compilation.package).canonical_bytes())
+    record["routes"][0]["registration_provenance_digest"] = digest
+    mutated = json.dumps(
+        record, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    with pytest.raises(
+        ValueError, match="registration provenance digest is invalid"
+    ):
+        read_workflow_provider_authority_bytes(mutated)
+
+
 def test_unmerged_v5_schema1_provider_authority_requires_readmission(
     tmp_path, workflow_writer
 ):

@@ -21,6 +21,7 @@ from hermes_cli.provider_capabilities import (
     resolve_provider_capability,
 )
 from hermes_cli.runtime_provider import (
+    _canonical_execution_provider,
     ExecutionRuntimeCapabilities,
     ExecutionRuntimeIdentity,
     classify_execution_runtime,
@@ -187,6 +188,8 @@ class WorkflowResolvedProviderRoute:
             raise ValueError("provider route fingerprint is invalid")
         if not _valid_digest(self.endpoint_sha256):
             raise ValueError("provider endpoint digest is invalid")
+        if not _valid_digest(self.registration_provenance_digest):
+            raise ValueError("registration provenance digest is invalid")
         if not self.effective_provider:
             object.__setattr__(self, "effective_provider", self.provider)
         object.__setattr__(
@@ -520,7 +523,6 @@ def _read_route(value: object) -> WorkflowResolvedProviderRoute:
         registration_provenance_digest=_bounded_text(
             record["registration_provenance_digest"],
             "registration provenance digest",
-            allow_empty=True,
         ),
         provider_options=_bounded_provider_option(options),
         config_scope=_bounded_text(record["config_scope"], "config scope"),
@@ -727,10 +729,14 @@ def _runtime_for_route(
     model_config: WorkflowModelConfigSnapshot, route: ResolvedModelRoute
 ) -> ExecutionRuntimeCapabilities:
     base_url = _base_url_for_route(model_config, route)
+    endpoint_provider_config = model_config.provider_endpoint_config.get(
+        _canonical_execution_provider(route.provider), {}
+    )
     runtime = classify_execution_runtime(
         provider=route.provider,
         model_config={"provider": route.provider, "default": route.model},
         provider_config={
+            **dict(endpoint_provider_config),
             "api_mode": route.api_mode,
             **({"base_url": base_url} if base_url else {}),
         },
@@ -741,6 +747,15 @@ def _runtime_for_route(
             runtime.endpoint_identity_error or "provider_endpoint_identity_invalid",
             "provider_resolution",
             "provider endpoint identity cannot be resolved",
+        )
+    if (
+        not runtime.registration_provenance_complete
+        or not _valid_digest(runtime.registration_provenance_digest)
+    ):
+        raise WorkflowProviderAuthorityError(
+            "provider_capability_drift",
+            "provider_resolution",
+            "provider registration provenance is incomplete",
         )
     if (
         runtime.api_mode != route.api_mode

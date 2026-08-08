@@ -11,11 +11,13 @@ from typing import TYPE_CHECKING, AbstractSet, Callable, Literal, Mapping
 from hermes_cli.config import read_raw_config
 from hermes_cli import managed_scope
 from hermes_cli.runtime_provider import (
+    _canonical_execution_provider,
     ConfiguredExecutionRoute,
     ExecutionRuntimeCapabilities,
     StructuredOutputCapabilityDecision,
     classify_configured_execution_route,
     classify_execution_runtime,
+    credential_free_provider_endpoint_config,
     resolve_structured_output_capability,
     snapshot_configured_execution_routes,
 )
@@ -503,7 +505,9 @@ def _configured_provider_metadata(
     if not isinstance(model_config, Mapping):
         return "", model_config, {}
     provider = model_config.get("provider", "")
-    return provider, model_config, {}
+    canonical = _canonical_execution_provider(provider)
+    provider_config = credential_free_provider_endpoint_config(config, canonical)
+    return provider, model_config, provider_config
 
 
 def _production_provider_snapshot() -> ExecutionProviderSnapshot:

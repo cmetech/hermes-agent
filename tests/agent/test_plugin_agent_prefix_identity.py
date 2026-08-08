@@ -273,6 +273,112 @@ def test_phase5_worker_blocks_same_trust_endpoint_drift_before_any_side_effect(
     assert provider_called == []
 
 
+def test_phase5_worker_checks_credential_free_route_before_every_side_effect(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import agent.vertex_adapter as vertex_adapter
+    import hermes_cli.config as config_mod
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_cli.timeouts as timeout_mod
+    from tools import mcp_tool, registry as registry_mod, tool_search
+
+    calls = []
+    admitted_url = (
+        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
+        "admitted-private-project/locations/us-central1/endpoints/openapi"
+    )
+    runtime_url = (
+        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
+        "changed-private-project/locations/us-central1/endpoints/openapi"
+    )
+    admitted = runtime_provider.classify_execution_runtime(
+        provider="vertex",
+        model_config={"provider": "vertex", "default": "sealed-model"},
+        provider_config={"base_url": admitted_url},
+    )
+    expected_identity = runtime_provider.execution_runtime_identity(admitted).to_dict()
+
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config_readonly",
+        lambda: {
+            "model": {"provider": "vertex", "default": "sealed-model"},
+            "vertex": {
+                "project_id": "changed-private-project",
+                "region": "us-central1",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        env_loader, "load_hermes_dotenv", lambda: calls.append("dotenv")
+    )
+    monkeypatch.setattr(
+        worker,
+        "_finalize_authenticated_mcp_config",
+        lambda *args, **kwargs: calls.append("mcp_finalize") or args[0],
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "_interpolate_env_vars",
+        lambda value: calls.append("mcp_interpolate") or value,
+    )
+    original_mcp_loader = mcp_tool._load_mcp_config
+    original_tool_search_config = tool_search.load_config
+    original_timeout = timeout_mod.get_provider_request_timeout
+    original_generation = registry_mod.registry._generation
+    monkeypatch.setattr(
+        vertex_adapter,
+        "get_vertex_config",
+        lambda: calls.append("token_mint") or ("token", runtime_url),
+    )
+
+    def credential_refresh(**_kwargs):
+        calls.append("credential_refresh")
+        token, base_url = vertex_adapter.get_vertex_config()
+        return {
+            "provider": "vertex",
+            "model": "sealed-model",
+            "api_mode": "chat_completions",
+            "base_url": base_url,
+            "api_key": token,
+        }
+
+    monkeypatch.setattr(
+        runtime_provider, "resolve_runtime_provider", credential_refresh
+    )
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **_kwargs: calls.append("agent_constructed"),
+    )
+
+    result = worker._run(
+        {
+            "plugin_id": "workflow",
+            "request": PluginAgentRunRequest(
+                prompt="continue",
+                provider="vertex",
+                model="sealed-model",
+                allowed_tools=(),
+                mcp_servers={"test": {"command": "unused"}},
+                intended_authority_digest="a" * 64,
+                expected_runtime_identity=expected_identity,
+            ).to_wire(),
+        },
+        provider_start_gate=lambda: calls.append("provider_dispatch"),
+    )
+
+    assert result["audit"]["failure_kind"] == "provider_capability_drift"
+    assert result["audit"]["mismatched_fields"] == ["endpoint_sha256"]
+    assert calls == []
+    assert mcp_tool._load_mcp_config is original_mcp_loader
+    assert tool_search.load_config is original_tool_search_config
+    assert timeout_mod.get_provider_request_timeout is original_timeout
+    assert registry_mod.registry._generation == original_generation
+
+
 def test_prefix_expectation_without_sealed_authority_is_rejected() -> None:
     request = PluginAgentRunRequest(
         prompt="continue",

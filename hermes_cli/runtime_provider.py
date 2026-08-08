@@ -136,6 +136,7 @@ _RUNTIME_IDENTITY_FIELDS = frozenset({
     "registration_provenance_digest",
 })
 _LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ENDPOINT_CONFIG_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 class _UnclassifiedRouteQuery(ValueError):
@@ -146,9 +147,12 @@ def _credential_free_route_url(value: object) -> str:
     """Return stable route evidence without credential-bearing URL material."""
     if not isinstance(value, str) or not value.strip():
         return ""
-    parsed = urlparse(value.strip())
-    scheme = parsed.scheme.lower()
-    hostname = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        parsed = urlparse(value.strip())
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
     if scheme not in {"http", "https"} or not hostname:
         return ""
     try:
@@ -740,7 +744,10 @@ def _structured_output_runtime_declaration(
     effective_base_url = base_url or (
         str(profile.base_url) if profile is not None else ""
     )
-    hostname = (base_url_hostname(effective_base_url) or "").lower()
+    try:
+        hostname = (base_url_hostname(effective_base_url) or "").lower()
+    except ValueError:
+        hostname = ""
 
     declared_strategy = None
     declaration_source = None
@@ -799,6 +806,7 @@ def _classify_execution_api_mode(
     provider: object = "",
     model: object = "",
     base_url: object = "",
+    endpoint_identity_error: str | None = None,
 ) -> ExecutionRuntimeCapabilities:
     """Classify one already-derived API mode."""
     normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
@@ -827,6 +835,8 @@ def _classify_execution_api_mode(
         api_mode=normalized,
         base_url=normalized_base_url,
     )
+    if endpoint_identity_error is not None:
+        endpoint_identity = _ExecutionEndpointIdentity("", endpoint_identity_error)
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
         hermes_managed_tool_loop=(
@@ -852,6 +862,81 @@ def _classify_execution_api_mode(
     )
 
 
+def _canonical_execution_provider(provider: object) -> str:
+    requested = provider.strip().lower() if isinstance(provider, str) else ""
+    if not requested:
+        return ""
+    try:
+        return auth_mod.resolve_provider(requested)
+    except AuthError:
+        return requested
+
+
+def _endpoint_config_segment(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    return normalized if _ENDPOINT_CONFIG_SEGMENT_RE.fullmatch(normalized) else ""
+
+
+def _configured_execution_endpoint(
+    *,
+    provider: object,
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None,
+) -> tuple[str, str | None]:
+    """Derive a credential-free endpoint from immutable route authority."""
+    explicit = _execution_base_url(model_config, provider_config)
+    if explicit:
+        return explicit, None
+
+    canonical = _canonical_execution_provider(provider)
+    config = provider_config if isinstance(provider_config, Mapping) else {}
+    if canonical == "bedrock":
+        region = _endpoint_config_segment(config.get("region", "us-east-1"))
+        if not region:
+            return "", _PROVIDER_ENDPOINT_IDENTITY_INVALID
+        return f"https://bedrock-runtime.{region}.amazonaws.com", None
+    if canonical == "vertex":
+        project_id = _endpoint_config_segment(config.get("project_id"))
+        region = _endpoint_config_segment(config.get("region", "global"))
+        if not project_id or not region:
+            return "", _PROVIDER_ENDPOINT_IDENTITY_INVALID
+        hostname = (
+            "aiplatform.googleapis.com"
+            if region == "global"
+            else f"{region}-aiplatform.googleapis.com"
+        )
+        return (
+            f"https://{hostname}/v1beta1/projects/{project_id}/locations/"
+            f"{region}/endpoints/openapi",
+            None,
+        )
+    return "", None
+
+
+def credential_free_provider_endpoint_config(
+    config: Mapping[str, object] | object,
+    provider: object,
+) -> Mapping[str, object]:
+    """Select only non-secret config fields that author a dynamic endpoint."""
+    if not isinstance(config, Mapping):
+        return MappingProxyType({})
+    canonical = _canonical_execution_provider(provider)
+    section = config.get(canonical, {})
+    if not isinstance(section, Mapping):
+        return MappingProxyType({})
+    keys = {
+        "bedrock": ("region",),
+        "vertex": ("project_id", "region"),
+    }.get(canonical, ())
+    return MappingProxyType({
+        key: section[key] if isinstance(section[key], str) else None
+        for key in keys
+        if key in section
+    })
+
+
 def classify_execution_runtime(
     *,
     provider: object,
@@ -872,11 +957,17 @@ def classify_execution_runtime(
         provider_config=provider_config,
         target_model=target_model,
     )
+    base_url, endpoint_error = _configured_execution_endpoint(
+        provider=provider,
+        model_config=model_config,
+        provider_config=provider_config,
+    )
     return _classify_execution_api_mode(
         api_mode,
         provider=provider,
         model=_execution_model(model_config, provider_config, target_model),
-        base_url=_execution_base_url(model_config, provider_config),
+        base_url=base_url,
+        endpoint_identity_error=endpoint_error,
     )
 
 
@@ -1031,6 +1122,45 @@ def classify_configured_execution_route(
         ),
         endpoint_sha256="",
         endpoint_identity_error=route.route_evidence_error,
+    )
+
+
+def classify_credential_free_execution_runtime(
+    config: Mapping[str, object] | object,
+    *,
+    requested_provider: object,
+    target_model: object = None,
+    managed_config: Mapping[str, object] | object | None = None,
+) -> ExecutionRuntimeCapabilities:
+    """Classify live config without loading secrets, env, or runtime credentials."""
+    source: Mapping[str, object] = config if isinstance(config, Mapping) else {}
+    if isinstance(managed_config, Mapping):
+        from hermes_cli.workflow_model_resolution import _deep_merge
+
+        merged = _deep_merge(dict(source), dict(managed_config))
+        source = merged if isinstance(merged, Mapping) else {}
+    requested = (
+        requested_provider.strip().casefold()
+        if isinstance(requested_provider, str)
+        else ""
+    )
+    configured_route = snapshot_configured_execution_routes(source).get(requested)
+    if configured_route is not None:
+        return classify_configured_execution_route(
+            configured_route,
+            target_model=(target_model if isinstance(target_model, str) else None),
+        )
+
+    model_config = source.get("model", {})
+    if not isinstance(model_config, Mapping):
+        model_config = {}
+    canonical = _canonical_execution_provider(requested)
+    provider_config = credential_free_provider_endpoint_config(source, canonical)
+    return classify_execution_runtime(
+        provider=canonical or requested,
+        model_config=model_config,
+        provider_config=provider_config,
+        target_model=target_model,
     )
 
 

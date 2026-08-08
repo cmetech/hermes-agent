@@ -78,6 +78,8 @@ def test_runtime_identity_query_evidence_is_structural_and_credential_free() -> 
         ("https://example.test:invalid/v1", "provider_endpoint_identity_invalid"),
         ("ftp://example.test/v1", "provider_endpoint_identity_invalid"),
         ("not-a-url", "provider_endpoint_identity_invalid"),
+        ("https://[::1", "provider_endpoint_identity_invalid"),
+        ("https://[not-ipv6]/v1", "provider_endpoint_identity_invalid"),
     ],
 )
 def test_runtime_identity_blocks_unresolvable_endpoint(base_url, expected_error) -> None:
@@ -142,6 +144,45 @@ def test_runtime_identity_uses_versioned_sentinel_only_for_endpointless_mode() -
     ).hexdigest()
     assert endpointless.endpoint_identity_error is None
     assert concrete.endpoint_sha256 != endpointless.endpoint_sha256
+
+
+@pytest.mark.parametrize(
+    ("provider", "provider_config", "expected_url"),
+    [
+        (
+            "bedrock",
+            {"region": "eu-central-1"},
+            "https://bedrock-runtime.eu-central-1.amazonaws.com",
+        ),
+        (
+            "vertex",
+            {"project_id": "private-project-7", "region": "europe-west4"},
+            "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/"
+            "private-project-7/locations/europe-west4/endpoints/openapi",
+        ),
+    ],
+)
+def test_dynamic_provider_endpoint_identity_is_derived_without_credentials(
+    monkeypatch, provider, provider_config, expected_url
+) -> None:
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pure endpoint classification minted a Vertex token")
+        ),
+    )
+    capabilities = rp.classify_execution_runtime(
+        provider=provider,
+        model_config={"provider": provider, "default": "test-model"},
+        provider_config=provider_config,
+    )
+
+    expected = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0" + expected_url.encode("utf-8")
+    ).hexdigest()
+    assert capabilities.endpoint_sha256 == expected
+    assert capabilities.endpoint_identity_error is None
+    assert "private-project-7" not in repr(capabilities)
 
 
 def test_runtime_identity_to_dict_is_exact_six_field_codec() -> None:
