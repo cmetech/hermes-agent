@@ -3192,6 +3192,13 @@ class AIAgent:
                 _admit_hard_cancel()
             self._pending_redirect = None
 
+        # Serialize cancellation against sealed credential publication.  The
+        # interrupt flag is visible before this wait, so a constructor already
+        # inside the critical section rejects publication; if publication won,
+        # this invalidates only future reuse of that turn generation.
+        with self._openai_client_lock():
+            self._deactivate_credential_recovery_locked()
+
         # Codex app-server owns its model/tool loop and watches a private
         # interrupt event rather than Hermes' per-thread flag.
         if getattr(self, "api_mode", None) == "codex_app_server":
@@ -4323,6 +4330,12 @@ class AIAgent:
         """
         task_id = getattr(self, "session_id", None) or ""
 
+        try:
+            with self._openai_client_lock():
+                self._deactivate_credential_recovery_locked()
+        except Exception:
+            pass
+
         # 1. Kill background processes for this task
         try:
             from tools.process_registry import process_registry
@@ -4812,6 +4825,314 @@ class AIAgent:
             self._client_lock = lock
         return lock
 
+    def _begin_credential_recovery_turn(self):
+        from agent.turn_retry_state import _CredentialRecoveryTurnState
+
+        with self._openai_client_lock():
+            generation = int(
+                getattr(self, "_credential_recovery_generation", 0)
+            ) + 1
+            self._credential_recovery_generation = generation
+            self._credential_recovery_active_generation = generation
+            self._credential_recovery_adopted_generation = None
+            self._pending_sealed_credential_adoption = None
+        return _CredentialRecoveryTurnState(generation=generation)
+
+    def _end_credential_recovery_turn(self, generation: int) -> None:
+        with self._openai_client_lock():
+            pending = getattr(self, "_pending_sealed_credential_adoption", None)
+            if pending is not None and pending.generation == generation:
+                self._pending_sealed_credential_adoption = None
+            if (
+                getattr(self, "_credential_recovery_active_generation", None)
+                == generation
+            ):
+                self._credential_recovery_generation = max(
+                    int(getattr(self, "_credential_recovery_generation", 0)),
+                    generation,
+                ) + 1
+                self._credential_recovery_active_generation = None
+            if (
+                getattr(self, "_credential_recovery_adopted_generation", None)
+                == generation
+            ):
+                self._credential_recovery_adopted_generation = None
+
+    def _deactivate_credential_recovery_locked(self) -> None:
+        self._credential_recovery_generation = int(
+            getattr(self, "_credential_recovery_generation", 0)
+        ) + 1
+        self._credential_recovery_active_generation = None
+        self._credential_recovery_adopted_generation = None
+        self._pending_sealed_credential_adoption = None
+
+    def _credential_transition_generation(self) -> int | None:
+        """Wait for credential adoption and capture the route generation."""
+        with self._openai_client_lock():
+            active_generation = getattr(
+                self, "_credential_recovery_active_generation", None
+            )
+            if (
+                active_generation is not None
+                and getattr(
+                    self, "_credential_recovery_adopted_generation", None
+                )
+                == active_generation
+            ):
+                return None
+            if getattr(self, "_pending_sealed_credential_adoption", None) is not None:
+                return None
+            return int(getattr(self, "_credential_recovery_generation", 0))
+
+    def _invalidate_for_route_transition(
+        self,
+        generation: int,
+        *,
+        fallback_client: Any = None,
+    ) -> bool:
+        """Invalidate credential recovery immediately before route publication."""
+        del fallback_client
+        with self._openai_client_lock():
+            if (
+                int(getattr(self, "_credential_recovery_generation", 0))
+                != generation
+                or getattr(self, "_pending_sealed_credential_adoption", None)
+                is not None
+            ):
+                return False
+            active_generation = getattr(
+                self, "_credential_recovery_active_generation", None
+            )
+            if (
+                active_generation is not None
+                and getattr(
+                    self, "_credential_recovery_adopted_generation", None
+                )
+                == active_generation
+            ):
+                return False
+            self._deactivate_credential_recovery_locked()
+            return True
+
+    def _install_pending_sealed_credential_locked(self, candidate) -> bool:
+        if (
+            getattr(self, "_credential_recovery_active_generation", None)
+            != candidate.generation
+            or getattr(self, "_interrupt_requested", False)
+            or getattr(self, "_execution_route_constraint", None)
+            is not candidate.route_constraint
+        ):
+            return False
+        if getattr(self, "_pending_sealed_credential_adoption", None) is not None:
+            return False
+        self._pending_sealed_credential_adoption = candidate
+        return True
+
+    def _clear_pending_sealed_credential_locked(
+        self, generation: int, *, reason: str
+    ) -> bool:
+        del reason
+        pending = getattr(self, "_pending_sealed_credential_adoption", None)
+        if pending is None or pending.generation != generation:
+            return False
+        self._pending_sealed_credential_adoption = None
+        return True
+
+    def _record_pending_adoption_failure_locked(
+        self, generation: int, *, attempt_number: int
+    ) -> bool:
+        from dataclasses import replace
+
+        pending = getattr(self, "_pending_sealed_credential_adoption", None)
+        if (
+            pending is None
+            or pending.generation != generation
+            or pending.adoption_attempts != attempt_number - 1
+        ):
+            return False
+        self._pending_sealed_credential_adoption = replace(
+            pending, adoption_attempts=attempt_number
+        )
+        return True
+
+    def _attempt_pending_openai_candidate_locked(
+        self, generation: int, *, attempt_number: int
+    ):
+        from agent.credential_adoption import (
+            _CandidateAttemptResult,
+            _CandidateAttemptStatus,
+            _materialize_candidate_client_kwargs,
+        )
+
+        candidate = getattr(self, "_pending_sealed_credential_adoption", None)
+        if (
+            candidate is None
+            or candidate.generation != generation
+            or candidate.adoption_attempts != attempt_number - 1
+            or getattr(self, "_credential_recovery_active_generation", None)
+            != generation
+            or getattr(self, "_interrupt_requested", False)
+        ):
+            return _CandidateAttemptResult(_CandidateAttemptStatus.INVALIDATED)
+        if (
+            getattr(self, "_execution_route_constraint", None)
+            is not candidate.route_constraint
+        ):
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_changed"
+            )
+            raise ProviderCapabilityDriftError()
+
+        candidate_client_kwargs = _materialize_candidate_client_kwargs(
+            candidate.client_kwargs
+        )
+        new_client = None
+        try:
+            new_client = self._create_openai_client(
+                candidate_client_kwargs,
+                reason="sealed_credential_adoption",
+                shared=True,
+                candidate_safe=True,
+            )
+            self._assert_execution_route_constraint()
+            self._assert_execution_route_constraint(
+                new_client,
+                base_url=candidate.base_url,
+                client_kwargs=candidate_client_kwargs,
+            )
+        except ProviderCapabilityDriftError:
+            if new_client is not None:
+                self._close_openai_client(
+                    new_client,
+                    reason="rejected:sealed_route_drift",
+                    shared=False,
+                    candidate_safe=True,
+                )
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_drift"
+            )
+            raise
+        except Exception as exc:
+            if new_client is not None:
+                self._close_openai_client(
+                    new_client,
+                    reason="rejected:sealed_build_failure",
+                    shared=False,
+                    candidate_safe=True,
+                )
+            logger.warning(
+                "sealed credential adoption failed reason=%s error_type=%s",
+                "client_build",
+                type(exc).__name__,
+            )
+            return _CandidateAttemptResult(
+                _CandidateAttemptStatus.RETRYABLE_BUILD_FAILURE
+            )
+
+        current = getattr(self, "_pending_sealed_credential_adoption", None)
+        if (
+            current is not candidate
+            or getattr(self, "_credential_recovery_active_generation", None)
+            != generation
+            or getattr(self, "_interrupt_requested", False)
+        ):
+            self._close_openai_client(
+                new_client,
+                reason="rejected:sealed_generation_changed",
+                shared=False,
+                candidate_safe=True,
+            )
+            if current is candidate:
+                self._clear_pending_sealed_credential_locked(
+                    generation, reason="invalidated"
+                )
+            return _CandidateAttemptResult(_CandidateAttemptStatus.INVALIDATED)
+        if (
+            getattr(self, "_execution_route_constraint", None)
+            is not candidate.route_constraint
+        ):
+            self._close_openai_client(
+                new_client,
+                reason="rejected:sealed_route_changed",
+                shared=False,
+                candidate_safe=True,
+            )
+            self._clear_pending_sealed_credential_locked(
+                generation, reason="route_changed"
+            )
+            raise ProviderCapabilityDriftError()
+
+        prior_client = getattr(self, "client", None)
+        self.api_key = candidate.api_key
+        self.base_url = candidate.base_url
+        self._client_kwargs.clear()
+        self._client_kwargs.update(candidate_client_kwargs)
+        self._credential_pool_entry_id = candidate.pool_entry_id
+        self.client = new_client
+        self._pending_sealed_credential_adoption = None
+        self._credential_recovery_adopted_generation = generation
+        return _CandidateAttemptResult(
+            _CandidateAttemptStatus.ADOPTED,
+            prior_client=prior_client,
+            retirement_kind="openai",
+        )
+
+    def _retire_adopted_prior_client(
+        self,
+        prior_client: Any,
+        *,
+        retirement_kind: str | None,
+        candidate_safe: bool = False,
+    ) -> None:
+        if retirement_kind == "openai":
+            self._retire_shared_openai_client(
+                prior_client,
+                reason="replace:sealed_credential_adoption",
+                candidate_safe=candidate_safe,
+            )
+
+    def _adopt_pending_sealed_openai_candidate(self, candidate):
+        from agent.credential_adoption import (
+            _CandidateAttemptStatus,
+            _CandidateAttemptResult,
+            _CredentialRefreshStatus,
+        )
+
+        refresh_status = _CredentialRefreshStatus.INVALIDATED
+        retirement: _CandidateAttemptResult | None = None
+        with self._openai_client_lock():
+            if self._install_pending_sealed_credential_locked(candidate):
+                for attempt in range(2):
+                    result = self._attempt_pending_openai_candidate_locked(
+                        candidate.generation,
+                        attempt_number=attempt + 1,
+                    )
+                    if result.status is _CandidateAttemptStatus.ADOPTED:
+                        refresh_status = _CredentialRefreshStatus.ADOPTED
+                        retirement = result
+                        break
+                    if result.status is _CandidateAttemptStatus.INVALIDATED:
+                        refresh_status = _CredentialRefreshStatus.INVALIDATED
+                        break
+                    if attempt == 0:
+                        self._record_pending_adoption_failure_locked(
+                            candidate.generation,
+                            attempt_number=1,
+                        )
+                else:
+                    self._clear_pending_sealed_credential_locked(
+                        candidate.generation,
+                        reason="adoption_exhausted",
+                    )
+                    refresh_status = _CredentialRefreshStatus.ADOPTION_FAILED
+        if retirement is not None and retirement.prior_client is not None:
+            self._retire_adopted_prior_client(
+                retirement.prior_client,
+                retirement_kind=retirement.retirement_kind,
+                candidate_safe=True,
+            )
+        return refresh_status
+
     @staticmethod
     def _is_openai_client_closed(client: Any) -> bool:
         """Check if an OpenAI client is closed.
@@ -4912,10 +5233,23 @@ class AIAgent:
         except Exception:
             return None
 
-    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    def _create_openai_client(
+        self,
+        client_kwargs: dict,
+        *,
+        reason: str,
+        shared: bool,
+        candidate_safe: bool = False,
+    ) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
         from agent.agent_runtime_helpers import create_openai_client
-        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
+        return create_openai_client(
+            self,
+            client_kwargs,
+            reason=reason,
+            shared=shared,
+            candidate_safe=candidate_safe,
+        )
 
     @staticmethod
     def _force_close_tcp_sockets(client: Any) -> int:
@@ -4923,31 +5257,69 @@ class AIAgent:
         from agent.agent_runtime_helpers import force_close_tcp_sockets
         return force_close_tcp_sockets(client)
 
-    def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
+    def _close_openai_client(
+        self,
+        client: Any,
+        *,
+        reason: str,
+        shared: bool,
+        candidate_safe: bool = False,
+    ) -> None:
         if client is None:
             return
         # Force-close TCP sockets first to prevent CLOSE-WAIT accumulation,
         # then do the graceful SDK-level close.
-        force_closed = self._force_close_tcp_sockets(client)
+        force_closed = 0
+        if candidate_safe:
+            try:
+                force_closed = self._force_close_tcp_sockets(client)
+            except Exception as exc:
+                logger.warning(
+                    "sealed credential client close failed reason=%s error_type=%s",
+                    "tcp_force_close",
+                    type(exc).__name__,
+                )
+        else:
+            force_closed = self._force_close_tcp_sockets(client)
         try:
             client.close()
-            logger.info(
-                "OpenAI client closed (%s, shared=%s, tcp_force_closed=%d) %s",
-                reason,
-                shared,
-                force_closed,
-                self._client_log_context(),
-            )
+            if candidate_safe:
+                logger.info(
+                    "sealed credential client closed reason=%s shared=%s",
+                    reason,
+                    shared,
+                )
+            else:
+                logger.info(
+                    "OpenAI client closed (%s, shared=%s, tcp_force_closed=%d) %s",
+                    reason,
+                    shared,
+                    force_closed,
+                    self._client_log_context(),
+                )
         except Exception as exc:
-            logger.debug(
-                "OpenAI client close failed (%s, shared=%s) %s error=%s",
-                reason,
-                shared,
-                self._client_log_context(),
-                exc,
-            )
+            if candidate_safe:
+                logger.warning(
+                    "sealed credential client close failed reason=%s error_type=%s",
+                    reason,
+                    type(exc).__name__,
+                )
+            else:
+                logger.debug(
+                    "OpenAI client close failed (%s, shared=%s) %s error=%s",
+                    reason,
+                    shared,
+                    self._client_log_context(),
+                    exc,
+                )
 
-    def _retire_shared_openai_client(self, client: Any, *, reason: str) -> None:
+    def _retire_shared_openai_client(
+        self,
+        client: Any,
+        *,
+        reason: str,
+        candidate_safe: bool = False,
+    ) -> None:
         """Ownership-safe retirement of a replaced shared OpenAI client.
 
         #70773 / #67142 / #29507: ``client.close()`` releases the pool's raw
@@ -4973,20 +5345,34 @@ class AIAgent:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "Shared OpenAI client retired (%s, tcp_shutdown=%d, "
-                "fd_release=deferred_to_gc) %s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-            )
+            if candidate_safe:
+                logger.info(
+                    "sealed credential prior client retired reason=%s",
+                    reason,
+                )
+            else:
+                logger.info(
+                    "Shared OpenAI client retired (%s, tcp_shutdown=%d, "
+                    "fd_release=deferred_to_gc) %s",
+                    reason,
+                    shutdown_count,
+                    self._client_log_context(),
+                )
         except Exception as exc:
-            logger.debug(
-                "Shared OpenAI client retire failed (%s) %s error=%s",
-                reason,
-                self._client_log_context(),
-                exc,
-            )
+            if candidate_safe:
+                logger.warning(
+                    "sealed credential prior client retirement failed "
+                    "reason=%s error_type=%s",
+                    reason,
+                    type(exc).__name__,
+                )
+            else:
+                logger.debug(
+                    "Shared OpenAI client retire failed (%s) %s error=%s",
+                    reason,
+                    self._client_log_context(),
+                    exc,
+                )
 
     def _replace_primary_openai_client(
         self,
@@ -5800,6 +6186,75 @@ class AIAgent:
             )
         return True
 
+    def _refresh_vertex_credentials_for_turn(self, credential_recovery_state):
+        from agent.credential_adoption import (
+            _CredentialRefreshStatus,
+            _PendingSealedCredentialAdoption,
+            _snapshot_candidate_client_kwargs,
+        )
+
+        if self.api_mode != "chat_completions" or self.provider != "vertex":
+            return _CredentialRefreshStatus.NOT_APPLICABLE
+
+        route_constraint = self._assert_execution_route_constraint()
+        if route_constraint is None or credential_recovery_state is None:
+            return (
+                _CredentialRefreshStatus.ADOPTED
+                if self._try_refresh_vertex_client_credentials()
+                else _CredentialRefreshStatus.ACQUISITION_FAILED
+            )
+
+        try:
+            from agent.vertex_adapter import get_vertex_credentials
+            from hermes_cli.runtime_provider import execution_sdk_endpoint
+
+            token, _credential_project = get_vertex_credentials()
+            sdk_endpoint = execution_sdk_endpoint(
+                base_url=route_constraint.base_url
+            )
+            base_url = sdk_endpoint.base_url.rstrip("/")
+        except Exception as exc:
+            logger.debug(
+                "Vertex credential refresh failed error_type=%s",
+                type(exc).__name__,
+            )
+            return _CredentialRefreshStatus.ACQUISITION_FAILED
+
+        if not isinstance(token, str) or not token.strip():
+            return _CredentialRefreshStatus.ACQUISITION_FAILED
+        if not isinstance(base_url, str) or not base_url.strip():
+            return _CredentialRefreshStatus.ACQUISITION_FAILED
+
+        candidate_api_key = token.strip()
+        candidate_base_url = base_url.strip().rstrip("/")
+        candidate_client_kwargs = dict(self._client_kwargs)
+        candidate_client_kwargs["api_key"] = candidate_api_key
+        candidate_client_kwargs["base_url"] = candidate_base_url
+        if sdk_endpoint.query_items:
+            candidate_client_kwargs["default_query"] = sdk_endpoint.default_query
+        else:
+            candidate_client_kwargs.pop("default_query", None)
+        try:
+            snapshot = _snapshot_candidate_client_kwargs(candidate_client_kwargs)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "sealed credential acquisition failed reason=%s error_type=%s",
+                "candidate_snapshot",
+                type(exc).__name__,
+            )
+            return _CredentialRefreshStatus.ACQUISITION_FAILED
+
+        candidate = _PendingSealedCredentialAdoption(
+            generation=credential_recovery_state.generation,
+            source="vertex",
+            route_constraint=route_constraint,
+            api_key=candidate_api_key,
+            base_url=candidate_base_url,
+            client_kwargs=snapshot,
+            pool_entry_id=getattr(self, "_credential_pool_entry_id", None),
+        )
+        return self._adopt_pending_sealed_openai_candidate(candidate)
+
     def _try_refresh_vertex_client_credentials(self) -> bool:
         """Re-mint the Vertex OAuth2 access token and rebuild the OpenAI client.
 
@@ -6158,7 +6613,9 @@ class AIAgent:
         if merged:
             target_kwargs["default_headers"] = merged
 
-    def _swap_credential(self, entry) -> bool:
+    def _swap_credential(
+        self, entry, *, credential_recovery_state=None
+    ) -> bool:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         runtime_base = AIAgent._credential_refresh_base_url(self, runtime_base)
@@ -6191,6 +6648,53 @@ class AIAgent:
             return True
 
         route_constraint = AIAgent._assert_execution_route_constraint(self)
+        if route_constraint is not None and credential_recovery_state is not None:
+            from agent.credential_adoption import (
+                _CredentialRefreshStatus,
+                _PendingSealedCredentialAdoption,
+                _snapshot_candidate_client_kwargs,
+            )
+
+            if self.api_mode not in {"chat_completions", "codex_responses"}:
+                return False
+            candidate_base_url = (
+                runtime_base.rstrip("/")
+                if isinstance(runtime_base, str)
+                else runtime_base
+            )
+            candidate_client_kwargs = dict(self._client_kwargs)
+            candidate_client_kwargs["api_key"] = runtime_key
+            candidate_client_kwargs["base_url"] = candidate_base_url
+            self._reapply_route_client_config(
+                route_changed=route_changed,
+                client_kwargs=candidate_client_kwargs,
+                base_url=candidate_base_url,
+            )
+            try:
+                snapshot = _snapshot_candidate_client_kwargs(
+                    candidate_client_kwargs
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "sealed credential acquisition failed reason=%s error_type=%s",
+                    "candidate_snapshot",
+                    type(exc).__name__,
+                )
+                return False
+            candidate = _PendingSealedCredentialAdoption(
+                generation=credential_recovery_state.generation,
+                source="pool",
+                route_constraint=route_constraint,
+                api_key=runtime_key,
+                base_url=candidate_base_url,
+                client_kwargs=snapshot,
+                pool_entry_id=candidate_pool_entry_id,
+            )
+            return (
+                self._adopt_pending_sealed_openai_candidate(candidate)
+                is _CredentialRefreshStatus.ADOPTED
+            )
+
         if route_constraint is not None:
             candidate_base_url = (
                 runtime_base.rstrip("/")
@@ -6278,10 +6782,18 @@ class AIAgent:
         has_retried_429: bool,
         classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
+        credential_recovery_state=None,
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(self, status_code=status_code, has_retried_429=has_retried_429, classified_reason=classified_reason, error_context=error_context)
+        return recover_with_credential_pool(
+            self,
+            status_code=status_code,
+            has_retried_429=has_retried_429,
+            classified_reason=classified_reason,
+            error_context=error_context,
+            credential_recovery_state=credential_recovery_state,
+        )
 
     def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""
@@ -8142,6 +8654,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        recovery_state = self._begin_credential_recovery_turn()
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8196,6 +8709,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    credential_recovery_state=recovery_state,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
@@ -8230,30 +8744,33 @@ class AIAgent:
             raise
         finally:
             try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
+                self._end_credential_recovery_turn(recovery_state.generation)
             finally:
                 try:
-                    if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(
-                            relay_lease
+                    if relay_turn is not None:
+                        relay_runtime.SESSION_COORDINATOR.end_turn(
+                            relay_turn,
+                            outcome=relay_outcome,
                         )
                 finally:
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
-                        self._reset_activity_labels_after_turn()
-                    except Exception:
-                        pass
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+                        if relay_lease is not None:
+                            relay_runtime.SESSION_COORDINATOR.release_conversation(
+                                relay_lease
+                            )
+                    finally:
+                        # Always clear mid-turn labels when the turn exits — including
+                        # interrupted early returns that skip finalize_turn. Keep ts.
+                        try:
+                            self._reset_activity_labels_after_turn()
+                        except Exception:
+                            pass
+                        if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                            self._relay_pending_turn_id = None
+                        if acct_token is not None:
+                            reset_accounting_context(acct_token)
+                        if token is not None:
+                            reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

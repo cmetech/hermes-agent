@@ -45,6 +45,7 @@ from agent.turn_context import (
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
+from agent.credential_adoption import _CredentialRefreshStatus
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -1251,6 +1252,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    credential_recovery_state=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1395,13 +1397,6 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-
-    # Per-turn tally of consecutive successful credential-pool token refreshes,
-    # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
-    # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
-    # so this tally caps same-entry refreshes and lets the fallback chain take
-    # over instead of spinning. Reset here so each turn starts fresh. See #26080.
-    agent._auth_pool_refresh_counts = {}
 
     # Reset the per-turn usage holder forwarded to the context engine's
     # on_turn_complete() observation hook. Set after each successful provider
@@ -3900,6 +3895,7 @@ def run_conversation(
                     has_retried_429=_retry.has_retried_429,
                     classified_reason=classified.reason,
                     error_context=error_context,
+                    credential_recovery_state=credential_recovery_state,
                 )
                 if recovered_with_pool:
                     continue
@@ -4004,10 +4000,15 @@ def run_conversation(
                     and status_code == 401
                     and not _retry.vertex_auth_retry_attempted
                 ):
-                    _retry.vertex_auth_retry_attempted = True
-                    if agent._try_refresh_vertex_client_credentials():
+                    refresh_status = agent._refresh_vertex_credentials_for_turn(
+                        credential_recovery_state
+                    )
+                    if refresh_status is _CredentialRefreshStatus.ADOPTED:
+                        _retry.vertex_auth_retry_attempted = True
                         agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
                         continue
+                    if refresh_status is _CredentialRefreshStatus.ACQUISITION_FAILED:
+                        _retry.vertex_auth_retry_attempted = True
                 if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"

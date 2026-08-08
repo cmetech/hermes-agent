@@ -289,6 +289,7 @@ upstream_changes:
   owner: workflow-orchestration
   overlap_policy: owned_symbol
   files:
+  - agent/credential_adoption.py
   - agent/agent_init.py
   - agent/agent_runtime_helpers.py
   - agent/anthropic_adapter.py
@@ -300,6 +301,7 @@ upstream_changes:
   - agent/plugin_agent_worker.py
   - agent/provider_attempts.py
   - agent/relay_llm.py
+  - agent/turn_retry_state.py
   - hermes_cli/runtime_provider.py
   - model_tools.py
   - run_agent.py
@@ -317,6 +319,11 @@ upstream_changes:
   - AIAgent private execution_route_constraint transport pin
   - AIAgent._assert_execution_route_constraint
   - AIAgent._replace_primary_openai_client atomic candidate-state adoption
+  - AIAgent generation-scoped pending sealed credential adoption lifecycle
+  - _PendingSealedCredentialAdoption immutable private candidate snapshot
+  - _CredentialRecoveryTurnState turn-owned authentication retry accounting
+  - _CredentialRefreshStatus and _CandidateAttemptResult adoption outcomes
+  - candidate-safe OpenAI construction close and retirement diagnostics
   - recover_with_credential_pool explicit client-adoption result
   - ProviderCapabilityDriftError bounded pre-transport failure
   - execution_endpoint_sha256 effective SDK endpoint reconstruction
@@ -349,6 +356,11 @@ upstream_changes:
   - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
   - sealed environment refresh compares route eligibility through the canonical endpoint digest and advances its seen baseline only after concrete client adoption
   - sealed Vertex and credential-pool candidates publish their client credentials endpoint kwargs pool identity and retry markers only after concrete construction and exact-route validation succeed
+  - one acquired sealed candidate owns one initial construction and at most one identical-candidate retry before another credential source or fallback may run
+  - pending sealed adoption is generation-bound and cleared on success bounded failure route drift cancellation disposal fallback transition and every turn exit
+  - fallback credential resolution waits for pending adoption and invalidates the captured generation immediately before route publication
+  - credential-pool counts and Vertex or 429 guards change only after successful adoption while acquisition failures retain their existing bounds
+  - candidate-path diagnostics expose only stable reason tokens and exception types without credentials endpoints digests or local paths
   - failed sealed client adoption preserves the prior live client and published state so the same candidate remains retryable while any rejected concrete candidate is closed
   - repeated approved structural query values survive real initialization and credential-only client recreation without duplication or collapse
   - a recreated sealed OpenAI client is endpoint-validated before replacing the live shared client
@@ -368,8 +380,15 @@ upstream_changes:
   - tests/plugins/workflow/test_typed_publication_recovery.py
   - tests/plugins/workflow/test_phase4_loops.py
   - tests/run_agent/test_env_credential_turn_refresh.py
+  - tests/run_agent/test_credential_pool_interrupt.py
+  - tests/run_agent/test_fallback_credential_isolation.py
+  - tests/run_agent/test_primary_runtime_restore.py
+  - tests/agent/test_credential_adoption.py
+  - tests/agent/test_turn_retry_state.py
+  - tests/agent/test_credential_pool_routing.py
   - tests/agent/test_provider_attempt_transport.py
   - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true
   merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
@@ -379,8 +398,13 @@ upstream_changes:
     for the whole attempt, reassert it around every credential refresh and client
     recreation and at every concrete SDK transport reservation, and keep sealed
     Vertex recovery token-only. Publish refreshed sealed client and credential state
-    as one validated transaction; failed adoption must preserve retry eligibility
-    and the prior live state. Treat route drift as terminal before accounting,
+    as one validated generation-scoped transaction; retry the identical immutable
+    candidate at most once before releasing source precedence, and defer turn-local
+    marker publication until adoption succeeds. Failed adoption must preserve retry
+    eligibility and the prior live state. Invalidate pending ownership before route
+    transitions and on cancellation, disposal, or every turn exit. Keep all nested
+    candidate construction, close, and retirement diagnostics credential-free and
+    path-free. Treat route drift as terminal before accounting,
     fallback, repair, retry, or provider I/O. Preserve exact legacy recovery
     encodings and never resolve workflow aliases or provider capabilities inside
     clients.

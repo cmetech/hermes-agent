@@ -11,6 +11,7 @@ _swap_credential continue operating on the PRIMARY's credential pool during
 fallback calls, contaminating primary state with fallback-provider errors.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -166,6 +167,95 @@ class TestFallbackCredentialIsolation:
         assert agent._credential_pool is fallback_pool
         assert agent._credential_pool.provider == "openai-codex"
         assert agent._transport_cache == {}
+
+
+def test_fallback_waits_for_pending_candidate_then_runs_once_after_exhaustion(
+    monkeypatch,
+):
+    from tests.run_agent.test_env_credential_turn_refresh import (
+        _prepare_pending_pool_recovery,
+    )
+
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=2,
+        pause_before_second=True,
+    )
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "openrouter/auto"}
+    ]
+    agent.context_compressor = None
+    fallback_resolution_calls: list[str] = []
+    fallback_resolved = threading.Event()
+    fallback_client = SimpleNamespace(
+        api_key="fallback-key",
+        base_url="https://openrouter.ai/api/v1",
+        _custom_headers={},
+    )
+
+    def resolve_fallback(*_args, **_kwargs):
+        fallback_resolution_calls.append("openrouter")
+        fallback_resolved.set()
+        return fallback_client, "openrouter/auto"
+
+    recovery_result: list[bool] = []
+    recovery_errors: list[BaseException] = []
+    fallback_result: list[bool] = []
+    fallback_errors: list[BaseException] = []
+
+    def recover() -> None:
+        try:
+            recovery_result.append(
+                agent._swap_credential(
+                    candidate,
+                    credential_recovery_state=recovery_state,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            recovery_errors.append(exc)
+
+    def activate_fallback() -> None:
+        try:
+            fallback_result.append(agent._try_activate_fallback())
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            fallback_errors.append(exc)
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        resolve_fallback,
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: None)
+    recovery_thread = threading.Thread(target=recover)
+    fallback_thread = threading.Thread(target=activate_fallback)
+    recovery_thread.start()
+    barrier.wait_until_first_failure()
+    fallback_thread.start()
+    resolved_while_pending = fallback_resolved.wait(timeout=0.2)
+    barrier.release_second_attempt()
+    recovery_thread.join(timeout=5)
+    fallback_thread.join(timeout=5)
+
+    try:
+        assert not recovery_thread.is_alive()
+        assert not fallback_thread.is_alive()
+        assert resolved_while_pending is False
+        assert recovery_errors == []
+        assert fallback_errors == []
+        assert recovery_result == [False]
+        assert fallback_result == [True]
+        assert fallback_resolution_calls == ["openrouter"]
+    finally:
+        barrier.release_second_attempt()
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
 
 
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────

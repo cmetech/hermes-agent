@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 
-from agent.turn_retry_state import TurnRetryState
+from agent.turn_retry_state import TurnRetryState, _CredentialRecoveryTurnState
 
 
 EXPECTED_FIELDS = {
@@ -57,6 +57,16 @@ def test_guards_are_independently_mutable():
     # untouched guards stay False
     assert s.has_retried_429 is False
     assert s.anthropic_auth_retry_attempted is False
+
+
+def test_credential_recovery_turn_state_owns_refresh_counts_per_generation():
+    first = _CredentialRecoveryTurnState(generation=7)
+    second = _CredentialRecoveryTurnState(generation=8)
+
+    first.auth_pool_refresh_counts[("provider", "entry")] = 1
+    assert first.generation == 7
+    assert second.generation == 8
+    assert second.auth_pool_refresh_counts == {}
 
 
 def test_copilot_provider_check_accepts_alias_spellings():

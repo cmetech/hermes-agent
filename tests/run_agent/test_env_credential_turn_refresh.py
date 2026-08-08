@@ -14,12 +14,16 @@ failover legitimately move the session off the env credential, and config
 ``model.base_url`` has higher precedence than the env override.
 """
 
+import json
+import logging
 import os
 import sys
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -120,10 +124,141 @@ def _real_sealed_query_agent(
     return agent, constraint
 
 
+def _build_real_sealed_openai_agent(
+    *,
+    provider: str,
+    endpoint: str,
+    api_key: str,
+    credential_pool=None,
+):
+    """Build the real sealed runtime exercised by credential-recovery tests."""
+    constraint = _sealed_route_constraint(provider=provider, base_url=endpoint)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+    ):
+        agent = AIAgent(
+            provider=provider,
+            requested_provider=provider,
+            model="test-model",
+            api_mode="chat_completions",
+            base_url=endpoint,
+            api_key=api_key,
+            credential_pool=credential_pool,
+            execution_route_constraint=constraint,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=2,
+        )
+    agent._cached_system_prompt = "You are helpful."
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent._disable_streaming = True
+    return agent, constraint
+
+
+class _LowestConstructorBarrier:
+    """Deterministic OpenAI constructor boundary with real SDK clients."""
+
+    def __init__(
+        self,
+        concrete_openai,
+        *,
+        agent,
+        expired_token: str,
+        fresh_token: str,
+        failures: int,
+        pause_before_second: bool = False,
+        before_candidate_return=None,
+        failure_message: str = "deterministic SDK constructor failure",
+    ) -> None:
+        self._concrete_openai = concrete_openai
+        self._agent = agent
+        self._expired_token = expired_token
+        self._fresh_token = fresh_token
+        self._failures_remaining = failures
+        self._pause_before_second = pause_before_second
+        self._before_candidate_return = before_candidate_return
+        self._failure_message = failure_message
+        self.constructor_tokens: list[str] = []
+        self.clients: list[object] = []
+        self._first_failure = threading.Event()
+        self._second_attempt_waiting = threading.Event()
+        self._release_second_attempt = threading.Event()
+
+    def wait_until_first_failure(self) -> None:
+        assert self._first_failure.wait(timeout=5)
+
+    def wait_until_second_attempt(self) -> None:
+        assert self._second_attempt_waiting.wait(timeout=5)
+
+    def release_second_attempt(self) -> None:
+        self._release_second_attempt.set()
+
+    def __call__(self, **kwargs):
+        token = kwargs.get("api_key")
+        published_key = getattr(self._agent, "api_key", None)
+        is_adoption_build = token == self._fresh_token and published_key != token
+        if is_adoption_build:
+            self.constructor_tokens.append(token)
+            if len(self.constructor_tokens) == 2 and self._pause_before_second:
+                self._second_attempt_waiting.set()
+                assert self._release_second_attempt.wait(timeout=5)
+            if self._failures_remaining:
+                self._failures_remaining -= 1
+                if len(self.constructor_tokens) == 1:
+                    self._first_failure.set()
+                raise RuntimeError(self._failure_message)
+            if self._before_candidate_return is not None:
+                self._before_candidate_return()
+
+        supplied_http_client = kwargs.get("http_client")
+        if supplied_http_client is not None:
+            supplied_http_client.close()
+
+        def handle_request(_request: httpx.Request) -> httpx.Response:
+            if token == self._expired_token:
+                return httpx.Response(
+                    401,
+                    json={"error": {"message": "expired", "type": "auth"}},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-sealed-recovery",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            )
+
+        kwargs["http_client"] = httpx.Client(
+            transport=httpx.MockTransport(handle_request)
+        )
+        client = self._concrete_openai(**kwargs)
+        self.clients.append(client)
+        return client
+
+
+def _drive_provider_error(agent):
+    """Drive a real provider 401 through the complete conversation loop."""
+    return agent.run_conversation("hello")
+
+
 def _published_openai_state(agent):
-    auth_pool_refresh_counts = getattr(
-        agent, "_auth_pool_refresh_counts", _MISSING
-    )
     return {
         "client": agent.client,
         "api_key": agent.api_key,
@@ -133,11 +268,6 @@ def _published_openai_state(agent):
             agent, "_credential_pool_entry_id", _MISSING
         ),
         "env_creds_seen": getattr(agent, "_env_creds_seen", _MISSING),
-        "auth_pool_refresh_counts": (
-            _MISSING
-            if auth_pool_refresh_counts is _MISSING
-            else deepcopy(auth_pool_refresh_counts)
-        ),
     }
 
 
@@ -151,10 +281,6 @@ def _assert_published_openai_state(agent, expected) -> None:
         == expected["credential_pool_entry_id"]
     )
     assert getattr(agent, "_env_creds_seen", _MISSING) == expected["env_creds_seen"]
-    assert (
-        getattr(agent, "_auth_pool_refresh_counts", _MISSING)
-        == expected["auth_pool_refresh_counts"]
-    )
 
 
 def _fail_first_openai_construction(monkeypatch, agent):
@@ -179,9 +305,6 @@ def _fail_first_openai_construction(monkeypatch, agent):
                 ),
                 "published_env_creds_seen": getattr(
                     agent, "_env_creds_seen", _MISSING
-                ),
-                "published_auth_pool_refresh_counts": deepcopy(
-                    getattr(agent, "_auth_pool_refresh_counts", _MISSING)
                 ),
             }
         )
@@ -650,7 +773,6 @@ def test_sealed_vertex_constructor_failure_is_atomic_and_retries_same_token(
     old_client = agent.client
     agent._credential_pool_entry_id = "original-entry"
     agent._env_creds_seen = (constraint.identity.endpoint_sha256, "expired-token")
-    agent._auth_pool_refresh_counts = {("vertex", "original-entry"): 1}
     original_state = _published_openai_state(agent)
     credential_reads = []
 
@@ -695,8 +817,6 @@ def test_sealed_vertex_constructor_failure_is_atomic_and_retries_same_token(
             and attempt["published_pool_entry_id"] == "original-entry"
             and attempt["published_env_creds_seen"]
             == original_state["env_creds_seen"]
-            and attempt["published_auth_pool_refresh_counts"]
-            == original_state["auth_pool_refresh_counts"]
             for attempt in attempts
         )
         assert agent.client is not old_client
@@ -707,9 +827,6 @@ def test_sealed_vertex_constructor_failure_is_atomic_and_retries_same_token(
         assert agent.client.default_query == REPEATED_DEFAULT_QUERY
         assert agent._credential_pool_entry_id == "original-entry"
         assert agent._env_creds_seen == original_state["env_creds_seen"]
-        assert agent._auth_pool_refresh_counts == original_state[
-            "auth_pool_refresh_counts"
-        ]
         assert agent._assert_execution_route_constraint(agent.client) is constraint
     finally:
         if attempts and not attempts[0]["http_client"].is_closed:
@@ -790,7 +907,6 @@ def test_sealed_pool_constructor_failure_is_atomic_and_retries_same_entry(
     old_client = agent.client
     agent._credential_pool_entry_id = "original-entry"
     agent._env_creds_seen = (constraint.identity.endpoint_sha256, "test-credential")
-    agent._auth_pool_refresh_counts = None
     original_state = _published_openai_state(agent)
     entry = SimpleNamespace(
         id="rotated",
@@ -823,27 +939,19 @@ def test_sealed_pool_constructor_failure_is_atomic_and_retries_same_entry(
 
     agent._credential_pool = RetrySameCandidatePool()
     attempts = _fail_first_openai_construction(monkeypatch, agent)
+    recovery_state = agent._begin_credential_recovery_turn()
 
     try:
         recovered, retry_same = agent._recover_with_credential_pool(
             status_code=401,
             has_retried_429=False,
-        )
-
-        assert recovered is False
-        assert retry_same is False
-        _assert_published_openai_state(agent, original_state)
-        assert agent._is_openai_client_closed(old_client) is False
-        assert attempts[0]["http_client"].is_closed is True
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=401,
-            has_retried_429=False,
+            credential_recovery_state=recovery_state,
         )
 
         assert recovered is True
         assert retry_same is False
-        assert attempted_entries == ["rotated", "rotated"]
+        assert attempts[0]["http_client"].is_closed is True
+        assert attempted_entries == ["rotated"]
         assert [attempt["api_key"] for attempt in attempts] == [
             "rotated-credential",
             "rotated-credential",
@@ -857,8 +965,6 @@ def test_sealed_pool_constructor_failure_is_atomic_and_retries_same_entry(
             and attempt["published_pool_entry_id"] == "original-entry"
             and attempt["published_env_creds_seen"]
             == original_state["env_creds_seen"]
-            and attempt["published_auth_pool_refresh_counts"]
-            == original_state["auth_pool_refresh_counts"]
             for attempt in attempts
         )
         assert agent.client is not old_client
@@ -872,16 +978,861 @@ def test_sealed_pool_constructor_failure_is_atomic_and_retries_same_entry(
         assert agent.client.default_query == REPEATED_DEFAULT_QUERY
         assert agent._credential_pool_entry_id == "rotated"
         assert agent._env_creds_seen == original_state["env_creds_seen"]
-        assert agent._auth_pool_refresh_counts == {
+        assert recovery_state.auth_pool_refresh_counts == {
             ("azure-foundry", "rotated"): 1
         }
         assert agent._assert_execution_route_constraint(agent.client) is constraint
     finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
         if attempts and not attempts[0]["http_client"].is_closed:
             attempts[0]["http_client"].close()
         if agent.client is not old_client:
             agent.client.close()
         old_client.close()
+
+
+def test_sealed_pool_constructor_failure_retries_same_real_oauth_token_once(
+    tmp_path, monkeypatch
+) -> None:
+    import run_agent
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        CredentialPool,
+        PooledCredential,
+    )
+
+    endpoint = "https://route.test/v1"
+    expired_token = "expired-oauth-token"
+    fresh_token = "fresh-oauth-token"
+    entry = PooledCredential(
+        provider="anthropic",
+        id="oauth-entry",
+        label="OAuth entry",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:test",
+        access_token=expired_token,
+        refresh_token="refresh-token",
+        base_url=endpoint,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="anthropic",
+        endpoint=endpoint,
+        api_key=expired_token,
+        credential_pool=pool,
+    )
+    first_client = agent.client
+    oauth_refresh_calls: list[str] = []
+
+    def refresh_oauth(refresh_token, *, use_json=False):
+        oauth_refresh_calls.append(refresh_token)
+        assert use_json is False
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "rotated-refresh-token",
+            "expires_at_ms": 9_999_999_999_000,
+        }
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        refresh_oauth,
+    )
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=1,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+
+    try:
+        result = _drive_provider_error(agent)
+
+        assert oauth_refresh_calls == ["refresh-token"]
+        assert barrier.constructor_tokens == [fresh_token, fresh_token]
+        assert result.get("failed") is not True
+        assert agent.client is not first_client
+    finally:
+        agent.close()
+        if not first_client.is_closed():
+            first_client.close()
+
+
+def test_sealed_vertex_constructor_failure_reads_credentials_once(
+    tmp_path, monkeypatch
+) -> None:
+    import run_agent
+
+    endpoint = REPEATED_QUERY_ENDPOINT
+    expired_token = "expired-vertex-token"
+    fresh_token = "fresh-vertex-token"
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="vertex",
+        endpoint=endpoint,
+        api_key=expired_token,
+    )
+    first_client = agent.client
+    vertex_credential_reads: list[bool] = []
+
+    def get_vertex_credentials():
+        vertex_credential_reads.append(True)
+        return fresh_token, "credential-project"
+
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_credentials",
+        get_vertex_credentials,
+    )
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=1,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+
+    try:
+        result = _drive_provider_error(agent)
+
+        assert vertex_credential_reads == [True]
+        assert barrier.constructor_tokens == [fresh_token, fresh_token]
+        assert result.get("failed") is not True
+        assert agent.client is not first_client
+    finally:
+        agent.close()
+        if not first_client.is_closed():
+            first_client.close()
+
+
+def test_sealed_pool_two_adoption_failures_clear_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    import run_agent
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        CredentialPool,
+        PooledCredential,
+    )
+
+    endpoint = "https://route.test/v1"
+    expired_token = "expired-oauth-token"
+    fresh_token = "fresh-oauth-token"
+    entry = PooledCredential(
+        provider="anthropic",
+        id="oauth-entry",
+        label="OAuth entry",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:test",
+        access_token=expired_token,
+        refresh_token="refresh-token",
+        base_url=endpoint,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="anthropic",
+        endpoint=endpoint,
+        api_key=expired_token,
+        credential_pool=pool,
+    )
+    oauth_refresh_calls: list[str] = []
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        lambda refresh_token, **_kwargs: oauth_refresh_calls.append(refresh_token)
+        or {
+            "access_token": fresh_token,
+            "refresh_token": "rotated-refresh-token",
+            "expires_at_ms": 9_999_999_999_000,
+        },
+    )
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=2,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+
+    try:
+        result = _drive_provider_error(agent)
+
+        assert result.get("failed") is True
+        assert oauth_refresh_calls == ["refresh-token"]
+        assert barrier.constructor_tokens == [fresh_token, fresh_token]
+        assert getattr(agent, "_pending_sealed_credential_adoption", None) is None
+    finally:
+        agent.close()
+
+
+def _assert_sealed_vertex_acquisition_failure_is_bounded(
+    outcome, tmp_path, monkeypatch
+) -> None:
+    import run_agent
+
+    endpoint = REPEATED_QUERY_ENDPOINT
+    expired_token = "expired-vertex-token"
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="vertex",
+        endpoint=endpoint,
+        api_key=expired_token,
+    )
+    credential_reads: list[bool] = []
+
+    def get_vertex_credentials():
+        credential_reads.append(True)
+        if outcome == "error":
+            raise RuntimeError("credential source failed")
+        return "", "credential-project"
+
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_credentials",
+        get_vertex_credentials,
+    )
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token="unused-fresh-token",
+        failures=0,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+
+    try:
+        result = _drive_provider_error(agent)
+
+        assert result.get("failed") is True
+        assert credential_reads == [True]
+        assert barrier.constructor_tokens == []
+    finally:
+        agent.close()
+
+
+def test_sealed_vertex_acquisition_empty_is_bounded(tmp_path, monkeypatch) -> None:
+    _assert_sealed_vertex_acquisition_failure_is_bounded(
+        "empty", tmp_path, monkeypatch
+    )
+
+
+def test_sealed_vertex_acquisition_error_is_bounded(tmp_path, monkeypatch) -> None:
+    _assert_sealed_vertex_acquisition_failure_is_bounded(
+        "error", tmp_path, monkeypatch
+    )
+
+
+def _prepare_pending_pool_recovery(
+    monkeypatch,
+    *,
+    failures: int,
+    pause_before_second: bool = False,
+    endpoint: str = REPEATED_QUERY_ENDPOINT,
+    before_candidate_return=None,
+    failure_message: str = "deterministic SDK constructor failure",
+):
+    import run_agent
+
+    expired_token = "expired-pool-token"
+    fresh_token = "fresh-pool-token"
+    agent, constraint = _build_real_sealed_openai_agent(
+        provider="azure-foundry",
+        endpoint=endpoint,
+        api_key=expired_token,
+    )
+    current = SimpleNamespace(
+        id="current-entry",
+        runtime_api_key=expired_token,
+        last_status=None,
+    )
+    candidate = SimpleNamespace(
+        id="candidate-entry",
+        runtime_api_key=fresh_token,
+        runtime_base_url=endpoint,
+        last_status=None,
+    )
+    source_calls: list[str] = []
+
+    class _Pool:
+        provider = "azure-foundry"
+
+        @staticmethod
+        def current():
+            return current
+
+        @staticmethod
+        def entries():
+            return [current, candidate]
+
+        @staticmethod
+        def try_refresh_matching(**_kwargs):
+            source_calls.append("pool")
+            return candidate
+
+    agent._credential_pool = _Pool()
+    agent._credential_pool_entry_id = current.id
+    recovery_state = agent._begin_credential_recovery_turn()
+    barrier = _LowestConstructorBarrier(
+        run_agent.OpenAI,
+        agent=agent,
+        expired_token=expired_token,
+        fresh_token=fresh_token,
+        failures=failures,
+        pause_before_second=pause_before_second,
+        before_candidate_return=before_candidate_return,
+        failure_message=failure_message,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", barrier)
+    return agent, constraint, current, candidate, recovery_state, barrier, source_calls
+
+
+def test_sealed_pool_ordinary_429_markers_change_only_after_adoption(
+    monkeypatch,
+) -> None:
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=2)
+    agent._credential_pool.mark_exhausted_and_rotate = MagicMock(
+        return_value=candidate
+    )
+    try:
+        recovered, marker = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+            credential_recovery_state=recovery_state,
+        )
+
+        assert recovered is False
+        assert marker is True
+        assert barrier.constructor_tokens == [
+            "fresh-pool-token",
+            "fresh-pool-token",
+        ]
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_pool_preexhausted_429_markers_change_only_after_adoption(
+    monkeypatch,
+) -> None:
+    (
+        agent,
+        _constraint,
+        current,
+        candidate,
+        recovery_state,
+        barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=2)
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    current.last_status = STATUS_EXHAUSTED
+    agent._credential_pool.mark_exhausted_and_rotate = MagicMock(
+        return_value=candidate
+    )
+    try:
+        recovered, marker = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            credential_recovery_state=recovery_state,
+        )
+
+        assert recovered is False
+        assert marker is False
+        assert barrier.constructor_tokens == [
+            "fresh-pool-token",
+            "fresh-pool-token",
+        ]
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_pending_candidate_accepts_reordered_repeated_query_identity(
+    monkeypatch,
+) -> None:
+    reordered = (
+        "https://tenant.openai.azure.com/openai/deployments/review"
+        "?deployment=green&api-version=2025-04-01-preview&deployment=blue"
+    )
+    (
+        agent,
+        constraint,
+        _current,
+        candidate,
+        recovery_state,
+        barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=0)
+    candidate.runtime_base_url = reordered
+    try:
+        assert agent._swap_credential(
+            candidate,
+            credential_recovery_state=recovery_state,
+        ) is True
+        assert barrier.constructor_tokens == ["fresh-pool-token"]
+        assert agent._assert_execution_route_constraint(agent.client) is constraint
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+class _LockOrderProbe:
+    def __init__(self, agent) -> None:
+        self.agent = agent
+        self.calls = 0
+
+    def __call__(self, *_args, **_kwargs) -> None:
+        self.calls += 1
+        owned = getattr(self.agent._openai_client_lock(), "_is_owned", lambda: False)
+        assert owned() is False
+
+
+def test_sealed_openai_retirement_starts_after_client_lock_release(
+    monkeypatch,
+) -> None:
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=0)
+    probe = _LockOrderProbe(agent)
+    monkeypatch.setattr(agent, "_retire_shared_openai_client", probe)
+    try:
+        assert agent._swap_credential(
+            candidate,
+            credential_recovery_state=recovery_state,
+        ) is True
+        assert probe.calls == 1
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "invalidated"])
+def test_sealed_openai_failed_or_invalidated_adoption_never_retires_live_client(
+    outcome, monkeypatch
+) -> None:
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch, failures=2 if outcome == "failed" else 0
+    )
+    old_client = agent.client
+    retirements: list[object] = []
+    monkeypatch.setattr(
+        agent,
+        "_retire_shared_openai_client",
+        lambda client, **_kwargs: retirements.append(client),
+    )
+    if outcome == "invalidated":
+        agent._interrupt_requested = True
+    try:
+        assert agent._swap_credential(
+            candidate,
+            credential_recovery_state=recovery_state,
+        ) is False
+        assert retirements == []
+        assert agent.client is old_client
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_candidate_build_does_not_consume_provider_or_budget_ledgers(
+    monkeypatch,
+) -> None:
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=1)
+    provider_attempts: list[bool] = []
+    cost_attempts: list[bool] = []
+    agent._provider_attempt_reservation_callback = lambda: provider_attempts.append(True)
+    agent._cost_budget_acquire_callback = lambda: cost_attempts.append(True)
+    budget_before = agent.iteration_budget.remaining
+    try:
+        assert agent._swap_credential(
+            candidate,
+            credential_recovery_state=recovery_state,
+        ) is True
+        assert provider_attempts == []
+        assert cost_attempts == []
+        assert agent.iteration_budget.remaining == budget_before
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+@pytest.mark.parametrize("later_source", ["vertex", "anthropic", "nous", "codex"])
+def test_pending_pool_candidate_precedes_every_later_source(
+    later_source,
+    monkeypatch,
+) -> None:
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        barrier,
+        source_calls,
+    ) = _prepare_pending_pool_recovery(monkeypatch, failures=1)
+    later_source_calls: list[str] = []
+    try:
+        recovered, _marker = agent._recover_with_credential_pool(
+            status_code=401,
+            has_retried_429=False,
+            credential_recovery_state=recovery_state,
+        )
+        if not recovered:
+            later_source_calls.append(later_source)
+
+        assert recovered is True
+        assert source_calls == ["pool"]
+        assert barrier.constructor_tokens == [
+            "fresh-pool-token",
+            "fresh-pool-token",
+        ]
+        assert later_source_calls == []
+        assert agent._credential_pool_entry_id == candidate.id
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def _assert_sealed_candidate_canaries_absent(caplog, public_result, canaries):
+    combined = caplog.text + json.dumps(public_result, sort_keys=True)
+    for canary in canaries:
+        assert canary not in combined
+
+
+def test_sealed_candidate_redaction_second_adoption_failure_keeps_live_client(
+    monkeypatch,
+    caplog,
+) -> None:
+    canaries = [
+        "TOKEN_CANARY_RETRY",
+        "ENDPOINT_CANARY_RETRY",
+        "EXCEPTION_CANARY_RETRY",
+        "DIGEST_CANARY_RETRY",
+        "/tmp/PATH_CANARY_RETRY",
+    ]
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=2,
+        failure_message=" ".join(canaries),
+    )
+    old_client = agent.client
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    try:
+        adopted = agent._swap_credential(
+            candidate,
+            credential_recovery_state=recovery_state,
+        )
+        public_result = {
+            "adopted": adopted,
+            "client_unchanged": agent.client is old_client,
+        }
+
+        assert adopted is False
+        assert agent.client is old_client
+        assert old_client.is_closed() is False
+        _assert_sealed_candidate_canaries_absent(
+            caplog, public_result, canaries
+        )
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_candidate_redaction_nested_create_failure_closes_owned_transport(
+    monkeypatch,
+    caplog,
+) -> None:
+    import run_agent
+
+    canaries = [
+        "TOKEN_CANARY_CREATE",
+        "ENDPOINT_CANARY_CREATE",
+        "EXCEPTION_CANARY_CREATE",
+        "DIGEST_CANARY_CREATE",
+        "/tmp/PATH_CANARY_CREATE",
+    ]
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="azure-foundry",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="published-key",
+    )
+
+    class _OwnedTransport:
+        closed = False
+
+        def close(self):
+            self.closed = True
+            raise RuntimeError(" ".join(canaries))
+
+    owned_transport = _OwnedTransport()
+    monkeypatch.setattr(
+        agent,
+        "_build_keepalive_http_client",
+        lambda *_args, **_kwargs: owned_transport,
+    )
+    monkeypatch.setattr(
+        run_agent,
+        "OpenAI",
+        MagicMock(side_effect=RuntimeError(" ".join(canaries))),
+    )
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    public_result = {}
+    try:
+        with pytest.raises(RuntimeError):
+            agent._create_openai_client(
+                {
+                    "api_key": canaries[0],
+                    "base_url": "https://route.test/v1",
+                },
+                reason="sealed_credential_adoption",
+                shared=True,
+                candidate_safe=True,
+            )
+        public_result = {"error_type": "RuntimeError"}
+
+        assert owned_transport.closed is True
+        _assert_sealed_candidate_canaries_absent(
+            caplog, public_result, canaries
+        )
+    finally:
+        agent.close()
+
+
+def test_sealed_candidate_redaction_constructor_leaves_caller_transport_owned(
+    monkeypatch,
+    caplog,
+) -> None:
+    import run_agent
+
+    canaries = ["TOKEN_CANARY_CALLER", "EXCEPTION_CANARY_CALLER"]
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="azure-foundry",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="published-key",
+    )
+
+    class _CallerTransport:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    caller_transport = _CallerTransport()
+    monkeypatch.setattr(
+        run_agent,
+        "OpenAI",
+        MagicMock(side_effect=RuntimeError(" ".join(canaries))),
+    )
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    try:
+        with pytest.raises(RuntimeError):
+            agent._create_openai_client(
+                {
+                    "api_key": canaries[0],
+                    "base_url": "https://route.test/v1",
+                    "http_client": caller_transport,
+                },
+                reason="sealed_credential_adoption",
+                shared=True,
+                candidate_safe=True,
+            )
+
+        assert caller_transport.close_calls == 0
+        _assert_sealed_candidate_canaries_absent(
+            caplog, {"error_type": "RuntimeError"}, canaries
+        )
+    finally:
+        agent.close()
+
+
+def test_sealed_candidate_redaction_nested_close_and_retirement_failures(
+    monkeypatch,
+    caplog,
+) -> None:
+    canaries = [
+        "ENDPOINT_CANARY_CLOSE",
+        "EXCEPTION_CANARY_CLOSE",
+        "DIGEST_CANARY_CLOSE",
+        "/tmp/PATH_CANARY_CLOSE",
+    ]
+    agent, _constraint = _build_real_sealed_openai_agent(
+        provider="azure-foundry",
+        endpoint=REPEATED_QUERY_ENDPOINT,
+        api_key="published-key",
+    )
+
+    class _RejectedClient:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError(" ".join(canaries))
+
+    rejected = _RejectedClient()
+    agent.base_url = "https://route.test/ENDPOINT_CANARY_CLOSE"
+    monkeypatch.setattr(agent, "_force_close_tcp_sockets", lambda _client: 0)
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    agent._close_openai_client(
+        rejected,
+        reason="rejected:sealed_build_failure",
+        shared=False,
+        candidate_safe=True,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_force_close_tcp_sockets",
+        MagicMock(side_effect=RuntimeError(" ".join(canaries))),
+    )
+    agent._retire_shared_openai_client(
+        rejected,
+        reason="replace:sealed_credential_adoption",
+        candidate_safe=True,
+    )
+
+    try:
+        assert rejected.close_calls == 1
+        _assert_sealed_candidate_canaries_absent(
+            caplog, {"retirement": "best_effort"}, canaries
+        )
+    finally:
+        agent.base_url = REPEATED_QUERY_ENDPOINT
+        monkeypatch.setattr(agent, "_force_close_tcp_sockets", lambda _client: 0)
+        agent.close()
+
+
+def test_sealed_candidate_redaction_route_drift_closes_rejected_client(
+    monkeypatch,
+    caplog,
+) -> None:
+    canaries = [
+        "ENDPOINT_CANARY_DRIFT",
+        "DIGEST_CANARY_DRIFT",
+        "/tmp/PATH_CANARY_DRIFT",
+    ]
+    agent_ref: dict[str, object] = {}
+
+    def drift_route():
+        agent_ref["agent"].base_url = (
+            "https://drift.invalid/tmp/PATH_CANARY_DRIFT"
+            "?api-version=ENDPOINT_CANARY_DRIFT"
+            "&deployment=DIGEST_CANARY_DRIFT"
+        )
+
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=0,
+        before_candidate_return=drift_route,
+    )
+    agent_ref["agent"] = agent
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    try:
+        with pytest.raises(ProviderCapabilityDriftError):
+            agent._swap_credential(
+                candidate,
+                credential_recovery_state=recovery_state,
+            )
+        assert len(barrier.clients) == 1
+        assert barrier.clients[0].is_closed() is True
+        _assert_sealed_candidate_canaries_absent(
+            caplog,
+            {"error": "provider_capability_drift"},
+            canaries,
+        )
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_candidate_route_drift_is_terminal_without_fallback(
+    monkeypatch,
+) -> None:
+    agent_ref: dict[str, object] = {}
+
+    def drift_route():
+        agent_ref["agent"].base_url = "https://drift.invalid/v1"
+
+    (
+        agent,
+        _constraint,
+        _current,
+        candidate,
+        recovery_state,
+        _barrier,
+        _source_calls,
+    ) = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=0,
+        before_candidate_return=drift_route,
+    )
+    agent_ref["agent"] = agent
+    fallback_calls: list[bool] = []
+    monkeypatch.setattr(
+        agent,
+        "_try_activate_fallback",
+        lambda *_args, **_kwargs: fallback_calls.append(True) or True,
+    )
+    try:
+        with pytest.raises(ProviderCapabilityDriftError):
+            agent._swap_credential(
+                candidate,
+                credential_recovery_state=recovery_state,
+            )
+        assert fallback_calls == []
+        assert getattr(agent, "_pending_sealed_credential_adoption", None) is None
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
 
 
 def test_drifted_concrete_replacement_is_closed_and_never_published() -> None:

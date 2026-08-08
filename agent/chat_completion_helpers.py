@@ -1721,6 +1721,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    transition_generation = agent._credential_transition_generation()
+    if transition_generation is None:
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1895,6 +1899,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+
+        if not agent._invalidate_for_route_transition(
+            transition_generation,
+            fallback_client=fb_client,
+        ):
+            agent._close_openai_client(
+                fb_client,
+                reason="rejected:fallback_generation_changed",
+                shared=False,
+            )
+            return False
 
         old_model = agent.model
         old_provider = agent.provider

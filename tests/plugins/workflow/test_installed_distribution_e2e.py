@@ -23,12 +23,10 @@ def _version_selection_from_guidance(path: Path) -> dict[str, object]:
     return json.loads(payload)
 
 
-@pytest.mark.integration
-def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
-    tmp_path: Path,
-) -> None:
-    """Exercise installed-filesystem layout through the authorized Nix build path."""
-    artifacts = tmp_path / "artifacts"
+@pytest.fixture(scope="module")
+def installed_distribution(tmp_path_factory):
+    root = tmp_path_factory.mktemp("installed-distribution")
+    artifacts = root / "artifacts"
     generated_paths = (REPO_ROOT / "build", REPO_ROOT / "hermes_agent.egg-info")
     preexisting = {path for path in generated_paths if path.exists()}
     build_env = os.environ.copy()
@@ -58,7 +56,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     wheels = list(artifacts.glob("*.whl"))
     assert len(wheels) == 1
 
-    site = tmp_path / "site"
+    site = root / "site"
     install = subprocess.run(
         [
             "uv",
@@ -71,19 +69,176 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
             "--no-deps",
             str(wheels[0]),
         ],
-        cwd=tmp_path,
+        cwd=root,
         capture_output=True,
         text=True,
         timeout=300,
     )
     assert install.returncode == 0, f"wheel extraction failed:\n{install.stderr}"
 
-    home = tmp_path / "home"
     env = os.environ.copy()
-    env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(site)
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
     env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
+    return site, env, wheels
+
+
+@pytest.mark.integration
+def test_installed_distribution_runs_sealed_openai_credential_transaction(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, base_env, _wheels = installed_distribution
+    probe_path = tmp_path / "sealed_credential_transaction_probe.py"
+    probe_path.write_text(
+        r'''
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import agent.credential_adoption as credential_adoption
+import run_agent
+from agent.credential_adoption import (
+    _CredentialRefreshStatus,
+    _PendingSealedCredentialAdoption,
+    _snapshot_candidate_client_kwargs,
+)
+from hermes_cli import runtime_provider as rp
+from run_agent import AIAgent
+
+base_url = "https://route.test/v1"
+provider = "openai-api"
+runtime = rp.classify_execution_runtime(
+    provider=provider,
+    model_config={"provider": provider, "default": "test-model"},
+    provider_config={"api_mode": "chat_completions", "base_url": base_url},
+)
+identity = rp.execution_runtime_identity(runtime)
+constraint = rp.CredentialFreeExecutionRouteConstraint(
+    route_fingerprint="f" * 64,
+    requested_provider=provider,
+    model="test-model",
+    api_mode="chat_completions",
+    base_url=base_url,
+    provider_config={},
+    identity=identity,
+)
+
+real_openai = run_agent.OpenAI
+old_client = real_openai(api_key="old-key", base_url=base_url)
+agent = object.__new__(AIAgent)
+agent.provider = provider
+agent.requested_provider = provider
+agent.model = "test-model"
+agent.api_mode = "chat_completions"
+agent.base_url = base_url
+agent.api_key = "old-key"
+agent._client_kwargs = {"api_key": "old-key", "base_url": base_url}
+agent._credential_pool_entry_id = "old-entry"
+agent._execution_route_constraint = constraint
+agent._interrupt_requested = False
+agent.client = old_client
+agent._build_keepalive_http_client = lambda *_args, **_kwargs: None
+retired = []
+agent._retire_shared_openai_client = (
+    lambda client, **_kwargs: retired.append(client)
+)
+
+state = agent._begin_credential_recovery_turn()
+candidate = _PendingSealedCredentialAdoption(
+    generation=state.generation,
+    source="pool",
+    route_constraint=constraint,
+    api_key="fresh-key",
+    base_url=base_url,
+    client_kwargs=_snapshot_candidate_client_kwargs(
+        {"api_key": "fresh-key", "base_url": base_url}
+    ),
+    pool_entry_id="fresh-entry",
+)
+constructor_keys = []
+published_clients = []
+
+def deterministic_openai(**kwargs):
+    if kwargs.get("api_key") == "fresh-key":
+        constructor_keys.append(kwargs["api_key"])
+        if len(constructor_keys) == 1:
+            raise RuntimeError("first candidate construction fails")
+    client = real_openai(**kwargs)
+    if kwargs.get("api_key") == "fresh-key":
+        published_clients.append(client)
+    return client
+
+run_agent.OpenAI = deterministic_openai
+try:
+    status = agent._adopt_pending_sealed_openai_candidate(candidate)
+    payload = {
+        "run_agent_file": str(Path(run_agent.__file__).resolve()),
+        "credential_module_file": str(Path(credential_adoption.__file__).resolve()),
+        "status": status.value,
+        "constructor_keys": constructor_keys,
+        "published_concrete": (
+            len(published_clients) == 1
+            and agent.client is published_clients[0]
+        ),
+        "published_key": agent.api_key,
+        "published_entry": agent._credential_pool_entry_id,
+        "retired_old": retired == [old_client],
+        "pending_cleared": (
+            getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        ),
+    }
+    assert status is _CredentialRefreshStatus.ADOPTED
+    print(json.dumps(payload))
+finally:
+    run_agent.OpenAI = real_openai
+    agent._end_credential_recovery_turn(state.generation)
+    if agent.client is not old_client:
+        agent.client.close()
+    old_client.close()
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    env = base_env.copy()
+    env["HERMES_HOME"] = str(tmp_path / "home")
+    result = subprocess.run(
+        [sys.executable, str(probe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["run_agent_file"]).is_relative_to(site.resolve())
+    assert Path(payload["credential_module_file"]).is_relative_to(site.resolve())
+    assert payload == {
+        "run_agent_file": payload["run_agent_file"],
+        "credential_module_file": payload["credential_module_file"],
+        "status": "adopted",
+        "constructor_keys": ["fresh-key", "fresh-key"],
+        "published_concrete": True,
+        "published_key": "fresh-key",
+        "published_entry": "fresh-entry",
+        "retired_old": True,
+        "pending_cleared": True,
+    }
+
+
+@pytest.mark.integration
+def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    """Exercise installed-filesystem layout through the authorized Nix build path."""
+    site, env, wheels = installed_distribution
+
+    home = tmp_path / "home"
+    env = env.copy()
+    env["HERMES_HOME"] = str(home)
 
     portable_profile = tmp_path / "portable-profile.yaml"
     portable_managed = tmp_path / "portable-managed.yaml"
