@@ -438,13 +438,24 @@ precedence, cleanup, and redaction are not.
       ADOPTED = "adopted"
       RETRYABLE_BUILD_FAILURE = "retryable_build_failure"
       INVALIDATED = "invalidated"
+
+
+  @dataclass(frozen=True, slots=True, repr=False)
+  class _CandidateAttemptResult:
+      status: _CandidateAttemptStatus
+      prior_client: Any = field(default=None, repr=False, compare=False)
+      retirement_kind: Literal["openai", "anthropic"] | None = None
   ```
 
   `_PendingSealedCredentialAdoption`, `_CredentialRefreshStatus`,
+  `_CandidateAttemptStatus`, `_CandidateAttemptResult`,
   `_snapshot_candidate_client_kwargs()`, and
   `_materialize_candidate_client_kwargs()` live in the dependency-light
-  `agent/credential_adoption.py`; `_CredentialRecoveryTurnState` lives in
-  `agent/turn_retry_state.py`. The candidate stores the frozen authoritative
+  `agent/credential_adoption.py`;
+  `_CredentialRecoveryTurnState` lives in `agent/turn_retry_state.py`. The
+  result is private and never serialized; only `ADOPTED` may carry the prior
+  published client and its retirement kind out of the critical section. The
+  candidate stores the frozen authoritative
   `CredentialFreeExecutionRouteConstraint`; it does not handwrite or duplicate
   provider/model/API/endpoint identity. The snapshot helper accepts only
   `None`, booleans, numbers, strings, bytes, nested string-key mappings,
@@ -598,32 +609,40 @@ precedence, cleanup, and redaction are not.
   complete adoption attempts:
 
   ```python
+  refresh_status = _CredentialRefreshStatus.INVALIDATED
+  retirement: _CandidateAttemptResult | None = None
   with self._openai_client_lock():
-      if not self._install_pending_sealed_credential_locked(candidate):
-          return _CredentialRefreshStatus.INVALIDATED
-      for attempt in range(2):
-          try:
-              status = self._attempt_pending_openai_candidate_locked(
+      if self._install_pending_sealed_credential_locked(candidate):
+          for attempt in range(2):
+              result = self._attempt_pending_openai_candidate_locked(
                   candidate.generation,
                   attempt_number=attempt + 1,
               )
-              if status is _CandidateAttemptStatus.ADOPTED:
-                  return _CredentialRefreshStatus.ADOPTED
-              if status is _CandidateAttemptStatus.INVALIDATED:
-                  return _CredentialRefreshStatus.INVALIDATED
+              if result.status is _CandidateAttemptStatus.ADOPTED:
+                  refresh_status = _CredentialRefreshStatus.ADOPTED
+                  retirement = result
+                  break
+              if result.status is _CandidateAttemptStatus.INVALIDATED:
+                  refresh_status = _CredentialRefreshStatus.INVALIDATED
+                  break
               if attempt == 0:
                   self._record_pending_adoption_failure_locked(
                       candidate.generation,
                       attempt_number=1,
                   )
-                  continue
-          except ProviderCapabilityDriftError:
-              raise
-      self._clear_pending_sealed_credential_locked(
-          candidate.generation,
-          reason="adoption_exhausted",
+          else:
+              self._clear_pending_sealed_credential_locked(
+                  candidate.generation,
+                  reason="adoption_exhausted",
+              )
+              refresh_status = _CredentialRefreshStatus.ADOPTION_FAILED
+  if retirement is not None and retirement.prior_client is not None:
+      self._retire_adopted_prior_client(
+          retirement.prior_client,
+          retirement_kind=retirement.retirement_kind,
+          candidate_safe=True,
       )
-      return _CredentialRefreshStatus.ADOPTION_FAILED
+  return refresh_status
   ```
 
   The owning branch holds the client lock across install and both bounded
@@ -632,12 +651,15 @@ precedence, cleanup, and redaction are not.
   under that lock. Before publication it rechecks generation, cancellation,
   the exact stored `CredentialFreeExecutionRouteConstraint`, and pending
   identity. On success it publishes client/API key/base/default query/AIAgent
-  pool-entry identity and clears pending before releasing the same lock. A
-  retryable constructor/build failure retains pending. Invalidation closes the
-  unpublished client and returns `INVALIDATED`; it is never reinstalled or
-  retried. Route drift closes and clears under the lock, then raises the exact
-  terminal exception. If publication wins, later invalidation observes one
-  consistent committed state.
+  pool-entry identity and clears pending before releasing the same lock, then
+  returns the prior client only through `_CandidateAttemptResult`. The owner
+  retires it exactly once after lock release. A retryable constructor/build
+  failure retains pending and returns no prior client. Invalidation closes the
+  unpublished client, returns `INVALIDATED` with no prior client, and is never
+  reinstalled or retried. Route drift closes and clears under the lock, then
+  raises the exact terminal exception without retiring the live client. If
+  publication wins, later invalidation observes one consistent committed
+  state.
 
 - [ ] **Step 5: Defer conversation-owned retry markers until success.**
 
@@ -735,6 +757,12 @@ precedence, cleanup, and redaction are not.
   `test_sealed_pool_ordinary_429_markers_change_only_after_adoption`,
   `test_sealed_pool_preexhausted_429_markers_change_only_after_adoption`, and
   `test_pending_candidate_accepts_reordered_repeated_query_identity`.
+  Define `_LockOrderProbe` and add
+  `test_sealed_openai_retirement_starts_after_client_lock_release` plus
+  `test_sealed_openai_failed_or_invalidated_adoption_never_retires_live_client`.
+  The probe must fail if the retirement callback starts while the client lock
+  is owned; the failure and invalidation rows must observe zero retirement
+  calls for the published client.
   Assert provider-attempt and budget ledgers are unchanged by local client
   construction, route drift stays terminal, fallback performs no credential
   resolution while pending, and fallback becomes eligible exactly once after
@@ -793,7 +821,7 @@ precedence, cleanup, and redaction are not.
     tests/run_agent/test_env_credential_turn_refresh.py \
     tests/run_agent/test_fallback_credential_isolation.py \
     tests/run_agent/test_primary_runtime_restore.py \
-    -k "pending or sealed_pool_ordinary_429 or sealed_pool_preexhausted_429 or reordered_repeated_query" \
+    -k "pending or sealed_openai or sealed_pool_ordinary_429 or sealed_pool_preexhausted_429 or reordered_repeated_query" \
     -q
   ```
 
@@ -949,7 +977,7 @@ mutate the live client before replacement succeeds.
   ```text
   AIAgent._publish_pending_anthropic_candidate(
       candidate: _PendingSealedCredentialAdoption,
-  ) -> _CandidateAttemptStatus
+  ) -> _CandidateAttemptResult
   ```
 
   On success it publishes `_anthropic_client`, `_anthropic_api_key`,
@@ -994,6 +1022,11 @@ mutate the live client before replacement succeeds.
   `test_sealed_anthropic_acquisition_error_consumes_existing_guard`,
   `test_sealed_anthropic_first_build_failure_then_success_sets_guard`, and
   `test_sealed_anthropic_two_build_failures_leave_success_guard_clear`.
+  Also add `test_sealed_anthropic_retirement_starts_after_client_lock_release`,
+  `test_sealed_anthropic_failed_or_invalidated_adoption_never_retires_live_client`,
+  and `test_sealed_anthropic_adoption_preserves_disabled_1m_beta`. Define the
+  same deterministic `_LockOrderProbe` pattern in the Anthropic test module;
+  failed and invalidated rows must never retire the published client.
 
 - [ ] **Step 2: Run Anthropic RED.**
 
@@ -1034,6 +1067,9 @@ mutate the live client before replacement succeeds.
       candidate.api_key,
       candidate.base_url,
       timeout=get_provider_request_timeout(self.provider, self.model),
+      drop_context_1m_beta=bool(
+          getattr(self, "_oauth_1m_beta_disabled", False)
+      ),
   )
   self._assert_execution_route_constraint(
       new_client,
@@ -1049,9 +1085,12 @@ mutate the live client before replacement succeeds.
   self._credential_pool_entry_id = candidate.pool_entry_id
   ```
 
-  Execute that publication only inside the Task 1A transaction. After lock
-  release, retire `old_client` best-effort; close failure logs only reason and
-  exception type and does not roll back the new state. Reject
+  Execute that publication only inside the Task 1A transaction and return
+  `old_client` in the repr-hidden `_CandidateAttemptResult`. After lock release,
+  the transaction owner retires it best-effort exactly once; close failure
+  logs only reason and exception type and does not roll back the new state.
+  Preserve `_oauth_1m_beta_disabled` in every request-local and adopted client
+  construction so a rejected 1M beta is never re-enabled. Reject
   `bedrock_converse` and `codex_app_server` pool fallthrough explicitly.
 
 - [ ] **Step 4: Run Anthropic GREEN and redaction checks.**
@@ -1727,6 +1766,12 @@ Canonical tokens always outrank alias claims. Canonical-versus-canonical keeps t
   ```bash
   scripts/run_tests.sh -q
   .venv/bin/ruff check \
+    run_agent.py \
+    agent/credential_adoption.py \
+    agent/agent_runtime_helpers.py \
+    agent/chat_completion_helpers.py \
+    agent/conversation_loop.py \
+    agent/turn_retry_state.py \
     hermes_cli/runtime_provider.py \
     hermes_cli/workflow_model_resolution.py \
     providers/__init__.py \
@@ -1737,7 +1782,19 @@ Canonical tokens always outrank alias claims. Canonical-versus-canonical keeps t
     plugins/workflow/executors/base.py \
     plugins/workflow/executors/ai.py \
     plugins/workflow/executors/approval.py \
-    plugins/workflow/scheduler.py
+    plugins/workflow/scheduler.py \
+    tests/agent/test_credential_adoption.py \
+    tests/agent/test_credential_pool_routing.py \
+    tests/agent/test_turn_retry_state.py \
+    tests/plugins/workflow/test_installed_distribution_e2e.py \
+    tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py \
+    tests/run_agent/test_anthropic_third_party_oauth_guard.py \
+    tests/run_agent/test_credential_pool_interrupt.py \
+    tests/run_agent/test_env_credential_turn_refresh.py \
+    tests/run_agent/test_fallback_credential_isolation.py \
+    tests/run_agent/test_primary_runtime_restore.py \
+    tests/run_agent/test_run_agent.py \
+    tests/run_agent/test_sealed_anthropic_credential_adoption.py
   ```
 
   Expected: zero test failures and Ruff clean. If an unrelated environmental failure occurs, prove it independently and record it; do not relabel a candidate defect as environmental without reproduction.
