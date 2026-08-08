@@ -220,6 +220,7 @@ def _install_constructor_barrier(
     agent: AIAgent,
     monkeypatch,
     *,
+    expired_token: str = EXPIRED_TOKEN,
     fresh_token: str = FRESH_TOKEN,
     failures: int,
     pause_before_second: bool = False,
@@ -232,7 +233,7 @@ def _install_constructor_barrier(
     barrier = _AnthropicConstructorBarrier(
         sdk.Anthropic,
         agent=agent,
-        expired_token=EXPIRED_TOKEN,
+        expired_token=expired_token,
         fresh_token=fresh_token,
         failures=failures,
         pause_before_second=pause_before_second,
@@ -651,6 +652,47 @@ def test_sealed_anthropic_two_build_failures_leave_success_guard_clear(
         assert barrier.constructor_tokens == [FRESH_TOKEN, FRESH_TOKEN]
         assert len(states) == 1
         assert states[0].anthropic_auth_retry_attempted is False
+    finally:
+        agent.close()
+
+
+def test_sealed_anthropic_failed_recovery_redacts_published_credential_everywhere(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    del tmp_path
+    credential_canary = "SEALED_AUTH_CANARY_full-secret"
+    credential_prefix = credential_canary[:12]
+    agent, _constraint = _build_real_sealed_anthropic_agent(
+        api_key=credential_canary
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: FRESH_TOKEN,
+    )
+    barrier = _install_constructor_barrier(
+        agent,
+        monkeypatch,
+        expired_token=credential_canary,
+        failures=2,
+    )
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+
+    try:
+        result = _drive_native_anthropic_401(agent)
+        captured = capsys.readouterr()
+        public_result = json.dumps(result, default=str, sort_keys=True)
+
+        assert result.get("failed") is True
+        assert barrier.constructor_tokens == [FRESH_TOKEN, FRESH_TOKEN]
+        for public_channel in (
+            captured.out,
+            captured.err,
+            caplog.text,
+            public_result,
+        ):
+            assert credential_canary not in public_channel
+            assert credential_prefix not in public_channel
     finally:
         agent.close()
 
