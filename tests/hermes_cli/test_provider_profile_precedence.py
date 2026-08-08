@@ -19,6 +19,7 @@ def _write_plugin(
     helper_value: str | None = None,
     spoofed_origin: str | None = None,
     aliases: tuple[str, ...] | None = None,
+    base_url: str = "",
 ) -> Path:
     plugin = root / directory_name
     plugin.mkdir(parents=True)
@@ -55,6 +56,7 @@ def _write_plugin(
         f"    name={registered_name!r},\n"
         f"    description={marker!r},\n"
         f"    aliases={declared_aliases!r},\n"
+        f"    base_url={base_url!r},\n"
         ")\n"
         f"{spoof}"
         "register_provider(profile)\n",
@@ -364,3 +366,90 @@ def test_discovery_resolves_canonical_alias_collisions_in_both_directions(
         ("claude", "provider_alias_displaced_by_canonical"),
         ("openrouter", "provider_alias_rejected_canonical"),
     }
+
+
+def test_auth_resolution_consumes_registry_canonical_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        "openrouter-probe",
+        registered_name="openrouter",
+        marker="bundled-openrouter",
+        aliases=("or",),
+    )
+    _write_plugin(
+        user_root,
+        "or-probe",
+        registered_name="or",
+        marker="user-or",
+        aliases=(),
+    )
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    from hermes_cli.auth import resolve_provider
+
+    registration = providers.get_provider_registration("or")
+    assert registration is not None
+    assert registration.profile.description == "user-or"
+    assert registration.provenance.origin_kind == "user_plugin"
+    assert resolve_provider("or") == "or"
+
+
+def test_credential_free_runtime_uses_registry_winner_not_hardcoded_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_provider_registry: None,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    _write_plugin(
+        bundled_root,
+        "bedrock-probe",
+        registered_name="bedrock",
+        marker="bundled-bedrock",
+        aliases=("aws",),
+    )
+    _write_plugin(
+        user_root,
+        "aws-probe",
+        registered_name="aws",
+        marker="user-aws",
+        aliases=(),
+        base_url="https://user-aws.example/v1",
+    )
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user_root)
+    monkeypatch.setattr(providers, "__path__", [str(legacy_root)])
+    providers._discovered = False
+
+    from hermes_cli.runtime_provider import (
+        classify_execution_runtime,
+        execution_endpoint_sha256,
+    )
+
+    runtime = classify_execution_runtime(
+        provider="aws",
+        model_config={"provider": "aws", "default": "user-model"},
+        provider_config={"api_mode": "chat_completions", "region": "eu-west-1"},
+    )
+
+    assert runtime.effective_provider == "aws"
+    assert runtime.registration_origin_kind == "user_plugin"
+    assert runtime.base_url_trust_class == "unknown"
+    assert runtime.endpoint_sha256 == execution_endpoint_sha256(
+        provider="aws",
+        api_mode="chat_completions",
+        base_url="https://user-aws.example/v1",
+    )

@@ -907,7 +907,6 @@ def resolve_provider_full(
     Returns:
         ProviderDef if found, else None.
     """
-    canonical = normalize_provider(name)
     raw = name.strip().lower()
 
     # 0. User-defined config providers win over the built-in alias table.
@@ -922,6 +921,36 @@ def resolve_provider_full(
         user_pdef = resolve_user_provider(raw, user_providers)
         if user_pdef is not None:
             return user_pdef
+
+    # The loader-arbitrated registry owns canonical and alias identity. Consult
+    # its raw-token winner before the static compatibility table so a user
+    # canonical (``claude``) cannot be collapsed into a bundled alias owner and
+    # a same-name user override (``openrouter``) cannot be hidden by a built-in
+    # ProviderDef. Keep bundled winners on the built-in path when both sources
+    # agree so overlays/models.dev metadata retain their established contract.
+    registry_profile = None
+    registry_registration = None
+    try:
+        from providers import (
+            get_provider_profile as _get_registry_profile,
+            get_provider_registration as _get_registry_registration,
+        )
+
+        registry_profile = _get_registry_profile(raw)
+        registry_registration = _get_registry_registration(raw)
+    except Exception:
+        pass
+
+    if (
+        registry_profile is not None
+        and registry_registration is not None
+        and registry_registration.provenance.origin_kind != "bundled"
+    ):
+        return _provider_def_from_plugin_profile(registry_profile)
+
+    canonical = normalize_provider(name)
+    if registry_profile is not None and registry_profile.name != canonical:
+        return _provider_def_from_plugin_profile(registry_profile)
 
     # 0.5 Exact Hermes provider IDs must win over LOSSY alias collapsing.
     # Example: kimi-coding-cn should stay distinct from kimi-coding instead of
@@ -998,7 +1027,7 @@ def resolve_provider_full(
     #    resolves the raw name and profile aliases; try canonical too.
     try:
         from providers import get_provider_profile as _get_plugin_profile
-        plugin_profile = _get_plugin_profile(raw) or _get_plugin_profile(canonical)
+        plugin_profile = registry_profile or _get_plugin_profile(canonical)
         if plugin_profile is not None:
             return _provider_def_from_plugin_profile(plugin_profile)
     except Exception:

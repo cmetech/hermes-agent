@@ -254,6 +254,7 @@ upstream_changes:
   change_class: provider-runtime-generic
   owner: workflow-orchestration
   files:
+  - hermes_cli/auth.py
   - hermes_cli/providers.py
   - providers/__init__.py
   - tests/hermes_cli/test_execution_runtime_capabilities.py
@@ -272,6 +273,7 @@ upstream_changes:
   - bundled, legacy-compatible, and user-plugin registration precedence
   - _ProviderAliasRegistration loader-authored alias provenance
   - canonical-first provider token lookup and alias collision arbitration
+  - registry-first public provider and authentication resolution
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -280,6 +282,7 @@ upstream_changes:
   - equal-precedence alias collisions preserve last-writer compatibility with one bounded diagnostic
   - replacing a canonical registration removes only that registration's stale alias claims
   - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
+  - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -299,8 +302,11 @@ upstream_changes:
     remain bundled below legacy-compatible below user plugins for both canonical
     and alias claims. Canonical tokens always outrank aliases; replacing a
     canonical registration removes its stale aliases; equal-rank collisions
-    retain last-writer compatibility. Diagnostics remain bounded and free of
-    local paths, credentials, or provider payloads.
+    retain last-writer compatibility. Public provider and authentication
+    resolution must consume that same registry winner before static aliases or
+    built-in metadata while preserving exact user-config provider priority and
+    agreed bundled overlay metadata. Diagnostics remain bounded and free of local
+    paths, credentials, or provider payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic
     provider-registration authority with immutable loader provenance, closure
     identity, and canonical transport round-tripping.

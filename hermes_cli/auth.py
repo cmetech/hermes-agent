@@ -1967,8 +1967,23 @@ def resolve_provider(
     """
     normalized = (requested or "auto").strip().lower()
 
-    # Normalize provider aliases
-    _PROVIDER_ALIASES = {
+    # The provider registry is the authority for both canonical names and
+    # aliases. In particular, canonical registration must beat an older alias
+    # claim (for example a user provider named ``or`` versus OpenRouter's
+    # bundled alias). Return the winning canonical profile name directly so
+    # this public resolver cannot reconstruct a different owner.
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+
+        _profile = _get_provider_profile(normalized)
+    except Exception:
+        _profile = None
+    if _profile is not None:
+        return _profile.name
+
+    # Compatibility aliases without a declarative provider profile retain
+    # their historical routing. Registry-owned tokens never reach this map.
+    _LEGACY_PROVIDER_ALIASES = {
         "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
         "google": "gemini", "google-gemini": "gemini", "google-ai-studio": "gemini",
         "x-ai": "xai", "x.ai": "xai", "grok": "xai",
@@ -2003,18 +2018,7 @@ def resolve_provider(
         "vllm": "custom", "llamacpp": "custom",
         "llama.cpp": "custom", "llama-cpp": "custom",
     }
-    # Extend with aliases declared in plugins/model-providers/<name>/ that aren't already mapped.
-    # This keeps providers/ as the single source for new aliases while the
-    # hardcoded dict above remains authoritative for existing ones.
-    try:
-        from providers import list_providers as _lp
-        for _pp in _lp():
-            for _alias in _pp.aliases:
-                if _alias not in _PROVIDER_ALIASES:
-                    _PROVIDER_ALIASES[_alias] = _pp.name
-    except Exception:
-        pass
-    normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+    normalized = _LEGACY_PROVIDER_ALIASES.get(normalized, normalized)
 
     if normalized == "openrouter":
         return "openrouter"
