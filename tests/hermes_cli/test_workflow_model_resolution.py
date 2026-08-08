@@ -118,6 +118,64 @@ def test_live_alias_route_selects_one_private_constraint_by_fingerprint() -> Non
     assert "private-alias.example" not in repr(constraint)
 
 
+def test_unregistered_legacy_provider_alias_keeps_worker_identity(
+    monkeypatch,
+) -> None:
+    alias = "alibaba_coding_plan"
+    canonical = "alibaba-coding-plan"
+    model = "qwen3-coder-plus"
+    endpoint = "https://coding-intl.dashscope.aliyuncs.com/v1"
+    config = {"model": {"provider": alias, "default": model}}
+
+    snapshot = parse_workflow_model_config(config)
+    route = resolve_workflow_model_reference(snapshot, model)
+    admission = runtime_provider.classify_execution_runtime(
+        provider=alias,
+        model_config=config["model"],
+        provider_config={},
+    )
+    admitted_identity = runtime_provider.execution_runtime_identity(admission)
+
+    assert admitted_identity.to_dict() == {
+        "provider": canonical,
+        "model": model,
+        "api_mode": "chat_completions",
+        "base_url_trust_class": "unknown",
+        "endpoint_sha256": hashlib.sha256(
+            b"hermes-execution-endpoint-v1\0" + endpoint.encode("utf-8")
+        ).hexdigest(),
+        "registration_provenance_digest": route.registration_provenance_digest,
+    }
+    constraint = runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity=admitted_identity,
+    )
+    assert constraint is not None
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "_get_model_config",
+        lambda: dict(config["model"]),
+    )
+    resolved = runtime_provider.resolve_runtime_provider(
+        requested=alias,
+        explicit_api_key="worker-key",
+        target_model=model,
+        route_constraint=constraint,
+    )
+    worker = runtime_provider.classify_resolved_execution_runtime(
+        resolved,
+        target_model=model,
+    )
+
+    assert resolved["provider"] == canonical
+    assert resolved["base_url"] == endpoint
+    assert runtime_provider.execution_runtime_identity(worker) == admitted_identity
+
+
 def test_live_alias_route_rejects_mismatched_requested_provider() -> None:
     config = {
         "model": {"provider": "openrouter", "default": "other-model"},

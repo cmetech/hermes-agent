@@ -118,7 +118,10 @@ def test_resolved_unknown_explicit_route_is_credential_free(monkeypatch) -> None
     assert accessed == []
 
 
-def test_auto_explicit_route_stays_unresolved_and_credential_free(monkeypatch) -> None:
+def test_unregistered_auto_explicit_route_stays_unresolved_and_credential_free(
+    monkeypatch,
+) -> None:
+    assert provider_profiles.get_provider_registration("auto") is None
     accessed = _forbid_preflight_provider_state(monkeypatch)
 
     capabilities = rp.classify_execution_runtime(

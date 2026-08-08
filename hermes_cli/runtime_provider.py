@@ -1141,7 +1141,7 @@ def classify_execution_runtime(
     """
     provider_authority = _resolve_execution_provider_authority(provider)
     api_mode = _effective_execution_api_mode(
-        provider=provider,
+        provider=provider_authority.canonical_provider or provider,
         model_config=model_config,
         provider_config=provider_config,
         target_model=target_model,
@@ -1680,7 +1680,9 @@ def _effective_execution_api_mode(
         or model_cfg.get("base_url")
         or ""
     ).strip()
-    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    configured_provider = _canonical_execution_provider(
+        model_cfg.get("provider")
+    )
 
     # These providers deliberately re-derive the transport on every model
     # switch because one provider serves models on multiple API surfaces.

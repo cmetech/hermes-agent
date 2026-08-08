@@ -10,6 +10,21 @@ import pytest
 import providers
 
 
+_UNREGISTERED_PUBLIC_LEGACY_ALIASES = (
+    ("alibaba_coding_plan", "alibaba-coding-plan"),
+    ("grok-oauth", "xai-oauth"),
+    ("minimax-global", "minimax-oauth"),
+    ("minimax-portal", "minimax-oauth"),
+    ("tencent", "tencent-tokenhub"),
+    ("tencent-cloud", "tencent-tokenhub"),
+    ("tencentmaas", "tencent-tokenhub"),
+    ("tokenhub", "tencent-tokenhub"),
+    ("x-ai-oauth", "xai-oauth"),
+    ("xai-grok-oauth", "xai-oauth"),
+    ("xai-oauth", "xai-oauth"),
+)
+
+
 def _write_plugin(
     root: Path,
     directory_name: str,
@@ -404,6 +419,23 @@ def test_auth_resolution_consumes_registry_canonical_winner(
     assert registration.profile.description == "user-or"
     assert registration.provenance.origin_kind == "user_plugin"
     assert resolve_provider("or") == "or"
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    _UNREGISTERED_PUBLIC_LEGACY_ALIASES,
+)
+def test_unregistered_public_legacy_aliases_have_auth_preflight_parity(
+    alias: str,
+    canonical: str,
+) -> None:
+    from hermes_cli.auth import resolve_provider
+    from hermes_cli.models import normalize_provider
+    from hermes_cli.runtime_provider import _canonical_execution_provider
+
+    assert resolve_provider(alias) == canonical
+    assert normalize_provider(alias) == canonical
+    assert _canonical_execution_provider(alias) == canonical
 
 
 def test_credential_free_runtime_uses_registry_winner_not_hardcoded_alias(

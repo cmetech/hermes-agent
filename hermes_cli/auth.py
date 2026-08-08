@@ -50,6 +50,7 @@ from hermes_cli.config import (
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_cli.provider_aliases import PUBLIC_PROVIDER_COMPATIBILITY_ALIASES
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -1983,42 +1984,7 @@ def resolve_provider(
 
     # Compatibility aliases without a declarative provider profile retain
     # their historical routing. Registry-owned tokens never reach this map.
-    _LEGACY_PROVIDER_ALIASES = {
-        "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
-        "google": "gemini", "google-gemini": "gemini", "google-ai-studio": "gemini",
-        "x-ai": "xai", "x.ai": "xai", "grok": "xai",
-        "xai-oauth": "xai-oauth", "x-ai-oauth": "xai-oauth",
-        "grok-oauth": "xai-oauth", "xai-grok-oauth": "xai-oauth",
-        "kimi": "kimi-coding", "kimi-for-coding": "kimi-coding", "moonshot": "kimi-coding",
-        "kimi-cn": "kimi-coding-cn", "moonshot-cn": "kimi-coding-cn",
-        "step": "stepfun", "stepfun-coding-plan": "stepfun",
-        "arcee-ai": "arcee", "arceeai": "arcee",
-        "gmi-cloud": "gmi", "gmicloud": "gmi",
-        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
-        "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
-        "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
-        "alibaba_coding_plan": "alibaba-coding-plan",
-        "claude": "anthropic", "claude-code": "anthropic",
-        "github": "copilot", "github-copilot": "copilot",
-        "github-models": "copilot", "github-model": "copilot",
-        "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
-        "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
-        "opencode": "opencode-zen", "zen": "opencode-zen",
-        "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
-        "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
-        "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
-        "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
-        "tencent-cloud": "tencent-tokenhub", "tencentmaas": "tencent-tokenhub",
-        "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
-        "go": "opencode-go", "opencode-go-sub": "opencode-go",
-        "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
-        "lmstudio": "lmstudio", "lm-studio": "lmstudio", "lm_studio": "lmstudio",
-        # Local server aliases — route through the generic custom provider
-        "ollama": "custom", "ollama_cloud": "ollama-cloud",
-        "vllm": "custom", "llamacpp": "custom",
-        "llama.cpp": "custom", "llama-cpp": "custom",
-    }
-    normalized = _LEGACY_PROVIDER_ALIASES.get(normalized, normalized)
+    normalized = PUBLIC_PROVIDER_COMPATIBILITY_ALIASES.get(normalized, normalized)
 
     if normalized == "openrouter":
         return "openrouter"

@@ -255,7 +255,10 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - hermes_cli/auth.py
+  - hermes_cli/models.py
+  - hermes_cli/provider_aliases.py
   - hermes_cli/providers.py
+  - hermes_cli/runtime_provider.py
   - providers/__init__.py
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -264,6 +267,7 @@ upstream_changes:
   - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
   - tests/hermes_cli/test_web_server.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
   - tests/providers/test_plugin_discovery.py
   - tests/providers/test_provider_registry.py
   owned_symbols:
@@ -277,6 +281,7 @@ upstream_changes:
   - registration-gated Bedrock and Vertex synthetic endpoint derivation
   - _ExecutionProviderAuthority shared runtime registration resolution
   - _static_execution_provider credential-free compatibility canonicalization
+  - PUBLIC_PROVIDER_COMPATIBILITY_ALIASES immutable shared fallback authority
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -288,7 +293,8 @@ upstream_changes:
   - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
   - Bedrock and Vertex endpoint synthesis requires a bundled winner or no registration for legacy compatibility; non-bundled same-name winners use their registered profile endpoint
   - runtime registration resolution checks the raw token first then the existing static compatibility canonical target once and shares that winner across endpoint fallback trust and provenance
-  - credential-free runtime classification canonicalizes registry misses with static compatibility aliases only and never consults config auth stores credential pools environment secrets or credential probes; auto remains unresolved
+  - credential-free runtime classification canonicalizes registry misses with the same immutable compatibility aliases as public auth and never consults config auth stores credential pools environment secrets or credential probes; unregistered auto remains unresolved
+  - public auth and pure model normalization have canonical parity for every compatibility alias not supplied by the provider registry
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
@@ -297,6 +303,7 @@ upstream_changes:
   - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
   - tests/hermes_cli/test_web_server.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
   - tests/providers/test_plugin_discovery.py
   - tests/providers/test_provider_registry.py
   expected_commit_subject: 'fix(providers): enforce canonical alias precedence'
@@ -315,11 +322,14 @@ upstream_changes:
     synthesis is bundled authority (with an unregistered legacy fallback), so a
     non-bundled same-name winner must retain its profile endpoint and provenance.
     Resolve runtime registration once, preferring the raw registry token before
-    consulting the static compatibility target; endpoint
+    consulting the shared immutable compatibility target; endpoint
     eligibility, profile fallback, trust, and provenance must consume that same
     result rather than rebuilding aliases independently. This classification
     path must not call the credential-aware provider resolver or inspect ambient
-    provider, authentication, or credential state; `auto` remains unresolved.
+    provider, authentication, or credential state; unregistered `auto` remains
+    unresolved. Public auth and pure preflight normalization must consume the
+    same compatibility map so aliases cannot drift across admission and worker
+    resolution.
     Diagnostics remain bounded and free of local paths, credentials, or provider
     payloads.
   removal_condition: Remove when upstream exposes an equivalent deterministic

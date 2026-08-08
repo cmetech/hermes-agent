@@ -19,9 +19,11 @@ import urllib.error
 import time
 from difflib import get_close_matches
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
+from hermes_cli.provider_aliases import PUBLIC_PROVIDER_COMPATIBILITY_ALIASES
 from hermes_cli.urllib_security import open_credentialed_url
 
 logger = logging.getLogger(__name__)
@@ -1279,91 +1281,29 @@ def group_providers(slugs):
     return rows
 
 
-_PROVIDER_ALIASES = {
-    "glm": "zai",
-    "z-ai": "zai",
-    "z.ai": "zai",
-    "zhipu": "zai",
-    "github": "copilot",
-    "github-copilot": "copilot",
-    "github-models": "copilot",
-    "github-model": "copilot",
-    "github-copilot-acp": "copilot-acp",
-    "copilot-acp-agent": "copilot-acp",
-    "google": "gemini",
-    "google-gemini": "gemini",
-    "google-ai-studio": "gemini",
+_MODEL_ONLY_PROVIDER_ALIASES = {
     "google-vertex": "vertex",
     "vertex-ai": "vertex",
     "gcp-vertex": "vertex",
     "vertexai": "vertex",
-    "kimi": "kimi-coding",
-    "moonshot": "kimi-coding",
-    "kimi-cn": "kimi-coding-cn",
-    "moonshot-cn": "kimi-coding-cn",
-    "step": "stepfun",
-    "stepfun-coding-plan": "stepfun",
-    "arcee-ai": "arcee",
-    "arceeai": "arcee",
-    "gmi-cloud": "gmi",
-    "gmicloud": "gmi",
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
-    "minimax-china": "minimax-cn",
-    "minimax_cn": "minimax-cn",
-    "minimax-portal": "minimax-oauth",
-    "minimax-global": "minimax-oauth",
-    "minimax_oauth": "minimax-oauth",
-    "claude": "anthropic",
-    "claude-code": "anthropic",
     "deep-seek": "deepseek",
-    "opencode": "opencode-zen",
-    "zen": "opencode-zen",
-    "go": "opencode-go",
-    "opencode-go-sub": "opencode-go",
-    "aigateway": "ai-gateway",
-    "vercel": "ai-gateway",
-    "vercel-ai-gateway": "ai-gateway",
-    "kilo": "kilocode",
-    "kilo-code": "kilocode",
-    "kilo-gateway": "kilocode",
     "dashscope": "alibaba",
     "aliyun": "alibaba",
     "qwen": "alibaba",
     "alibaba-cloud": "alibaba",
-    "qwen-portal": "qwen-oauth",
-    "hf": "huggingface",
-    "hugging-face": "huggingface",
-    "huggingface-hub": "huggingface",
     "novita-ai": "novita",
     "novitaai": "novita",
-    "mimo": "xiaomi",
-    "xiaomi-mimo": "xiaomi",
-    "tencent": "tencent-tokenhub",
-    "tokenhub": "tencent-tokenhub",
-    "tencent-cloud": "tencent-tokenhub",
-    "tencentmaas": "tencent-tokenhub",
-    "aws": "bedrock",
-    "aws-bedrock": "bedrock",
-    "amazon-bedrock": "bedrock",
-    "amazon": "bedrock",
-    "grok": "xai",
-    "grok-oauth": "xai-oauth",
-    "xai-oauth": "xai-oauth",
-    "x-ai-oauth": "xai-oauth",
-    "xai-grok-oauth": "xai-oauth",
-    "x-ai": "xai",
-    "x.ai": "xai",
     "nim": "nvidia",
     "nvidia-nim": "nvidia",
     "build-nvidia": "nvidia",
     "nemotron": "nvidia",
-    "lmstudio": "lmstudio",
-    "lm-studio": "lmstudio",
-    "lm_studio": "lmstudio",
-    "ollama": "custom",  # bare "ollama" = local; use "ollama-cloud" for cloud
-    "ollama_cloud": "ollama-cloud",
 }
+_PROVIDER_ALIASES = MappingProxyType({
+    **PUBLIC_PROVIDER_COMPATIBILITY_ALIASES,
+    **_MODEL_ONLY_PROVIDER_ALIASES,
+})
 
 
 # In-repo fallback for the model Hermes silently lands on when the user never
