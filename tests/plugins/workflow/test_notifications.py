@@ -230,6 +230,106 @@ def test_notification_authority_values_are_value_free_across_durable_delivery(
     assert history[0]["payload"]["mismatched_fields"] == authority_field_names
 
 
+def test_notification_authority_containers_scrub_raw_echoes_before_sanitizing(
+    tmp_path,
+):
+    """Raw authority leaves stay private even under secret or cyclic containers."""
+    store = RunStore(tmp_path / "notification-private-authority-containers")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 13, tzinfo=timezone.utc)
+    endpoint_identity = "e5" * 32
+    nested_endpoint_identity = "f6" * 32
+    registration_identity = "a7" * 32
+    nested_registration_identity = "b8" * 32
+    authority_field_names = [
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    ]
+    endpoint_container = {
+        "primary": endpoint_identity,
+        "nested": [nested_endpoint_identity],
+    }
+    endpoint_container["cycle"] = endpoint_container
+
+    notification_id = outbox.record(
+        run_id="private-authority-container-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "status": "failed",
+            "interaction": {
+                "type": "reconcile",
+                "interaction_id": "authority-container-interaction",
+            },
+            "mismatched_fields": authority_field_names,
+            "credentialEndpointSha256": endpoint_container,
+            "registration_provenance_digest": [
+                registration_identity,
+                {"nested": nested_registration_identity},
+            ],
+            "detail": (
+                f"endpoint values {endpoint_identity} {nested_endpoint_identity}; "
+                f"registration value {registration_identity}"
+            ),
+            "messages": [
+                f"registration nested {nested_registration_identity}",
+                {"echo": endpoint_identity},
+            ],
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id="private-authority-container-run")
+    with store._connect() as connection:
+        outbox_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_outbox "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+        fact_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_facts "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+
+    public_payloads = json.dumps(
+        {
+            "outbox": outbox_payloads,
+            "facts": fact_payloads,
+            "leased": leased,
+            "history": history,
+        },
+        sort_keys=True,
+    )
+    for private_value in (
+        endpoint_identity,
+        nested_endpoint_identity,
+        registration_identity,
+        nested_registration_identity,
+    ):
+        assert private_value not in public_payloads
+    assert outbox_payloads and fact_payloads
+    expected_actions = ["status", "events", "resume", "retry", "abandon"]
+    for item in (leased[0], history[0]):
+        assert item["payload"]["code"] == "provider_capability_drift"
+        assert item["payload"]["mismatched_fields"] == authority_field_names
+        assert item["payload"]["next_actions"] == expected_actions
+
+
 def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
     store = RunStore(tmp_path / "stable-delivery-reason")
     outbox = NotificationOutbox(store)

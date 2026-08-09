@@ -194,9 +194,6 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str 
 
 def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str, object]:
     """Project notification data without durable raw recovery/error authority."""
-    projected = sanitize_projection(dict(payload))
-    if not isinstance(projected, dict):
-        return {}
     sensitive_values: set[str] = set()
 
     def normalized_key(key: object) -> str:
@@ -221,18 +218,50 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
             )
         )
 
-    to_collect: list[object] = [projected]
-    while to_collect:
-        current = to_collect.pop()
-        if isinstance(current, dict):
-            for key, value in current.items():
-                if (
-                    is_sensitive_key(key) or is_private_authority_value_key(key)
-                ) and isinstance(value, str):
-                    sensitive_values.add(value)
-                to_collect.append(value)
-        elif isinstance(current, list):
-            to_collect.extend(current)
+    def collect_private_string_leaves(value: object) -> set[str]:
+        # Mirror sanitize_projection's closed traversal limits while preventing
+        # cyclic containers from creating an unbounded authority-value walk.
+        collected: set[str] = set()
+        seen: set[tuple[int, bool]] = set()
+        pending_values: list[tuple[object, int, bool]] = [(value, 0, False)]
+        while pending_values:
+            current, depth, collect_all = pending_values.pop()
+            if depth > 12:
+                continue
+            if isinstance(current, str):
+                if collect_all and current:
+                    collected.add(current)
+                continue
+            if isinstance(current, Mapping):
+                state = (id(current), collect_all)
+                if state in seen:
+                    continue
+                seen.add(state)
+                for key, child in list(current.items())[:200]:
+                    pending_values.append((
+                        child,
+                        depth + 1,
+                        collect_all
+                        or is_sensitive_key(key)
+                        or is_private_authority_value_key(key),
+                    ))
+                continue
+            if isinstance(current, (list, tuple)):
+                state = (id(current), collect_all)
+                if state in seen:
+                    continue
+                seen.add(state)
+                pending_values.extend(
+                    (child, depth + 1, collect_all) for child in current[:200]
+                )
+        return collected
+
+    raw_payload = dict(payload)
+    sensitive_values.update(collect_private_string_leaves(raw_payload))
+    projected = sanitize_projection(raw_payload)
+    if not isinstance(projected, dict):
+        return {}
+    sensitive_values.update(collect_private_string_leaves(projected))
 
     pending: list[object] = [projected]
     while pending:
