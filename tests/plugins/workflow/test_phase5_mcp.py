@@ -66,15 +66,47 @@ def test_phase5_mcp_launches_only_exact_hermes_python_with_isolated_guard(tmp_pa
 
 def test_phase5_mcp_runtime_identity_round_trips_and_drift_blocks_worker(monkeypatch):
     import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+
+    runtime = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    expected_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(runtime)
+    )
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="d" * 64,
+        requested_provider="openrouter",
+        model="openai/gpt-5.4",
+        api_mode="chat_completions",
+        base_url=runtime["base_url"],
+        provider_config={},
+        identity=expected_identity,
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
+    )
 
     request = PluginAgentRunRequest(
         prompt="run",
+        provider="openrouter",
+        model="openai/gpt-5.4",
         intended_authority_digest="a" * 64,
+        expected_runtime_identity=expected_identity.to_dict(),
+        expected_runtime_route_fingerprint="d" * 64,
+        expected_runtime_route_options={},
         expected_mcp_runtime_identity_digest="b" * 64,
         allowed_tools=(),
     )
     decoded = PluginAgentRunRequest.from_wire(request.to_wire())
     _validate_request(decoded)
+    assert decoded.expected_mcp_runtime_identity_digest == "b" * 64
+    assert decoded.expected_runtime_identity == expected_identity.to_dict()
     monkeypatch.setattr(
         worker, "plugin_agent_python_runtime_identity", lambda: "c" * 64
     )
