@@ -6,6 +6,8 @@ import logging
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
@@ -328,6 +330,124 @@ def test_notification_authority_containers_scrub_raw_echoes_before_sanitizing(
         assert item["payload"]["code"] == "provider_capability_drift"
         assert item["payload"]["mismatched_fields"] == authority_field_names
         assert item["payload"]["next_actions"] == expected_actions
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("child_201", "depth_13", "unsupported_set", "deep_first_alias"),
+)
+def test_incomplete_notification_authority_collection_fails_closed(
+    tmp_path,
+    case,
+):
+    """Unprovable authority collection retains only recovery-safe metadata."""
+    private_value = {
+        "child_201": "c1" * 32,
+        "depth_13": "d2" * 32,
+        "unsupported_set": "e3" * 32,
+        "deep_first_alias": "f4" * 32,
+    }[case]
+    if case == "child_201":
+        private_key = "credentialEndpointSha256"
+        private_container = [f"public-{index}" for index in range(200)] + [
+            private_value
+        ]
+        mismatch = "endpoint_sha256"
+    elif case == "depth_13":
+        private_key = "expectedRegistrationProvenanceDigest"
+        private_container = private_value
+        for _ in range(12):
+            private_container = [private_container]
+        mismatch = "registration_provenance_digest"
+    elif case == "unsupported_set":
+        private_key = "expectedEndpointSha256"
+        private_container = {private_value}
+        mismatch = "endpoint_sha256"
+    else:
+        private_key = "expectedRegistrationProvenanceDigest"
+        shared = {"leaf": private_value}
+        deep = shared
+        for _ in range(10):
+            deep = [deep]
+        private_container = {"shallow": shared, "deep": deep}
+        mismatch = "registration_provenance_digest"
+
+    store = RunStore(tmp_path / f"notification-incomplete-{case}")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 14, tzinfo=timezone.utc)
+    arbitrary_sibling = f"arbitrary-sibling-{case}"
+    notification_id = outbox.record(
+        run_id=f"incomplete-authority-{case}",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "status": "failed",
+            "interaction": {
+                "type": "reconcile",
+                "interaction_id": f"interaction-{case}",
+            },
+            "mismatched_fields": [mismatch],
+            private_key: private_container,
+            "detail": f"{arbitrary_sibling} {private_value}",
+            "messages": [private_value, arbitrary_sibling],
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id=f"incomplete-authority-{case}")
+    with store._connect() as connection:
+        outbox_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_outbox "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+        fact_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_facts "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+
+    rendered = json.dumps(
+        {
+            "outbox": outbox_payloads,
+            "facts": fact_payloads,
+            "leased": leased,
+            "history": history,
+        },
+        sort_keys=True,
+    )
+    assert private_value not in rendered
+    assert arbitrary_sibling not in rendered
+    assert outbox_payloads and fact_payloads
+    expected_actions = ["status", "events", "resume", "retry", "abandon"]
+    for item in (leased[0], history[0]):
+        projected = item["payload"]
+        assert set(projected) == {
+            "code",
+            "status",
+            "interaction",
+            "mismatched_fields",
+            "state_version",
+            "next_actions",
+        }
+        assert projected["code"] == "provider_capability_drift"
+        assert projected["interaction"] == {"type": "reconcile"}
+        assert projected["mismatched_fields"] == [mismatch]
+        assert projected["next_actions"] == expected_actions
 
 
 def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):

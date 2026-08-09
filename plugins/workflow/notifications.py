@@ -17,7 +17,7 @@ from plugins.workflow.evidence import (
     _read_contained_regular_file,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.sanitize import sanitize_projection
+from plugins.workflow.sanitize import public_display_identifier, sanitize_projection
 
 
 logger = logging.getLogger(__name__)
@@ -218,15 +218,17 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
             )
         )
 
-    def collect_private_string_leaves(value: object) -> set[str]:
+    def collect_private_string_leaves(value: object) -> tuple[set[str], bool]:
         # Mirror sanitize_projection's closed traversal limits while preventing
         # cyclic containers from creating an unbounded authority-value walk.
         collected: set[str] = set()
-        seen: set[tuple[int, bool]] = set()
+        complete = True
+        shallowest_depth: dict[tuple[int, bool], int] = {}
         pending_values: list[tuple[object, int, bool]] = [(value, 0, False)]
         while pending_values:
             current, depth, collect_all = pending_values.pop()
             if depth > 12:
+                complete = False
                 continue
             if isinstance(current, str):
                 if collect_all and current:
@@ -234,10 +236,14 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
                 continue
             if isinstance(current, Mapping):
                 state = (id(current), collect_all)
-                if state in seen:
+                prior_depth = shallowest_depth.get(state)
+                if prior_depth is not None and depth >= prior_depth:
                     continue
-                seen.add(state)
-                for key, child in list(current.items())[:200]:
+                shallowest_depth[state] = depth
+                children = list(current.items())
+                if len(children) > 200:
+                    complete = False
+                for key, child in children[:200]:
                     pending_values.append((
                         child,
                         depth + 1,
@@ -248,20 +254,84 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
                 continue
             if isinstance(current, (list, tuple)):
                 state = (id(current), collect_all)
-                if state in seen:
+                prior_depth = shallowest_depth.get(state)
+                if prior_depth is not None and depth >= prior_depth:
                     continue
-                seen.add(state)
+                shallowest_depth[state] = depth
+                if len(current) > 200:
+                    complete = False
                 pending_values.extend(
                     (child, depth + 1, collect_all) for child in current[:200]
                 )
-        return collected
+                continue
+            if collect_all and current is not None and not isinstance(
+                current, (bool, int, float)
+            ):
+                complete = False
+        return collected, complete
+
+    def minimal_recovery_payload(value: Mapping[str, object]) -> dict[str, object]:
+        minimal: dict[str, object] = {}
+        code = value.get("code")
+        if isinstance(code, str) and public_display_identifier(code) == code:
+            minimal["code"] = code
+        allowed_mismatches = frozenset({
+            "provider",
+            "model",
+            "api_mode",
+            "base_url_trust_class",
+            "endpoint_sha256",
+            "registration_provenance_digest",
+        })
+        mismatches = value.get("mismatched_fields")
+        if isinstance(mismatches, list):
+            safe_mismatches = [
+                item
+                for item in mismatches[: len(allowed_mismatches)]
+                if isinstance(item, str) and item in allowed_mismatches
+            ]
+            if safe_mismatches:
+                minimal["mismatched_fields"] = safe_mismatches
+        allowed_statuses = frozenset({
+            "queued",
+            "running",
+            "waiting_retry",
+            "paused",
+            "recovery_pending",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "abandoned",
+        })
+        status = value.get("status")
+        if isinstance(status, str) and status in allowed_statuses:
+            minimal["status"] = status
+            safe_interaction: dict[str, object] = {}
+            interaction = value.get("interaction")
+            if isinstance(interaction, Mapping):
+                interaction_type = interaction.get("type")
+                if interaction_type in {
+                    "approval",
+                    "workflow_approval",
+                    "loop_input",
+                    "loop_signal_confirmation",
+                    "reconcile",
+                }:
+                    safe_interaction["type"] = interaction_type
+            minimal["interaction"] = safe_interaction
+        return minimal
 
     raw_payload = dict(payload)
-    sensitive_values.update(collect_private_string_leaves(raw_payload))
+    raw_values, raw_complete = collect_private_string_leaves(raw_payload)
+    sensitive_values.update(raw_values)
     projected = sanitize_projection(raw_payload)
     if not isinstance(projected, dict):
         return {}
-    sensitive_values.update(collect_private_string_leaves(projected))
+    projected_values, projected_complete = collect_private_string_leaves(projected)
+    sensitive_values.update(projected_values)
+    if not raw_complete or not projected_complete:
+        return minimal_recovery_payload(projected)
 
     pending: list[object] = [projected]
     while pending:
