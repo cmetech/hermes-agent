@@ -16,6 +16,66 @@ _SIX_FIELD_RUNTIME_IDENTITY = {
 }
 
 
+@pytest.mark.parametrize(
+    ("request_kwargs", "error_match"),
+    [
+        ({}, None),
+        (
+            {"intended_authority_digest": "a" * 64},
+            "intended authority requires expected runtime identity",
+        ),
+        (
+            {
+                "expected_runtime_identity": dict(_SIX_FIELD_RUNTIME_IDENTITY),
+                "expected_runtime_route_fingerprint": "b" * 64,
+                "expected_runtime_route_options": {},
+            },
+            "expected runtime identity requires sealed intended authority",
+        ),
+        (
+            {
+                "intended_authority_digest": "a" * 64,
+                "expected_runtime_identity": dict(_SIX_FIELD_RUNTIME_IDENTITY),
+                "expected_runtime_route_fingerprint": "b" * 64,
+                "expected_runtime_route_options": {},
+            },
+            None,
+        ),
+        (
+            {
+                "intended_authority_digest": "a" * 64,
+                "expected_runtime_identity": {
+                    key: value
+                    for key, value in _SIX_FIELD_RUNTIME_IDENTITY.items()
+                    if key != "endpoint_sha256"
+                },
+                "expected_runtime_route_fingerprint": "b" * 64,
+                "expected_runtime_route_options": {},
+            },
+            "expected runtime identity is malformed",
+        ),
+    ],
+    ids=(
+        "legacy-both-absent",
+        "intended-authority-only",
+        "runtime-identity-only",
+        "sealed-pair-valid",
+        "sealed-pair-malformed-identity",
+    ),
+)
+def test_plugin_agent_sealed_authority_fields_form_an_exact_pair(
+    request_kwargs,
+    error_match,
+) -> None:
+    request = PluginAgentRunRequest(prompt="continue", **request_kwargs)
+
+    if error_match is None:
+        _validate_request(request)
+    else:
+        with pytest.raises(ValueError, match=error_match):
+            _validate_request(request)
+
+
 def test_model_visible_prefix_digest_binds_exact_prompt_tool_schema_and_order() -> None:
     digest = model_tools.model_visible_prefix_digest
     first_tools = [
@@ -788,29 +848,52 @@ def test_phase5_worker_checks_runtime_prefix_before_shared_session_lookup(
     monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    runtime = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "credential",
+    }
     monkeypatch.setattr(
         runtime_provider,
         "resolve_runtime_provider",
-        lambda **_kwargs: {
-            "provider": "sealed-provider",
-            "model": "sealed-model",
-            "api_mode": "chat_completions",
-            "base_url": "",
-            "api_key": "credential",
-        },
+        lambda **_kwargs: runtime,
+    )
+    expected_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(runtime)
+    )
+
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="d" * 64,
+        requested_provider="openrouter",
+        model="openai/gpt-5.4",
+        api_mode="chat_completions",
+        base_url=runtime["base_url"],
+        provider_config={},
+        identity=expected_identity,
+    )
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
     )
 
     result = worker._run({
         "plugin_id": "workflow",
         "request": PluginAgentRunRequest(
             prompt="continue",
-            provider="sealed-provider",
-            model="sealed-model",
+            provider="openrouter",
+            model="openai/gpt-5.4",
             context_mode="shared",
             session_id="session-1",
             allowed_tools=(),
             intended_authority_digest="a" * 64,
             expected_model_visible_prefix_digest="b" * 64,
+            expected_runtime_identity=expected_identity.to_dict(),
+            expected_runtime_route_fingerprint="d" * 64,
+            expected_runtime_route_options={},
         ).to_wire(),
     })
 

@@ -153,10 +153,51 @@ def test_phase5_inline_agent_deny_rule_is_not_overridden(tmp_path):
     assert runner.requests == []
 
 
-def test_phase5_worker_rejects_forged_unreachable_inline_agent_before_provider():
+def test_phase5_worker_rejects_forged_unreachable_inline_agent_before_provider(
+    monkeypatch,
+):
+    import hermes_cli.runtime_provider as runtime_provider
+
+    runtime = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "test-credential",
+    }
+    expected_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(runtime)
+    )
+    identity = expected_identity.to_dict()
+
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="d" * 64,
+        requested_provider="openrouter",
+        model="openai/gpt-5.4",
+        api_mode="chat_completions",
+        base_url=runtime["base_url"],
+        provider_config={},
+        identity=expected_identity,
+    )
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: runtime,
+    )
     request = PluginAgentRunRequest(
         prompt="parent",
+        provider="openrouter",
+        model="openai/gpt-5.4",
         intended_authority_digest="a" * 64,
+        expected_runtime_identity=identity,
+        expected_runtime_route_fingerprint="d" * 64,
+        expected_runtime_route_options={},
         allowed_tools=(),
         inline_agents={
             "reviewer": {

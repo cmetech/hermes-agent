@@ -546,16 +546,17 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
     monkeypatch.setattr(plugin_agent, "PluginAgentRunner", ChildRunner)
     monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    runtime = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "secret",
+    }
     monkeypatch.setattr(
         runtime_provider,
         "resolve_runtime_provider",
-        lambda **_kwargs: {
-            "provider": "openrouter",
-            "model": "openai/gpt-5.4",
-            "api_mode": "chat_completions",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "secret",
-        },
+        lambda **_kwargs: runtime,
     )
     identity = {
         "provider": "openrouter",
@@ -565,12 +566,35 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         "endpoint_sha256": "6" * 64,
         "registration_provenance_digest": "5" * 64,
     }
+    expected_primary_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(runtime)
+    )
+    primary_identity = expected_primary_identity.to_dict()
+
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="9" * 64,
+        requested_provider="openrouter",
+        model="openai/gpt-5.4",
+        api_mode="chat_completions",
+        base_url=runtime["base_url"],
+        provider_config={},
+        identity=expected_primary_identity,
+    )
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
+    )
     structured_schema = normalize_schema({"type": "object"})
     request = PluginAgentRunRequest(
         prompt="immutable user turn",
         provider="openrouter",
         model="openai/gpt-5.4",
         intended_authority_digest="a" * 64,
+        expected_runtime_identity=primary_identity,
+        expected_runtime_route_fingerprint="9" * 64,
+        expected_runtime_route_options={},
         allowed_tools=(),
         sandbox_policy={"mode": "provider_native"},
         workdir=tmp_path,
@@ -703,22 +727,46 @@ def test_worker_treats_provider_capability_drift_as_terminal(
     monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
     monkeypatch.setattr(plugin_agent, "PluginAgentRunner", ChildRunner)
     monkeypatch.setattr(worker, "_emit", lambda *_args, **_kwargs: None)
+    runtime = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "private-credential",
+    }
     monkeypatch.setattr(
         runtime_provider,
         "resolve_runtime_provider",
-        lambda **_kwargs: {
-            "provider": "openrouter",
-            "model": "openai/gpt-5.4",
-            "api_mode": "chat_completions",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "private-credential",
-        },
+        lambda **_kwargs: runtime,
+    )
+    expected_primary_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(runtime)
+    )
+    primary_identity = expected_primary_identity.to_dict()
+
+    constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="9" * 64,
+        requested_provider="openrouter",
+        model="openai/gpt-5.4",
+        api_mode="chat_completions",
+        base_url=runtime["base_url"],
+        provider_config={},
+        identity=expected_primary_identity,
+    )
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "select_credential_free_execution_route",
+        lambda *_args, **_kwargs: constraint,
     )
     request = PluginAgentRunRequest(
         prompt="immutable user turn",
         provider="openrouter",
         model="openai/gpt-5.4",
         intended_authority_digest="a" * 64,
+        expected_runtime_identity=primary_identity,
+        expected_runtime_route_fingerprint="9" * 64,
+        expected_runtime_route_options={},
         allowed_tools=(),
         workdir=tmp_path,
         sealed_provider_attempt_grant=True,

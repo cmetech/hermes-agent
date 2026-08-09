@@ -1092,6 +1092,13 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError(
             "expected model-visible prefix requires sealed intended authority"
         )
+    if (
+        request.intended_authority_digest is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError(
+            "intended authority requires expected runtime identity"
+        )
     if request.expected_runtime_identity is not None:
         from hermes_cli.runtime_provider import (
             execution_runtime_identity_from_sealed_route,

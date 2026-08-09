@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult
+from agent.plugin_agent import (
+    PluginAgentRunRequest,
+    PluginAgentRunResult,
+    _validate_request,
+)
 from hermes_cli.provider_capabilities import WorkflowProviderFeature
 from plugins.workflow.admission import RunAdmissionRequest
 import plugins.workflow.execution_semantics as execution_semantics
@@ -146,6 +150,21 @@ def _assert_sealed_route_identity(
         "endpoint_sha256",
         "registration_provenance_digest",
     }
+
+
+def test_intended_authority_cannot_enter_worker_without_runtime_identity() -> None:
+    request = PluginAgentRunRequest(
+        prompt="sealed request",
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        intended_authority_digest="a" * 64,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="intended authority requires expected runtime identity",
+    ):
+        _validate_request(request)
 
 
 def test_all_phase5_request_routes_use_their_exact_endpoint_bound_identity(

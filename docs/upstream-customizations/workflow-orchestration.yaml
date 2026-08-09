@@ -387,6 +387,7 @@ upstream_changes:
   - build_anthropic_bedrock_client
   - ManagedLlmStream._callback_error
   - PluginAgentRunRequest
+  - _validate_request
   - _phase5_structured_repair_matches_admission
   - phase5_node_intended_authority_digest
   - phase5_shared_context_compatibility_digest
@@ -398,6 +399,7 @@ upstream_changes:
   - ApprovalExecutor.execute
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
+  - plugin-agent intended authority and expected runtime identity are accepted only as a complete pair while legacy requests may omit both
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
   - current normalized endpoint digest must exactly match sealed authority before MCP startup agent construction fallback or provider transport
   - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
@@ -439,6 +441,7 @@ upstream_changes:
   - sealed boto3 and AnthropicBedrock clients receive the selected endpoint explicitly while unsealed boto3 construction retains region-only SDK resolution
   tests:
   - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/plugins/workflow/test_phase5_adversarial_remediation.py
   - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_phase5_execution_context.py
