@@ -180,9 +180,10 @@ def _credential_free_route_url(value: object) -> str:
         else f"{quote(key, safe='')}={quote(query_value, safe='')}"
         for key, query_value in sorted(query_evidence)
     )
+    normalized_path = (parsed.path or "").rstrip("/")
     return urlunsplit(
-        (scheme, normalized_host, parsed.path or "", structural_query, "")
-    ).rstrip("/")
+        (scheme, normalized_host, normalized_path, structural_query, "")
+    )
 
 
 def credential_free_endpoint_config_sha256(value: object) -> str:

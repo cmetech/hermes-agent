@@ -1830,7 +1830,10 @@ def _run(
                 "approval",
                 {"command": command, "description": description},
             )
-            if request._provider_attempt_authority is not None:
+            if (
+                request._provider_attempt_authority is not None
+                and request.approved_action_digest == descriptor["action_digest"]
+            ):
                 try:
                     from agent.plugin_agent import _consume_shared_approved_action
 

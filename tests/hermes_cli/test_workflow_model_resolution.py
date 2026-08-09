@@ -55,6 +55,47 @@ def _route_identity(route) -> dict[str, str]:
     }
 
 
+def _endpoint_surface_config(
+    surface: str, url: str
+) -> tuple[dict[str, object], str]:
+    config = _config()
+    if surface == "active":
+        config["model"]["base_url"] = url
+        return config, "claude-sonnet-4.6"
+    if surface == "alias":
+        config["model_aliases"]["review"]["base_url"] = url
+        return config, "@review"
+    config["model_tiers"]["small"]["base_url"] = url
+    return config, "small"
+
+
+@pytest.mark.parametrize("surface", ["active", "alias", "tier"])
+def test_trailing_path_slash_before_query_is_normalization_equivalent(
+    surface: str,
+) -> None:
+    first, reference = _endpoint_surface_config(
+        surface, "https://example.test/v1/?region=one"
+    )
+    second, _reference = _endpoint_surface_config(
+        surface, "https://example.test/v1?region=one"
+    )
+    first_snapshot = parse_workflow_model_config(first)
+    second_snapshot = parse_workflow_model_config(second)
+    first_route = resolve_workflow_model_reference(first_snapshot, reference)
+    second_route = resolve_workflow_model_reference(second_snapshot, reference)
+
+    assert first_snapshot.config_fingerprint == second_snapshot.config_fingerprint
+    assert first_route.endpoint_sha256 == second_route.endpoint_sha256
+    assert first_route.route_fingerprint == second_route.route_fingerprint
+    assert runtime_provider.select_credential_free_execution_route(
+        second,
+        requested_provider=first_route.provider,
+        target_model=first_route.model,
+        route_fingerprint=first_route.route_fingerprint,
+        expected_runtime_identity=_route_identity(first_route),
+    ) is not None
+
+
 def test_query_order_and_repeated_values_are_normalization_equivalent() -> None:
     first = _endpoint_config(
         "https://example.test/v1?region=one&region=two&deployment=three"
@@ -103,7 +144,9 @@ def test_meaningful_endpoint_changes_change_all_route_identity(changed_url) -> N
 
 
 def test_live_route_selection_reconstructs_sealed_v2_identity() -> None:
-    config = _endpoint_config("https://OPENROUTER.ai:443/api/v1/")
+    config = _endpoint_config(
+        "https://OPENROUTER.ai:443/api/v1/?region=one"
+    )
     old_snapshot = model_resolution._parse_workflow_model_config_v2(config)
     old_route = resolve_workflow_model_reference(old_snapshot, "@review")
     current_route = resolve_workflow_model_reference(

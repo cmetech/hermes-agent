@@ -188,7 +188,8 @@ upstream_changes:
     Public projections include only route URL digests, never URLs or secrets.
     Resolver v3 config and route fingerprints use the centralized normalized
     endpoint digest rather than hashing raw URL spelling or credential-bearing
-    values. Live route selection reconstructs resolver v2 identity only for
+    values, including a trailing path slash before a structural query. Live
+    route selection reconstructs resolver v2 identity only for
     immutable replay, and requires one exact current-or-v2 match. Dynamic
     Bedrock region and Vertex project/location authority is frozen privately,
     fingerprinted digest-only, and shared by admission and worker preflight.
@@ -441,7 +442,7 @@ upstream_changes:
   - sealed native and pooled Anthropic candidates publish the concrete client Anthropic credential endpoint OAuth identity generic credential endpoint and pool identity together before post-lock retirement
   - sealed Anthropic request-local construction uses only the published credential while direct 401 recovery exclusively owns live token resolution and success-only retry guards
   - one acquired sealed candidate owns one initial construction and at most one identical-candidate retry before another credential source or fallback may run
-  - one scheduler-consumed approval digest is atomically consumable once across the complete inline-agent request tree while later matching siblings pause and broker state is torn down with the parent exchange
+  - one scheduler-consumed approval digest is atomically consumable once across the complete inline-agent request tree only when the current request carries that exact non-null digest; cleared fallback and later matching sibling requests pause while broker state is torn down with the parent exchange
   - pending sealed adoption is generation-bound and cleared on success bounded failure route drift cancellation disposal fallback transition and every turn exit
   - fallback credential resolution waits for pending adoption and invalidates the captured generation immediately before route publication
   - credential-pool counts and Vertex or 429 guards change only after successful adoption while acquisition failures retain their existing bounds

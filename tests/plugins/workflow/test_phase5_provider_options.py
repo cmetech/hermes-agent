@@ -497,8 +497,19 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     import hermes_cli.runtime_provider as runtime_provider
     import hermes_state
     import run_agent
+    from tools.terminal_tool import _get_approval_callback
 
     captured = []
+    fallback_callback_results: list[str] = []
+    fallback_worker_results: list[dict] = []
+    command = "publish fallback artifact"
+    description = "outward fallback effect"
+    digest = worker._interaction_descriptor(
+        "approval", {"command": command, "description": description}
+    )["action_digest"]
+    authority = plugin_agent._ProviderAttemptAuthority(
+        3, approved_action_digest=digest
+    )
 
     class FakeDB:
         def close(self):
@@ -521,6 +532,14 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
             return "8" * 64
 
         def run_conversation(self, _prompt, conversation_history=None):
+            if self.model == "anthropic/claude-sonnet-4.6":
+                callback = _get_approval_callback()
+                assert callback is not None
+                fallback_callback_results.append(callback(command, description))
+                return {
+                    "api_calls": 0,
+                    "final_response": fallback_callback_results[-1],
+                }
             return {"failed": True, "api_calls": 1, "final_response": ""}
 
     class ChildRunner:
@@ -529,6 +548,10 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
 
         def run(self, request, **kwargs):
             captured.append((request, kwargs))
+            fallback_worker_results.append(worker._run({
+                "plugin_id": "workflow",
+                "request": request.to_wire(),
+            }))
             return PluginAgentRunResult(
                 final_response="fallback done",
                 session_id="fallback-session",
@@ -556,19 +579,23 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": "secret",
     }
+    fallback_runtime = {
+        **runtime,
+        "model": "anthropic/claude-sonnet-4.6",
+    }
     monkeypatch.setattr(
         runtime_provider,
         "resolve_runtime_provider",
-        lambda **_kwargs: runtime,
+        lambda **kwargs: (
+            fallback_runtime
+            if kwargs.get("target_model") == "anthropic/claude-sonnet-4.6"
+            else runtime
+        ),
     )
-    identity = {
-        "provider": "openrouter",
-        "model": "anthropic/claude-sonnet-4.6",
-        "api_mode": "chat_completions",
-        "base_url_trust_class": "trusted_direct",
-        "endpoint_sha256": "6" * 64,
-        "registration_provenance_digest": "5" * 64,
-    }
+    fallback_identity = runtime_provider.execution_runtime_identity(
+        runtime_provider.classify_resolved_execution_runtime(fallback_runtime)
+    )
+    identity = fallback_identity.to_dict()
     expected_primary_identity = runtime_provider.execution_runtime_identity(
         runtime_provider.classify_resolved_execution_runtime(runtime)
     )
@@ -583,11 +610,44 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         provider_config={},
         identity=expected_primary_identity,
     )
+    fallback_constraint = runtime_provider.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="7" * 64,
+        requested_provider="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        api_mode="chat_completions",
+        base_url=fallback_runtime["base_url"],
+        provider_config={},
+        identity=fallback_identity,
+    )
 
     monkeypatch.setattr(
         runtime_provider,
         "select_credential_free_execution_route",
-        lambda *_args, **_kwargs: constraint,
+        lambda *_args, **kwargs: (
+            fallback_constraint
+            if kwargs.get("target_model") == "anthropic/claude-sonnet-4.6"
+            else constraint
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_structured_output_capability",
+        lambda runtime, *, schema_fingerprint, model=None: (
+            runtime_provider.StructuredOutputCapabilityDecision(
+                strategy=(
+                    StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+                    if model == "anthropic/claude-sonnet-4.6"
+                    else StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+                ),
+                effective_provider=runtime.effective_provider,
+                model=model or "",
+                api_mode=runtime.api_mode,
+                declaration_source="test",
+                adapter_version=1,
+                schema_fingerprint=schema_fingerprint,
+                rationale="test fixture",
+            )
+        ),
     )
     structured_schema = normalize_schema({"type": "object"})
     request = PluginAgentRunRequest(
@@ -602,6 +662,8 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         sandbox_policy={"mode": "provider_native"},
         workdir=tmp_path,
         sealed_provider_attempt_grant=True,
+        approved_action_digest=digest,
+        _provider_attempt_authority=authority.descriptor,
         structured_output=StructuredOutputRequest(
             schema=structured_schema,
             strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
@@ -625,7 +687,13 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
         },
     )
 
-    result = worker._run({"plugin_id": "workflow", "request": request.to_wire()})
+    try:
+        result = worker._run({"plugin_id": "workflow", "request": request.to_wire()})
+        rightful_consumption = plugin_agent._consume_shared_approved_action(
+            authority.descriptor, digest
+        )
+    finally:
+        authority.close()
 
     assert result["status"] == "completed"
     assert result["final_response"] == "fallback done"
@@ -651,7 +719,11 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     )
     assert child.fallback_model is None
     assert child.sealed_fallback_route is None
+    assert child.approved_action_digest is None
     assert child.sandbox_policy == {"mode": "provider_native"}
+    assert fallback_callback_results == ["deny"], fallback_worker_results
+    assert fallback_worker_results[0]["status"] == "paused"
+    assert rightful_consumption is True
     _validate_request(child)
     assert kwargs["is_cancelled"]() is False
 
