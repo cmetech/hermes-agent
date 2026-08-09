@@ -110,6 +110,10 @@ _PUBLIC_ERROR = {
     "code": "workflow_operation_failed",
     "message": "Workflow operation failed.",
 }
+_PUBLIC_ATTEMPT_ERROR_CODES = frozenset({
+    "execution_integrity",
+    "package_mcp_unavailable",
+})
 _PUBLIC_RETRY_FIELDS = (
     "requested_retries",
     "requested_total_attempts",
@@ -378,6 +382,9 @@ def public_attempt_projection(
             projected["cost_budget"] = safe_budget
     if attempt.get("error_code") is not None or attempt.get("error_message") is not None:
         projected["error"] = dict(_PUBLIC_ERROR)
+    error_code = attempt.get("error_code")
+    if isinstance(error_code, str) and error_code in _PUBLIC_ATTEMPT_ERROR_CODES:
+        projected["error_code"] = error_code
     for field in ("started_at", "completed_at", "next_attempt_at"):
         timestamp = _bounded_timestamp(attempt.get(field))
         if timestamp is not None:
@@ -389,9 +396,13 @@ def public_artifact_projection(artifact: Mapping[str, object]) -> dict[str, obje
     """Return artifact integrity metadata without paths, content, or session identity."""
     projected: dict[str, object] = {"item_type": "artifact"}
     publication_id = artifact.get("publication_id")
-    projected["publication_id"] = _bounded_identifier(
-        publication_id, fallback="legacy-artifact"
+    typed_publication = (
+        artifact.get("typed_publication_version") == 2
+        and isinstance(publication_id, str)
+        and _OPAQUE_PUBLIC_ID.fullmatch(publication_id) is not None
     )
+    if typed_publication:
+        projected["publication_id"] = publication_id
     for field in ("node_id", "attempt_id", "output_type"):
         value = artifact.get(field)
         if isinstance(value, str):
@@ -410,10 +421,10 @@ def public_artifact_projection(artifact: Mapping[str, object]) -> dict[str, obje
     if produced_at is not None:
         projected["produced_at"] = produced_at
     projected["integrity_status"] = (
-        "verified" if isinstance(publication_id, str) else "legacy_unverified"
+        "verified" if typed_publication else "legacy_unverified"
     )
     projected["recovery_status"] = (
-        "verified" if isinstance(publication_id, str) else "projection_recovered"
+        "verified" if typed_publication else "projection_recovered"
     )
     return projected
 
@@ -490,6 +501,8 @@ def public_event_projection(value: Mapping[str, object]) -> dict[str, object]:
                 identifier = payload.get(field)
                 if isinstance(identifier, str):
                     projected[field] = public_display_identifier(identifier)
+    if value.get("payload_truncated") is True:
+        projected["payload_truncated"] = True
     return projected
 
 

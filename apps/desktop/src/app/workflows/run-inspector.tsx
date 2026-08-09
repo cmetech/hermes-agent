@@ -116,7 +116,7 @@ function evidenceItemKey(item: WorkflowEvidenceItem, index: number): string {
     return String(item.attempt_id)
   }
 
-  if ('publication_id' in item) {
+  if ('publication_id' in item && item.publication_id !== undefined) {
     return item.publication_id
   }
 

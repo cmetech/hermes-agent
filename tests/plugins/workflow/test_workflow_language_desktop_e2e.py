@@ -388,6 +388,7 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
         if item.get("node_id") == "producer"
     )
     assert desktop_attempt == {
+        "item_type": "attempt",
         "node_id": "producer",
         "attempt_id": producer_attempt["attempt_id"],
         "state": "succeeded",
@@ -400,6 +401,8 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
             "additional_provider_attempts": 0,
             "capped": False,
         },
+        "started_at": producer_attempt["started_at"],
+        "completed_at": producer_attempt["completed_at"],
     }
     assert preview.status_code == 200
     assert preview.json() == {

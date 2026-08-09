@@ -118,6 +118,15 @@ describe('workflow public codecs', () => {
       })
     ).toBeNull()
 
+    expect(
+      decodeWorkflowEventPage({
+        cursor_reset: false,
+        events: [{ ...event, payload_truncated: true }],
+        next_cursor: 3,
+        schema_version: 1
+      })
+    ).not.toBeNull()
+
     const interactionPage = {
       items: [
         {
@@ -172,7 +181,61 @@ describe('workflow public codecs', () => {
     expect(
       decodeWorkflowEvidencePage({
         ...page,
+        items: [{ ...attempt, error_code: 'execution_integrity' }]
+      })
+    ).not.toBeNull()
+    expect(
+      decodeWorkflowEvidencePage({
+        ...page,
+        items: [{ ...attempt, error_code: 'provider_timeout' }]
+      })
+    ).toBeNull()
+    expect(
+      decodeWorkflowEvidencePage({
+        ...page,
         items: [{ ...attempt, audit: { error: 'private' } }]
+      })
+    ).toBeNull()
+
+    const legacyArtifactPage = {
+      items: [
+        {
+          integrity_status: 'legacy_unverified',
+          item_type: 'artifact',
+          recovery_status: 'projection_recovered',
+          sha256: 'a'.repeat(64)
+        }
+      ],
+      kind: 'artifacts',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    }
+
+    expect(decodeWorkflowEvidencePage(legacyArtifactPage)).toEqual(legacyArtifactPage)
+    expect(
+      decodeWorkflowEvidencePage({
+        ...legacyArtifactPage,
+        items: [{ ...legacyArtifactPage.items[0], publication_id: 'c'.repeat(32) }]
+      })
+    ).toBeNull()
+    expect(
+      decodeWorkflowEvidencePage({
+        ...legacyArtifactPage,
+        items: [
+          {
+            ...legacyArtifactPage.items[0],
+            integrity_status: 'verified',
+            publication_id: 'c'.repeat(32),
+            recovery_status: 'verified'
+          }
+        ]
+      })
+    ).not.toBeNull()
+    expect(
+      decodeWorkflowEvidencePage({
+        ...legacyArtifactPage,
+        items: [{ ...legacyArtifactPage.items[0], relative_path: 'private/report.json' }]
       })
     ).toBeNull()
   })

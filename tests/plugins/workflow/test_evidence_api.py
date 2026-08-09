@@ -189,7 +189,6 @@ def test_legacy_artifact_paths_are_not_projected(tmp_path, workflow_writer):
     assert page["items"] == [
         {
             "item_type": "artifact",
-            "publication_id": "legacy-artifact",
             "sha256": "a" * 64,
             "size_bytes": 10,
             "media_type": "application/json",

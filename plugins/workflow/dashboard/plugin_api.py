@@ -176,6 +176,9 @@ class WorkflowAttemptProjection(BaseModel):
     ]
     retry: WorkflowRetryProjection
     error: WorkflowPublicError | None = None
+    error_code: Literal[
+        "execution_integrity", "package_mcp_unavailable",
+    ] | None = None
     provider_authority: WorkflowProviderAuthorityProjection | None = None
     cost_budget: WorkflowCostBudgetProjection | None = None
     started_at: str | None = None
@@ -221,7 +224,7 @@ class WorkflowArtifactProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_type: Literal["artifact"]
-    publication_id: str = Field(..., min_length=1, max_length=128)
+    publication_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
     node_id: str | None = Field(None, max_length=128)
     attempt_id: str | None = Field(None, max_length=128)
     output_type: str | None = Field(None, max_length=128)
@@ -232,6 +235,22 @@ class WorkflowArtifactProjection(BaseModel):
     produced_at: str | None = None
     integrity_status: Literal["verified", "legacy_unverified"]
     recovery_status: Literal["verified", "projection_recovered"]
+
+    @model_validator(mode="after")
+    def require_authenticated_publication_identity(self):
+        typed = (
+            self.integrity_status == "verified"
+            and self.recovery_status == "verified"
+        )
+        legacy = (
+            self.integrity_status == "legacy_unverified"
+            and self.recovery_status == "projection_recovered"
+        )
+        if not (typed or legacy):
+            raise ValueError("artifact integrity and recovery status must agree")
+        if typed != (self.publication_id is not None):
+            raise ValueError("only verified typed artifacts carry publication_id")
+        return self
 
 
 class WorkflowProgressProjection(BaseModel):
@@ -349,6 +368,7 @@ class WorkflowTimelineEventProjection(BaseModel):
     outcome: str | None = None
     actor: str | None = Field(None, max_length=128)
     channel: str | None = Field(None, max_length=128)
+    payload_truncated: StrictBool | None = None
 
 
 class WorkflowEventPageProjection(BaseModel):

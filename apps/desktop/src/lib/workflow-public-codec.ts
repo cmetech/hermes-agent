@@ -1,4 +1,5 @@
 import type {
+  WorkflowArtifactEvidence,
   WorkflowAttemptEvidence,
   WorkflowAttentionPage,
   WorkflowEventPage,
@@ -120,6 +121,7 @@ const INTERACTION_TYPES = new Set([
 
 const PROVENANCE_SOURCES = new Set(['api', 'background_agent', 'chat', 'cli', 'cron', 'desktop'])
 const PROVENANCE_ASSURANCE = new Set(['legacy_unknown', 'local_admin_claim', 'system_schedule', 'verified_adapter'])
+const ATTEMPT_ERROR_CODES = new Set(['execution_integrity', 'package_mcp_unavailable'])
 
 const EVIDENCE_KINDS = new Set([
   'artifacts',
@@ -284,6 +286,7 @@ function attempt(value: unknown): value is WorkflowAttemptEvidence {
         'completed_at',
         'cost_budget',
         'error',
+        'error_code',
         'item_type',
         'next_attempt_at',
         'node_id',
@@ -304,6 +307,7 @@ function attempt(value: unknown): value is WorkflowAttemptEvidence {
     NODE_STATES.has(String(value.state)) &&
     retry(value.retry) &&
     (value.error === undefined || value.error === null || closedError(value.error)) &&
+    (value.error_code === undefined || ATTEMPT_ERROR_CODES.has(String(value.error_code))) &&
     optionalString(value.started_at) &&
     optionalString(value.completed_at) &&
     optionalString(value.next_attempt_at) &&
@@ -317,7 +321,7 @@ function attempt(value: unknown): value is WorkflowAttemptEvidence {
   )
 }
 
-function artifact(value: unknown): boolean {
+function artifact(value: unknown): value is WorkflowArtifactEvidence {
   if (
     !record(value) ||
     !exact(
@@ -341,11 +345,19 @@ function artifact(value: unknown): boolean {
     return false
   }
 
+  const typedPublication =
+    value.integrity_status === 'verified' &&
+    value.recovery_status === 'verified' &&
+    typeof value.publication_id === 'string' &&
+    /^[0-9a-f]{32}$/.test(value.publication_id)
+  const legacyArtifact =
+    value.integrity_status === 'legacy_unverified' &&
+    value.recovery_status === 'projection_recovered' &&
+    value.publication_id === undefined
+
   return (
     value.item_type === 'artifact' &&
-    typeof value.publication_id === 'string' &&
-    ['legacy_unverified', 'verified'].includes(String(value.integrity_status)) &&
-    ['projection_recovered', 'verified'].includes(String(value.recovery_status)) &&
+    (typedPublication || legacyArtifact) &&
     ['attempt_id', 'media_type', 'node_id', 'output_type', 'produced_at', 'schema_fingerprint', 'sha256'].every(key =>
       optionalString(value[key])
     ) &&
@@ -370,6 +382,7 @@ function event(value: unknown): value is WorkflowTimelineEvent {
         'item_type',
         'node_id',
         'outcome',
+        'payload_truncated',
         'reason_code',
         'run_id',
         'sequence',
@@ -386,6 +399,7 @@ function event(value: unknown): value is WorkflowTimelineEvent {
     typeof value.timestamp === 'string' &&
     typeof value.run_id === 'string' &&
     typeof value.event_type === 'string' &&
+    optionalBoolean(value.payload_truncated) &&
     ['actor', 'attempt_id', 'channel', 'decision', 'interaction_id', 'node_id', 'outcome', 'reason_code'].every(key =>
       optionalString(value[key])
     )

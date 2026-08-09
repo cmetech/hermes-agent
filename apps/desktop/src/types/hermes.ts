@@ -625,19 +625,23 @@ export type WorkflowEvidenceKind =
   | 'recovery'
   | 'timeline'
 
-export interface WorkflowTypedArtifact {
+export interface WorkflowArtifactEvidence {
   attempt_id?: null | string
   integrity_status?: null | string
   media_type?: null | string
   node_id?: null | string
   output_type?: null | string
   produced_at?: null | string
-  publication_id: string
+  publication_id?: string
   recovery_status?: null | string
   schema_fingerprint?: null | string
   sha256?: null | string
   size_bytes?: null | number
   item_type: 'artifact'
+}
+
+export interface WorkflowTypedArtifact extends WorkflowArtifactEvidence {
+  publication_id: string
 }
 
 export interface WorkflowArtifactPreview {
@@ -669,6 +673,7 @@ export interface WorkflowAttemptEvidence {
     settlement_count?: null | number
   }
   error?: null | WorkflowPublicError
+  error_code?: 'execution_integrity' | 'package_mcp_unavailable'
   item_type: 'attempt'
   next_attempt_at?: null | string
   node_id: string
@@ -706,6 +711,7 @@ export interface WorkflowTimelineEvent {
   item_type: 'timeline_event'
   node_id?: string
   outcome?: string
+  payload_truncated?: boolean
   reason_code?: string
   run_id: string
   sequence: number
@@ -784,7 +790,7 @@ export type WorkflowEvidenceItem =
   | WorkflowPersistentSessionRecoveryEvidence
   | WorkflowProcessRecoveryEvidence
   | WorkflowTimelineEvent
-  | WorkflowTypedArtifact
+  | WorkflowArtifactEvidence
 
 export interface WorkflowRunPage {
   next_cursor: null | string

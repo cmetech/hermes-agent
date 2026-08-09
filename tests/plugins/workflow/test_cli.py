@@ -1803,7 +1803,7 @@ def test_run_status_events_and_runs_sanitize_the_durable_store(
     assert events["truncated"] is True
     assert events["next_cursor"] == events["events"][-1]["sequence"]
     assert events["events"][-1]["payload_truncated"] is True
-    assert len(events["events"][-1]["payload"]["items"]) == 200
+    assert "payload" not in events["events"][-1]
     assert "operator_scope_digest" not in json.dumps(events)
     assert "idempotency_key_digest" not in json.dumps(events)
 

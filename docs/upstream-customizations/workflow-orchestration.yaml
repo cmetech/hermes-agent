@@ -851,7 +851,9 @@ upstream_changes:
   owned_invariants:
   - public run node event interaction attempt evidence attention REST Gateway and Desktop projections copy only explicitly permitted fields
   - provider payloads audit errors prompts commands approval text loop feedback rework reasons session identifiers and local paths remain private durable state
-  - provider and executor failures use one fixed public code and message while retries repairs and child work retain private diagnostics
+  - provider and executor failures use one fixed public error and message while only execution_integrity and package_mcp_unavailable retain bounded pre-transport attempt codes and retries repairs child work and all other diagnostics remain private
+  - timeline payload truncation retains one boolean marker without restoring the private payload
+  - only verified typed-publication descriptor-v2 rows expose publication identity while visible legacy artifacts omit publication identity and cannot be treated as previewable typed output
   - malformed legacy and direct SQL rows recover to generic bounded projections without traversing or copying unknown values
   - REST response models and Desktop runtime decoders reject unknown keys scalar confusion and non-finite values
   - public evidence rendering is discriminated and never stringifies arbitrary backend objects
@@ -861,10 +863,13 @@ upstream_changes:
   - tests/plugins/workflow/test_phase5_public_run_evidence_contract.py
   - tests/plugins/workflow/test_phase5_public_projection_contract.py
   - tests/plugins/workflow/test_evidence_api.py
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/plugins/workflow/test_cli.py
   - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_notification_delivery.py
   - tests/plugins/workflow/test_phase4_surfaces.py
   - tests/plugins/workflow/test_persistent_session_recovery.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
   - apps/desktop/src/lib/workflow-public-codec.test.ts
   - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/index.test.tsx

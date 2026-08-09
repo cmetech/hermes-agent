@@ -17,7 +17,12 @@ from hermes_cli.plugin_invocation import PluginInvocationContext
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.gateway_command import workflow_gateway_command
-from plugins.workflow.sanitize import public_event_projection, public_run_projection
+from plugins.workflow.sanitize import (
+    public_artifact_projection,
+    public_attempt_projection,
+    public_event_projection,
+    public_run_projection,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
@@ -290,6 +295,134 @@ def test_interaction_event_variants_retain_only_bounded_actor_and_channel(
         "channel": "desktop",
     }
     assert _CANARY not in json.dumps(item, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_public_code"),
+    (
+        ("execution_integrity", "execution_integrity"),
+        ("package_mcp_unavailable", "package_mcp_unavailable"),
+        ("provider_timeout", None),
+        (_CANARY, None),
+        ({"provider_payload": _CANARY}, None),
+    ),
+)
+def test_attempt_failure_code_projection_is_an_explicit_closed_allowlist(
+    error_code: object,
+    expected_public_code: str | None,
+) -> None:
+    projected = public_attempt_projection(
+        "work",
+        {
+            "attempt_id": "attempt-1",
+            "state": "failed",
+            "error_code": error_code,
+            "error_message": f"private failure {_CANARY}",
+            "audit": {"provider_payload": _CANARY},
+        },
+    )
+
+    assert projected["error"] == _SAFE_ERROR
+    assert projected.get("error_code") == expected_public_code
+    assert "error_message" not in projected
+    assert "audit" not in projected
+    assert _CANARY not in json.dumps(projected, sort_keys=True)
+
+
+def test_event_truncation_projection_preserves_only_the_boolean_marker() -> None:
+    projected = public_event_projection({
+        "sequence": 7,
+        "timestamp": "2026-08-08T20:00:00+00:00",
+        "run_id": "run-1",
+        "event_type": "diagnostic",
+        "payload_truncated": True,
+        "payload": {"provider_payload": _CANARY},
+    })
+
+    assert projected == {
+        "item_type": "timeline_event",
+        "sequence": 7,
+        "timestamp": "2026-08-08T20:00:00+00:00",
+        "run_id": "run-1",
+        "event_type": "diagnostic",
+        "payload_truncated": True,
+    }
+    assert "payload" not in projected
+
+
+def test_artifact_projection_distinguishes_typed_publications_from_legacy_rows() -> None:
+    typed = public_artifact_projection({
+        "typed_publication_version": 2,
+        "publication_id": "c" * 32,
+        "node_id": "produce",
+        "sha256": "a" * 64,
+        "relative_path": f"private/{_CANARY}",
+        "content": _CANARY,
+    })
+    legacy = public_artifact_projection({
+        "node_id": "produce",
+        "sha256": "b" * 64,
+        "relative_path": f"private/{_CANARY}",
+        "content": _CANARY,
+    })
+
+    assert typed == {
+        "item_type": "artifact",
+        "publication_id": "c" * 32,
+        "node_id": "produce",
+        "sha256": "a" * 64,
+        "integrity_status": "verified",
+        "recovery_status": "verified",
+    }
+    assert legacy == {
+        "item_type": "artifact",
+        "node_id": "produce",
+        "sha256": "b" * 64,
+        "integrity_status": "legacy_unverified",
+        "recovery_status": "projection_recovered",
+    }
+    assert _CANARY not in json.dumps({"typed": typed, "legacy": legacy}, sort_keys=True)
+
+
+def test_rest_projection_models_accept_only_the_closed_failure_truncation_and_artifact_shapes() -> None:
+    module = _api_module()
+    attempt = public_attempt_projection(
+        "work",
+        {
+            "attempt_id": "attempt-1",
+            "state": "failed",
+            "error_code": "execution_integrity",
+            "error_message": _CANARY,
+        },
+    )
+    event = public_event_projection({
+        "sequence": 7,
+        "timestamp": "2026-08-08T20:00:00+00:00",
+        "run_id": "run-1",
+        "event_type": "diagnostic",
+        "payload_truncated": True,
+        "payload": {"provider_payload": _CANARY},
+    })
+    legacy_artifact = public_artifact_projection({
+        "relative_path": f"private/{_CANARY}",
+        "sha256": "a" * 64,
+    })
+
+    assert module.WorkflowAttemptProjection.model_validate(attempt).error_code == "execution_integrity"
+    assert module.WorkflowTimelineEventProjection.model_validate(event).payload_truncated is True
+    assert module.WorkflowArtifactProjection.model_validate(legacy_artifact).publication_id is None
+    for model, value in (
+        (module.WorkflowAttemptProjection, {**attempt, "provider_payload": _CANARY}),
+        (module.WorkflowTimelineEventProjection, {**event, "payload": {"prompt": _CANARY}}),
+        (module.WorkflowArtifactProjection, {**legacy_artifact, "relative_path": _CANARY}),
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate(value)
+    with pytest.raises(ValidationError):
+        module.WorkflowArtifactProjection.model_validate({
+            **legacy_artifact,
+            "publication_id": "c" * 32,
+        })
 
 
 def test_direct_sql_and_malformed_legacy_rows_recover_to_bounded_public_projections(
