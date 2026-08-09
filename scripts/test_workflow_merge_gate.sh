@@ -424,6 +424,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase5_execution_context.py \
       tests/plugins/workflow/test_phase5_hooks.py \
       tests/plugins/workflow/test_phase5_identity_convergence.py \
+      tests/plugins/workflow/test_phase5_inline_approval_convergence.py \
       tests/plugins/workflow/test_phase5_inline_limits.py \
       tests/plugins/workflow/test_phase5_language.py \
       tests/plugins/workflow/test_phase5_mcp.py \

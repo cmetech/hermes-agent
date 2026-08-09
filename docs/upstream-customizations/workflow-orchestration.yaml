@@ -411,7 +411,7 @@ upstream_changes:
   - _language_has_phase4_semantics
   - ApprovalExecutor.execute
   - PluginAgentRunRequest.sealed_runtime_authority_required
-  - _ProviderAttemptAuthority request-tree broker
+  - _ProviderAttemptAuthority
   - _consume_shared_approved_action
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
