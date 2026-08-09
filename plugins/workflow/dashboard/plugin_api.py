@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Literal, Mapping
+from typing import Annotated, Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -1088,7 +1088,280 @@ def cleanup_history(
     }
 
 
-@router.get("/notifications/lease")
+WorkflowNotificationAction = Literal[
+    "status",
+    "events",
+    "approve",
+    "reject",
+    "provide-input",
+    "resume",
+    "retry",
+    "reconcile",
+    "cancel",
+    "abandon",
+    "archive",
+    "restore",
+]
+WorkflowNotificationDeliveryReason = Literal[
+    "adapter_send_failed",
+    "adapter_send_timeout",
+    "adapter_unavailable",
+    "bad_format",
+    "delivery_store_unavailable",
+    "forbidden",
+    "gateway_loop_unavailable",
+    "invalid_text",
+    "not_found",
+    "notification delivery failed",
+    "outcome_uncertain",
+    "permanent_failure",
+    "projection_failed",
+    "rate_limited",
+    "retryable_failure",
+    "too_long",
+    "transient",
+    "unauthorized",
+    "unknown",
+]
+
+
+class WorkflowNotificationInteractionProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "approval",
+        "workflow_approval",
+        "loop_input",
+        "loop_signal_confirmation",
+        "reconcile",
+    ]
+    interaction_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$",
+    )
+    iteration: StrictInt | None = Field(None, ge=1, le=100)
+    max_iterations: StrictInt | None = Field(None, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_iteration_pair(self):
+        if (self.iteration is None) != (self.max_iterations is None):
+            raise ValueError("iteration bounds must be present together")
+        if (
+            self.iteration is not None
+            and self.max_iterations is not None
+            and self.iteration > self.max_iterations
+        ):
+            raise ValueError("iteration cannot exceed max_iterations")
+        return self
+
+
+class WorkflowTransitionNotificationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payload_type: Literal["workflow_transition"]
+    workflow: str | None = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$",
+    )
+    status: Literal[
+        "queued",
+        "running",
+        "waiting_retry",
+        "paused",
+        "recovery_pending",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ] | None = None
+    event_type: Literal[
+        "node_reconciliation_required",
+        "run_reconciliation_required",
+        "cancel_reconciliation_required",
+        "run_failed",
+        "cleanup_failed",
+        "run_succeeded",
+        "run_cancelled",
+        "run_retry_waiting",
+        "node_retry_scheduled",
+        "run_stalled",
+        "coordinator_stalled",
+        "workflow_approval_required",
+        "node_approval_required",
+        "loop_input_required",
+        "loop_signal_confirmation_required",
+        "run_paused",
+    ] | None = None
+    node_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$",
+    )
+    interaction: WorkflowNotificationInteractionProjection | None = None
+    code: Literal[
+        "cleanup_failed",
+        "host_pressure",
+        "persistent_session_registry_update_pending",
+        "provider_capability_drift",
+        "schedule_overlap_forbidden",
+        "schedule_revalidation_failed",
+        "workflow_operation_failed",
+    ] | None = None
+    mismatched_fields: list[
+        Literal[
+            "provider",
+            "model",
+            "api_mode",
+            "base_url_trust_class",
+            "endpoint_sha256",
+            "registration_provenance_digest",
+        ]
+    ] | None = Field(None, max_length=6)
+    state_version: StrictInt = Field(..., ge=0, le=1_000_000_000)
+    next_actions: list[WorkflowNotificationAction] = Field(..., max_length=12)
+
+    @field_validator("mismatched_fields", "next_actions")
+    @classmethod
+    def validate_unique_values(cls, value):
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("notification list values must be unique")
+        return value
+
+
+class WorkflowDeliveryDecisionNotificationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payload_type: Literal["delivery_decision"]
+    decision: Literal[
+        "terminal_dead_letter",
+        "delivery_outcome_uncertain",
+        "dead_letter_retried",
+        "delivery_pruned",
+    ]
+    error: WorkflowNotificationDeliveryReason | None = None
+    attempts: StrictInt | None = Field(None, ge=0, le=1_000_000)
+    previous_attempts: StrictInt | None = Field(None, ge=0, le=1_000_000)
+    previous_error: WorkflowNotificationDeliveryReason | None = None
+    authority_scope: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$",
+    )
+    delivery_state: Literal[
+        "pending", "suppressed", "leased", "delivered", "dead", "pruned"
+    ] | None = None
+    delivered_at: str | None = Field(None, min_length=1, max_length=64)
+    dismissed_at: str | None = Field(None, min_length=1, max_length=64)
+    state_version: StrictInt = Field(..., ge=0, le=1_000_000_000)
+    next_actions: list[WorkflowNotificationAction] = Field(..., max_length=12)
+
+    @field_validator("next_actions")
+    @classmethod
+    def validate_unique_actions(cls, value):
+        if len(value) != len(set(value)):
+            raise ValueError("notification actions must be unique")
+        return value
+
+
+class WorkflowProjectionRecoveryNotificationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payload_type: Literal["projection_recovery"]
+    code: Literal["notification_projection_invalid"]
+    state_version: StrictInt = Field(..., ge=0, le=1_000_000_000)
+    next_actions: list[WorkflowNotificationAction] = Field(..., max_length=12)
+
+    @field_validator("next_actions")
+    @classmethod
+    def validate_unique_actions(cls, value):
+        if len(value) != len(set(value)):
+            raise ValueError("notification actions must be unique")
+        return value
+
+
+WorkflowNotificationPayload = Annotated[
+    WorkflowTransitionNotificationPayload
+    | WorkflowDeliveryDecisionNotificationPayload
+    | WorkflowProjectionRecoveryNotificationPayload,
+    Field(discriminator="payload_type"),
+]
+
+
+class WorkflowNotificationProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    notification_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$",
+    )
+    run_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$",
+    )
+    kind: Literal[
+        "approval_required",
+        "input_required",
+        "failure",
+        "stalled",
+        "reconciliation_required",
+        "completion",
+        "cancellation",
+        "retry",
+    ]
+    destination: Literal["desktop", "gateway:opaque"]
+    transition_version: StrictInt = Field(..., ge=0, le=1_000_000_000)
+    coalesced_count: StrictInt = Field(..., ge=1, le=1_000_000)
+    payload: WorkflowNotificationPayload
+    state: Literal["pending", "suppressed", "leased", "delivered", "dead", "pruned"]
+    created_at: str | None = Field(None, min_length=1, max_length=64)
+    updated_at: str | None = Field(None, min_length=1, max_length=64)
+    lease_owner: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$",
+    )
+    lease_expires_at: str | None = Field(None, min_length=1, max_length=64)
+    delivered_at: str | None = Field(None, min_length=1, max_length=64)
+    dismissed_at: str | None = Field(None, min_length=1, max_length=64)
+    attempts: StrictInt = Field(..., ge=0, le=1_000_000)
+    last_error: WorkflowNotificationDeliveryReason | None = None
+
+    @model_validator(mode="after")
+    def validate_payload_envelope(self):
+        if self.payload.state_version != self.transition_version:
+            raise ValueError("payload state_version must match transition_version")
+        if (
+            isinstance(self.payload, WorkflowProjectionRecoveryNotificationPayload)
+            and self.kind != "reconciliation_required"
+        ):
+            raise ValueError("projection recovery requires reconciliation kind")
+        return self
+
+
+class WorkflowNotificationPageProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    items: list[WorkflowNotificationProjection] = Field(..., max_length=100)
+
+
+@router.get(
+    "/notifications/lease",
+    response_model=WorkflowNotificationPageProjection,
+    response_model_exclude_none=True,
+)
 def lease_notifications(
     request: Request,
     client_id: str = Query(..., min_length=1, max_length=256),
@@ -1104,7 +1377,7 @@ def lease_notifications(
             lease_seconds=30,
             limit=limit,
         )
-    return {"schema_version": 1, "items": sanitize_projection(items)}
+    return {"schema_version": 1, "items": items}
 
 
 class NotificationReceiptRequest(BaseModel):

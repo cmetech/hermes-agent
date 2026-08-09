@@ -5,25 +5,38 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
-from plugins.workflow.actions import available_actions
+from plugins.workflow.actions import WIRE_ACTIONS, available_actions
 from plugins.workflow.evidence import (
     _UnsafeEvidencePath,
     _read_contained_regular_file,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.sanitize import public_display_identifier, sanitize_projection
+from plugins.workflow.sanitize import public_display_identifier
 
 
 logger = logging.getLogger(__name__)
 
 
 COALESCED_KINDS = frozenset({"failure", "stalled", "retry"})
+PUBLIC_NOTIFICATION_KINDS = frozenset(
+    {
+        "approval_required",
+        "input_required",
+        "failure",
+        "stalled",
+        "reconciliation_required",
+        "completion",
+        "cancellation",
+        "retry",
+    }
+)
 ATTENTION_KINDS = frozenset(
     {
         "approval_required",
@@ -32,6 +45,120 @@ ATTENTION_KINDS = frozenset(
         "stalled",
         "reconciliation_required",
     }
+)
+_PUBLIC_NOTIFICATION_STATUSES = frozenset(
+    {
+        "queued",
+        "running",
+        "waiting_retry",
+        "paused",
+        "recovery_pending",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    }
+)
+_PUBLIC_NOTIFICATION_EVENT_TYPES = frozenset(
+    {
+        "node_reconciliation_required",
+        "run_reconciliation_required",
+        "cancel_reconciliation_required",
+        "run_failed",
+        "cleanup_failed",
+        "run_succeeded",
+        "run_cancelled",
+        "run_retry_waiting",
+        "node_retry_scheduled",
+        "run_stalled",
+        "coordinator_stalled",
+        "workflow_approval_required",
+        "node_approval_required",
+        "loop_input_required",
+        "loop_signal_confirmation_required",
+        "run_paused",
+    }
+)
+_PUBLIC_NOTIFICATION_INTERACTION_TYPES = frozenset(
+    {
+        "approval",
+        "workflow_approval",
+        "loop_input",
+        "loop_signal_confirmation",
+        "reconcile",
+    }
+)
+_PUBLIC_NOTIFICATION_CODES = frozenset(
+    {
+        "cleanup_failed",
+        "host_pressure",
+        "persistent_session_registry_update_pending",
+        "provider_capability_drift",
+        "schedule_overlap_forbidden",
+        "schedule_revalidation_failed",
+        "workflow_operation_failed",
+    }
+)
+_PUBLIC_RUNTIME_MISMATCH_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "api_mode",
+        "base_url_trust_class",
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    }
+)
+_PUBLIC_NOTIFICATION_PAYLOAD_TYPES = frozenset(
+    {"workflow_transition", "delivery_decision", "projection_recovery"}
+)
+_PUBLIC_NOTIFICATION_DECISIONS = frozenset(
+    {
+        "terminal_dead_letter",
+        "delivery_outcome_uncertain",
+        "dead_letter_retried",
+        "delivery_pruned",
+    }
+)
+_PUBLIC_NOTIFICATION_STATES = frozenset(
+    {"pending", "suppressed", "leased", "delivered", "dead", "pruned"}
+)
+_PUBLIC_NOTIFICATION_DESTINATIONS = frozenset({"desktop", "gateway:opaque"})
+_PUBLIC_LOGICAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
+_PUBLIC_NOTIFICATION_JSON_MAX_CHARS = 16_384
+_WORKFLOW_PAYLOAD_FIELDS = frozenset(
+    {
+        "payload_type",
+        "workflow",
+        "status",
+        "event_type",
+        "node_id",
+        "interaction",
+        "code",
+        "mismatched_fields",
+        "state_version",
+        "next_actions",
+    }
+)
+_DELIVERY_PAYLOAD_FIELDS = frozenset(
+    {
+        "payload_type",
+        "decision",
+        "error",
+        "attempts",
+        "previous_attempts",
+        "previous_error",
+        "authority_scope",
+        "delivery_state",
+        "delivered_at",
+        "dismissed_at",
+        "state_version",
+        "next_actions",
+    }
+)
+_RECOVERY_PAYLOAD_FIELDS = frozenset(
+    {"payload_type", "code", "state_version", "next_actions"}
 )
 _GENERIC_DELIVERY_FAILURE_REASON = "notification delivery failed"
 _STABLE_DELIVERY_FAILURE_REASONS = frozenset(
@@ -192,188 +319,278 @@ def notification_kind(event_type: str, projection: Mapping[str, object]) -> str 
     return None
 
 
-def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str, object]:
-    """Project notification data without durable raw recovery/error authority."""
-    sensitive_values: set[str] = set()
+def _bounded_int(value: object, *, minimum: int = 0, maximum: int = 1_000_000) -> int | None:
+    if type(value) is int and minimum <= value <= maximum:
+        return value
+    return None
 
-    def normalized_key(key: object) -> str:
-        return "".join(
-            character for character in str(key).lower() if character.isalnum()
-        )
 
-    def is_sensitive_key(key: object) -> bool:
-        normalized = normalized_key(key)
-        return (
-            normalized.endswith("sessionid")
-            or normalized.endswith("cachefingerprint")
-            or normalized in {"sessionalias", "fingerprintalias"}
-        ) and not normalized.endswith("sha256")
+def _public_identifier(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    projected = public_display_identifier(value)
+    if _logical_identifier(projected, maximum_bytes=128) is not None:
+        return projected
+    digest = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"redacted:{digest[:16]}"
 
-    def is_private_authority_value_key(key: object) -> bool:
-        normalized = normalized_key(key)
-        return normalized.endswith(
-            (
-                "endpointsha256",
-                "registrationprovenancedigest",
-            )
-        )
 
-    def collect_private_string_leaves(value: object) -> tuple[set[str], bool]:
-        # Mirror sanitize_projection's closed traversal limits while preventing
-        # cyclic containers from creating an unbounded authority-value walk.
-        collected: set[str] = set()
-        complete = True
-        shallowest_depth: dict[tuple[int, bool], int] = {}
-        pending_values: list[tuple[object, int, bool]] = [(value, 0, False)]
-        while pending_values:
-            current, depth, collect_all = pending_values.pop()
-            if depth > 12:
-                complete = False
-                continue
-            if isinstance(current, str):
-                if collect_all and current:
-                    collected.add(current)
-                continue
-            if isinstance(current, Mapping):
-                state = (id(current), collect_all)
-                prior_depth = shallowest_depth.get(state)
-                if prior_depth is not None and depth >= prior_depth:
-                    continue
-                shallowest_depth[state] = depth
-                children = list(current.items())
-                if len(children) > 200:
-                    complete = False
-                for key, child in children[:200]:
-                    pending_values.append((
-                        child,
-                        depth + 1,
-                        collect_all
-                        or is_sensitive_key(key)
-                        or is_private_authority_value_key(key),
-                    ))
-                continue
-            if isinstance(current, (list, tuple)):
-                state = (id(current), collect_all)
-                prior_depth = shallowest_depth.get(state)
-                if prior_depth is not None and depth >= prior_depth:
-                    continue
-                shallowest_depth[state] = depth
-                if len(current) > 200:
-                    complete = False
-                pending_values.extend(
-                    (child, depth + 1, collect_all) for child in current[:200]
-                )
-                continue
-            if collect_all and current is not None and not isinstance(
-                current, (bool, int, float)
-            ):
-                complete = False
-        return collected, complete
+def _logical_identifier(value: object, *, maximum_bytes: int = 256) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > maximum_bytes or _PUBLIC_LOGICAL_IDENTIFIER.fullmatch(value) is None:
+        return None
+    return value
 
-    def minimal_recovery_payload(value: Mapping[str, object]) -> dict[str, object]:
-        minimal: dict[str, object] = {}
-        code = value.get("code")
-        if isinstance(code, str) and public_display_identifier(code) == code:
-            minimal["code"] = code
-        allowed_mismatches = frozenset({
-            "provider",
-            "model",
-            "api_mode",
-            "base_url_trust_class",
-            "endpoint_sha256",
-            "registration_provenance_digest",
-        })
-        mismatches = value.get("mismatched_fields")
-        if isinstance(mismatches, list):
-            safe_mismatches = [
-                item
-                for item in mismatches[: len(allowed_mismatches)]
-                if isinstance(item, str) and item in allowed_mismatches
-            ]
-            if safe_mismatches:
-                minimal["mismatched_fields"] = safe_mismatches
-        allowed_statuses = frozenset({
-            "queued",
-            "running",
-            "waiting_retry",
-            "paused",
-            "recovery_pending",
-            "succeeded",
-            "failed",
-            "cancelled",
-            "interrupted",
-            "abandoned",
-        })
-        status = value.get("status")
-        if isinstance(status, str) and status in allowed_statuses:
-            minimal["status"] = status
-            safe_interaction: dict[str, object] = {}
-            interaction = value.get("interaction")
-            if isinstance(interaction, Mapping):
-                interaction_type = interaction.get("type")
-                if interaction_type in {
-                    "approval",
-                    "workflow_approval",
-                    "loop_input",
-                    "loop_signal_confirmation",
-                    "reconcile",
-                }:
-                    safe_interaction["type"] = interaction_type
-            minimal["interaction"] = safe_interaction
-        return minimal
 
-    raw_payload = dict(payload)
-    raw_values, raw_complete = collect_private_string_leaves(raw_payload)
-    sensitive_values.update(raw_values)
-    projected = sanitize_projection(raw_payload)
-    if not isinstance(projected, dict):
-        return {}
-    projected_values, projected_complete = collect_private_string_leaves(projected)
-    sensitive_values.update(projected_values)
-    if not raw_complete or not projected_complete:
-        return minimal_recovery_payload(projected)
+def _public_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
 
-    pending: list[object] = [projected]
-    while pending:
-        current = pending.pop()
-        if isinstance(current, dict):
-            for key in tuple(current):
-                normalized = normalized_key(key)
-                if is_sensitive_key(key) or normalized in {
-                    "sessionregistryupdatecandidate",
-                    "pendingsessionregistryupdate",
-                    "pendingsessionregistryupdates",
-                }:
-                    current.pop(key, None)
-                    continue
-                if is_private_authority_value_key(key):
-                    current[key] = "[REDACTED]"
-                    continue
-                if normalized == "lasterror":
-                    current[key] = "workflow operation failed"
-                    continue
-                child = current[key]
-                if isinstance(child, str):
-                    for private_value in sorted(
-                        sensitive_values, key=len, reverse=True
-                    ):
-                        if private_value:
-                            child = child.replace(private_value, "[REDACTED]")
-                    current[key] = child
-                else:
-                    pending.append(child)
-        elif isinstance(current, list):
-            for index, child in enumerate(current):
-                if isinstance(child, str):
-                    for private_value in sorted(
-                        sensitive_values, key=len, reverse=True
-                    ):
-                        if private_value:
-                            child = child.replace(private_value, "[REDACTED]")
-                    current[index] = child
-                else:
-                    pending.append(child)
+
+def _closed_actions(value: object) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > len(WIRE_ACTIONS):
+        return None
+    actions: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item not in WIRE_ACTIONS or item in actions:
+            return None
+        actions.append(item)
+    return actions
+
+
+def _recovery_actions(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    actions: list[str] = []
+    for item in value[: len(WIRE_ACTIONS)]:
+        if isinstance(item, str) and item in WIRE_ACTIONS and item not in actions:
+            actions.append(item)
+    return actions
+
+
+def _closed_interaction(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    interaction_type = value.get("type")
+    if interaction_type not in _PUBLIC_NOTIFICATION_INTERACTION_TYPES:
+        return None
+    projected: dict[str, object] = {"type": interaction_type}
+    interaction_id = _public_identifier(value.get("interaction_id"))
+    if interaction_id is not None:
+        projected["interaction_id"] = interaction_id
+    iteration = _bounded_int(value.get("iteration"), minimum=1, maximum=100)
+    maximum = _bounded_int(value.get("max_iterations"), minimum=1, maximum=100)
+    if iteration is not None and maximum is not None and iteration <= maximum:
+        projected["iteration"] = iteration
+        projected["max_iterations"] = maximum
     return projected
+
+
+def _workflow_notification_payload(
+    payload: Mapping[str, object],
+    *,
+    transition_version: int,
+) -> dict[str, object]:
+    """Build one closed workflow-transition payload without visiting unknown fields."""
+    projected: dict[str, object] = {"payload_type": "workflow_transition"}
+    workflow = _public_identifier(payload.get("workflow"))
+    if workflow is not None:
+        projected["workflow"] = workflow
+    status = payload.get("status")
+    if isinstance(status, str) and status in _PUBLIC_NOTIFICATION_STATUSES:
+        projected["status"] = status
+    event_type = payload.get("event_type")
+    if isinstance(event_type, str) and event_type in _PUBLIC_NOTIFICATION_EVENT_TYPES:
+        projected["event_type"] = event_type
+    node_id = _public_identifier(payload.get("node_id"))
+    if node_id is not None:
+        projected["node_id"] = node_id
+    raw_interaction = payload.get("interaction")
+    interaction = _closed_interaction(raw_interaction)
+    if interaction is not None:
+        projected["interaction"] = interaction
+    raw_code = payload.get("code")
+    last_error = payload.get("last_error")
+    if raw_code is None and isinstance(last_error, Mapping):
+        raw_code = last_error.get("code")
+    if isinstance(raw_code, str):
+        projected["code"] = (
+            raw_code
+            if raw_code in _PUBLIC_NOTIFICATION_CODES
+            else "workflow_operation_failed"
+        )
+    mismatches = payload.get("mismatched_fields")
+    if isinstance(mismatches, list):
+        safe_mismatches = [
+            item
+            for item in mismatches[: len(_PUBLIC_RUNTIME_MISMATCH_FIELDS)]
+            if isinstance(item, str) and item in _PUBLIC_RUNTIME_MISMATCH_FIELDS
+        ]
+        if safe_mismatches:
+            projected["mismatched_fields"] = list(dict.fromkeys(safe_mismatches))
+    projected["state_version"] = transition_version
+    if isinstance(status, str) and status in _PUBLIC_NOTIFICATION_STATUSES:
+        projected["next_actions"] = available_actions(status, raw_interaction)
+    else:
+        projected["next_actions"] = ["status", "events"]
+    return projected
+
+
+def _delivery_decision_payload(
+    decision: object,
+    payload: Mapping[str, object],
+    *,
+    transition_version: int,
+) -> dict[str, object]:
+    if not isinstance(decision, str) or decision not in _PUBLIC_NOTIFICATION_DECISIONS:
+        return _projection_recovery_payload(transition_version=transition_version)
+    projected: dict[str, object] = {
+        "payload_type": "delivery_decision",
+        "decision": decision,
+        "state_version": transition_version,
+        "next_actions": [],
+    }
+    for field in ("attempts", "previous_attempts"):
+        count = _bounded_int(payload.get(field))
+        if count is not None:
+            projected[field] = count
+    for field in ("error", "previous_error"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            projected[field] = _stable_delivery_failure_reason(value)
+    scope = _logical_identifier(payload.get("authority_scope"))
+    if scope is not None:
+        projected["authority_scope"] = scope
+    delivery_state = payload.get("delivery_state")
+    if isinstance(delivery_state, str) and delivery_state in _PUBLIC_NOTIFICATION_STATES:
+        projected["delivery_state"] = delivery_state
+    for field in ("delivered_at", "dismissed_at"):
+        value = _public_timestamp(payload.get(field))
+        if value is not None:
+            projected[field] = value
+    return projected
+
+
+def _projection_recovery_payload(
+    *,
+    transition_version: int,
+    actions: object = None,
+) -> dict[str, object]:
+    return {
+        "payload_type": "projection_recovery",
+        "code": "notification_projection_invalid",
+        "state_version": transition_version,
+        "next_actions": _recovery_actions(actions),
+    }
+
+
+def _decode_notification_payload(
+    raw_payload: object,
+    *,
+    transition_version: int,
+) -> dict[str, object] | None:
+    """Decode an exact persisted public payload without retaining unknown fields."""
+    if not isinstance(raw_payload, dict):
+        return None
+    payload_type = raw_payload.get("payload_type")
+    if payload_type not in _PUBLIC_NOTIFICATION_PAYLOAD_TYPES:
+        return None
+    allowed_fields = {
+        "workflow_transition": _WORKFLOW_PAYLOAD_FIELDS,
+        "delivery_decision": _DELIVERY_PAYLOAD_FIELDS,
+        "projection_recovery": _RECOVERY_PAYLOAD_FIELDS,
+    }[payload_type]
+    if not set(raw_payload).issubset(allowed_fields):
+        return None
+    if (
+        type(raw_payload.get("state_version")) is not int
+        or raw_payload.get("state_version") != transition_version
+    ):
+        return None
+    actions = _closed_actions(raw_payload.get("next_actions"))
+    if actions is None:
+        return None
+    if payload_type == "projection_recovery":
+        if raw_payload.get("code") != "notification_projection_invalid":
+            return None
+        return _projection_recovery_payload(
+            transition_version=transition_version,
+            actions=actions,
+        )
+    if payload_type == "delivery_decision":
+        decision = raw_payload.get("decision")
+        if decision not in _PUBLIC_NOTIFICATION_DECISIONS:
+            return None
+        rebuilt = _delivery_decision_payload(
+            decision,
+            raw_payload,
+            transition_version=transition_version,
+        )
+        if rebuilt != raw_payload:
+            return None
+        return rebuilt
+    rebuilt = _workflow_notification_payload(
+        raw_payload,
+        transition_version=transition_version,
+    )
+    rebuilt["next_actions"] = actions
+    if rebuilt != raw_payload:
+        return None
+    return rebuilt
+
+
+def _load_notification_payload(
+    raw: object,
+    *,
+    transition_version: int,
+) -> tuple[dict[str, object], bool]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate notification payload key")
+            result[key] = value
+        return result
+
+    if not isinstance(raw, str) or len(raw) > _PUBLIC_NOTIFICATION_JSON_MAX_CHARS:
+        loaded = None
+    else:
+        try:
+            loaded = json.loads(
+                raw,
+                object_pairs_hook=unique_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"invalid JSON constant: {value}")
+                ),
+            )
+        except (RecursionError, TypeError, ValueError):
+            loaded = None
+    decoded = _decode_notification_payload(
+        loaded,
+        transition_version=transition_version,
+    )
+    if decoded is not None:
+        return decoded, True
+    actions = loaded.get("next_actions") if isinstance(loaded, dict) else None
+    return (
+        _projection_recovery_payload(
+            transition_version=transition_version,
+            actions=actions,
+        ),
+        False,
+    )
 
 
 class NotificationOutbox:
@@ -392,11 +609,9 @@ class NotificationOutbox:
 
     @staticmethod
     def _authority_scope(authority_scope: str) -> str:
-        if not isinstance(authority_scope, str) or not authority_scope.strip():
-            raise ValueError("authority_scope must not be empty")
-        normalized = authority_scope.strip()
-        if len(normalized.encode("utf-8")) > 4096:
-            raise ValueError("authority_scope is too large")
+        normalized = _logical_identifier(authority_scope)
+        if normalized is None:
+            raise ValueError("authority_scope must be a bounded logical identifier")
         return normalized
 
     @staticmethod
@@ -410,11 +625,14 @@ class NotificationOutbox:
         occurred_at: str,
     ) -> None:
         safe_payload = json.dumps(
-            _value_free_notification_payload(
-                {"decision": decision, **dict(payload)}
+            _delivery_decision_payload(
+                decision,
+                payload,
+                transition_version=int(row["transition_version"]),
             ),
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         connection.execute(
             "INSERT OR IGNORE INTO workflow_notification_facts ("
@@ -446,6 +664,24 @@ class NotificationOutbox:
     ) -> str:
         if delivery_state not in {"pending", "suppressed"}:
             raise ValueError("delivery_state must be pending or suppressed")
+        if _logical_identifier(run_id) is None:
+            raise ValueError("run_id must be a bounded logical identifier")
+        if destination != "desktop" and not destination.startswith("gateway:"):
+            raise ValueError("destination must be desktop or a gateway capability")
+        if destination.startswith("gateway:"):
+            capability = destination.removeprefix("gateway:")
+            if (
+                not capability
+                or len(capability.encode("utf-8", errors="surrogatepass")) > 4096
+                or any(
+                    ord(character) < 0x20 or ord(character) == 0x7F
+                    for character in capability
+                )
+            ):
+                raise ValueError("gateway capability must be non-empty and bounded")
+        if type(transition_version) is not int or not 0 <= transition_version <= 1_000_000_000:
+            raise ValueError("transition_version must be a bounded integer")
+        safe_kind = kind if kind in PUBLIC_NOTIFICATION_KINDS else "reconciliation_required"
         observed = self._aware(now or datetime.now(timezone.utc))
         timestamp = observed.isoformat()
         transition_destination = destination
@@ -455,21 +691,21 @@ class NotificationOutbox:
                 "gateway:sha256:" + hashlib.sha256(capability.encode()).hexdigest()
             )
         transition_key = (
-            f"{run_id}:{kind}:{transition_version}:{transition_destination}"
+            f"{run_id}:{safe_kind}:{transition_version}:{transition_destination}"
         )
-        projected_payload = _value_free_notification_payload(payload)
-        interaction = projected_payload.get("interaction")
-        status = projected_payload.get("status")
-        if isinstance(interaction, Mapping) and isinstance(status, str):
-            projected_payload["state_version"] = transition_version
-            projected_payload["next_actions"] = available_actions(
-                status,
-                interaction,
+        projected_payload = (
+            _workflow_notification_payload(
+                payload,
+                transition_version=transition_version,
             )
+            if kind in PUBLIC_NOTIFICATION_KINDS
+            else _projection_recovery_payload(transition_version=transition_version)
+        )
         safe_payload = json.dumps(
             projected_payload,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         gateway_destination = self._gateway_destination(
             run_id,
@@ -497,13 +733,13 @@ class NotificationOutbox:
                         now=observed,
                     )
                 return notification_id
-            if kind in COALESCED_KINDS:
+            if safe_kind in COALESCED_KINDS:
                 window = (observed - timedelta(seconds=60)).isoformat()
                 candidate = connection.execute(
                     "SELECT notification_id FROM workflow_notification_outbox "
                     "WHERE run_id=? AND kind=? AND destination=? AND state='pending' "
                     "AND created_at>=? ORDER BY created_at DESC LIMIT 1",
-                    (run_id, kind, destination, window),
+                    (run_id, safe_kind, destination, window),
                 ).fetchone()
                 if candidate is not None:
                     connection.execute(
@@ -527,7 +763,7 @@ class NotificationOutbox:
                             transition_key,
                             candidate["notification_id"],
                             run_id,
-                            kind,
+                            safe_kind,
                             destination,
                             transition_version,
                             safe_payload,
@@ -557,7 +793,7 @@ class NotificationOutbox:
                     notification_id,
                     transition_key,
                     run_id,
-                    kind,
+                    safe_kind,
                     destination,
                     transition_version,
                     safe_payload,
@@ -576,7 +812,7 @@ class NotificationOutbox:
                     transition_key,
                     notification_id,
                     run_id,
-                    kind,
+                    safe_kind,
                     destination,
                     transition_version,
                     safe_payload,
@@ -980,9 +1216,8 @@ class NotificationOutbox:
                 )
             connection.commit()
         return tuple(
-            self._public(
+            self._private_gateway_delivery(
                 row,
-                include_gateway_capability=True,
                 lease_owner=owner_id,
                 lease_expires_at=expires,
             )
@@ -1323,47 +1558,110 @@ class NotificationOutbox:
         return tuple(
             {
                 **self._public(row),
-                "transition_version": row["transition_version"],
-                "payload": json.loads(str(row["payload_json"])),
-                "occurred_at": row["occurred_at"],
-                "transition_key": row["transition_key"],
+                "occurred_at": _public_timestamp(row["occurred_at"]),
+                "transition_key": self._public_transition_key(
+                    row["transition_key"]
+                ),
             }
             for row in rows
         )
 
     @staticmethod
-    def _public(
+    def _public_transition_key(value: object) -> str:
+        if not isinstance(value, str) or not value or len(value) > 1024:
+            return "redacted:invalid-transition"
+        projected = value
+        if ":gateway:" in projected:
+            projected = projected.partition(":gateway:")[0] + ":gateway:opaque"
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in projected):
+            return "redacted:invalid-transition"
+        return projected
+
+    @classmethod
+    def _private_gateway_delivery(
+        cls,
         row: Mapping[str, object],
-        *,
-        include_gateway_capability: bool = False,
         **updates: object,
     ) -> dict[str, object]:
+        """Add the opaque delivery capability only to the coordinator-owned DTO."""
+        public = cls._public(row, **updates)
         destination = str(row["destination"])
-        if destination.startswith("gateway:") and not include_gateway_capability:
+        capability = destination.removeprefix("gateway:")
+        public["delivery_capability"] = capability
+        return public
+
+    @staticmethod
+    def _public(
+        row: Mapping[str, object],
+        **updates: object,
+    ) -> dict[str, object]:
+        transition_version = _bounded_int(
+            row["transition_version"], maximum=1_000_000_000
+        )
+        if transition_version is None:
+            transition_version = 0
+        payload, payload_valid = _load_notification_payload(
+            row["payload_json"],
+            transition_version=transition_version,
+        )
+        raw_kind = row["kind"]
+        kind = (
+            raw_kind
+            if payload_valid
+            and payload["payload_type"] != "projection_recovery"
+            and raw_kind in PUBLIC_NOTIFICATION_KINDS
+            else "reconciliation_required"
+        )
+        destination = str(row["destination"])
+        if destination.startswith("gateway:"):
             destination = "gateway:opaque"
+        if destination not in _PUBLIC_NOTIFICATION_DESTINATIONS:
+            destination = "desktop"
+        notification_id = _logical_identifier(row["notification_id"])
+        run_id = _logical_identifier(row["run_id"])
+        state_value = updates.get("state", row["state"])
+        state = (
+            state_value
+            if isinstance(state_value, str) and state_value in _PUBLIC_NOTIFICATION_STATES
+            else "dead"
+        )
+        lease_owner_value = updates.get("lease_owner", row["lease_owner"])
+        lease_owner = _logical_identifier(lease_owner_value)
+        last_error_value = row["last_error"]
+        last_error = (
+            _stable_delivery_failure_reason(last_error_value)
+            if isinstance(last_error_value, str)
+            else None
+        )
         return {
-            "notification_id": row["notification_id"],
-            "run_id": row["run_id"],
-            "kind": row["kind"],
+            "notification_id": notification_id or "redacted:invalid-notification",
+            "run_id": run_id or "redacted:invalid-run",
+            "kind": kind,
             "destination": destination,
-            "transition_version": row["transition_version"],
-            "coalesced_count": row["coalesced_count"],
-            "payload": json.loads(str(row["payload_json"])),
-            "state": updates.get("state", row["state"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "lease_owner": updates.get("lease_owner", row["lease_owner"]),
-            "lease_expires_at": updates.get("lease_expires_at", row["lease_expires_at"]),
-            "delivered_at": row["delivered_at"],
-            "dismissed_at": row["dismissed_at"],
-            "attempts": row["attempts"],
-            "last_error": row["last_error"],
+            "transition_version": transition_version,
+            "coalesced_count": _bounded_int(
+                row["coalesced_count"], minimum=1
+            )
+            or 1,
+            "payload": payload,
+            "state": state,
+            "created_at": _public_timestamp(row["created_at"]),
+            "updated_at": _public_timestamp(row["updated_at"]),
+            "lease_owner": lease_owner,
+            "lease_expires_at": _public_timestamp(
+                updates.get("lease_expires_at", row["lease_expires_at"])
+            ),
+            "delivered_at": _public_timestamp(row["delivered_at"]),
+            "dismissed_at": _public_timestamp(row["dismissed_at"]),
+            "attempts": _bounded_int(row["attempts"]) or 0,
+            "last_error": last_error,
         }
 
 
 __all__ = [
     "ATTENTION_KINDS",
     "COALESCED_KINDS",
+    "PUBLIC_NOTIFICATION_KINDS",
     "NotificationOutbox",
     "install_notification_schema",
     "notification_kind",

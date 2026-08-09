@@ -428,6 +428,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase5_provider_authority.py \
       tests/plugins/workflow/test_phase5_provider_options.py \
       tests/plugins/workflow/test_phase5_provider_snapshot.py \
+      tests/plugins/workflow/test_phase5_public_projection_contract.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \

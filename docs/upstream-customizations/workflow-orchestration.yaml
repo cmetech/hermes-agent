@@ -773,6 +773,7 @@ upstream_changes:
   - every catalog language row carries the backend-authored normalizer version so clients can fail closed without resolving language state
   tests:
   - tests/plugins/workflow/test_phase5_surfaces.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
   - tests/plugins/workflow/test_evidence_api.py
   - tests/plugins/workflow/test_notifications.py
   - tests/plugins/workflow/test_catalog_api.py
@@ -1663,13 +1664,21 @@ upstream_changes:
   change_class: desktop-composition-generic
   owner: workflow-orchestration
   files:
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/store/native-notifications.ts
   - apps/desktop/src/store/workflow-notifications.ts
   - apps/desktop/src/store/workflow-notifications.test.ts
   owned_symbols:
   - projectNativeNotification
+  - decodeWorkflowNotificationPage
   - deliverWorkflowNotificationsOnce
   - startWorkflowNotificationDelivery
+  - WorkflowNotificationPayload
+  - WorkflowNotificationPage
+  owned_invariants:
+  - Desktop treats notification REST data as unknown until an exact closed-vocabulary decoder accepts the complete page
+  - malformed notification pages are never rendered or acknowledged and Desktop never reconstructs backend authority
   tests:
   - apps/desktop/src/store/native-notifications.test.ts
   - apps/desktop/src/store/workflow-notifications.test.ts
@@ -1977,10 +1986,16 @@ upstream_changes:
   - GatewayRunner authenticated plugin invocation and delivery boundary
   - workflow_gateway_command
   - WorkflowCoordinatorService._deliver_gateway_notifications
+  - NotificationOutbox closed public notification codec
+  - NotificationOutbox._private_gateway_delivery
+  owned_invariants:
+  - notification persistence and public reads use one exact discriminated DTO with strict JSON and safe legacy-row recovery
+  - gateway delivery capabilities remain private coordinator data while public destinations are opaque
   tests:
   - tests/hermes_cli/test_authenticated_plugin_commands.py
   - tests/gateway/test_plugin_delivery.py
   - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
   - tests/hermes_cli/test_plugin_background_services.py
   - tests/gateway/test_plugin_background_services.py
   - tests/hermes_cli/test_plugin_provider_hot_reload.py

@@ -79,7 +79,6 @@ import type {
   WorkflowEventPage,
   WorkflowEvidenceKind,
   WorkflowEvidencePage,
-  WorkflowNotificationPage,
   WorkflowRunListView,
   WorkflowRunPage,
   WorkflowRunSnapshot
@@ -277,7 +276,6 @@ function profileScoped(profile?: null | string): { profile?: string } {
   return selected ? { profile: selected } : {}
 }
 
-
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
  *  shape, minus the path (which is namespace-derived). */
 export interface PluginRestOptions {
@@ -434,8 +432,8 @@ export function executeWorkflowCleanup(confirmationToken: string, olderThan = '7
   })
 }
 
-export function leaseWorkflowNotifications(clientId: string): Promise<WorkflowNotificationPage> {
-  return window.hermesDesktop.api<WorkflowNotificationPage>({
+export function leaseWorkflowNotifications(clientId: string): Promise<unknown> {
+  return window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/notifications/lease?client_id=${encodeURIComponent(clientId)}`,
     ...profileScoped()
   })

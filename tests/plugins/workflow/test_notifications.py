@@ -437,6 +437,7 @@ def test_incomplete_notification_authority_collection_fails_closed(
     for item in (leased[0], history[0]):
         projected = item["payload"]
         assert set(projected) == {
+            "payload_type",
             "code",
             "status",
             "interaction",
@@ -445,7 +446,11 @@ def test_incomplete_notification_authority_collection_fails_closed(
             "next_actions",
         }
         assert projected["code"] == "provider_capability_drift"
-        assert projected["interaction"] == {"type": "reconcile"}
+        assert projected["payload_type"] == "workflow_transition"
+        assert projected["interaction"] == {
+            "type": "reconcile",
+            "interaction_id": f"interaction-{case}",
+        }
         assert projected["mismatched_fields"] == [mismatch]
         assert projected["next_actions"] == expected_actions
 
@@ -604,7 +609,7 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
         kind="failure",
         destination="desktop",
         transition_version=2,
-        payload={"error": "one"},
+        payload={"status": "failed", "event_type": "run_failed"},
         now=now,
     )
     second = outbox.record(
@@ -612,7 +617,7 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
         kind="failure",
         destination="desktop",
         transition_version=3,
-        payload={"error": "two"},
+        payload={"status": "failed", "event_type": "run_failed"},
         now=now + timedelta(seconds=30),
     )
     gate_one = outbox.record(
@@ -644,7 +649,8 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
     summary = next(item for item in leased if item["notification_id"] == first)
     assert summary["coalesced_count"] == 2
     assert summary["transition_version"] == 3
-    assert summary["payload"]["error"] == "two"
+    assert summary["payload"]["payload_type"] == "workflow_transition"
+    assert summary["payload"]["status"] == "failed"
 
 
 def test_transition_identity_is_idempotent(tmp_path):
@@ -868,14 +874,14 @@ def test_notification_history_is_newest_first_and_keyset_paginated(tmp_path):
 
     newest = outbox.history(run_id="run-newest", limit=200)
 
-    assert [item["payload"]["version"] for item in newest[:3]] == [204, 203, 202]
-    assert newest[-1]["payload"]["version"] == 5
+    assert [item["transition_version"] for item in newest[:3]] == [204, 203, 202]
+    assert newest[-1]["transition_version"] == 5
     older = outbox.history(
         run_id="run-newest",
         limit=200,
         before=(newest[-1]["occurred_at"], newest[-1]["transition_key"]),
     )
-    assert [item["payload"]["version"] for item in older] == [4, 3, 2, 1, 0]
+    assert [item["transition_version"] for item in older] == [4, 3, 2, 1, 0]
 
 
 def test_bounded_repair_reads_one_run_page_and_only_candidate_fact_keys(

@@ -159,10 +159,7 @@ export interface WorkflowLanguageStatus {
 }
 
 export type WorkflowProviderCapabilityDisposition =
-  | 'degraded_with_explicit_semantics'
-  | 'hermes_adapter'
-  | 'native'
-  | 'unsupported'
+  'degraded_with_explicit_semantics' | 'hermes_adapter' | 'native' | 'unsupported'
 
 export type WorkflowProviderFeature =
   | 'cost_budgets'
@@ -367,18 +364,155 @@ export interface WorkflowCleanupResult {
   run_ids: string[]
 }
 
+export type WorkflowNotificationAction =
+  | 'abandon'
+  | 'approve'
+  | 'archive'
+  | 'cancel'
+  | 'events'
+  | 'provide-input'
+  | 'reconcile'
+  | 'reject'
+  | 'restore'
+  | 'resume'
+  | 'retry'
+  | 'status'
+
+export type WorkflowNotificationKind =
+  | 'approval_required'
+  | 'cancellation'
+  | 'completion'
+  | 'failure'
+  | 'input_required'
+  | 'reconciliation_required'
+  | 'retry'
+  | 'stalled'
+
+export type WorkflowNotificationDeliveryReason =
+  | 'adapter_send_failed'
+  | 'adapter_send_timeout'
+  | 'adapter_unavailable'
+  | 'bad_format'
+  | 'delivery_store_unavailable'
+  | 'forbidden'
+  | 'gateway_loop_unavailable'
+  | 'invalid_text'
+  | 'not_found'
+  | 'notification delivery failed'
+  | 'outcome_uncertain'
+  | 'permanent_failure'
+  | 'projection_failed'
+  | 'rate_limited'
+  | 'retryable_failure'
+  | 'too_long'
+  | 'transient'
+  | 'unauthorized'
+  | 'unknown'
+
+export interface WorkflowNotificationInteraction {
+  interaction_id?: string
+  iteration?: number
+  max_iterations?: number
+  type: 'approval' | 'loop_input' | 'loop_signal_confirmation' | 'reconcile' | 'workflow_approval'
+}
+
+export interface WorkflowTransitionNotificationPayload {
+  code?:
+    | 'cleanup_failed'
+    | 'host_pressure'
+    | 'persistent_session_registry_update_pending'
+    | 'provider_capability_drift'
+    | 'schedule_overlap_forbidden'
+    | 'schedule_revalidation_failed'
+    | 'workflow_operation_failed'
+  event_type?:
+    | 'cancel_reconciliation_required'
+    | 'cleanup_failed'
+    | 'coordinator_stalled'
+    | 'loop_input_required'
+    | 'loop_signal_confirmation_required'
+    | 'node_approval_required'
+    | 'node_reconciliation_required'
+    | 'node_retry_scheduled'
+    | 'run_cancelled'
+    | 'run_failed'
+    | 'run_paused'
+    | 'run_reconciliation_required'
+    | 'run_retry_waiting'
+    | 'run_stalled'
+    | 'run_succeeded'
+    | 'workflow_approval_required'
+  interaction?: WorkflowNotificationInteraction
+  mismatched_fields?: Array<
+    'api_mode' | 'base_url_trust_class' | 'endpoint_sha256' | 'model' | 'provider' | 'registration_provenance_digest'
+  >
+  next_actions: WorkflowNotificationAction[]
+  node_id?: string
+  payload_type: 'workflow_transition'
+  state_version: number
+  status?:
+    | 'abandoned'
+    | 'cancelled'
+    | 'failed'
+    | 'interrupted'
+    | 'paused'
+    | 'queued'
+    | 'recovery_pending'
+    | 'running'
+    | 'succeeded'
+    | 'waiting_retry'
+  workflow?: string
+}
+
+export interface WorkflowDeliveryDecisionNotificationPayload {
+  attempts?: number
+  authority_scope?: string
+  decision: 'dead_letter_retried' | 'delivery_outcome_uncertain' | 'delivery_pruned' | 'terminal_dead_letter'
+  delivered_at?: string
+  delivery_state?: 'dead' | 'delivered' | 'leased' | 'pending' | 'pruned' | 'suppressed'
+  dismissed_at?: string
+  error?: WorkflowNotificationDeliveryReason
+  next_actions: WorkflowNotificationAction[]
+  payload_type: 'delivery_decision'
+  previous_attempts?: number
+  previous_error?: WorkflowNotificationDeliveryReason
+  state_version: number
+}
+
+export interface WorkflowProjectionRecoveryNotificationPayload {
+  code: 'notification_projection_invalid'
+  next_actions: WorkflowNotificationAction[]
+  payload_type: 'projection_recovery'
+  state_version: number
+}
+
+export type WorkflowNotificationPayload =
+  | WorkflowDeliveryDecisionNotificationPayload
+  | WorkflowProjectionRecoveryNotificationPayload
+  | WorkflowTransitionNotificationPayload
+
 export interface WorkflowNotification {
+  attempts: number
   coalesced_count: number
-  kind: string
+  created_at?: string
+  delivered_at?: string
+  destination: 'desktop' | 'gateway:opaque'
+  dismissed_at?: string
+  kind: WorkflowNotificationKind
+  last_error?: WorkflowNotificationDeliveryReason
+  lease_expires_at?: string
+  lease_owner?: string
   notification_id: string
-  payload: Record<string, unknown>
+  payload: WorkflowNotificationPayload
   run_id: string
+  state: 'dead' | 'delivered' | 'leased' | 'pending' | 'pruned' | 'suppressed'
   transition_version: number
+  updated_at?: string
 }
 
 export interface WorkflowNotificationPage {
   items: WorkflowNotification[]
-  schema_version: number
+  schema_version: 1
 }
 
 export type WorkflowEvidenceKind =
