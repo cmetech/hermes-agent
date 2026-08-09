@@ -2390,7 +2390,7 @@ export const zh: Translations = {
     abandon: '放弃',
     dataStale: '数据已过期。正在重新连接…',
     loadMore: '加载更多',
-    workflowUnavailable: 'Workflow 插件不可用。请运行 hermes plugins enable workflow。',
+    workflowUnavailable: '工作流数据不可用。请检查连接后重试。',
     kanbanUnavailable: 'Kanban 插件不可用。请运行 hermes plugins enable kanban。',
     dispatcherOffline: '调度器未运行，这些卡片不会被处理。请从状态栏启动网关以开始处理。',
     physicalBoard: board => `机器共享物理看板：${board}`

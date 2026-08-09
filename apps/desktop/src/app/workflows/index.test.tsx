@@ -951,6 +951,18 @@ describe('WorkflowsView', () => {
     }
   )
 
+  it('does not diagnose a run-list decoding failure as a disabled workflow plugin', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockRejectedValue(new Error('Hermes returned an invalid workflow run page'))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    fireEvent.click(await screen.findByRole('tab', { name: 'History' }))
+
+    expect(await screen.findByText('Workflow data is unavailable. Check your connection and try again.')).toBeTruthy()
+    expect(screen.queryByText(/plugins enable workflow/i)).toBeNull()
+  })
+
   it('refetches a stale run after 409 and disables repeat actions until recovery', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
     const mutation = deferred<WorkflowRunSnapshot>()

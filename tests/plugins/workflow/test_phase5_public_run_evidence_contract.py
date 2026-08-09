@@ -410,7 +410,9 @@ def test_rest_projection_models_accept_only_the_closed_failure_truncation_and_ar
 
     assert module.WorkflowAttemptProjection.model_validate(attempt).error_code == "execution_integrity"
     assert module.WorkflowTimelineEventProjection.model_validate(event).payload_truncated is True
-    assert module.WorkflowArtifactProjection.model_validate(legacy_artifact).publication_id is None
+    legacy_model = module.WorkflowArtifactProjection.model_validate(legacy_artifact)
+    assert legacy_model.publication_id is None
+    assert "publication_id" not in legacy_model.model_dump(mode="json")
     for model, value in (
         (module.WorkflowAttemptProjection, {**attempt, "provider_payload": _CANARY}),
         (module.WorkflowTimelineEventProjection, {**event, "payload": {"prompt": _CANARY}}),

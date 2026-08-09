@@ -2201,7 +2201,7 @@ export const en: Translations = {
     abandon: 'Abandon',
     dataStale: 'Data is stale. Reconnecting…',
     loadMore: 'Load more',
-    workflowUnavailable: 'Workflow plugin unavailable. Enable it with hermes plugins enable workflow.',
+    workflowUnavailable: 'Workflow data is unavailable. Check your connection and try again.',
     kanbanUnavailable: 'Kanban plugin unavailable. Enable it with hermes plugins enable kanban.',
     dispatcherOffline:
       'No dispatcher is running, so these cards will not be picked up. Start the gateway from the status bar to work them.',

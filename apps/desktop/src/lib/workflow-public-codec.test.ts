@@ -46,6 +46,21 @@ const structuredOutputCapability = {
   summary_count: 1
 }
 
+const serializedLegacyArtifact = {
+  attempt_id: 'attempt-1',
+  integrity_status: 'legacy_unverified',
+  item_type: 'artifact',
+  media_type: 'text/plain',
+  node_id: 'retry',
+  output_type: null,
+  produced_at: null,
+  publication_id: null,
+  recovery_status: 'projection_recovered',
+  schema_fingerprint: null,
+  sha256: 'a'.repeat(64),
+  size_bytes: 0
+}
+
 describe('workflow public codecs', () => {
   it('accepts only the exact backend structured-output catalog projection', () => {
     expect(isWorkflowStructuredOutputCapabilitySummary(structuredOutputCapability)).toBe(true)
@@ -92,6 +107,16 @@ describe('workflow public codecs', () => {
         }
       })
     ).toBeNull()
+  })
+
+  it('accepts a serialized legacy artifact with a null publication identity on run pages', () => {
+    const page = {
+      next_cursor: null,
+      runs: [{ ...run, artifacts: [serializedLegacyArtifact] }],
+      schema_version: 1
+    }
+
+    expect(decodeWorkflowRunPage(page)).toEqual(page)
   })
 
   it('rejects event payloads and evidence extras at runtime', () => {
@@ -238,6 +263,18 @@ describe('workflow public codecs', () => {
         items: [{ ...legacyArtifactPage.items[0], relative_path: 'private/report.json' }]
       })
     ).toBeNull()
+  })
+
+  it('accepts a serialized legacy artifact with a null publication identity on evidence pages', () => {
+    const page = {
+      items: [serializedLegacyArtifact],
+      kind: 'artifacts',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    }
+
+    expect(decodeWorkflowEvidencePage(page)).toEqual(page)
   })
 
   it('formats decoded evidence without serializing arbitrary objects', () => {
