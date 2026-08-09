@@ -308,7 +308,9 @@ function event(value: unknown): value is WorkflowTimelineEvent {
     !exact(
       value,
       new Set([
+        'actor',
         'attempt_id',
+        'channel',
         'decision',
         'event_type',
         'interaction_id',
@@ -331,7 +333,7 @@ function event(value: unknown): value is WorkflowTimelineEvent {
     typeof value.timestamp === 'string' &&
     typeof value.run_id === 'string' &&
     typeof value.event_type === 'string' &&
-    ['attempt_id', 'decision', 'interaction_id', 'node_id', 'outcome', 'reason_code'].every(key =>
+    ['actor', 'attempt_id', 'channel', 'decision', 'interaction_id', 'node_id', 'outcome', 'reason_code'].every(key =>
       optionalString(value[key])
     )
   )
@@ -358,6 +360,8 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
     cleanup: new Set(['bytes', 'files', 'item_type', 'outcome', 'sequence']),
     coordinator: new Set(['health', 'item_type', 'status']),
     interaction: new Set([
+      'actor',
+      'channel',
       'decision',
       'event_type',
       'interaction_id',
@@ -410,7 +414,7 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
 
     case 'interaction':
       return (
-        ['decision', 'event_type', 'interaction_id', 'node_id', 'outcome', 'type'].every(key =>
+        ['actor', 'channel', 'decision', 'event_type', 'interaction_id', 'node_id', 'outcome', 'type'].every(key =>
           optionalString(value[key])
         ) &&
         optionalFiniteInt(value.iteration) &&
@@ -747,10 +751,18 @@ export function formatWorkflowEvidenceItem(item: WorkflowEvidenceItem): string {
     }
 
     case 'timeline_event':
-      return [String(item.sequence), item.event_type, item.node_id, item.attempt_id].filter(Boolean).join(' · ')
+      return [String(item.sequence), item.event_type, item.node_id, item.attempt_id, item.actor, item.channel]
+        .filter(Boolean)
+        .join(' · ')
 
     case 'interaction':
-      return [item.event_type ?? item.type ?? 'interaction', item.node_id, item.interaction_id]
+      return [
+        item.event_type ?? item.type ?? 'interaction',
+        item.node_id,
+        item.interaction_id,
+        item.actor,
+        item.channel
+      ]
         .filter(Boolean)
         .join(' · ')
 

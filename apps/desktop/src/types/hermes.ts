@@ -682,7 +682,9 @@ export interface WorkflowPersistentSessionRecoveryEvidence {
 }
 
 export interface WorkflowTimelineEvent {
+  actor?: string
   attempt_id?: string
+  channel?: string
   decision?: string
   event_type: string
   interaction_id?: string
@@ -696,6 +698,8 @@ export interface WorkflowTimelineEvent {
 }
 
 export interface WorkflowInteractionEvidence {
+  actor?: string
+  channel?: string
   decision?: string
   event_type?: string
   interaction_id?: string

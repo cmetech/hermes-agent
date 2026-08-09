@@ -86,6 +86,12 @@ _PUBLIC_INTERACTION_TYPES = frozenset({
     "capability",
     "reconcile",
 })
+_PUBLIC_INTERACTION_EVENT_TYPES = frozenset({
+    "loop_input_provided",
+    "loop_signal_confirmation_required",
+    "loop_signal_accepted",
+    "loop_feedback_provided",
+})
 _PUBLIC_PROVENANCE_SOURCES = frozenset({
     "api",
     "background_agent",
@@ -477,6 +483,13 @@ def public_event_projection(value: Mapping[str, object]) -> dict[str, object]:
             code = _bounded_code(payload.get(field))
             if code is not None:
                 projected[field] = code
+        if str(event_type).startswith("interaction_") or event_type in (
+            _PUBLIC_INTERACTION_EVENT_TYPES
+        ):
+            for field in ("actor", "channel"):
+                identifier = payload.get(field)
+                if isinstance(identifier, str):
+                    projected[field] = public_display_identifier(identifier)
     return projected
 
 

@@ -470,7 +470,14 @@ class EvidenceReader:
             "sequence": event.get("sequence", 0),
             "event_type": event.get("event_type", "workflow_event"),
         }
-        for field in ("node_id", "interaction_id", "decision", "outcome"):
+        for field in (
+            "node_id",
+            "interaction_id",
+            "decision",
+            "outcome",
+            "actor",
+            "channel",
+        ):
             value = event.get(field)
             if isinstance(value, str):
                 projected[field] = public_display_identifier(value)

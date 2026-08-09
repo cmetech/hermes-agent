@@ -347,6 +347,8 @@ class WorkflowTimelineEventProjection(BaseModel):
     reason_code: str | None = None
     decision: str | None = None
     outcome: str | None = None
+    actor: str | None = Field(None, max_length=128)
+    channel: str | None = Field(None, max_length=128)
 
 
 class WorkflowEventPageProjection(BaseModel):
@@ -371,6 +373,8 @@ class WorkflowInteractionEvidenceProjection(BaseModel):
     max_iterations: StrictInt | None = Field(None, ge=0)
     decision: str | None = None
     outcome: str | None = None
+    actor: str | None = Field(None, max_length=128)
+    channel: str | None = Field(None, max_length=128)
     state_version: StrictInt | None = Field(None, ge=0)
     next_actions: list[
         Literal[

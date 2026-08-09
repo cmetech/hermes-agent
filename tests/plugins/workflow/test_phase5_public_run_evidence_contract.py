@@ -17,7 +17,7 @@ from hermes_cli.plugin_invocation import PluginInvocationContext
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.gateway_command import workflow_gateway_command
-from plugins.workflow.sanitize import public_run_projection
+from plugins.workflow.sanitize import public_event_projection, public_run_projection
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
@@ -248,6 +248,50 @@ def test_real_approval_rework_and_interaction_journal_omit_rendered_user_text(
     assert all(item["item_type"] == "interaction" for item in interactions["items"])
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    (
+        "interaction_approved",
+        "interaction_rejected",
+        "loop_input_provided",
+        "loop_signal_confirmation_required",
+        "loop_signal_accepted",
+        "loop_feedback_provided",
+    ),
+)
+def test_interaction_event_variants_retain_only_bounded_actor_and_channel(
+    event_type: str,
+) -> None:
+    public_event = public_event_projection({
+        "sequence": 7,
+        "timestamp": "2026-08-08T20:00:00+00:00",
+        "run_id": "run-1",
+        "event_type": event_type,
+        "node_id": "review",
+        "payload": {
+            "actor": "operator-1",
+            "channel": "desktop",
+            "comment": _CANARY,
+            "message": _CANARY,
+            "prompt": _CANARY,
+            "feedback": _CANARY,
+            "provider_payload": {"response": _CANARY},
+        },
+    })
+
+    item = EvidenceReader._interaction_event_item(public_event)
+
+    assert item == {
+        "item_type": "interaction",
+        "sequence": 7,
+        "event_type": event_type,
+        "node_id": "review",
+        "actor": "operator-1",
+        "channel": "desktop",
+    }
+    assert _CANARY not in json.dumps(item, sort_keys=True)
+
+
 def test_direct_sql_and_malformed_legacy_rows_recover_to_bounded_public_projections(
     tmp_path,
     workflow_writer,
@@ -322,6 +366,17 @@ def test_real_rest_run_event_and_evidence_routes_enforce_closed_models(
         "diagnostic",
         {"audit": {"error": _CANARY}, "provider_payload": _CANARY},
     )
+    store.append_event(
+        run_id,
+        "interaction_approved",
+        {
+            "actor": "operator-1",
+            "channel": "desktop",
+            "comment": _CANARY,
+            "provider_payload": _CANARY,
+        },
+        node_id="work",
+    )
     module = _api_module()
     client = TestClient(_app(module.router))
 
@@ -331,12 +386,27 @@ def test_real_rest_run_event_and_evidence_routes_enforce_closed_models(
         f"/api/plugins/workflow/runs/{run_id}/evidence",
         params={"kind": "timeline"},
     )
+    interactions = client.get(
+        f"/api/plugins/workflow/runs/{run_id}/evidence",
+        params={"kind": "interactions"},
+    )
 
-    assert detail.status_code == events.status_code == evidence.status_code == 200
-    assert _CANARY not in detail.text + events.text + evidence.text
+    assert (
+        detail.status_code
+        == events.status_code
+        == evidence.status_code
+        == interactions.status_code
+        == 200
+    )
+    rendered = detail.text + events.text + evidence.text + interactions.text
+    assert _CANARY not in rendered
+    for response in (events, evidence, interactions):
+        assert '"actor":"operator-1"' in response.text
+        assert '"channel":"desktop"' in response.text
     module.WorkflowRunProjection.model_validate(detail.json())
     module.WorkflowEventPageProjection.model_validate(events.json())
     module.WorkflowEvidencePageProjection.model_validate(evidence.json())
+    module.WorkflowEvidencePageProjection.model_validate(interactions.json())
     invalid = detail.json()
     invalid["provider_payload"] = _CANARY
     with pytest.raises(ValidationError):

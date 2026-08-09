@@ -68,7 +68,9 @@ describe('workflow public codecs', () => {
 
   it('rejects event payloads and evidence extras at runtime', () => {
     const event = {
-      event_type: 'node_failed',
+      actor: 'operator-1',
+      channel: 'desktop',
+      event_type: 'interaction_approved',
       item_type: 'timeline_event',
       node_id: 'work',
       run_id: 'run-1',
@@ -85,6 +87,31 @@ describe('workflow public codecs', () => {
         events: [{ ...event, payload: { provider_payload: 'private' } }],
         next_cursor: 3,
         schema_version: 1
+      })
+    ).toBeNull()
+
+    const interactionPage = {
+      items: [
+        {
+          actor: 'operator-1',
+          channel: 'desktop',
+          event_type: 'interaction_approved',
+          item_type: 'interaction',
+          node_id: 'work',
+          sequence: 4
+        }
+      ],
+      kind: 'interactions',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    }
+
+    expect(decodeWorkflowEvidencePage(interactionPage)).toEqual(interactionPage)
+    expect(
+      decodeWorkflowEvidencePage({
+        ...interactionPage,
+        items: [{ ...interactionPage.items[0], comment: 'private' }]
       })
     ).toBeNull()
 
