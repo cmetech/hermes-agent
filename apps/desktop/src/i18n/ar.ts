@@ -1671,6 +1671,7 @@ export const ar = defineLocale({
     acceptResult: 'قبول النتيجة',
     continueWithFeedback: 'متابعة مع ملاحظات',
     feedback: 'الملاحظات',
+    workflowUnavailable: 'بيانات سير العمل غير متاحة. تحقق من الاتصال وحاول مرة أخرى.',
     workflowRunProviderAuthorityUnavailable: 'تغيّر استعداد المزوّد. راجعه قبل البدء.',
     workflowProviderReadiness: 'جاهزية المزوّد',
     workflowProviderAuthorityDigest: 'بصمة الصلاحية',
