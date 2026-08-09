@@ -13,7 +13,7 @@ import pytest
 import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.output_resolution import ArchonOutputIntegrityError
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import (
     ArtifactRef,
@@ -47,7 +47,12 @@ def _start_archon(
         "language_compatibility: archon-2026-07\n",
         encoding="utf-8",
     )
-    package = load_workflow(workflow)
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(f"{workflow.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
     prepared = store.prepare_run_snapshot(package)
     return store.start_run(
         RunAdmissionRequest(

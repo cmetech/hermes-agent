@@ -11,6 +11,7 @@ import sqlite3
 from typing import Literal, Mapping
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission_service import assess_workflow_admission
 from plugins.workflow.coordinator_store import CoordinatorStore
 from plugins.workflow.entitlement import verified_showcase_run_metadata
 from plugins.workflow.input_contract import (
@@ -32,7 +33,6 @@ from plugins.workflow.compat import (
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.runner_binding import (
     WorkflowRunnerBinding,
-    assess_package_execution,
     background_execution_context,
     production_workflow_runner_binding,
 )
@@ -48,8 +48,6 @@ from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     WorkflowTrustStore,
-    WorkflowPackageDigest,
-    compute_package_digest,
     preflight_execution,
 )
 
@@ -349,20 +347,14 @@ def start_api_run(
         requires_ai=(scenario.requires_ai if scenario is not None else None),
     )
     try:
-        package_digest = (
-            WorkflowPackageDigest(
-                compilation.composite_digest,
-                compilation.covered_relative_paths,
-            )
-            if phase4_compilation is not None
-            else compute_package_digest(package, read_budget=resource_budget)
-        )
-        compatibility, risk = assess_package_execution(
-            package,
+        assessment = assess_workflow_admission(
+            compilation,
             execution_context,
             read_budget=resource_budget,
-            compilation=phase4_compilation,
         )
+        package_digest = assessment.package_digest
+        compatibility = assessment.compatibility
+        risk = assessment.risk
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(
             "workflow_catalog_capacity", status_code=503, retryable=True
@@ -383,6 +375,14 @@ def start_api_run(
     except OSError as exc:
         raise ApiAdmissionError("workflow_package_changed", status_code=409) from exc
 
+    try:
+        require_runnable(compatibility)
+    except WorkflowCompatibilityBlockedError as exc:
+        raise ApiAdmissionError(
+            exc.code,
+            status_code=409,
+        ) from exc
+
     if verified_showcase is None:
         trust_store = WorkflowTrustStore(home)
         trust_snapshot = trust_store.snapshot_read_only(
@@ -400,13 +400,6 @@ def start_api_run(
         trusted = True
     if not trusted:
         raise ApiAdmissionError("workflow_trust_required", status_code=403)
-    try:
-        require_runnable(compatibility)
-    except WorkflowCompatibilityBlockedError as exc:
-        raise ApiAdmissionError(
-            exc.code,
-            status_code=409,
-        ) from exc
     try:
         preflight_execution(risk, trusted=True)
     except WorkflowTrustError as exc:
@@ -471,6 +464,7 @@ def start_api_run(
             resource_read_budget=resource_budget,
             trusted_package_digest=package_digest,
             execution_limits=execution_limits,
+            provider_authority=assessment.provider_authority,
         )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(
@@ -538,7 +532,7 @@ def start_api_run(
             "catalog_source": (
                 "showcase" if verified_showcase is not None else str(package.source)
             ),
-            "execution_identity": execution_context.identity_digest_for(package),
+            "execution_identity": assessment.execution_identity,
             "execution_runtime_identity": execution_context.identity_digest,
             "package_digest": package_digest.sha256,
             "risk_digest": risk.risk_digest,

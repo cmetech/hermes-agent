@@ -3,7 +3,7 @@ from __future__ import annotations
 from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.compat import CompatibilityLevel, assess_compatibility
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 
 
 def _package(workflow_writer, tmp_path):

@@ -8,18 +8,21 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getApiRequestProfile, getWorkflowEvidence } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { formatWorkflowEvidenceItem } from '@/lib/workflow-public-codec'
 import type {
   WorkflowAttemptEvidence,
+  WorkflowEvidenceItem,
   WorkflowEvidenceKind,
   WorkflowPersistentSessionRecoveryEvidence,
-  WorkflowRunSnapshot
+  WorkflowRunSnapshot,
+  WorkflowTimelineEvent
 } from '@/types/hermes'
 
 import { isWorkflowTypedArtifact, TypedArtifactView } from './typed-artifact-view'
 
 interface RunInspectorProps {
   actionsDisabled?: boolean
-  events?: Array<Record<string, unknown>>
+  events?: WorkflowTimelineEvent[]
   onAction?: (action: string, body?: Record<string, unknown>) => void
   run: WorkflowRunSnapshot
 }
@@ -73,29 +76,7 @@ export function isLoopSignalConfirmation(value: unknown): value is LoopSignalCon
 }
 
 export function isWorkflowAttemptEvidence(item: unknown): item is WorkflowAttemptEvidence {
-  if (!isRecord(item) || !isRecord(item.retry)) {
-    return false
-  }
-
-  const retry = item.retry
-  const error = item.error
-
-  return (
-    typeof item.attempt_id === 'string' &&
-    typeof item.node_id === 'string' &&
-    (item.state === undefined || typeof item.state === 'string') &&
-    isNumber(retry.additional_provider_attempts) &&
-    typeof retry.capped === 'boolean' &&
-    isNumber(retry.effective_total_attempts) &&
-    isNumber(retry.remaining_attempts) &&
-    isNumber(retry.requested_retries) &&
-    isNumber(retry.requested_total_attempts) &&
-    isNumber(retry.retry_consumed) &&
-    (error === undefined ||
-      (isRecord(error) &&
-        typeof error.code === 'string' &&
-        (error.message === undefined || error.message === null || typeof error.message === 'string')))
-  )
+  return isRecord(item) && item.item_type === 'attempt'
 }
 
 export function isWorkflowPersistentSessionRecoveryEvidence(
@@ -103,6 +84,7 @@ export function isWorkflowPersistentSessionRecoveryEvidence(
 ): item is WorkflowPersistentSessionRecoveryEvidence {
   return (
     isRecord(item) &&
+    item.item_type === 'recovery' &&
     typeof item.attempt_id === 'string' &&
     typeof item.cache_fingerprint_sha256 === 'string' &&
     typeof item.missing_session_sha256 === 'string' &&
@@ -117,7 +99,7 @@ export function isWorkflowPersistentSessionRecoveryEvidence(
   )
 }
 
-function evidenceItemKey(item: Record<string, unknown>, index: number): string {
+function evidenceItemKey(item: WorkflowEvidenceItem, index: number): string {
   if (isWorkflowAttemptEvidence(item)) {
     return `${item.node_id}:${item.attempt_id}`
   }
@@ -126,18 +108,22 @@ function evidenceItemKey(item: Record<string, unknown>, index: number): string {
     return `${item.node_id}:${item.attempt_id}:${item.recovery_kind}`
   }
 
-  return String(item.sequence ?? item.attempt_id ?? index)
+  if ('sequence' in item && item.sequence !== undefined) {
+    return String(item.sequence)
+  }
+
+  if ('attempt_id' in item && item.attempt_id !== undefined) {
+    return String(item.attempt_id)
+  }
+
+  if ('publication_id' in item && item.publication_id !== undefined) {
+    return item.publication_id
+  }
+
+  return `${item.item_type}:${index}`
 }
 
-function EvidenceItems({
-  emptyLabel,
-  items,
-  logs
-}: {
-  emptyLabel: string
-  items: Array<Record<string, unknown>>
-  logs?: boolean
-}) {
+function EvidenceItems({ emptyLabel, items }: { emptyLabel: string; items: WorkflowEvidenceItem[] }) {
   if (items.length === 0) {
     return <p className="text-sm text-(--ui-text-tertiary)">{emptyLabel}</p>
   }
@@ -145,11 +131,9 @@ function EvidenceItems({
   return (
     <div className="space-y-2" role="list">
       {items.map((item, index) => {
-        const content = logs && typeof item.text === 'string' ? item.text : JSON.stringify(item, null, 2)
-
         return (
           <LogView className="max-h-72" key={evidenceItemKey(item, index)} role="listitem">
-            {content}
+            {formatWorkflowEvidenceItem(item)}
           </LogView>
         )
       })}
@@ -278,13 +262,19 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
             <dd>{asDisplay(run.next_retry_at, copy.estimateUnavailable)}</dd>
             <dt>{copy.definition}</dt>
             <dd className="break-all">{asDisplay(run.definition_digest, copy.estimateUnavailable)}</dd>
+            {run.provider_resolution_sha256 ? (
+              <>
+                <dt>{copy.workflowProviderAuthorityDigest}</dt>
+                <dd className="break-all font-mono">{run.provider_resolution_sha256}</dd>
+              </>
+            ) : null}
           </dl>
         ) : tab === 'timeline' ? (
           <EvidenceItems emptyLabel={copy.noEvidence} items={events} />
         ) : tab === 'artifacts' && typedArtifacts.length > 0 ? (
           <TypedArtifactView artifacts={typedArtifacts} runId={run.run_id} />
         ) : (
-          <EvidenceItems emptyLabel={copy.noEvidence} items={evidenceItems} logs={tab === 'logs'} />
+          <EvidenceItems emptyLabel={copy.noEvidence} items={evidenceItems} />
         )}
       </section>
 

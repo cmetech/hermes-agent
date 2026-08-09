@@ -12,6 +12,10 @@ import pytest
 
 from plugins.workflow.models import ExecutionFence, RunExecutionLimits
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission_service import (
+    assess_production_workflow_admission,
+    assess_workflow_admission,
+)
 from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
 from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
 from plugins.workflow.compat import assess_compatibility
@@ -23,7 +27,7 @@ from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
 )
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduler import RunScheduler
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.showcase import run_showcase
@@ -70,7 +74,12 @@ def _archon_package(tmp_path, workflow_writer, *, nodes, sidecar=None):
         ),
         encoding="utf-8",
     )
-    return load_workflow(path)
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=4,
+    )
 
 
 def test_effective_execution_semantics_round_trip_exact_schema_and_caps(
@@ -305,9 +314,10 @@ def test_legacy_snapshot_shape_and_digest_ignore_phase3_execution_authority(
 
 
 def test_gateway_admission_seals_resolved_profile_execution_authority(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, monkeypatch
 ) -> None:
     home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     path = workflow_writer(
         tmp_path / "package",
         name="archon-sealed-gateway-limits",
@@ -319,6 +329,11 @@ def test_gateway_admission_seals_resolved_profile_execution_authority(
     home.mkdir()
     (home / "config.yaml").write_text(
         yaml.safe_dump({
+            "model": {
+                "provider": "openrouter",
+                "default": "openai/gpt-5.4",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
             "plugins": {
                 "entries": {
                     "workflow": {
@@ -340,11 +355,7 @@ def test_gateway_admission_seals_resolved_profile_execution_authority(
         str(path),
     )
     package = compilation.package
-    risk = build_risk_summary(
-        package,
-        assess_compatibility(package),
-        compilation=compilation,
-    )
+    risk = assess_production_workflow_admission(compilation).risk
     WorkflowTrustStore(home).trust(
         compilation.composite_digest,
         actor="test",
@@ -453,6 +464,11 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     (home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "openai/gpt-5.4",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
                 "plugins": {
                     "entries": {
                         "workflow": {
@@ -485,20 +501,17 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     binding = production_workflow_runner_binding()
     context = background_execution_context(binding, requires_ai=True)
     trust_store = WorkflowTrustStore(home)
-    risks = {}
+    assessments = []
     for compilation in (profile_compilation, explicit_compilation):
-        _compatibility, compilation_risk = assess_package_execution(
-            compilation.package,
-            context,
-            compilation=compilation,
-        )
+        assessment = assess_workflow_admission(compilation, context)
         trust_store.trust(
             compilation.composite_digest,
             actor="test",
-            risk_digest=compilation_risk.risk_digest,
+            risk_digest=assessment.risk.risk_digest,
         )
-        risks[compilation.composite_digest] = compilation_risk
-    risk = risks[profile_compilation.composite_digest]
+        assessments.append(assessment)
+    profile_assessment, explicit_assessment = assessments
+    risk = profile_assessment.risk
     store = RunStore(home)
     now = datetime.now(timezone.utc)
     coordinator = CoordinatorStore(store.database)
@@ -656,12 +669,14 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
         values=values,
         execution_limits=resolved,
         compilation=profile_compilation,
+        provider_authority=profile_assessment.provider_authority,
     )
     explicit_direct = store.prepare_run_snapshot(
         explicit_compilation.package,
         values=values,
         execution_limits=resolved,
         compilation=explicit_compilation,
+        provider_authority=explicit_assessment.provider_authority,
     )
     profile_resources = (
         profile_direct.staging_directory / "resources.json"
@@ -707,6 +722,11 @@ def test_all_admission_boundaries_seal_identical_canonical_execution_semantics(
     (home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "openai/gpt-5.4",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
                 "plugins": {
                     "entries": {
                         "workflow": {
@@ -901,7 +921,7 @@ def test_scheduler_resume_uses_sealed_limits_after_current_configuration_changes
         scheduler.shutdown(deadline_seconds=2)
 
     assert loaded is not None
-    resumed_limits = loaded[1]
+    resumed_limits = loaded.execution_limits
     assert (
         resumed_limits.ai_idle_timeout_seconds,
         resumed_limits.ai_wall_timeout_seconds,

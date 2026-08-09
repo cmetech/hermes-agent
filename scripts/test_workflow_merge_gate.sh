@@ -417,6 +417,22 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase3_bash_substitution.py \
       tests/plugins/workflow/test_phase3_bash_descriptor_faults.py \
       tests/plugins/workflow/test_phase3_bash_reference_ordering.py \
+      tests/plugins/workflow/test_phase5_admission_parity.py \
+      tests/plugins/workflow/test_phase5_adversarial_remediation.py \
+      tests/plugins/workflow/test_phase5_cost_budget.py \
+      tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
+      tests/plugins/workflow/test_phase5_execution_context.py \
+      tests/plugins/workflow/test_phase5_hooks.py \
+      tests/plugins/workflow/test_phase5_identity_convergence.py \
+      tests/plugins/workflow/test_phase5_inline_approval_convergence.py \
+      tests/plugins/workflow/test_phase5_inline_limits.py \
+      tests/plugins/workflow/test_phase5_language.py \
+      tests/plugins/workflow/test_phase5_mcp.py \
+      tests/plugins/workflow/test_phase5_provider_authority.py \
+      tests/plugins/workflow/test_phase5_provider_options.py \
+      tests/plugins/workflow/test_phase5_provider_snapshot.py \
+      tests/plugins/workflow/test_phase5_public_projection_contract.py \
+      tests/plugins/workflow/test_phase5_public_run_evidence_contract.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
@@ -429,6 +445,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_typed_publication.py \
       tests/plugins/workflow/test_typed_publication_recovery.py \
       tests/plugins/workflow/test_catalog_api.py \
+      tests/plugins/workflow/test_phase5_surfaces.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
       tests/plugins/workflow/test_workflow_language_desktop_e2e.py \

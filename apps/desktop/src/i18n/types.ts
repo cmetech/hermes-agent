@@ -1771,6 +1771,11 @@ export interface Translations {
     workflowRunCatalogSourceInvalid: string
     workflowRunCoordinatorUnavailable: string
     workflowRunIncompatible: string
+    workflowRunProviderAuthorityUnavailable: string
+    workflowProviderReadiness: string
+    workflowProviderAuthorityDigest: string
+    workflowProviderCapabilityLevel: string
+    workflowProviderRoute: (node: string, provider: string, model: string) => string
     workflowRunNetworkError: string
     workflowRunProfileUnavailable: string
     workflowRunValidationError: string

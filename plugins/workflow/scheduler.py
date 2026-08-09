@@ -34,6 +34,9 @@ from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_enti
 from plugins.workflow.execution_semantics import (
     Phase3ExecutionSemantics,
     WorkflowExecutionSemanticsError,
+    phase5_node_mcp_runtime_identity_digest,
+    phase5_node_intended_authority_digest,
+    phase5_shared_context_compatibility_digest,
     read_phase3_execution_semantics,
 )
 from plugins.workflow.executors.ai import AgentNodeExecutor
@@ -50,6 +53,7 @@ from plugins.workflow.language import (
     read_language_snapshot,
     supports_phase3_semantics,
     supports_phase4_semantics,
+    supports_phase5_semantics,
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
@@ -85,7 +89,11 @@ from plugins.workflow.output_resolution import (
     resolved_output_publication_identity,
     _read_descriptor_relative,
 )
-from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.resources import (
+    ResourceResolver,
+    VariableContext,
+    read_snapshot_provider_authority,
+)
 from plugins.workflow.schema import (
     is_inline_script,
     load_workflow_snapshot,
@@ -142,6 +150,25 @@ class _StrictReferenceSnapshot:
             raise WorkflowOutputReferenceError(
                 "output_reference_integrity", node_id, tuple(path)
             ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRunPackage:
+    """Legacy-five-tuple preparation result plus private Phase 5 authority."""
+
+    package: WorkflowPackage
+    execution_limits: RunExecutionLimits
+    sealed_resource_paths: frozenset[str]
+    sealed_resource_bytes: Mapping[str, bytes]
+    execution_semantics: Phase3ExecutionSemantics | None
+    provider_authority: object | None = None
+
+    def __iter__(self):
+        yield self.package
+        yield self.execution_limits
+        yield self.sealed_resource_paths
+        yield self.sealed_resource_bytes
+        yield self.execution_semantics
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
 _OUTPUT_RESOLUTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
@@ -536,6 +563,22 @@ def load_snapshot_format2(
 
     if projection.get("snapshot_format_version") != 2:
         mismatch("workflow snapshot format identity is not version 2")
+    language_snapshot = read_language_snapshot(resources.get("language"))
+    if language_snapshot is None or not supports_phase4_semantics(
+        language_snapshot.effective_profile,
+        language_snapshot.normalizer_version,
+    ):
+        mismatch("format-2 language identity is missing")
+    normalizer_version = language_snapshot.normalizer_version
+    try:
+        read_snapshot_provider_authority(
+            language_snapshot=language_snapshot,
+            resources=resources,
+            authenticated_bytes=authenticated_bytes,
+            projected_digest=projection.get("provider_resolution_sha256"),
+        )
+    except ValueError as exc:
+        mismatch("provider authority identity changed", exc)
     definition_bytes = authenticated_bytes.get("definition.yaml")
     policy_bytes = authenticated_bytes.get("policy.yaml")
     manifest_bytes = authenticated_bytes.get("dependencies.json")
@@ -662,7 +705,7 @@ def load_snapshot_format2(
         )
         identity_package = _compile_workflow_source_document(
             identity_source,
-            normalizer_version=4,
+            normalizer_version=normalizer_version,
         )
         identity_package = bind_v4_loop_command_semantics(
             identity_package,
@@ -705,9 +748,6 @@ def load_snapshot_format2(
     ):
         mismatch("expanded workflow package identity changed")
 
-    language_snapshot = read_language_snapshot(resources.get("language"))
-    if language_snapshot is None or language_snapshot.normalizer_version != 4:
-        mismatch("format-2 language identity is missing")
     verify_language_snapshot(
         identity_package,
         composite_digest,
@@ -736,7 +776,7 @@ def load_snapshot_format2(
         runtime_source = replace(runtime_source, nodes=tuple(runtime_nodes))
         runtime_package = _compile_workflow_source_document(
             runtime_source,
-            normalizer_version=4,
+            normalizer_version=normalizer_version,
         )
     except WorkflowLanguageCompatibilityError:
         raise
@@ -1022,6 +1062,8 @@ class RunScheduler:
                 expected_generation=candidate.expected_generation,
                 session_id=candidate.new_session_id,
                 cache_fingerprint=candidate.cache_fingerprint,
+                intended_authority_digest=candidate.intended_authority_digest,
+                model_visible_prefix_digest=candidate.model_visible_prefix_digest,
             )
         except Exception:
             if retry_count < 5:
@@ -1919,6 +1961,33 @@ class RunScheduler:
                 for field in ("session_id", "cache_fingerprint")
                 if field in state
             }
+            if state.get("state") == "succeeded":
+                attempts = state.get("attempts")
+                winning_attempts = (
+                    [
+                        attempt
+                        for attempt in attempts
+                        if isinstance(attempt, Mapping)
+                        and attempt.get("state") == "succeeded"
+                    ]
+                    if isinstance(attempts, list)
+                    else []
+                )
+                if len(winning_attempts) == 1:
+                    metadata = winning_attempts[0].get("metadata")
+                    identity_fields = (
+                        "intended_authority_digest",
+                        "model_visible_prefix_digest",
+                        "shared_context_compatibility_digest",
+                    )
+                    if isinstance(metadata, Mapping) and all(
+                        isinstance(metadata.get(field), str)
+                        and _SHA256.fullmatch(metadata[field]) is not None
+                        for field in identity_fields
+                    ):
+                        evidence.update({
+                            field: metadata[field] for field in identity_fields
+                        })
             output = outputs.get(dependency)
             if isinstance(output, ResolvedNodeOutput):
                 evidence["output_evidence"] = MappingProxyType({
@@ -3366,6 +3435,7 @@ class RunScheduler:
                     )
                 )
             semantics = None
+            resources = None
             if supports_phase3_semantics(
                 package.language.effective_profile, package.language.normalizer_version
             ):
@@ -3409,7 +3479,21 @@ class RunScheduler:
                 )
             else:
                 execution_limits = self._run_execution_limits(package)
-            return package, execution_limits, sealed_paths, sealed_bytes, semantics
+            projection = self.store.load_run(run_id)
+            provider_authority = read_snapshot_provider_authority(
+                language_snapshot=package.language,
+                resources=resources or {},
+                authenticated_bytes=sealed_bytes,
+                projected_digest=projection.get("provider_resolution_sha256"),
+            )
+            return _PreparedRunPackage(
+                package=package,
+                execution_limits=execution_limits,
+                sealed_resource_paths=sealed_paths,
+                sealed_resource_bytes=sealed_bytes,
+                execution_semantics=semantics,
+                provider_authority=provider_authority,
+            )
         except WorkflowValidationError as exc:
             if not exc.issues:
                 raise
@@ -3559,6 +3643,7 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None,
         *,
         now: float | None = None,
+        remaining_wall_seconds: float | None = None,
     ) -> DeadlineBudget:
         if now is None:
             now = self._monotonic()
@@ -3567,8 +3652,18 @@ class RunScheduler:
             attempt_wall = float(
                 node_semantics["attempt_wall_timeout_seconds"]
             )
+            if remaining_wall_seconds is not None:
+                attempt_wall = min(attempt_wall, remaining_wall_seconds)
             sealed_idle = node_semantics["idle_timeout_seconds"]
             sealed_provider = node_semantics["provider_request_timeout_seconds"]
+            if attempt_wall <= 0:
+                return DeadlineBudget(
+                    wall_deadline=float(now),
+                    idle_seconds=float(sealed_idle or 1),
+                    provider_seconds=float(sealed_provider or 1),
+                    last_semantic_progress=float(now),
+                    last_heartbeat=float(now),
+                )
             return DeadlineBudget.from_attempt_semantics(
                 now=now,
                 attempt_wall_seconds=attempt_wall,
@@ -3695,6 +3790,7 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
+        provider_authority=None,
         claimed_deadline_budget: DeadlineBudget | None = None,
     ) -> None:
         with self._activity:
@@ -3719,6 +3815,11 @@ class RunScheduler:
                         NodeExecutionResult(
                             "cancelled",
                             error_code=self._cancellation_reason(run_id) or "cancelled",
+                            metadata={
+                                "provider_attempts": 0,
+                                "provider_attempts_exact": True,
+                                "known_no_effect": True,
+                            },
                         ),
                         execution_limits,
                         language_profile=package.language.effective_profile,
@@ -3732,6 +3833,17 @@ class RunScheduler:
                 node_state = dict(projection["nodes"][node.id])
                 consumed_attempts = max(
                     0, int(node_state.get("retry_consumed", 0))
+                )
+                phase5_continuity = (
+                    execution_semantics is not None
+                    and supports_phase5_semantics(
+                        package.language.effective_profile,
+                        execution_semantics.normalizer_version,
+                    )
+                )
+                remaining_iterations = max(
+                    0,
+                    90 - int(node_state.get("iteration_consumed", 0)),
                 )
                 if execution_semantics is not None:
                     retry_grant = self._sealed_retry_grant(
@@ -3755,6 +3867,60 @@ class RunScheduler:
                             "failed",
                             error_code="retry_budget_exhausted",
                             error_message="combined retry budget is exhausted",
+                            metadata={"known_no_effect": True},
+                        ),
+                        execution_limits,
+                        language_profile=package.language.effective_profile,
+                        execution_semantics=execution_semantics,
+                        outward_action=(
+                            node.id
+                            in package.sidecar.get("outward_action_nodes", ())
+                        ),
+                    )
+                    return
+                if phase5_continuity and remaining_iterations <= 0:
+                    self._persist_result(
+                        claim,
+                        node,
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="iteration_budget_exhausted",
+                            error_message="model iteration budget is exhausted",
+                            metadata={
+                                "known_no_effect": True,
+                                "archon_terminal_failure": True,
+                                "iteration_consumed": int(
+                                    node_state.get("iteration_consumed", 0)
+                                ),
+                                "remaining_iterations": 0,
+                            },
+                        ),
+                        execution_limits,
+                        language_profile=package.language.effective_profile,
+                        execution_semantics=execution_semantics,
+                        outward_action=(
+                            node.id
+                            in package.sidecar.get("outward_action_nodes", ())
+                        ),
+                    )
+                    return
+                if (
+                    phase5_continuity
+                    and claimed_deadline_budget is not None
+                    and claimed_deadline_budget.remaining_wall(self._monotonic()) <= 0
+                ):
+                    self._persist_result(
+                        claim,
+                        node,
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="deadline_budget_exhausted",
+                            error_message="workflow attempt deadline is exhausted",
+                            metadata={
+                                "known_no_effect": True,
+                                "archon_terminal_failure": True,
+                                "remaining_wall_seconds": 0.0,
+                            },
                         ),
                         execution_limits,
                         language_profile=package.language.effective_profile,
@@ -3891,6 +4057,36 @@ class RunScheduler:
                                 "_sealed_loop_semantics": loop_semantics,
                             },
                         )
+                    sealed_node_route = (
+                        provider_authority.routes.get(f"{node.id}:primary")
+                        if provider_authority is not None
+                        else None
+                    )
+                    sealed_node_authority = (
+                        provider_authority if sealed_node_route is not None else None
+                    )
+                    sealed_closure_digest = str(
+                        projection.get("definition_digest") or ""
+                    )
+                    intended_authority_digest = (
+                        phase5_node_intended_authority_digest(
+                            sealed_node_authority,
+                            node_id=node.id,
+                            sealed_closure_digest=sealed_closure_digest,
+                        )
+                        if sealed_node_authority is not None
+                        else None
+                    )
+                    shared_context_compatibility_digest = (
+                        phase5_shared_context_compatibility_digest(
+                            package,
+                            sealed_node_authority,
+                            node_id=node.id,
+                            sealed_closure_digest=sealed_closure_digest,
+                        )
+                        if sealed_node_authority is not None
+                        else None
+                    )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -3946,6 +4142,7 @@ class RunScheduler:
                             # Provider and workflow attempts draw from the same
                             # frozen per-run allowance, so the retry layers do not multiply.
                             max_provider_attempts=remaining_attempts,
+                            max_model_iterations=remaining_iterations,
                             cancellation_reason=lambda: self._cancellation_reason(
                                 run_id
                             ),
@@ -4022,6 +4219,20 @@ class RunScheduler:
                             sealed_resource_bytes=sealed_resource_bytes,
                             language_profile=package.language.effective_profile,
                             normalizer_version=package.language.normalizer_version,
+                            sealed_provider_route=sealed_node_route,
+                            sealed_provider_authority=sealed_node_authority,
+                            intended_authority_digest=intended_authority_digest,
+                            shared_context_compatibility_digest=(
+                                shared_context_compatibility_digest
+                            ),
+                            sealed_mcp_runtime_identity_digest=(
+                                phase5_node_mcp_runtime_identity_digest(
+                                    sealed_node_authority,
+                                    node_id=node.id,
+                                )
+                                if sealed_node_authority is not None
+                                else None
+                            ),
                             structured_output=structured_output,
                             structured_output_decision=structured_output_decision,
                             outward_action=(
@@ -4048,7 +4259,18 @@ class RunScheduler:
                         "failed",
                         error_code="structured_output_capability_drift",
                         error_message=str(exc),
-                        metadata={"archon_terminal_failure": True},
+                        metadata={
+                            "archon_terminal_failure": True,
+                            **(
+                                {
+                                    "provider_attempts": 0,
+                                    "provider_attempts_exact": True,
+                                    "known_no_effect": True,
+                                }
+                                if phase5_continuity
+                                else {}
+                            ),
+                        },
                     )
                 except LoopInputIntegrityError as exc:
                     result = NodeExecutionResult(
@@ -4058,6 +4280,15 @@ class RunScheduler:
                         metadata={
                             "archon_terminal_failure": True,
                             "additional_provider_attempts": 0,
+                            **(
+                                {
+                                    "provider_attempts": 0,
+                                    "provider_attempts_exact": True,
+                                    "known_no_effect": True,
+                                }
+                                if phase5_continuity
+                                else {}
+                            ),
                         },
                     )
                 except WorkflowOutputReferenceError as exc:
@@ -4068,6 +4299,15 @@ class RunScheduler:
                         metadata={
                             "archon_terminal_failure": True,
                             "additional_provider_attempts": 0,
+                            **(
+                                {
+                                    "provider_attempts": 0,
+                                    "provider_attempts_exact": True,
+                                    "known_no_effect": True,
+                                }
+                                if phase5_continuity
+                                else {}
+                            ),
                         },
                     )
                 except Exception as exc:
@@ -4079,6 +4319,54 @@ class RunScheduler:
                 finally:
                     heartbeat_stop.set()
                     heartbeat_thread.join(timeout=self.heartbeat_seconds)
+                if phase5_continuity:
+                    consumed_iterations_before = int(
+                        node_state.get("iteration_consumed", 0)
+                    )
+                    result_metadata = dict(result.metadata)
+                    known_zero_effect = (
+                        result_metadata.get("known_no_effect") is True
+                    )
+                    audit = result_metadata.get("audit")
+                    observed_model_calls = (
+                        audit.get("model_calls")
+                        if isinstance(audit, Mapping)
+                        else None
+                    )
+                    model_calls_exact = (
+                        isinstance(observed_model_calls, int)
+                        and not isinstance(observed_model_calls, bool)
+                        and 0 <= observed_model_calls <= remaining_iterations
+                    )
+                    if node.node_type not in {
+                        "command",
+                        "prompt",
+                        "loop",
+                        "approval",
+                    } or known_zero_effect:
+                        consumed_now = 0
+                        model_calls_exact = True
+                    elif model_calls_exact:
+                        consumed_now = int(observed_model_calls)
+                    else:
+                        consumed_now = remaining_iterations
+                    iteration_consumed = min(
+                        90,
+                        consumed_iterations_before + consumed_now,
+                    )
+                    result_metadata.update({
+                        "model_calls": consumed_now,
+                        "model_calls_exact": model_calls_exact,
+                        "iteration_consumed": iteration_consumed,
+                        "remaining_iterations": 90 - iteration_consumed,
+                    })
+                    if claimed_deadline_budget is not None:
+                        result_metadata["remaining_wall_seconds"] = (
+                            claimed_deadline_budget.remaining_wall(
+                                self._monotonic()
+                            )
+                        )
+                    result = replace(result, metadata=result_metadata)
                 if ownership_lost.is_set():
                     return
             self._persist_result(
@@ -4208,14 +4496,44 @@ class RunScheduler:
                 raise RuntimeError(
                     "persistent session recovery outcome lost its active claim"
                 )
+        phase5_identity_fields = (
+            "intended_authority_digest",
+            "model_visible_prefix_digest",
+            "shared_context_compatibility_digest",
+        )
+        if result.status != "succeeded" and any(
+            field in result.metadata for field in phase5_identity_fields
+        ):
+            result = replace(
+                result,
+                metadata={
+                    key: value
+                    for key, value in result.metadata.items()
+                    if key not in {*phase5_identity_fields, "cache_fingerprint"}
+                },
+            )
         projection: dict[str, object] | None = None
         retry_grant: RetryLedgerGrant | None = None
         retry_charge = None
-        if execution_semantics is not None and result.status not in {
-            "cancelled",
-            "interrupted",
-            "paused",
-        }:
+        phase5_continuity = (
+            execution_semantics is not None
+            and supports_phase5_semantics(
+                language_profile,
+                execution_semantics.normalizer_version,
+            )
+        )
+        known_zero_effect = result.metadata.get("known_no_effect") is True
+        charge_execution_authority = execution_semantics is not None and (
+            (
+                phase5_continuity
+                and not known_zero_effect
+            )
+            or (
+                not phase5_continuity
+                and result.status not in {"cancelled", "interrupted", "paused"}
+            )
+        )
+        if charge_execution_authority:
             projection = self.store.load_run(claim.run_id)
             node_state = projection["nodes"][claim.node_id]
             consumed_before = int(node_state.get("retry_consumed", 0))
@@ -4226,12 +4544,13 @@ class RunScheduler:
             )
             if retry_grant.remaining_attempts > 0:
                 provider_evidence = (
-                    0
-                    if node.node_type not in {"command", "prompt"}
-                    else result.metadata.get(
+                    result.metadata.get(
                         "additional_provider_attempts",
                         result.metadata.get("provider_attempts"),
                     )
+                    if phase5_continuity
+                    or node.node_type in {"command", "prompt"}
+                    else 0
                 )
                 exactness = result.metadata.get("provider_attempts_exact")
                 retry_charge = retry_grant.charge(
@@ -4370,6 +4689,15 @@ class RunScheduler:
                 )
             return
         if execution_semantics is not None:
+            if retry_grant is None:
+                if projection is None:
+                    projection = self.store.load_run(claim.run_id)
+                node_state = projection["nodes"][claim.node_id]
+                retry_grant = self._sealed_retry_grant(
+                    node,
+                    execution_semantics,
+                    retry_consumed=int(node_state.get("retry_consumed", 0)),
+                )
             assert retry_grant is not None
             policy = retry_grant.policy
         else:
@@ -4381,6 +4709,9 @@ class RunScheduler:
         if retry_charge is not None:
             provider_attempts = retry_charge.additional_provider_attempts
             consumed = retry_charge.retry_consumed
+        elif phase5_continuity and known_zero_effect:
+            provider_attempts = 0
+            consumed = consumed_before
         else:
             provider_attempts = int(result.metadata.get("provider_attempts", 0))
             consumed = min(
@@ -4506,6 +4837,7 @@ class RunScheduler:
             sealed_resource_bytes,
             execution_semantics,
         ) = prepared_package
+        provider_authority = prepared_package.provider_authority
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -4579,6 +4911,67 @@ class RunScheduler:
                 fence_lost = False
                 for node_id in ready[:capacity]:
                     claim_now = self._monotonic()
+                    claimed_deadline_budget = (
+                        self._attempt_deadline_budget(
+                            by_id[node_id],
+                            execution_limits,
+                            execution_semantics,
+                            now=claim_now,
+                            remaining_wall_seconds=(
+                                float(
+                                    projection["nodes"][node_id][
+                                        "remaining_wall_seconds"
+                                    ]
+                                )
+                                if execution_semantics is not None
+                                and "remaining_wall_seconds"
+                                in projection["nodes"][node_id]
+                                else None
+                            ),
+                        )
+                        if execution_semantics is not None
+                        else None
+                    )
+                    claim_execution_authority = None
+                    if (
+                        execution_semantics is not None
+                        and supports_phase5_semantics(
+                            package.language.effective_profile,
+                            execution_semantics.normalizer_version,
+                        )
+                    ):
+                        retry_consumed_before = int(
+                            projection["nodes"][node_id].get("retry_consumed", 0)
+                        )
+                        authority_grant = self._sealed_retry_grant(
+                            by_id[node_id],
+                            execution_semantics,
+                            retry_consumed=retry_consumed_before,
+                        )
+                        claim_execution_authority = {
+                            "schema_version": 1,
+                            "retry_consumed_before": retry_consumed_before,
+                            "remaining_attempts": authority_grant.remaining_attempts,
+                            "iteration_consumed_before": int(
+                                projection["nodes"][node_id].get(
+                                    "iteration_consumed", 0
+                                )
+                            ),
+                            "remaining_iterations": max(
+                                0,
+                                90
+                                - int(
+                                    projection["nodes"][node_id].get(
+                                        "iteration_consumed", 0
+                                    )
+                                ),
+                            ),
+                            "remaining_wall_seconds": (
+                                claimed_deadline_budget.remaining_wall(claim_now)
+                                if claimed_deadline_budget is not None
+                                else 0.0
+                            ),
+                        }
                     session_recovery_reserve = (
                         self._persistent_session_recovery_reserve(
                             by_id[node_id],
@@ -4615,6 +5008,7 @@ class RunScheduler:
                             foreground_owner_epoch=foreground_owner_epoch,
                             require_execution_authority=True,
                             max_run_workers=execution_limits.max_total_workers,
+                            execution_authority=claim_execution_authority,
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -4625,16 +5019,6 @@ class RunScheduler:
                         fence_lost = True
                         break
                     if claim is not None:
-                        claimed_deadline_budget = (
-                            self._attempt_deadline_budget(
-                                by_id[node_id],
-                                execution_limits,
-                                execution_semantics,
-                                now=claim_now,
-                            )
-                            if execution_semantics is not None
-                            else None
-                        )
                         claims.append((
                             claim,
                             by_id[node_id],
@@ -4665,6 +5049,7 @@ class RunScheduler:
                             execution_semantics,
                             sealed_resource_paths,
                             sealed_resource_bytes,
+                            provider_authority,
                             budget,
                         )
                         for claim, node, snapshot, strict_snapshot, budget in claims
@@ -4744,6 +5129,7 @@ class RunScheduler:
         sealed_resource_paths = {}
         sealed_resource_bytes = {}
         execution_semantics = {}
+        provider_authorities = {}
         package_failures = {}
         prepared_run_ids = []
         for run_id in run_ids:
@@ -4756,11 +5142,13 @@ class RunScheduler:
                 package_failures[run_id] = self.store.load_run(run_id)
                 continue
             package, limits, paths, resource_bytes, semantics = prepared_package
+            provider_authority = prepared_package.provider_authority
             packages[run_id] = package
             execution_limits[run_id] = limits
             sealed_resource_paths[run_id] = paths
             sealed_resource_bytes[run_id] = resource_bytes
             execution_semantics[run_id] = semantics
+            provider_authorities[run_id] = provider_authority
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -4874,6 +5262,72 @@ class RunScheduler:
                             if node.id == node_id
                         )
                         claim_now = self._monotonic()
+                        claimed_deadline_budget = (
+                            self._attempt_deadline_budget(
+                                node,
+                                execution_limits[run_id],
+                                execution_semantics[run_id],
+                                now=claim_now,
+                                remaining_wall_seconds=(
+                                    float(
+                                        snapshots[run_id]["nodes"][node_id][
+                                            "remaining_wall_seconds"
+                                        ]
+                                    )
+                                    if execution_semantics[run_id] is not None
+                                    and "remaining_wall_seconds"
+                                    in snapshots[run_id]["nodes"][node_id]
+                                    else None
+                                ),
+                            )
+                            if execution_semantics[run_id] is not None
+                            else None
+                        )
+                        claim_execution_authority = None
+                        node_semantics = execution_semantics[run_id]
+                        if (
+                            node_semantics is not None
+                            and supports_phase5_semantics(
+                                packages[run_id].language.effective_profile,
+                                node_semantics.normalizer_version,
+                            )
+                        ):
+                            retry_consumed_before = int(
+                                snapshots[run_id]["nodes"][node_id].get(
+                                    "retry_consumed", 0
+                                )
+                            )
+                            authority_grant = self._sealed_retry_grant(
+                                node,
+                                node_semantics,
+                                retry_consumed=retry_consumed_before,
+                            )
+                            claim_execution_authority = {
+                                "schema_version": 1,
+                                "retry_consumed_before": retry_consumed_before,
+                                "remaining_attempts": (
+                                    authority_grant.remaining_attempts
+                                ),
+                                "iteration_consumed_before": int(
+                                    snapshots[run_id]["nodes"][node_id].get(
+                                        "iteration_consumed", 0
+                                    )
+                                ),
+                                "remaining_iterations": max(
+                                    0,
+                                    90
+                                    - int(
+                                        snapshots[run_id]["nodes"][node_id].get(
+                                            "iteration_consumed", 0
+                                        )
+                                    ),
+                                ),
+                                "remaining_wall_seconds": (
+                                    claimed_deadline_budget.remaining_wall(claim_now)
+                                    if claimed_deadline_budget is not None
+                                    else 0.0
+                                ),
+                            }
                         session_recovery_reserve = (
                             self._persistent_session_recovery_reserve(
                                 node,
@@ -4912,6 +5366,7 @@ class RunScheduler:
                                 max_run_workers=(
                                     execution_limits[run_id].max_total_workers
                                 ),
+                                execution_authority=claim_execution_authority,
                             )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(
@@ -4926,16 +5381,6 @@ class RunScheduler:
                             break
                         if claim is None:
                             continue
-                        claimed_deadline_budget = (
-                            self._attempt_deadline_budget(
-                                node,
-                                execution_limits[run_id],
-                                execution_semantics[run_id],
-                                now=claim_now,
-                            )
-                            if execution_semantics[run_id] is not None
-                            else None
-                        )
                         claims.append((
                             run_id,
                             claim,
@@ -4947,6 +5392,7 @@ class RunScheduler:
                             execution_semantics[run_id],
                             sealed_resource_paths[run_id],
                             sealed_resource_bytes[run_id],
+                            provider_authorities[run_id],
                             claimed_deadline_budget,
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)

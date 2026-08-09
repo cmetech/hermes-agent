@@ -19,7 +19,7 @@ from plugins.workflow.output_resolution import (
     WorkflowOutputReferenceError,
 )
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import ArtifactRef, RunStore
 from tools.managed_process import ProcessIdentity
@@ -36,6 +36,16 @@ _PRODUCER_IDENTITY = {
     "canonicalization_version": 1,
     "output_type": "text",
 }
+
+
+def _load_v3(path):
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes() if sidecar.exists() else None,
+        normalizer_version=3,
+    )
 
 
 def _start_archon_run(tmp_path, workflow_writer, *, name: str) -> tuple[RunStore, str]:
@@ -55,7 +65,7 @@ def _start_archon_run(tmp_path, workflow_writer, *, name: str) -> tuple[RunStore
     package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(package_path)
+    package = _load_v3(package_path)
     store = RunStore(tmp_path / f"home-{name}")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -130,7 +140,7 @@ def _start_multi_reference_run(
     package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(package_path)
+    package = _load_v3(package_path)
     store = RunStore(tmp_path / f"home-{name}")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -172,7 +182,7 @@ def _start_noncondition_reference_run(
     package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(package_path)
+    package = _load_v3(package_path)
     store = RunStore(tmp_path / f"home-{name}")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -721,7 +731,7 @@ def test_scheduler_preflights_noncondition_reference_before_claim(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v3(path)
     store = RunStore(tmp_path / "resolution-preclaim-home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -827,7 +837,7 @@ def test_scheduler_preflight_terminal_reference_failure_is_zero_attempt(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v3(path)
     store = RunStore(tmp_path / "resolution-preclaim-terminal-home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(

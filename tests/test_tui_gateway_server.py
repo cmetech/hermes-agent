@@ -4866,7 +4866,10 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
+                # Keep the nested turn in flight for the assertion even when
+                # a saturated full-suite host delays the parent-thread join.
+                # The finally block releases it immediately on the normal path.
+                if not release_nested.wait(timeout=30):
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 

@@ -1670,7 +1670,12 @@ export const ar = defineLocale({
     workflowIgnoredPolicyField: field => `تم تجاهله: ${field}`,
     acceptResult: 'قبول النتيجة',
     continueWithFeedback: 'متابعة مع ملاحظات',
-    feedback: 'الملاحظات'
+    feedback: 'الملاحظات',
+    workflowRunProviderAuthorityUnavailable: 'تغيّر استعداد المزوّد. راجعه قبل البدء.',
+    workflowProviderReadiness: 'جاهزية المزوّد',
+    workflowProviderAuthorityDigest: 'بصمة الصلاحية',
+    workflowProviderCapabilityLevel: 'مستوى الإمكانية',
+    workflowProviderRoute: (node, provider, model) => `${node}: ${provider} · ${model}`
   },
   composer: {
     message: 'الرسالة',

@@ -14,13 +14,43 @@ a brand-gateway model raised ``Unknown provider '<brand>'``.
 config-provider branch, so downstream routing is unchanged.
 """
 
+from pathlib import Path
+
 import providers as provider_registry
 from providers.base import ProviderProfile
 
 from hermes_cli.providers import resolve_provider_full
 
 
-def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
+def _register_user_provider(
+    root: Path,
+    *,
+    name: str,
+    base_url: str,
+) -> None:
+    plugin = root / f"phase5-public-{name}"
+    plugin.mkdir()
+    (plugin / "__init__.py").write_text(
+        "from providers import register_provider\n"
+        "from providers.base import ProviderProfile\n"
+        "register_provider(ProviderProfile(\n"
+        f"    name={name!r},\n"
+        f"    base_url={base_url!r},\n"
+        "    env_vars=('PHASE5_PUBLIC_PROVIDER_API_KEY',),\n"
+        "))\n",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.yaml").write_text(
+        f"name: phase5-public-{name}\n"
+        "kind: model-provider\n"
+        "version: 1.0.0\n",
+        encoding="utf-8",
+    )
+    provider_registry.get_provider_profile("anthropic")
+    provider_registry._import_plugin_dir(plugin, "user")
+
+
+def test_resolve_provider_full_finds_plugin_only_provider():
     """A provider registered only in the plugin registry (no config.yaml entry)
     must resolve, with routing fields populated from the profile."""
     # Unique slug: not a built-in alias, not in models.dev, not in any config.
@@ -35,10 +65,10 @@ def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
         supports_unauthenticated=True,
         model_capabilities_path="model-capabilities",
     )
-    # Trigger lazy plugin discovery, THEN install the profile so our injection
-    # isn't clobbered by discovery. monkeypatch.setitem auto-reverts.
+    # Trigger lazy plugin discovery, THEN register the profile so discovery
+    # cannot clobber the application-level fixture.
     provider_registry.get_provider_profile("anthropic")
-    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
+    provider_registry.register_provider(profile)
 
     # Plugin registry is the ONLY source — empty config providers/custom lists.
     pdef = resolve_provider_full(slug, {}, {})
@@ -55,7 +85,7 @@ def test_resolve_provider_full_finds_plugin_only_provider(monkeypatch):
     assert pdef.base_url_env_var == "OTTO_PARITY_GW_BASE_URL"
 
 
-def test_resolve_provider_full_plugin_provider_resolves_via_alias(monkeypatch):
+def test_resolve_provider_full_plugin_provider_resolves_via_alias():
     """Plugin providers declare aliases; resolving by alias must also work
     (get_provider_profile resolves aliases → canonical name)."""
     slug = "otto-parity-gw"
@@ -68,11 +98,44 @@ def test_resolve_provider_full_plugin_provider_resolves_via_alias(monkeypatch):
         auth_type="api_key",
     )
     provider_registry.get_provider_profile("anthropic")
-    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
-    monkeypatch.setitem(provider_registry._ALIASES, f"{slug}-alias", slug)
+    provider_registry.register_provider(profile)
 
     pdef = resolve_provider_full(f"{slug}-alias", {}, {})
 
     assert pdef is not None
     assert pdef.id == slug
     assert pdef.base_url == "http://127.0.0.1:18080/v1"
+
+
+def test_resolve_provider_full_honors_user_canonical_over_static_alias(
+    tmp_path: Path,
+) -> None:
+    _register_user_provider(
+        tmp_path,
+        name="claude",
+        base_url="https://user-claude.example/v1",
+    )
+
+    pdef = resolve_provider_full("claude", {}, {})
+
+    assert pdef is not None
+    assert pdef.id == "claude"
+    assert pdef.base_url == "https://user-claude.example/v1"
+    assert pdef.source == "plugin"
+
+
+def test_resolve_provider_full_honors_user_override_of_builtin_provider(
+    tmp_path: Path,
+) -> None:
+    _register_user_provider(
+        tmp_path,
+        name="openrouter",
+        base_url="https://user-openrouter.example/v1",
+    )
+
+    pdef = resolve_provider_full("openrouter", {}, {})
+
+    assert pdef is not None
+    assert pdef.id == "openrouter"
+    assert pdef.base_url == "https://user-openrouter.example/v1"
+    assert pdef.source == "plugin"

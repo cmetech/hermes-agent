@@ -1079,6 +1079,8 @@ class NodeSessionRecord:
     cache_fingerprint: str
     generation: int
     updated_at: str
+    intended_authority_digest: str | None = None
+    model_visible_prefix_digest: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -1100,6 +1102,20 @@ class NodeSessionRecord:
             raise ValueError("node session record is malformed") from exc
         if updated_at.tzinfo is None or updated_at.utcoffset() is None:
             raise ValueError("node session record is malformed")
+        identities = (
+            self.intended_authority_digest,
+            self.model_visible_prefix_digest,
+        )
+        if (identities[0] is None) != (identities[1] is None) or any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or len(value) != _SHA256_LENGTH
+                or any(character not in "0123456789abcdef" for character in value)
+            )
+            for value in identities
+        ):
+            raise ValueError("node session Phase 5 identity is malformed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1113,6 +1129,8 @@ class PersistentSessionRecoverySelection:
     run_id: str
     attempt_id: str
     source: str = "cross_run_registry"
+    intended_authority_digest: str | None = None
+    model_visible_prefix_digest: str | None = None
 
     def __post_init__(self) -> None:
         bounded = (
@@ -1148,6 +1166,22 @@ class PersistentSessionRecoverySelection:
             raise ValueError("persistent session recovery values must be non-empty")
         if self.source != "cross_run_registry":
             raise ValueError("persistent session recovery source is invalid")
+        identities = (
+            self.intended_authority_digest,
+            self.model_visible_prefix_digest,
+        )
+        if (identities[0] is None) != (identities[1] is None):
+            raise ValueError("Phase 5 identities must be paired")
+        if any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or len(value) != _SHA256_LENGTH
+                or any(character not in "0123456789abcdef" for character in value)
+            )
+            for value in identities
+        ):
+            raise ValueError("Phase 5 identities must be lowercase SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1162,6 +1196,8 @@ class SessionRegistryUpdateCandidate:
     winning_node_id: str
     winning_attempt_id: str
     recovery_selected: bool = False
+    intended_authority_digest: str | None = None
+    model_visible_prefix_digest: str | None = None
 
     def __post_init__(self) -> None:
         bounded = (
@@ -1200,6 +1236,22 @@ class SessionRegistryUpdateCandidate:
             raise ValueError("session registry update values must be non-empty")
         if type(self.recovery_selected) is not bool:
             raise ValueError("session registry update recovery flag is invalid")
+        identities = (
+            self.intended_authority_digest,
+            self.model_visible_prefix_digest,
+        )
+        if (identities[0] is None) != (identities[1] is None):
+            raise ValueError("Phase 5 identities must be paired")
+        if any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or len(value) != _SHA256_LENGTH
+                or any(character not in "0123456789abcdef" for character in value)
+            )
+            for value in identities
+        ):
+            raise ValueError("Phase 5 identities must be lowercase SHA-256")
 
 
 class NodeSessionRegistry:
@@ -1222,12 +1274,28 @@ class NodeSessionRegistry:
                         profile TEXT NOT NULL,
                         session_id TEXT NOT NULL,
                         cache_fingerprint TEXT NOT NULL,
+                        intended_authority_digest TEXT,
+                        model_visible_prefix_digest TEXT,
                         generation INTEGER NOT NULL,
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY (workflow, node_id, scope, provider, profile)
                     )
                     """
                 )
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(node_sessions)")
+                }
+                if "intended_authority_digest" not in columns:
+                    connection.execute(
+                        "ALTER TABLE node_sessions ADD COLUMN "
+                        "intended_authority_digest TEXT"
+                    )
+                if "model_visible_prefix_digest" not in columns:
+                    connection.execute(
+                        "ALTER TABLE node_sessions ADD COLUMN "
+                        "model_visible_prefix_digest TEXT"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=5, isolation_level=None)
@@ -1256,6 +1324,8 @@ class NodeSessionRegistry:
             cache_fingerprint=row["cache_fingerprint"],
             generation=row["generation"],
             updated_at=row["updated_at"],
+            intended_authority_digest=row["intended_authority_digest"],
+            model_visible_prefix_digest=row["model_visible_prefix_digest"],
         )
 
     def compare_and_set(
@@ -1264,6 +1334,9 @@ class NodeSessionRegistry:
         expected_generation: int,
         session_id: str,
         cache_fingerprint: str,
+        *,
+        intended_authority_digest: str | None = None,
+        model_visible_prefix_digest: str | None = None,
     ) -> bool:
         return (
             self.compare_and_set_or_observe(
@@ -1271,6 +1344,8 @@ class NodeSessionRegistry:
                 expected_generation,
                 session_id,
                 cache_fingerprint,
+                intended_authority_digest=intended_authority_digest,
+                model_visible_prefix_digest=model_visible_prefix_digest,
             )
             == "stale_entry_replaced"
         )
@@ -1281,6 +1356,9 @@ class NodeSessionRegistry:
         expected_generation: int,
         session_id: str,
         cache_fingerprint: str,
+        *,
+        intended_authority_digest: str | None = None,
+        model_visible_prefix_digest: str | None = None,
     ) -> str:
         if (
             isinstance(expected_generation, bool)
@@ -1297,12 +1375,24 @@ class NodeSessionRegistry:
             or len(cache_fingerprint) > _REGISTRY_VALUE_MAX_CHARS
         ):
             raise ValueError("session_id and cache_fingerprint must be non-empty")
+        identities = (intended_authority_digest, model_visible_prefix_digest)
+        if (identities[0] is None) != (identities[1] is None) or any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or len(value) != _SHA256_LENGTH
+                or any(character not in "0123456789abcdef" for character in value)
+            )
+            for value in identities
+        ):
+            raise ValueError("Phase 5 session identities must be paired SHA-256 values")
         now = datetime.now(timezone.utc).isoformat()
         with workflow_lock(self.lock_path):
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT session_id, cache_fingerprint, generation "
+                    "SELECT session_id, cache_fingerprint, "
+                    "intended_authority_digest, model_visible_prefix_digest, generation "
                     "FROM node_sessions WHERE workflow=? AND "
                     "node_id=? AND scope=? AND provider=? AND profile=?",
                     self._values(key),
@@ -1313,6 +1403,8 @@ class NodeSessionRegistry:
                     and row is not None
                     and row["session_id"] == session_id
                     and row["cache_fingerprint"] == cache_fingerprint
+                    and row["intended_authority_digest"] == intended_authority_digest
+                    and row["model_visible_prefix_digest"] == model_visible_prefix_digest
                 ):
                     connection.rollback()
                     return "stale_entry_replaced_already_applied"
@@ -1321,11 +1413,17 @@ class NodeSessionRegistry:
                     return "newer_entry_retained"
                 if row is None:
                     connection.execute(
-                        "INSERT INTO node_sessions VALUES (?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO node_sessions "
+                        "(workflow,node_id,scope,provider,profile,session_id,"
+                        "cache_fingerprint,intended_authority_digest,"
+                        "model_visible_prefix_digest,generation,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             *self._values(key),
                             session_id,
                             cache_fingerprint,
+                            intended_authority_digest,
+                            model_visible_prefix_digest,
                             1,
                             now,
                         ),
@@ -1333,11 +1431,14 @@ class NodeSessionRegistry:
                 else:
                     connection.execute(
                         "UPDATE node_sessions SET session_id=?, cache_fingerprint=?, "
+                        "intended_authority_digest=?, model_visible_prefix_digest=?, "
                         "generation=?, updated_at=? WHERE workflow=? AND node_id=? "
                         "AND scope=? AND provider=? AND profile=?",
                         (
                             session_id,
                             cache_fingerprint,
+                            intended_authority_digest,
+                            model_visible_prefix_digest,
                             generation + 1,
                             now,
                             *self._values(key),

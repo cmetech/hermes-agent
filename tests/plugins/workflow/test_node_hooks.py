@@ -10,6 +10,7 @@ from agent.plugin_agent_worker import (
 )
 from plugins.workflow.compat import MAPPED_HOOK_EVENTS, UNSUPPORTED_HOOK_EVENTS
 from plugins.workflow.executors.ai import AgentNodeExecutor
+from hermes_cli.plugins import PluginManager
 from tests.plugins.workflow.test_ai_executor import (
     FakeAgentRunner,
     _archon_context,
@@ -174,11 +175,7 @@ def test_structured_repair_does_not_reinstall_original_node_hooks(tmp_path):
 
 
 def test_installed_pre_tool_hook_rewrites_then_blocks_matching_call(monkeypatch):
-    class Manager:
-        _hooks = {}
-        _middleware = {}
-
-    manager = Manager()
+    manager = PluginManager()
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     observed = _install_node_hooks((
         {
@@ -207,3 +204,4 @@ def test_installed_pre_tool_hook_rewrites_then_blocks_matching_call(monkeypatch)
         "args": {"path": "safe.txt"},
     }
     assert [event["event"] for event in observed] == ["PreToolUse", "PreToolUse"]
+    observed.close()

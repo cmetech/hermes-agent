@@ -26,6 +26,9 @@ def _make_agent(*, platform="cron"):
     agent._touch_activity = MagicMock()
     agent._create_request_openai_client = MagicMock()
     agent._close_request_openai_client = MagicMock()
+    agent._active_cost_budget_attempt_id = None
+    agent._cost_budget_acquire_callback = None
+    agent._provider_attempt_reservation_callback = None
     return agent
 
 

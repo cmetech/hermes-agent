@@ -287,6 +287,44 @@ describe('workflow View dialog', () => {
     expect(within(dialog).queryByText(/Normalizer/)).toBeNull()
   })
 
+  it('renders only the backend-authored Phase 5 provider resolution', async () => {
+    currentDetail = detail({
+      language: {
+        declared_profile: 'archon-2026-07',
+        effective_profile: 'archon-2026-07',
+        legacy: false,
+        normalizer_version: 5
+      },
+      provider_capability: {
+        authority_digest: 'd'.repeat(64),
+        decisions: [],
+        degraded_count: 0,
+        level: 'portable',
+        mixed_provider: false,
+        resolved_route_count: 1,
+        routes: [
+          {
+            inline_agent_id: null,
+            model: 'openai/gpt-5.4',
+            node_id: 'ask',
+            provider: 'openrouter',
+            reference_kind: 'configured_alias',
+            role: 'primary'
+          }
+        ],
+        schema_version: 1,
+        unsupported_count: 0,
+        warning_codes: []
+      }
+    })
+    renderView()
+    const dialog = await openView()
+    const readiness = await within(dialog).findByRole('region', { name: 'Provider readiness' })
+
+    expect(within(readiness).getByText('openrouter', { exact: false }).textContent).toContain('openai/gpt-5.4')
+    expect(within(readiness).getByText('d'.repeat(64))).toBeTruthy()
+  })
+
   it('catches authenticated dependency details being discarded or replaced with filesystem data', async () => {
     currentDetail = detail({
       compilation: {

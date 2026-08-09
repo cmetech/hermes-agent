@@ -101,11 +101,19 @@ def _legacy_transitive_package(workflow_writer, root: Path):
 
 def _profile_package(workflow_writer, root: Path, *, profile: str):
     path = workflow_writer(root / "package", name=f"{profile}-snapshot")
+    sidecar_bytes = None
     if profile == "archon-2026-07":
-        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+        sidecar.write_text(
             "language_compatibility: archon-2026-07\n", encoding="utf-8"
         )
-    return load_workflow(path)
+        sidecar_bytes = sidecar.read_bytes()
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar_bytes,
+        normalizer_version=4 if profile == "archon-2026-07" else 2,
+    )
 
 
 def _start(store: RunStore, package, *, key: str):
@@ -287,7 +295,12 @@ def test_admission_seals_package_bound_language_metadata(tmp_path, workflow_writ
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=4,
+    )
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     resources = json.loads((prepared.staging_directory / "resources.json").read_text())
@@ -792,7 +805,7 @@ def test_concurrent_same_run_preparation_returns_independent_sealed_paths(
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
-    sealed_path_sets = tuple(result[2] for result in results)
+    sealed_path_sets = tuple(result.sealed_resource_paths for result in results)
     assert sealed_path_sets[0] is not None
     assert sealed_path_sets[0] == sealed_path_sets[1]
     run_directory = store.run_directory(admitted.run_id)
@@ -978,7 +991,12 @@ def test_resume_rejects_tampered_digest_covered_package_resource(
     (root / "commands" / "inspect.md").write_text(
         "Inspect admitted bytes.\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=4,
+    )
     store = RunStore(tmp_path / "home")
     _prepared, admitted = _start(store, package, key="tampered-package-resource")
     (store.run_directory(admitted.run_id) / "commands" / "inspect.md").write_text(

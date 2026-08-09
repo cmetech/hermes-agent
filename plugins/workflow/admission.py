@@ -61,6 +61,7 @@ class PreparedRunSnapshot:
     sealed_snapshot_digest: str | None = None
     snapshot_format_version: int = 1
     dependency_manifest_digest: str | None = None
+    provider_resolution_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.input_digests is None:

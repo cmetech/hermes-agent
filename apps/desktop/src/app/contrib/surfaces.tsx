@@ -24,8 +24,8 @@ import { contributedRoutes, KANBAN_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRo
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
-import { StatusbarBoundary } from '../shell/statusbar-fallback'
 import { StatusbarControls } from '../shell/statusbar-controls'
+import { StatusbarBoundary } from '../shell/statusbar-fallback'
 
 import { latestChatActions, latestSidebarActions } from './latest-actions'
 import { setStatusbarItemGroup, useStatusbarContributions } from './panes'

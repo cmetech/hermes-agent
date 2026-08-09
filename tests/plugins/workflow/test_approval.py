@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -20,7 +21,12 @@ from plugins.workflow.models import (
     DeadlineBudget,
     RunExecutionLimits,
     WorkflowNode,
+    WorkflowLanguageProfile,
     freeze_value,
+)
+from plugins.workflow.provider_authority import (
+    WorkflowProviderAuthority,
+    WorkflowResolvedProviderRoute,
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
@@ -29,7 +35,7 @@ from plugins.workflow.output_resolution import (
 )
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowPackageDigest
 
@@ -186,7 +192,10 @@ def test_v3_approval_message_rechecks_direct_dependency_before_pause(tmp_path) -
         depends_on=(),
         source_index=0,
         source_line=1,
-        options=freeze_value({}),
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+        }),
     )
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -443,11 +452,18 @@ def test_typed_approval_retries_after_publication_fails_post_source_write(
 
 
 class ReworkRunner:
+    starts_request_mcp = True
+
     def __init__(self):
         self.requests = []
+        self.launch_kwargs = []
 
-    def run(self, request, **_kwargs):
+    def run(self, request, **kwargs):
+        from agent.plugin_agent import _validate_request
+
+        _validate_request(request)
         self.requests.append(request)
+        self.launch_kwargs.append(kwargs)
         return PluginAgentRunResult(
             final_response="revised plan",
             session_id="rework-session",
@@ -456,8 +472,182 @@ class ReworkRunner:
             status="completed",
             pending_interaction=None,
             usage={},
-            audit={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            },
         )
+
+
+def test_v5_approval_rework_uses_the_sealed_route_and_shared_attempt_authority(
+    tmp_path,
+) -> None:
+    runner = ReworkRunner()
+    route = WorkflowResolvedProviderRoute(
+        route_id="review:primary",
+        node_id="review",
+        role="primary",
+        inline_agent_id=None,
+        reference_kind="configured_alias",
+        requested_reference_sha256="1" * 64,
+        provider="sealed-provider",
+        model="sealed-model",
+        api_mode="chat_completions",
+        route_fingerprint="2" * 64,
+        endpoint_sha256="d" * 64,
+        registration_provenance_digest="3" * 64,
+        provider_options={},
+        config_scope="profile",
+        base_url_trust_class="provider_default",
+    )
+    fallback_route = WorkflowResolvedProviderRoute(
+        route_id="review:fallback",
+        node_id="review",
+        role="fallback",
+        inline_agent_id=None,
+        reference_kind="configured_alias",
+        requested_reference_sha256="6" * 64,
+        provider="sealed-fallback-provider",
+        model="sealed-fallback-model",
+        api_mode="chat_completions",
+        route_fingerprint="7" * 64,
+        endpoint_sha256="9" * 64,
+        registration_provenance_digest="8" * 64,
+        provider_options={},
+        config_scope="profile",
+        base_url_trust_class="provider_default",
+    )
+    authority = WorkflowProviderAuthority(
+        config_fingerprint="4" * 64,
+        routes={
+            route.route_id: route,
+            fallback_route.route_id: fallback_route,
+        },
+        obligations=(),
+        warnings=(),
+        authority_digest="5" * 64,
+    )
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+        }),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+        }),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        workflow_options=freeze_value({
+            "provider": "authored-provider-must-not-run",
+            "model": "@mutable-alias",
+            "fallbackModel": "@mutable-fallback-must-not-run",
+        }),
+        variable_context=VariableContext(workflow_id="run-1"),
+        node_state=freeze_value({
+            "approval_rework": {"reason": "missing evidence"},
+        }),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=5,
+        sealed_provider_route=route,
+        sealed_provider_authority=authority,
+        intended_authority_digest="a" * 64,
+        spawn_intent=lambda _nonce: True,
+        spawn_failed=lambda _nonce, _code: True,
+        provider_dispatch=lambda _nonce: True,
+        provider_start_delivered=lambda _nonce: True,
+        provider_execute_received=lambda _nonce: True,
+        provider_execute_release=lambda _nonce: True,
+    )
+
+    result = ApprovalExecutor(runner).execute(context)
+
+    assert result.status == "paused"
+    request = runner.requests[0]
+    assert request.provider == "sealed-provider"
+    assert request.model == "sealed-model"
+    assert request.intended_authority_digest == "a" * 64
+    assert request.expected_runtime_identity == {
+        "provider": "sealed-provider",
+        "model": "sealed-model",
+        "api_mode": "chat_completions",
+        "base_url_trust_class": "provider_default",
+        "endpoint_sha256": "d" * 64,
+        "registration_provenance_digest": "3" * 64,
+    }
+    assert request.expected_runtime_route_fingerprint == "2" * 64
+    assert request.expected_runtime_route_options == {}
+    assert request.sealed_provider_attempt_grant is True
+    assert request.allowed_tools == ()
+    assert request.denied_tools == ("terminal",)
+    assert request.fallback_model is None
+    assert request.sealed_fallback_route == {
+        "provider": "sealed-fallback-provider",
+        "effective_provider": "sealed-fallback-provider",
+        "model": "sealed-fallback-model",
+        "context_mode": "fresh",
+        "expected_runtime_route_fingerprint": "7" * 64,
+        "expected_runtime_route_options": {},
+        "expected_runtime_identity": {
+            "provider": "sealed-fallback-provider",
+            "model": "sealed-fallback-model",
+            "api_mode": "chat_completions",
+            "base_url_trust_class": "provider_default",
+            "endpoint_sha256": "9" * 64,
+            "registration_provenance_digest": "8" * 64,
+        },
+        "reasoning_config": {},
+        "request_overrides": {},
+        "structured_output": None,
+    }
+    assert result.metadata["intended_authority_digest"] == "a" * 64
+    assert result.metadata["model_visible_prefix_digest"] == "9" * 64
+    assert set(runner.launch_kwargs[0]) == {
+        "is_cancelled",
+        "spawn_intent",
+        "spawn_failed",
+        "provider_dispatch",
+        "provider_start_delivered",
+        "provider_execute_received",
+        "provider_execute_release",
+    }
+
+    pre_cancelled_runner = ReworkRunner()
+    pre_cancelled = ApprovalExecutor(pre_cancelled_runner).execute(
+        replace(context, is_cancelled=lambda: True)
+    )
+    assert pre_cancelled.status == "cancelled"
+    assert pre_cancelled_runner.requests == []
+
+    class CancelledRunner:
+        def run(self, _request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="cancelled-rework",
+                provider="fake",
+                model="fake",
+                status="cancelled",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    cancelled = ApprovalExecutor(CancelledRunner()).execute(context)
+    assert cancelled.status == "cancelled"
+    assert cancelled.error_code == "cancelled"
 
 
 def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
@@ -476,7 +666,11 @@ def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
         depends_on=("producer",),
         source_index=0,
         source_line=1,
-        options=freeze_value({}),
+        options=freeze_value({
+            "allowed_tools": [],
+            "denied_tools": ["Bash"],
+            "systemPrompt": "legacy prompt must remain ignored",
+        }),
     )
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -512,6 +706,10 @@ def test_v3_approval_rejection_prompt_renders_strict_field_before_provider(
 
     assert result.status == "paused"
     assert runner.requests[0].prompt == "Revise plan: missing evidence"
+    assert runner.requests[0].allowed_tools is None
+    assert runner.requests[0].denied_tools == ()
+    assert runner.requests[0].ephemeral_system_prompt is None
+    assert set(runner.launch_kwargs[0]) == {"is_cancelled"}
 
 
 def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path):

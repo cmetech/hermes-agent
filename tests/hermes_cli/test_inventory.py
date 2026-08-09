@@ -516,9 +516,8 @@ def _install_inventory_gateway_profile(
         supports_unauthenticated=True,
         model_capabilities_path="model-capabilities",
     )
-    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
-    for alias in aliases:
-        monkeypatch.setitem(provider_registry._ALIASES, alias, slug)
+    provider_registry.get_provider_profile("anthropic")
+    provider_registry.register_provider(profile)
     monkeypatch.setitem(
         PROVIDER_REGISTRY,
         slug,
@@ -1064,7 +1063,6 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 
 

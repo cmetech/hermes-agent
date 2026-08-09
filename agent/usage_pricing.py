@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
+from agent.cost_budget import canonical_usd
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
 
@@ -95,6 +96,91 @@ class CostResult:
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
+
+
+_AUTHORITATIVE_SETTLEMENT_OUTCOMES = frozenset({
+    "success",
+    "stream",
+    "charged_error",
+    "disconnect",
+    "timeout",
+    "cancellation",
+})
+
+
+@dataclass(frozen=True)
+class AuthoritativeSettlementContract:
+    """Code-owned proof obligations for one provider billed-cost field."""
+
+    provider: str
+    strategy: str
+    billing_mode: str
+    covered_outcomes: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("authoritative settlement provider is invalid")
+        if not isinstance(self.strategy, str) or not self.strategy.strip():
+            raise ValueError("authoritative settlement strategy is invalid")
+        if not isinstance(self.billing_mode, str) or not self.billing_mode.strip():
+            raise ValueError("authoritative settlement billing mode is invalid")
+        if not isinstance(self.covered_outcomes, frozenset) or any(
+            not isinstance(value, str) for value in self.covered_outcomes
+        ):
+            raise ValueError("authoritative settlement outcomes are invalid")
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.billing_mode == "shared_credit"
+            and self.covered_outcomes == _AUTHORITATIVE_SETTLEMENT_OUTCOMES
+        )
+
+
+@dataclass(frozen=True)
+class AuthoritativeCostFact:
+    amount_usd: str
+    provider: str
+    model: str
+    strategy: str
+    authoritative: Literal[True] = True
+
+
+def authoritative_cost_fact(
+    response_usage: object,
+    *,
+    provider: str,
+    model: str,
+    contract: AuthoritativeSettlementContract | None,
+) -> AuthoritativeCostFact | None:
+    """Extract only a contract-covered provider-billed cost fact.
+
+    Display estimates and arbitrary result dictionaries intentionally have no
+    path into this function unless reviewed provider code supplies a complete
+    settlement contract for the exact route.
+    """
+
+    if (
+        contract is None
+        or not contract.complete
+        or provider != contract.provider
+        or not isinstance(model, str)
+        or not model
+    ):
+        return None
+    missing = object()
+    if isinstance(response_usage, dict):
+        raw_cost = response_usage.get("cost", missing)
+    else:
+        raw_cost = getattr(response_usage, "cost", missing)
+    if raw_cost is missing:
+        return None
+    return AuthoritativeCostFact(
+        amount_usd=canonical_usd(raw_cost),
+        provider=provider,
+        model=model,
+        strategy=contract.strategy,
+    )
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)

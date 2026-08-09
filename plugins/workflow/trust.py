@@ -564,7 +564,12 @@ def build_risk_summary(
     *,
     read_budget: WorkflowResourceReadBudget | None = None,
     compilation=None,
+    provider_authority_digest: str | None = None,
 ) -> WorkflowRiskSummary:
+    if provider_authority_digest is not None and not _SHA256.fullmatch(
+        provider_authority_digest
+    ):
+        raise ValueError("provider authority digest must be lowercase SHA-256")
     if compilation is not None:
         from plugins.workflow.compilation import WorkflowCompilation
 
@@ -722,6 +727,8 @@ def build_risk_summary(
             finding.path for finding in compatibility.blocking_findings
         ),
     }
+    if provider_authority_digest is not None:
+        risk_fields["provider_authority_digest"] = provider_authority_digest
     if compilation is not None:
         risk_fields["origin_risks"] = tuple(
             asdict(origin_risk) for origin_risk in origin_risks
@@ -755,6 +762,7 @@ def build_risk_summary(
                 "language_identity",
                 "origin_risks",
                 "ignored_child_policies",
+                "provider_authority_digest",
             }
         },
     )

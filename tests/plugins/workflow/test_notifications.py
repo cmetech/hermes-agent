@@ -6,6 +6,8 @@ import logging
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
@@ -147,6 +149,310 @@ def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_pat
         )
     assert canary not in durable
     assert canary not in str(outbox.history(run_id="private-notification-run"))
+
+
+def test_notification_authority_values_are_value_free_across_durable_delivery(
+    tmp_path,
+):
+    """Endpoint and registration identities never cross the notification boundary."""
+    store = RunStore(tmp_path / "notification-private-authority")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+    endpoint_identity = "a1" * 32
+    nested_endpoint_identity = "b2" * 32
+    registration_identity = "c3" * 32
+    nested_registration_identity = "d4" * 32
+    authority_field_names = [
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    ]
+
+    notification_id = outbox.record(
+        run_id="private-authority-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "mismatched_fields": authority_field_names,
+            "expected_runtime_identity": {
+                "endpoint_sha256": endpoint_identity,
+                "registration_provenance_digest": registration_identity,
+                "nested": [
+                    {"expectedEndpointSha256": nested_endpoint_identity},
+                    {
+                        "liveRegistrationProvenanceDigest": (
+                            nested_registration_identity
+                        )
+                    },
+                ],
+            },
+            "detail": (
+                f"endpoint changed from {endpoint_identity}; registration "
+                f"changed from {registration_identity}"
+            ),
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id="private-authority-run")
+    with store._connect() as connection:
+        durable = " ".join(
+            str(value)
+            for row in connection.execute(
+                "SELECT workflow_notification_outbox.payload_json, "
+                "workflow_notification_facts.payload_json "
+                "FROM workflow_notification_outbox LEFT JOIN "
+                "workflow_notification_facts USING(notification_id) "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+            for value in row
+        )
+
+    public_payloads = json.dumps(
+        {"leased": leased, "history": history, "durable": durable},
+        sort_keys=True,
+    )
+    for private_value in (
+        endpoint_identity,
+        nested_endpoint_identity,
+        registration_identity,
+        nested_registration_identity,
+    ):
+        assert private_value not in public_payloads
+    assert leased[0]["payload"]["code"] == "provider_capability_drift"
+    assert leased[0]["payload"]["mismatched_fields"] == authority_field_names
+    assert history[0]["payload"]["mismatched_fields"] == authority_field_names
+
+
+def test_notification_authority_containers_scrub_raw_echoes_before_sanitizing(
+    tmp_path,
+):
+    """Raw authority leaves stay private even under secret or cyclic containers."""
+    store = RunStore(tmp_path / "notification-private-authority-containers")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 13, tzinfo=timezone.utc)
+    endpoint_identity = "e5" * 32
+    nested_endpoint_identity = "f6" * 32
+    registration_identity = "a7" * 32
+    nested_registration_identity = "b8" * 32
+    authority_field_names = [
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    ]
+    endpoint_container = {
+        "primary": endpoint_identity,
+        "nested": [nested_endpoint_identity],
+    }
+    endpoint_container["cycle"] = endpoint_container
+
+    notification_id = outbox.record(
+        run_id="private-authority-container-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "status": "failed",
+            "interaction": {
+                "type": "reconcile",
+                "interaction_id": "authority-container-interaction",
+            },
+            "mismatched_fields": authority_field_names,
+            "credentialEndpointSha256": endpoint_container,
+            "registration_provenance_digest": [
+                registration_identity,
+                {"nested": nested_registration_identity},
+            ],
+            "detail": (
+                f"endpoint values {endpoint_identity} {nested_endpoint_identity}; "
+                f"registration value {registration_identity}"
+            ),
+            "messages": [
+                f"registration nested {nested_registration_identity}",
+                {"echo": endpoint_identity},
+            ],
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id="private-authority-container-run")
+    with store._connect() as connection:
+        outbox_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_outbox "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+        fact_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_facts "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+
+    public_payloads = json.dumps(
+        {
+            "outbox": outbox_payloads,
+            "facts": fact_payloads,
+            "leased": leased,
+            "history": history,
+        },
+        sort_keys=True,
+    )
+    for private_value in (
+        endpoint_identity,
+        nested_endpoint_identity,
+        registration_identity,
+        nested_registration_identity,
+    ):
+        assert private_value not in public_payloads
+    assert outbox_payloads and fact_payloads
+    expected_actions = ["status", "events", "resume", "retry", "abandon"]
+    for item in (leased[0], history[0]):
+        assert item["payload"]["code"] == "provider_capability_drift"
+        assert item["payload"]["mismatched_fields"] == authority_field_names
+        assert item["payload"]["next_actions"] == expected_actions
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("child_201", "depth_13", "unsupported_set", "deep_first_alias"),
+)
+def test_incomplete_notification_authority_collection_fails_closed(
+    tmp_path,
+    case,
+):
+    """Unprovable authority collection retains only recovery-safe metadata."""
+    private_value = {
+        "child_201": "c1" * 32,
+        "depth_13": "d2" * 32,
+        "unsupported_set": "e3" * 32,
+        "deep_first_alias": "f4" * 32,
+    }[case]
+    if case == "child_201":
+        private_key = "credentialEndpointSha256"
+        private_container = [f"public-{index}" for index in range(200)] + [
+            private_value
+        ]
+        mismatch = "endpoint_sha256"
+    elif case == "depth_13":
+        private_key = "expectedRegistrationProvenanceDigest"
+        private_container = private_value
+        for _ in range(12):
+            private_container = [private_container]
+        mismatch = "registration_provenance_digest"
+    elif case == "unsupported_set":
+        private_key = "expectedEndpointSha256"
+        private_container = {private_value}
+        mismatch = "endpoint_sha256"
+    else:
+        private_key = "expectedRegistrationProvenanceDigest"
+        shared = {"leaf": private_value}
+        deep = shared
+        for _ in range(10):
+            deep = [deep]
+        private_container = {"shallow": shared, "deep": deep}
+        mismatch = "registration_provenance_digest"
+
+    store = RunStore(tmp_path / f"notification-incomplete-{case}")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 14, tzinfo=timezone.utc)
+    arbitrary_sibling = f"arbitrary-sibling-{case}"
+    notification_id = outbox.record(
+        run_id=f"incomplete-authority-{case}",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "status": "failed",
+            "interaction": {
+                "type": "reconcile",
+                "interaction_id": f"interaction-{case}",
+            },
+            "mismatched_fields": [mismatch],
+            private_key: private_container,
+            "detail": f"{arbitrary_sibling} {private_value}",
+            "messages": [private_value, arbitrary_sibling],
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id=f"incomplete-authority-{case}")
+    with store._connect() as connection:
+        outbox_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_outbox "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+        fact_payloads = [
+            row["payload_json"]
+            for row in connection.execute(
+                "SELECT payload_json FROM workflow_notification_facts "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+        ]
+
+    rendered = json.dumps(
+        {
+            "outbox": outbox_payloads,
+            "facts": fact_payloads,
+            "leased": leased,
+            "history": history,
+        },
+        sort_keys=True,
+    )
+    assert private_value not in rendered
+    assert arbitrary_sibling not in rendered
+    assert outbox_payloads and fact_payloads
+    expected_actions = ["status", "events", "resume", "retry", "abandon"]
+    for item in (leased[0], history[0]):
+        projected = item["payload"]
+        assert set(projected) == {
+            "payload_type",
+            "code",
+            "status",
+            "interaction",
+            "mismatched_fields",
+            "state_version",
+            "next_actions",
+        }
+        assert projected["code"] == "provider_capability_drift"
+        assert projected["payload_type"] == "workflow_transition"
+        assert projected["interaction"] == {
+            "type": "reconcile",
+            "interaction_id": f"interaction-{case}",
+        }
+        assert projected["mismatched_fields"] == [mismatch]
+        assert projected["next_actions"] == expected_actions
 
 
 def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
@@ -303,7 +609,7 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
         kind="failure",
         destination="desktop",
         transition_version=2,
-        payload={"error": "one"},
+        payload={"status": "failed", "event_type": "run_failed"},
         now=now,
     )
     second = outbox.record(
@@ -311,7 +617,7 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
         kind="failure",
         destination="desktop",
         transition_version=3,
-        payload={"error": "two"},
+        payload={"status": "failed", "event_type": "run_failed"},
         now=now + timedelta(seconds=30),
     )
     gate_one = outbox.record(
@@ -343,7 +649,8 @@ def test_flapping_delivery_coalesces_but_distinct_human_gates_do_not(tmp_path):
     summary = next(item for item in leased if item["notification_id"] == first)
     assert summary["coalesced_count"] == 2
     assert summary["transition_version"] == 3
-    assert summary["payload"]["error"] == "two"
+    assert summary["payload"]["payload_type"] == "workflow_transition"
+    assert summary["payload"]["status"] == "failed"
 
 
 def test_transition_identity_is_idempotent(tmp_path):
@@ -567,14 +874,14 @@ def test_notification_history_is_newest_first_and_keyset_paginated(tmp_path):
 
     newest = outbox.history(run_id="run-newest", limit=200)
 
-    assert [item["payload"]["version"] for item in newest[:3]] == [204, 203, 202]
-    assert newest[-1]["payload"]["version"] == 5
+    assert [item["transition_version"] for item in newest[:3]] == [204, 203, 202]
+    assert newest[-1]["transition_version"] == 5
     older = outbox.history(
         run_id="run-newest",
         limit=200,
         before=(newest[-1]["occurred_at"], newest[-1]["transition_key"]),
     )
-    assert [item["payload"]["version"] for item in older] == [4, 3, 2, 1, 0]
+    assert [item["transition_version"] for item in older] == [4, 3, 2, 1, 0]
 
 
 def test_bounded_repair_reads_one_run_page_and_only_candidate_fact_keys(

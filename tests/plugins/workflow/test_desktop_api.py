@@ -30,6 +30,7 @@ from agent.plugin_agent import PluginAgentRunner, PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.admission import RunAdmissionRequest
 import plugins.workflow.api_admission as api_admission_module
+import plugins.workflow.catalog_api as catalog_api_module
 from plugins.workflow.catalog_api import workflow_catalog_run_support
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
@@ -62,7 +63,7 @@ from plugins.workflow.scheduled_revalidation import (
     sealed_snapshot_digest,
     verify_sealed_snapshot,
 )
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.sessions import NodeSessionKey, SessionRegistryUpdateCandidate
@@ -1817,8 +1818,10 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_workflow_admission
 
-    def incompatible(package, _context, *, read_budget=None, compilation=None):
+    def incompatible(compilation, context, **kwargs):
+        assessment = original_assess(compilation, context, **kwargs)
         compatibility = CompatibilityReport(
             level=CompatibilityLevel.UNSUPPORTED,
             findings=(
@@ -1831,16 +1834,15 @@ def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persiste
             ),
             runnable=False,
         )
-        return compatibility, build_risk_summary(
-            package,
-            compatibility,
-            read_budget=read_budget,
-            compilation=compilation,
+        return replace(
+            assessment,
+            compatibility=compatibility,
+            next_actions=("doctor",),
         )
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         incompatible,
     )
 
@@ -2209,22 +2211,17 @@ def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
     assessments = 0
 
-    def counted_assess(package, context, *, read_budget=None, compilation=None):
+    def counted_assess(compilation, context, **kwargs):
         nonlocal assessments
         assessments += 1
-        return original_assess(
-            package,
-            context,
-            read_budget=read_budget,
-            compilation=compilation,
-        )
+        return original_assess(compilation, context, **kwargs)
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         counted_assess,
     )
 
@@ -2923,21 +2920,16 @@ def test_post_runs_maps_final_authenticated_resource_change_to_conflict(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
 
-    def mutate_after_assessment(package, context, *, read_budget=None, compilation=None):
-        assessment = original_assess(
-            package,
-            context,
-            read_budget=read_budget,
-            compilation=compilation,
-        )
+    def mutate_after_assessment(compilation, context, **kwargs):
+        assessment = original_assess(compilation, context, **kwargs)
         resource.write_text("CHANGED_RESOURCE_WITH_NEW_SIZE", encoding="utf-8")
         return assessment
 
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         mutate_after_assessment,
     )
     response = TestClient(_app(_router()), raise_server_exceptions=False).post(
@@ -3015,6 +3007,105 @@ def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
     assert detail.status_code == 200
     assert admitted.status_code == 202
     assert admitted.json()["result"]["admission_disposition"] == "created"
+
+
+def test_catalog_route_accepts_exact_structured_output_capability_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "structured-output-catalog-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="catalog-plain-output",
+        nodes=[{"id": "plain", "bash": "true"}],
+    )
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="catalog-structured-output",
+        nodes=[
+            {
+                "id": "structured",
+                "prompt": "Return a structured report",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    (home / "workflows/catalog-structured-output.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    produced_rows: dict[str, dict[str, object]] = {}
+    original_build_catalog = catalog_api_module.build_workflow_catalog
+
+    def capture_produced_catalog(**kwargs):
+        produced, truncated = original_build_catalog(**kwargs)
+        produced_rows.update(
+            {
+                item["name"]: item
+                for item in produced
+                if item["name"]
+                in {"catalog-plain-output", "catalog-structured-output"}
+            }
+        )
+        return produced, truncated
+
+    monkeypatch.setattr(
+        catalog_api_module,
+        "build_workflow_catalog",
+        capture_produced_catalog,
+    )
+
+    module = _module()
+    response = TestClient(_app(module.router)).get(
+        "/api/plugins/workflow/workflows"
+    )
+
+    assert response.status_code == 200
+    assert "structured_output_capability" not in produced_rows["catalog-plain-output"]
+    assert "structured_output_capability" in produced_rows["catalog-structured-output"]
+    rows = {
+        item["name"]: item
+        for item in response.json()["items"]
+        if item["name"] in {"catalog-plain-output", "catalog-structured-output"}
+    }
+    assert "structured_output_capability" not in rows["catalog-plain-output"]
+    structured = rows["catalog-structured-output"]["structured_output_capability"]
+    assert set(structured) == {
+        "mixed",
+        "summaries",
+        "summaries_truncated",
+        "summary_count",
+    }
+    assert structured["summary_count"] == len(structured["summaries"]) == 1
+    assert structured["mixed"] is False
+    assert structured["summaries_truncated"] is False
+    assert set(structured["summaries"][0]) == {
+        "adapter_version",
+        "api_mode",
+        "provider",
+        "strategy",
+    }
+    with pytest.raises(ValueError):
+        module.WorkflowCatalogEntry.model_validate(
+            {**rows["catalog-structured-output"], "private_extra": "rejected"}
+        )
+    with pytest.raises(ValueError):
+        module.WorkflowCatalogEntry.model_validate(
+            {
+                **rows["catalog-structured-output"],
+                "structured_output_capability": {
+                    **structured,
+                    "summaries": [
+                        {**structured["summaries"][0], "private_extra": "rejected"}
+                    ],
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize("mutation", ["delete", "symlink"])
@@ -3234,7 +3325,7 @@ def test_recovered_typed_session_is_private_in_authenticated_api_projections(
         assert b"protected-publication-session" not in response.content, name
 
 
-def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
+def test_legacy_session_fields_remain_private_in_authenticated_api_projections(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "legacy-session-api-home"
@@ -3267,8 +3358,8 @@ def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
     )
     assert detail.status_code == events.status_code == 200
     for response in (detail, events):
-        assert b"legacy-api-session" in response.content
-        assert b"legacy-api-fingerprint" in response.content
+        assert b"legacy-api-session" not in response.content
+        assert b"legacy-api-fingerprint" not in response.content
 
 
 def test_runs_list_never_opens_real_artifact_bodies(
@@ -3466,8 +3557,8 @@ def test_artifact_preview_and_download_accept_producer_metadata_boundary(
         for value in evidence.json()["items"]
         if value.get("publication_id") == artifact["publication_id"]
     )
-    assert item["output_type"] == output_type
-    assert item["session_id"] == session_id
+    assert item["output_type"].startswith("redacted:")
+    assert "session_id" not in item
     assert body not in evidence.content
     assert len(evidence.content) < 40_000
 
@@ -4176,7 +4267,7 @@ def test_attention_returns_action_metadata_for_every_operator_attention_kind(
         stalled.run_id: ("stalled", "cancel"),
         reconcile.run_id: ("reconcile", "reconcile"),
     }
-    assert set(expected) <= set(by_run)
+    assert set(expected) <= set(by_run), (expected, by_run)
     for run_id, (kind, action) in expected.items():
         item = by_run[run_id]
         assert item["kind"] == kind

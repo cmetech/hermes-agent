@@ -46,6 +46,28 @@ from tools.managed_process import (
 )
 
 
+PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION = 1
+
+
+def plugin_agent_python_runtime_identity() -> str:
+    """Credential-free identity for the exact trusted Python MCP host."""
+    digest = hashlib.sha256()
+    digest.update(b"hermes-plugin-agent-python-runtime-v1\0")
+    for value in (
+        sys.implementation.name,
+        getattr(sys.implementation, "cache_tag", ""),
+        sys.version,
+        str(PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION),
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    with Path(sys.executable).open("rb") as interpreter:
+        while chunk := interpreter.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 _PROTOCOL_VERSION = 1
 _MAX_REQUEST_BYTES = 1_000_000
 _MAX_FRAME_BYTES = 4_000_000
@@ -182,7 +204,10 @@ def _validated_provider_attempt_authority(
 
 
 def _shared_provider_attempt_request(
-    descriptor: Mapping[str, Any], operation: str
+    descriptor: Mapping[str, Any],
+    operation: str,
+    *,
+    action_digest: str | None = None,
 ) -> Mapping[str, Any]:
     address, authkey = _validated_provider_attempt_authority(descriptor)
     nonce = base64.b64encode(
@@ -192,6 +217,7 @@ def _shared_provider_attempt_request(
         "version": _PROVIDER_AUTHORITY_VERSION,
         "operation": operation,
         "nonce": nonce,
+        **({"action_digest": action_digest} if action_digest is not None else {}),
     }
     try:
         with socket.create_connection(
@@ -261,15 +287,34 @@ def _snapshot_shared_provider_attempts(
     return {"provider_attempts": count, "exhausted": exhausted}
 
 
-class _ProviderAttemptAuthority:
-    """Authenticated request-local broker for one process-tree attempt grant."""
+def _consume_shared_approved_action(
+    descriptor: Mapping[str, Any], action_digest: str
+) -> bool:
+    if re.fullmatch(r"[0-9a-f]{64}", action_digest) is None:
+        raise ValueError("approved action digest is invalid")
+    response = _shared_provider_attempt_request(
+        descriptor, "consume_action", action_digest=action_digest
+    )
+    consumed = response.get("consumed")
+    if not isinstance(consumed, bool):
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    return consumed
 
-    def __init__(self, grant: int) -> None:
+
+class _ProviderAttemptAuthority:
+    """Authenticated request-tree broker for attempts and one outward action."""
+
+    def __init__(self, grant: int, *, approved_action_digest: str | None = None) -> None:
         if isinstance(grant, bool) or not isinstance(grant, int) or not 1 <= grant <= 5:
             raise ValueError("provider attempt authority grant must be between 1 and 5")
         self._grant = grant
         self._provider_attempts = 0
         self._exhausted = False
+        if approved_action_digest is not None and re.fullmatch(
+            r"[0-9a-f]{64}", approved_action_digest
+        ) is None:
+            raise ValueError("approved action digest is invalid")
+        self._approved_action_digest = approved_action_digest
         self._state_lock = threading.Lock()
         self._authkey = secrets.token_bytes(_PROVIDER_AUTHORITY_AUTHKEY_BYTES)
         self._seen_nonces: set[str] = set()
@@ -333,12 +378,10 @@ class _ProviderAttemptAuthority:
             request = json.loads(
                 _recv_provider_authority_frame(connection).decode("ascii")
             )
-            if not isinstance(request, Mapping) or set(request) != {
-                "version",
-                "operation",
-                "nonce",
-                "mac",
-            }:
+            if not isinstance(request, Mapping) or set(request) not in (
+                {"version", "operation", "nonce", "mac"},
+                {"version", "operation", "nonce", "action_digest", "mac"},
+            ):
                 return
             request = dict(request)
             request_mac = request.pop("mac", None)
@@ -346,9 +389,16 @@ class _ProviderAttemptAuthority:
             operation = request.get("operation")
             if (
                 request.get("version") != _PROVIDER_AUTHORITY_VERSION
-                or operation not in {"reserve", "snapshot"}
+                or operation not in {"reserve", "snapshot", "consume_action"}
                 or not isinstance(nonce, str)
                 or not isinstance(request_mac, str)
+                or (
+                    operation == "consume_action"
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", str(request.get("action_digest") or "")
+                    ) is None
+                )
+                or (operation != "consume_action" and "action_digest" in request)
             ):
                 return
             try:
@@ -383,11 +433,22 @@ class _ProviderAttemptAuthority:
                             "reserved": True,
                             "provider_attempts": self._provider_attempts,
                         }
-                else:
+                elif operation == "snapshot":
                     response = {
                         "provider_attempts": self._provider_attempts,
                         "exhausted": self._exhausted,
                     }
+                else:
+                    requested_digest = str(request["action_digest"])
+                    consumed = (
+                        self._approved_action_digest is not None
+                        and hmac.compare_digest(
+                            self._approved_action_digest, requested_digest
+                        )
+                    )
+                    if consumed:
+                        self._approved_action_digest = None
+                    response = {"consumed": consumed}
             signed = {
                 "version": _PROVIDER_AUTHORITY_VERSION,
                 "nonce": nonce,
@@ -459,6 +520,16 @@ class PluginAgentRunRequest:
     model: str | None = None
     context_mode: Literal["fresh", "shared"] = "fresh"
     session_id: str | None = None
+    sealed_runtime_authority_required: bool = False
+    intended_authority_digest: str | None = None
+    expected_model_visible_prefix_digest: str | None = None
+    expected_runtime_identity: Mapping[str, str] | None = None
+    expected_runtime_route_fingerprint: str | None = None
+    expected_runtime_route_options: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
+    expected_mcp_runtime_identity_digest: str | None = None
     enabled_toolsets: tuple[str, ...] | None = None
     allowed_tools: tuple[str, ...] | None = None
     denied_tools: tuple[str, ...] = ()
@@ -468,10 +539,17 @@ class PluginAgentRunRequest:
     inline_agents: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     reasoning_config: Mapping[str, Any] | None = None
     fallback_model: str | None = None
+    sealed_fallback_route: Mapping[str, Any] | None = None
     ephemeral_system_prompt: str | None = None
     request_overrides: Mapping[str, Any] = field(default_factory=dict)
     structured_output: StructuredOutputRequest | None = None
     max_budget_usd: float | None = None
+    _cost_budget_authority: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _cost_budget_contract: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
     sandbox_policy: Mapping[str, Any] | None = None
     approved_action_digest: str | None = None
     workdir: Path | None = None
@@ -484,6 +562,9 @@ class PluginAgentRunRequest:
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
+    absolute_wall_deadline: float | None = None
+    absolute_idle_deadline: float | None = None
+    absolute_provider_deadline: float | None = None
     max_process_tree_rss_bytes: int = 2048 * 1024 * 1024
     max_process_tree_cpu_seconds: float = 900.0
     max_descendants: int = 32
@@ -498,6 +579,20 @@ class PluginAgentRunRequest:
             "model": self.model,
             "context_mode": self.context_mode,
             "session_id": self.session_id,
+            "intended_authority_digest": self.intended_authority_digest,
+            "expected_model_visible_prefix_digest": (
+                self.expected_model_visible_prefix_digest
+            ),
+            "expected_runtime_identity": _wire_json(self.expected_runtime_identity),
+            "expected_runtime_route_fingerprint": (
+                self.expected_runtime_route_fingerprint
+            ),
+            "expected_runtime_route_options": _wire_json(
+                self.expected_runtime_route_options
+            ),
+            "expected_mcp_runtime_identity_digest": (
+                self.expected_mcp_runtime_identity_digest
+            ),
             "enabled_toolsets": _wire_json(self.enabled_toolsets),
             "allowed_tools": _wire_json(self.allowed_tools),
             "denied_tools": _wire_json(self.denied_tools),
@@ -507,6 +602,9 @@ class PluginAgentRunRequest:
             "inline_agents": _wire_json(self.inline_agents),
             "reasoning_config": _wire_json(self.reasoning_config),
             "fallback_model": self.fallback_model,
+            "sealed_fallback_route": _sealed_fallback_route_to_wire(
+                self.sealed_fallback_route
+            ),
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "request_overrides": _wire_json(self.request_overrides),
             "structured_output": (
@@ -524,6 +622,9 @@ class PluginAgentRunRequest:
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "wall_timeout_seconds": self.wall_timeout_seconds,
             "provider_request_timeout_seconds": self.provider_request_timeout_seconds,
+            "absolute_wall_deadline": self.absolute_wall_deadline,
+            "absolute_idle_deadline": self.absolute_idle_deadline,
+            "absolute_provider_deadline": self.absolute_provider_deadline,
             "max_process_tree_rss_bytes": self.max_process_tree_rss_bytes,
             "max_process_tree_cpu_seconds": self.max_process_tree_cpu_seconds,
             "max_descendants": self.max_descendants,
@@ -531,9 +632,19 @@ class PluginAgentRunRequest:
             "term_grace_seconds": self.term_grace_seconds,
             "kill_reap_grace_seconds": self.kill_reap_grace_seconds,
         }
+        if self.sealed_runtime_authority_required:
+            payload["sealed_runtime_authority_required"] = True
         if self._provider_attempt_authority is not None:
             payload["_provider_attempt_authority"] = _wire_json(
                 self._provider_attempt_authority
+            )
+        if self._cost_budget_authority is not None:
+            payload["_cost_budget_authority"] = _wire_json(
+                self._cost_budget_authority
+            )
+        if self._cost_budget_contract is not None:
+            payload["_cost_budget_contract"] = _wire_json(
+                self._cost_budget_contract
             )
         return payload
 
@@ -547,6 +658,13 @@ class PluginAgentRunRequest:
             "model",
             "context_mode",
             "session_id",
+            "sealed_runtime_authority_required",
+            "intended_authority_digest",
+            "expected_model_visible_prefix_digest",
+            "expected_runtime_identity",
+            "expected_runtime_route_fingerprint",
+            "expected_runtime_route_options",
+            "expected_mcp_runtime_identity_digest",
             "enabled_toolsets",
             "allowed_tools",
             "denied_tools",
@@ -556,6 +674,7 @@ class PluginAgentRunRequest:
             "inline_agents",
             "reasoning_config",
             "fallback_model",
+            "sealed_fallback_route",
             "ephemeral_system_prompt",
             "request_overrides",
             "structured_output",
@@ -567,9 +686,14 @@ class PluginAgentRunRequest:
             "max_api_attempts",
             "sealed_provider_attempt_grant",
             "_provider_attempt_authority",
+            "_cost_budget_authority",
+            "_cost_budget_contract",
             "idle_timeout_seconds",
             "wall_timeout_seconds",
             "provider_request_timeout_seconds",
+            "absolute_wall_deadline",
+            "absolute_idle_deadline",
+            "absolute_provider_deadline",
             "max_process_tree_rss_bytes",
             "max_process_tree_cpu_seconds",
             "max_descendants",
@@ -596,6 +720,14 @@ class PluginAgentRunRequest:
             data["structured_output"] = _structured_output_from_wire(
                 data["structured_output"]
             )
+        fallback = data.get("sealed_fallback_route")
+        if isinstance(fallback, Mapping):
+            fallback_data = dict(fallback)
+            if fallback_data.get("structured_output") is not None:
+                fallback_data["structured_output"] = _structured_output_from_wire(
+                    fallback_data["structured_output"]
+                )
+            data["sealed_fallback_route"] = fallback_data
         try:
             return cls(**data)
         except TypeError as exc:
@@ -713,6 +845,18 @@ def _structured_output_to_wire(request: StructuredOutputRequest) -> dict[str, An
         "output_bytes_limit": request.output_bytes_limit,
         "canonicalization_version": request.canonicalization_version,
     }
+
+
+def _sealed_fallback_route_to_wire(
+    route: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if route is None:
+        return None
+    payload = dict(route)
+    structured = payload.get("structured_output")
+    if structured is not None:
+        payload["structured_output"] = _structured_output_to_wire(structured)
+    return _wire_json(payload)
 
 
 def _structured_output_from_wire(value: object) -> StructuredOutputRequest:
@@ -860,6 +1004,14 @@ def _correlate_structured_result(
     request: PluginAgentRunRequest, result: PluginAgentRunResult
 ) -> None:
     admitted = request.structured_output
+    if result.audit.get("fallback_used") is True:
+        fallback = request.sealed_fallback_route
+        if (
+            not isinstance(fallback, Mapping)
+            or result.audit.get("fallback_context") != "fresh"
+        ):
+            raise RuntimeError("fallback structured output authority is missing")
+        admitted = fallback.get("structured_output")
     evidence = result.structured_output
     if admitted is None:
         if evidence is not None:
@@ -929,6 +1081,23 @@ def _validate_name_list(label: str, values: tuple[str, ...] | None) -> None:
         raise ValueError(f"{label} must contain non-empty strings")
 
 
+def _valid_runtime_route_options(value: object) -> bool:
+    if not isinstance(value, Mapping) or len(value) > 16:
+        return False
+    if any(not isinstance(key, str) for key in value):
+        return False
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(encoded) <= 2048
+
+
 def _validate_request(request: PluginAgentRunRequest) -> None:
     if not isinstance(request, PluginAgentRunRequest):
         raise TypeError("request must be PluginAgentRunRequest")
@@ -942,6 +1111,81 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         not isinstance(request.session_id, str) or not request.session_id.strip()
     ):
         raise ValueError("shared context requires session_id")
+    if not isinstance(request.sealed_runtime_authority_required, bool):
+        raise TypeError("sealed_runtime_authority_required must be boolean")
+    if request.sealed_runtime_authority_required and (
+        request.intended_authority_digest is None
+        or request.expected_runtime_identity is None
+    ):
+        raise ValueError("sealed runtime authority is required")
+    for label, value in (
+        ("intended authority", request.intended_authority_digest),
+        (
+            "expected model-visible prefix",
+            request.expected_model_visible_prefix_digest,
+        ),
+        (
+            "expected MCP runtime identity",
+            request.expected_mcp_runtime_identity_digest,
+        ),
+        (
+            "expected runtime route fingerprint",
+            request.expected_runtime_route_fingerprint,
+        ),
+    ):
+        if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{label} digest must be lowercase SHA-256")
+    if (
+        request.expected_model_visible_prefix_digest is not None
+        and request.intended_authority_digest is None
+    ):
+        raise ValueError(
+            "expected model-visible prefix requires sealed intended authority"
+        )
+    if (
+        request.intended_authority_digest is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError(
+            "intended authority requires expected runtime identity"
+        )
+    if request.expected_runtime_identity is not None:
+        from hermes_cli.runtime_provider import (
+            execution_runtime_identity_from_sealed_route,
+        )
+
+        execution_runtime_identity_from_sealed_route(
+            request.expected_runtime_identity
+        )
+        if request.intended_authority_digest is None:
+            raise ValueError(
+                "expected runtime identity requires sealed intended authority"
+            )
+        if request.expected_runtime_route_fingerprint is None:
+            raise ValueError(
+                "expected runtime identity requires route fingerprint"
+            )
+        if not _valid_runtime_route_options(
+            request.expected_runtime_route_options
+        ):
+            raise ValueError("expected runtime identity requires route options")
+    if (
+        request.expected_runtime_route_fingerprint is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError("route fingerprint requires expected runtime identity")
+    if (
+        request.expected_runtime_route_options is not None
+        and request.expected_runtime_identity is None
+    ):
+        raise ValueError("route options require expected runtime identity")
+    if (
+        request.expected_mcp_runtime_identity_digest is not None
+        and request.intended_authority_digest is None
+    ):
+        raise ValueError(
+            "expected MCP runtime identity requires sealed intended authority"
+        )
     if (
         not isinstance(request.max_iterations, int)
         or isinstance(request.max_iterations, bool)
@@ -957,9 +1201,12 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
     if not isinstance(request.sealed_provider_attempt_grant, bool):
         raise ValueError("sealed provider attempt grant must be boolean")
     if request._provider_attempt_authority is not None:
-        if not request.sealed_provider_attempt_grant:
+        if (
+            not request.sealed_provider_attempt_grant
+            and request.approved_action_digest is None
+        ):
             raise ValueError(
-                "provider attempt authority requires a sealed provider grant"
+                "request-tree authority requires a sealed provider or action grant"
             )
         _validated_provider_attempt_authority(request._provider_attempt_authority)
     for label, value in (("provider", request.provider), ("model", request.model)):
@@ -987,6 +1234,25 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("idle timeout cannot exceed wall timeout")
     if request.provider_request_timeout_seconds > request.wall_timeout_seconds:
         raise ValueError("provider request timeout cannot exceed wall timeout")
+    for label, value in (
+        ("absolute_wall_deadline", request.absolute_wall_deadline),
+        ("absolute_idle_deadline", request.absolute_idle_deadline),
+        ("absolute_provider_deadline", request.absolute_provider_deadline),
+    ):
+        if value is not None and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be finite and positive or None")
+    if request.absolute_wall_deadline is not None:
+        for label, value in (
+            ("absolute idle deadline", request.absolute_idle_deadline),
+            ("absolute provider deadline", request.absolute_provider_deadline),
+        ):
+            if value is not None and value > request.absolute_wall_deadline:
+                raise ValueError(f"{label} cannot exceed absolute wall deadline")
     for label, value in (
         ("cooperative shutdown", request.cooperative_shutdown_seconds),
         ("TERM grace", request.term_grace_seconds),
@@ -1074,6 +1340,80 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or not request.fallback_model.strip()
     ):
         raise ValueError("fallback_model must be a non-empty string or None")
+    if request.sealed_fallback_route is not None:
+        fallback = request.sealed_fallback_route
+        required = {
+            "provider",
+            "effective_provider",
+            "model",
+            "context_mode",
+            "expected_runtime_identity",
+            "expected_runtime_route_fingerprint",
+            "expected_runtime_route_options",
+            "reasoning_config",
+            "request_overrides",
+            "structured_output",
+        }
+        if (
+            not isinstance(fallback, Mapping)
+            or set(fallback) != required
+            or fallback.get("context_mode") != "fresh"
+            or not isinstance(fallback.get("provider"), str)
+            or not fallback.get("provider")
+            or not isinstance(fallback.get("effective_provider"), str)
+            or not fallback.get("effective_provider")
+            or not isinstance(fallback.get("model"), str)
+            or not fallback.get("model")
+            or not isinstance(fallback.get("reasoning_config"), Mapping)
+            or not isinstance(fallback.get("request_overrides"), Mapping)
+            or not _valid_runtime_route_options(
+                fallback.get("expected_runtime_route_options")
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(fallback.get("expected_runtime_route_fingerprint") or ""),
+            )
+            is None
+            or (
+                fallback.get("structured_output") is not None
+                and not isinstance(
+                    fallback.get("structured_output"), StructuredOutputRequest
+                )
+            )
+            or request.intended_authority_digest is None
+            or request.sealed_provider_attempt_grant is not True
+            or request.fallback_model is not None
+        ):
+            raise ValueError("sealed fallback route is malformed")
+        fallback_structured = fallback.get("structured_output")
+        if (fallback_structured is None) != (request.structured_output is None):
+            raise ValueError("sealed fallback route is malformed")
+        if fallback_structured is not None and request.structured_output is not None:
+            _validate_structured_output(fallback_structured)
+            if (
+                fallback_structured.schema.schema_fingerprint
+                != request.structured_output.schema.schema_fingerprint
+                or fallback_structured.output_bytes_limit
+                != request.structured_output.output_bytes_limit
+                or fallback_structured.canonicalization_version
+                != request.structured_output.canonicalization_version
+            ):
+                raise ValueError("sealed fallback route is malformed")
+        identity = fallback.get("expected_runtime_identity")
+        try:
+            from hermes_cli.runtime_provider import (
+                execution_runtime_identity_from_sealed_route,
+            )
+
+            fallback_identity = execution_runtime_identity_from_sealed_route(identity)
+        except (TypeError, ValueError):
+            fallback_identity = None
+        if (
+            fallback_identity is None
+            or fallback_identity.provider != fallback.get("effective_provider")
+            or fallback_identity.model != fallback.get("model")
+        ):
+            raise ValueError("sealed fallback route is malformed")
     if request.ephemeral_system_prompt is not None and not isinstance(
         request.ephemeral_system_prompt, str
     ):
@@ -1085,6 +1425,42 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or request.max_budget_usd <= 0
     ):
         raise ValueError("max_budget_usd must be finite and positive")
+    cost_authority_present = request._cost_budget_authority is not None
+    cost_contract_present = request._cost_budget_contract is not None
+    if cost_authority_present != cost_contract_present:
+        raise ValueError("authoritative cost authority and contract must be paired")
+    if (
+        request.max_budget_usd is not None
+        and request.intended_authority_digest is not None
+        and not cost_authority_present
+    ):
+        raise ValueError("max_budget_usd requires authoritative cost enforcement")
+    if cost_authority_present:
+        if request.max_budget_usd is None:
+            raise ValueError("authoritative cost authority requires max_budget_usd")
+        from agent.cost_budget import validate_cost_budget_authority_descriptor
+        from agent.usage_pricing import AuthoritativeSettlementContract
+
+        validate_cost_budget_authority_descriptor(request._cost_budget_authority)
+        contract = request._cost_budget_contract
+        if not isinstance(contract, Mapping) or set(contract) != {
+            "provider",
+            "strategy",
+            "billing_mode",
+            "covered_outcomes",
+        }:
+            raise ValueError("authoritative cost contract is invalid")
+        covered = contract.get("covered_outcomes")
+        if not isinstance(covered, (list, tuple)):
+            raise ValueError("authoritative cost contract is invalid")
+        parsed_contract = AuthoritativeSettlementContract(
+            provider=contract.get("provider"),
+            strategy=contract.get("strategy"),
+            billing_mode=contract.get("billing_mode"),
+            covered_outcomes=frozenset(covered),
+        )
+        if not parsed_contract.complete:
+            raise ValueError("authoritative cost contract is incomplete")
     if request.structured_output is not None:
         _validate_structured_output(request.structured_output)
         overrides = request.request_overrides
@@ -1493,14 +1869,27 @@ def _exchange_worker(
 
     owned_authority: _ProviderAttemptAuthority | None = None
     request = payload.get("request")
-    if (
+    shared_provider_tree = (
         isinstance(request, dict)
         and request.get("sealed_provider_attempt_grant") is True
+        and bool(
+            request.get("inline_agents") or request.get("sealed_fallback_route")
+        )
+    )
+    shared_approval_tree = (
+        isinstance(request, dict)
+        and isinstance(request.get("approved_action_digest"), str)
         and bool(request.get("inline_agents"))
+    )
+    if (
+        isinstance(request, dict)
+        and (shared_provider_tree or shared_approval_tree)
         and request.get("_provider_attempt_authority") is None
     ):
         grant = request.get("max_api_attempts")
-        owned_authority = _ProviderAttemptAuthority(grant)
+        owned_authority = _ProviderAttemptAuthority(
+            grant, approved_action_digest=request.get("approved_action_digest")
+        )
         payload = {
             **payload,
             "request": {
@@ -1579,6 +1968,29 @@ class PluginAgentRunner:
                     "persistent plugin-agent session is missing"
                 )
 
+        now = time.monotonic()
+        remaining_wall = request.wall_timeout_seconds
+        remaining_idle = request.idle_timeout_seconds
+        if request.absolute_wall_deadline is not None:
+            remaining_wall = min(
+                remaining_wall,
+                request.absolute_wall_deadline - now,
+            )
+        if request.absolute_idle_deadline is not None:
+            remaining_idle = min(
+                remaining_idle,
+                request.absolute_idle_deadline - now,
+            )
+        if remaining_wall <= 0:
+            raise TimeoutError("plugin-agent absolute wall deadline expired")
+        if remaining_idle <= 0:
+            raise TimeoutError("plugin-agent absolute idle deadline expired")
+        if (
+            request.absolute_provider_deadline is not None
+            and now >= request.absolute_provider_deadline
+        ):
+            raise TimeoutError("plugin-agent absolute provider deadline expired")
+
         payload = _request_payload(self.plugin_id, request)
         try:
             frame = _exchange_worker(
@@ -1586,8 +1998,8 @@ class PluginAgentRunner:
                 workdir=Path(request.workdir).expanduser().resolve()
                 if request.workdir
                 else None,
-                idle_timeout_seconds=request.idle_timeout_seconds,
-                wall_timeout_seconds=request.wall_timeout_seconds,
+                idle_timeout_seconds=min(remaining_idle, remaining_wall),
+                wall_timeout_seconds=remaining_wall,
                 is_cancelled=is_cancelled,
                 resource_limits=ProcessResourceLimits(
                     max_rss_bytes=request.max_process_tree_rss_bytes,

@@ -493,15 +493,21 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         )
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
         api_kwargs.pop("__bedrock_converse__", None)
-        client = _get_bedrock_runtime_client(region)
+        constraint = getattr(agent, "_execution_route_constraint", None)
+        endpoint_url = (
+            getattr(constraint, "base_url", None)
+            if constraint is not None
+            else None
+        )
+        client = _get_bedrock_runtime_client(region, endpoint_url=endpoint_url)
         try:
-            reserve_provider_transport_attempt(agent)
+            reserve_provider_transport_attempt(agent, client)
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
             if is_stale_connection_error(_bedrock_exc):
-                invalidate_runtime_client(region)
+                invalidate_runtime_client(region, endpoint_url=endpoint_url)
             raise
         return normalize_converse_response(raw_response)
     if agent.provider == "moa":
@@ -511,7 +517,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         reserve_provider_transport_attempt(agent)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    reserve_provider_transport_attempt(agent)
+    reserve_provider_transport_attempt(agent, request_client)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1715,6 +1721,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    transition_token = agent._credential_transition_generation()
+    if transition_token is None:
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1889,6 +1899,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+
+        if not agent._invalidate_for_route_transition(
+            transition_token,
+            fallback_client=fb_client,
+        ):
+            agent._close_openai_client(
+                fb_client,
+                reason="rejected:fallback_generation_changed",
+                shared=False,
+            )
+            return False
 
         old_model = agent.model
         old_provider = agent.provider
@@ -2327,7 +2348,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 )
 
                 def _reserved_summary_create(request):
-                    reserve_provider_transport_attempt(agent)
+                    reserve_provider_transport_attempt(agent, summary_client)
                     return summary_client.chat.completions.create(**request)
 
                 summary_response = _managed_summary_call(
@@ -2394,7 +2415,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 )
 
                 def _reserved_summary_retry_create(request):
-                    reserve_provider_transport_attempt(agent)
+                    reserve_provider_transport_attempt(agent, summary_client)
                     return summary_client.chat.completions.create(**request)
 
                 summary_response = _managed_summary_call(
@@ -2612,9 +2633,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
+                    constraint = getattr(
+                        agent, "_execution_route_constraint", None
+                    )
+                    endpoint_url = (
+                        getattr(constraint, "base_url", None)
+                        if constraint is not None
+                        else None
+                    )
+                    client = _get_bedrock_runtime_client(
+                        region, endpoint_url=endpoint_url
+                    )
                     try:
-                        reserve_provider_transport_attempt(agent)
+                        reserve_provider_transport_attempt(agent, client)
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -2633,12 +2664,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
-                            reserve_provider_transport_attempt(agent)
+                            reserve_provider_transport_attempt(agent, client)
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
                         if is_stale_connection_error(_bedrock_exc):
-                            invalidate_runtime_client(region)
+                            invalidate_runtime_client(
+                                region, endpoint_url=endpoint_url
+                            )
                         raise
                     return raw_response.get("stream", [])
 
@@ -2747,7 +2780,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # below and let the streak+give-up breaker escalate across turns.
                 try:
                     from agent.bedrock_adapter import invalidate_runtime_client
-                    invalidate_runtime_client(_bedrock_region)
+                    constraint = getattr(
+                        agent, "_execution_route_constraint", None
+                    )
+                    invalidate_runtime_client(
+                        _bedrock_region,
+                        endpoint_url=(
+                            getattr(constraint, "base_url", None)
+                            if constraint is not None
+                            else None
+                        ),
+                    )
                 except Exception as _inval_exc:
                     logger.debug(
                         "bedrock: stale client eviction failed: %s", _inval_exc
@@ -3099,7 +3142,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            reserve_provider_transport_attempt(agent)
+            reserve_provider_transport_attempt(agent, request_client)
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -3584,7 +3627,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
-            reserve_provider_transport_attempt(agent)
+            reserve_provider_transport_attempt(agent, request_client)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

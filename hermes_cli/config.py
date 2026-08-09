@@ -1888,6 +1888,8 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "custom_providers",  # legacy list form; modern equivalent is providers: {}
     "fallback_model",    # optional single dict or chain list; omitted when disabled
     "mcp_servers",       # MCP server definitions written by setup/tools flows
+    "model_aliases",     # optional rich exact model references
+    "model_tiers",       # optional small/medium/large portable model references
     # Roots read from the raw user YAML (or written by our own flows) that are
     # intentionally absent from DEFAULT_CONFIG:
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
@@ -1951,6 +1953,28 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── portable workflow model references ──────────────────────────────
+    try:
+        from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+
+        model_snapshot = parse_workflow_model_config(config)
+        for issue in model_snapshot.issues:
+            issues.append(
+                ConfigIssue(
+                    issue.severity,
+                    f"{issue.code}: {issue.path}: {issue.message}",
+                    "Fix the portable model entry in config.yaml",
+                )
+            )
+    except Exception as exc:
+        issues.append(
+            ConfigIssue(
+                "error",
+                "model_reference_config_invalid: portable model config could not be parsed",
+                f"Fix model_aliases/model_tiers ({type(exc).__name__})",
+            )
+        )
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -3145,7 +3169,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
-def load_config() -> Dict[str, Any]:
+def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
     Cached on the config file's (mtime_ns, size). Returns a deepcopy of
@@ -3158,11 +3182,16 @@ def load_config() -> Dict[str, Any]:
     Read-only callers should use ``load_config_readonly()`` to skip the
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
+    ``config_path`` selects an explicit profile without mutating process-global
+    ``HERMES_HOME``. This is the canonical behavioral-read seam for
+    multi-profile services: defaults, normalization, environment expansion,
+    managed-scope overlay, caching, and last-known-good handling remain
+    identical to the active-profile path.
     """
-    return _load_config_impl(want_deepcopy=True)
+    return _load_config_impl(want_deepcopy=True, config_path=config_path)
 
 
-def load_config_readonly() -> Dict[str, Any]:
+def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3181,8 +3210,10 @@ def load_config_readonly() -> Dict[str, Any]:
     Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
+    ``config_path`` has the same explicit-profile semantics as
+    :func:`load_config` and does not mutate process-global profile state.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _load_config_impl(want_deepcopy=False, config_path=config_path)
 
 
 def write_platform_config_field(
@@ -3313,10 +3344,17 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *,
+    want_deepcopy: bool,
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if config_path is None:
+            ensure_hermes_home()
+            config_path = get_config_path()
+        else:
+            config_path = Path(config_path)
         path_key = str(config_path)
 
         try:

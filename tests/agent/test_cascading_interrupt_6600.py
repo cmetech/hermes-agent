@@ -43,6 +43,9 @@ def _make_agent():
     # _compute_non_stream_stale_timeout / streaming setup helpers return
     # benign values; the real call path is mocked per-test.
     agent._compute_non_stream_stale_timeout.return_value = 5.0
+    agent._active_cost_budget_attempt_id = None
+    agent._cost_budget_acquire_callback = None
+    agent._provider_attempt_reservation_callback = None
     return agent
 
 
@@ -138,5 +141,4 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     )
     # Worker unblocks and closes its own request client from its own thread.
     _wait_for_mock_call(agent._close_request_anthropic_client)
-
 

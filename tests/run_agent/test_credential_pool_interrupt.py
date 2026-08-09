@@ -3,6 +3,7 @@
 When has_retried_429 is lost (user cancels between 429s), the pool should
 still rotate if the current credential is already marked exhausted.
 """
+import threading
 from unittest.mock import MagicMock, patch
 
 from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
@@ -81,3 +82,103 @@ def test_rotate_on_second_429_when_not_exhausted():
     assert recovered is True
     assert retried is False
     pool.mark_exhausted_and_rotate.assert_called_once()
+
+
+def _start_paused_sealed_adoption(monkeypatch):
+    from tests.run_agent.test_env_credential_turn_refresh import (
+        _prepare_pending_pool_recovery,
+    )
+
+    prepared = _prepare_pending_pool_recovery(
+        monkeypatch,
+        failures=1,
+        pause_before_second=True,
+    )
+    agent, _constraint, _current, candidate, recovery_state, barrier, _calls = prepared
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def recover() -> None:
+        try:
+            results.append(
+                agent._swap_credential(
+                    candidate,
+                    credential_recovery_state=recovery_state,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=recover)
+    thread.start()
+    barrier.wait_until_second_attempt()
+    return prepared, thread, results, errors
+
+
+def test_sealed_candidate_cancellation_before_publication_wins(monkeypatch):
+    (
+        prepared,
+        recovery_thread,
+        results,
+        errors,
+    ) = _start_paused_sealed_adoption(monkeypatch)
+    agent, _constraint, _current, _candidate, recovery_state, barrier, _calls = prepared
+    old_client = agent.client
+    client_lock = agent._openai_client_lock()
+    interrupt_published = threading.Event()
+
+    def probed_client_lock():
+        if agent._interrupt_requested:
+            interrupt_published.set()
+        return client_lock
+
+    monkeypatch.setattr(agent, "_openai_client_lock", probed_client_lock)
+    interrupt_thread = threading.Thread(
+        target=lambda: agent.interrupt(hard_cancel=True)
+    )
+    interrupt_thread.start()
+    assert interrupt_published.wait(timeout=5)
+    assert agent._interrupt_requested is True
+    barrier.release_second_attempt()
+    recovery_thread.join(timeout=5)
+    interrupt_thread.join(timeout=5)
+
+    try:
+        assert not recovery_thread.is_alive()
+        assert not interrupt_thread.is_alive()
+        assert errors == []
+        assert results == [False]
+        assert agent.client is old_client
+        assert getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        assert getattr(agent, "_credential_recovery_active_generation", None) is None
+    finally:
+        barrier.release_second_attempt()
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()
+
+
+def test_sealed_candidate_publication_before_cancellation_stays_committed(
+    monkeypatch,
+):
+    (
+        prepared,
+        recovery_thread,
+        results,
+        errors,
+    ) = _start_paused_sealed_adoption(monkeypatch)
+    agent, _constraint, _current, _candidate, recovery_state, barrier, _calls = prepared
+    old_client = agent.client
+    barrier.release_second_attempt()
+    recovery_thread.join(timeout=5)
+    agent.interrupt(hard_cancel=True)
+
+    try:
+        assert not recovery_thread.is_alive()
+        assert errors == []
+        assert results == [True]
+        assert agent.client is not old_client
+        assert getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        assert getattr(agent, "_credential_recovery_active_generation", None) is None
+    finally:
+        agent._end_credential_recovery_turn(recovery_state.generation)
+        agent.close()

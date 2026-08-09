@@ -13,6 +13,7 @@ import {
 const copy = {
   workflowRunCoordinatorUnavailable: 'coordinator unavailable',
   workflowRunIncompatible: 'incompatible',
+  workflowRunProviderAuthorityUnavailable: 'provider authority unavailable',
   workflowRunShowcaseFromCli: 'showcase CLI required',
   workflowRunSupportUnavailable: 'support unavailable',
   workflowRunUnsupportedInputs: 'unsupported inputs',
@@ -95,6 +96,77 @@ describe('workflow catalog schedule support', () => {
 })
 
 describe('desktop workflow Run disabled reason', () => {
+  const providerCapability = {
+    authority_digest: 'a'.repeat(64),
+    degraded_count: 0,
+    level: 'portable' as const,
+    mixed_provider: false,
+    resolved_route_count: 1,
+    schema_version: 1 as const,
+    unsupported_count: 0,
+    warning_codes: [],
+    routes: [
+      {
+        inline_agent_id: null,
+        model: 'openai/gpt-5.4',
+        node_id: 'ask',
+        provider: 'openrouter',
+        reference_kind: 'configured_alias' as const,
+        role: 'primary' as const
+      }
+    ],
+    decisions: [
+      {
+        code: 'provider_capability_native',
+        disposition: 'native' as const,
+        effective_semantics: { request_field: 'reasoning.effort' },
+        feature: 'effort_thinking' as const,
+        model: 'openai/gpt-5.4',
+        option: 'effort',
+        path: 'nodes[0].effort',
+        provider: 'openrouter'
+      }
+    ]
+  }
+
+  it('requires backend-authored Phase 5 authority and rejects unknown enums', () => {
+    const phase5 = workflow({
+      language: {
+        declared_profile: 'archon-2026-07',
+        effective_profile: 'archon-2026-07',
+        legacy: false,
+        normalizer_version: 5
+      }
+    })
+    expect(desktopWorkflowRunDisabledReason(phase5, copy, 'detail')).toBe('provider authority unavailable')
+    expect(
+      desktopWorkflowRunDisabledReason(
+        workflow({ ...phase5, provider_capability: { ...providerCapability, level: 'future' as never } }),
+        copy,
+        'detail'
+      )
+    ).toBe('provider authority unavailable')
+    expect(
+      desktopWorkflowRunDisabledReason(workflow({ ...phase5, provider_capability: providerCapability }), copy, 'detail')
+    ).toBeNull()
+  })
+
+  it('accepts only the bounded catalog summary and full detail shape', () => {
+    const { decisions, routes, ...summary } = providerCapability
+    const language = {
+      declared_profile: 'archon-2026-07' as const,
+      effective_profile: 'archon-2026-07' as const,
+      legacy: false,
+      normalizer_version: 5
+    }
+    expect(
+      desktopWorkflowRunDisabledReason(catalogWorkflow({ language, provider_capability: summary }), copy, 'catalog')
+    ).toBeNull()
+    expect(
+      desktopWorkflowRunDisabledReason(workflow({ language, provider_capability: summary }), copy, 'detail')
+    ).toBe('provider authority unavailable')
+  })
+
   it('fails closed when an unsupported backend sends an unknown reason', () => {
     expect(
       desktopWorkflowRunDisabledReason(

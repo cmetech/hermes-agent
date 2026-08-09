@@ -10,8 +10,10 @@ Verifies that:
 """
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from run_agent import AIAgent
 
@@ -56,6 +58,50 @@ def _mock_resolve(base_url="https://openrouter.ai/api/v1", api_key="fallback-key
     mock_client.api_key = api_key
     mock_client.base_url = base_url
     return mock_client
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["normal", "direct_return", "exception", "cancelled", "agent_close"],
+)
+def test_pending_candidate_is_cleared_on_every_turn_exit(exit_kind):
+    agent = _make_agent()
+    observed_generation: list[int] = []
+
+    def inner_loop(
+        inner_agent,
+        *_args,
+        credential_recovery_state,
+        **_kwargs,
+    ):
+        generation = credential_recovery_state.generation
+        observed_generation.append(generation)
+        with inner_agent._openai_client_lock():
+            inner_agent._pending_sealed_credential_adoption = SimpleNamespace(
+                generation=generation
+            )
+        if exit_kind == "exception":
+            raise RuntimeError("turn exit canary")
+        if exit_kind == "agent_close":
+            inner_agent.close()
+        if exit_kind == "cancelled":
+            return {"interrupted": True}
+        return {"final_response": exit_kind, "completed": True}
+
+    with patch("agent.conversation_loop.run_conversation", side_effect=inner_loop):
+        if exit_kind == "exception":
+            with pytest.raises(RuntimeError, match="turn exit canary"):
+                agent.run_conversation("hello")
+        else:
+            agent.run_conversation("hello")
+
+    assert len(observed_generation) == 1
+    assert getattr(agent, "_pending_sealed_credential_adoption", None) is None
+    assert (
+        getattr(agent, "_credential_recovery_active_generation", None)
+        != observed_generation[0]
+    )
+    agent.close()
 
 
 # =============================================================================

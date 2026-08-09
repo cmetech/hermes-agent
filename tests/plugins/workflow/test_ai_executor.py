@@ -11,8 +11,12 @@ import types
 
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult
-from agent.structured_output import StructuredOutputStrategy, normalize_schema
+from agent.plugin_agent import PluginAgentRunRequest, PluginAgentRunResult
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow import output_resolution
 import plugins.workflow.executors.ai as ai_executor_module
@@ -852,6 +856,139 @@ def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
     assert result.metadata["repair_disposition"] == "succeeded"
     output = tmp_path / "run" / result.primary_output.attempt_relative_path
     assert output.read_bytes() == b'{"answer":"fixed"}'
+
+
+def test_phase5_structured_repair_inherits_exact_authority_and_limits(tmp_path):
+    structured = StructuredOutputRequest(
+        schema=normalize_schema({"type": "object"}),
+        strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+        adapter_version=1,
+    )
+    provider_attempt_authority = {"address": "provider-authority"}
+    cost_budget_authority = {"address": "cost-authority"}
+    cost_budget_contract = {"strategy": "sealed-cost"}
+    initial = PluginAgentRunRequest(
+        prompt="sealed primary request",
+        provider="selected-alias",
+        model="sealed-model",
+        context_mode="shared",
+        session_id="primary-session",
+        intended_authority_digest="a" * 64,
+        expected_model_visible_prefix_digest="b" * 64,
+        expected_runtime_identity={
+            "provider": "effective-provider",
+            "model": "sealed-model",
+            "api_mode": "chat_completions",
+            "base_url_trust_class": "trusted_direct",
+            "endpoint_sha256": "c" * 64,
+            "registration_provenance_digest": "d" * 64,
+        },
+        expected_runtime_route_fingerprint="e" * 64,
+        expected_runtime_route_options={"effort": "high"},
+        expected_mcp_runtime_identity_digest="f" * 64,
+        enabled_toolsets=("file",),
+        allowed_tools=("read_file",),
+        denied_tools=("terminal",),
+        skills=("review",),
+        hooks=({"event": "pre-tool", "command": "check"},),
+        mcp_servers={"sealed": {"command": "server"}},
+        inline_agents={"reviewer": {"prompt": "review"}},
+        reasoning_config={"enabled": True, "effort": "high"},
+        fallback_model="fallback-model",
+        sealed_fallback_route={"sealed": "fallback"},
+        ephemeral_system_prompt="primary-only system prompt",
+        request_overrides={
+            "extra_body": {"reasoning": {"effort": "high"}}
+        },
+        structured_output=structured,
+        max_budget_usd=2.5,
+        _cost_budget_authority=cost_budget_authority,
+        _cost_budget_contract=cost_budget_contract,
+        sandbox_policy={"mode": "provider_native"},
+        approved_action_digest="1" * 64,
+        workdir=tmp_path,
+        max_iterations=90,
+        max_api_attempts=4,
+        sealed_provider_attempt_grant=True,
+        _provider_attempt_authority=provider_attempt_authority,
+        idle_timeout_seconds=37,
+        wall_timeout_seconds=71,
+        provider_request_timeout_seconds=23,
+        absolute_wall_deadline=1000,
+        absolute_idle_deadline=990,
+        absolute_provider_deadline=980,
+        max_process_tree_rss_bytes=123456,
+        max_process_tree_cpu_seconds=88,
+        max_descendants=7,
+        cooperative_shutdown_seconds=4,
+        term_grace_seconds=3,
+        kill_reap_grace_seconds=2,
+    )
+
+    repair = AgentNodeExecutor(FakeAgentRunner())._phase5_structured_repair_request(
+        initial_request=initial,
+        repair_prompt="repair only the invalid JSON",
+        remaining_provider_attempts=2,
+        remaining_timeout_seconds=19,
+    )
+
+    assert repair.prompt == "repair only the invalid JSON"
+    assert repair.provider == initial.provider
+    assert repair.model == initial.model
+    assert repair.intended_authority_digest == initial.intended_authority_digest
+    assert repair.expected_runtime_identity == initial.expected_runtime_identity
+    assert len(repair.expected_runtime_identity) == 6
+    assert (
+        repair.expected_runtime_route_fingerprint
+        == initial.expected_runtime_route_fingerprint
+    )
+    assert repair.expected_runtime_route_options == {"effort": "high"}
+    assert repair.reasoning_config == initial.reasoning_config
+    assert repair.request_overrides == initial.request_overrides
+    assert repair.structured_output is initial.structured_output
+    assert repair.sealed_provider_attempt_grant is True
+    assert repair._provider_attempt_authority is provider_attempt_authority
+    assert repair.max_budget_usd == initial.max_budget_usd
+    assert repair._cost_budget_authority is cost_budget_authority
+    assert repair._cost_budget_contract is cost_budget_contract
+    assert repair.absolute_wall_deadline == initial.absolute_wall_deadline
+    assert repair.absolute_idle_deadline == initial.absolute_idle_deadline
+    assert repair.absolute_provider_deadline == initial.absolute_provider_deadline
+    assert repair.workdir == initial.workdir
+    assert repair.max_process_tree_rss_bytes == initial.max_process_tree_rss_bytes
+    assert (
+        repair.max_process_tree_cpu_seconds
+        == initial.max_process_tree_cpu_seconds
+    )
+    assert repair.max_descendants == initial.max_descendants
+    assert (
+        repair.cooperative_shutdown_seconds
+        == initial.cooperative_shutdown_seconds
+    )
+    assert repair.term_grace_seconds == initial.term_grace_seconds
+    assert repair.kill_reap_grace_seconds == initial.kill_reap_grace_seconds
+    assert repair.sandbox_policy == initial.sandbox_policy
+    assert repair.max_iterations == 1
+    assert repair.max_api_attempts == 2
+    assert repair.wall_timeout_seconds == 19
+    assert repair.idle_timeout_seconds == 19
+    assert repair.provider_request_timeout_seconds == 19
+
+    assert repair.context_mode == "fresh"
+    assert repair.session_id is None
+    assert repair.expected_model_visible_prefix_digest is None
+    assert repair.expected_mcp_runtime_identity_digest is None
+    assert repair.enabled_toolsets == ()
+    assert repair.allowed_tools == ()
+    assert repair.denied_tools == ("delegate_task", "workflow_agent")
+    assert repair.skills == ()
+    assert repair.hooks == ()
+    assert repair.mcp_servers is None
+    assert repair.inline_agents == {}
+    assert repair.fallback_model is None
+    assert repair.sealed_fallback_route is None
+    assert repair.approved_action_digest is None
+    assert repair.ephemeral_system_prompt is None
 
 
 @pytest.mark.parametrize(

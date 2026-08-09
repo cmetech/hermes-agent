@@ -326,7 +326,40 @@ describe('Hermes REST helpers', () => {
   })
 
   it('routes every workflow operation through the authenticated profile bridge', async () => {
-    api.mockResolvedValue({})
+    const run = {
+      health: 'healthy',
+      next_actions: ['cancel'],
+      progress: { completed_nodes: 0, kind: 'graph', total_nodes: 1 },
+      run_id: 'run-1',
+      state_version: 1,
+      status: 'running',
+      updated_at: '2026-08-08T20:00:00Z',
+      workflow: 'portable'
+    }
+
+    api.mockImplementation(async ({ path }: { path: string }) => {
+      if (path.startsWith('/api/plugins/workflow/runs?')) {
+        return { next_cursor: null, runs: [run], schema_version: 1 }
+      }
+
+      if (path === '/api/plugins/workflow/attention') {
+        return { items: [], next_cursor: null, schema_version: 1 }
+      }
+
+      if (path.includes('/events?')) {
+        return { cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 }
+      }
+
+      if (path.includes('/evidence?')) {
+        return { items: [], kind: 'attempts', next_cursor: 0, schema_version: 1, truncated: false }
+      }
+
+      if (path.includes('/runs/')) {
+        return run
+      }
+
+      return {}
+    })
     setApiRequestProfile('remote-profile')
 
     await Promise.all([
@@ -359,6 +392,7 @@ describe('Hermes REST helpers', () => {
     const artifact: WorkflowTypedArtifact = {
       attempt_id: 'attempt-1',
       integrity_status: 'verified',
+      item_type: 'artifact',
       media_type: 'application/json',
       node_id: 'produce',
       output_type: 'Report',
@@ -369,7 +403,7 @@ describe('Hermes REST helpers', () => {
     }
 
     const page: WorkflowEvidencePage = {
-      items: [{ relative_path: 'legacy.txt' }, artifact],
+      items: [artifact],
       kind: 'artifacts',
       next_cursor: 0,
       schema_version: 1,
@@ -390,7 +424,7 @@ describe('Hermes REST helpers', () => {
 
     await expect(getWorkflowArtifactPreview('run / one', artifact.publication_id)).resolves.toEqual(preview)
 
-    expect(page.items).toHaveLength(2)
+    expect(page.items).toHaveLength(1)
     expect(api).toHaveBeenCalledWith({
       path: '/api/plugins/workflow/runs/run%20%2F%20one/artifacts/publication%20%2F%20opaque/preview',
       profile: 'remote-profile'

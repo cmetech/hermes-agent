@@ -458,7 +458,7 @@ describe('ModelSettings', () => {
     )
   })
 
-  it('carries the user-defined endpoint when an aux slot is set to a local main model', async () => {
+  it('keeps a local main model inherited instead of pinning its endpoint into an aux slot', async () => {
     getGlobalModelOptions.mockResolvedValueOnce({
       providers: [
         {
@@ -484,11 +484,10 @@ describe('ModelSettings', () => {
 
     await waitFor(() =>
       expect(setModelAssignment).toHaveBeenCalledWith({
-        model: 'qwen3:latest',
-        provider: 'local-ollama',
+        model: '',
+        provider: 'auto',
         scope: 'auxiliary',
-        task: 'vision',
-        base_url: 'http://localhost:11434/v1'
+        task: 'vision'
       })
     )
   })
@@ -1101,15 +1100,18 @@ describe('ModelSettings MoA preset editor', () => {
     try {
       await openReferenceEditor()
 
-      fireEvent.click(screen.getByRole('switch', { name: 'Enabled' }))
-      await vi.advanceTimersByTimeAsync(700)
+      await act(async () => {
+        fireEvent.click(screen.getByRole('switch', { name: 'Enabled' }))
+        await vi.advanceTimersByTimeAsync(700)
+      })
 
       expect(saveMoaModels).toHaveBeenCalledWith(
         expect.objectContaining({
           presets: expect.objectContaining({
             default: expect.objectContaining({ enabled: false })
           })
-        })
+        }),
+        null
       )
     } finally {
       vi.useRealTimers()
@@ -1122,8 +1124,10 @@ describe('ModelSettings MoA preset editor', () => {
     try {
       await openReferenceEditor()
 
-      fireEvent.click(screen.getByRole('switch', { name: 'Disable reference 1' }))
-      await vi.advanceTimersByTimeAsync(700)
+      await act(async () => {
+        fireEvent.click(screen.getByRole('switch', { name: 'Disable reference 1' }))
+        await vi.advanceTimersByTimeAsync(700)
+      })
 
       expect(saveMoaModels).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1135,7 +1139,8 @@ describe('ModelSettings MoA preset editor', () => {
               ]
             })
           })
-        })
+        }),
+        null
       )
     } finally {
       vi.useRealTimers()

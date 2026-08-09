@@ -26,7 +26,15 @@ imported by the turn loop without an import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
+
+
+@dataclass(slots=True)
+class _CredentialRecoveryTurnState:
+    generation: int
+    auth_pool_refresh_counts: dict[tuple[str, str], int] = field(
+        default_factory=dict
+    )
 
 
 @dataclass

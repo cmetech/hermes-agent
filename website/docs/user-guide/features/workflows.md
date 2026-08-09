@@ -17,7 +17,7 @@ backend; keep workflow directories shared with older runtimes unversioned until
 every consumer recognizes the declaration.
 
 See the [Workflow YAML reference](./workflow-yaml-reference) for the generated
-schema commands, complete field inventory, current Phase 4 status, sealed
+schema commands, complete field inventory, current Phase 5 status, sealed
 compatibility guidance, and migration steps.
 
 The portable graph has seven node kinds: `command`, `prompt`, `bash`, `script`,
@@ -26,32 +26,64 @@ on `command` and `prompt`, not extra node kinds. Script nodes already support
 the documented `uv` and `bun` runtimes; structured data does not add another
 script or extension node type.
 
-### Phase 4 operation
+### Phase 5 operation
 
-New and default `archon-2026-07` admissions use normalizer v4. Current
-`hermes-legacy` admissions use v2. Explicit and already sealed v1, v2, and v3
-packages remain supported compatibility inputs; their pinned semantics do not
-move when the default changes.
+New and default `archon-2026-07` admissions use normalizer v5. Current
+`hermes-legacy` admissions use v2. Explicit and already sealed v1 through v4
+packages remain supported compatibility inputs with their recorded behavior.
 
 <!-- workflow-language-version-selection -->
 ```json
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 4
+    "archon-2026-07": 5
   },
-  "supported_normalizer_versions": [1, 2, 3, 4]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
 ```
 
-The current v4 contract adds compile-only package includes and confirmed
-ordinary-loop signals. The root companion remains the only policy authority;
+The v5 contract adds provider-portable model resolution and a single
+backend-authored capability matrix on top of v4 compile-only package includes
+and confirmed ordinary-loop signals. The root companion remains the only policy authority;
 authenticated child companions are ignored. Included named resources are
 sealed from their logical child package, and the admitted composite digest
 covers the root, every selected dependency, and their resources. An explicit
 version selection must validate and diagnose that composite package, review and
 trust that exact digest, and admit the resulting immutable compilation—not
 reload a child independently.
+
+Model values may select configured `small`, `medium`, or `large` tiers,
+configured `@aliases`, or literal model IDs. Tiers and aliases belong in
+`config.yaml`, never `.env`; admission pins a concrete provider, model, API
+mode, supported options, and authority digest. Every requested structured
+output, session, tool, hook, MCP, skill/inline-agent, reasoning, fallback, web,
+budget, and provider-sandbox feature is classified as `native`,
+`hermes_adapter`, `degraded_with_explicit_semantics`, or `unsupported`.
+Unsupported means no run is admitted, not “ignored” or “audit-only.”
+
+Desktop displays the backend summary and route decisions but does not resolve a
+model or capability. Review & Run fetches fresh authoritative detail immediately
+before its existing admission POST. Missing, malformed, unsupported, unknown, or
+changed Phase 5 authority leaves Run disabled and sends no mutation.
+
+`allowed_tools: []` remains exactly no built-in tools. Skills are complete
+current-user-turn content, never system-prompt edits. Inline agents and fresh
+fallback workers share remaining attempt, cost, resource, workdir, deadline,
+and cancellation authority. Hook events without a mapped lifecycle block. MCP
+definitions and executable resources are package-contained, digest-bound,
+worker-isolated, bounded, and torn down with the worker; secret values remain
+outside packages and public evidence.
+
+`maxBudgetUsd` is enforceable only when reviewed provider code supplies
+authoritative billed-cost settlement. Retries, repair, fallback, and children
+share the same budget; exhaustion is terminal. One already-started call can
+settle above the remaining amount. Estimated-only providers block instead of
+claiming hard enforcement. No current provider proves provider-native sandbox
+enforcement, so Archon v5 `sandbox` blocks with
+`provider_native_sandbox_unavailable`. Use the companion policy
+`execution_environment: isolated_backend_required` when appropriate; process
+resource limits are not a sandbox or security boundary.
 
 After admission, the ordinary operator surface applies. Keep the run ID and
 inspect `status` and `events`. A loop signal awaiting confirmation appears as
@@ -66,7 +98,7 @@ Resume verifies the pinned normalizer, composite dependency manifest, and
 sealed resource origins before execution. The original root and child source
 trees may be unavailable after admission without changing the run; any missing
 or changed snapshot byte fails closed. Diagnose include failures by their
-stable generated codes and bounded logical paths. The v4 contract does not
+stable generated codes and bounded logical paths. The v5 contract still does not
 provide live child workflows, include parameters, or loop groups.
 
 ## Browse the catalog
@@ -139,6 +171,7 @@ For API detail and run requests, a name without `catalog_source` resolves the us
 | Untrusted workflow                        | Run stays disabled with an associated explanation                         | Review and trust the current digest through the CLI.                        |
 | Unsupported inputs                        | Run stays disabled; the dialog points to `hermes workflow run NAME`       | Run it through the CLI; Desktop v1 does not build rich or file-input forms. |
 | Incompatible workflow                     | Blocking findings; no admission request is sent                           | Resolve the reported runtime or package incompatibility.                    |
+| Provider authority unavailable or changed | Run remains disabled; no admission request is sent                         | Review fresh backend detail and resolve provider capability/configuration findings. |
 | Coordinator unavailable / HTTP 503        | Warning and retry path; no run is created                                 | Start or repair the coordinator host, then retry from the same review.      |
 | Validation failure / HTTP 422             | Field-level message when possible, otherwise a general validation error   | Correct the rejected values and submit again.                               |
 | Idempotency conflict / HTTP 409           | Conflict message instructing a fresh review                               | Close the modal, review current inputs, and start a new intent.             |

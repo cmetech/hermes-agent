@@ -48,6 +48,68 @@ def _anthropic_reasoning_is_mandatory(model: str | None) -> bool:
 class OpenRouterProfile(ProviderProfile):
     """OpenRouter aggregator — provider preferences, reasoning config passthrough."""
 
+    def declare_workflow_capability(
+        self,
+        feature: str,
+        *,
+        model: str,
+        option: str | None,
+    ) -> object | None:
+        """Declare only exact, request-translation facts owned by this profile."""
+
+        if feature == "cost_budgets":
+            return {
+                "disposition": "unsupported",
+                "code": "authoritative_cost_unavailable",
+                "rationale": (
+                    "OpenRouter settlement is not proven complete for every billable "
+                    "failure, cancellation, timeout, retry, and BYOK route"
+                ),
+            }
+        if feature == "provider_native_sandbox":
+            return {
+                "disposition": "unsupported",
+                "code": "provider_native_sandbox_unavailable",
+                "rationale": "OpenRouter does not provide an exact native sandbox contract",
+            }
+        if feature == "effort_thinking" and option == "thinking":
+            return {
+                "disposition": "unsupported",
+                "code": "openrouter_thinking_shape_unsupported",
+                "rationale": (
+                    "OpenRouter has no single exact translation for the documented "
+                    "workflow thinking shapes"
+                ),
+            }
+        if feature != "effort_thinking" or option != "effort":
+            return super().declare_workflow_capability(
+                feature,
+                model=model,
+                option=option,
+            )
+        if _anthropic_reasoning_is_mandatory(model):
+            effective = {
+                "request_field": "verbosity",
+                "thinking_mode": "adaptive",
+            }
+            code = "openrouter_effort_mapped_to_verbosity"
+            rationale = (
+                "OpenRouter maps requested effort to verbosity while mandatory "
+                "Anthropic thinking remains adaptive"
+            )
+        else:
+            effective = {"request_field": "reasoning.effort"}
+            code = "openrouter_effort_mapped_to_reasoning"
+            rationale = "OpenRouter maps requested effort through reasoning.effort"
+        return {
+            "disposition": "degraded_with_explicit_semantics",
+            "options": [option],
+            "effective_semantics": effective,
+            "adapter_version": 1,
+            "code": code,
+            "rationale": rationale,
+        }
+
     def fetch_models(
         self,
         *,

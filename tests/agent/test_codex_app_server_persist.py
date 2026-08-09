@@ -58,6 +58,9 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._session_db = session_db
     agent._session_db_created = True
     agent.session_id = session_id
+    agent._active_cost_budget_attempt_id = None
+    agent._cost_budget_acquire_callback = None
+    agent._provider_attempt_reservation_callback = None
     return agent
 
 

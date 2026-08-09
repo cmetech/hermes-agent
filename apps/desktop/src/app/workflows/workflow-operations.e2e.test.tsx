@@ -13,7 +13,7 @@ type ApiRequest = Parameters<Window['hermesDesktop']['api']>[0]
 
 function snapshot(overrides: Partial<WorkflowRunSnapshot> = {}): WorkflowRunSnapshot {
   return {
-    definition_digest: 'definition-1',
+    definition_digest: 'a'.repeat(64),
     health: 'user_wait',
     next_actions: ['approve'],
     pending_interaction: { interaction_id: 'interaction-1', type: 'workflow_approval' },

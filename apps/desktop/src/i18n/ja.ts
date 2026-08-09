@@ -1935,6 +1935,11 @@ export const ja = defineLocale({
     workflowRunCoordinatorUnavailable:
       'バックグラウンドコーディネーターが動作していません。しばらくしてから再試行してください。',
     workflowRunIncompatible: 'このワークフローは現在の Hermes ランタイムと互換性がないため開始できません。',
+    workflowRunProviderAuthorityUnavailable: 'プロバイダーの準備状態が変わりました。開始前に確認してください。',
+    workflowProviderReadiness: 'プロバイダーの準備状態',
+    workflowProviderAuthorityDigest: '権限ダイジェスト',
+    workflowProviderCapabilityLevel: '機能レベル',
+    workflowProviderRoute: (node, provider, model) => `${node}: ${provider} · ${model}`,
     workflowRunNetworkError: '接続に失敗したため、実行を開始できませんでした。',
     workflowRunProfileUnavailable:
       '実行は開始されましたが、そのプロファイルを開けませんでした。再試行して既存の実行を表示してください。',

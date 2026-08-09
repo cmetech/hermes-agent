@@ -18,7 +18,7 @@ from plugins.workflow.models import (
     WorkflowRuntimeConfig,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from tools.managed_process import ProcessResourceLimits
 

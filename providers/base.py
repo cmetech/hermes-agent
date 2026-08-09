@@ -68,6 +68,12 @@ class ProviderProfile:
     # fallback. Native declarations are honored only on a trusted direct URL.
     structured_output_strategy: str | None = None
 
+    # Pure provider-owned facts consumed only by the central workflow
+    # capability resolver. Values cannot grant Hermes adapter behavior; they
+    # describe exact native/translated behavior for this profile. Subclasses
+    # may override ``declare_workflow_capability`` for model-aware facts.
+    workflow_capabilities: dict[str, object] = field(default_factory=dict)
+
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
     # tool-result messages natively.  Set on providers that expose
@@ -112,6 +118,18 @@ class ProviderProfile:
     # empty = use main model
 
     # ── Hooks (override in subclass for complex providers) ───
+
+    def declare_workflow_capability(
+        self,
+        feature: str,
+        *,
+        model: str,
+        option: str | None,
+    ) -> object | None:
+        """Return one pure capability fact for the exact model and option."""
+
+        del model, option
+        return self.workflow_capabilities.get(feature)
 
     def get_hostname(self) -> str:
         """Return the provider's base hostname for URL-based detection.

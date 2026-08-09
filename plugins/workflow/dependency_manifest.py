@@ -1476,6 +1476,13 @@ def seal_workflow_compilation(
                 for candidate in candidates:
                     if not candidate or candidate.startswith(("$", "-")):
                         continue
+                    if (
+                        package.language.normalizer_version >= 5
+                        and candidate == sys.executable
+                    ):
+                        # The v5 MCP host interpreter is a separately attested
+                        # runtime dependency, never package content.
+                        continue
                     candidate_path = source.root / candidate
                     if not (
                         budget.has_cached(candidate_path)

@@ -9,6 +9,8 @@ import pytest
 import yaml
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.runtime_provider import classify_execution_runtime
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
@@ -17,9 +19,15 @@ from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     make_language_snapshot,
     read_language_snapshot,
+    supports_phase4_semantics,
+    supports_phase5_semantics,
     verify_language_snapshot,
 )
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
+from plugins.workflow.provider_authority import (
+    ProviderAuthorityEnvironment,
+    resolve_workflow_provider_authority,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import parse_workflow_source_bytes
 from plugins.workflow.store import RunStore
@@ -49,6 +57,37 @@ def _compile_v4(path: Path):
     return _compile_version(path, 4)
 
 
+def _phase5_authority(package):
+    model_config = parse_workflow_model_config({
+        "model": {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.4",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    })
+    runtime = classify_execution_runtime(
+        provider="openrouter",
+        model_config={
+            "provider": "openrouter",
+            "default": "openai/gpt-5.4",
+        },
+        provider_config={"base_url": "https://openrouter.ai/api/v1"},
+    )
+    return resolve_workflow_provider_authority(
+        package,
+        model_config=model_config,
+        default_runtime=runtime,
+        environment=ProviderAuthorityEnvironment(
+            session_store_available=True,
+            mcp_available=True,
+            hook_lifecycle_available=True,
+            inline_agent_available=True,
+            web_service_available=True,
+            authoritative_cost_available=False,
+        ),
+    )
+
+
 class _CountedAgentRunner:
     def __init__(self, *responses: str) -> None:
         self.responses = list(responses)
@@ -64,7 +103,12 @@ class _CountedAgentRunner:
             status="completed",
             pending_interaction=None,
             usage={},
-            audit={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            },
         )
 
 
@@ -86,7 +130,12 @@ class _ShutdownAgentRunner(_CountedAgentRunner):
             status=self.status,
             pending_interaction=None,
             usage={},
-            audit={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            },
         )
 
 
@@ -97,13 +146,23 @@ def _admit_compilation(
     key: str,
 ) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / "home")
-    if compilation.package.language.normalizer_version == 4:
+    if supports_phase4_semantics(
+        WorkflowLanguageProfile(compilation.package.language.effective_profile),
+        compilation.package.language.normalizer_version,
+    ):
+        phase5 = supports_phase5_semantics(
+            WorkflowLanguageProfile(compilation.package.language.effective_profile),
+            compilation.package.language.normalizer_version,
+        )
         prepared = store.prepare_run_snapshot(
             compilation.package,
             compilation=compilation,
             trusted_package_digest=WorkflowPackageDigest(
                 compilation.composite_digest,
                 compilation.covered_relative_paths,
+            ),
+            provider_authority=(
+                _phase5_authority(compilation.package) if phase5 else None
             ),
         )
     else:
@@ -152,6 +211,8 @@ def _write_loop(
         (3, None, "succeeded"),
         (4, None, "paused"),
         (4, True, "succeeded"),
+        (5, None, "paused"),
+        (5, True, "succeeded"),
     ],
 )
 def test_counted_provider_signal_outcomes_follow_sealed_loop_semantics(
@@ -189,8 +250,14 @@ def test_counted_provider_signal_outcomes_follow_sealed_loop_semantics(
 
     outcome = RunScheduler(store, agent_runner=runner).advance(run_id)
 
-    assert outcome["status"] == expected_status
-    assert len(runner.requests) == 1
+    diagnostic = outcome["nodes"]["refine"]["attempts"][-1]
+    detail = (
+        diagnostic.get("error_code"),
+        diagnostic.get("error_message"),
+        diagnostic.get("metadata"),
+    )
+    assert outcome["status"] == expected_status, detail
+    assert len(runner.requests) == 1, detail
     artifact = outcome["artifacts"][-1]
     cleaned = store.run_directory(run_id).joinpath(
         artifact["relative_path"]
@@ -217,9 +284,11 @@ def test_counted_provider_signal_outcomes_follow_sealed_loop_semantics(
         (3, None, "succeeded", b"draft\nDONE"),
         (4, True, "succeeded", b"draft"),
         (4, None, "paused", b"draft"),
+        (5, True, "succeeded", b"draft"),
+        (5, None, "paused", b"draft"),
     ],
 )
-def test_plain_signal_cleanup_is_v4_only(
+def test_plain_signal_cleanup_follows_sealed_phase4_semantics(
     tmp_path: Path,
     version: int,
     signal_completes: bool | None,
@@ -257,7 +326,14 @@ def test_plain_signal_cleanup_is_v4_only(
         agent_runner=_CountedAgentRunner("draft\nDONE"),
     ).advance(run_id)
 
-    assert outcome["status"] == expected_status
+    diagnostic = outcome["nodes"]["refine"]["attempts"][-1]
+    detail = (
+        diagnostic.get("error_code"),
+        diagnostic.get("error_message"),
+        diagnostic.get("metadata"),
+    )
+    assert outcome["status"] == expected_status, detail
+    assert outcome["artifacts"], detail
     artifact = outcome["artifacts"][-1]
     output = (
         store.run_directory(run_id) / artifact["relative_path"]

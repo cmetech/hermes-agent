@@ -90,6 +90,9 @@ def _install_test_canonical_profile(
 @pytest.fixture(autouse=True)
 def _disable_live_custom_provider_model_probe(monkeypatch):
     """Keep custom-provider picker fixtures independent of local model servers."""
+    from hermes_cli import models as models_mod
+
+    real_provider_model_ids = models_mod.provider_model_ids
     monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: []
@@ -97,6 +100,24 @@ def _disable_live_custom_provider_model_probe(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.models.provider_model_ids", lambda *_a, **_kw: []
     )
+    monkeypatch.setattr(
+        "hermes_cli.models.get_curated_nous_model_ids", lambda *_a, **_kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_ollama_cloud_models", lambda *_a, **_kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch._credential_pool_is_usable",
+        lambda *_a, **_kw: False,
+    )
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None
+    )
+    return real_provider_model_ids
 
 
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
@@ -685,7 +706,9 @@ def test_lmstudio_picker_probes_when_explicitly_configured_but_not_current(monke
     assert row["models"] == ["configured-chat-model"]
 
 
-def test_delivered_noauth_gateway_is_globally_discoverable(monkeypatch):
+def test_delivered_noauth_gateway_is_globally_discoverable(
+    monkeypatch, _disable_live_custom_provider_model_probe
+):
     """Every profile can select a delivered Gateway without storing a key."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
@@ -703,6 +726,12 @@ def test_delivered_noauth_gateway_is_globally_discoverable(monkeypatch):
         model_capabilities_path="model-capabilities",
         fetch_models=_fetch_models,
     )
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, **_kwargs: _disable_live_custom_provider_model_probe(
+            provider, force_refresh=True
+        ),
+    )
 
     providers = list_authenticated_providers(
         current_provider="openrouter",
@@ -716,7 +745,9 @@ def test_delivered_noauth_gateway_is_globally_discoverable(monkeypatch):
     assert row["models"] == ["live-gateway-model"]
 
 
-def test_local_noauth_provider_is_discoverable_when_base_url_is_explicit(monkeypatch):
+def test_local_noauth_provider_is_discoverable_when_base_url_is_explicit(
+    monkeypatch, _disable_live_custom_provider_model_probe
+):
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
     calls = []
@@ -735,6 +766,12 @@ def test_local_noauth_provider_is_discoverable_when_base_url_is_explicit(monkeyp
     monkeypatch.setenv(
         "TEST_LOCAL_NOAUTH_BASE_URL",
         "http://configured.local/test-local-noauth/v1",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, **_kwargs: _disable_live_custom_provider_model_probe(
+            provider, force_refresh=True
+        ),
     )
 
     providers = list_authenticated_providers(
@@ -1051,30 +1088,29 @@ def test_excluded_providers_hides_builtin_row(monkeypatch):
     """``excluded_providers`` must hide a built-in provider row that would
     otherwise surface when its credentials are present."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
-    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
 
     baseline = list_authenticated_providers(
-        current_provider="openrouter",
-        current_base_url="https://openrouter.ai/api/v1",
+        current_provider="openai-api",
+        current_base_url="https://api.openai.com/v1",
         user_providers={},
         custom_providers=[],
         max_models=50,
     )
-    assert any(p["slug"] == "openrouter" for p in baseline), (
-        "sanity: openrouter row must appear when OPENROUTER_API_KEY is set"
+    assert any(p["slug"] == "openai-api" for p in baseline), (
+        "sanity: openai-api row must appear when OPENAI_API_KEY is set"
     )
 
     filtered = list_authenticated_providers(
-        current_provider="openrouter",
-        current_base_url="https://openrouter.ai/api/v1",
+        current_provider="openai-api",
+        current_base_url="https://api.openai.com/v1",
         user_providers={},
         custom_providers=[],
         max_models=50,
-        excluded_providers=["openrouter"],
+        excluded_providers=["openai-api"],
     )
-    assert not any(p["slug"] == "openrouter" for p in filtered), (
-        "excluded_providers=['openrouter'] must hide the openrouter row"
+    assert not any(p["slug"] == "openai-api" for p in filtered), (
+        "excluded_providers=['openai-api'] must hide the openai-api row"
     )
 
 

@@ -920,6 +920,7 @@ def recover_with_credential_pool(
     has_retried_429: bool,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
+    credential_recovery_state=None,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation.
 
@@ -1029,6 +1030,16 @@ def recover_with_credential_pool(
             kwargs["failure_reason"] = effective_reason.value
         return pool.mark_exhausted_and_rotate(**kwargs)
 
+    def _adopt_pool_entry(entry) -> bool:
+        # ``None`` remains compatible with lightweight legacy agent doubles;
+        # the real AIAgent returns explicit False when concrete adoption fails.
+        if credential_recovery_state is None:
+            return agent._swap_credential(entry) is not False
+        return agent._swap_credential(
+            entry,
+            credential_recovery_state=credential_recovery_state,
+        ) is not False
+
     effective_reason = classified_reason
     if effective_reason is None:
         if status_code == 402:
@@ -1069,8 +1080,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, has_retried_429
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
@@ -1107,8 +1119,9 @@ def recover_with_credential_pool(
                     rotate_status,
                     getattr(next_entry, "id", "?"),
                 )
-                agent._swap_credential(next_entry)
-                return True, False
+                if _adopt_pool_entry(next_entry):
+                    return True, False
+                return False, has_retried_429
             return False, True
 
         usage_limit_reached = False
@@ -1131,8 +1144,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, True
         return False, True
 
     if effective_reason == FailoverReason.auth:
@@ -1210,23 +1224,27 @@ def recover_with_credential_pool(
             # See #26080.
             refreshed_id = getattr(refreshed, "id", None)
             if refreshed_id is not None:
-                refresh_counts = getattr(agent, "_auth_pool_refresh_counts", None)
-                if refresh_counts is None:
-                    refresh_counts = {}
-                    agent._auth_pool_refresh_counts = refresh_counts
+                refresh_counts = (
+                    credential_recovery_state.auth_pool_refresh_counts
+                    if credential_recovery_state is not None
+                    else {}
+                )
                 refresh_key = (agent.provider, refreshed_id)
-                refresh_counts[refresh_key] = refresh_counts.get(refresh_key, 0) + 1
-                if refresh_counts[refresh_key] > _MAX_AUTH_REFRESH_ATTEMPTS:
+                next_refresh_count = refresh_counts.get(refresh_key, 0) + 1
+                if next_refresh_count > _MAX_AUTH_REFRESH_ATTEMPTS:
                     _ra().logger.warning(
                         "Credential auth failure persists after %s refreshes for "
                         "pool entry %s — treating as unrecoverable and allowing "
                         "fallback to activate.",
-                        refresh_counts[refresh_key] - 1,
+                        next_refresh_count - 1,
                         refreshed_id,
                     )
                     return False, has_retried_429
             _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
-            agent._swap_credential(refreshed)
+            if not _adopt_pool_entry(refreshed):
+                return False, has_retried_429
+            if refreshed_id is not None:
+                refresh_counts[refresh_key] = next_refresh_count
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by the refresh attempt.
@@ -1238,8 +1256,9 @@ def recover_with_credential_pool(
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if _adopt_pool_entry(next_entry):
+                return True, False
+            return False, has_retried_429
 
     return False, has_retried_429
 
@@ -1318,6 +1337,9 @@ def try_recover_primary_transport(
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                drop_context_1m_beta=bool(
+                    getattr(agent, "_oauth_1m_beta_disabled", False)
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1574,6 +1596,9 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                drop_context_1m_beta=bool(
+                    getattr(agent, "_oauth_1m_beta_disabled", False)
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -2238,7 +2263,14 @@ def anthropic_prompt_cache_policy(
 
 
 
-def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+def create_openai_client(
+    agent,
+    client_kwargs: dict,
+    *,
+    reason: str,
+    shared: bool,
+    candidate_safe: bool = False,
+) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
@@ -2259,12 +2291,19 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
-        _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
-            reason,
-            shared,
-            agent._client_log_context(),
-        )
+        if candidate_safe:
+            _ra().logger.info(
+                "sealed credential client created reason=%s shared=%s",
+                reason,
+                shared,
+            )
+        else:
+            _ra().logger.info(
+                "Copilot ACP client created (%s, shared=%s) %s",
+                reason,
+                shared,
+                agent._client_log_context(),
+            )
         return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
@@ -2282,12 +2321,19 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 if keepalive_http is not None:
                     safe_kwargs["http_client"] = keepalive_http
             client = GeminiNativeClient(**safe_kwargs)
-            _ra().logger.info(
-                "Gemini native client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                agent._client_log_context(),
-            )
+            if candidate_safe:
+                _ra().logger.info(
+                    "sealed credential client created reason=%s shared=%s",
+                    reason,
+                    shared,
+                )
+            else:
+                _ra().logger.info(
+                    "Gemini native client created (%s, shared=%s) %s",
+                    reason,
+                    shared,
+                    agent._client_log_context(),
+                )
             return client
     # Inject TCP keepalives so the kernel detects dead provider connections
     # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
@@ -2306,12 +2352,14 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # constructs a fresh one — no stale closed transport can be reused.
     # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
+    owned_http_client = None
     if "http_client" not in client_kwargs:
         keepalive_http = agent._build_keepalive_http_client(
             client_kwargs.get("base_url", ""), verify=httpx_verify,
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+            owned_http_client = keepalive_http
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop,
     # which honors Retry-After and applies adaptive/jittered backoff. The OpenAI
     # SDK default (max_retries=2) uses its own 1-2s backoff that ignores
@@ -2348,13 +2396,41 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
-    client = _ra().OpenAI(**client_kwargs)
-    _ra().logger.info(
-        "OpenAI client created (%s, shared=%s) %s",
-        reason,
-        shared,
-        agent._client_log_context(),
-    )
+    try:
+        client = _ra().OpenAI(**client_kwargs)
+    except Exception:
+        # The SDK never took ownership when its constructor failed. Close only
+        # the transport created in this function; caller-supplied clients remain
+        # caller-owned.
+        if owned_http_client is not None:
+            try:
+                owned_http_client.close()
+            except Exception as close_exc:
+                if candidate_safe:
+                    _ra().logger.warning(
+                        "sealed credential adoption failed reason=%s error_type=%s",
+                        "rejected_transport_close",
+                        type(close_exc).__name__,
+                    )
+                else:
+                    _ra().logger.debug(
+                        "Failed to close rejected OpenAI constructor transport",
+                        exc_info=True,
+                    )
+        raise
+    if candidate_safe:
+        _ra().logger.info(
+            "sealed credential client created reason=%s shared=%s",
+            reason,
+            shared,
+        )
+    else:
+        _ra().logger.info(
+            "OpenAI client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
     return client
 
 
@@ -2565,6 +2641,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
+                drop_context_1m_beta=bool(
+                    getattr(agent, "_oauth_1m_beta_disabled", False)
+                ),
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None

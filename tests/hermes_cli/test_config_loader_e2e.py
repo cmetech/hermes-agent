@@ -158,3 +158,67 @@ def test_writeback_roundtrip_byte_identical_when_unchanged(tmp_path):
     out = _run_py(code, {"HERMES_HOME": str(home)}, tmp_path)
     assert out["identical"] is True
     assert out["parsed"]["custom_prompt"] == "keep ${NOT_SET_VAR}"
+
+
+def test_behavioral_loader_accepts_an_explicit_profile_path(tmp_path):
+    active_home = tmp_path / "active"
+    active_home.mkdir()
+    (active_home / "config.yaml").write_text(
+        "custom_prompt: active\n", encoding="utf-8"
+    )
+
+    target_home = tmp_path / "target"
+    target_home.mkdir()
+    (target_home / "config.yaml").write_text(
+        "custom_prompt: 'target ${EXPLICIT_PROFILE_SUFFIX}'\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 2\n",
+        encoding="utf-8",
+    )
+
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 5\n",
+        encoding="utf-8",
+    )
+
+    code = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli.config import load_config_readonly
+
+        target = Path(os.environ["EXPLICIT_PROFILE_HOME"]) / "config.yaml"
+        cfg = load_config_readonly(target)
+        Path(os.environ["E2E_OUT_FILE"]).write_text(json.dumps({
+            "prompt": cfg.get("custom_prompt"),
+            "max_parallel_nodes": cfg["plugins"]["entries"]["workflow"]["runtime"]["max_parallel_nodes"],
+            "active_home": os.environ["HERMES_HOME"],
+        }), encoding="utf-8")
+        """
+    )
+    out = _run_py(
+        code,
+        {
+            "HERMES_HOME": str(active_home),
+            "HERMES_MANAGED_DIR": str(managed_dir),
+            "EXPLICIT_PROFILE_HOME": str(target_home),
+            "EXPLICIT_PROFILE_SUFFIX": "expanded",
+        },
+        tmp_path,
+    )
+
+    assert out == {
+        "prompt": "target expanded",
+        "max_parallel_nodes": 5,
+        "active_home": str(active_home),
+    }
