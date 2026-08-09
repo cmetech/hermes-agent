@@ -10,6 +10,7 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    _validate_request,
 )
 from agent.plugin_agent_worker import _build_inline_agent_handler, _run
 from plugins.workflow.compat import assess_compatibility
@@ -242,8 +243,28 @@ def test_inline_child_inherits_absolute_deadlines_limits_and_cancellation(tmp_pa
             )
 
     now = time.monotonic()
+    parent_identity = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_mode": "chat_completions",
+        "base_url_trust_class": "trusted_direct",
+        "endpoint_sha256": "1" * 64,
+        "registration_provenance_digest": "2" * 64,
+    }
+    child_identity = {
+        **parent_identity,
+        "model": "anthropic/claude-sonnet-4.6",
+        "endpoint_sha256": "3" * 64,
+        "registration_provenance_digest": "4" * 64,
+    }
     parent = PluginAgentRunRequest(
         prompt="parent",
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        intended_authority_digest="a" * 64,
+        expected_runtime_identity=parent_identity,
+        expected_runtime_route_fingerprint="b" * 64,
+        expected_runtime_route_options={},
         workdir=tmp_path,
         max_api_attempts=4,
         sealed_provider_attempt_grant=True,
@@ -259,6 +280,12 @@ def test_inline_child_inherits_absolute_deadlines_limits_and_cancellation(tmp_pa
         definitions={
             "reviewer": {
                 "prompt": "Review",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "intended_authority_digest": "c" * 64,
+                "expected_runtime_identity": child_identity,
+                "expected_runtime_route_fingerprint": "d" * 64,
+                "expected_runtime_route_options": {},
                 "allowed_tools": [],
                 "denied_tools": ["delegate_task", "workflow_agent"],
                 "max_iterations": 2,
@@ -283,6 +310,9 @@ def test_inline_child_inherits_absolute_deadlines_limits_and_cancellation(tmp_pa
     assert child.max_process_tree_rss_bytes == 123_456
     assert child.max_process_tree_cpu_seconds == 12.5
     assert child.max_descendants == 2
+    assert child.intended_authority_digest == "c" * 64
+    assert child.expected_runtime_identity == child_identity
+    _validate_request(child)
 
 
 def test_expired_absolute_provider_deadline_blocks_before_worker_spawn(monkeypatch):

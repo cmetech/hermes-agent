@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from types import MappingProxyType
 
-from agent.plugin_agent import PluginAgentRunResult
-from agent.plugin_agent import PluginAgentRunRequest
+from agent.plugin_agent import (
+    PluginAgentRunRequest,
+    PluginAgentRunResult,
+    _validate_request,
+)
 from agent.structured_output import (
     StructuredOutputRequest,
     StructuredOutputStrategy,
@@ -636,6 +639,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.session_id is None
     assert child.provider == "openrouter"
     assert child.model == "anthropic/claude-sonnet-4.6"
+    assert child.intended_authority_digest == request.intended_authority_digest
     assert child.expected_runtime_identity == identity
     assert child.expected_runtime_route_fingerprint == "7" * 64
     assert child.expected_runtime_route_options == {}
@@ -648,6 +652,7 @@ def test_worker_runs_sealed_fallback_in_fresh_child_context(monkeypatch, tmp_pat
     assert child.fallback_model is None
     assert child.sealed_fallback_route is None
     assert child.sandbox_policy == {"mode": "provider_native"}
+    _validate_request(child)
     assert kwargs["is_cancelled"]() is False
 
 
