@@ -258,8 +258,8 @@ def workflow_gateway_command(
                         sort_keys=True,
                     )
                 result = {
-                    "action": args.action,
                     **public_run_projection(updated),
+                    "action": args.action,
                 }
             else:
                 response = args.comment if args.action == "approve" else args.reason
@@ -285,14 +285,15 @@ def workflow_gateway_command(
             },
             sort_keys=True,
         )
-    except (SystemExit, Exception) as exc:
+    except (SystemExit, Exception):
         return json.dumps(
             {
                 "ok": False,
-                "error": type(exc).__name__,
-                "message": str(exc)[:512],
+                "error": "workflow_operation_failed",
+                "message": "Workflow operation failed.",
             },
             sort_keys=True,
+            allow_nan=False,
         )
 
 

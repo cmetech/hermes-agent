@@ -328,6 +328,8 @@ def _bounded_int(value: object, *, minimum: int = 0, maximum: int = 1_000_000) -
 def _public_identifier(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
+    if re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", value):
+        return value
     projected = public_display_identifier(value)
     if _logical_identifier(projected, maximum_bytes=128) is not None:
         return projected

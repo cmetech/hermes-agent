@@ -2,6 +2,13 @@ import { JsonRpcGatewayClient } from '@hermes/shared'
 
 import type { WorkflowArtifactDownloadResult } from '@/global'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
+import {
+  decodeWorkflowAttentionPage,
+  decodeWorkflowEventPage,
+  decodeWorkflowEvidencePage,
+  decodeWorkflowRun,
+  decodeWorkflowRunPage
+} from '@/lib/workflow-public-codec'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -403,17 +410,25 @@ export async function listSessions(
   }
 }
 
-export function listWorkflowRuns(cursor?: string, view: WorkflowRunListView = 'board'): Promise<WorkflowRunPage> {
+export async function listWorkflowRuns(cursor?: string, view: WorkflowRunListView = 'board'): Promise<WorkflowRunPage> {
   const query = new URLSearchParams({ view })
 
   if (cursor) {
     query.set('cursor', cursor)
   }
 
-  return window.hermesDesktop.api<WorkflowRunPage>({
+  const raw = await window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/runs?${query.toString()}`,
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowRunPage(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow run page')
+  }
+
+  return decoded
 }
 
 export function previewWorkflowCleanup(olderThan = '7d'): Promise<WorkflowCleanupPreview> {
@@ -457,38 +472,70 @@ export function failWorkflowNotification(notificationId: string, clientId: strin
   })
 }
 
-export function getWorkflowRun(runId: string): Promise<WorkflowRunSnapshot> {
-  return window.hermesDesktop.api<WorkflowRunSnapshot>({
+export async function getWorkflowRun(runId: string): Promise<WorkflowRunSnapshot> {
+  const raw = await window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}`,
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowRun(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow run')
+  }
+
+  return decoded
 }
 
-export function listWorkflowAttention(): Promise<WorkflowAttentionPage> {
-  return window.hermesDesktop.api<WorkflowAttentionPage>({
+export async function listWorkflowAttention(): Promise<WorkflowAttentionPage> {
+  const raw = await window.hermesDesktop.api<unknown>({
     path: '/api/plugins/workflow/attention',
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowAttentionPage(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow attention page')
+  }
+
+  return decoded
 }
 
-export function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEventPage> {
-  return window.hermesDesktop.api<WorkflowEventPage>({
+export async function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEventPage> {
+  const raw = await window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=0`,
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowEventPage(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow event page')
+  }
+
+  return decoded
 }
 
-export function getWorkflowEvidence(
+export async function getWorkflowEvidence(
   runId: string,
   kind: WorkflowEvidenceKind,
   after = 0
 ): Promise<WorkflowEvidencePage> {
   const query = new URLSearchParams({ after: String(after), kind })
 
-  return window.hermesDesktop.api<WorkflowEvidencePage>({
+  const raw = await window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/evidence?${query}`,
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowEvidencePage(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow evidence page')
+  }
+
+  return decoded
 }
 
 function workflowArtifactUrl(runId: string, publicationId: string, action: 'download' | 'preview'): string {
@@ -522,17 +569,25 @@ export function cancelWorkflowArtifactDownload(requestId: string): Promise<{ can
   return window.hermesDesktop.cancelWorkflowArtifactDownload(requestId)
 }
 
-export function mutateWorkflowRun(
+export async function mutateWorkflowRun(
   runId: string,
   action: string,
   body: Record<string, unknown>
 ): Promise<WorkflowRunSnapshot> {
-  return window.hermesDesktop.api<WorkflowRunSnapshot>({
+  const raw = await window.hermesDesktop.api<unknown>({
     path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/${encodeURIComponent(action)}`,
     method: 'POST',
     body,
     ...profileScoped()
   })
+
+  const decoded = decodeWorkflowRun(raw)
+
+  if (decoded === null) {
+    throw new Error('Hermes returned an invalid workflow run mutation')
+  }
+
+  return decoded
 }
 
 export function getKanbanBoardSummary(board: string): Promise<KanbanBoardSummary> {

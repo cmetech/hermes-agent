@@ -1,5 +1,5 @@
 import { useI18n } from '@/i18n'
-import type { WorkflowAttentionItem } from '@/types/hermes'
+import type { WorkflowAttentionItem, WorkflowPublicAction } from '@/types/hermes'
 
 import { isLoopSignalConfirmation } from './run-inspector'
 
@@ -38,18 +38,18 @@ export function AttentionInbox({ items, onOpenRun }: AttentionInboxProps) {
           const action = item.next_actions.find(candidate => !['events', 'status'].includes(candidate))
           const signalConfirmation = isLoopSignalConfirmation(item.interaction)
 
-          const actionLabel = action
-            ? ({
-                abandon: t.operations.abandon,
-                approve: signalConfirmation ? t.operations.acceptResult : t.operations.approve,
-                cancel: t.operations.cancel,
-                reconcile: t.operations.reconcile,
-                reject: t.operations.reject,
-                resume: t.operations.resume,
-                retry: t.operations.retry,
-                'provide-input': signalConfirmation ? t.operations.continueWithFeedback : t.operations.provideInput
-              }[action] ?? action.replaceAll('-', ' '))
-            : null
+          const actionLabels: Partial<Record<WorkflowPublicAction, string>> = {
+            abandon: t.operations.abandon,
+            approve: signalConfirmation ? t.operations.acceptResult : t.operations.approve,
+            cancel: t.operations.cancel,
+            reconcile: t.operations.reconcile,
+            reject: t.operations.reject,
+            resume: t.operations.resume,
+            retry: t.operations.retry,
+            'provide-input': signalConfirmation ? t.operations.continueWithFeedback : t.operations.provideInput
+          }
+
+          const actionLabel = action ? (actionLabels[action] ?? action.replaceAll('-', ' ')) : null
 
           return (
             <li className="min-w-0" key={`${item.run_id}:${item.node_id ?? item.kind}`}>

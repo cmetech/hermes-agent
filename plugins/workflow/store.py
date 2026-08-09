@@ -89,6 +89,8 @@ from plugins.workflow.schedule_time import (
     run_is_scheduled_wait,
 )
 from plugins.workflow.sanitize import (
+    public_cleanup_projection,
+    public_event_projection,
     sanitize_projection,
     workflow_filename_components_are_distinct,
     workflow_input_name_is_portable,
@@ -8691,6 +8693,8 @@ class RunStore:
         for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
+            # Retain the recorded v1-v4 direct-reader contract. REST and
+            # evidence readers use events_after(), which closes each event.
             public_events.append(_sanitize(event))
         return tuple(public_events)
 
@@ -8703,12 +8707,13 @@ class RunStore:
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         """Return a bounded monotonic event page for REST/desktop consumers."""
-        events = self.tail_events(
+        raw_events = self.tail_events(
             run_id,
             after_sequence=after,
             limit=max(1, min(int(limit), 200)),
             operator_scope=operator_scope,
         )
+        events = tuple(public_event_projection(event) for event in raw_events)
         return {
             "schema_version": 1,
             "events": events,
@@ -8762,7 +8767,7 @@ class RunStore:
         for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
-            public_events.append(sanitize_projection(event))
+            public_events.append(public_event_projection(event))
         return {
             "events": tuple(public_events),
             "truncated": truncated,
@@ -17563,14 +17568,13 @@ class RunStore:
                 (run_id,),
             ).fetchall()
         return tuple(
-            {
+            public_cleanup_projection({
                 "sequence": row["sequence"],
                 "timestamp": row["timestamp"],
                 "files": row["files"],
                 "bytes": row["bytes"],
                 "outcome": row["outcome"],
-                "details": _sanitize(json.loads(row["payload_json"])),
-            }
+            })
             for row in rows
         )
 

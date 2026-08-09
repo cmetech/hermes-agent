@@ -49,6 +49,7 @@ from plugins.workflow.runtime import (
 from plugins.workflow.sanitize import (
     projection_key_is_secret,
     public_display_identifier,
+    public_pending_interaction,
     public_run_projection,
     sanitize_evidence_bytes,
     sanitize_projection,
@@ -124,6 +125,417 @@ def _schedule_now_utc() -> datetime:
 
 
 _ALL_WORKFLOW_CAPABILITIES = frozenset({"read", "write", "delivery", "admin"})
+
+
+class WorkflowPublicError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["workflow_operation_failed"]
+    message: Literal["Workflow operation failed."]
+
+
+class WorkflowRetryProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested_retries: StrictInt = Field(..., ge=0)
+    requested_total_attempts: StrictInt = Field(..., ge=0)
+    effective_total_attempts: StrictInt = Field(..., ge=0)
+    retry_consumed: StrictInt = Field(..., ge=0)
+    remaining_attempts: StrictInt = Field(..., ge=0)
+    additional_provider_attempts: StrictInt = Field(..., ge=0)
+    capped: StrictBool
+
+
+class WorkflowProviderAuthorityProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authority_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    manifest_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkflowCostBudgetProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_budget_usd: str | None = Field(None, max_length=64)
+    settled_cost_usd: str | None = Field(None, max_length=64)
+    remaining_usd: str | None = Field(None, max_length=64)
+    overage_usd: str | None = Field(None, max_length=64)
+    settlement_count: StrictInt | None = Field(None, ge=0, le=1_000_000)
+
+
+class WorkflowAttemptProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["attempt"]
+    node_id: str = Field(..., min_length=1, max_length=128)
+    attempt_id: str = Field(..., min_length=1, max_length=128)
+    state: Literal[
+        "pending", "ready", "claimed", "running", "waiting_retry",
+        "waiting_resolution", "paused", "interrupted", "succeeded",
+        "failed", "cancelled", "skipped",
+    ]
+    retry: WorkflowRetryProjection
+    error: WorkflowPublicError | None = None
+    provider_authority: WorkflowProviderAuthorityProjection | None = None
+    cost_budget: WorkflowCostBudgetProjection | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    next_attempt_at: str | None = None
+
+
+class WorkflowPendingInteractionProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "approval", "workflow_approval", "loop_input",
+        "loop_signal_confirmation", "capability", "reconcile",
+    ]
+    interaction_id: str | None = Field(None, min_length=1, max_length=128)
+    node_id: str | None = Field(None, min_length=1, max_length=128)
+    iteration: StrictInt | None = Field(None, ge=0)
+    max_iterations: StrictInt | None = Field(None, ge=0)
+
+
+class WorkflowNodeProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    state: Literal[
+        "pending", "ready", "claimed", "running", "waiting_retry",
+        "waiting_resolution", "paused", "interrupted", "succeeded",
+        "failed", "cancelled", "skipped",
+    ]
+    depends_on: list[str]
+    attempts: list[WorkflowAttemptProjection]
+    attempt_count: StrictInt = Field(..., ge=0)
+    pending_interaction: WorkflowPendingInteractionProjection | None = None
+    approval_rework_attempts: StrictInt | None = Field(None, ge=0)
+    retry_consumed: StrictInt | None = Field(None, ge=0)
+    next_attempt_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    error: WorkflowPublicError | None = None
+
+
+class WorkflowArtifactProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["artifact"]
+    publication_id: str = Field(..., min_length=1, max_length=128)
+    node_id: str | None = Field(None, max_length=128)
+    attempt_id: str | None = Field(None, max_length=128)
+    output_type: str | None = Field(None, max_length=128)
+    media_type: str | None = Field(None, max_length=128)
+    size_bytes: StrictInt | None = Field(None, ge=0)
+    sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    schema_fingerprint: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    produced_at: str | None = None
+    integrity_status: Literal["verified", "legacy_unverified"]
+    recovery_status: Literal["verified", "projection_recovered"]
+
+
+class WorkflowProgressProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["graph"]
+    completed_nodes: StrictInt = Field(..., ge=0)
+    total_nodes: StrictInt = Field(..., ge=0)
+
+
+class WorkflowRunProvenanceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["api", "background_agent", "chat", "cli", "cron", "desktop"]
+    assurance: Literal[
+        "legacy_unknown", "local_admin_claim", "system_schedule", "verified_adapter"
+    ]
+    admitted_at: str | None = None
+
+
+class WorkflowCoordinatorProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(..., min_length=1, max_length=128)
+    reason_code: str | None = Field(None, max_length=128)
+    epoch: StrictInt | None = Field(None, ge=0)
+    heartbeat_at: str | None = None
+    lease_expires_at: str | None = None
+
+
+class WorkflowRunProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    action: Literal[
+        "status", "events", "approve", "reject", "provide-input", "resume",
+        "retry", "reconcile", "cancel", "abandon", "archive", "restore",
+    ]
+    run_id: str = Field(..., min_length=1, max_length=128)
+    workflow: str = Field(..., min_length=1, max_length=128)
+    workflow_version: str | None = Field(None, max_length=128)
+    status: Literal[
+        "queued", "running", "waiting_retry", "recovery_pending", "paused",
+        "interrupted", "succeeded", "failed", "cancelled", "abandoned",
+    ]
+    status_authoritative: StrictBool
+    health: Literal[
+        "healthy", "terminal", "user_wait", "interrupted", "waiting",
+        "retry_wait", "stalled", "coordinator_unavailable", "storage_degraded",
+    ]
+    blocking_reason: str | None = Field(None, max_length=128)
+    created_at: str | None = None
+    updated_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    state_version: StrictInt = Field(..., ge=0)
+    event_sequence: StrictInt | None = Field(None, ge=0)
+    execution_mode: str | None = Field(None, max_length=128)
+    trigger: str | None = Field(None, max_length=128)
+    provenance: WorkflowRunProvenanceProjection | None = None
+    definition_digest: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    provider_resolution_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    nodes: dict[str, WorkflowNodeProjection]
+    artifacts: list[WorkflowArtifactProjection]
+    warnings: list[str] | None = None
+    coordinator: WorkflowCoordinatorProjection | None = None
+    progress: WorkflowProgressProjection
+    attempts: StrictInt = Field(..., ge=0)
+    current_nodes: list[str]
+    previous_node: str | None = None
+    next_retry_at: str | None = None
+    pending_interaction: WorkflowPendingInteractionProjection | None = None
+    next_actions: list[
+        Literal[
+            "status", "events", "approve", "reject", "provide-input",
+            "resume", "retry", "reconcile", "cancel", "abandon", "archive",
+            "restore",
+        ]
+    ]
+    queue_position: StrictInt | None = Field(None, ge=0)
+    blocked_by_run_id: str | None = None
+    schedule_at: str | None = None
+    presentation_state: str | None = Field(
+        None, max_length=128, exclude_if=lambda value: value is None
+    )
+    archived_at: str | None = None
+    archive_version: StrictInt | None = Field(None, ge=0)
+    restored_to_history: StrictBool | None = None
+    admission_disposition: str | None = Field(None, max_length=128)
+    last_semantic_progress_at: str | None = None
+    last_error: WorkflowPublicError | None = None
+
+
+class WorkflowRunPageProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    runs: list[WorkflowRunProjection]
+    next_cursor: str | None
+
+
+class WorkflowTimelineEventProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["timeline_event"]
+    sequence: StrictInt = Field(..., ge=0)
+    timestamp: str
+    run_id: str
+    event_type: str
+    node_id: str | None = None
+    attempt_id: str | None = None
+    interaction_id: str | None = None
+    reason_code: str | None = None
+    decision: str | None = None
+    outcome: str | None = None
+
+
+class WorkflowEventPageProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    events: list[WorkflowTimelineEventProjection]
+    next_cursor: StrictInt = Field(..., ge=0)
+    cursor_reset: StrictBool
+
+
+class WorkflowInteractionEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["interaction"]
+    sequence: StrictInt | None = Field(None, ge=0)
+    event_type: str | None = None
+    type: str | None = None
+    interaction_id: str | None = None
+    node_id: str | None = None
+    iteration: StrictInt | None = Field(None, ge=0)
+    max_iterations: StrictInt | None = Field(None, ge=0)
+    decision: str | None = None
+    outcome: str | None = None
+    state_version: StrictInt | None = Field(None, ge=0)
+    next_actions: list[
+        Literal[
+            "status", "events", "approve", "reject", "provide-input",
+            "resume", "retry", "reconcile", "cancel", "abandon", "archive",
+            "restore",
+        ]
+    ] | None = None
+
+
+class WorkflowOutputEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["output"]
+    node_id: str
+    available: Literal[True]
+
+
+class WorkflowRecoveryEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["recovery"]
+    node_id: str
+    recovery_kind: Literal["process", "persistent_session"]
+    outcome: str
+    attempt_id: str | None = None
+    registry_generation: StrictInt | None = Field(None, ge=0)
+    missing_session_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    cache_fingerprint_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    source: str | None = None
+    provider: str | None = None
+    runtime_profile: str | None = None
+    provider_attempts_before_recovery: StrictInt | None = Field(None, ge=0)
+
+
+class WorkflowCoordinatorEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["coordinator"]
+    status: str
+    health: str
+
+
+class WorkflowCleanupEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["cleanup"]
+    sequence: StrictInt = Field(..., ge=0)
+    files: StrictInt = Field(..., ge=0)
+    bytes: StrictInt = Field(..., ge=0)
+    outcome: str
+
+
+class WorkflowLogEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["log"]
+    node_id: str
+    attempt_id: str
+    stream: Literal["stdout", "stderr"]
+    bytes_returned: StrictInt = Field(..., ge=0)
+    truncated: StrictBool
+
+
+class WorkflowNotificationEvidenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: Literal["notification"]
+    notification_id: str
+    kind: str
+    state: str
+    transition_version: StrictInt = Field(..., ge=0)
+
+
+WorkflowEvidenceItemProjection = Annotated[
+    WorkflowTimelineEventProjection
+    | WorkflowInteractionEvidenceProjection
+    | WorkflowAttemptProjection
+    | WorkflowOutputEvidenceProjection
+    | WorkflowArtifactProjection
+    | WorkflowRecoveryEvidenceProjection
+    | WorkflowCoordinatorEvidenceProjection
+    | WorkflowCleanupEvidenceProjection
+    | WorkflowLogEvidenceProjection
+    | WorkflowNotificationEvidenceProjection,
+    Field(discriminator="item_type"),
+]
+
+
+class WorkflowEvidencePageProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    kind: Literal[
+        "timeline", "interactions", "attempts", "logs", "outputs", "artifacts",
+        "recovery", "coordinator", "cleanup", "notifications",
+    ]
+    items: list[WorkflowEvidenceItemProjection]
+    next_cursor: StrictInt = Field(..., ge=0)
+    truncated: StrictBool
+    warnings: list[Literal["unsafe_evidence_path"]] | None = None
+
+
+class WorkflowAttentionInteractionProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "approval", "workflow_approval", "loop_input",
+        "loop_signal_confirmation", "capability", "reconcile", "notification",
+    ]
+    interaction_id: str | None = Field(
+        None, exclude_if=lambda value: value is None
+    )
+    node_id: str | None = Field(None, exclude_if=lambda value: value is None)
+    iteration: StrictInt | None = Field(
+        None, ge=0, exclude_if=lambda value: value is None
+    )
+    max_iterations: StrictInt | None = Field(
+        None, ge=0, exclude_if=lambda value: value is None
+    )
+    notification_id: str | None = Field(
+        None, exclude_if=lambda value: value is None
+    )
+    kind: str | None = Field(None, exclude_if=lambda value: value is None)
+
+
+class WorkflowAttentionItemProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    workflow: str
+    node_id: str | None
+    kind: Literal[
+        "approval", "workflow_approval", "loop_input",
+        "loop_signal_confirmation", "capability", "reconcile", "notification",
+        "failure", "stalled",
+    ]
+    origin: str
+    cause: str
+    interaction: WorkflowAttentionInteractionProjection | None
+    status: Literal[
+        "queued", "running", "waiting_retry", "recovery_pending", "paused",
+        "interrupted", "succeeded", "failed", "cancelled", "abandoned",
+    ]
+    health: Literal[
+        "healthy", "terminal", "user_wait", "interrupted", "waiting",
+        "retry_wait", "stalled", "coordinator_unavailable", "storage_degraded",
+    ]
+    next_actions: list[
+        Literal[
+            "status", "events", "approve", "reject", "provide-input",
+            "resume", "retry", "reconcile", "cancel", "abandon", "archive",
+            "restore",
+        ]
+    ]
+    state_version: StrictInt = Field(..., ge=0)
+    updated_at: str
+
+
+class WorkflowAttentionPageProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    items: list[WorkflowAttentionItemProjection]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1496,7 +1908,10 @@ def dismiss_notification_projection(
     return {"schema_version": 1, "outcome": "presentation_dismissed"}
 
 
-@router.get("/runs")
+@router.get(
+    "/runs",
+    response_model=WorkflowRunPageProjection,
+)
 def list_runs(
     request: Request,
     limit: int = Query(100, ge=1, le=100),
@@ -1702,7 +2117,10 @@ def post_runs(
     }
 
 
-@router.get("/runs/{run_id}")
+@router.get(
+    "/runs/{run_id}",
+    response_model=WorkflowRunProjection,
+)
 def get_run(
     request: Request,
     run_id: str,
@@ -1743,9 +2161,12 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
         }:
             continue
         item_kind = str(kind)
-        interaction = (
-            dict(pending) if isinstance(pending, Mapping) else {"type": item_kind}
+        interaction = public_pending_interaction(
+            pending if isinstance(pending, Mapping) else {"type": item_kind},
+            node_id=node_id,
         )
+        if interaction is None:
+            continue
         items.append(
             {
                 "run_id": run["run_id"],
@@ -1753,17 +2174,16 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
                 "node_id": str(node_id),
                 "kind": item_kind,
                 "origin": origin,
-                "cause": str(
-                    interaction.get("message")
-                    or interaction.get("gate_message")
-                    or interaction.get("prompt")
-                    or item_kind
-                ),
+                "cause": item_kind,
                 "interaction": interaction,
                 "status": run["status"],
                 "health": run["health"],
                 "next_actions": run["next_actions"],
-                "state_version": run.get("state_version"),
+                "state_version": (
+                    run.get("state_version")
+                    if type(run.get("state_version")) is int
+                    else 0
+                ),
                 "updated_at": run["updated_at"],
                 "_source": "run",
                 "_source_position": [
@@ -1775,12 +2195,6 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
             }
         )
     if run["status"] == "failed":
-        last_error = run.get("last_error")
-        failure_cause = (
-            last_error.get("message") or last_error.get("code")
-            if isinstance(last_error, Mapping)
-            else None
-        )
         items.append(
             {
                 "run_id": run["run_id"],
@@ -1788,14 +2202,16 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
                 "node_id": None,
                 "kind": "failure",
                 "origin": origin,
-                "cause": str(
-                    failure_cause or run.get("blocking_reason") or "workflow_failed"
-                ),
+                "cause": "workflow_failed",
                 "interaction": None,
                 "status": run["status"],
                 "health": run["health"],
                 "next_actions": run["next_actions"],
-                "state_version": run.get("state_version"),
+                "state_version": (
+                    run.get("state_version")
+                    if type(run.get("state_version")) is int
+                    else 0
+                ),
                 "updated_at": run["updated_at"],
                 "_source": "run",
                 "_source_position": [
@@ -1823,7 +2239,11 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
                 "status": run["status"],
                 "health": run["health"],
                 "next_actions": run["next_actions"],
-                "state_version": run.get("state_version"),
+                "state_version": (
+                    run.get("state_version")
+                    if type(run.get("state_version")) is int
+                    else 0
+                ),
                 "updated_at": run["updated_at"],
                 "_source": "run",
                 "_source_position": [
@@ -1874,7 +2294,10 @@ def _attention_cursor_position(
     return tuple(value)
 
 
-@router.get("/attention")
+@router.get(
+    "/attention",
+    response_model=WorkflowAttentionPageProjection,
+)
 def attention(
     request: Request,
     limit: int = Query(100, ge=1, le=100),
@@ -2040,7 +2463,11 @@ async def _acquire_event_waiter(runtime: WorkflowApiRuntime) -> None:
         ) from exc
 
 
-@router.get("/runs/{run_id}/events")
+@router.get(
+    "/runs/{run_id}/events",
+    response_model=WorkflowEventPageProjection,
+    response_model_exclude_none=True,
+)
 async def events(
     request: Request,
     run_id: str,
@@ -2066,13 +2493,17 @@ async def events(
                     operator_scope=None if operator.unrestricted else operator.scope,
                 )
                 if page["events"] or wait_seconds == 0 or time.monotonic() >= deadline:
-                    return sanitize_projection(page)
+                    return page
                 await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
     finally:
         runtime.event_waiters.release()
 
 
-@router.get("/runs/{run_id}/evidence")
+@router.get(
+    "/runs/{run_id}/evidence",
+    response_model=WorkflowEvidencePageProjection,
+    response_model_exclude_none=True,
+)
 def evidence(
     request: Request,
     run_id: str,
@@ -2296,7 +2727,10 @@ def _pending_interaction_for_action(
     return public_pending if isinstance(public_pending, Mapping) else None
 
 
-@router.post("/runs/{run_id}/{action}")
+@router.post(
+    "/runs/{run_id}/{action}",
+    response_model=WorkflowRunProjection,
+)
 def mutate_run(
     request_context: Request,
     run_id: str,

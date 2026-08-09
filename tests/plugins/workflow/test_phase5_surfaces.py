@@ -267,9 +267,19 @@ def test_attempt_evidence_projects_manifest_and_closed_budget_totals_only() -> N
 
     assert page["items"] == [
         {
+            "item_type": "attempt",
             "node_id": "ask",
             "attempt_id": "attempt-1",
             "state": "failed",
+            "retry": {
+                "requested_retries": 0,
+                "requested_total_attempts": 0,
+                "effective_total_attempts": 0,
+                "retry_consumed": 0,
+                "remaining_attempts": 0,
+                "additional_provider_attempts": 0,
+                "capped": False,
+            },
             "provider_authority": {
                 "authority_digest": "5" * 64,
                 "manifest_digest": "6" * 64,
@@ -282,8 +292,8 @@ def test_attempt_evidence_projects_manifest_and_closed_budget_totals_only() -> N
                 "settlement_count": 1,
             },
             "error": {
-                "code": "cost_budget_exhausted",
-                "message": "budget exhausted",
+                "code": "workflow_operation_failed",
+                "message": "Workflow operation failed.",
             },
         }
     ]

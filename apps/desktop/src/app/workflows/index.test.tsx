@@ -62,7 +62,7 @@ function deferred<T>() {
 
 function run(overrides: Partial<WorkflowRunSnapshot> = {}): WorkflowRunSnapshot {
   return {
-    definition_digest: 'definition-1',
+    definition_digest: 'a'.repeat(64),
     health: 'user_wait',
     next_actions: ['approve'],
     pending_interaction: { interaction_id: 'interaction-1', type: 'workflow_approval' },
@@ -369,6 +369,7 @@ describe('WorkflowsView', () => {
     await renderView(client, 'workflows')
 
     const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+
     const languageBadge = Array.from(row.querySelectorAll('[data-slot="badge"]')).find(badge =>
       badge.textContent?.includes('future-workflow-language')
     )
@@ -1098,7 +1099,7 @@ describe('WorkflowsView', () => {
               interaction_id: 'future-1',
               iteration: 1,
               max_iterations: 2,
-              type: 'loop_signal_confirmation_v2'
+              type: 'loop_signal_confirmation_v2' as never
             }
           })}
         />
@@ -1194,8 +1195,18 @@ describe('WorkflowsView', () => {
 
     const attemptEvidence = {
       attempt_id: 'attempt-1',
-      error: { code: 'provider_timeout', message: 'first line\nsecond line' },
-      retry: { requested_retries: 2 },
+      error: { code: 'workflow_operation_failed', message: 'Workflow operation failed.' },
+      item_type: 'attempt',
+      node_id: 'producer',
+      retry: {
+        additional_provider_attempts: 0,
+        capped: false,
+        effective_total_attempts: 3,
+        remaining_attempts: 0,
+        requested_retries: 2,
+        requested_total_attempts: 3,
+        retry_consumed: 3
+      },
       state: 'failed'
     }
 
@@ -1212,17 +1223,9 @@ describe('WorkflowsView', () => {
     fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Attempts' }), { button: 0, ctrlKey: false })
     await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'attempts'))
     const attempt = await screen.findByRole('listitem')
-    expect(attempt.textContent).toBe(`{
-  "attempt_id": "attempt-1",
-  "error": {
-    "code": "provider_timeout",
-    "message": "first line\\nsecond line"
-  },
-  "retry": {
-    "requested_retries": 2
-  },
-  "state": "failed"
-}`)
+    expect(attempt.textContent).toBe(
+      'producer · attempt-1 · failed · workflow_operation_failed: Workflow operation failed.'
+    )
 
     fireEvent.change(screen.getByLabelText('Input value'), { target: { value: 'bounded answer' } })
     fireEvent.click(screen.getByRole('button', { name: 'Provide input' }))
@@ -1242,8 +1245,17 @@ describe('WorkflowsView', () => {
       items: [
         {
           attempt_id: 'attempt-1',
+          cache_fingerprint_sha256: 'b'.repeat(64),
+          item_type: 'recovery',
+          missing_session_sha256: 'a'.repeat(64),
+          node_id: 'producer',
           outcome: 'stale_entry_replaced',
-          recovery_kind: 'persistent_session'
+          provider: 'test-provider',
+          provider_attempts_before_recovery: 0,
+          recovery_kind: 'persistent_session',
+          registry_generation: 7,
+          runtime_profile: 'default',
+          source: 'cross_run_registry'
         }
       ],
       kind: 'recovery',
@@ -1260,13 +1272,13 @@ describe('WorkflowsView', () => {
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Recovery' }), { button: 0, ctrlKey: false })
 
     await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'recovery'))
-    expect(await screen.findByText(/"recovery_kind": "persistent_session"/)).toBeTruthy()
-    expect(screen.getByText(/"outcome": "stale_entry_replaced"/)).toBeTruthy()
+    expect(await screen.findByText('producer · persistent_session · stale_entry_replaced')).toBeTruthy()
   })
 
   it('narrows only complete Phase 3 attempt and persistent-session recovery evidence', () => {
     const attempt: Record<string, unknown> = {
       attempt_id: 'attempt-1',
+      item_type: 'attempt',
       node_id: 'producer',
       retry: {
         additional_provider_attempts: 2,
@@ -1283,6 +1295,7 @@ describe('WorkflowsView', () => {
     const recovery: Record<string, unknown> = {
       attempt_id: 'attempt-2',
       cache_fingerprint_sha256: 'b'.repeat(64),
+      item_type: 'recovery',
       missing_session_sha256: 'a'.repeat(64),
       node_id: 'producer',
       outcome: 'stale_entry_replaced',
@@ -1317,10 +1330,16 @@ describe('WorkflowsView', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     getWorkflowEvidence.mockResolvedValueOnce({
       items: [
-        { relative_path: 'legacy.txt' },
+        {
+          integrity_status: 'legacy_unverified',
+          item_type: 'artifact',
+          publication_id: 'legacy-artifact',
+          recovery_status: 'projection_recovered'
+        },
         {
           attempt_id: 'attempt-1',
           integrity_status: 'verified',
+          item_type: 'artifact',
           media_type: 'text/markdown; charset=utf-8',
           node_id: 'producer',
           output_type: 'Report',
@@ -1348,7 +1367,14 @@ describe('WorkflowsView', () => {
 
     cleanup()
     getWorkflowEvidence.mockResolvedValueOnce({
-      items: [{ publication_id: '   ', relative_path: 'legacy.txt' }],
+      items: [
+        {
+          integrity_status: 'legacy_unverified',
+          item_type: 'artifact',
+          publication_id: 'legacy-artifact',
+          recovery_status: 'projection_recovered'
+        }
+      ],
       kind: 'artifacts',
       next_cursor: 0,
       schema_version: 1,
@@ -1361,7 +1387,7 @@ describe('WorkflowsView', () => {
     )
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Verified artifacts' }), { button: 0, ctrlKey: false })
 
-    expect(await screen.findByText(/legacy\.txt/)).toBeTruthy()
+    expect(await screen.findByText(/legacy-artifact/)).toBeTruthy()
     expect(screen.queryByRole('link', { name: 'Download artifact' })).toBeNull()
   })
 

@@ -112,20 +112,15 @@ export interface WorkflowProgress {
 }
 
 export interface WorkflowProvenance {
-  actor_id?: null | string
-  admitted_at?: string
+  admitted_at?: null | string
   assurance: 'legacy_unknown' | 'local_admin_claim' | 'system_schedule' | 'verified_adapter'
-  claimed_actor?: null | string
   source: 'api' | 'background_agent' | 'chat' | 'cli' | 'cron' | 'desktop'
-  source_instance?: null | string
 }
 
 export interface WorkflowCoordinatorSnapshot {
   epoch?: null | number
   heartbeat_at?: null | string
-  host_kind?: null | string
   lease_expires_at?: null | string
-  owner_id?: null | string
   reason_code?: null | string
   status: string
 }
@@ -291,32 +286,120 @@ export interface WorkflowDetail extends WorkflowDefinition {
 }
 
 export interface WorkflowRunSnapshot {
+  action?: WorkflowPublicAction
   archived_at?: null | string
-  archive_version?: number
-  admission_disposition?: string
-  artifacts?: unknown[]
+  archive_version?: null | number
+  admission_disposition?: null | string
+  artifacts?: WorkflowTypedArtifact[]
+  attempts?: number
   blocked_by_run_id?: null | string
-  concurrency_key?: string
-  coordinator?: WorkflowCoordinatorSnapshot
+  blocking_reason?: null | string
+  completed_at?: null | string
+  coordinator?: null | WorkflowCoordinatorSnapshot
+  created_at?: null | string
   current_nodes?: string[]
-  health: string
-  next_actions: string[]
-  pending_interaction?: null | Record<string, unknown>
+  definition_digest?: null | string
+  event_sequence?: null | number
+  execution_mode?: null | string
+  health:
+    | 'coordinator_unavailable'
+    | 'healthy'
+    | 'interrupted'
+    | 'retry_wait'
+    | 'stalled'
+    | 'storage_degraded'
+    | 'terminal'
+    | 'user_wait'
+    | 'waiting'
+  last_error?: null | WorkflowPublicError
+  last_semantic_progress_at?: null | string
+  next_actions: WorkflowPublicAction[]
+  next_retry_at?: null | string
+  nodes?: Record<string, WorkflowNodeProjection>
+  pending_interaction?: null | WorkflowPendingInteraction
   presentation_state?: null | string
   previous_node?: null | string
-  provider_resolution_sha256?: string
-  provenance?: WorkflowProvenance
+  provider_resolution_sha256?: null | string
+  provenance?: null | WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
   run_id: string
   schedule_at?: null | string
   state_version: number
-  status: string
-  restored_to_history?: boolean
+  status: WorkflowRunStatus
+  status_authoritative?: boolean
+  restored_to_history?: null | boolean
+  schema_version?: 1
+  started_at?: null | string
+  trigger?: null | string
   updated_at: string
+  warnings?: null | string[]
   workflow: string
-  workflow_version?: string
-  [key: string]: unknown
+  workflow_version?: null | string
+}
+
+export type WorkflowPublicAction =
+  | 'abandon'
+  | 'approve'
+  | 'archive'
+  | 'cancel'
+  | 'events'
+  | 'provide-input'
+  | 'reconcile'
+  | 'reject'
+  | 'restore'
+  | 'resume'
+  | 'retry'
+  | 'status'
+
+export type WorkflowRunStatus =
+  | 'abandoned'
+  | 'cancelled'
+  | 'failed'
+  | 'interrupted'
+  | 'paused'
+  | 'queued'
+  | 'recovery_pending'
+  | 'running'
+  | 'succeeded'
+  | 'waiting_retry'
+
+export interface WorkflowPublicError {
+  code: 'workflow_operation_failed'
+  message: 'Workflow operation failed.'
+}
+
+export interface WorkflowPendingInteraction {
+  interaction_id?: null | string
+  iteration?: null | number
+  max_iterations?: null | number
+  node_id?: null | string
+  type: 'approval' | 'capability' | 'loop_input' | 'loop_signal_confirmation' | 'reconcile' | 'workflow_approval'
+}
+
+export interface WorkflowRetryProjection {
+  additional_provider_attempts: number
+  capped: boolean
+  effective_total_attempts: number
+  remaining_attempts: number
+  requested_retries: number
+  requested_total_attempts: number
+  retry_consumed: number
+}
+
+export interface WorkflowNodeProjection {
+  approval_rework_attempts?: null | number
+  attempt_count: number
+  attempts: WorkflowAttemptEvidence[]
+  completed_at?: null | string
+  depends_on: string[]
+  error?: null | WorkflowPublicError
+  id: string
+  next_attempt_at?: null | string
+  pending_interaction?: null | WorkflowPendingInteraction
+  retry_consumed?: null | number
+  started_at?: null | string
+  state: string
 }
 
 export type WorkflowRunView = 'workflows' | 'board' | 'history' | 'archive'
@@ -527,7 +610,7 @@ export type WorkflowEvidenceKind =
   | 'recovery'
   | 'timeline'
 
-export interface WorkflowTypedArtifact extends Record<string, unknown> {
+export interface WorkflowTypedArtifact {
   attempt_id?: null | string
   integrity_status?: null | string
   media_type?: null | string
@@ -537,9 +620,9 @@ export interface WorkflowTypedArtifact extends Record<string, unknown> {
   publication_id: string
   recovery_status?: null | string
   schema_fingerprint?: null | string
-  session_id?: null | string
   sha256?: null | string
   size_bytes?: null | number
+  item_type: 'artifact'
 }
 
 export interface WorkflowArtifactPreview {
@@ -552,32 +635,41 @@ export interface WorkflowArtifactPreview {
 }
 
 export interface WorkflowEvidencePage {
-  items: Array<Record<string, unknown>>
+  items: WorkflowEvidenceItem[]
   kind: WorkflowEvidenceKind
   next_cursor: number
   schema_version: number
   truncated: boolean
+  warnings?: string[]
 }
 
-export interface WorkflowAttemptEvidence extends Record<string, unknown> {
+export interface WorkflowAttemptEvidence {
   attempt_id: string
-  error?: { code: string; message?: null | string }
-  node_id: string
-  retry: {
-    additional_provider_attempts: number
-    capped: boolean
-    effective_total_attempts: number
-    remaining_attempts: number
-    requested_retries: number
-    requested_total_attempts: number
-    retry_consumed: number
+  completed_at?: null | string
+  cost_budget?: null | {
+    max_budget_usd?: null | string
+    overage_usd?: null | string
+    remaining_usd?: null | string
+    settled_cost_usd?: null | string
+    settlement_count?: null | number
   }
+  error?: null | WorkflowPublicError
+  item_type: 'attempt'
+  next_attempt_at?: null | string
+  node_id: string
+  provider_authority?: null | {
+    authority_digest: string
+    manifest_digest: string
+  }
+  retry: WorkflowRetryProjection
+  started_at?: null | string
   state?: string
 }
 
-export interface WorkflowPersistentSessionRecoveryEvidence extends Record<string, unknown> {
+export interface WorkflowPersistentSessionRecoveryEvidence {
   attempt_id: string
   cache_fingerprint_sha256: string
+  item_type: 'recovery'
   missing_session_sha256: string
   node_id: string
   outcome: string
@@ -589,6 +681,92 @@ export interface WorkflowPersistentSessionRecoveryEvidence extends Record<string
   source: string
 }
 
+export interface WorkflowTimelineEvent {
+  attempt_id?: string
+  decision?: string
+  event_type: string
+  interaction_id?: string
+  item_type: 'timeline_event'
+  node_id?: string
+  outcome?: string
+  reason_code?: string
+  run_id: string
+  sequence: number
+  timestamp: string
+}
+
+export interface WorkflowInteractionEvidence {
+  decision?: string
+  event_type?: string
+  interaction_id?: string
+  item_type: 'interaction'
+  iteration?: number
+  max_iterations?: number
+  next_actions?: WorkflowPublicAction[]
+  node_id?: string
+  outcome?: string
+  sequence?: number
+  state_version?: number
+  type?: string
+}
+
+export interface WorkflowOutputEvidence {
+  available: true
+  item_type: 'output'
+  node_id: string
+}
+
+export interface WorkflowLogEvidence {
+  attempt_id: string
+  bytes_returned: number
+  item_type: 'log'
+  node_id: string
+  stream: 'stderr' | 'stdout'
+  truncated: boolean
+}
+
+export interface WorkflowCleanupEvidence {
+  bytes: number
+  files: number
+  item_type: 'cleanup'
+  outcome: string
+  sequence: number
+}
+
+export interface WorkflowCoordinatorEvidence {
+  health: string
+  item_type: 'coordinator'
+  status: string
+}
+
+export interface WorkflowProcessRecoveryEvidence {
+  item_type: 'recovery'
+  node_id: string
+  outcome: string
+  recovery_kind: 'process'
+}
+
+export interface WorkflowNotificationEvidence {
+  item_type: 'notification'
+  kind: string
+  notification_id: string
+  state: string
+  transition_version: number
+}
+
+export type WorkflowEvidenceItem =
+  | WorkflowAttemptEvidence
+  | WorkflowCleanupEvidence
+  | WorkflowCoordinatorEvidence
+  | WorkflowInteractionEvidence
+  | WorkflowLogEvidence
+  | WorkflowNotificationEvidence
+  | WorkflowOutputEvidence
+  | WorkflowPersistentSessionRecoveryEvidence
+  | WorkflowProcessRecoveryEvidence
+  | WorkflowTimelineEvent
+  | WorkflowTypedArtifact
+
 export interface WorkflowRunPage {
   next_cursor: null | string
   runs: WorkflowRunSnapshot[]
@@ -597,15 +775,33 @@ export interface WorkflowRunPage {
 
 export interface WorkflowAttentionItem {
   cause: string
-  health: string
-  interaction?: null | Record<string, unknown>
-  kind: string
-  next_actions: string[]
+  health: WorkflowRunSnapshot['health']
+  interaction?:
+    | null
+    | (
+        | WorkflowPendingInteraction
+        | {
+            kind: string
+            notification_id: string
+            type: 'notification'
+          }
+      )
+  kind:
+    | 'approval'
+    | 'capability'
+    | 'failure'
+    | 'loop_input'
+    | 'loop_signal_confirmation'
+    | 'notification'
+    | 'reconcile'
+    | 'stalled'
+    | 'workflow_approval'
+  next_actions: WorkflowPublicAction[]
   node_id: null | string
   origin: string
   run_id: string
   state_version: number
-  status: string
+  status: WorkflowRunStatus
   updated_at: string
   workflow: string
 }
@@ -618,7 +814,7 @@ export interface WorkflowAttentionPage {
 
 export interface WorkflowEventPage {
   cursor_reset: boolean
-  events: Array<Record<string, unknown>>
+  events: WorkflowTimelineEvent[]
   next_cursor: number
   schema_version: number
 }

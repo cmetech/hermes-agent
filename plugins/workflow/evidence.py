@@ -7,7 +7,14 @@ import stat
 from pathlib import Path
 from typing import Mapping
 
-from plugins.workflow.sanitize import sanitize_evidence_bytes, sanitize_projection
+from plugins.workflow.sanitize import (
+    public_artifact_projection,
+    public_attempt_projection,
+    public_cleanup_projection,
+    public_display_identifier,
+    public_event_projection,
+    public_pending_interaction,
+)
 from plugins.workflow.store import (
     PublicationIntegrityError,
     PublicationNotFoundError,
@@ -285,7 +292,7 @@ class EvidenceReader:
             return {
                 "schema_version": 1,
                 "kind": kind,
-                "items": sanitize_projection(page["events"]),
+                "items": page["events"],
                 "next_cursor": page["next_cursor"],
                 "truncated": len(page["events"]) == limit,
             }
@@ -301,7 +308,7 @@ class EvidenceReader:
         response = {
             "schema_version": 1,
             "kind": kind,
-            "items": sanitize_projection(page),
+            "items": page,
             "next_cursor": after + len(page),
             "truncated": after + len(page) < len(items),
         }
@@ -327,7 +334,7 @@ class EvidenceReader:
         node_items = nodes.items() if isinstance(nodes, Mapping) else ()
         if kind == "interactions":
             historical = [
-                event
+                self._interaction_event_item(public_event_projection(event))
                 for event in self.store.tail_events(
                     run_id, limit=200, operator_scope=operator_scope
                 )
@@ -342,19 +349,33 @@ class EvidenceReader:
             ]
             pending_items = [
                 {
-                    "node_id": node_id,
-                    **pending,
-                    "state_version": run.get("state_version"),
-                    "next_actions": run.get("next_actions", []),
+                    "item_type": "interaction",
+                    **projected,
+                    "state_version": (
+                        run.get("state_version")
+                        if type(run.get("state_version")) is int
+                        else 0
+                    ),
+                    "next_actions": [
+                        action
+                        for action in run.get("next_actions", [])
+                        if isinstance(action, str)
+                    ][:20],
                 }
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance((pending := node.get("pending_interaction")), Mapping)
+                and (
+                    projected := public_pending_interaction(
+                        pending, node_id=node_id
+                    )
+                )
+                is not None
             ]
             return [*historical, *pending_items]
         if kind == "attempts":
             return [
-                self._attempt_evidence_item(
+                public_attempt_projection(
                     node_id,
                     attempt,
                     manifest_digest=run.get("provider_resolution_sha256"),
@@ -366,19 +387,28 @@ class EvidenceReader:
             ]
         if kind == "outputs":
             return [
-                {"node_id": node_id, "output": node["output"]}
+                {
+                    "item_type": "output",
+                    "node_id": public_display_identifier(node_id),
+                    "available": True,
+                }
                 for node_id, node in node_items
                 if isinstance(node, Mapping) and node.get("output") is not None
             ]
         if kind == "artifacts":
             return [
-                self._artifact_evidence_item(artifact)
+                public_artifact_projection(artifact)
                 for artifact in run.get("artifacts", [])
                 if isinstance(artifact, Mapping)
             ]
         if kind == "recovery":
             process_recovery = [
-                {"node_id": node_id, "recovery": node["recovery"]}
+                {
+                    "item_type": "recovery",
+                    "node_id": public_display_identifier(node_id),
+                    "recovery_kind": "process",
+                    "outcome": "recovery_recorded",
+                }
                 for node_id, node in node_items
                 if isinstance(node, Mapping)
                 and isinstance(node.get("recovery"), Mapping)
@@ -392,24 +422,59 @@ class EvidenceReader:
             ]
             return [*process_recovery, *persistent_session_recovery]
         if kind == "coordinator":
-            return [
-                {
-                    "coordinator": run.get("coordinator"),
-                    "execution_mode": run.get("execution_mode"),
-                    "health": run.get("health"),
-                    "blocking_reason": run.get("blocking_reason"),
-                    "last_semantic_progress_at": run.get("last_semantic_progress_at"),
-                }
-            ]
+            coordinator = run.get("coordinator")
+            coordinator = coordinator if isinstance(coordinator, Mapping) else {}
+            return [{
+                "item_type": "coordinator",
+                "status": public_display_identifier(
+                    coordinator.get("status", "unavailable")
+                ),
+                "health": public_display_identifier(
+                    run.get("health", "storage_degraded")
+                ),
+            }]
         if kind == "cleanup":
-            return list(
-                self.store.cleanup_history(run_id, operator_scope=operator_scope)
-            )
+            return [
+                public_cleanup_projection(item)
+                for item in self.store.cleanup_history(
+                    run_id, operator_scope=operator_scope
+                )
+            ]
         if kind == "notifications":
             from plugins.workflow.notifications import NotificationOutbox
 
-            return list(NotificationOutbox(self.store).history(run_id=run_id))
+            return [
+                {
+                    "item_type": "notification",
+                    "notification_id": public_display_identifier(
+                        item.get("notification_id", "notification")
+                    ),
+                    "kind": public_display_identifier(
+                        item.get("kind", "reconciliation_required")
+                    ),
+                    "state": public_display_identifier(item.get("state", "pending")),
+                    "transition_version": (
+                        item.get("transition_version")
+                        if type(item.get("transition_version")) is int
+                        else 0
+                    ),
+                }
+                for item in NotificationOutbox(self.store).history(run_id=run_id)
+            ]
         return []
+
+    @staticmethod
+    def _interaction_event_item(event: Mapping[str, object]) -> dict[str, object]:
+        projected: dict[str, object] = {
+            "item_type": "interaction",
+            "sequence": event.get("sequence", 0),
+            "event_type": event.get("event_type", "workflow_event"),
+        }
+        for field in ("node_id", "interaction_id", "decision", "outcome"):
+            value = event.get(field)
+            if isinstance(value, str):
+                projected[field] = public_display_identifier(value)
+        return projected
 
     @staticmethod
     def _attempt_evidence_item(
@@ -418,60 +483,18 @@ class EvidenceReader:
         *,
         manifest_digest: object = None,
     ) -> dict[str, object]:
-        metadata = attempt.get("metadata")
-        projected: dict[str, object] = {
-            "node_id": node_id,
-            "attempt_id": attempt.get("attempt_id"),
-            "state": attempt.get("state"),
-        }
-        if isinstance(metadata, Mapping) and all(
-            field in metadata for field in _PHASE3_RETRY_FIELDS
-        ):
-            projected["retry"] = {
-                field: metadata[field] for field in _PHASE3_RETRY_FIELDS
-            }
-        authority_digest = (
-            _public_digest(metadata.get("intended_authority_digest"))
-            if isinstance(metadata, Mapping)
-            else None
+        return public_attempt_projection(
+            node_id, attempt, manifest_digest=manifest_digest
         )
-        public_manifest_digest = _public_digest(manifest_digest)
-        if authority_digest is not None and public_manifest_digest is not None:
-            projected["provider_authority"] = {
-                "authority_digest": authority_digest,
-                "manifest_digest": public_manifest_digest,
-            }
-        audit = metadata.get("audit") if isinstance(metadata, Mapping) else None
-        cost_budget = audit.get("cost_budget") if isinstance(audit, Mapping) else None
-        if isinstance(cost_budget, Mapping):
-            closed_budget = {
-                field: cost_budget[field]
-                for field in _COST_BUDGET_FIELDS
-                if field in cost_budget
-                and (
-                    isinstance(cost_budget[field], str)
-                    and len(cost_budget[field]) <= 64
-                    or field == "settlement_count"
-                    and type(cost_budget[field]) is int
-                    and 0 <= cost_budget[field] <= 1_000_000
-                )
-            }
-            if closed_budget:
-                projected["cost_budget"] = closed_budget
-        if attempt.get("error_code") is not None:
-            projected["error"] = {
-                "code": attempt.get("error_code"),
-                "message": attempt.get("error_message"),
-            }
-        return projected
 
     @staticmethod
     def _persistent_session_recovery_item(
         node_id: object,
         recovery: Mapping[str, object],
     ) -> dict[str, object]:
-        return {
-            "node_id": node_id,
+        projected = {
+            "item_type": "recovery",
+            "node_id": public_display_identifier(node_id),
             "recovery_kind": "persistent_session",
             **{
                 field: recovery[field]
@@ -479,30 +502,22 @@ class EvidenceReader:
                 if field in recovery
             },
         }
+        for field in (
+            "attempt_id",
+            "source",
+            "provider",
+            "runtime_profile",
+            "outcome",
+        ):
+            if field in projected:
+                projected[field] = public_display_identifier(projected[field])
+        return projected
 
     @staticmethod
     def _artifact_evidence_item(
         artifact: Mapping[str, object],
     ) -> dict[str, object]:
-        if not isinstance(artifact.get("publication_id"), str):
-            return dict(artifact)
-        return {
-            "publication_id": artifact.get("publication_id"),
-            "output_type": artifact.get("output_type"),
-            "media_type": artifact.get("media_type"),
-            "size_bytes": artifact.get("size_bytes"),
-            "sha256": artifact.get("sha256"),
-            "node_id": artifact.get("node_id"),
-            "attempt_id": artifact.get("attempt_id"),
-            "schema_fingerprint": artifact.get("schema_fingerprint"),
-            "produced_at": artifact.get("produced_at"),
-            "session_id": artifact.get("session_id"),
-            # load_run() revalidates the checked journal, projection descriptor,
-            # bundle containment, canonical filename, size, and digest before
-            # EvidenceReader can observe this projection.
-            "integrity_status": "verified",
-            "recovery_status": "verified",
-        }
+        return public_artifact_projection(artifact)
 
     @staticmethod
     def _logs(directory: Path) -> tuple[list[dict[str, object]], list[str]]:
@@ -519,14 +534,13 @@ class EvidenceReader:
                     warnings.append("unsafe_evidence_path")
                 continue
             remaining -= len(data)
-            text, truncated = sanitize_evidence_bytes(data)
             items.append({
-                "node_id": path.parent.parent.name,
-                "attempt_id": path.parent.name,
+                "item_type": "log",
+                "node_id": public_display_identifier(path.parent.parent.name),
+                "attempt_id": public_display_identifier(path.parent.name),
                 "stream": "stderr" if path.name == "stderr.txt" else "stdout",
-                "text": text,
                 "bytes_returned": len(data),
-                "truncated": truncated or size > len(data),
+                "truncated": size > len(data),
             })
         return items, warnings
 

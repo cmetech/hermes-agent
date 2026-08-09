@@ -3225,7 +3225,7 @@ def test_recovered_typed_session_is_private_in_authenticated_api_projections(
         assert b"protected-publication-session" not in response.content, name
 
 
-def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
+def test_legacy_session_fields_remain_private_in_authenticated_api_projections(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "legacy-session-api-home"
@@ -3258,8 +3258,8 @@ def test_legacy_session_fields_remain_public_in_authenticated_api_projections(
     )
     assert detail.status_code == events.status_code == 200
     for response in (detail, events):
-        assert b"legacy-api-session" in response.content
-        assert b"legacy-api-fingerprint" in response.content
+        assert b"legacy-api-session" not in response.content
+        assert b"legacy-api-fingerprint" not in response.content
 
 
 def test_runs_list_never_opens_real_artifact_bodies(
@@ -3457,8 +3457,8 @@ def test_artifact_preview_and_download_accept_producer_metadata_boundary(
         for value in evidence.json()["items"]
         if value.get("publication_id") == artifact["publication_id"]
     )
-    assert item["output_type"] == output_type
-    assert item["session_id"] == session_id
+    assert item["output_type"].startswith("redacted:")
+    assert "session_id" not in item
     assert body not in evidence.content
     assert len(evidence.content) < 40_000
 
@@ -4167,7 +4167,7 @@ def test_attention_returns_action_metadata_for_every_operator_attention_kind(
         stalled.run_id: ("stalled", "cancel"),
         reconcile.run_id: ("reconcile", "reconcile"),
     }
-    assert set(expected) <= set(by_run)
+    assert set(expected) <= set(by_run), (expected, by_run)
     for run_id, (kind, action) in expected.items():
         item = by_run[run_id]
         assert item["kind"] == kind

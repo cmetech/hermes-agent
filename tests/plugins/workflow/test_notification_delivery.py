@@ -627,14 +627,20 @@ def test_read_apis_never_expose_gateway_return_route_capability(
     assert notification_response.status_code == 200
     assert capability not in run_response.text
     assert capability not in notification_response.text
-    assert run_response.json()["provenance"]["return_route"] == "[REDACTED]"
-    gateway_items = [
-        item
-        for item in notification_response.json()["items"]
-        if item["destination"] == "gateway:opaque"
-    ]
-    assert gateway_items
-    assert gateway_items[0]["transition_key"].endswith(":gateway:opaque")
+    assert "return_route" not in run_response.json()["provenance"]
+    notification_items = notification_response.json()["items"]
+    assert notification_items
+    assert all(
+        set(item)
+        == {
+            "item_type",
+            "notification_id",
+            "kind",
+            "state",
+            "transition_version",
+        }
+        for item in notification_items
+    )
 
 
 def test_authenticated_gateway_command_starts_real_background_run(

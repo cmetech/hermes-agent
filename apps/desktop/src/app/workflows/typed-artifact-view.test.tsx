@@ -24,6 +24,7 @@ function artifact(overrides: Partial<WorkflowTypedArtifact> = {}): WorkflowTyped
   return {
     attempt_id: 'attempt-7',
     integrity_status: 'verified',
+    item_type: 'artifact',
     media_type: 'application/json',
     node_id: 'produce-report',
     output_type: 'DiagnosticReport',
@@ -31,7 +32,6 @@ function artifact(overrides: Partial<WorkflowTypedArtifact> = {}): WorkflowTyped
     publication_id: 'publication / opaque',
     recovery_status: 'verified',
     schema_fingerprint: 'schema-fingerprint',
-    session_id: 'session-9',
     sha256: 'a'.repeat(64),
     size_bytes: 1_024,
     ...overrides
@@ -122,7 +122,6 @@ describe('TypedArtifactView', () => {
     expect(screen.getByText('a'.repeat(64))).toBeTruthy()
     expect(screen.getByText('schema-fingerprint')).toBeTruthy()
     expect(screen.getByText('2026-07-30T12:00:00Z')).toBeTruthy()
-    expect(screen.getByText('session-9')).toBeTruthy()
     expect(screen.getAllByText('verified')).toHaveLength(2)
     expect(getWorkflowArtifactPreview).not.toHaveBeenCalled()
 
@@ -160,7 +159,6 @@ describe('TypedArtifactView', () => {
         produced_at: undefined,
         recovery_status: undefined,
         schema_fingerprint: undefined,
-        session_id: undefined,
         sha256: undefined,
         size_bytes: undefined
       })

@@ -43,9 +43,22 @@ export function isWorkflowTypedArtifact(item: unknown): item is WorkflowTypedArt
     return false
   }
 
-  const publicationId = (item as { publication_id?: unknown }).publication_id
+  const candidate = item as {
+    integrity_status?: unknown
+    item_type?: unknown
+    publication_id?: unknown
+    recovery_status?: unknown
+  }
 
-  return typeof publicationId === 'string' && publicationId.trim().length > 0
+  const publicationId = candidate.publication_id
+
+  return (
+    candidate.item_type === 'artifact' &&
+    candidate.integrity_status === 'verified' &&
+    candidate.recovery_status === 'verified' &&
+    typeof publicationId === 'string' &&
+    publicationId.trim().length > 0
+  )
 }
 
 function readableValue(value: null | string | undefined, fallback: string): string {
@@ -193,7 +206,6 @@ export function TypedArtifactView({ artifacts, runId }: TypedArtifactViewProps) 
             { label: copy.artifactSha256, value: readableValue(artifact.sha256, copy.artifactUnavailable) },
             { label: copy.artifactSchemaFingerprint, value: artifact.schema_fingerprint ?? null },
             { label: copy.artifactProducedAt, value: artifact.produced_at ?? null },
-            { label: copy.artifactSession, value: artifact.session_id ?? null },
             {
               label: copy.artifactIntegrity,
               value: readableValue(artifact.integrity_status, copy.artifactUnavailable)

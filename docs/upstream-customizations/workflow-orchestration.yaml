@@ -790,6 +790,76 @@ upstream_changes:
     authority projection shared by evidence REST catalog doctor notifications and
     Desktop with fail-closed client skew handling.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-closed-public-run-evidence-projections
+  change_class: workflow-desktop-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/store.py
+  - plugins/workflow/evidence.py
+  - plugins/workflow/notifications.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/lib/workflow-public-codec.ts
+  - apps/desktop/src/app/workflows/attention-inbox.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.tsx
+  - apps/desktop/src/hermes.ts
+  owned_symbols:
+  - public_run_projection
+  - public_event_projection
+  - public_attempt_projection
+  - public_artifact_projection
+  - public_cleanup_projection
+  - public_pending_interaction
+  - WorkflowRunProjection
+  - WorkflowCostBudgetProjection
+  - WorkflowAttentionInteractionProjection
+  - WorkflowEventPageProjection
+  - WorkflowEvidencePageProjection
+  - WorkflowAttentionPageProjection
+  - decodeWorkflowRun
+  - decodeWorkflowRunPage
+  - decodeWorkflowEventPage
+  - decodeWorkflowEvidencePage
+  - decodeWorkflowAttentionPage
+  - formatWorkflowEvidenceItem
+  - AttentionInbox
+  owned_invariants:
+  - public run node event interaction attempt evidence attention REST Gateway and Desktop projections copy only explicitly permitted fields
+  - provider payloads audit errors prompts commands approval text loop feedback rework reasons session identifiers and local paths remain private durable state
+  - provider and executor failures use one fixed public code and message while retries repairs and child work retain private diagnostics
+  - malformed legacy and direct SQL rows recover to generic bounded projections without traversing or copying unknown values
+  - REST response models and Desktop runtime decoders reject unknown keys scalar confusion and non-finite values
+  - public evidence rendering is discriminated and never stringifies arbitrary backend objects
+  - v1 through v4 durable snapshots and direct tail event readers retain recorded behavior while network and evidence pages use the closed projection
+  - generated run attempt publication and interaction identifiers retain exact old-client identity and existing action URLs and vocabulary remain unchanged
+  tests:
+  - tests/plugins/workflow/test_phase5_public_run_evidence_contract.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
+  - tests/plugins/workflow/test_evidence_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_phase4_surfaces.py
+  - tests/plugins/workflow/test_persistent_session_recovery.py
+  - apps/desktop/src/lib/workflow-public-codec.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/hermes.test.ts
+  expected_commit_subject: 'fix(workflow): close public run evidence projections'
+  upstream_candidate: true
+  merge_guidance: Preserve private durable diagnostics and historical snapshot readers,
+    but make every network and Desktop projection an explicit closed DTO. New public
+    fields require backend model and Desktop decoder changes in the same commit and
+    must never restore arbitrary recursive sanitization or JSON object rendering.
+  removal_condition: Remove when upstream provides an equivalent closed run event
+    evidence attention and mutation projection with fixed errors legacy recovery and
+    exact Desktop runtime decoding.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: desktop-workflow-lint-invariants
   change_class: desktop-workflow-generic
   owner: workflow-orchestration
