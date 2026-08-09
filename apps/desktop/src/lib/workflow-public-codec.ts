@@ -6,6 +6,7 @@ import type {
   WorkflowEvidencePage,
   WorkflowRunPage,
   WorkflowRunSnapshot,
+  WorkflowStructuredOutputCapabilitySummary,
   WorkflowTimelineEvent
 } from '@/types/hermes'
 
@@ -133,6 +134,13 @@ const EVIDENCE_KINDS = new Set([
   'timeline'
 ])
 
+const STRUCTURED_OUTPUT_STRATEGIES = new Set([
+  'native_json_mode',
+  'native_json_schema',
+  'prompt_json_schema',
+  'unsupported'
+])
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -143,6 +151,51 @@ function exact(value: Record<string, unknown>, keys: Set<string>): boolean {
 
 function finiteInt(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function isWorkflowStructuredOutputCapabilitySummary(
+  value: unknown
+): value is WorkflowStructuredOutputCapabilitySummary {
+  if (
+    !record(value) ||
+    !exact(value, new Set(['mixed', 'summaries', 'summaries_truncated', 'summary_count'])) ||
+    typeof value.mixed !== 'boolean' ||
+    typeof value.summaries_truncated !== 'boolean' ||
+    !finiteInt(value.summary_count) ||
+    value.summary_count < 1 ||
+    value.summary_count > 1_000_000 ||
+    !Array.isArray(value.summaries) ||
+    value.summaries.length < 1 ||
+    value.summaries.length > 16
+  ) {
+    return false
+  }
+
+  if (value.mixed !== (value.summary_count > 1)) {
+    return false
+  }
+
+  if (
+    value.summaries_truncated
+      ? value.summary_count <= 16 || value.summaries.length !== 16
+      : value.summary_count !== value.summaries.length
+  ) {
+    return false
+  }
+
+  return value.summaries.every(
+    summary =>
+      record(summary) &&
+      exact(summary, new Set(['adapter_version', 'api_mode', 'provider', 'strategy'])) &&
+      finiteInt(summary.adapter_version) &&
+      summary.adapter_version >= 1 &&
+      summary.adapter_version <= 1_000_000 &&
+      typeof summary.api_mode === 'string' &&
+      summary.api_mode.length <= 64 &&
+      typeof summary.provider === 'string' &&
+      summary.provider.length <= 64 &&
+      STRUCTURED_OUTPUT_STRATEGIES.has(String(summary.strategy))
+  )
 }
 
 function optionalString(value: unknown): boolean {

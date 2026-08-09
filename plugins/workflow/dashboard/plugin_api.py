@@ -837,6 +837,42 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         return self
 
 
+class WorkflowStructuredOutputCapabilitySummaryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal[
+        "native_json_schema",
+        "native_json_mode",
+        "prompt_json_schema",
+        "unsupported",
+    ]
+    provider: str = Field(..., max_length=64)
+    api_mode: str = Field(..., max_length=64)
+    adapter_version: StrictInt = Field(..., ge=1, le=1_000_000)
+
+
+class WorkflowStructuredOutputCapabilitySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mixed: StrictBool
+    summary_count: StrictInt = Field(..., ge=1, le=1_000_000)
+    summaries_truncated: StrictBool
+    summaries: list[WorkflowStructuredOutputCapabilitySummaryItem] = Field(
+        ..., min_length=1, max_length=16
+    )
+
+    @model_validator(mode="after")
+    def require_authoritative_summary_state(self):
+        if self.mixed != (self.summary_count > 1):
+            raise ValueError("mixed must match the authoritative summary count")
+        if self.summaries_truncated:
+            if self.summary_count <= 16 or len(self.summaries) != 16:
+                raise ValueError("truncated summaries must fill the fixed bound")
+        elif self.summary_count != len(self.summaries):
+            raise ValueError("complete summary count must match summaries")
+        return self
+
+
 class WorkflowDetailCompatibilityFinding(WorkflowCompatibilityFinding):
     model_config = ConfigDict(extra="forbid")
 
@@ -1064,6 +1100,9 @@ class WorkflowCatalogEntry(BaseModel):
         None
     )
     provider_capability: WorkflowProviderCapabilityProjection | None = None
+    structured_output_capability: (
+        WorkflowStructuredOutputCapabilitySummary | None
+    ) = None
 
     @model_validator(mode="after")
     def require_source_compatibility_projection(self):
@@ -1364,12 +1403,29 @@ def _cleanup_duration(value: str):
     }[match.group(2)]
 
 
-def _notification_destination(store: RunStore, notification_id: str) -> str:
+def _notification_destination(
+    store: RunStore,
+    notification_id: str,
+    *,
+    operator_scope: str | None = None,
+) -> str:
+    scope_clause = (
+        " AND EXISTS (SELECT 1 FROM runs WHERE "
+        "runs.run_id=workflow_notification_outbox.run_id AND "
+        "runs.operator_scope_digest=?)"
+        if operator_scope is not None
+        else ""
+    )
+    values: tuple[object, ...] = (
+        (notification_id, store._scope_digest(operator_scope))
+        if operator_scope is not None
+        else (notification_id,)
+    )
     with store._connect() as connection:
         row = connection.execute(
             "SELECT destination FROM workflow_notification_outbox "
-            "WHERE notification_id=?",
-            (notification_id,),
+            f"WHERE notification_id=?{scope_clause}",
+            values,
         ).fetchone()
     if row is None:
         raise HTTPException(
@@ -1786,12 +1842,14 @@ def lease_notifications(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require_delivery_destination("desktop")
+    authorized_scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
         items = NotificationOutbox(store).lease(
             destination="desktop",
             owner_id=client_id,
             lease_seconds=30,
             limit=limit,
+            operator_scope=authorized_scope,
         )
     return {"schema_version": 1, "items": items}
 
@@ -1819,6 +1877,7 @@ def prune_notifications(
             older_than=_cleanup_duration(request.older_than),
             authority_scope=operator.cursor_scope,
             limit=request.limit,
+            operator_scope=None if operator.unrestricted else operator.scope,
         )
     return {"schema_version": 1, "pruned": pruned}
 
@@ -1831,11 +1890,15 @@ def retry_dead_notification(
 ):
     operator = _verified_operator(request_context, operator_scope)
     operator.require("admin")
+    authorized_scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
-        _notification_destination(store, notification_id)
+        _notification_destination(
+            store, notification_id, operator_scope=authorized_scope
+        )
         applied = NotificationOutbox(store).retry_dead(
             notification_id,
             operator.cursor_scope,
+            operator_scope=authorized_scope,
         )
     if not applied:
         raise HTTPException(
@@ -1852,12 +1915,17 @@ def acknowledge_notification(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
+    authorized_scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
         operator.require_delivery_destination(
-            _notification_destination(store, notification_id)
+            _notification_destination(
+                store, notification_id, operator_scope=authorized_scope
+            )
         )
         applied = NotificationOutbox(store).ack(
-            notification_id, owner_id=request.client_id
+            notification_id,
+            owner_id=request.client_id,
+            operator_scope=authorized_scope,
         )
     if not applied:
         raise HTTPException(
@@ -1874,14 +1942,18 @@ def fail_notification(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
+    authorized_scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
         operator.require_delivery_destination(
-            _notification_destination(store, notification_id)
+            _notification_destination(
+                store, notification_id, operator_scope=authorized_scope
+            )
         )
         applied = NotificationOutbox(store).fail(
             notification_id,
             owner_id=request.client_id,
             error=request.error or "projection_failed",
+            operator_scope=authorized_scope,
         )
     if not applied:
         raise HTTPException(
@@ -1898,12 +1970,17 @@ def dismiss_notification_projection(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
+    authorized_scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
         operator.require_delivery_destination(
-            _notification_destination(store, notification_id)
+            _notification_destination(
+                store, notification_id, operator_scope=authorized_scope
+            )
         )
         applied = NotificationOutbox(store).dismiss(
-            notification_id, owner_id=request.client_id
+            notification_id,
+            owner_id=request.client_id,
+            operator_scope=authorized_scope,
         )
     if not applied:
         raise HTTPException(

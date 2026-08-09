@@ -44,24 +44,40 @@ def _module():
     return module
 
 
-def _app(router, *, scopes=("workflow:admin",), principal="desktop-client"):
+def _app(
+    router,
+    *,
+    scopes=("workflow:admin",),
+    principal="desktop-client",
+    local_admin: bool = False,
+):
     app = FastAPI()
 
     @app.middleware("http")
     async def authenticated(request, call_next):
-        request.state.token_principal = TokenPrincipal(
-            principal=principal,
-            provider="test",
-            scopes=tuple(scopes),
-        )
-        request.state.token_authenticated = True
+        if local_admin:
+            request.state.local_admin_authenticated = True
+        else:
+            request.state.token_principal = TokenPrincipal(
+                principal=principal,
+                provider="test",
+                scopes=tuple(scopes),
+            )
+            request.state.token_authenticated = True
         return await call_next(request)
 
     app.include_router(router, prefix="/api/plugins/workflow")
     return app
 
 
-def _terminal_run(store, tmp_path, workflow_writer, *, name: str) -> str:
+def _terminal_run(
+    store,
+    tmp_path,
+    workflow_writer,
+    *,
+    name: str,
+    operator_scope: str | None = None,
+) -> str:
     package = load_workflow(workflow_writer(tmp_path / name, name=name))
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -73,11 +89,153 @@ def _terminal_run(store, tmp_path, workflow_writer, *, name: str) -> str:
             trigger_source="cli",
             idempotency_key=name,
             concurrency_key=name,
+            operator_scope=operator_scope,
         ),
         immutable_snapshot=prepared,
     )
     RunScheduler(store).advance(admitted.run_id)
     return admitted.run_id
+
+
+def test_desktop_delivery_is_operator_scoped_with_unrestricted_local_admin(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "operator-scoped-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = RunStore(home)
+    scopes = {
+        "alice": "service:test:alice",
+        "bob": "service:test:bob",
+    }
+    run_ids = {
+        principal: _terminal_run(
+            store,
+            tmp_path,
+            workflow_writer,
+            name=f"delivery-{principal}",
+            operator_scope=scope,
+        )
+        for principal, scope in scopes.items()
+    }
+    outbox = NotificationOutbox(store)
+    notification_ids = {
+        principal: [
+            outbox.record(
+                run_id=run_ids[principal],
+                kind=kind,
+                destination="desktop",
+                transition_version=index,
+                payload={},
+                now=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            )
+            for index, kind in enumerate(
+                ("approval_required", "input_required", "cancellation"),
+                start=1,
+            )
+        ]
+        for principal in scopes
+    }
+    for principal in scopes:
+        leased = outbox.lease(
+            destination="desktop",
+            owner_id=f"stale-{principal}",
+            now=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            lease_seconds=1,
+            limit=3,
+            operator_scope=scopes[principal],
+        )
+        assert {item["notification_id"] for item in leased} == set(
+            notification_ids[principal]
+        )
+
+    module = _module()
+    alice = TestClient(
+        _app(module.router, scopes=("workflow:delivery",), principal="alice")
+    )
+    bob = TestClient(
+        _app(module.router, scopes=("workflow:delivery",), principal="bob")
+    )
+
+    alice_lease = alice.get(
+        "/api/plugins/workflow/notifications/lease?client_id=alice-client"
+    )
+    assert alice_lease.status_code == 200
+    assert {
+        item["notification_id"] for item in alice_lease.json()["items"]
+    } == set(notification_ids["alice"])
+    with store._connect() as connection:
+        bob_rows = connection.execute(
+            "SELECT state, lease_owner FROM workflow_notification_outbox "
+            "WHERE run_id=? AND notification_id IN (?, ?, ?) "
+            "ORDER BY notification_id",
+            (run_ids["bob"], *notification_ids["bob"]),
+        ).fetchall()
+    assert {(row["state"], row["lease_owner"]) for row in bob_rows} == {
+        ("leased", "stale-bob")
+    }
+
+    nonexistent = alice.post(
+        "/api/plugins/workflow/notifications/missing-notification/ack",
+        json={"client_id": "alice-client"},
+    )
+    for suffix, foreign_id in zip(
+        ("ack", "fail", "dismiss"), notification_ids["bob"], strict=True
+    ):
+        foreign = alice.post(
+            f"/api/plugins/workflow/notifications/{foreign_id}/{suffix}",
+            json={"client_id": "alice-client"},
+        )
+        assert foreign.status_code == nonexistent.status_code == 404
+        assert foreign.json() == nonexistent.json() == {
+            "detail": {"code": "notification_not_found"}
+        }
+
+    for suffix, own_id in zip(
+        ("ack", "fail", "dismiss"), notification_ids["alice"], strict=True
+    ):
+        response = alice.post(
+            f"/api/plugins/workflow/notifications/{own_id}/{suffix}",
+            json={"client_id": "alice-client"},
+        )
+        assert response.status_code == 200
+
+    bob_lease = bob.get(
+        "/api/plugins/workflow/notifications/lease?client_id=bob-client"
+    )
+    assert bob_lease.status_code == 200
+    assert {item["notification_id"] for item in bob_lease.json()["items"]} == set(
+        notification_ids["bob"]
+    )
+    bob_ack = bob.post(
+        f"/api/plugins/workflow/notifications/{notification_ids['bob'][0]}/ack",
+        json={"client_id": "bob-client"},
+    )
+    assert bob_ack.status_code == 200
+
+    unrestricted_ids = {
+        outbox.record(
+            run_id=run_ids[principal],
+            kind="completion",
+            destination="desktop",
+            transition_version=99,
+            payload={"status": "succeeded"},
+        )
+        for principal in scopes
+    }
+    local_admin = TestClient(_app(module.router, local_admin=True))
+    unrestricted = local_admin.get(
+        "/api/plugins/workflow/notifications/lease?client_id=local-admin"
+    )
+    assert unrestricted.status_code == 200
+    assert unrestricted_ids <= {
+        item["notification_id"] for item in unrestricted.json()["items"]
+    }
+    for notification_id in unrestricted_ids:
+        receipt = local_admin.post(
+            f"/api/plugins/workflow/notifications/{notification_id}/ack",
+            json={"client_id": "local-admin"},
+        )
+        assert receipt.status_code == 200
 
 
 @pytest.mark.parametrize("outbox_state", ["pending", "leased", "dead"])
@@ -151,7 +309,7 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
         transition_version=2,
         payload={"workflow": "review", "interaction_id": "gate"},
     )
-    client = TestClient(_app(_module().router))
+    client = TestClient(_app(_module().router, local_admin=True))
 
     lease = client.get(
         "/api/plugins/workflow/notifications/lease?client_id=electron-stable"
@@ -187,7 +345,7 @@ def test_desktop_projection_failure_retains_fixed_fallback_reason(
         transition_version=1,
         payload={"status": "succeeded"},
     )
-    client = TestClient(_app(_module().router))
+    client = TestClient(_app(_module().router, local_admin=True))
     lease = client.get(
         "/api/plugins/workflow/notifications/lease?client_id=electron-projection"
     )
@@ -219,7 +377,7 @@ def test_desktop_projection_failure_normalizes_free_form_detail(
         payload={"status": "succeeded"},
     )
     canary = "private desktop provider session /path history"
-    client = TestClient(_app(_module().router))
+    client = TestClient(_app(_module().router, local_admin=True))
     lease = client.get(
         "/api/plugins/workflow/notifications/lease?client_id=electron-free-form"
     )
@@ -248,7 +406,7 @@ def test_dismissal_records_presentation_only(tmp_path, monkeypatch):
         transition_version=3,
         payload={},
     )
-    client = TestClient(_app(_module().router))
+    client = TestClient(_app(_module().router, local_admin=True))
     client.get("/api/plugins/workflow/notifications/lease?client_id=electron")
 
     response = client.post(
@@ -263,13 +421,21 @@ def test_dismissal_records_presentation_only(tmp_path, monkeypatch):
 
 
 def test_delivery_scope_can_lease_its_bound_desktop_projection(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    outbox = NotificationOutbox(RunStore(home))
+    store = RunStore(home)
+    run_id = _terminal_run(
+        store,
+        tmp_path,
+        workflow_writer,
+        name="run-delivery",
+        operator_scope="service:test:desktop-client",
+    )
+    outbox = NotificationOutbox(store)
     notification_id = outbox.record(
-        run_id="run-delivery",
+        run_id=run_id,
         kind="approval_required",
         destination="desktop",
         transition_version=1,
@@ -285,13 +451,21 @@ def test_delivery_scope_can_lease_its_bound_desktop_projection(
 
 
 def test_delivery_scope_cannot_ack_another_bound_destination(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    outbox = NotificationOutbox(RunStore(home))
+    store = RunStore(home)
+    run_id = _terminal_run(
+        store,
+        tmp_path,
+        workflow_writer,
+        name="run-gateway",
+        operator_scope="service:test:desktop-client",
+    )
+    outbox = NotificationOutbox(store)
     notification_id = outbox.record(
-        run_id="run-gateway",
+        run_id=run_id,
         kind="approval_required",
         destination="gateway:verified-route",
         transition_version=1,
@@ -316,7 +490,7 @@ def test_delivery_scope_cannot_ack_another_bound_destination(
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "workflow_delivery_scope_mismatch"
-    assert outbox.history(run_id="run-gateway")[0]["state"] == "leased"
+    assert outbox.history(run_id=run_id)[0]["state"] == "leased"
 
 
 def test_dead_letter_admin_retry_ack_clears_cleanup_dependency(
@@ -325,7 +499,13 @@ def test_dead_letter_admin_retry_ack_clears_cleanup_dependency(
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     store = RunStore(home)
-    run_id = _terminal_run(store, tmp_path, workflow_writer, name="dead-retry")
+    run_id = _terminal_run(
+        store,
+        tmp_path,
+        workflow_writer,
+        name="dead-retry",
+        operator_scope="service:test:desktop-client",
+    )
     outbox = NotificationOutbox(store)
     now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
     notification_id = outbox.record(
@@ -419,7 +599,7 @@ def test_notification_prune_requires_admin_authority(tmp_path, monkeypatch) -> N
     assert denied.status_code == 403
     assert denied.json()["detail"]["code"] == "workflow_admin_required"
 
-    allowed = TestClient(_app(module.router)).post(
+    allowed = TestClient(_app(module.router, local_admin=True)).post(
         "/api/plugins/workflow/notifications/prune",
         json={"older_than": "0d", "limit": 20},
     )

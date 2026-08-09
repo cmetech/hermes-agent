@@ -202,6 +202,20 @@ export interface WorkflowProviderCapabilityProjection {
   warning_codes: string[]
 }
 
+export interface WorkflowStructuredOutputCapabilitySummaryItem {
+  adapter_version: number
+  api_mode: string
+  provider: string
+  strategy: 'native_json_mode' | 'native_json_schema' | 'prompt_json_schema' | 'unsupported'
+}
+
+export interface WorkflowStructuredOutputCapabilitySummary {
+  mixed: boolean
+  summaries: WorkflowStructuredOutputCapabilitySummaryItem[]
+  summaries_truncated: boolean
+  summary_count: number
+}
+
 export interface WorkflowDefinition {
   compatibility?: { level: string; runnable?: boolean }
   description: string
@@ -216,6 +230,7 @@ export interface WorkflowDefinition {
   supported_inputs: WorkflowDefinitionInputSupport
   trust_state: WorkflowTrustState
   version: string
+  structured_output_capability?: WorkflowStructuredOutputCapabilitySummary
 }
 
 export interface WorkflowDefinitionError {

@@ -6,7 +6,8 @@ import {
   decodeWorkflowEvidencePage,
   decodeWorkflowRun,
   decodeWorkflowRunPage,
-  formatWorkflowEvidenceItem
+  formatWorkflowEvidenceItem,
+  isWorkflowStructuredOutputCapabilitySummary
 } from './workflow-public-codec'
 
 const run = {
@@ -31,7 +32,34 @@ const run = {
   workflow: 'portable'
 }
 
+const structuredOutputCapability = {
+  mixed: false,
+  summaries: [
+    {
+      adapter_version: 1,
+      api_mode: 'codex_responses',
+      provider: 'openai',
+      strategy: 'native_json_schema'
+    }
+  ],
+  summaries_truncated: false,
+  summary_count: 1
+}
+
 describe('workflow public codecs', () => {
+  it('accepts only the exact backend structured-output catalog projection', () => {
+    expect(isWorkflowStructuredOutputCapabilitySummary(structuredOutputCapability)).toBe(true)
+    expect(isWorkflowStructuredOutputCapabilitySummary({ ...structuredOutputCapability, private_extra: 'rejected' })).toBe(
+      false
+    )
+    expect(
+      isWorkflowStructuredOutputCapabilitySummary({
+        ...structuredOutputCapability,
+        summaries: [{ ...structuredOutputCapability.summaries[0], private_extra: 'rejected' }]
+      })
+    ).toBe(false)
+  })
+
   it('accepts only closed run and run-page objects', () => {
     expect(decodeWorkflowRun(run)).toEqual(run)
     expect(decodeWorkflowRunPage({ next_cursor: null, runs: [run], schema_version: 1 })).toEqual({

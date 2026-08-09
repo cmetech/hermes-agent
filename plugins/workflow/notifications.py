@@ -1146,6 +1146,7 @@ class NotificationOutbox:
         now: datetime | None = None,
         lease_seconds: float = 30,
         limit: int = 20,
+        operator_scope: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         if not owner_id or len(owner_id) > 256:
             raise ValueError("owner_id must be bounded text")
@@ -1154,19 +1155,31 @@ class NotificationOutbox:
         observed = self._aware(now or datetime.now(timezone.utc))
         timestamp = observed.isoformat()
         expires = (observed + timedelta(seconds=lease_seconds)).isoformat()
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "UPDATE workflow_notification_outbox SET state='pending', "
                 "lease_owner=NULL, lease_expires_at=NULL WHERE state='leased' "
-                "AND lease_expires_at<=?",
-                (timestamp,),
+                f"AND lease_expires_at<=?{scope_clause}",
+                (timestamp, *scope_values),
             )
             rows = connection.execute(
                 "SELECT * FROM workflow_notification_outbox WHERE destination=? "
                 "AND state='pending' AND available_at<=? "
-                "ORDER BY created_at, notification_id LIMIT ?",
-                (destination, timestamp, limit),
+                f"{scope_clause} ORDER BY created_at, notification_id LIMIT ?",
+                (destination, timestamp, *scope_values, limit),
             ).fetchall()
             ids = [row["notification_id"] for row in rows]
             for notification_id in ids:
@@ -1273,14 +1286,34 @@ class NotificationOutbox:
             connection.commit()
         return True
 
-    def ack(self, notification_id: str, *, owner_id: str, now: datetime | None = None) -> bool:
+    def ack(
+        self,
+        notification_id: str,
+        *,
+        owner_id: str,
+        now: datetime | None = None,
+        operator_scope: str | None = None,
+    ) -> bool:
         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             changed = connection.execute(
                 "UPDATE workflow_notification_outbox SET state='delivered', "
                 "delivered_at=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL "
-                "WHERE notification_id=? AND state='leased' AND lease_owner=?",
-                (timestamp, timestamp, notification_id, owner_id),
+                "WHERE notification_id=? AND state='leased' AND lease_owner=?"
+                f"{scope_clause}",
+                (timestamp, timestamp, notification_id, owner_id, *scope_values),
             ).rowcount
         return changed == 1
 
@@ -1291,15 +1324,29 @@ class NotificationOutbox:
         owner_id: str,
         error: str,
         now: datetime | None = None,
+        operator_scope: str | None = None,
     ) -> bool:
         observed = self._aware(now or datetime.now(timezone.utc))
         failure_reason = _stable_delivery_failure_reason(error)
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM workflow_notification_outbox WHERE "
-                "notification_id=? AND state='leased' AND lease_owner=?",
-                (notification_id, owner_id),
+                "notification_id=? AND state='leased' AND lease_owner=?"
+                f"{scope_clause}",
+                (notification_id, owner_id, *scope_values),
             ).fetchone()
             if row is None:
                 return False
@@ -1339,16 +1386,29 @@ class NotificationOutbox:
         authority_scope: str,
         *,
         now: datetime | None = None,
+        operator_scope: str | None = None,
     ) -> bool:
         scope = self._authority_scope(authority_scope)
         observed = self._aware(now or datetime.now(timezone.utc))
         timestamp = observed.isoformat()
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM workflow_notification_outbox "
-                "WHERE notification_id=? AND state='dead'",
-                (notification_id,),
+                f"WHERE notification_id=? AND state='dead'{scope_clause}",
+                (notification_id, *scope_values),
             ).fetchone()
             if row is None:
                 connection.rollback()
@@ -1383,6 +1443,7 @@ class NotificationOutbox:
         authority_scope: str,
         limit: int = 200,
         now: datetime | None = None,
+        operator_scope: str | None = None,
     ) -> int:
         scope = self._authority_scope(authority_scope)
         if not isinstance(older_than, timedelta) or older_than < timedelta(0):
@@ -1392,15 +1453,28 @@ class NotificationOutbox:
         observed = self._aware(now or datetime.now(timezone.utc))
         timestamp = observed.isoformat()
         cutoff = (observed - older_than).isoformat()
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 "SELECT * FROM workflow_notification_outbox WHERE "
                 "(state='delivered' OR dismissed_at IS NOT NULL) AND "
                 "COALESCE(dismissed_at, delivered_at, updated_at)<=? "
-                "ORDER BY COALESCE(dismissed_at, delivered_at, updated_at), "
+                f"{scope_clause} ORDER BY "
+                "COALESCE(dismissed_at, delivered_at, updated_at), "
                 "notification_id LIMIT ?",
-                (cutoff, limit),
+                (cutoff, *scope_values, limit),
             ).fetchall()
             for row in rows:
                 self._record_decision_fact(
@@ -1426,14 +1500,32 @@ class NotificationOutbox:
         return len(rows)
 
     def dismiss(
-        self, notification_id: str, *, owner_id: str, now: datetime | None = None
+        self,
+        notification_id: str,
+        *,
+        owner_id: str,
+        now: datetime | None = None,
+        operator_scope: str | None = None,
     ) -> bool:
         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE "
+            "runs.run_id=workflow_notification_outbox.run_id AND "
+            "runs.operator_scope_digest=?)"
+            if operator_scope is not None
+            else ""
+        )
+        scope_values: tuple[object, ...] = (
+            (self.store._scope_digest(operator_scope),)
+            if operator_scope is not None
+            else ()
+        )
         with self.store._connect() as connection:
             changed = connection.execute(
                 "UPDATE workflow_notification_outbox SET dismissed_at=?, updated_at=? "
-                "WHERE notification_id=? AND (lease_owner=? OR state='delivered')",
-                (timestamp, timestamp, notification_id, owner_id),
+                "WHERE notification_id=? AND (lease_owner=? OR state='delivered')"
+                f"{scope_clause}",
+                (timestamp, timestamp, notification_id, owner_id, *scope_values),
             ).rowcount
         return changed == 1
 

@@ -31,7 +31,10 @@ describe('workflow catalog authenticated API', () => {
   let apiStructured: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
-    apiStructured = vi.fn().mockResolvedValue({ ok: true, value: {} })
+    apiStructured = vi.fn().mockResolvedValue({
+      ok: true,
+      value: { items: [], truncated: false }
+    })
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
       value: { apiStructured }
@@ -55,6 +58,32 @@ describe('workflow catalog authenticated API', () => {
       path: '/api/plugins/workflow/workflows',
       profile: 'remote-profile'
     })
+  })
+
+  it('rejects a malformed backend structured-output catalog projection', async () => {
+    apiStructured.mockResolvedValue({
+      ok: true,
+      value: {
+        items: [
+          {
+            name: 'structured',
+            structured_output_capability: {
+              mixed: false,
+              private_extra: 'rejected',
+              summaries: [],
+              summaries_truncated: false,
+              summary_count: 1
+            }
+          }
+        ],
+        truncated: false
+      }
+    })
+    const { listWorkflowDefinitions } = await workflowApi()
+
+    await expect(listWorkflowDefinitions()).rejects.toThrow(
+      'Workflow structured-output capability projection is invalid.'
+    )
   })
 
   it('uses an explicitly captured profile instead of mutable ambient profile state', async () => {
