@@ -279,3 +279,56 @@ blockers. The only non-blocking operational risk is the documented pair of
 non-reproducing full-suite timing failures under saturated parallel load; both
 complete affected files pass independently, and the full no-retry suite has a
 32,641/32,641 green result at the exact code SHA.
+
+## Superseding adversarial status — 2026-08-08
+
+The Final disposition above records the truthful pre-adversarial state at
+`1373c306061d2f4a2cf1dd313df16f6453fa1939`; it is preserved as historical
+evidence. It was superseded on 2026-08-07 when the independent Fable review
+reproduced four defects and issued **BLOCK**:
+
+- F-1 High: v5 cross-node `context: shared` was structurally incompatible.
+- F-2 High: structured repair omitted sealed route and option authority.
+- F-3 Medium: canonical/alias collisions bypassed precedence and diagnostics.
+- F-4 Medium: same-trust-class endpoint drift was not compared exactly.
+
+The remediation commits are:
+
+- F-4 and generic sealed-transport hardening: `dcd0a458c`, `370365328`,
+  `e26adc848`, `c9ce20b5e`, `359936f3a`, `e1c7ca745`, `7001ca3fe`,
+  `3c4c70e87`, `b1ddafe67`, `8f5fbf04c`, `98bc4403f`, and `1761d273e`.
+- F-2: `ce7ccfbd6` and `e4387d214`.
+- F-1: `34de47885` and `c32f5c7e4`.
+- F-3 and registry-consumer convergence: `2aeb1ada1`, `3ddd306fa`,
+  `e33d589b4`, `f7c390b90`, `d4ddbc989`, and `d6960baa0`.
+
+Fresh Task 5 evidence, with retries disabled:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/run_tests.sh tests/plugins/workflow/test_phase5_adversarial_remediation.py -q
+```
+
+Result: **15 passed, 0 failed in 1.2s**.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/run_tests.sh tests/plugins/workflow/test_phase5_adversarial_remediation.py tests/plugins/workflow/test_phase4_defensive_invariants.py tests/plugins/workflow/test_phase5_execution_context.py tests/plugins/workflow/test_phase5_hooks.py tests/plugins/workflow/test_phase5_mcp.py tests/plugins/workflow/test_node_skills.py tests/plugins/workflow/test_phase5_inline_limits.py tests/plugins/workflow/test_phase5_cost_budget.py tests/plugins/workflow/test_phase5_provider_authority.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_phase5_surfaces.py -q
+```
+
+Result: **11 files, 199 passed, 0 failed in 3.9s**.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/run_tests.sh tests/scripts/test_workflow_merge_gate.py -q
+```
+
+Result: **49 passed, 0 failed in 47.0s** after pinning the new defensive suite
+into the explicit base-gate inventory and correcting Phase 5 ledger prose to
+traced machine-locatable identifiers. The upstream baseline was not advanced.
+
+The bounded review over `1373c306..d6960baa` found no new Critical, Important,
+or Minor defect. Full finding-by-finding evidence and residual risks are in
+`2026-08-08-workflow-language-phase-5-adversarial-remediation.md`.
+
+**Current status remains BLOCK.** F-1 through F-4 are implemented and locally
+verified, but the BLOCK is not cleared until Task 6 completes fresh independent
+specification-compliance and code-quality reviews plus the full distribution,
+Desktop, upstream, and branded-rehearsal gates at one exact final candidate.

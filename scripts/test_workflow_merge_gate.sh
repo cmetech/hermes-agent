@@ -418,6 +418,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase3_bash_descriptor_faults.py \
       tests/plugins/workflow/test_phase3_bash_reference_ordering.py \
       tests/plugins/workflow/test_phase5_admission_parity.py \
+      tests/plugins/workflow/test_phase5_adversarial_remediation.py \
       tests/plugins/workflow/test_phase5_cost_budget.py \
       tests/plugins/workflow/test_phase5_execution_context.py \
       tests/plugins/workflow/test_phase5_hooks.py \

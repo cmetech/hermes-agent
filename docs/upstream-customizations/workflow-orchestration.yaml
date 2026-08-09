@@ -368,29 +368,31 @@ upstream_changes:
   - model_visible_prefix_digest
   - AIAgent.seal_model_visible_prefix
   - AIAgent.verify_model_visible_prefix
-  - AIAgent private execution_route_constraint transport pin
+  - _execution_route_constraint
   - AIAgent._assert_execution_route_constraint
-  - AIAgent._replace_primary_openai_client atomic candidate-state adoption
-  - AIAgent._publish_pending_anthropic_candidate atomic candidate-state adoption
-  - AIAgent._refresh_anthropic_credentials_for_turn sealed acquisition owner
-  - AIAgent generation-scoped pending sealed credential adoption lifecycle
-  - _PendingSealedCredentialAdoption immutable private candidate snapshot
-  - _CredentialRecoveryTurnState turn-owned authentication retry accounting
-  - _CredentialRefreshStatus and _CandidateAttemptResult adoption outcomes
-  - candidate-safe OpenAI construction close and retirement diagnostics
-  - candidate-safe Anthropic construction close and retirement diagnostics
-  - recover_with_credential_pool explicit client-adoption result
-  - ProviderCapabilityDriftError bounded pre-transport failure
-  - execution_endpoint_sha256 effective SDK endpoint reconstruction
-  - sealed Bedrock endpoint-pinned client construction
-  - Relay managed stream callback error identity preservation
+  - AIAgent._replace_primary_openai_client
+  - AIAgent._publish_pending_anthropic_candidate
+  - AIAgent._refresh_anthropic_credentials_for_turn
+  - AIAgent._adopt_pending_sealed_openai_candidate
+  - _PendingSealedCredentialAdoption
+  - _CredentialRecoveryTurnState
+  - _CredentialRefreshStatus
+  - _CandidateAttemptResult
+  - AIAgent._retire_shared_openai_client
+  - AIAgent._retire_adopted_prior_client
+  - recover_with_credential_pool
+  - ProviderCapabilityDriftError
+  - execution_endpoint_sha256
+  - _get_bedrock_runtime_client
+  - build_anthropic_bedrock_client
+  - ManagedLlmStream._callback_error
   - PluginAgentRunRequest
   - _phase5_structured_repair_matches_admission
   - phase5_node_intended_authority_digest
   - phase5_shared_context_compatibility_digest
   - phase5_session_cache_fingerprint
   - NodeExecutionContext.shared_context_compatibility_digest
-  - RunScheduler._predecessor_results winning-attempt identity reader
+  - RunScheduler._predecessor_results
   - NodeSessionRecord
   - _language_has_phase4_semantics
   - ApprovalExecutor.execute
@@ -681,7 +683,7 @@ upstream_changes:
   - ProviderOptionTransport
   - encode_provider_option_transport
   - resolve_workflow_provider_authority
-  - WorkflowResolvedProviderRoute schema-2 endpoint identity
+  - WorkflowResolvedProviderRoute
   - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
   - _hook_operations_supported
   - NodeExecutionContext
