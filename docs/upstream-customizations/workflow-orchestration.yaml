@@ -857,7 +857,7 @@ upstream_changes:
   owned_invariants:
   - public run node event interaction attempt evidence attention REST Gateway and Desktop projections copy only explicitly permitted fields
   - provider payloads audit errors prompts commands approval text loop feedback rework reasons session identifiers and local paths remain private durable state
-  - provider and executor failures use one fixed public error and message while only execution_integrity and package_mcp_unavailable retain bounded pre-transport attempt codes and retries repairs child work and all other diagnostics remain private
+  - provider and executor failures use one fixed public error and message while only execution_integrity and package_mcp_unavailable retain bounded pre-transport attempt codes, successful and redacted attempts accept the backend's explicit null optional code, and retries repairs child work and all other diagnostics remain private
   - timeline payload truncation retains one boolean marker without restoring the private payload
   - only verified typed-publication descriptor-v2 rows expose publication identity while canonical backend serialization omits it for visible legacy artifacts and Desktop tolerates only omitted or null legacy identity without treating it as previewable typed output
   - malformed legacy and direct SQL rows recover to generic bounded projections without traversing or copying unknown values

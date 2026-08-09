@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import type { WorkflowAttemptEvidence } from '@/types/hermes'
+
 import {
   decodeWorkflowAttentionPage,
   decodeWorkflowEventPage,
@@ -113,6 +115,61 @@ describe('workflow public codecs', () => {
     const page = {
       next_cursor: null,
       runs: [{ ...run, artifacts: [serializedLegacyArtifact] }],
+      schema_version: 1
+    }
+
+    expect(decodeWorkflowRunPage(page)).toEqual(page)
+  })
+
+  it('accepts a FastAPI-serialized successful attempt whose optional error code is null', () => {
+    const serializedAttempt = {
+      attempt_id: 'attempt-1',
+      completed_at: '2026-08-09T17:06:40Z',
+      cost_budget: null,
+      error: null,
+      error_code: null,
+      item_type: 'attempt',
+      next_attempt_at: null,
+      node_id: 'work',
+      provider_authority: null,
+      retry: {
+        additional_provider_attempts: 0,
+        capped: false,
+        effective_total_attempts: 1,
+        remaining_attempts: 0,
+        requested_retries: 0,
+        requested_total_attempts: 1,
+        retry_consumed: 0
+      },
+      started_at: '2026-08-09T17:06:39Z',
+      state: 'succeeded'
+    } satisfies WorkflowAttemptEvidence
+    const page = {
+      next_cursor: null,
+      runs: [
+        {
+          ...run,
+          attempts: 1,
+          current_nodes: [],
+          nodes: {
+            work: {
+              approval_rework_attempts: null,
+              attempt_count: 1,
+              attempts: [serializedAttempt],
+              completed_at: '2026-08-09T17:06:40Z',
+              depends_on: [],
+              error: null,
+              id: 'work',
+              next_attempt_at: null,
+              pending_interaction: null,
+              retry_consumed: null,
+              started_at: '2026-08-09T17:06:39Z',
+              state: 'succeeded'
+            }
+          },
+          status: 'succeeded'
+        }
+      ],
       schema_version: 1
     }
 

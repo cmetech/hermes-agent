@@ -307,7 +307,9 @@ function attempt(value: unknown): value is WorkflowAttemptEvidence {
     NODE_STATES.has(String(value.state)) &&
     retry(value.retry) &&
     (value.error === undefined || value.error === null || closedError(value.error)) &&
-    (value.error_code === undefined || ATTEMPT_ERROR_CODES.has(String(value.error_code))) &&
+    (value.error_code === undefined ||
+      value.error_code === null ||
+      ATTEMPT_ERROR_CODES.has(String(value.error_code))) &&
     optionalString(value.started_at) &&
     optionalString(value.completed_at) &&
     optionalString(value.next_attempt_at) &&
