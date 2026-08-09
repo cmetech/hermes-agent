@@ -264,6 +264,7 @@ upstream_changes:
   - tests/hermes_cli/test_inventory.py
   - tests/hermes_cli/test_provider_capabilities.py
   - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_provider_token_convergence.py
   - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
   - tests/hermes_cli/test_web_server.py
@@ -282,6 +283,7 @@ upstream_changes:
   - _ExecutionProviderAuthority shared runtime registration resolution
   - _static_execution_provider credential-free compatibility canonicalization
   - PUBLIC_PROVIDER_COMPATIBILITY_ALIASES immutable shared fallback authority
+  - ProviderSelectorResolution and resolve_provider_selector finite token authority
   - bounded public-safe provider collision diagnostics
   - explicit route then provider-profile endpoint precedence
   owned_invariants:
@@ -295,11 +297,14 @@ upstream_changes:
   - runtime registration resolution checks the raw token first then the existing static compatibility canonical target once and shares that winner across endpoint fallback trust and provenance
   - credential-free runtime classification canonicalizes registry misses with the same immutable compatibility aliases as public auth and never consults config auth stores credential pools environment secrets or credential probes; unregistered auto remains unresolved
   - public auth and pure model normalization have canonical parity for every compatibility alias not supplied by the provider registry
+  - every registered canonical token registered alias and public compatibility token has one registry-first winner across auth runtime provider detail model parsing and ACP
+  - provider-registry discovery failure remains a visible failure and can never be reclassified as an ordinary immutable compatibility miss
   tests:
   - tests/hermes_cli/test_execution_runtime_capabilities.py
   - tests/hermes_cli/test_inventory.py
   - tests/hermes_cli/test_provider_capabilities.py
   - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_provider_token_convergence.py
   - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
   - tests/hermes_cli/test_runtime_provider_resolution.py
   - tests/hermes_cli/test_web_server.py
@@ -397,9 +402,11 @@ upstream_changes:
   - NodeSessionRecord
   - _language_has_phase4_semantics
   - ApprovalExecutor.execute
+  - PluginAgentRunRequest.sealed_runtime_authority_required
   owned_invariants:
   - normalizer-v5 execution uses only the authenticated sealed provider model and option route
   - plugin-agent intended authority and expected runtime identity are accepted only as a complete pair while legacy requests may omit both
+  - every normalizer-v5 primary approval structured-repair inline-agent and fallback constructor marks sealed runtime authority as required so deleting its identity tuple cannot downgrade into the generic legacy wire contract
   - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
   - current normalized endpoint digest must exactly match sealed authority before MCP startup agent construction fallback or provider transport
   - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
@@ -463,6 +470,7 @@ upstream_changes:
   - tests/agent/test_credential_pool_routing.py
   - tests/agent/test_provider_attempt_transport.py
   - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_phase5_identity_convergence.py
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
   upstream_candidate: true

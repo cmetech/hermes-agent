@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
+from hermes_cli.provider_aliases import resolve_provider_selector
 
 logger = logging.getLogger(__name__)
 
@@ -948,7 +949,8 @@ def resolve_provider_full(
     ):
         return _provider_def_from_plugin_profile(registry_profile)
 
-    canonical = normalize_provider(name)
+    selector = resolve_provider_selector(raw)
+    canonical = normalize_provider(selector.provider)
     if registry_profile is not None and registry_profile.name != canonical:
         return _provider_def_from_plugin_profile(registry_profile)
 

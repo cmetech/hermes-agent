@@ -50,7 +50,7 @@ from hermes_cli.config import (
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
-from hermes_cli.provider_aliases import PUBLIC_PROVIDER_COMPATIBILITY_ALIASES
+from hermes_cli.provider_aliases import resolve_provider_selector
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -1968,23 +1968,10 @@ def resolve_provider(
     """
     normalized = (requested or "auto").strip().lower()
 
-    # The provider registry is the authority for both canonical names and
-    # aliases. In particular, canonical registration must beat an older alias
-    # claim (for example a user provider named ``or`` versus OpenRouter's
-    # bundled alias). Return the winning canonical profile name directly so
-    # this public resolver cannot reconstruct a different owner.
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-
-        _profile = _get_provider_profile(normalized)
-    except Exception:
-        _profile = None
-    if _profile is not None:
-        return _profile.name
-
-    # Compatibility aliases without a declarative provider profile retain
-    # their historical routing. Registry-owned tokens never reach this map.
-    normalized = PUBLIC_PROVIDER_COMPATIBILITY_ALIASES.get(normalized, normalized)
+    selector = resolve_provider_selector(normalized)
+    if selector.source == "registry":
+        return selector.provider
+    normalized = selector.provider
 
     if normalized == "openrouter":
         return "openrouter"

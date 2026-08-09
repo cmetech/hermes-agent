@@ -481,6 +481,7 @@ class PluginAgentRunRequest:
     model: str | None = None
     context_mode: Literal["fresh", "shared"] = "fresh"
     session_id: str | None = None
+    sealed_runtime_authority_required: bool = False
     intended_authority_digest: str | None = None
     expected_model_visible_prefix_digest: str | None = None
     expected_runtime_identity: Mapping[str, str] | None = None
@@ -592,6 +593,8 @@ class PluginAgentRunRequest:
             "term_grace_seconds": self.term_grace_seconds,
             "kill_reap_grace_seconds": self.kill_reap_grace_seconds,
         }
+        if self.sealed_runtime_authority_required:
+            payload["sealed_runtime_authority_required"] = True
         if self._provider_attempt_authority is not None:
             payload["_provider_attempt_authority"] = _wire_json(
                 self._provider_attempt_authority
@@ -616,6 +619,7 @@ class PluginAgentRunRequest:
             "model",
             "context_mode",
             "session_id",
+            "sealed_runtime_authority_required",
             "intended_authority_digest",
             "expected_model_visible_prefix_digest",
             "expected_runtime_identity",
@@ -1068,6 +1072,13 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         not isinstance(request.session_id, str) or not request.session_id.strip()
     ):
         raise ValueError("shared context requires session_id")
+    if not isinstance(request.sealed_runtime_authority_required, bool):
+        raise TypeError("sealed_runtime_authority_required must be boolean")
+    if request.sealed_runtime_authority_required and (
+        request.intended_authority_digest is None
+        or request.expected_runtime_identity is None
+    ):
+        raise ValueError("sealed runtime authority is required")
     for label, value in (
         ("intended authority", request.intended_authority_digest),
         (

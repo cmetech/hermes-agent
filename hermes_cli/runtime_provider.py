@@ -49,6 +49,7 @@ from hermes_cli.config import (
     normalize_extra_headers,
 )
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from hermes_cli.provider_aliases import resolve_provider_selector
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.providers import is_official_openai_host
 from utils import base_url_host_matches, base_url_hostname, env_int
@@ -983,35 +984,12 @@ def _classify_execution_api_mode(
 
 
 def _static_execution_provider(provider: object) -> str:
-    requested = provider.strip().lower() if isinstance(provider, str) else ""
-    if not requested:
-        return ""
-    try:
-        from hermes_cli.models import normalize_provider
-
-        return normalize_provider(requested)
-    except Exception:
-        return requested
+    return resolve_provider_selector(provider).provider
 
 
 def _canonical_execution_provider(provider: object) -> str:
     """Resolve registry identity, then static aliases, without runtime state."""
-    requested = provider.strip().lower() if isinstance(provider, str) else ""
-    if not requested:
-        return ""
-    try:
-        from providers import get_provider_registration
-
-        registration = get_provider_registration(requested)
-    except Exception:
-        registration = None
-    if registration is not None:
-        profile_name = str(
-            getattr(registration.profile, "name", "") or ""
-        ).strip().lower()
-        if profile_name:
-            return profile_name
-    return _static_execution_provider(requested)
+    return resolve_provider_selector(provider).provider
 
 
 def _resolve_execution_provider_authority(

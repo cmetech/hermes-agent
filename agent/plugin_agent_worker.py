@@ -1145,6 +1145,9 @@ def _build_inline_agent_handler(
                 or getattr(parent, "provider", None)
             ),
             model=definition.get("model") or getattr(parent, "model", None),
+            sealed_runtime_authority_required=getattr(
+                parent, "sealed_runtime_authority_required", False
+            ),
             intended_authority_digest=definition.get(
                 "intended_authority_digest"
             ),
@@ -2226,6 +2229,9 @@ def _run(
                     model=str(fallback["model"]),
                     context_mode="fresh",
                     session_id=None,
+                    sealed_runtime_authority_required=(
+                        request.sealed_runtime_authority_required
+                    ),
                     intended_authority_digest=request.intended_authority_digest,
                     expected_runtime_identity=dict(
                         fallback["expected_runtime_identity"]

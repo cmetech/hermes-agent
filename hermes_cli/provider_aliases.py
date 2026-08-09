@@ -8,7 +8,9 @@ not have a loader registration without consulting configuration or credentials.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Literal
 
 
 PUBLIC_PROVIDER_COMPATIBILITY_ALIASES: Mapping[str, str] = MappingProxyType({
@@ -89,3 +91,43 @@ PUBLIC_PROVIDER_COMPATIBILITY_ALIASES: Mapping[str, str] = MappingProxyType({
     "llama.cpp": "custom",
     "llama-cpp": "custom",
 })
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSelectorResolution:
+    """Credential- and config-free owner of one provider selector token."""
+
+    token: str
+    provider: str
+    source: Literal["registry", "public_compatibility", "unresolved"]
+
+    @property
+    def recognized(self) -> bool:
+        return self.source != "unresolved"
+
+
+def resolve_provider_selector(provider: object) -> ProviderSelectorResolution:
+    """Resolve registry ownership before the immutable compatibility fallback."""
+
+    token = provider.strip().lower() if isinstance(provider, str) else ""
+    if not token:
+        return ProviderSelectorResolution("", "", "unresolved")
+    # Keep this import lazy so providers can finish initializing before the
+    # resolver consults its registry. Registry discovery failures are not an
+    # alias miss: callers must see them instead of silently falling through to
+    # a compatibility spelling with potentially different authority.
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(token)
+    if profile is not None:
+        canonical = str(getattr(profile, "name", "") or "").strip().lower()
+        if canonical:
+            return ProviderSelectorResolution(token, canonical, "registry")
+    compatibility = PUBLIC_PROVIDER_COMPATIBILITY_ALIASES.get(token)
+    if compatibility is not None:
+        return ProviderSelectorResolution(
+            token,
+            compatibility,
+            "public_compatibility",
+        )
+    return ProviderSelectorResolution(token, token, "unresolved")

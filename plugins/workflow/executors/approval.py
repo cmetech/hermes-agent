@@ -287,6 +287,7 @@ class ApprovalExecutor:
                 if phase5
                 else context.workflow_options.get("model")
             ),
+            sealed_runtime_authority_required=phase5,
             intended_authority_digest=(
                 intended_authority_digest if phase5 else None
             ),

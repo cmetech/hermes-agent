@@ -1666,6 +1666,7 @@ class AgentNodeExecutor:
                 ),
                 context_mode=context_mode,
                 session_id=session_id,
+                sealed_runtime_authority_required=phase5,
                 intended_authority_digest=(
                     intended_authority_digest if phase5 else None
                 ),
