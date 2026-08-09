@@ -43,6 +43,16 @@ def test_sealed_phase5_requires_authority_but_legacy_wire_remains_compatible():
             PluginAgentRunRequest(
                 prompt="phase5",
                 intended_authority_digest="a" * 64,
+                expected_runtime_identity={
+                    "provider": "sealed-provider",
+                    "model": "sealed-model",
+                    "api_mode": "chat_completions",
+                    "base_url_trust_class": "provider_default",
+                    "endpoint_sha256": "b" * 64,
+                    "registration_provenance_digest": "c" * 64,
+                },
+                expected_runtime_route_fingerprint="d" * 64,
+                expected_runtime_route_options={},
                 max_budget_usd=1,
             )
         )
