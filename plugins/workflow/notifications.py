@@ -212,12 +212,23 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
             or normalized in {"sessionalias", "fingerprintalias"}
         ) and not normalized.endswith("sha256")
 
+    def is_private_authority_value_key(key: object) -> bool:
+        normalized = normalized_key(key)
+        return normalized.endswith(
+            (
+                "endpointsha256",
+                "registrationprovenancedigest",
+            )
+        )
+
     to_collect: list[object] = [projected]
     while to_collect:
         current = to_collect.pop()
         if isinstance(current, dict):
             for key, value in current.items():
-                if is_sensitive_key(key) and isinstance(value, str):
+                if (
+                    is_sensitive_key(key) or is_private_authority_value_key(key)
+                ) and isinstance(value, str):
                     sensitive_values.add(value)
                 to_collect.append(value)
         elif isinstance(current, list):
@@ -235,6 +246,9 @@ def _value_free_notification_payload(payload: Mapping[str, object]) -> dict[str,
                     "pendingsessionregistryupdates",
                 }:
                     current.pop(key, None)
+                    continue
+                if is_private_authority_value_key(key):
+                    current[key] = "[REDACTED]"
                     continue
                 if normalized == "lasterror":
                     current[key] = "workflow operation failed"

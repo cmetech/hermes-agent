@@ -149,6 +149,87 @@ def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_pat
     assert canary not in str(outbox.history(run_id="private-notification-run"))
 
 
+def test_notification_authority_values_are_value_free_across_durable_delivery(
+    tmp_path,
+):
+    """Endpoint and registration identities never cross the notification boundary."""
+    store = RunStore(tmp_path / "notification-private-authority")
+    outbox = NotificationOutbox(store)
+    now = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+    endpoint_identity = "a1" * 32
+    nested_endpoint_identity = "b2" * 32
+    registration_identity = "c3" * 32
+    nested_registration_identity = "d4" * 32
+    authority_field_names = [
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    ]
+
+    notification_id = outbox.record(
+        run_id="private-authority-run",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "code": "provider_capability_drift",
+            "mismatched_fields": authority_field_names,
+            "expected_runtime_identity": {
+                "endpoint_sha256": endpoint_identity,
+                "registration_provenance_digest": registration_identity,
+                "nested": [
+                    {"expectedEndpointSha256": nested_endpoint_identity},
+                    {
+                        "liveRegistrationProvenanceDigest": (
+                            nested_registration_identity
+                        )
+                    },
+                ],
+            },
+            "detail": (
+                f"endpoint changed from {endpoint_identity}; registration "
+                f"changed from {registration_identity}"
+            ),
+        },
+        now=now,
+    )
+
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="notification-owner",
+        now=now,
+        lease_seconds=30,
+    )
+    history = outbox.history(run_id="private-authority-run")
+    with store._connect() as connection:
+        durable = " ".join(
+            str(value)
+            for row in connection.execute(
+                "SELECT workflow_notification_outbox.payload_json, "
+                "workflow_notification_facts.payload_json "
+                "FROM workflow_notification_outbox LEFT JOIN "
+                "workflow_notification_facts USING(notification_id) "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchall()
+            for value in row
+        )
+
+    public_payloads = json.dumps(
+        {"leased": leased, "history": history, "durable": durable},
+        sort_keys=True,
+    )
+    for private_value in (
+        endpoint_identity,
+        nested_endpoint_identity,
+        registration_identity,
+        nested_registration_identity,
+    ):
+        assert private_value not in public_payloads
+    assert leased[0]["payload"]["code"] == "provider_capability_drift"
+    assert leased[0]["payload"]["mismatched_fields"] == authority_field_names
+    assert history[0]["payload"]["mismatched_fields"] == authority_field_names
+
+
 def test_notification_failures_preserve_allowlisted_stable_delivery_reason(tmp_path):
     store = RunStore(tmp_path / "stable-delivery-reason")
     outbox = NotificationOutbox(store)

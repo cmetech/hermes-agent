@@ -26,7 +26,7 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
-from plugins.workflow.notifications import _value_free_notification_payload
+from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.provider_authority import (
     WorkflowProviderAuthority,
     WorkflowResolvedProviderRoute,
@@ -507,12 +507,33 @@ def test_public_surface_and_log_closure_excludes_private_canaries(
         "run-1",
         kind="attempts",
     )
-    notification = _value_free_notification_payload({
-        "run_id": "run-1",
-        "kind": "failure",
-        "provider_capability": provider_projection,
-        "evidence": evidence,
-    })
+    notification_outbox = NotificationOutbox(RunStore(tmp_path / "notification-home"))
+    notification_outbox.record(
+        run_id="run-1",
+        kind="failure",
+        destination="desktop",
+        transition_version=1,
+        payload={
+            "provider_capability": provider_projection,
+            "evidence": evidence,
+            "upstream_failure": {
+                "credential": private["credential"],
+                "base_url": private["base_url"],
+                "expected_runtime_identity": {
+                    "endpoint_sha256": private["endpoint_sha256"],
+                    "registration_provenance_digest": private[
+                        "registration_provenance_digest"
+                    ],
+                },
+                "prompt": private["prompt"],
+                "command": private["command"],
+                "provider_response": private["provider_response"],
+                "feedback": private["feedback"],
+                "path": private["path"],
+            },
+        },
+    )
+    notification = notification_outbox.history(run_id="run-1")
     from plugins.workflow.dashboard.plugin_api import (
         WorkflowProviderCapabilityProjection,
     )
