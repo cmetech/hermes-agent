@@ -18,6 +18,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     conservative_provider_retry_count,
+    pretransport_zero_metadata,
     sealed_provider_request_for_launch,
 )
 from plugins.workflow.language import supports_phase5_semantics
@@ -185,7 +186,7 @@ class ApprovalExecutor:
                 "failed",
                 error_code="provider_timeout",
                 error_message="workflow attempt deadline expired",
-                metadata={"provider_attempts": 0},
+                metadata=pretransport_zero_metadata(phase5=phase5),
             )
         wall_deadline = (
             context.deadline_budget.wall_deadline
@@ -395,7 +396,7 @@ class ApprovalExecutor:
                 "failed",
                 error_code="provider_timeout",
                 error_message="workflow attempt deadline expired",
-                metadata={"provider_attempts": 0},
+                metadata=pretransport_zero_metadata(phase5=phase5),
             )
         if phase5 and context.is_cancelled is not None and context.is_cancelled():
             return NodeExecutionResult(

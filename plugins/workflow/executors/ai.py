@@ -42,6 +42,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     conservative_provider_retry_count,
+    pretransport_zero_metadata,
     sealed_provider_request_for_launch,
     validated_provider_retry_count,
     validated_provider_total_call_count,
@@ -1430,10 +1431,10 @@ class AgentNodeExecutor:
                     "failed",
                     error_code="provider_timeout",
                     error_message="workflow attempt deadline expired",
-                    metadata={
-                        "provider_attempts": 0,
-                        **({"provider_attempts_exact": True} if strict_v3 else {}),
-                    },
+                    metadata=pretransport_zero_metadata(
+                        phase5=phase5,
+                        exact_for_legacy=strict_v3,
+                    ),
                 )
             wall_deadline = (
                 context.deadline_budget.wall_deadline
@@ -1795,7 +1796,7 @@ class AgentNodeExecutor:
                     "failed",
                     error_code="provider_timeout",
                     error_message="workflow attempt deadline expired",
-                    metadata={"provider_attempts": 0},
+                    metadata=pretransport_zero_metadata(phase5=phase5),
                 )
             if context.is_cancelled is not None and context.is_cancelled():
                 return NodeExecutionResult(
@@ -1845,7 +1846,7 @@ class AgentNodeExecutor:
                             "failed",
                             error_code="provider_timeout",
                             error_message="workflow attempt deadline expired",
-                            metadata={"provider_attempts": 0},
+                            metadata=pretransport_zero_metadata(phase5=phase5),
                         )
                     )
                 if context.is_cancelled is not None and context.is_cancelled():

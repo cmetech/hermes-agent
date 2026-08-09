@@ -81,7 +81,16 @@ class RecordingRunner:
         )
 
 
-def _admit_phase5_run(tmp_path, workflow_writer, *, name, nodes):
+def _admit_phase5_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    name,
+    nodes,
+    normalizer_version=5,
+    store=None,
+    idempotency_key=None,
+):
     path = workflow_writer(
         tmp_path / name / "source/workflows",
         name=name,
@@ -105,7 +114,7 @@ def _admit_phase5_run(tmp_path, workflow_writer, *, name, nodes):
     compilation = compile_workflow(
         source,
         WorkflowCatalogSnapshot.capture((source,)),
-        normalizer_version=5,
+        normalizer_version=normalizer_version,
     )
     package = compilation.package
     model_config = parse_workflow_model_config({
@@ -123,28 +132,38 @@ def _admit_phase5_run(tmp_path, workflow_writer, *, name, nodes):
         },
         provider_config={"base_url": "https://openrouter.ai/api/v1"},
     )
-    authority = resolve_workflow_provider_authority(
-        package,
-        model_config=model_config,
-        default_runtime=runtime,
-        environment=ProviderAuthorityEnvironment(
-            session_store_available=True,
-            mcp_available=True,
-            hook_lifecycle_available=True,
-            inline_agent_available=True,
-            web_service_available=True,
-            authoritative_cost_available=False,
-        ),
+    authority = (
+        resolve_workflow_provider_authority(
+            package,
+            model_config=model_config,
+            default_runtime=runtime,
+            environment=ProviderAuthorityEnvironment(
+                session_store_available=True,
+                mcp_available=True,
+                hook_lifecycle_available=True,
+                inline_agent_available=True,
+                web_service_available=True,
+                authoritative_cost_available=False,
+            ),
+        )
+        if normalizer_version >= 5
+        else None
     )
-    store = RunStore(tmp_path / f"{name}-home")
+    store = store or RunStore(tmp_path / f"{name}-home")
     prepared = store.prepare_run_snapshot(
         package,
-        compilation=compilation,
-        trusted_package_digest=WorkflowPackageDigest(
-            compilation.composite_digest,
-            compilation.covered_relative_paths,
+        **(
+            {
+                "compilation": compilation,
+                "trusted_package_digest": WorkflowPackageDigest(
+                    compilation.composite_digest,
+                    compilation.covered_relative_paths,
+                ),
+                "provider_authority": authority,
+            }
+            if normalizer_version >= 4
+            else {}
         ),
-        provider_authority=authority,
     )
     admitted = store.start_run(
         RunAdmissionRequest(
@@ -153,7 +172,7 @@ def _admit_phase5_run(tmp_path, workflow_writer, *, name, nodes):
             policy_digest=prepared.policy_digest,
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
-            idempotency_key=name,
+            idempotency_key=idempotency_key or name,
             concurrency_key=package.definition.name,
         ),
         immutable_snapshot=prepared,

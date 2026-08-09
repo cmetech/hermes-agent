@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import copy
 import time
 
-from agent.plugin_agent import PluginAgentRunResult
+import pytest
+
+from agent.plugin_agent import PluginAgentRunResult, PluginAgentSessionMissingError
+from plugins.workflow.executors import ai as ai_executor_module
+from plugins.workflow.executors import approval as approval_executor_module
+from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.store import RunStore
+from plugins.workflow.sessions import NodeSessionRegistry
+from plugins.workflow.store import JournalRecoveryError, RunStore
 from tests.plugins.workflow.test_ai_e2e import RecordingRunner, _admit_phase5_run
 from tools.managed_process import ProcessIdentity
 
@@ -61,6 +68,240 @@ class _CancellingAfterProviderRunner:
                 "model_visible_prefix_digest": "9" * 64,
             },
         )
+
+
+_OMITTED = object()
+_VALID_EXECUTION_AUTHORITY = {
+    "schema_version": 1,
+    "retry_consumed_before": 0,
+    "remaining_attempts": 2,
+    "iteration_consumed_before": 0,
+    "remaining_iterations": 90,
+    "remaining_wall_seconds": 120.0,
+}
+
+
+def _release_provider_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    execution_authority=_VALID_EXECUTION_AUTHORITY,
+):
+    claim_kwargs = {"executor_id": "prompt"}
+    if execution_authority is not _OMITTED:
+        claim_kwargs["execution_authority"] = execution_authority
+    claim = store.claim_node(
+        run_id,
+        "ask",
+        "crashed-owner",
+        **claim_kwargs,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    nonce = "crashed-provider"
+    process = ProcessIdentity(pid=999_991, start_time=12345.0, group_id=999_991)
+    assert store.record_spawn_intent(claim, executor_nonce=nonce)
+    assert store.record_process_started(claim, process)
+    assert store.record_provider_dispatch(claim, executor_nonce=nonce)
+    assert store.record_provider_start_delivered(claim, executor_nonce=nonce)
+    assert store.record_provider_execute_received(claim, executor_nonce=nonce)
+    assert store.record_provider_execute_released(claim, executor_nonce=nonce)
+    assert store.record_process_stopped(claim, process, cleaned=True)
+    assert store.release_or_expire_claim(claim)
+    paused = store.load_run(run_id)
+    return paused, paused["nodes"]["ask"]["pending_interaction"]
+
+
+@pytest.mark.parametrize(
+    "execution_authority",
+    (
+        pytest.param(_OMITTED, id="omitted"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="non-mapping"),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "schema_version": 2},
+            id="wrong-version",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _VALID_EXECUTION_AUTHORITY.items()
+                if key != "remaining_attempts"
+            },
+            id="missing-field",
+        ),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "unexpected": 1},
+            id="extra-field",
+        ),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "remaining_attempts": -1},
+            id="invalid-field",
+        ),
+    ),
+)
+def test_phase5_public_claim_requires_exact_execution_authority_without_flag(
+    tmp_path,
+    workflow_writer,
+    execution_authority,
+) -> None:
+    """Removing the durable-language check must let public callers omit authority."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-claim-authority",
+        nodes=[{"id": "ask", "prompt": "must remain unclaimed"}],
+    )
+    before = store.load_run(run_id)
+    kwargs = {"executor_id": "prompt"}
+    if execution_authority is not _OMITTED:
+        kwargs["execution_authority"] = execution_authority
+
+    with pytest.raises(ValueError, match="execution authority is malformed"):
+        store.claim_node(run_id, "ask", "public-caller", **kwargs)
+
+    after = store.load_run(run_id)
+    assert after == before
+    assert after["state_version"] == before["state_version"]
+    assert after["nodes"]["ask"]["state"] == "ready"
+    assert after["nodes"]["ask"]["attempts"] == []
+
+
+@pytest.mark.parametrize(
+    "persisted_authority",
+    (
+        pytest.param(_OMITTED, id="omitted"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="non-mapping"),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "schema_version": 2},
+            id="wrong-version",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _VALID_EXECUTION_AUTHORITY.items()
+                if key != "remaining_attempts"
+            },
+            id="missing-field",
+        ),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "unexpected": 1},
+            id="extra-field",
+        ),
+        pytest.param(
+            {**_VALID_EXECUTION_AUTHORITY, "remaining_attempts": True},
+            id="invalid-field",
+        ),
+    ),
+)
+def test_phase5_rebuilt_store_rejects_malformed_released_execution_authority(
+    tmp_path,
+    workflow_writer,
+    persisted_authority,
+) -> None:
+    """Malformed released-work authority must not disappear into a fresh grant."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-recovery-authority",
+        nodes=[{
+            "id": "ask",
+            "prompt": "provider may have accepted this",
+            "retry": {"max_attempts": 1},
+        }],
+    )
+    _release_provider_attempt(
+        store,
+        run_id,
+        execution_authority=_VALID_EXECUTION_AUTHORITY,
+    )
+    corrupted = store.load_run(run_id)
+    attempt = corrupted["nodes"]["ask"]["attempts"][-1]
+    if persisted_authority is _OMITTED:
+        attempt.pop("execution_authority")
+    else:
+        attempt["execution_authority"] = copy.deepcopy(persisted_authority)
+    store.append_event(
+        run_id,
+        "test_corrupt_execution_authority",
+        projection_updates={"nodes": corrupted["nodes"]},
+    )
+    rebuilt = RunStore(store.hermes_home)
+    before = rebuilt.load_run(run_id)
+    interaction = before["nodes"]["ask"]["pending_interaction"]
+    before_projection = (
+        rebuilt.run_directory(run_id) / "run.json"
+    ).read_bytes()
+
+    with pytest.raises(
+        JournalRecoveryError,
+        match="persisted execution authority is malformed",
+    ):
+        rebuilt.reconcile_run(
+            run_id,
+            "safe-to-retry",
+            expected_state_version=before["state_version"],
+            interaction_id=interaction["interaction_id"],
+        )
+
+    after = rebuilt.load_run(run_id)
+    assert after == before
+    assert after["state_version"] == before["state_version"]
+    assert after["nodes"]["ask"]["recovery"] == (
+        before["nodes"]["ask"]["recovery"]
+    )
+    assert after["nodes"]["ask"]["pending_interaction"] == interaction
+    assert (rebuilt.run_directory(run_id) / "run.json").read_bytes() == (
+        before_projection
+    )
+
+    calls = 0
+
+    class MustNotRun:
+        def run(self, _request, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("malformed recovery authority crossed transport")
+
+    observed = RunScheduler(
+        RunStore(store.hermes_home),
+        agent_runner=MustNotRun(),
+    ).advance(run_id)
+    assert calls == 0
+    assert observed == before
+
+
+@pytest.mark.parametrize("normalizer_version", (1, 2, 3, 4))
+def test_historical_released_claim_without_execution_authority_remains_accepted(
+    tmp_path,
+    workflow_writer,
+    normalizer_version,
+) -> None:
+    """Requiring authority outside Phase 5 must break historical recovery."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name=f"historical-recovery-v{normalizer_version}",
+        normalizer_version=normalizer_version,
+        nodes=[{"id": "ask", "prompt": "historical provider work"}],
+    )
+    paused, interaction = _release_provider_attempt(
+        store,
+        run_id,
+        execution_authority=_OMITTED,
+    )
+
+    reconciled = RunStore(store.hermes_home).reconcile_run(
+        run_id,
+        "safe-to-retry",
+        expected_state_version=paused["state_version"],
+        interaction_id=interaction["interaction_id"],
+    )
+
+    assert reconciled["status"] == "running"
+    assert reconciled["nodes"]["ask"]["state"] == "ready"
+    assert "recovery" not in reconciled["nodes"]["ask"]
 
 
 def test_phase5_paused_provider_call_durably_consumes_exact_authority(
@@ -495,6 +736,265 @@ def test_phase5_sealed_decision_failure_preserves_zero_execution_charge(
     assert attempt["metadata"]["known_no_effect"] is True
 
 
+def _assert_zero_pretransport_charge(result, node_id: str) -> None:
+    node = result["nodes"][node_id]
+    attempt = node["attempts"][-1]
+    assert attempt["error_code"] == "provider_timeout"
+    assert node.get("retry_consumed", 0) == 0
+    assert node.get("iteration_consumed", 0) == 0
+    assert attempt["metadata"]["provider_attempts"] == 0
+    assert attempt["metadata"]["provider_attempts_exact"] is True
+    assert attempt["metadata"]["known_no_effect"] is True
+
+
+def test_phase5_scheduler_ai_initial_deadline_crossing_preserves_zero_charge(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    """Omitting known-zero evidence at the initial boundary charges one attempt."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-ai-initial-deadline",
+        nodes=[{
+            "id": "ask",
+            "prompt": "prepare until the boundary",
+            "retry": {"max_attempts": 1},
+        }],
+    )
+    now = [time.monotonic()]
+    runner = RecordingRunner()
+    original_prompt = AgentNodeExecutor._prompt
+
+    def prompt_then_expire(self, context):
+        prompt = original_prompt(self, context)
+        now[0] += 1800.0
+        return prompt
+
+    monkeypatch.setattr(AgentNodeExecutor, "_prompt", prompt_then_expire)
+    result = RunScheduler(
+        store,
+        agent_runner=runner,
+        monotonic=lambda: now[0],
+        heartbeat_seconds=2000,
+        lease_seconds=3000,
+    ).advance(run_id, max_nodes=1)
+
+    assert runner.requests == []
+    _assert_zero_pretransport_charge(result, "ask")
+
+
+def test_phase5_scheduler_ai_prelaunch_deadline_crossing_preserves_zero_charge(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    """The final request seal must retain exact no-call accounting."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-ai-prelaunch-deadline",
+        nodes=[{
+            "id": "ask",
+            "prompt": "assemble until the boundary",
+            "retry": {"max_attempts": 1},
+        }],
+    )
+    now = [time.monotonic()]
+    runner = RecordingRunner()
+    original_seal = ai_executor_module.sealed_provider_request_for_launch
+
+    def expire_then_seal(context, request):
+        now[0] += 1800.0
+        return original_seal(context, request)
+
+    monkeypatch.setattr(
+        ai_executor_module,
+        "sealed_provider_request_for_launch",
+        expire_then_seal,
+    )
+    result = RunScheduler(
+        store,
+        agent_runner=runner,
+        monotonic=lambda: now[0],
+        heartbeat_seconds=2000,
+        lease_seconds=3000,
+    ).advance(run_id, max_nodes=1)
+
+    assert runner.requests == []
+    _assert_zero_pretransport_charge(result, "ask")
+
+
+def test_phase5_scheduler_fresh_recovery_deadline_crossing_preserves_zero_charge(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    """A selected fresh request that expires before launch must remain free."""
+    nodes = [{
+        "id": "ask",
+        "prompt": "reuse the persistent session",
+        "persist_session": True,
+        "retry": {"max_attempts": 1},
+    }]
+    store, seed_run = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-fresh-recovery-deadline",
+        nodes=nodes,
+        idempotency_key="phase5-fresh-recovery-seed",
+    )
+    registry = NodeSessionRegistry(store.hermes_home)
+    seeded = RunScheduler(
+        store,
+        agent_runner=RecordingRunner(),
+        session_registry=registry,
+    ).advance(seed_run)
+    assert seeded["status"] == "succeeded"
+    _store, recovery_run = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-fresh-recovery-deadline",
+        nodes=nodes,
+        store=store,
+        idempotency_key="phase5-fresh-recovery-attempt",
+    )
+    now = [time.monotonic()]
+
+    class MissingSessionRunner:
+        def __init__(self) -> None:
+            self.session_probes = 0
+            self.fresh_calls = 0
+
+        def run(self, request, **_kwargs):
+            if request.context_mode == "shared":
+                self.session_probes += 1
+                now[0] += 1800.0
+                raise PluginAgentSessionMissingError("confirmed absent")
+            self.fresh_calls += 1
+            raise AssertionError("expired fresh recovery crossed transport")
+
+    runner = MissingSessionRunner()
+    result = RunScheduler(
+        RunStore(store.hermes_home),
+        agent_runner=runner,
+        session_registry=registry,
+        monotonic=lambda: now[0],
+        heartbeat_seconds=2000,
+        lease_seconds=3000,
+    ).advance(recovery_run, max_nodes=1)
+
+    assert runner.session_probes == 1
+    assert runner.fresh_calls == 0
+    _assert_zero_pretransport_charge(result, "ask")
+
+
+def _rejected_phase5_approval(store, run_id: str) -> None:
+    paused = RunScheduler(store).advance(run_id, max_nodes=1)
+    pending = paused["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        run_id,
+        reason="revise",
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+
+def test_phase5_scheduler_approval_initial_deadline_crossing_preserves_zero_charge(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    """Approval prompt rendering that reaches the boundary must remain free."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-approval-initial-deadline",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+        }],
+    )
+    _rejected_phase5_approval(store, run_id)
+    now = [time.monotonic()]
+    runner = RecordingRunner()
+    original_renderer = approval_executor_module.substitution_renderer
+
+    def renderer_then_expire(*args, **kwargs):
+        renderer = original_renderer(*args, **kwargs)
+
+        class CrossingRenderer:
+            def render_prompt(self, value):
+                rendered = renderer.render_prompt(value)
+                now[0] += 1800.0
+                return rendered
+
+        return CrossingRenderer()
+
+    monkeypatch.setattr(
+        approval_executor_module,
+        "substitution_renderer",
+        renderer_then_expire,
+    )
+    result = RunScheduler(
+        store,
+        agent_runner=runner,
+        monotonic=lambda: now[0],
+        heartbeat_seconds=2000,
+        lease_seconds=3000,
+    ).advance(run_id, max_nodes=1)
+
+    assert runner.requests == []
+    _assert_zero_pretransport_charge(result, "review")
+
+
+def test_phase5_scheduler_approval_prelaunch_deadline_crossing_preserves_zero_charge(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+) -> None:
+    """Approval final request sealing must preserve exact no-call evidence."""
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-approval-prelaunch-deadline",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+        }],
+    )
+    _rejected_phase5_approval(store, run_id)
+    now = [time.monotonic()]
+    runner = RecordingRunner()
+    original_seal = approval_executor_module.sealed_provider_request_for_launch
+
+    def expire_then_seal(context, request):
+        now[0] += 1800.0
+        return original_seal(context, request)
+
+    monkeypatch.setattr(
+        approval_executor_module,
+        "sealed_provider_request_for_launch",
+        expire_then_seal,
+    )
+    result = RunScheduler(
+        store,
+        agent_runner=runner,
+        monotonic=lambda: now[0],
+        heartbeat_seconds=2000,
+        lease_seconds=3000,
+    ).advance(run_id, max_nodes=1)
+
+    assert runner.requests == []
+    _assert_zero_pretransport_charge(result, "review")
+
+
 def test_phase5_rebuilt_store_uses_durable_shared_context_identity(
     tmp_path,
     workflow_writer,
@@ -563,7 +1063,13 @@ def test_phase5_rebuilt_store_blocks_bad_shared_identity_before_transport(
             },
         ],
     )
-    claim = store.claim_node(run_id, "first", "persisted-winner", executor_id="prompt")
+    claim = store.claim_node(
+        run_id,
+        "first",
+        "persisted-winner",
+        executor_id="prompt",
+        execution_authority=_VALID_EXECUTION_AUTHORITY,
+    )
     assert claim is not None
     store.mark_node_started(claim)
     store.complete_node(

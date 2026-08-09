@@ -121,6 +121,20 @@ class NodeExecutionResult:
     session_recovery_outcome: str | None = None
 
 
+def pretransport_zero_metadata(
+    *,
+    phase5: bool,
+    exact_for_legacy: bool = False,
+) -> dict[str, object]:
+    """Describe a provider launch that provably stopped before transport."""
+    metadata: dict[str, object] = {"provider_attempts": 0}
+    if phase5 or exact_for_legacy:
+        metadata["provider_attempts_exact"] = True
+    if phase5:
+        metadata["known_no_effect"] = True
+    return metadata
+
+
 def sealed_provider_request_for_launch(
     context: NodeExecutionContext,
     request: Any,

@@ -167,6 +167,42 @@ def _language_has_phase5_semantics(language: object) -> bool:
     )
 
 
+_EXECUTION_AUTHORITY_FIELDS = frozenset({
+    "schema_version",
+    "retry_consumed_before",
+    "remaining_attempts",
+    "iteration_consumed_before",
+    "remaining_iterations",
+    "remaining_wall_seconds",
+})
+
+
+def _validated_execution_authority(value: object) -> dict[str, object]:
+    """Return one exact v1 execution-authority projection or reject it."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _EXECUTION_AUTHORITY_FIELDS
+        or value.get("schema_version") != 1
+        or any(
+            isinstance(value.get(name), bool)
+            or not isinstance(value.get(name), int)
+            or int(value[name]) < 0
+            for name in (
+                "retry_consumed_before",
+                "remaining_attempts",
+                "iteration_consumed_before",
+                "remaining_iterations",
+            )
+        )
+        or isinstance(value.get("remaining_wall_seconds"), bool)
+        or not isinstance(value.get("remaining_wall_seconds"), int | float)
+        or not math.isfinite(float(value["remaining_wall_seconds"]))
+        or float(value["remaining_wall_seconds"]) < 0
+    ):
+        raise ValueError("execution authority is malformed")
+    return dict(value)
+
+
 class InputSnapshotError(ValueError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
@@ -10102,39 +10138,6 @@ class RunStore:
             or max_run_workers <= 0
         ):
             raise ValueError("max_run_workers must be a positive integer")
-        if execution_authority is not None:
-            if (
-                set(execution_authority)
-                != {
-                    "schema_version",
-                    "retry_consumed_before",
-                    "remaining_attempts",
-                    "iteration_consumed_before",
-                    "remaining_iterations",
-                    "remaining_wall_seconds",
-                }
-                or execution_authority.get("schema_version") != 1
-                or any(
-                    isinstance(execution_authority.get(name), bool)
-                    or not isinstance(execution_authority.get(name), int)
-                    or int(execution_authority[name]) < 0
-                    for name in (
-                        "retry_consumed_before",
-                        "remaining_attempts",
-                        "iteration_consumed_before",
-                        "remaining_iterations",
-                    )
-                )
-                or isinstance(execution_authority.get("remaining_wall_seconds"), bool)
-                or not isinstance(
-                    execution_authority.get("remaining_wall_seconds"), int | float
-                )
-                or not math.isfinite(
-                    float(execution_authority["remaining_wall_seconds"])
-                )
-                or float(execution_authority["remaining_wall_seconds"]) < 0
-            ):
-                raise ValueError("execution authority is malformed")
         if (
             isinstance(terminal_journal_reserve_bytes, bool)
             or not isinstance(terminal_journal_reserve_bytes, int)
@@ -10148,6 +10151,14 @@ class RunStore:
         with workflow_lock(self.admission_lock):
             with workflow_lock(self._run_lock_path(run_id)):
                 projection = json.loads((directory / "run.json").read_text())
+                if _language_has_phase5_semantics(projection.get("language")):
+                    execution_authority = _validated_execution_authority(
+                        execution_authority
+                    )
+                elif execution_authority is not None:
+                    execution_authority = _validated_execution_authority(
+                        execution_authority
+                    )
                 node = projection["nodes"].get(node_id)
                 if (
                     projection.get("desired_status") is not None
@@ -17220,6 +17231,33 @@ class RunStore:
                 raise RuntimeError(
                     "cannot authorize replay until prior executor termination is proven"
                 )
+            attempt = None
+            if isinstance(recovery, Mapping):
+                attempt_id = recovery.get("attempt_id")
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+            released_execution_authority = None
+            if (
+                outcome == "safe-to-retry"
+                and _language_has_phase5_semantics(projection.get("language"))
+                and isinstance(attempt, Mapping)
+                and isinstance(attempt.get("provider_dispatch"), Mapping)
+                and attempt["provider_dispatch"].get("state") == "released"
+            ):
+                try:
+                    released_execution_authority = _validated_execution_authority(
+                        attempt.get("execution_authority")
+                    )
+                except ValueError as exc:
+                    raise JournalRecoveryError(
+                        "persisted execution authority is malformed"
+                    ) from exc
             node.pop("pending_interaction", None)
             if outcome == "confirmed-succeeded":
                 node["state"] = "succeeded"
@@ -17237,47 +17275,25 @@ class RunStore:
                 reconciled_attempt_id = (
                     attempt_id if isinstance(attempt_id, str) else None
                 )
-                attempt = next(
-                    (
-                        candidate
-                        for candidate in reversed(node.get("attempts", []))
-                        if candidate.get("attempt_id") == attempt_id
-                    ),
-                    None,
-                )
                 if isinstance(attempt, dict):
                     attempt["reconciliation"] = {
                         "outcome": outcome,
                         "recorded_at": recovery["reconciled_at"],
                     }
-                    execution_authority = attempt.get("execution_authority")
                     provider_dispatch = attempt.get("provider_dispatch")
                     if (
-                        outcome == "safe-to-retry"
-                        and _language_has_phase5_semantics(
-                            projection.get("language")
-                        )
-                        and isinstance(execution_authority, Mapping)
+                        released_execution_authority is not None
                         and isinstance(provider_dispatch, Mapping)
                         and provider_dispatch.get("state") == "released"
                     ):
-                        consumed_before = execution_authority.get(
+                        consumed_before = released_execution_authority.get(
                             "retry_consumed_before"
                         )
-                        remaining_attempts = execution_authority.get(
+                        remaining_attempts = released_execution_authority.get(
                             "remaining_attempts"
                         )
-                        if (
-                            isinstance(consumed_before, bool)
-                            or not isinstance(consumed_before, int)
-                            or consumed_before < 0
-                            or isinstance(remaining_attempts, bool)
-                            or not isinstance(remaining_attempts, int)
-                            or remaining_attempts < 0
-                        ):
-                            raise JournalRecoveryError(
-                                "persisted execution authority is malformed"
-                            )
+                        assert isinstance(consumed_before, int)
+                        assert isinstance(remaining_attempts, int)
                         conservative_consumed = (
                             consumed_before + remaining_attempts
                         )
@@ -17285,23 +17301,14 @@ class RunStore:
                             int(node.get("retry_consumed", 0)),
                             conservative_consumed,
                         )
-                        iteration_consumed_before = execution_authority.get(
+                        iteration_consumed_before = released_execution_authority.get(
                             "iteration_consumed_before"
                         )
-                        remaining_iterations = execution_authority.get(
+                        remaining_iterations = released_execution_authority.get(
                             "remaining_iterations"
                         )
-                        if (
-                            isinstance(iteration_consumed_before, bool)
-                            or not isinstance(iteration_consumed_before, int)
-                            or iteration_consumed_before < 0
-                            or isinstance(remaining_iterations, bool)
-                            or not isinstance(remaining_iterations, int)
-                            or remaining_iterations < 0
-                        ):
-                            raise JournalRecoveryError(
-                                "persisted iteration authority is malformed"
-                            )
+                        assert isinstance(iteration_consumed_before, int)
+                        assert isinstance(remaining_iterations, int)
                         node["iteration_consumed"] = max(
                             int(node.get("iteration_consumed", 0)),
                             iteration_consumed_before + remaining_iterations,
