@@ -13,8 +13,10 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
@@ -263,12 +265,36 @@ def test_notification_read_codec_rejects_duplicate_keys_and_scalar_type_confusio
 def test_notification_rest_lease_returns_the_closed_backend_projection(
     tmp_path,
     monkeypatch,
+    workflow_writer,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    outbox = NotificationOutbox(RunStore(home))
+    store = RunStore(home)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "rest-closed-package",
+            name="notification-rest-closed",
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key="notification-rest-closed",
+            concurrency_key=package.definition.name,
+            concurrency_policy="allow",
+            operator_scope="service:test:desktop-contract",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    outbox = NotificationOutbox(store)
     outbox.record(
-        run_id="run-rest-closed",
+        run_id=admitted.run_id,
         kind="failure",
         destination="desktop",
         transition_version=3,
