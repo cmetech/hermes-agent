@@ -1,12 +1,12 @@
 # Workflow Language Phase 5 adversarial remediation review
 
-**Review date:** 2026-08-08
+**Review date:** 2026-08-09
 
 **Original candidate:** `1373c306061d2f4a2cf1dd313df16f6453fa1939`
 
-**Remediation range reviewed:** `1373c306061d2f4a2cf1dd313df16f6453fa1939..d6960baa096be2d5d0cd66e5e8c7c69e04037046`
+**Remediation range reviewed:** `1373c306061d2f4a2cf1dd313df16f6453fa1939..5fa4f998c5eeda65d6abdfb7eb42c144c924b487`
 
-**Current verdict:** `BLOCK — remediation is implemented and locally verified; independent final review remains required`
+**Current verdict:** `GO — remediation, convergence review, and final non-publishing gates complete`
 
 ## Status and history
 
@@ -17,11 +17,13 @@ Fable adversarial review. That review reproduced two High and two Medium
 defects and correctly issued `BLOCK`. This document does not erase or relabel
 that history.
 
-All four findings now have implementation and regression coverage. The
-bounded Task 5 review found no new Critical, Important, or Minor defect in the
-remediation range. The BLOCK is nevertheless retained until Task 6 completes
-the full distribution, Desktop, upstream, branded-rehearsal, and fresh
-independent-review gates.
+All four findings now have implementation and regression coverage. A later
+cross-domain convergence review deliberately widened the inspection to public
+projection, provider identity, request construction, durable recovery, and
+zero-call boundaries. Its six confirmed defects and two immediate sibling
+defects were fixed and independently re-reviewed to GO before any final full
+or release gate ran. Task 6 then completed the full distribution, Desktop,
+upstream, and branded-rehearsal gates at the exact immutable candidate above.
 
 ## Finding closure
 
@@ -125,7 +127,85 @@ candidate defect:
   payload, feedback, and temporary absolute path. None appears in the tested
   public projections or candidate-safe retirement log.
 
-## Residual risks and pending gates
+## Final convergence review closure
+
+The first bounded finding review was not treated as the end of discovery. A
+frozen cross-domain review panel inspected the complete candidate at
+`2938a4bee2d511b731697a123eb30f857d458c3e` and returned one Critical, two
+High, and three Medium defects:
+
+| Finding | Closure |
+|---|---|
+| Cross-scope Desktop notification leasing and receipts | `95235782c` makes lease, acknowledgement, failure, dismissal, retry, reset, and pruning scope-bound while retaining explicit unrestricted local administration. |
+| Replayable inline-child approval authority | `07ea302cb` moves outward action consumption to one authenticated request-tree broker so fallback and inline children cannot replay a copied scalar. |
+| Released recovery with absent/malformed execution authority | `6042a8a74` validates the complete persisted authority before reconstructing grants and fails closed without transport or projection mutation. |
+| Structured-output catalog response-model mismatch | `95235782c` aligns the closed backend projection and REST model while preserving unknown-field rejection. |
+| Equivalent endpoint spellings produced route-fingerprint drift | `07ea302cb`, then sibling repair `257cfd287`, canonicalize endpoint case, default ports, query ordering, and slash placement before identity construction. |
+| Prelaunch deadline expiry consumed an attempt | `6042a8a74` records complete zero-effect metadata and preserves the durable attempt ledger at all five pretransport boundaries. |
+
+The bounded re-review at `4e852ea7d` returned GO for public surfaces and
+execution authority, and found two Important identity siblings: a cleared
+fallback scalar could still consume through its inherited broker descriptor,
+and `/v1/?q=x` differed from `/v1?q=x`. `257cfd287` fixed both. The identity
+reviewer then returned GO with no Critical or Important finding. The three
+independent correctness/compatibility domains were therefore all GO before
+the final full validation pass.
+
+The subsequent workflow gate exposed four concrete regression classes rather
+than new architecture defects: closed error-code projection expectations,
+missing bounded `payload_truncated`, positional `NodeExecutionContext`
+compatibility, and overly broad typed-publication IDs. `460c329ec` and
+`a18c66081` closed them; `4b5a1ca78` completed the merge inventory. The first
+full Python run then found two stale test fixtures and one non-reproducing
+process-reaping timing failure. `5fa4f998c` corrected the fixtures by building
+a complete sealed budget identity and exercising the relay boundary on a real
+uninitialized `AIAgent`. The process test passed independently and in the
+final full run.
+
+Per explicit user direction, no separate threat-focused review was run. This
+does not replace or weaken the completed correctness, compatibility,
+isolation, redaction, package, Desktop, upstream, or release-regression gates.
+
+## Final exact-candidate verification
+
+Every Python command below used `HERMES_TEST_FILE_RETRIES=0` and
+`scripts/run_tests.sh`:
+
+- Focused Phase 5 closure: **718 passed, 0 failed**.
+- Complete workflow plugin suite after the final workflow fixes: **5,261
+  passed, 0 failed**.
+- Installed-distribution integration: **3 passed, 0 failed**.
+- Merge/customization/upstream/Desktop inventory gates: **49/49, 275/275,
+  104/104, and 2/2**.
+- Full Python suite at `5fa4f998c`: **2,802 files, 32,995 passed, 0 failed in
+  715.1s**, 14 workers.
+- Exact changed-file Ruff gate: clean.
+
+Desktop at the same candidate passed **499 files with one skipped; 4,748 tests
+with two skipped**. TypeScript typecheck passed. ESLint completed with zero
+errors and 162 established warnings.
+
+The clean detached base release gate passed **3,816/3,816** selected Python
+tests, **3/3** installed-distribution tests, and **173/173** Desktop release
+tests. The combined upstream/descriptor rehearsal exited zero against
+`origin/main`, `origin/loop24`, and `origin/otto`. Separate LOOP24 and OTTO
+rehearsals recorded only passed command results, no failed ledger entry test,
+`contains_tested_base: true`, and `generic_runtime_matches_base: true`.
+
+Before/after comparisons were empty for local refs, source remote refs, brand
+release-repository refs, worktrees, branch/status, tags, and release metadata.
+The release JSON hashes remained:
+
+- LOOP24: `d9938240ba634ba18b03ddad1f4cf633b5638912a7302949e848487c2b3ba187`.
+- OTTO: `f8e700e7d19b1d9901cbf314b1af4edef11e00134e4b671146a1b4e98b06428b`.
+
+The unchanged entries remain `LOOP24 Desktop v5.3.0` published
+`2026-08-07T01:17:38Z` and `OTTO Desktop v5.3.0` published
+`2026-08-07T01:18:00Z`. The temporary evidence directory was reviewed and
+then removed; no persistent branch, ref, tag, release, or repository was
+mutated.
+
+## Residual risks
 
 - Provider discovery fixtures retain registry/probe module state within a
   single test file. Unique provider slugs plus per-file process isolation
@@ -135,17 +215,13 @@ candidate defect:
   canonical provider named `auto`. It remains non-bundled and fail-closed for
   native capability trust. Ledger wording that “unregistered `auto` remains
   unresolved” applies only when no such registration exists.
-- Task 5 did not rerun the full Python suite, installed-wheel integration,
-  complete Desktop suite, upstream rehearsal, or external-state-audited
-  branded rehearsals. Those are Task 6 gates and must pass at the final exact
-  candidate before the 2026-08-07 BLOCK can be cleared.
 - This review ran on macOS. Native Windows and Linux coverage remains delegated
-  to the established CI and Task 6 portability/rehearsal gates.
+  to established CI.
 
 ## Preservation state
 
 - Feature branch: `feat/workflow-language-phase-5-provider-portability`.
-- Pre-Task-5 HEAD: `d6960baa096be2d5d0cd66e5e8c7c69e04037046`.
+- Exact tested candidate HEAD: `5fa4f998c5eeda65d6abdfb7eb42c144c924b487`.
 - `base` and `origin/base`: `cff7875049a7f369c2eae758503c63b6467c4433`.
 - `origin/otto`: `3cf9a3a89f01133ceb4e0cbf79123e632bfeab5c`.
 - `origin/loop24`: `6e15b6611edcf88a2bb0569beffe977e035b088f`.
@@ -157,7 +233,7 @@ candidate defect:
 
 ## Disposition
 
-F-1 through F-4 are **implemented and locally verified** with no new bounded
-review finding. The historical `BLOCK` remains open pending Task 6's fresh
-independent specification-compliance and code-quality verdicts plus the full
-distribution, Desktop, upstream, and branded-release regression gates.
+F-1 through F-4 and the later convergence findings are **implemented,
+independently re-reviewed, and fully verified**. The historical 2026-08-07
+BLOCK is cleared. Phase 5 adversarial remediation is **GO** with no unresolved
+Critical or Important finding and no remaining local validation gate.

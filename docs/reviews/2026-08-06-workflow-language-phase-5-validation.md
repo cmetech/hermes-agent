@@ -328,7 +328,12 @@ The bounded review over `1373c306..d6960baa` found no new Critical, Important,
 or Minor defect. Full finding-by-finding evidence and residual risks are in
 `2026-08-08-workflow-language-phase-5-adversarial-remediation.md`.
 
-**Current status remains BLOCK.** F-1 through F-4 are implemented and locally
-verified, but the BLOCK is not cleared until Task 6 completes fresh independent
-specification-compliance and code-quality reviews plus the full distribution,
-Desktop, upstream, and branded-rehearsal gates at one exact final candidate.
+That BLOCK was subsequently cleared by the reviewed remediation recorded in
+`2026-08-08-workflow-language-phase-5-adversarial-remediation.md`. The final
+exact candidate is `5fa4f998c5eeda65d6abdfb7eb42c144c924b487`: all three
+independent convergence domains returned GO, the full Python suite passed
+32,995/32,995, Desktop passed 4,748 tests with two skips, and the clean
+base/upstream/LOOP24/OTTO non-publishing rehearsals passed with identical
+before/after refs and release metadata. The authoritative current status is
+therefore **GO — adversarial remediation and final regression closure
+complete**.
