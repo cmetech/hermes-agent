@@ -20,6 +20,10 @@ from plugins.workflow.output_resolution import (
     PrimaryOutputCandidate,
     ResolvedOutputReference,
 )
+from plugins.workflow.provider_authority import (
+    WorkflowProviderAuthority,
+    WorkflowResolvedProviderRoute,
+)
 from plugins.workflow.sessions import (
     PersistentSessionRecoverySelection,
     SessionRegistryUpdateCandidate,
@@ -80,6 +84,12 @@ class NodeExecutionContext:
     sealed_resource_bytes: Mapping[str, bytes] | None = None
     language_profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY
     normalizer_version: int = 2
+    sealed_provider_route: WorkflowResolvedProviderRoute | None = None
+    sealed_provider_authority: WorkflowProviderAuthority | None = None
+    intended_authority_digest: str | None = None
+    shared_context_compatibility_digest: str | None = None
+    expected_model_visible_prefix_digest: str | None = None
+    sealed_mcp_runtime_identity_digest: str | None = None
     structured_output: WorkflowStructuredOutput | None = None
     structured_output_decision: StructuredOutputCapabilityDecision | None = None
     outward_action: bool = False
@@ -95,6 +105,7 @@ class NodeExecutionContext:
     provider_execute_received: Callable[[str], bool] | None = None
     provider_execute_release: Callable[[str], bool] | None = None
     record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
+    max_model_iterations: int = 90
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,20 @@ class NodeExecutionResult:
     session_registry_update: SessionRegistryUpdateCandidate | None = None
     session_registry_authority: SessionRegistryUpdateCandidate | None = None
     session_recovery_outcome: str | None = None
+
+
+def pretransport_zero_metadata(
+    *,
+    phase5: bool,
+    exact_for_legacy: bool = False,
+) -> dict[str, object]:
+    """Describe a provider launch that provably stopped before transport."""
+    metadata: dict[str, object] = {"provider_attempts": 0}
+    if phase5 or exact_for_legacy:
+        metadata["provider_attempts_exact"] = True
+    if phase5:
+        metadata["known_no_effect"] = True
+    return metadata
 
 
 def sealed_provider_request_for_launch(

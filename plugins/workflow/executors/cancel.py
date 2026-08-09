@@ -11,7 +11,12 @@ class CancelExecutor:
             "cancelled",
             error_code="cancel_node",
             error_message=str(context.node.value),
-            metadata={"cancel_reason": str(context.node.value)},
+            metadata={
+                "cancel_reason": str(context.node.value),
+                "provider_attempts": 0,
+                "provider_attempts_exact": True,
+                "known_no_effect": True,
+            },
         )
 
 

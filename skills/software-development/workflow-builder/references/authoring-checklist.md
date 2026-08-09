@@ -1,7 +1,7 @@
 # Authoring checklist
 
-Current/default Archon authoring and admission use normalizer v4; current
-legacy uses v2. Explicit and sealed v1-v3 contracts remain compatible and keep
+Current/default Archon authoring and admission use normalizer v5; current
+legacy uses v2. Explicit and sealed v1-v4 contracts remain compatible and keep
 their pinned semantics.
 
 <!-- workflow-language-version-selection -->
@@ -9,9 +9,9 @@ their pinned semantics.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 4
+    "archon-2026-07": 5
   },
-  "supported_normalizer_versions": [1, 2, 3, 4]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
 ```
 
@@ -36,7 +36,7 @@ Before writing files:
 - Describe contract phase numbers only as enforcement-phase metadata, never as
   delivery dates, availability promises, or schedules.
 - Archon timeout and retry fields are supported: they were introduced in v3 and
-  are inherited by current v4. Author
+  are inherited by current v5. Author
   timeout values in milliseconds, remember the omitted Bash/script 120,000 ms
   default, and count `retry.max_attempts` as retries after the initial attempt.
   Legacy timeout values remain seconds and legacy attempts remain totals.
@@ -46,11 +46,11 @@ Before writing files:
   safe token contexts. Larger values are contents, never pathnames.
 - Only a confirmed missing cross-run session may start fresh. Same-run missing
   context and session-store errors must remain failures.
-- MCP and skills remain node options. `include` is a compile-only v4 directive,
-  not an executable node kind; ordinary new Archon admissions and generated
-  contracts use v4.
-- Compile and admit the generated v4 contract and preserve it in the sealed run
-  snapshot. Use explicit v1-v3 only for compatibility with an intentionally
+- MCP and skills remain node options. `include` is a compile-only v4 directive
+  inherited by v5, not an executable node kind; ordinary new Archon admissions
+  and generated contracts use v5.
+- Compile and admit the generated v5 contract and preserve it in the sealed run
+  snapshot. Use explicit v1-v4 only for compatibility with an intentionally
   selected or already sealed historical contract.
 - Give an include only `id`, literal `include`, optional `depends_on`, and
   optional `trigger_rule`. Do not add runtime fields, `with`, URLs, paths,

@@ -25,6 +25,7 @@ from plugins.workflow.runner_binding import (
     WorkflowRunnerBinding,
     assess_package_execution,
 )
+from plugins.workflow.resources import read_snapshot_provider_authority
 from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILE_BYTES,
     WORKFLOW_RESOURCE_MAX_FILES,
@@ -394,6 +395,28 @@ def verify_sealed_snapshot(
         if projected_snapshot_digest is not None
         else None
     )
+    provider_bytes: dict[str, bytes] = {}
+    if sealed_paths is not None and "provider-resolution.json" in sealed_paths:
+        try:
+            provider_bytes["provider-resolution.json"] = budget.read(
+                run_directory / "provider-resolution.json",
+                verify_cached_identity=True,
+            )
+        except (OSError, WorkflowResourceCapacityError) as exc:
+            raise ScheduledRunRevalidationError(
+                "sealed provider authority is unreadable"
+            ) from exc
+    try:
+        read_snapshot_provider_authority(
+            language_snapshot=sealed_language,
+            resources=resources_document,
+            authenticated_bytes=provider_bytes,
+            projected_digest=run.get("provider_resolution_sha256"),
+        )
+    except ValueError as exc:
+        raise ScheduledRunRevalidationError(
+            "sealed provider authority identity changed"
+        ) from exc
     if (
         sealed_snapshot_digest(
             run_directory,

@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 
-import yaml
-
 from plugins.workflow.store import RunStore
 
 
@@ -26,10 +24,10 @@ class WorkflowRetentionPolicy:
 
     @classmethod
     def from_profile(cls, hermes_home: str | Path) -> "WorkflowRetentionPolicy":
+        from hermes_cli.config import load_config_readonly
+
         path = Path(hermes_home) / "config.yaml"
-        if not path.is_file():
-            return cls()
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        document = load_config_readonly(path)
         try:
             values = document["plugins"]["entries"]["workflow"]["retention"]
         except (KeyError, TypeError):
@@ -67,10 +65,10 @@ class WorkflowApiLimits:
 
     @classmethod
     def from_profile(cls, hermes_home: str | Path) -> "WorkflowApiLimits":
+        from hermes_cli.config import load_config_readonly
+
         path = Path(hermes_home) / "config.yaml"
-        if not path.is_file():
-            return cls()
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        document = load_config_readonly(path)
         try:
             values = document["plugins"]["entries"]["workflow"]["api"]
         except (KeyError, TypeError):

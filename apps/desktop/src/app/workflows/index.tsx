@@ -120,6 +120,7 @@ export function WorkflowsView() {
     setViewIntent(null)
   }
 
+  // eslint-disable-next-line no-restricted-syntax -- mount/generation lifecycle guards, not an atom mirror
   useEffect(() => {
     mounted.current = true
 

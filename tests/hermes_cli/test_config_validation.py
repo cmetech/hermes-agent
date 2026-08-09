@@ -10,6 +10,32 @@ from hermes_cli.config import (
 )
 
 
+def test_portable_model_roots_are_known_without_defaults() -> None:
+    assert {"model_aliases", "model_tiers"}.issubset(_EXTRA_KNOWN_ROOT_KEYS)
+    assert "model_aliases" not in DEFAULT_CONFIG
+    assert "model_tiers" not in DEFAULT_CONFIG
+
+
+def test_portable_model_configuration_issues_are_reported() -> None:
+    issues = validate_config_structure(
+        {
+            "model_tiers": {
+                "extra": {"provider": "custom", "model": "invented-tier"},
+                "small": {
+                    "provider": "custom",
+                    "model": "small-model",
+                    "options": {"api_key": "must-not-live-here"},
+                },
+            },
+            "model_aliases": {"missing-provider": {"model": "alias-model"}},
+        }
+    )
+    messages = {issue.message for issue in issues if issue.severity == "error"}
+    assert any("model_tier_unknown" in message for message in messages)
+    assert any("model_reference_options_invalid" in message for message in messages)
+    assert any("model_reference_provider_missing" in message for message in messages)
+
+
 class TestCustomProvidersValidation:
     """custom_providers must be a YAML list, not a dict."""
 
@@ -119,4 +145,3 @@ class TestUnknownTopLevelKeys:
         ]
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
-

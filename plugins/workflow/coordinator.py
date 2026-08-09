@@ -244,8 +244,7 @@ class WorkflowCoordinatorService:
         delivered = 0
         for notification in outbox.lease_gateway(owner_id=owner_id, limit=20):
             notification_id = str(notification["notification_id"])
-            destination = str(notification["destination"])
-            capability = destination.removeprefix("gateway:")
+            capability = str(notification["delivery_capability"])
             idempotency_key = (
                 f"workflow-notification:{notification_id}:"
                 f"{notification['transition_version']}"

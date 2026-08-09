@@ -19,13 +19,14 @@ import { Loader } from '@/components/ui/loader'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
-import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
+import { preflightWorkflow, startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
 import {
   desktopWorkflowLanguageLabel,
   desktopWorkflowRunDisabledReason,
+  isDesktopProviderCapabilityProjection,
   workflowSupportsImmediateRun,
   workflowSupportsScheduledRun,
   workflowTrustAllowsRun
@@ -42,6 +43,7 @@ interface AdmissionError {
     | 'conflict'
     | 'coordinator'
     | 'network'
+    | 'provider_capability'
     | 'profile'
     | 'schedule'
     | 'showcase_cli'
@@ -416,6 +418,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const submitInFlight = useRef(false)
   const [idempotencyKey] = useState(() => globalThis.crypto.randomUUID())
 
+  // eslint-disable-next-line no-restricted-syntax -- request-lifetime cancellation guard, not an atom mirror
   useEffect(() => {
     active.current = true
     setDetail(null)
@@ -509,6 +512,28 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
     try {
       if (!run) {
+        const freshDetail = await preflightWorkflow(workflow.name, workflow.source, profile)
+        const freshDisabledReason = desktopWorkflowRunDisabledReason(freshDetail, copy, 'detail')
+        const reviewedAuthority = detail.provider_capability?.authority_digest
+        const freshAuthority = freshDetail.provider_capability?.authority_digest
+        const phase5 = Number(freshDetail.language?.normalizer_version) >= 5
+
+        if (
+          freshDisabledReason ||
+          (phase5 && (!reviewedAuthority || !freshAuthority || reviewedAuthority !== freshAuthority))
+        ) {
+          setDetail(freshDetail)
+          setError({
+            kind:
+              phase5 &&
+              (freshDisabledReason === copy.workflowRunProviderAuthorityUnavailable ||
+                reviewedAuthority !== freshAuthority)
+                ? 'provider_capability'
+                : 'compatibility'
+          })
+          return
+        }
+
         const response = await startWorkflowRun(
           {
             catalogSource: workflow.source,
@@ -574,6 +599,9 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   }
 
   const runSupport = detail?.run_support
+  const providerCapability = isDesktopProviderCapabilityProjection(detail?.provider_capability, 'detail')
+    ? detail.provider_capability
+    : null
 
   const runDisabledReason = detail ? desktopWorkflowRunDisabledReason(detail, copy, 'detail') : null
 
@@ -605,6 +633,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     coordinator: copy.workflowRunCoordinatorUnavailable,
     network: copy.workflowRunNetworkError,
     profile: copy.workflowRunProfileUnavailable,
+    provider_capability: copy.workflowRunProviderAuthorityUnavailable,
     schedule: copy.workflowRunScheduleInvalid,
     showcase_cli: copy.workflowRunShowcaseFromCli,
     showcase_verification: copy.workflowRunShowcaseVerificationFailed
@@ -672,6 +701,24 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 </div>
               ) : null}
             </section>
+            {providerCapability ? (
+              <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
+                <h2 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowProviderReadiness}</h2>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-(--ui-text-secondary)">
+                  <dt>{copy.workflowProviderCapabilityLevel}</dt>
+                  <dd>{providerCapability.level}</dd>
+                  <dt>{copy.workflowProviderAuthorityDigest}</dt>
+                  <dd className="break-all font-mono">{providerCapability.authority_digest}</dd>
+                </dl>
+                <ul className="grid gap-1 text-xs text-(--ui-text-secondary)">
+                  {providerCapability.routes?.map((route, index) => (
+                    <li key={`${route.node_id}:${route.role}:${route.inline_agent_id ?? index}`}>
+                      {copy.workflowProviderRoute(route.node_id, route.provider, route.model)}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
             <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
               <h2 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowRunRisk}</h2>
               <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-(--ui-text-secondary)">

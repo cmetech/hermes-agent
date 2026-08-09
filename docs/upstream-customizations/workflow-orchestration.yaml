@@ -45,6 +45,975 @@ coverage:
   - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
     reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
+- id: workflow-phase5-dormant-language-contract
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/resources.py
+  - plugins/workflow/schema.py
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/agent/test_workflow_builder_skill.py
+  owned_symbols:
+  - supports_phase5_semantics explicit reader gate
+  - _normalize_v5 cumulative provider-portability semantic identity
+  - _read_phase5_provider_portability exact untrusted snapshot reader
+  - normalize_mcp_server_document bounded wrapper canonicalization
+  - explicit v5 hook matcher schema and validation
+  owned_invariants:
+  - explicit Archon v5 inherits v2 structured output, v3 execution, and v4 loop semantics
+  - v5 was introduced as a dormant explicit reader before its separately reviewed activation
+  - model tiers, configured aliases, literals, hooks, and MCP references alter sealed semantic identity
+  - unsupported hook events and operations remain canonical obligations rather than disappearing
+  - v5 hook matchers, operation payloads, counts, timeouts, and readers are bounded and fail closed
+  - mcp_servers, mcpServers, bare maps, and single-server forms canonicalize without changing v1-v4 resolution
+  tests:
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  expected_commit_subject: 'feat(workflow): define dormant phase 5 semantics'
+  upstream_candidate: true
+  merge_guidance: Preserve v5 as explicitly selectable and exactly readable, including
+    for sealed snapshots created before or after its activation. Keep v5 semantics cumulative, sealed in the
+    existing node-semantic envelope, and credential-free. Unsupported hooks remain
+    visible obligations for the central authority to block. Canonicalize only explicit
+    v5 MCP reads; v1-v4 resource behavior must remain unchanged.
+  removal_condition: Remove when upstream provides an equivalent dormant cumulative
+    language version with exact old-version replay, bounded hook/MCP normalization,
+    portable model-reference identity, and an independently gated activation boundary.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-language-activation
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/language_schema.py
+  - website/docs/user-guide/features/workflows.md
+  - website/docs/user-guide/features/workflow-yaml-reference.md
+  - skills/software-development/workflow-builder/references/portable-schema.md
+  - skills/software-development/workflow-builder/references/authoring-checklist.md
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_phase3_language.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  owned_symbols:
+  - CURRENT_NORMALIZER_BY_PROFILE
+  - LATEST_NORMALIZER_VERSION
+  - _field_schema
+  - test_v5_is_the_current_archon_admission_contract
+  - test_current_v5_schema_is_bounded_and_explicit_v4_remains_readable
+  - test_archon_authoring_contract_is_bounded_and_versioned
+  - test_current_v5_composite_trust_is_consistent_between_catalog_and_detail
+  - test_language_status_crosses_real_desktop_middleware_without_mutation
+  owned_invariants:
+  - current/default archon-2026-07 selects v5 while hermes-legacy remains v2
+  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":5,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4,5]}'
+  - supported and sealed readers remain exactly v1 through v5 without changing snapshot format 2
+  - v5 format-2 admission requires one immutable provider authority while historical v1-v4 tests stay explicitly pinned
+  - generated authoring guidance and installed reference assets match the runtime profile mapping
+  - catalog detail and Desktop consume backend-authored normalizer and provider capability projections
+  tests:
+  - tests/plugins/workflow/test_phase5_language.py
+  - tests/plugins/workflow/test_phase3_language.py
+  - tests/plugins/workflow/test_phase4_language.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - tests/plugins/workflow/test_phase4_compilation.py
+  - tests/agent/test_workflow_builder_skill.py
+  expected_commit_subject: 'feat(workflow): activate provider portability'
+  upstream_candidate: true
+  merge_guidance: Keep CURRENT_NORMALIZER_BY_PROFILE as the sole profile-selection
+    authority and derive LATEST_NORMALIZER_VERSION from it. Preserve legacy at v2,
+    explicit and sealed v1-v4 replay, snapshot format 2, fail-closed provider authority,
+    config-only tiers and aliases, backend-authored client projections, and the exact
+    Phase 1-4 compatibility contracts inherited by v5.
+  removal_condition: Remove when upstream activates an equivalent v5 provider-portable
+    Archon contract with the same historical readers, immutable provider authority,
+    generated guidance, installed-distribution coverage, and backend-owned client surfaces.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: portable-workflow-model-resolution
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/config.py
+  - hermes_cli/model_switch.py
+  - hermes_cli/runtime_provider.py
+  - hermes_cli/workflow_model_resolution.py
+  - tests/hermes_cli/test_config_validation.py
+  - tests/hermes_cli/test_ollama_cloud_auth.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  owned_symbols:
+  - optional model_aliases and model_tiers config roots
+  - WORKFLOW_MODEL_RESOLVER_VERSION
+  - credential_free_endpoint_config_sha256
+  - _parse_workflow_model_config_v2 sealed replay parser
+  - WorkflowModelConfigSnapshot and ConfiguredModelEntry immutable parser output
+  - ResolvedModelRoute credential-free model authority
+  - parse_workflow_model_config profile and managed leaf precedence
+  - resolve_workflow_model_reference tier alias literal and option precedence
+  - normalized endpoint digest in credential-free config and route fingerprints
+  - private Bedrock and Vertex endpoint-authority config snapshot
+  - model_switch shared portable alias parser integration
+  tests:
+  - tests/hermes_cli/test_config_validation.py
+  - tests/hermes_cli/test_model_switch_configured_provider_routing.py
+  - tests/hermes_cli/test_ollama_cloud_auth.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  expected_commit_subject: 'feat(config): resolve portable workflow model references'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact small, medium, and large tier grammar,
+    exact @alias grammar, and literal model pass-through. Rich top-level aliases
+    win over model.aliases, managed config wins per leaf, and no project/package
+    alias authority or environment expansion is accepted. Resolution must remain
+    pure and independent of catalog, credential, and mutable global alias caches.
+    Public projections include only route URL digests, never URLs or secrets.
+    Resolver v3 config and route fingerprints use the centralized normalized
+    endpoint digest rather than hashing raw URL spelling or credential-bearing
+    values, including a trailing path slash before a structural query. Live
+    route selection reconstructs resolver v2 identity only for
+    immutable replay, and requires one exact current-or-v2 match. Dynamic
+    Bedrock region and Vertex project/location authority is frozen privately,
+    fingerprinted digest-only, and shared by admission and worker preflight.
+    Active literals, configured aliases, and tiers retain one route fingerprint
+    that the worker can match exactly without reconstructing the authored reference.
+  removal_condition: Remove when upstream has an equivalent bounded immutable
+    profile/managed parser shared with interactive aliases and a credential-free
+    workflow route resolver with identical precedence, provenance, warnings, and
+    installed-distribution guarantees.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: provider-workflow-capability-authority
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/provider_capabilities.py
+  - hermes_cli/runtime_provider.py
+  - plugins/model-providers/openrouter/__init__.py
+  - providers/base.py
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  owned_symbols:
+  - CapabilityDisposition and WorkflowProviderFeature closed inventories
+  - ProviderCapabilityDecision immutable public projection
+  - resolve_provider_capability pure central decision engine
+  - capability_authority_digest canonical decision identity
+  - ProviderProfile workflow capability declaration seam
+  - ExecutionRuntimeCapabilities additive registration provenance
+  - ExecutionRuntimeIdentity exact six-field endpoint-bound private codec
+  - execution_runtime_identity centralized admission and worker builder
+  - ExecutionSdkEndpoint and execution_sdk_endpoint lossless SDK route representation
+  - execution_endpoint_sha256 canonical SDK transport endpoint builder
+  - classify_credential_free_execution_runtime live preflight classifier
+  - credential_free_provider_endpoint_config bounded dynamic route selector
+  - CredentialFreeExecutionRouteConstraint private selected route authority
+  - select_credential_free_execution_route exact live route selector
+  - OpenRouter model-aware effort and explicit unsupported security declarations
+  - execution-adapter availability is an explicit fail-closed resolver precondition that provider declarations cannot override
+  tests:
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_provider_compat.py
+  - tests/plugins/workflow/test_runner_binding.py
+  expected_commit_subject: 'feat(providers): centralize workflow capability decisions'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact eleven-feature and four-disposition closed
+    inventories. Provider profiles may declare pure exact native or translated
+    facts, but only the central resolver may grant versioned Hermes adapters.
+    Loader provenance must bind declarations; incomplete closures lose provider
+    claims while retaining wholly Hermes-enforced adapters. User plugins cannot
+    assert authoritative billing or provider-native sandbox guarantees, and all
+    public decisions remain bounded, immutable, credential-free JSON. Private
+    execution identity hashes only normalized structural endpoint evidence;
+    malformed or unresolvable HTTP routes fail closed and only explicitly
+    enumerated endpointless API modes receive the versioned sentinel. Bedrock
+    region and Vertex project/location derive their real execution endpoint
+    without resolving credentials, and incomplete provider registration
+    provenance cannot create sealed authority. SDK-split base URLs and default
+    query mappings, including repeated approved keys and values, must round-trip
+    without loss and recompose through this same credential-free digest; never
+    introduce a parallel transport URL hash.
+  removal_condition: Remove when upstream provides an equivalent single pure
+    provider capability matrix with loader-bound declarations, central adapter
+    policy, canonical identity, installed-distribution coverage, and unchanged
+    legacy runtime-capability equality.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: provider-runtime-deterministic-authority
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/auth.py
+  - hermes_cli/models.py
+  - hermes_cli/provider_aliases.py
+  - hermes_cli/providers.py
+  - hermes_cli/runtime_provider.py
+  - providers/__init__.py
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_inventory.py
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_provider_token_convergence.py
+  - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/hermes_cli/test_web_server.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/providers/test_plugin_discovery.py
+  - tests/providers/test_provider_registry.py
+  owned_symbols:
+  - canonical profile api-mode to transport adapter
+  - _ExecutionEndpointIdentity and endpointless execution API-mode inventory
+  - loader-authored provider registration provenance and code-closure digest
+  - bundled, legacy-compatible, and user-plugin registration precedence
+  - _ProviderAliasRegistration loader-authored alias provenance
+  - canonical-first provider token lookup and alias collision arbitration
+  - registry-first public provider and authentication resolution
+  - registration-gated Bedrock and Vertex synthetic endpoint derivation
+  - _ExecutionProviderAuthority shared runtime registration resolution
+  - _static_execution_provider credential-free compatibility canonicalization
+  - PUBLIC_PROVIDER_COMPATIBILITY_ALIASES immutable shared fallback authority
+  - ProviderSelectorResolution and resolve_provider_selector finite token authority
+  - bounded public-safe provider collision diagnostics
+  - explicit route then provider-profile endpoint precedence
+  owned_invariants:
+  - canonical provider tokens always outrank aliases regardless of origin or import order
+  - canonical collisions and alias collisions use bundled below legacy-compatible below user-plugin precedence
+  - equal-precedence alias collisions preserve last-writer compatibility with one bounded diagnostic
+  - replacing a canonical registration removes only that registration's stale alias claims
+  - alias resolution cannot promote a user plugin to bundled trusted-direct capability authority
+  - public provider and authentication resolution consume the loader-arbitrated canonical winner before static compatibility aliases or built-in metadata
+  - Bedrock and Vertex endpoint synthesis requires a bundled winner or no registration for legacy compatibility; non-bundled same-name winners use their registered profile endpoint
+  - runtime registration resolution checks the raw token first then the existing static compatibility canonical target once and shares that winner across endpoint fallback trust and provenance
+  - credential-free runtime classification canonicalizes registry misses with the same immutable compatibility aliases as public auth and never consults config auth stores credential pools environment secrets or credential probes; unregistered auto remains unresolved
+  - public auth and pure model normalization have canonical parity for every compatibility alias not supplied by the provider registry
+  - every registered canonical token registered alias and public compatibility token has one registry-first winner across auth runtime provider detail model parsing and ACP
+  - provider-registry discovery failure remains a visible failure and can never be reclassified as an ordinary immutable compatibility miss
+  tests:
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_inventory.py
+  - tests/hermes_cli/test_provider_capabilities.py
+  - tests/hermes_cli/test_provider_profile_precedence.py
+  - tests/hermes_cli/test_provider_token_convergence.py
+  - tests/hermes_cli/test_resolve_provider_full_plugin_registry.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/hermes_cli/test_web_server.py
+  - tests/hermes_cli/test_workflow_model_resolution.py
+  - tests/providers/test_plugin_discovery.py
+  - tests/providers/test_provider_registry.py
+  expected_commit_subject: 'fix(providers): enforce canonical alias precedence'
+  upstream_candidate: true
+  merge_guidance: Preserve canonical round-tripping for every declared provider
+    API mode, including codex responses and Bedrock converse. Provider origin,
+    distribution identity, and bounded code-closure identity must be authored by
+    the loader rather than accepted from profile data. Discovery precedence must
+    remain bundled below legacy-compatible below user plugins for both canonical
+    and alias claims. Canonical tokens always outrank aliases; replacing a
+    canonical registration removes its stale aliases; equal-rank collisions
+    retain last-writer compatibility. Public provider and authentication
+    resolution must consume that same registry winner before static aliases or
+    built-in metadata while preserving exact user-config provider priority and
+    agreed bundled overlay metadata. Bedrock and Vertex regional endpoint
+    synthesis is bundled authority (with an unregistered legacy fallback), so a
+    non-bundled same-name winner must retain its profile endpoint and provenance.
+    Resolve runtime registration once, preferring the raw registry token before
+    consulting the shared immutable compatibility target; endpoint
+    eligibility, profile fallback, trust, and provenance must consume that same
+    result rather than rebuilding aliases independently. This classification
+    path must not call the credential-aware provider resolver or inspect ambient
+    provider, authentication, or credential state; unregistered `auto` remains
+    unresolved. Public auth and pure preflight normalization must consume the
+    same compatibility map so aliases cannot drift across admission and worker
+    resolution.
+    Diagnostics remain bounded and free of local paths, credentials, or provider
+    payloads.
+  removal_condition: Remove when upstream exposes an equivalent deterministic
+    provider-registration authority with immutable loader provenance, closure
+    identity, and canonical transport round-tripping.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-sealed-runtime-context
+  change_class: workflow-security
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/credential_adoption.py
+  - agent/agent_init.py
+  - agent/agent_runtime_helpers.py
+  - agent/anthropic_adapter.py
+  - agent/bedrock_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/codex_runtime.py
+  - agent/conversation_loop.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - agent/provider_attempts.py
+  - agent/relay_llm.py
+  - agent/turn_retry_state.py
+  - hermes_cli/runtime_provider.py
+  - model_tools.py
+  - run_agent.py
+  - plugins/workflow/execution_semantics.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/sessions.py
+  - plugins/workflow/store.py
+  - tests/agent/test_plugin_agent_shared_approval.py
+  - tests/plugins/workflow/test_phase5_inline_approval_convergence.py
+  owned_symbols:
+  - model_visible_prefix_digest
+  - AIAgent.seal_model_visible_prefix
+  - AIAgent.verify_model_visible_prefix
+  - _execution_route_constraint
+  - AIAgent._assert_execution_route_constraint
+  - AIAgent._replace_primary_openai_client
+  - AIAgent._publish_pending_anthropic_candidate
+  - AIAgent._refresh_anthropic_credentials_for_turn
+  - AIAgent._adopt_pending_sealed_openai_candidate
+  - _PendingSealedCredentialAdoption
+  - _CredentialRecoveryTurnState
+  - _CredentialRefreshStatus
+  - _CandidateAttemptResult
+  - AIAgent._retire_shared_openai_client
+  - AIAgent._retire_adopted_prior_client
+  - recover_with_credential_pool
+  - ProviderCapabilityDriftError
+  - execution_endpoint_sha256
+  - _get_bedrock_runtime_client
+  - build_anthropic_bedrock_client
+  - ManagedLlmStream._callback_error
+  - PluginAgentRunRequest
+  - _validate_request
+  - _phase5_structured_repair_matches_admission
+  - phase5_node_intended_authority_digest
+  - phase5_shared_context_compatibility_digest
+  - phase5_session_cache_fingerprint
+  - NodeExecutionContext.shared_context_compatibility_digest
+  - RunScheduler._predecessor_results
+  - NodeSessionRecord
+  - _language_has_phase4_semantics
+  - ApprovalExecutor.execute
+  - PluginAgentRunRequest.sealed_runtime_authority_required
+  - _ProviderAttemptAuthority
+  - _consume_shared_approved_action
+  owned_invariants:
+  - normalizer-v5 execution uses only the authenticated sealed provider model and option route
+  - plugin-agent intended authority and expected runtime identity are accepted only as a complete pair while legacy requests may omit both
+  - every normalizer-v5 primary approval structured-repair inline-agent and fallback constructor marks sealed runtime authority as required so deleting its identity tuple cannot downgrade into the generic legacy wire contract
+  - current runtime API mode trust class and registration provenance must match sealed authority before agent construction or provider transport
+  - current normalized endpoint digest must exactly match sealed authority before MCP startup agent construction fallback or provider transport
+  - the exact rendered system prompt bytes and complete ordered model-visible tool schemas are sealed once and reused
+  - same-node intended-authority or model-visible-prefix drift selects fresh context before provider transport rather than mutating a cached prefix
+  - distinct same-run nodes may resume only when their sealed cross-node compatibility digests match and the predecessor cache fingerprint recomputes from its own intended authority and exact prefix
+  - persistent recovery keeps node-bound intended authority separate from cross-node compatibility authority
+  - only a succeeded winning attempt persists the complete Phase 5 handoff identity; failed retry-scheduled paused cancelled and interrupted outcomes strip all top-level handoff and cache fields at the scheduler persistence boundary
+  - durable recovery reads the complete lowercase identity triple only from the unique winning succeeded attempt while failed superseded missing or tampered metadata fails closed
+  - legacy session and recovery records remain byte-compatible and the new identity fields stay private attempt metadata rather than public run fields
+  - normalizer v5 ordinary loops inherit v4 authenticated decision recovery and consumed-input cleanup
+  - provider-free nodes carry no fabricated provider route or provider execution identity
+  - normalizer-v5 approval rejection rework uses its sealed route and returns paired worker execution identities
+  - prefix verification runs again at every sealed provider-attempt reservation
+  - no prompts tools credentials provider payloads or local paths enter public identity evidence
+  - runtime drift diagnostics expose only stable field names and never endpoint or provenance digest values
+  - one exact live route fingerprint selects the provider model API mode endpoint and bounded dynamic endpoint config used by credential resolution
+  - Vertex credentials supply only an OAuth token while config supplies project and region; Bedrock config or us-east-1 supplies region while AWS credentials cannot change it
+  - the selected route constraint remains private and immutable inside AIAgent for the full provider attempt
+  - sealed credential refresh and client recreation may update credentials but never provider model API mode or endpoint
+  - env-authored endpoints cannot replace a sealed config-authored endpoint, and sealed Vertex 401 recovery refreshes only its OAuth token
+  - sealed environment refresh compares route eligibility through the canonical endpoint digest and advances its seen baseline only after concrete client adoption
+  - sealed Vertex and credential-pool candidates publish their client credentials endpoint kwargs pool identity and retry markers only after concrete construction and exact-route validation succeed
+  - sealed native and pooled Anthropic candidates publish the concrete client Anthropic credential endpoint OAuth identity generic credential endpoint and pool identity together before post-lock retirement
+  - sealed Anthropic request-local construction uses only the published credential while direct 401 recovery exclusively owns live token resolution and success-only retry guards
+  - one acquired sealed candidate owns one initial construction and at most one identical-candidate retry before another credential source or fallback may run
+  - one scheduler-consumed approval digest is atomically consumable once across the complete inline-agent request tree only when the current request carries that exact non-null digest; cleared fallback and later matching sibling requests pause while broker state is torn down with the parent exchange
+  - pending sealed adoption is generation-bound and cleared on success bounded failure route drift cancellation disposal fallback transition and every turn exit
+  - fallback credential resolution waits for pending adoption and invalidates the captured generation immediately before route publication
+  - credential-pool counts and Vertex or 429 guards change only after successful adoption while acquisition failures retain their existing bounds
+  - candidate-path diagnostics expose only stable reason tokens and exception types without credentials endpoints digests or local paths
+  - failed sealed client adoption preserves the prior live client and published state so the same candidate remains retryable while any rejected concrete candidate is closed
+  - repeated approved structural query values survive real initialization and credential-only client recreation without duplication or collapse
+  - a recreated sealed OpenAI client is endpoint-validated before replacing the live shared client
+  - every sealed provider reservation reasserts the concrete SDK client endpoint at the last pre-network seam before accounting or provider I/O
+  - SDK default_query is part of effective endpoint identity, including after credential-only client recreation
+  - provider capability drift is terminal and cannot activate retry fallback structured repair or another provider attempt
+  - Phase 5 structured repair revalidates the admitted effective provider model API mode strategy adapter and schema fingerprint before construction or transport
+  - contradictory structured repair authority fails terminally before a repair request or provider attempt is created
+  - Codex app-server propagates the exact capability-drift exception instead of returning a generic partial result
+  - sealed boto3 and AnthropicBedrock clients receive the selected endpoint explicitly while unsealed boto3 construction retains region-only SDK resolution
+  tests:
+  - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/agent/test_plugin_agent_shared_approval.py
+  - tests/plugins/workflow/test_phase5_adversarial_remediation.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_phase5_provider_snapshot.py
+  - tests/plugins/workflow/test_approval.py
+  - tests/plugins/workflow/test_persistent_session_recovery.py
+  - tests/plugins/workflow/test_crash_recovery.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduler.py
+  - tests/plugins/workflow/test_typed_publication_recovery.py
+  - tests/plugins/workflow/test_phase4_loops.py
+  - tests/run_agent/test_env_credential_turn_refresh.py
+  - tests/run_agent/test_sealed_anthropic_credential_adoption.py
+  - tests/run_agent/test_credential_pool_interrupt.py
+  - tests/run_agent/test_fallback_credential_isolation.py
+  - tests/run_agent/test_primary_runtime_restore.py
+  - tests/agent/test_credential_adoption.py
+  - tests/agent/test_turn_retry_state.py
+  - tests/agent/test_credential_pool_routing.py
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_phase5_identity_convergence.py
+  - tests/plugins/workflow/test_phase5_inline_approval_convergence.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  expected_commit_subject: 'feat(workflow): enforce sealed provider execution context'
+  upstream_candidate: true
+  merge_guidance: Keep the generic plugin-agent request seam limited to credential-free
+    expected runtime identity, node-bound intended authority, exact prefix identity,
+    and the separate cross-node compatibility digest. Compute the runtime prefix
+    only after prompt contributors and final tool filtering, but before session reads
+    and provider calls. Carry the private selected route constraint into AIAgent
+    for the whole attempt, reassert it around every credential refresh and client
+    recreation and at every concrete SDK transport reservation, and keep sealed
+    Vertex recovery token-only. Publish refreshed sealed client and credential state
+    as one validated generation-scoped transaction; retry the identical immutable
+    candidate at most once before releasing source precedence, and defer turn-local
+    marker publication until adoption succeeds. Failed adoption must preserve retry
+    eligibility and the prior live state. Invalidate pending ownership before route
+    transitions and on cancellation, disposal, or every turn exit. Keep all nested
+    candidate construction, close, and retirement diagnostics credential-free and
+    path-free. Treat route drift as terminal before accounting,
+    fallback, repair, retry, or provider I/O. Preserve exact legacy recovery
+    encodings and never resolve workflow aliases or provider capabilities inside
+    clients.
+  removal_condition: Remove when upstream provides equivalent two-stage immutable
+    provider and model-visible-prefix authority with crash-safe paired recovery and
+    pre-transport drift rejection.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-scoped-hook-lifecycle
+  change_class: plugin-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/plugins.py
+  - agent/plugin_agent_worker.py
+  owned_symbols:
+  - PluginManager.register_scoped_lifecycle
+  - PluginManager._close_scoped_lifecycle
+  - _ScopedLifecycleRegistration
+  - _InstalledNodeHooks
+  owned_invariants:
+  - temporary hooks and middleware register atomically under one synchronization boundary
+  - invocation uses a stable callback snapshot without holding the registration lock across plugin code
+  - opaque idempotent teardown removes only callbacks owned by that registration token
+  - concurrent foreign plugin registrations survive workflow success failure cancellation and cleanup
+  - workflow node hook installation never snapshot-clears or mutates plugin manager private registries directly
+  - hook responses affect only existing lifecycle operations and never mutate the system prompt or insert conversation messages
+  tests:
+  - tests/plugins/workflow/test_phase5_hooks.py
+  - tests/plugins/workflow/test_node_hooks.py
+  - tests/test_transform_tool_result_hook.py
+  - tests/test_transform_llm_output_hook.py
+  - tests/tools/test_approval_plugin_hooks.py
+  expected_commit_subject: 'feat(plugins): scope workflow hook lifecycles'
+  upstream_candidate: true
+  merge_guidance: Preserve the small generic opaque lifecycle registration API and
+    identity-based removal under a dedicated lock. Invoke a copied callback tuple
+    outside the lock, and never restore whole hook or middleware dictionaries during
+    scoped cleanup.
+  removal_condition: Remove when upstream exposes equivalent concurrency-safe scoped
+    hook and middleware ownership with idempotent selective teardown.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-sealed-mcp-runtime
+  change_class: workflow-security
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - plugins/workflow/admission_service.py
+  - plugins/workflow/dependency_manifest.py
+  - plugins/workflow/execution_semantics.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduler.py
+  owned_symbols:
+  - PLUGIN_AGENT_MCP_IMPORT_POLICY_VERSION
+  - plugin_agent_python_runtime_identity
+  - _PHASE5_AUTHORITY_LOADER
+  - _phase5_mcp_execution_preconditions
+  - _phase5_mcp_launch_shape_is_sealed
+  - phase5_node_mcp_runtime_identity_digest
+  owned_invariants:
+  - v5 MCP admission supports only an exact trusted Hermes Python interpreter and sealed package entry script
+  - admission rejects non-string arguments malformed environments and every unsealed path-bearing argument or environment value before run creation
+  - admission conservatively rejects every URI-bearing Phase 5 MCP argument rather than admitting a launch shape the worker may later classify unsafe
+  - interpreter family version build bytes and import-policy version are sealed as a credential-free authority digest
+  - worker startup recomputes the exact interpreter identity before MCP discovery or provider transport
+  - v5 launches with isolated -I -S semantics and a lifetime import guard limited to standard-library and sealed package roots
+  - PATH commands python module and inline-code forms Node npm registries standalone binaries and remote HTTP or SSE block
+  - v1-v4 authenticated MCP launch normalization and lifecycle behavior remain unchanged
+  - existing MCP startup cancellation shutdown process-tree cleanup and redacted diagnostics remain authoritative
+  tests:
+  - tests/plugins/workflow/test_phase5_mcp.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  - tests/tools/test_mcp_initial_connect_shutdown.py
+  - tests/tools/test_mcp_cancelled_error_propagation.py
+  - tests/tools/test_mcp_reconnect_log_hygiene.py
+  - tests/tools/test_process_registry.py
+  expected_commit_subject: 'feat(workflow): seal MCP executable closure'
+  upstream_candidate: true
+  merge_guidance: Keep v5 strictness conditional on sealed Phase 5 authority so
+    old snapshots retain their exact launch contract. Treat the trusted interpreter
+    as an attested host dependency rather than package content, recompute its digest
+    before discovery, and keep the import guard active for the entire child lifetime.
+  removal_condition: Remove when upstream supplies an equivalent versioned package-contained
+    MCP Python closure with interpreter attestation and lifetime import-root enforcement.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-inline-agent-authority
+  change_class: plugin-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - plugins/workflow/compat.py
+  - plugins/workflow/executors/ai.py
+  owned_symbols:
+  - PluginAgentRunRequest
+  - _build_inline_agent_handler
+  - _tool_policy_incompatible_failure
+  owned_invariants:
+  - omitted allowed_tools remains distinct from an explicit empty allow set
+  - Phase 5 never auto-adds workflow_agent or overrides a deny rule
+  - unreachable inline agents block at admission and again before worker agent construction
+  - inline children inherit one shared provider-attempt authority and absolute parent deadlines
+  - inline children retain the exact contained workdir process-tree RSS CPU descendant and cancellation limits
+  - node and child skills remain complete sealed current-user-turn content and never mutate the system prompt
+  - legacy workflow snapshots retain their prior workflow_agent auto-add behavior
+  tests:
+  - tests/plugins/workflow/test_phase5_inline_limits.py
+  - tests/plugins/workflow/test_node_agents.py
+  - tests/plugins/workflow/test_node_skills.py
+  - tests/plugins/workflow/test_node_tool_policy.py
+  - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_iteration_budget_race.py
+  expected_commit_subject: 'feat(agent): share sealed inline-agent limits'
+  upstream_candidate: true
+  merge_guidance: Keep the request extension optional and wire-compatible for generic
+    plugin callers. Only sealed Phase 5 execution treats unreachable declared inline
+    agents as terminal; legacy workflows retain their existing adapter behavior. Preserve
+    one authenticated remaining-attempt authority and absolute deadline values across
+    every child without adding a raw delegation callback or core model tool.
+  removal_condition: Remove when upstream provides an equivalent bounded inline-agent
+    request authority with exact empty-tool semantics shared remaining limits and
+    pre-provider fail-closed validation.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-authoritative-cost-budget
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/cost_budget.py
+  - agent/provider_attempts.py
+  - agent/relay_llm.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - agent/conversation_loop.py
+  - agent/usage_pricing.py
+  - plugins/workflow/executors/ai.py
+  owned_symbols:
+  - AuthoritativeCostBudget
+  - AuthoritativeSettlementContract
+  - AuthoritativeCostFact
+  - authoritative_cost_fact
+  - reserve_provider_transport_attempt
+  - settle_provider_transport_attempt
+  - poison_provider_transport_attempt
+  - PluginAgentRunRequest
+  owned_invariants:
+  - hard budgets use bounded exact decimal settlement and never binary-float pricing estimates
+  - only a complete code-owned provider settlement contract can create an authoritative cost fact
+  - one authenticated in-flight lease serializes parent repair retry fallback and inline transports
+  - duplicate settlements are idempotent while contradictions route spoofing and missing settlement poison terminally
+  - a settled call may overrun once but exhaustion starts no later transport and cannot be retried or reset
+  - Phase 5 structured repair preserves the primary request's provider-attempt and authoritative cost-budget authorities and contracts without minting replacement authority
+  - provider-attempt refusal releases a cost lease only with proof that transport did not start
+  - timeout cancellation disconnect and ambiguous transport failure never reopen the authority
+  - public evidence is a closed bounded credential-free ledger without raw usage or provider payloads
+  - OpenRouter shared-credit and BYOK routes remain unsupported until every billable terminal outcome is contractually covered
+  - pre-Phase-5 plugin-agent max-budget metadata retains its legacy wire and audit behavior
+  tests:
+  - tests/agent/test_cost_budget.py
+  - tests/agent/test_usage_pricing.py
+  - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_plugin_agent.py
+  - tests/agent/test_cascading_interrupt_6600.py
+  - tests/agent/test_codex_app_server_persist.py
+  - tests/agent/test_cron_inline_api_call_62151.py
+  - tests/cron/test_cron_direct_api_call_62151.py
+  - tests/plugins/workflow/test_phase5_cost_budget.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_retry.py
+  expected_commit_subject: 'feat(agent): enforce shared authoritative cost budgets'
+  upstream_candidate: true
+  merge_guidance: Keep display estimates and local price tables wholly separate from
+    the hard authority. A provider route may install the generic callbacks only after
+    reviewed bundled code proves exact billed settlement across success streaming
+    charged errors disconnect timeout and cancellation. Preserve one shared lease and
+    poison rather than retry whenever billing outcome is ambiguous.
+  removal_condition: Remove when upstream provides an equivalent provider-neutral
+    authenticated exact-settlement authority plus a complete provider contract gate
+    and bounded public evidence.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-provider-option-transport
+  change_class: provider-runtime-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/provider_capabilities.py
+  - plugins/model-providers/openrouter/__init__.py
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/scheduler.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  owned_symbols:
+  - ProviderOptionTransport
+  - encode_provider_option_transport
+  - resolve_workflow_provider_authority
+  - WorkflowResolvedProviderRoute
+  - _SUPPORTED_HOOK_OPERATIONS_BY_EVENT
+  - _hook_operations_supported
+  - NodeExecutionContext
+  - PluginAgentRunRequest
+  - _phase5_structured_repair_request
+  owned_invariants:
+  - every accepted provider option has one reviewed exact transport encoder or blocks before transport
+  - every provider-calling prompt command or ordinary loop node receives a sealed primary route
+  - approval nodes receive a provider route only when authenticated rejection rework can call the provider
+  - hook events without exact worker lifecycle and response semantics resolve unsupported and block admission
+  - hook support is decided by an event-specific consumed-operation matrix rather than a global response-field allowlist
+  - hook response combinations block when values are ineffective duplicated or precedence-dropped by the worker translator
+  - approval rejection rework preserves exact empty tool restrictions and blocks every generic AI option its executor cannot apply
+  - approval rejection rework shares cancellation and process/provider lifecycle callbacks with the primary isolated agent path
+  - v1-v4 approval rework retains its prior unrestricted tool request empty denial set ignored systemPrompt and legacy lifecycle handoff
+  - route-specific effort decisions cannot be inherited from a different provider or model
+  - OpenRouter effort uses only the declared reasoning.effort or verbosity request field
+  - unsupported thinking shapes and every current provider-native sandbox request block without provider use
+  - Hermes web execution is admitted only when the service and exact web_search tool policy are reachable
+  - Phase 5 fallback uses a fresh child context with its own sealed provider model runtime and option identity
+  - Phase 5 structured repair is derived with dataclasses.replace from the sealed primary request so its six-field runtime identity and exact reasoning and request-override option transport remain unchanged
+  - Phase 5 structured repair clears cache and MCP reuse extensions tools fallback approval and ephemeral prompt authority while preserving sandbox workdir deadline resource and execution authorities
+  - primary fallback and inline agents share attempt cost deadline workdir resource and cancellation authorities
+  - legacy fallback request behavior remains wire-compatible and unchanged
+  - v5 provider authority schema and model resolver version advance together and schema-1 v5 records require re-admission
+  - every sealed primary fallback and inline-agent route integrity-binds one normalized endpoint digest while snapshot format remains 2
+  tests:
+  - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_phase5_provider_authority.py
+  - tests/plugins/workflow/test_phase5_execution_context.py
+  - tests/plugins/workflow/test_approval.py
+  - tests/plugins/workflow/test_phase5_inline_limits.py
+  - tests/plugins/workflow/test_phase4_loops.py
+  - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_fallback_reasoning_override.py
+  - tests/run_agent/test_conversation_fallback_state.py
+  - tests/plugins/web/test_web_search_provider_plugins.py
+  - tests/plugins/workflow/test_security_boundaries.py
+  - tests/plugins/workflow/test_provider_failures.py
+  expected_commit_subject: 'feat(workflow): enforce provider option capabilities'
+  upstream_candidate: true
+  merge_guidance: Keep provider declarations separate from transport encoders. A
+    declaration without a reviewed exact request mapping must fail closed. Preserve
+    the generic optional plugin-agent wire extension and run sealed fallback inside
+    the already registered worker tree so cached primary context is never mutated.
+    Do not describe process resource ceilings as sandbox enforcement.
+  removal_condition: Remove when upstream provides equivalent route-specific sealed
+    option transports fresh-context fallback with shared authorities and truthful
+    provider-native sandbox blocking.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-phase5-public-provider-authority
+  change_class: workflow-desktop-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - plugins/workflow/provider_authority.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/evidence.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  owned_symbols:
+  - public_display_identifier
+  - public_provider_capability_projection
+  - WorkflowProviderRouteProjection
+  - WorkflowProviderDecisionProjection
+  - WorkflowProviderCapabilityProjection
+  - WorkflowDetailLanguageStatus
+  - WorkflowCatalogLanguageStatus
+  - _catalog_language_projection
+  - isDesktopProviderCapabilityProjection
+  owned_invariants:
+  - catalog projects only bounded capability summary while detail adds bounded routes and decisions
+  - unsafe provider and model identifiers are replaced wholesale by a stable digest label
+  - prompts commands credentials provider responses feedback private paths base URLs and MCP stderr never enter public projections
+  - Desktop renders backend-authored resolution and never resolves tiers aliases models or capabilities locally
+  - missing malformed unsupported unknown or changed Phase 5 authority blocks before the existing run mutation URL
+  - provider authority and budget evidence contain only sealed digests bounded outcomes and closed totals
+  - existing workflow action names and mutation URLs remain unchanged
+  - the closed REST language projection accepts every supported v1 through v5 reader contract
+  - every catalog language row carries the backend-authored normalizer version so clients can fail closed without resolving language state
+  tests:
+  - tests/plugins/workflow/test_phase5_surfaces.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
+  - tests/plugins/workflow/test_evidence_api.py
+  - tests/plugins/workflow/test_notifications.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  expected_commit_subject: 'feat(workflow): project provider authority to clients'
+  upstream_candidate: true
+  merge_guidance: Preserve the backend as the only model and capability authority.
+    Keep the public contract closed and versioned, redact unsafe identifiers wholesale,
+    and require a fresh authoritative detail check immediately before Desktop submits
+    through the existing mutation URL.
+  removal_condition: Remove when upstream provides an equivalent closed provider
+    authority projection shared by evidence REST catalog doctor notifications and
+    Desktop with fail-closed client skew handling.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-closed-public-run-evidence-projections
+  change_class: workflow-desktop-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/store.py
+  - plugins/workflow/evidence.py
+  - plugins/workflow/notifications.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/lib/workflow-public-codec.ts
+  - apps/desktop/src/app/workflows/attention-inbox.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.tsx
+  - apps/desktop/src/hermes.ts
+  owned_symbols:
+  - public_run_projection
+  - public_event_projection
+  - public_attempt_projection
+  - public_artifact_projection
+  - public_cleanup_projection
+  - public_pending_interaction
+  - WorkflowRunProjection
+  - WorkflowCostBudgetProjection
+  - WorkflowAttentionInteractionProjection
+  - WorkflowEventPageProjection
+  - WorkflowEvidencePageProjection
+  - WorkflowAttentionPageProjection
+  - decodeWorkflowRun
+  - decodeWorkflowRunPage
+  - decodeWorkflowEventPage
+  - decodeWorkflowEvidencePage
+  - decodeWorkflowAttentionPage
+  - formatWorkflowEvidenceItem
+  - AttentionInbox
+  owned_invariants:
+  - public run node event interaction attempt evidence attention REST Gateway and Desktop projections copy only explicitly permitted fields
+  - provider payloads audit errors prompts commands approval text loop feedback rework reasons session identifiers and local paths remain private durable state
+  - provider and executor failures use one fixed public error and message while only execution_integrity and package_mcp_unavailable retain bounded pre-transport attempt codes and retries repairs child work and all other diagnostics remain private
+  - timeline payload truncation retains one boolean marker without restoring the private payload
+  - only verified typed-publication descriptor-v2 rows expose publication identity while visible legacy artifacts omit publication identity and cannot be treated as previewable typed output
+  - malformed legacy and direct SQL rows recover to generic bounded projections without traversing or copying unknown values
+  - REST response models and Desktop runtime decoders reject unknown keys scalar confusion and non-finite values
+  - public evidence rendering is discriminated and never stringifies arbitrary backend objects
+  - v1 through v4 durable snapshots and direct tail event readers retain recorded behavior while network and evidence pages use the closed projection
+  - generated run attempt publication and interaction identifiers retain exact old-client identity and existing action URLs and vocabulary remain unchanged
+  tests:
+  - tests/plugins/workflow/test_phase5_public_run_evidence_contract.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
+  - tests/plugins/workflow/test_evidence_api.py
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_phase4_surfaces.py
+  - tests/plugins/workflow/test_persistent_session_recovery.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - apps/desktop/src/lib/workflow-public-codec.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/hermes.test.ts
+  expected_commit_subject: 'fix(workflow): close public run evidence projections'
+  upstream_candidate: true
+  merge_guidance: Preserve private durable diagnostics and historical snapshot readers,
+    but make every network and Desktop projection an explicit closed DTO. New public
+    fields require backend model and Desktop decoder changes in the same commit and
+    must never restore arbitrary recursive sanitization or JSON object rendering.
+  removal_condition: Remove when upstream provides an equivalent closed run event
+    evidence attention and mutation projection with fixed errors legacy recovery and
+    exact Desktop runtime decoding.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: desktop-workflow-lint-invariants
+  change_class: desktop-workflow-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/contrib/surfaces.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.tsx
+  owned_symbols:
+  - StatusbarControls and StatusbarBoundary import order
+  - WorkflowsView mounted and review generation lifecycle guard
+  - ReviewRunDialog request lifecycle guard
+  - TypedArtifactView download lifecycle guard
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/typed-artifact-view.test.tsx
+  expected_commit_subject: 'fix(desktop): restore workflow lint baseline'
+  upstream_candidate: true
+  merge_guidance: Keep Desktop imports in canonical order. Retain the narrow
+    no-restricted-syntax exemptions only for workflow mount, request, and download
+    lifecycle refs; these refs guard asynchronous cleanup and are not mirrors of
+    nanostore values. Reactive callback reads must continue to use atom.get()
+    directly rather than expanding these exemptions.
+  removal_condition: Remove when upstream includes equivalent lint-clean workflow
+    lifecycle guards and canonical imports.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: desktop-model-settings-baseline-contracts
+  change_class: desktop-test-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  owned_symbols:
+  - local main-model auxiliary inheritance test
+  - profile-bound MoA autosave expectations
+  tests:
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  expected_commit_subject: 'test(desktop): align model settings baseline contracts'
+  upstream_candidate: true
+  merge_guidance: Preserve the auto follow-main sentinel when an auxiliary slot
+    inherits a user-defined local main model; inheriting must not pin the current
+    model or copy its endpoint into the slot. MoA debounced autosaves must assert
+    their captured request profile explicitly, including null for the default
+    profile, and timer-driven state changes must remain inside React act boundaries.
+  removal_condition: Remove when upstream tests cover the same follow-main and
+    profile-captured autosave contracts.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: enrolled-browser-managed-npx-resolution
+  change_class: runtime-resolution-generic
+  owner: workflow-orchestration
+  files:
+  - tools/browser_session_manager.py
+  - tests/test_managed_runtime_resolution.py
+  owned_symbols:
+  - browser_session_manager._agent_browser_cmd managed npx resolution
+  tests:
+  - tests/test_managed_runtime_resolution.py
+  expected_commit_subject: 'fix(browser): resolve enrolled npx from managed runtime'
+  upstream_candidate: true
+  merge_guidance: Preserve the enrolled browser session manager's reuse of
+    browser_tool._find_agent_browser, but resolve its npx fallback through the
+    canonical managed Node authority. A missing or broken managed tree must fail
+    closed instead of falling back to an unrelated ambient npx.
+  removal_condition: Remove when upstream enrolled browser sessions use an
+    equivalent managed-aware npx resolver.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: posix-generic-launcher-python-dispatch
+  change_class: installer-generic
+  owner: workflow-orchestration
+  files:
+  - scripts/install.sh
+  - tests/test_install_macos_launcher.py
+  - tests/test_install_sh_acp_launcher.py
+  - tests/test_posix_command_launchers.py
+  - tests/test_install_sh_symlink_stomp.py
+  owned_symbols:
+  - write_command_launchers python interpreter dispatch
+  - setup_path launcher_python binding
+  tests:
+  - tests/test_install_macos_launcher.py
+  - tests/test_install_sh_acp_launcher.py
+  - tests/test_posix_command_launchers.py
+  - tests/test_install_sh_symlink_stomp.py
+  - tests/test_install_python_isolation.py
+  expected_commit_subject: 'fix(install): preserve macOS-safe generic launchers'
+  upstream_candidate: true
+  merge_guidance: Preserve the generic project-script-derived launcher writer, but
+    have venv installs invoke every generated console script through the venv Python
+    interpreter. This bypasses uv's realpath-dependent shell trampoline on stock macOS
+    without reintroducing command-specific or brand-specific launcher blocks. Direct
+    non-venv installs must retain direct execution, and prior symlinks must be removed
+    before writing each launcher.
+  removal_condition: Remove when the upstream POSIX installer provides an equivalent
+    generic, brand-aware launcher that does not require realpath on stock macOS.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: explicit-profile-canonical-config-loader
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/config.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/runtime.py
+  - tests/hermes_cli/test_config_loader_e2e.py
+  - tests/hermes_cli/test_config_read_guard.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - load_config config_path
+  - load_config_readonly config_path
+  - _load_config_impl config_path
+  - _profile_config canonical behavioral read
+  - _runtime_config canonical behavioral read
+  - WorkflowRetentionPolicy.from_profile canonical behavioral read
+  - WorkflowApiLimits.from_profile canonical behavioral read
+  tests:
+  - tests/hermes_cli/test_config_loader_e2e.py
+  - tests/hermes_cli/test_config_read_guard.py
+  - tests/plugins/workflow/test_cli.py
+  expected_commit_subject: 'fix(config): load explicit profile paths canonically'
+  upstream_candidate: true
+  merge_guidance: Preserve the optional explicit config path on both canonical behavioral
+    loaders so multi-profile services can resolve a selected profile without mutating
+    process-global HERMES_HOME. The explicit path must retain defaults, normalization,
+    environment expansion, managed-scope precedence, cache invalidation, and
+    last-known-good semantics. Workflow retention, API, compatibility, and runtime
+    policy reads must consume this authority instead of parsing config.yaml directly.
+  removal_condition: Remove when upstream provides an equivalent thread-safe explicit-profile
+    behavioral loader and every workflow config consumer uses it.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: brand-aware-version-label
   change_class: branding-generic
   owner: downstream-branding
@@ -427,10 +1396,13 @@ upstream_changes:
   - PluginAgentRunResult
   - PluginAgentRunner
   - _exchange_worker
+  - PluginAgentRunRequest expected_runtime_route_fingerprint and bounded route options
   - ToolRegistry.scoped_names
   - PluginContext.agent
   tests:
   - tests/agent/test_plugin_agent.py
+  - tests/agent/test_plugin_agent_prefix_identity.py
+  - tests/plugins/workflow/test_ai_executor.py
   - tests/tools/test_registry.py
   expected_commit_subject: 'feat(workflow): enforce per-node agent resources'
   upstream_candidate: true
@@ -441,7 +1413,12 @@ upstream_changes:
     policy, semantic-progress framing that excludes stderr, and the exact-digest one-shot
     approval grant, node-local hook/MCP inputs, and bounded synchronous inline-agent
     dispatcher so a workflow scheduler can remain the sole retry and lifecycle authority
-    without granting a different action or exposing process-global resources.
+    without granting a different action or exposing process-global resources. Preserve
+    the digest-only sealed-route fingerprint and bounded secret-free provider options
+    on primary, approval, repair, fallback, and inline-child requests so exact option
+    precedence can be replayed without raw endpoint authority crossing the wire. Derive
+    Phase 5 structured repair by narrowing the admitted request so future authority and
+    limit fields cannot be silently omitted.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
@@ -783,13 +1760,21 @@ upstream_changes:
   change_class: desktop-composition-generic
   owner: workflow-orchestration
   files:
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/store/native-notifications.ts
   - apps/desktop/src/store/workflow-notifications.ts
   - apps/desktop/src/store/workflow-notifications.test.ts
   owned_symbols:
   - projectNativeNotification
+  - decodeWorkflowNotificationPage
   - deliverWorkflowNotificationsOnce
   - startWorkflowNotificationDelivery
+  - WorkflowNotificationPayload
+  - WorkflowNotificationPage
+  owned_invariants:
+  - Desktop treats notification REST data as unknown until an exact closed-vocabulary decoder accepts the complete page
+  - malformed notification pages are never rendered or acknowledged and Desktop never reconstructs backend authority
   tests:
   - apps/desktop/src/store/native-notifications.test.ts
   - apps/desktop/src/store/workflow-notifications.test.ts
@@ -1097,10 +2082,16 @@ upstream_changes:
   - GatewayRunner authenticated plugin invocation and delivery boundary
   - workflow_gateway_command
   - WorkflowCoordinatorService._deliver_gateway_notifications
+  - NotificationOutbox closed public notification codec
+  - NotificationOutbox._private_gateway_delivery
+  owned_invariants:
+  - notification persistence and public reads use one exact discriminated DTO with strict JSON and safe legacy-row recovery
+  - gateway delivery capabilities remain private coordinator data while public destinations are opaque
   tests:
   - tests/hermes_cli/test_authenticated_plugin_commands.py
   - tests/gateway/test_plugin_delivery.py
   - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_phase5_public_projection_contract.py
   - tests/hermes_cli/test_plugin_background_services.py
   - tests/gateway/test_plugin_background_services.py
   - tests/hermes_cli/test_plugin_provider_hot_reload.py
@@ -1252,12 +2243,14 @@ upstream_changes:
   - consecutive full-pair SHA-256 generation verification
   - WorkflowTrustStore.check_read_only
   - projection_key_is_secret
+  - _sanitize_success_result
   - suffix-bounded sanitize_projection strings
   - workflow show complete definition preservation
   - WorkflowDetailResponse
   - workflow_detail
   tests:
   - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_cli.py
   - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): Task 2 add detail preflight endpoint'
   upstream_candidate: true
@@ -2485,12 +3478,17 @@ upstream_changes:
   files:
   - run_agent.py
   - agent/anthropic_adapter.py
+  - agent/bedrock_adapter.py
   - agent/chat_completion_helpers.py
   - agent/codex_runtime.py
   - agent/provider_attempts.py
   - tests/agent/test_provider_attempt_transport.py
   owned_symbols:
   - reserve_provider_transport_attempt
+  - reservation-time concrete transport route assertion
+  - endpoint-keyed sealed Bedrock runtime client cache
+  - optional AnthropicBedrock base_url pin
+  - ManagedLlmStream provider callback error unwrapping
   - AIAgent._anthropic_messages_create before_transport bridge
   - chat-completions, Bedrock, MoA, and summary transport reservations
   - create_anthropic_message per-transport before_transport callback
@@ -2500,10 +3498,18 @@ upstream_changes:
   - each retry or stream-to-create fallback receives a distinct reservation
   - an absent request-local callback preserves ordinary Hermes behavior
   - reservation refusal propagates before provider I/O
+  - sealed route mismatch propagates before cost acquisition attempt reservation fallback retry repair or provider I/O
+  - effective SDK route comparison includes default_query and uses the centralized credential-free endpoint digest
+  - Codex app-server preserves reservation-time capability drift identity through worker terminal classification without a partial result
+  - sealed Bedrock clients receive the selected endpoint_url while unsealed construction omits it and retains SDK resolution
   tests:
   - tests/agent/test_provider_attempt_transport.py
+  - tests/agent/test_bedrock_adapter.py
+  - tests/agent/test_anthropic_adapter.py
   - tests/agent/test_plugin_agent.py
+  - tests/run_agent/test_env_credential_turn_refresh.py
   - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_phase5_provider_options.py
   expected_commit_subject: 'test(workflow): gate provider attempt transport seams'
   upstream_candidate: true
   merge_guidance: Preserve the optional request-local reservation callback at every
@@ -2514,6 +3520,10 @@ upstream_changes:
     I/O. Keep the hook optional so ordinary non-workflow conversations retain their
     existing behavior. Any upstream refactor that moves or adds provider launches
     must update the focused transport contract and retain equivalent pre-launch accounting.
+    For sealed requests, the same seam must verify the concrete SDK client's
+    effective endpoint (base URL plus default query) against the selected route
+    before accounting. Capability drift is a bounded terminal result and may not
+    enter app-server partial-result recovery, retry, repair, or fallback.
   removal_condition: Remove when upstream provides equivalent request-scoped, pre-transport
     provider-attempt authority across every supported provider path with a release-gated
     regression contract.
@@ -2545,6 +3555,7 @@ upstream_changes:
   - conservative_provider_retry_count
   - validated_provider_retry_count
   - loaded-gate scheduler fairness barrier regression
+  - Phase 5 structured repair inherits the primary request's absolute deadlines workdir resource ceilings termination policy and shared attempt authority while tightening only its remaining per-repair bounds
   tests:
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_ai_executor.py
@@ -2593,6 +3604,7 @@ upstream_changes:
   owned_symbols:
   - ExecutionRuntimeCapabilities
   - classify_execution_runtime
+  - classify_credential_free_execution_runtime
   - classify_resolved_execution_runtime
   - _effective_execution_api_mode
   - is_anthropic_bedrock_model
@@ -2618,7 +3630,10 @@ upstream_changes:
     the actual worker runtime before starting any required request MCP. Keep prospective
     Bedrock model routing in side-effect-free metadata rather than importing the lazy-installing
     adapter, and treat both Claude Messages and non-Claude Converse paths as Hermes-managed
-    tool loops. Preserve legacy no-config-read resolver short-circuits before loading
+    tool loops. Phase 5 workers compare the credential-free live route before
+    dotenv, SessionDB, MCP finalization, registry mutation, credential refresh,
+    or token minting, then pass the privately selected route constraint through
+    credential resolution and transport construction. Preserve legacy no-config-read resolver short-circuits before loading
     optional model metadata. The isolated worker must own discovery, registration,
     tool-policy ordering, and process reaping from one outer cleanup boundary while
     restoring loader, timeout, callbacks, hooks, inline tools, session state, and
@@ -3898,17 +4913,17 @@ upstream_changes:
   - OTTO V1 incompatible authoring-skill guidance
   owned_invariants:
   - historical Phase 1 workflow-language authoring-reference provenance
-  - 'workflow language authority superseded by: workflow-phase4-language-contracts'
+  - 'workflow language authority superseded by: workflow-phase5-language-activation'
   tests:
   - tests/plugins/workflow/test_language_schema.py
   - tests/agent/test_workflow_builder_skill.py
   expected_commit_subject: 'docs(workflow): publish language authoring contract'
   upstream_candidate: true
   merge_guidance: Preserve this entry's historical Phase 1 authoring-reference provenance,
-    but defer all live language-version guidance to workflow-phase4-language-contracts.
-    Current/default archon-2026-07 uses v4, hermes-legacy uses v2, and explicit/sealed
-    v1-v3 readers remain compatible. Phase 3 millisecond timeout, retry, structured-output,
-    and reference semantics are inherited by current v4 rather than deferred. Keep only
+    but defer all live language-version guidance to workflow-phase5-language-activation.
+    Current/default archon-2026-07 uses v5, hermes-legacy uses v2, and explicit/sealed
+    v1-v4 readers remain compatible. Phase 3 millisecond timeout, retry, structured-output,
+    and reference semantics are inherited by current v5 rather than deferred. Keep only
     fields that the generated current contract marks blocking behind the explicit two-choice
     authoring stop; later runtime child workflows, include.with, loop_group, portable
     budget/sandbox guarantees, and provider portability remain unavailable without
@@ -3920,7 +4935,7 @@ upstream_changes:
     equivalent profile-aware generated-contract reference, first-party authoring skill,
     legacy preservation, mixed-version backend guidance, current blocking-field choice
     gates, and explicit OTTO V1 incompatibility. Current language-authority removal remains
-    governed by workflow-phase4-language-contracts, not by this older entry.
+    governed by workflow-phase5-language-activation, not by this older entry.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: workflow-phase4-language-contracts
   change_class: workflow-compatibility
@@ -3950,10 +4965,10 @@ upstream_changes:
   - phase4_loop_prompt_sealed
   - phase4_signal_confirmation
   owned_invariants:
-  - current/default normalizer v4 generation and explicit/sealed v1-v3 compatibility
+  - current/default normalizer v5 generation with inherited v4 semantics and explicit/sealed v1-v4 compatibility
   - ordinary-loops-and-includes generated documentation topic
   - installed workflow-builder reference data files
-  - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":4,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4]}'
+  - 'workflow language authority superseded by: workflow-phase5-language-activation'
   - include is compile-only and absent from executable node kinds
   - root-only policy and authenticated ignored child sidecars
   - exact bounded include closure guidance
@@ -3971,8 +4986,9 @@ upstream_changes:
   - tests/skills/test_workflow_operator_behavior.py
   expected_commit_subject: 'feat(workflow): publish phase 4 language contracts'
   upstream_candidate: true
-  merge_guidance: Preserve normalizer v4 as the current/default archon-2026-07
-    contract, hermes-legacy at v2, and explicit/sealed v1-v3 reader compatibility.
+  merge_guidance: Defer live version selection to workflow-phase5-language-activation.
+    Preserve normalizer v5 as the current/default archon-2026-07 contract,
+    hermes-legacy at v2, and explicit/sealed v1-v4 reader compatibility.
     The original publication staged v4 behind explicit selection while v3 remained
     current; retain that provenance in historical evidence without restoring stale
     operator guidance. Publish the complete v4 syntax, structured ordinary-loop/include
@@ -3984,9 +5000,11 @@ upstream_changes:
     the provider on approval. Keep runtime child workflows, include.with, and loop_group
     explicitly outside this phase. Installed wheels and sdists must retain the workflow-builder
     reference documents that teach this contract.
-  removal_condition: Remove when upstream publishes an equivalent current-v4 Archon
-    authoring/admission contract, legacy-v2 default, explicit/sealed v1-v3 compatibility,
-    code catalog, installed reference assets, and operator guidance.
+  removal_condition: Remove this historical entry when
+    workflow-phase5-language-activation can be removed because upstream publishes an
+    equivalent current-v5 Archon authoring/admission contract with inherited v4
+    behavior, legacy-v2 default, explicit/sealed v1-v4 compatibility, code catalog,
+    installed reference assets, and operator guidance.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 - id: workflow-language-regression-gates
   change_class: workflow-testing
@@ -4348,4 +5366,26 @@ upstream_changes:
   removal_condition: Remove when upstream provides one shared schema contract for
     manifest and evidence repository paths with equivalent normalization and length
     bounds.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-schema-dotenv-startup-bypass
+  change_class: workflow-cli
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/main.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - _WORKFLOW_SCHEMA_READONLY_STARTUP dotenv bypass
+  owned_invariants:
+  - exact workflow schema introspection completes before dotenv, secret-source,
+    terminal-config, logging, recovery, or ordinary runtime startup side effects
+  tests:
+  - tests/plugins/workflow/test_cli.py
+  expected_commit_subject: 'fix(workflow): keep schema startup ahead of dotenv'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact schema-owned early path ahead of dotenv loading.
+    Dotenv loading can sanitize files, invoke configured secret sources, and bridge
+    terminal config through the canonical behavioral loader, so it is part of normal
+    startup and must remain outside read-only schema introspection.
+  removal_condition: Remove when upstream provides an equivalent dependency-bounded,
+    side-effect-free workflow schema entry point ahead of every normal startup seam.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

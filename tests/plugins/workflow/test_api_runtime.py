@@ -22,7 +22,7 @@ from plugins.workflow.runtime import (
     WorkflowApiLimits,
     WorkflowStoreRegistry,
 )
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 import plugins.workflow.store as store_module
 from plugins.workflow.store import (
     ArtifactRef,

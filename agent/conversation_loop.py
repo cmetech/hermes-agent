@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.cost_budget import CostBudgetPoisoned, CostBudgetTerminalError
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -44,6 +45,7 @@ from agent.turn_context import (
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
+from agent.credential_adoption import _CredentialRefreshStatus
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -78,6 +80,10 @@ from agent.prompt_caching import (
     build_prompt_cache_plan,
     strip_anthropic_cache_control,
     strip_anthropic_tool_cache_control,
+)
+from agent.provider_attempts import (
+    poison_provider_transport_attempt,
+    settle_provider_transport_attempt,
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
@@ -499,6 +505,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    if isinstance(getattr(agent, "_model_visible_prefix_digest", None), str):
+        agent.verify_model_visible_prefix()
+        return
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -1242,6 +1252,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    credential_recovery_state=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1291,6 +1302,8 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
+    agent._assert_execution_route_constraint()
+
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
     # was built at agent init (#67821). No-op when .env is unchanged.
@@ -1298,6 +1311,7 @@ def run_conversation(
         agent._try_refresh_env_client_credentials()
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
+    agent._assert_execution_route_constraint()
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1383,13 +1397,6 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-
-    # Per-turn tally of consecutive successful credential-pool token refreshes,
-    # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
-    # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
-    # so this tally caps same-entry refreshes and lets the fallback chain take
-    # over instead of spinning. Reset here so each turn starts fresh. See #26080.
-    agent._auth_pool_refresh_counts = {}
 
     # Reset the per-turn usage holder forwarded to the context engine's
     # on_turn_complete() observation hook. Set after each successful provider
@@ -2443,6 +2450,10 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                    settle_provider_transport_attempt(
+                        agent,
+                        getattr(response, "usage", None),
+                    )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3480,7 +3491,17 @@ def run_conversation(
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
-            except InterruptedError:
+            except CostBudgetTerminalError:
+                raise
+
+            except InterruptedError as interrupted_error:
+                if poison_provider_transport_attempt(
+                    agent, "authoritative_settlement_ambiguous"
+                ):
+                    raise CostBudgetPoisoned(
+                        "provider cancellation left billed cost ambiguous",
+                        failure_code="authoritative_settlement_ambiguous",
+                    ) from interrupted_error
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -3515,6 +3536,17 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if isinstance(
+                    api_error, _ra().ProviderCapabilityDriftError
+                ):
+                    raise
+                if poison_provider_transport_attempt(
+                    agent, "authoritative_settlement_ambiguous"
+                ):
+                    raise CostBudgetPoisoned(
+                        "provider failure left billed cost ambiguous",
+                        failure_code="authoritative_settlement_ambiguous",
+                    ) from api_error
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -3863,6 +3895,7 @@ def run_conversation(
                     has_retried_429=_retry.has_retried_429,
                     classified_reason=classified.reason,
                     error_context=error_context,
+                    credential_recovery_state=credential_recovery_state,
                 )
                 if recovered_with_pool:
                     continue
@@ -3967,10 +4000,15 @@ def run_conversation(
                     and status_code == 401
                     and not _retry.vertex_auth_retry_attempted
                 ):
-                    _retry.vertex_auth_retry_attempted = True
-                    if agent._try_refresh_vertex_client_credentials():
+                    refresh_status = agent._refresh_vertex_credentials_for_turn(
+                        credential_recovery_state
+                    )
+                    if refresh_status is _CredentialRefreshStatus.ADOPTED:
+                        _retry.vertex_auth_retry_attempted = True
                         agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
                         continue
+                    if refresh_status is _CredentialRefreshStatus.ACQUISITION_FAILED:
+                        _retry.vertex_auth_retry_attempted = True
                 if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"
@@ -4018,10 +4056,17 @@ def run_conversation(
                     and hasattr(agent, '_anthropic_api_key')
                     and not _retry.anthropic_auth_retry_attempted
                 ):
-                    _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
                     from agent.azure_identity_adapter import is_token_provider
-                    if agent._try_refresh_anthropic_client_credentials():
+                    refresh_status = agent._refresh_anthropic_credentials_for_turn(
+                        credential_recovery_state
+                    )
+                    if refresh_status in {
+                        _CredentialRefreshStatus.ADOPTED,
+                        _CredentialRefreshStatus.ACQUISITION_FAILED,
+                    }:
+                        _retry.anthropic_auth_retry_attempted = True
+                    if refresh_status is _CredentialRefreshStatus.ADOPTED:
                         print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info
@@ -4039,7 +4084,8 @@ def run_conversation(
                     else:
                         auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
                         print(f"{agent.log_prefix}   Auth method: {auth_method}")
-                        print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
+                        if getattr(agent, "_execution_route_constraint", None) is None:
+                            print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()

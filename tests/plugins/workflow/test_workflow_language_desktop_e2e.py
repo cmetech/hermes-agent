@@ -17,7 +17,7 @@ from plugins.workflow.runner_binding import (
     execution_capability_context,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore
 
@@ -149,6 +149,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert archon_row["language"] == {
             "effective_profile": "archon-2026-07",
             "legacy": False,
+            "normalizer_version": 5,
         }
         assert archon_row["compatibility"] == {
             "level": "portable",
@@ -157,6 +158,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert legacy_row["language"] == {
             "effective_profile": "hermes-legacy",
             "legacy": True,
+            "normalizer_version": 2,
         }
         assert legacy_row["compatibility"] == {
             "level": "mapped",
@@ -190,7 +192,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert detail["language"]["declared_profile"] == "archon-2026-07"
         assert detail["language"]["effective_profile"] == "archon-2026-07"
         assert detail["language"]["legacy"] is False
-        assert detail["language"]["normalizer_version"] == 4
+        assert detail["language"]["normalizer_version"] == 5
         assert len(detail["language"]["normalized_definition_digest"]) == 64
         assert set(detail["language"]) == {
             "declared_profile",
@@ -249,7 +251,13 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
     workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(workflow)
+    sidecar = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+    package = load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        normalizer_version=4,
+    )
     execution_context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -380,6 +388,7 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
         if item.get("node_id") == "producer"
     )
     assert desktop_attempt == {
+        "item_type": "attempt",
         "node_id": "producer",
         "attempt_id": producer_attempt["attempt_id"],
         "state": "succeeded",
@@ -392,6 +401,8 @@ def test_archon_canonical_output_crosses_scheduler_recovery_and_desktop_api(
             "additional_provider_attempts": 0,
             "capped": False,
         },
+        "started_at": producer_attempt["started_at"],
+        "completed_at": producer_attempt["completed_at"],
     }
     assert preview.status_code == 200
     assert preview.json() == {

@@ -14,7 +14,7 @@ from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freez
 from plugins.workflow.output_resolution import WorkflowOutputReferenceError
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow_snapshot
 from plugins.workflow.store import RunStore
 
 
@@ -41,7 +41,12 @@ def _archon_literal_package(workflow_writer, root, token: str):
         "language_compatibility: archon-2026-07\n",
         encoding="utf-8",
     )
-    return load_workflow(workflow)
+    return load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow.read_bytes(),
+        sidecar_bytes=workflow.with_name(f"{workflow.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=3,
+    )
 
 
 def _start(store: RunStore, package, *, key: str):

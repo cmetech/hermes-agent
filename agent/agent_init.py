@@ -28,7 +28,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
@@ -530,6 +530,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    execution_route_constraint=None,
 ):
     """
     Initialize the AI Agent.
@@ -640,6 +641,7 @@ def init_agent(
         else agent.provider
     )
     agent._credential_pool = credential_pool
+    agent._execution_route_constraint = execution_route_constraint
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -1048,7 +1050,15 @@ def init_agent(
             _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
             _br_region = _region_match.group(1) if _region_match else "us-east-1"
             agent._bedrock_region = _br_region
-            agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
+            agent._anthropic_client = build_anthropic_bedrock_client(
+                _br_region,
+                base_url=(
+                    base_url
+                    if getattr(agent, "_execution_route_constraint", None)
+                    is not None
+                    else None
+                ),
+            )
             agent._anthropic_api_key = "aws-sdk"
             agent._anthropic_base_url = base_url
             agent._is_anthropic_oauth = False
@@ -1170,16 +1180,14 @@ def init_agent(
             # Extract query params (e.g. Azure api-version) from base_url
             # and pass via default_query to prevent loss during SDK URL
             # joining (httpx drops query string when joining paths).
-            _parsed_url = urlparse(base_url)
-            if _parsed_url.query:
-                _clean_url = urlunparse(_parsed_url._replace(query=""))
-                _query_params = {
-                    k: v[0] for k, v in parse_qs(_parsed_url.query).items()
-                }
+            from hermes_cli.runtime_provider import execution_sdk_endpoint
+
+            _sdk_endpoint = execution_sdk_endpoint(base_url=base_url)
+            if _sdk_endpoint.query_items:
                 client_kwargs = {
                     "api_key": api_key,
-                    "base_url": _clean_url,
-                    "default_query": _query_params,
+                    "base_url": _sdk_endpoint.base_url,
+                    "default_query": _sdk_endpoint.default_query,
                 }
             else:
                 client_kwargs = {"api_key": api_key, "base_url": base_url}

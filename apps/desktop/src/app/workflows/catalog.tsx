@@ -18,6 +18,7 @@ import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes
 import {
   desktopWorkflowLanguageLabel,
   desktopWorkflowRunDisabledReason,
+  isDesktopProviderCapabilityProjection,
   workflowTrustAllowsRun
 } from './catalog-run-policy'
 
@@ -111,6 +112,11 @@ function CatalogRow({
           ) : null}
           {item.compatibility?.runnable === false ? (
             <Badge variant="warn">{t.operations.workflowIncompatible}</Badge>
+          ) : null}
+          {isDesktopProviderCapabilityProjection(item.provider_capability, 'catalog') ? (
+            <Badge variant={item.provider_capability.level === 'degraded' ? 'warn' : 'muted'}>
+              {t.operations.workflowProviderReadiness}: {item.provider_capability.level}
+            </Badge>
           ) : null}
         </div>
       </td>

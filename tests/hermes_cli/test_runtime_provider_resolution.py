@@ -1,11 +1,497 @@
 import base64
+import hashlib
 import json
+import socket
+import subprocess
 import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 
+from hermes_cli import providers as provider_definitions
 from hermes_cli import runtime_provider as rp
+import providers as provider_profiles
+
+
+def _runtime_identity(
+    base_url: str,
+    *,
+    provider: str = "custom",
+    api_mode: str = "chat_completions",
+):
+    return rp.execution_runtime_identity(
+        rp.classify_execution_runtime(
+            provider=provider,
+            model_config={"provider": provider, "default": "test-model"},
+            provider_config={"api_mode": api_mode, "base_url": base_url},
+        )
+    )
+
+
+def _forbid_preflight_provider_state(monkeypatch) -> list[str]:
+    accessed: list[str] = []
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            accessed.append(name)
+            raise AssertionError(
+                f"credential-free runtime classification accessed {name}"
+            )
+
+        return fail
+
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "resolve_provider",
+        forbidden("the credential-aware auth resolver"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        forbidden("config.yaml"),
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_auth_store",
+        forbidden("the auth store"),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        forbidden("the credential pool"),
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "has_usable_secret",
+        forbidden("credential environment probes"),
+    )
+    monkeypatch.setattr(
+        "agent.bedrock_adapter.has_aws_credentials",
+        forbidden("the AWS credential chain"),
+    )
+    return accessed
+
+
+def test_prospective_unknown_explicit_route_is_credential_free(monkeypatch) -> None:
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_execution_runtime(
+        provider="prospective-unknown",
+        model_config={
+            "provider": "prospective-unknown",
+            "default": "test-model",
+        },
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://prospective-unknown.example/v1",
+        },
+    )
+
+    assert capabilities.effective_provider == "prospective-unknown"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://prospective-unknown.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
+def test_resolved_unknown_explicit_route_is_credential_free(monkeypatch) -> None:
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_resolved_execution_runtime(
+        {
+            "provider": "resolved-unknown",
+            "model": "test-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://resolved-unknown.example/v1",
+        }
+    )
+
+    assert capabilities.effective_provider == "resolved-unknown"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://resolved-unknown.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
+def test_unregistered_auto_explicit_route_stays_unresolved_and_credential_free(
+    monkeypatch,
+) -> None:
+    assert provider_profiles.get_provider_registration("auto") is None
+    accessed = _forbid_preflight_provider_state(monkeypatch)
+
+    capabilities = rp.classify_execution_runtime(
+        provider="auto",
+        model_config={"provider": "auto", "default": "test-model"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://auto-explicit.example/v1",
+        },
+    )
+
+    assert capabilities.effective_provider == "auto"
+    assert capabilities.base_url_trust_class == "unknown"
+    assert capabilities.registration_origin_kind == ""
+    assert capabilities.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://auto-explicit.example/v1"
+    ).hexdigest()
+    assert capabilities.endpoint_identity_error is None
+    assert accessed == []
+
+
+def test_runtime_identity_accepts_normalization_equivalent_endpoint() -> None:
+    left = _runtime_identity("https://EXAMPLE.test:443/v1/")
+    right = _runtime_identity("https://example.test/v1")
+
+    assert left.endpoint_sha256 == right.endpoint_sha256
+    assert left.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0https://example.test/v1"
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "https://example.test/v2",
+        "https://other.test/v1",
+        "http://example.test/v1",
+        "https://example.test:8443/v1",
+    ],
+)
+def test_runtime_identity_distinguishes_structural_endpoint_changes(changed) -> None:
+    assert _runtime_identity(changed).endpoint_sha256 != _runtime_identity(
+        "https://example.test/v1"
+    ).endpoint_sha256
+
+
+def test_runtime_identity_query_evidence_is_structural_and_credential_free() -> None:
+    baseline = _runtime_identity(
+        "https://example.test/v1?region=us-east-1&token=first-secret"
+    )
+    changed_region = _runtime_identity(
+        "https://example.test/v1?region=eu-west-1&token=first-secret"
+    )
+    changed_token = _runtime_identity(
+        "https://example.test/v1?region=us-east-1&token=second-secret"
+    )
+
+    assert changed_region.endpoint_sha256 != baseline.endpoint_sha256
+    assert changed_token.endpoint_sha256 == baseline.endpoint_sha256
+    assert "first-secret" not in repr(baseline)
+    assert "first-secret" not in json.dumps(baseline.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_error"),
+    [
+        ("https://example.test/v1?unknown=secret-value", "unclassified_query_parameter"),
+        ("https://example.test:invalid/v1", "provider_endpoint_identity_invalid"),
+        ("ftp://example.test/v1", "provider_endpoint_identity_invalid"),
+        ("not-a-url", "provider_endpoint_identity_invalid"),
+        ("https://[::1", "provider_endpoint_identity_invalid"),
+        ("https://[not-ipv6]/v1", "provider_endpoint_identity_invalid"),
+    ],
+)
+def test_runtime_identity_blocks_unresolvable_endpoint(base_url, expected_error) -> None:
+    capabilities = rp.classify_execution_runtime(
+        provider="custom",
+        model_config={"provider": "custom", "default": "test-model"},
+        provider_config={"api_mode": "chat_completions", "base_url": base_url},
+    )
+
+    assert capabilities.endpoint_sha256 == ""
+    assert capabilities.endpoint_identity_error == expected_error
+    assert "secret-value" not in repr(capabilities)
+
+
+def test_runtime_identity_uses_provider_profile_default_when_route_omits_base_url(
+    monkeypatch,
+) -> None:
+    profile = SimpleNamespace(
+        name="sealed-provider",
+        base_url="https://PROFILE.example:443/v1/",
+        structured_output_strategy=None,
+    )
+    monkeypatch.setattr(
+        provider_profiles,
+        "get_provider_profile",
+        lambda name: profile if name == "sealed-provider" else None,
+    )
+
+    admission = rp.classify_execution_runtime(
+        provider="sealed-provider",
+        model_config={"provider": "sealed-provider", "default": "sealed-model"},
+        provider_config={"api_mode": "chat_completions"},
+    )
+    worker = rp.classify_resolved_execution_runtime({
+        "provider": "sealed-provider",
+        "model": "sealed-model",
+        "api_mode": "chat_completions",
+    })
+
+    assert rp.execution_runtime_identity(admission) == rp.execution_runtime_identity(worker)
+    assert admission.endpoint_identity_error is None
+
+
+def test_runtime_identity_uses_versioned_sentinel_only_for_endpointless_mode() -> None:
+    assert rp._ENDPOINTLESS_EXECUTION_API_MODES == frozenset({"codex_app_server"})
+    endpointless = rp.classify_execution_runtime(
+        provider="provider-without-profile",
+        model_config={"provider": "provider-without-profile", "default": "model"},
+        provider_config={"api_mode": "codex_app_server"},
+    )
+    concrete = rp.classify_execution_runtime(
+        provider="provider-without-profile",
+        model_config={"provider": "provider-without-profile", "default": "model"},
+        provider_config={
+            "api_mode": "codex_app_server",
+            "base_url": "https://endpoint.test/v1",
+        },
+    )
+
+    assert endpointless.endpoint_sha256 == hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0no-endpoint-v1"
+    ).hexdigest()
+    assert endpointless.endpoint_identity_error is None
+    assert concrete.endpoint_sha256 != endpointless.endpoint_sha256
+
+
+@pytest.mark.parametrize(
+    ("provider", "provider_config", "expected_url"),
+    [
+        (
+            "bedrock",
+            {"region": "eu-central-1"},
+            "https://bedrock-runtime.eu-central-1.amazonaws.com",
+        ),
+        (
+            "vertex",
+            {"project_id": "private-project-7", "region": "europe-west4"},
+            "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/"
+            "private-project-7/locations/europe-west4/endpoints/openapi",
+        ),
+    ],
+)
+def test_dynamic_provider_endpoint_identity_is_derived_without_credentials(
+    monkeypatch, provider, provider_config, expected_url
+) -> None:
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pure endpoint classification minted a Vertex token")
+        ),
+    )
+    capabilities = rp.classify_execution_runtime(
+        provider=provider,
+        model_config={"provider": provider, "default": "test-model"},
+        provider_config=provider_config,
+    )
+
+    expected = hashlib.sha256(
+        b"hermes-execution-endpoint-v1\0" + expected_url.encode("utf-8")
+    ).hexdigest()
+    assert capabilities.endpoint_sha256 == expected
+    assert capabilities.endpoint_identity_error is None
+    assert "private-project-7" not in repr(capabilities)
+
+
+def test_vertex_sealed_route_uses_config_endpoint_and_credentials_only_supply_token(
+    monkeypatch,
+) -> None:
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "vertex", "default": "gemini-3.6-flash"},
+        "vertex": {
+            "project_id": "config-private-project",
+            "region": "europe-west4",
+        },
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "gemini-3.6-flash"
+    )
+    constraint = rp.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+    assert constraint is not None
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(config["model"]))
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_credentials",
+        lambda: ("fresh-token", "credential-private-project"),
+    )
+    monkeypatch.setattr(
+        "agent.vertex_adapter.get_vertex_config",
+        lambda: (
+            _ for _ in ()
+        ).throw(AssertionError("sealed Vertex route asked credentials for routing")),
+    )
+
+    runtime = rp.resolve_runtime_provider(
+        requested="vertex",
+        target_model=route.model,
+        route_constraint=constraint,
+    )
+
+    assert runtime["api_key"] == "fresh-token"
+    assert runtime["base_url"].endswith(
+        "/projects/config-private-project/locations/europe-west4/endpoints/openapi"
+    )
+    assert "credential-private-project" not in runtime["base_url"]
+
+
+@pytest.mark.parametrize(
+    ("bedrock_config", "expected_region"),
+    [({}, "us-east-1"), ({"region": "eu-west-2"}, "eu-west-2")],
+    ids=("sealed-default", "sealed-nondefault"),
+)
+def test_bedrock_sealed_route_ignores_environment_region(
+    monkeypatch, bedrock_config, expected_region
+) -> None:
+    from hermes_cli.workflow_model_resolution import (
+        parse_workflow_model_config,
+        resolve_workflow_model_reference,
+    )
+
+    config = {
+        "model": {"provider": "bedrock", "default": "amazon.nova-pro-v1:0"},
+        "bedrock": bedrock_config,
+    }
+    route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "amazon.nova-pro-v1:0"
+    )
+    constraint = rp.select_credential_free_execution_route(
+        config,
+        requested_provider=route.provider,
+        target_model=route.model,
+        route_fingerprint=route.route_fingerprint,
+        expected_runtime_identity={
+            "provider": route.provider,
+            "model": route.model,
+            "api_mode": route.api_mode,
+            "base_url_trust_class": route.base_url_trust_class,
+            "endpoint_sha256": route.endpoint_sha256,
+            "registration_provenance_digest": (
+                route.registration_provenance_digest
+            ),
+        },
+    )
+    assert constraint is not None
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(config["model"]))
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+
+    runtime = rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model=route.model,
+        route_constraint=constraint,
+    )
+
+    assert runtime["region"] == expected_region
+    assert runtime["base_url"] == (
+        f"https://bedrock-runtime.{expected_region}.amazonaws.com"
+    )
+
+
+def test_sealed_route_constrains_inputs_seen_by_credential_resolver(monkeypatch) -> None:
+    identity = _runtime_identity("https://sealed.example/v1")
+    constraint = rp.CredentialFreeExecutionRouteConstraint(
+        route_fingerprint="f" * 64,
+        requested_provider="custom",
+        model="test-model",
+        api_mode="chat_completions",
+        base_url="https://sealed.example/v1",
+        provider_config={},
+        identity=identity,
+    )
+    captured = {}
+
+    def unclassified(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "custom",
+            "model": "test-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://sealed.example/v1",
+            "api_key": "credential-only",
+        }
+
+    monkeypatch.setattr(rp, "_resolve_runtime_provider_unclassified", unclassified)
+
+    runtime = rp.resolve_runtime_provider(
+        requested="mutable-provider",
+        target_model="mutable-model",
+        route_constraint=constraint,
+    )
+
+    assert captured["requested"] == "custom"
+    assert captured["target_model"] == "test-model"
+    assert captured["explicit_base_url"] == "https://sealed.example/v1"
+    assert runtime["api_key"] == "credential-only"
+
+
+def test_runtime_identity_to_dict_is_exact_six_field_codec() -> None:
+    identity = _runtime_identity("https://example.test/v1")
+
+    assert set(identity.to_dict()) == {
+        "provider",
+        "model",
+        "api_mode",
+        "base_url_trust_class",
+        "endpoint_sha256",
+        "registration_provenance_digest",
+    }
+
+
+def test_bundled_profile_api_modes_round_trip_without_runtime_io(monkeypatch):
+    """Every declarative profile spelling must survive the legacy adapter."""
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("provider classification performed runtime I/O")
+
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
+
+    mismatches = []
+    for profile in provider_profiles.list_providers():
+        provider_def = provider_definitions._provider_def_from_plugin_profile(profile)
+        actual_mode = provider_definitions.TRANSPORT_TO_API_MODE.get(provider_def.transport)
+        if actual_mode != profile.api_mode:
+            mismatches.append((profile.name, profile.api_mode, provider_def.transport, actual_mode))
+            continue
+
+        model = profile.fallback_models[0] if profile.fallback_models else "test-model"
+        prospective = rp.classify_execution_runtime(
+            provider=profile.name,
+            model_config={"provider": profile.name, "default": model},
+            provider_config={"api_mode": profile.api_mode},
+        )
+        resolved = rp.classify_resolved_execution_runtime(
+            {"provider": profile.name, "model": model, "api_mode": profile.api_mode}
+        )
+        assert prospective == resolved, profile.name
+
+    assert mismatches == []
 
 
 def test_moa_resolution_preserves_legacy_no_config_read_short_circuit(monkeypatch):

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
 from plugins.workflow.language_schema import NODE_TYPES, inapplicable_node_fields
-from plugins.workflow.language import supports_phase4_semantics
+from plugins.workflow.language import supports_phase4_semantics, supports_phase5_semantics
 from plugins.workflow.models import (
     CompatibilityFinding,
     CompatibilityLevel,
@@ -16,6 +16,7 @@ from plugins.workflow.models import (
 
 if TYPE_CHECKING:
     from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
+    from plugins.workflow.provider_authority import WorkflowProviderAuthority
     from plugins.workflow.trust import WorkflowRiskSummary
 
 
@@ -120,6 +121,7 @@ class DoctorReport:
     resolved_scripts: tuple[str, ...]
     resolved_mcp_servers: tuple[str, ...]
     resolved_skills: tuple[str, ...]
+    provider_capability: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable JSON representation used by the CLI and tests."""
@@ -459,6 +461,40 @@ def _check_provider_field(
         )
 
 
+def _add_provider_authority_findings(
+    findings: _FindingAccumulator,
+    authority: "WorkflowProviderAuthority",
+) -> None:
+    """Project sealed v5 provider decisions into admission findings."""
+    from hermes_cli.provider_capabilities import CapabilityDisposition
+
+    for obligation in authority.obligations:
+        decision = obligation.decision
+        unsupported = decision.disposition is CapabilityDisposition.UNSUPPORTED
+        _finding(
+            findings,
+            obligation.path,
+            (
+                CompatibilityLevel.UNSUPPORTED
+                if unsupported
+                else CompatibilityLevel.MAPPED
+            ),
+            decision.rationale,
+            code=decision.code,
+            blocking=unsupported,
+            severity="error" if unsupported else "warning",
+        )
+    for warning in authority.warnings:
+        _finding(
+            findings,
+            warning.path,
+            CompatibilityLevel.MAPPED,
+            warning.rationale,
+            code=warning.code,
+            severity="warning",
+        )
+
+
 def assess_compatibility(
     package: WorkflowPackage,
     *,
@@ -470,6 +506,7 @@ def assess_compatibility(
     structured_output_decisions: Mapping[
         str, "StructuredOutputCapabilityDecision"
     ] | None = None,
+    provider_authority: "WorkflowProviderAuthority | None" = None,
 ) -> CompatibilityReport:
     """Classify every declared field that requires a Hermes mapping."""
     tools = available_tools
@@ -477,6 +514,23 @@ def assess_compatibility(
     capabilities = provider_capabilities or {}
     findings = _FindingAccumulator(package.compatibility_findings)
     options = package.definition.options
+    phase5 = supports_phase5_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    )
+
+    if phase5:
+        if provider_authority is None:
+            _finding(
+                findings,
+                "provider_authority",
+                CompatibilityLevel.UNSUPPORTED,
+                "normalizer-v5 admission requires one sealed provider authority",
+                code="provider_authority_missing",
+                blocking=True,
+            )
+        else:
+            _add_provider_authority_findings(findings, provider_authority)
 
     for issue in package.validation_issues:
         _finding(
@@ -547,7 +601,7 @@ def assess_compatibility(
                 "caller-supplied workdir preserves worktree isolation",
                 code="worktree_requirement",
             )
-    for field in _PROVIDER_FIELDS:
+    for field in (() if phase5 else _PROVIDER_FIELDS):
         if field in options:
             _check_provider_field(
                 findings,
@@ -561,7 +615,11 @@ def assess_compatibility(
         prefix = f"nodes[{index}]"
         node_options = node.options
         structured_output = package.language.structured_outputs.get(node.id)
-        if structured_output is not None and structured_output_decisions is not None:
+        if (
+            not phase5
+            and structured_output is not None
+            and structured_output_decisions is not None
+        ):
             decision = structured_output_decisions.get(node.id)
             if decision is None:
                 decision = structured_output_decisions.get(
@@ -649,7 +707,7 @@ def assess_compatibility(
                     )
         if node.node_type not in {"command", "prompt"}:
             continue
-        if "persist_session" in node_options:
+        if "persist_session" in node_options and not phase5:
             _finding(
                 findings,
                 f"{prefix}.persist_session",
@@ -689,7 +747,30 @@ def assess_compatibility(
                         f"tool alias maps {requested} -> {target}",
                         code="tool_alias_mapped",
                     )
-        if "skills" in node_options:
+        if "agents" in node_options and phase5:
+            explicit_allowed = node_options.get("allowed_tools")
+            denied = node_options.get("denied_tools", ())
+
+            def resolves_to_inline_agent(value: object) -> bool:
+                try:
+                    return resolve_tool_name(value) == "workflow_agent"
+                except (TypeError, ValueError):
+                    return False
+
+            unreachable = (
+                explicit_allowed is not None
+                and not any(resolves_to_inline_agent(value) for value in explicit_allowed)
+            ) or any(resolves_to_inline_agent(value) for value in denied)
+            if unreachable:
+                _finding(
+                    findings,
+                    f"{prefix}.agents",
+                    CompatibilityLevel.UNSUPPORTED,
+                    "inline agents are unreachable under the declared tool policy",
+                    code="tool_policy_incompatible",
+                    blocking=True,
+                )
+        if "skills" in node_options and not phase5:
             _finding(
                 findings,
                 f"{prefix}.skills",
@@ -697,7 +778,7 @@ def assess_compatibility(
                 "skills are snapshotted into the node user message",
                 code="skill_snapshot",
             )
-        if "mcp" in node_options:
+        if "mcp" in node_options and not phase5:
             _finding(
                 findings,
                 f"{prefix}.mcp",
@@ -710,7 +791,7 @@ def assess_compatibility(
                 code="mcp_isolation",
                 blocking=not mcp_available,
             )
-        if "agents" in node_options:
+        if "agents" in node_options and not phase5:
             _finding(
                 findings,
                 f"{prefix}.agents",
@@ -727,14 +808,14 @@ def assess_compatibility(
                     f"{field} resolves through Hermes provider profiles",
                     code="provider_profile_resolution",
                 )
-        for field in (
+        for field in (() if phase5 else (
             "effort",
             "thinking",
             "maxBudgetUsd",
             "fallbackModel",
             "betas",
             "sandbox",
-        ):
+        )):
             if field in node_options:
                 _check_provider_field(
                     findings,
@@ -755,7 +836,7 @@ def assess_compatibility(
                 code="system_prompt_context",
                 blocking=shared,
             )
-        for event in node_options.get("hooks", {}):
+        for event in (() if phase5 else node_options.get("hooks", {})):
             path = f"{prefix}.hooks.{event}"
             if event in MAPPED_HOOK_EVENTS:
                 if event in {"Elicitation", "ElicitationResult"} and not mcp_available:

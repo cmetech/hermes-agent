@@ -541,3 +541,24 @@ def test_resolved_runtime_classifier_fails_closed_for_malformed_runtime(
     assert classified.effective_provider == (
         "broken" if isinstance(runtime, dict) else ""
     )
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["custom", "custom:openai-api", "openai"],
+)
+def test_custom_and_alias_routes_do_not_borrow_native_openai_trust(provider: str) -> None:
+    classified = runtime_provider.classify_execution_runtime(
+        provider=provider,
+        model_config={
+            "provider": provider,
+            "default": "gpt-5.4",
+        },
+        provider_config={
+            "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+
+    assert classified.base_url_trust_class != "trusted_direct"
+    assert classified.declared_structured_output_strategy is None

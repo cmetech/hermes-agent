@@ -31,7 +31,8 @@ from plugins.workflow.models import (
     WorkflowCompilationLimits,
     WorkflowValidationError,
 )
-from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
+from plugins.workflow.schema import parse_workflow_source_bytes
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.topology import project_topology
 

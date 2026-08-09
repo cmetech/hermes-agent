@@ -21,6 +21,7 @@ Public API (signatures preserved from the original 2,400-line version):
 """
 
 import os
+import hashlib
 import json
 import re
 import asyncio
@@ -39,6 +40,39 @@ from tools.registry import (
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
+
+_MODEL_VISIBLE_PREFIX_IDENTITY_VERSION = 1
+
+
+def model_visible_prefix_digest(
+    system_prompt: str,
+    tools: List[Dict[str, Any]],
+) -> str:
+    """Bind exact rendered system text and ordered provider-visible tools."""
+    if not isinstance(system_prompt, str):
+        raise TypeError("system_prompt must be text")
+    if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+        raise TypeError("tools must be an ordered list of definitions")
+    prompt_bytes = system_prompt.encode("utf-8")
+    try:
+        tool_bytes = json.dumps(
+            tools,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("tool definitions are not canonical JSON") from exc
+    digest = hashlib.sha256(
+        f"hermes.model-visible-prefix.v{_MODEL_VISIBLE_PREFIX_IDENTITY_VERSION}\0".encode(
+            "ascii"
+        )
+    )
+    for value in (prompt_bytes, tool_bytes):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
 
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.

@@ -18,6 +18,7 @@ from plugins.workflow.compilation import (
     WorkflowCompilation,
     compile_workflow,
 )
+from plugins.workflow.admission_service import assess_workflow_admission
 from plugins.workflow.cli import (
     WorkflowDefinitionProjectionCapacityError,
     show_package,
@@ -28,7 +29,11 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
-from plugins.workflow.language import language_projection, supports_phase4_semantics
+from plugins.workflow.language import (
+    language_projection,
+    supports_phase4_semantics,
+    supports_phase5_semantics,
+)
 from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowSourceDocument,
@@ -135,6 +140,7 @@ class CatalogEntry(TypedDict):
     language: dict[str, object]
     compatibility: NotRequired[dict[str, object]]
     structured_output_capability: NotRequired[dict[str, object]]
+    provider_capability: NotRequired[dict[str, object]]
 
 
 class InvalidCatalogEntry(TypedDict):
@@ -1039,6 +1045,7 @@ def _catalog_language_projection(
     status: dict[str, object] = {
         "effective_profile": language.effective_profile.value,
         "legacy": language.effective_profile.value == "hermes-legacy",
+        "normalizer_version": language.normalizer_version,
     }
     if detail:
         expanded = language_projection(language)
@@ -1115,7 +1122,27 @@ def _catalog_entry(
     execution_context: ExecutionCapabilityContext,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    if compilation is None:
+    phase4_compilation = (
+        compilation
+        if compilation is not None
+        and supports_phase4_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
+        else None
+    )
+    assessment = None
+    if compilation is not None and supports_phase5_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        assessment = assess_workflow_admission(
+            compilation,
+            execution_context,
+            read_budget=resource_budget,
+        )
+        compatibility, risk = assessment.compatibility, assessment.risk
+    elif phase4_compilation is None:
         compatibility, risk = assess_package_execution(
             package,
             execution_context,
@@ -1126,7 +1153,7 @@ def _catalog_entry(
             package,
             execution_context,
             read_budget=resource_budget,
-            compilation=compilation,
+            compilation=phase4_compilation,
         )
     if (
         verified_showcase is not None
@@ -1138,7 +1165,7 @@ def _catalog_entry(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
-        compilation=compilation,
+        compilation=phase4_compilation,
     )
     if verified_showcase is None:
         assert trust_store is not None and trust_snapshot is not None
@@ -1191,6 +1218,8 @@ def _catalog_entry(
     )
     if structured_output_capability is not None:
         entry["structured_output_capability"] = structured_output_capability
+    if assessment is not None and assessment.capability_summary is not None:
+        entry["provider_capability"] = dict(assessment.capability_summary)
     return entry
 
 
@@ -1300,14 +1329,7 @@ def build_workflow_catalog(
             items.append(discovered_item)
             continue
         package = discovered_item.package
-        compilation = (
-            discovered_item
-            if supports_phase4_semantics(
-                package.language.effective_profile,
-                package.language.normalizer_version,
-            )
-            else None
-        )
+        compilation = discovered_item
         resource_budget = WorkflowResourceReadBudget(
             max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
             max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -1458,11 +1480,7 @@ def build_workflow_detail(
                 )
             raise WorkflowDetailNotFoundError(name)
         package = selected_compilation.package
-        if supports_phase4_semantics(
-            package.language.effective_profile,
-            package.language.normalizer_version,
-        ):
-            compilation = selected_compilation
+        compilation = selected_compilation
 
     execution_context = background_execution_context(
         binding,
@@ -1473,12 +1491,36 @@ def build_workflow_detail(
         ),
     )
     try:
-        compatibility, risk = assess_package_execution(
-            package,
-            execution_context,
-            read_budget=resource_budget,
-            compilation=compilation,
+        assessment = (
+            assess_workflow_admission(
+                compilation,
+                execution_context,
+                read_budget=resource_budget,
+            )
+            if compilation is not None
+            and supports_phase5_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            else None
         )
+        if assessment is None:
+            compatibility, risk = assess_package_execution(
+                package,
+                execution_context,
+                read_budget=resource_budget,
+                compilation=(
+                    compilation
+                    if compilation is not None
+                    and supports_phase4_semantics(
+                        package.language.effective_profile,
+                        package.language.normalizer_version,
+                    )
+                    else None
+                ),
+            )
+        else:
+            compatibility, risk = assessment.compatibility, assessment.risk
     except WorkflowResourceCapacityError as exc:
         raise WorkflowCatalogCapacityError(
             "workflow detail resource limit exceeded"
@@ -1490,7 +1532,15 @@ def build_workflow_detail(
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
-        compilation=compilation,
+        compilation=(
+            compilation
+            if compilation is not None
+            and supports_phase4_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            else None
+        ),
     )
     if verified_showcase is None:
         try:
@@ -1566,6 +1616,16 @@ def build_workflow_detail(
     }
     if "compilation" in shown:
         detail["compilation"] = shown["compilation"]
+    if assessment is not None and assessment.capability_summary is not None:
+        from plugins.workflow.provider_authority import (
+            public_provider_capability_projection,
+        )
+
+        assert assessment.provider_authority is not None
+        detail["provider_capability"] = public_provider_capability_projection(
+            assessment.provider_authority,
+            include_details=True,
+        )
     return detail
 
 

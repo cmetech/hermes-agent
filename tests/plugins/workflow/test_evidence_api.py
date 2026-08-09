@@ -12,7 +12,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow import evidence as evidence_module
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.output_resolution import ArchonOutputIntegrityError
-from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 import plugins.workflow.store as store_module
 from plugins.workflow.store import (
     ArtifactRef,
@@ -153,7 +153,7 @@ def test_evidence_queries_are_bounded_sanitized_and_typed(tmp_path, workflow_wri
     assert page["truncated"] is False
 
 
-def test_artifact_paths_are_reduced_to_safe_names(tmp_path, workflow_writer):
+def test_legacy_artifact_paths_are_not_projected(tmp_path, workflow_writer):
     package = load_workflow(workflow_writer(tmp_path / "package", name="artifacts"))
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
@@ -188,10 +188,12 @@ def test_artifact_paths_are_reduced_to_safe_names(tmp_path, workflow_writer):
 
     assert page["items"] == [
         {
-            "relative_path": "report.json",
+            "item_type": "artifact",
             "sha256": "a" * 64,
             "size_bytes": 10,
             "media_type": "application/json",
+            "integrity_status": "legacy_unverified",
+            "recovery_status": "projection_recovered",
         }
     ]
 
@@ -211,6 +213,7 @@ def test_typed_artifact_evidence_exposes_only_bounded_publication_metadata(
     assert len(page["items"]) == 1
     item = page["items"][0]
     assert item == {
+        "item_type": "artifact",
         "publication_id": item["publication_id"],
         "output_type": "BoundedReport",
         "media_type": "text/markdown; charset=utf-8",
@@ -218,9 +221,7 @@ def test_typed_artifact_evidence_exposes_only_bounded_publication_metadata(
         "sha256": digest,
         "node_id": "produce",
         "attempt_id": claim.attempt_id,
-        "schema_fingerprint": None,
         "produced_at": item["produced_at"],
-        "session_id": "session-evidence",
         "integrity_status": "verified",
         "recovery_status": "verified",
     }
@@ -847,8 +848,11 @@ def test_regular_log_evidence_is_sanitized_and_aggregate_bounded(
 
     assert len(page["items"]) == 1
     item = page["items"][0]
-    assert item["text"].startswith("visible")
-    assert "\x1b" not in item["text"]
+    assert item["item_type"] == "log"
+    assert item["node_id"] == "n1"
+    assert item["attempt_id"] == "a1"
+    assert item["stream"] == "stdout"
+    assert "text" not in item
     assert item["bytes_returned"] == 256 * 1024
     assert item["truncated"] is True
     assert "warnings" not in page
@@ -892,6 +896,7 @@ def test_phase3_attempt_evidence_names_requested_effective_retry_and_error_field
 
     assert page["items"] == [
         {
+            "item_type": "attempt",
             "node_id": "agent",
             "attempt_id": "attempt-1",
             "state": "failed",
@@ -904,7 +909,10 @@ def test_phase3_attempt_evidence_names_requested_effective_retry_and_error_field
                 "additional_provider_attempts": 2,
                 "capped": True,
             },
-            "error": {"code": "provider_timeout", "message": "bounded failure"},
+            "error": {
+                "code": "workflow_operation_failed",
+                "message": "Workflow operation failed.",
+            },
         }
     ]
 
@@ -936,6 +944,7 @@ def test_persistent_session_recovery_evidence_is_a_closed_bounded_projection() -
 
     assert page["items"] == [
         {
+            "item_type": "recovery",
             "node_id": "agent",
             "attempt_id": "attempt-1",
             "recovery_kind": "persistent_session",

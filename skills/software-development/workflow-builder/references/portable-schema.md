@@ -46,8 +46,8 @@ because older strict companion parsers reject the new field. An explicit
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions use normalizer v4.
-Current `hermes-legacy` contracts use v2. Explicit and sealed v1, v2, and v3
+New and default `archon-2026-07` contracts and admissions use normalizer v5.
+Current `hermes-legacy` contracts use v2. Explicit and sealed v1 through v4
 remain supported compatibility inputs, and resume preserves their pinned
 semantics.
 
@@ -56,9 +56,9 @@ semantics.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 4
+    "archon-2026-07": 5
   },
-  "supported_normalizer_versions": [1, 2, 3, 4]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5]
 }
 ```
 

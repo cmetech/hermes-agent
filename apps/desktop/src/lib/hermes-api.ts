@@ -1,4 +1,5 @@
 import { getApiRequestProfile } from '@/hermes'
+import { isWorkflowStructuredOutputCapabilitySummary } from '@/lib/workflow-public-codec'
 import type { WorkflowCatalogPage, WorkflowCatalogSource, WorkflowDetail, WorkflowStartResponse } from '@/types/hermes'
 
 export interface StartWorkflowRunRequest {
@@ -70,11 +71,25 @@ async function requestWorkflowApi<T>(request: Parameters<Window['hermesDesktop']
   throw new WorkflowApiError(response, serverErrorFields(response.body))
 }
 
-export function listWorkflowDefinitions(profile: string | null = getApiRequestProfile()): Promise<WorkflowCatalogPage> {
-  return requestWorkflowApi<WorkflowCatalogPage>({
+export async function listWorkflowDefinitions(
+  profile: string | null = getApiRequestProfile()
+): Promise<WorkflowCatalogPage> {
+  const catalog = await requestWorkflowApi<WorkflowCatalogPage>({
     path: '/api/plugins/workflow/workflows',
     ...profileScoped(profile)
   })
+
+  for (const item of catalog.items) {
+    if ('error' in item || item.structured_output_capability === undefined) {
+      continue
+    }
+
+    if (!isWorkflowStructuredOutputCapabilitySummary(item.structured_output_capability)) {
+      throw new TypeError('Workflow structured-output capability projection is invalid.')
+    }
+  }
+
+  return catalog
 }
 
 export function preflightWorkflow(

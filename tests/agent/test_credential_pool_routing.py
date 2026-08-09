@@ -228,6 +228,23 @@ class TestPoolRotationCycle:
         )
         assert recovered is False
 
+    def test_unsealed_pre_exhausted_pool_without_candidate_consumes_marker(self):
+        """Characterize the legacy no-candidate branch from e1c7ca745."""
+        from agent.credential_pool import STATUS_EXHAUSTED
+
+        agent, pool, entries = self._make_agent_with_pool(1)
+        entries[0].last_status = STATUS_EXHAUSTED
+        pool.current.return_value = entries[0]
+
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+        )
+
+        assert recovered is False
+        assert has_retried is True
+        pool.mark_exhausted_and_rotate.assert_called_once()
+
     def test_402_immediate_rotation(self):
         """402 (billing) should immediately rotate, no retry-first."""
         agent, pool, entries = self._make_agent_with_pool(3)
@@ -372,6 +389,10 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: None,
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -542,4 +563,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-

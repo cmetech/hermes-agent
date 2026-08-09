@@ -18,6 +18,7 @@ from plugins.workflow.cli import doctor_package
 from plugins.workflow.models import CompatibilityFinding as ModelCompatibilityFinding
 from plugins.workflow.models import ValidationIssue
 from plugins.workflow.schema import load_workflow
+from tests.plugins.workflow_history import load_recorded_v4_workflow
 from plugins.workflow.schema import HOOK_EVENTS
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.evidence import EvidenceReader
@@ -697,7 +698,7 @@ def test_archon_profile_with_enforceable_fields_remains_runnable(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
 
-    report = assess_compatibility(load_workflow(path))
+    report = assess_compatibility(load_recorded_v4_workflow(path))
 
     assert report.runnable is True
     assert not report.blocking_findings

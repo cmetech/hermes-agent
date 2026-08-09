@@ -250,6 +250,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
         "tests/agent/test_provider_attempt_transport.py",
         "tests/scripts/test_workflow_merge_gate.py",
+        "tests/plugins/workflow/test_phase5_adversarial_remediation.py",
         "tests/plugins/workflow/test_catalog_api.py",
         "tests/plugins/workflow/test_workflow_detail_api.py",
         "tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py",

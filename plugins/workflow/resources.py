@@ -28,7 +28,10 @@ from plugins.workflow.bash_rendering import (
     bash_output_references,
     render_v3_bash,
 )
-from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.language import (
+    supports_phase3_semantics,
+    supports_phase5_semantics,
+)
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
@@ -60,6 +63,129 @@ _SCALAR_VARIABLE = re.compile(
 _REFERENCE_NODE_CANDIDATE = re.compile(
     r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
 )
+
+
+def read_snapshot_provider_authority(
+    *,
+    language_snapshot: object,
+    resources: Mapping[str, object],
+    authenticated_bytes: Mapping[str, bytes],
+    projected_digest: object = None,
+):
+    """Read the exact conditional v5 authority member or reject contradiction."""
+    from plugins.workflow.provider_authority import (
+        read_workflow_provider_authority_bytes,
+    )
+
+    profile = getattr(language_snapshot, "effective_profile", None)
+    normalizer_version = getattr(language_snapshot, "normalizer_version", None)
+    phase5 = supports_phase5_semantics(profile, normalizer_version)
+    member = authenticated_bytes.get("provider-resolution.json")
+    recorded_digest = resources.get("provider_resolution_sha256")
+    has_any = (
+        member is not None
+        or recorded_digest is not None
+        or projected_digest is not None
+    )
+    if not phase5:
+        if has_any:
+            raise ValueError("provider authority is forbidden before normalizer v5")
+        return None
+    if (
+        not isinstance(member, bytes)
+        or not isinstance(recorded_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", recorded_digest) is None
+        or projected_digest != recorded_digest
+        or hashlib.sha256(member).hexdigest() != recorded_digest
+    ):
+        raise ValueError("normalizer-v5 provider authority identity changed")
+    return read_workflow_provider_authority_bytes(member)
+
+
+def normalize_mcp_server_document(
+    document: Mapping[str, object], *, default_name: str
+) -> dict[str, dict[str, object]]:
+    """Canonicalize the bounded v5 package-local MCP wrapper spellings."""
+    if not isinstance(document, Mapping):
+        raise ValueError("MCP definition must be a mapping")
+    wrappers = [name for name in ("mcp_servers", "mcpServers") if name in document]
+    if len(wrappers) > 1:
+        raise ValueError("MCP definition has conflicting MCP wrappers")
+    if wrappers:
+        wrapper = wrappers[0]
+        if set(document) != {wrapper}:
+            raise ValueError("MCP wrapper must be the only top-level field")
+        raw_servers = document[wrapper]
+    elif "command" in document or "url" in document:
+        raw_servers = {default_name: document}
+    else:
+        raw_servers = document
+    if (
+        not isinstance(raw_servers, Mapping)
+        or not raw_servers
+        or len(raw_servers) > 64
+    ):
+        raise ValueError("MCP definition must contain at least one server")
+
+    servers: dict[str, dict[str, object]] = {}
+    for name, raw in sorted(raw_servers.items(), key=lambda item: str(item[0])):
+        if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
+            raise ValueError(f"invalid MCP server name: {name}")
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"MCP server {name} must be a mapping")
+        if len(raw) > 32 or any(not isinstance(key, str) for key in raw):
+            raise ValueError(f"MCP server {name} configuration is invalid")
+        has_command = "command" in raw
+        has_url = "url" in raw
+        if has_command == has_url:
+            raise ValueError(
+                f"MCP server {name} must define exactly one of command or url"
+            )
+        config = dict(raw)
+        authored_transport = config.get("transport")
+        if authored_transport is not None and not isinstance(
+            authored_transport, str
+        ):
+            raise ValueError(f"MCP server {name} transport is invalid")
+        endpoint = config["command" if has_command else "url"]
+        if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 4096:
+            raise ValueError(f"MCP server {name} endpoint is invalid")
+        if has_command:
+            if authored_transport not in {None, "stdio"}:
+                raise ValueError(f"MCP server {name} command transport must be stdio")
+            config["transport"] = "stdio"
+        else:
+            transport = {
+                None: "streamable_http",
+                "http": "streamable_http",
+                "streamable_http": "streamable_http",
+                "sse": "sse",
+            }.get(authored_transport)
+            if transport is None:
+                raise ValueError(f"MCP server {name} URL transport is invalid")
+            config["transport"] = transport
+        connect_timeout = config.get("connect_timeout", 60)
+        if (
+            isinstance(connect_timeout, bool)
+            or not isinstance(connect_timeout, int | float)
+            or not 0 < connect_timeout <= 300
+        ):
+            raise ValueError(
+                f"MCP server {name} connect_timeout must be between 0 and 300"
+            )
+        config["connect_timeout"] = float(connect_timeout)
+        try:
+            encoded = json.dumps(
+                config, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"MCP server {name} configuration is invalid") from exc
+        if len(encoded) > 256_000:
+            raise ValueError(f"MCP server {name} configuration is too large")
+        servers[name] = {
+            key: config[key] for key in sorted(config)
+        }
+    return servers
 
 
 def _supports_phase3_runtime(normalizer_version: int) -> bool:
@@ -581,6 +707,7 @@ class ResourceResolver:
         reference: str,
         *,
         materializer: AuthenticatedExecutionMaterializer | None = None,
+        normalizer_version: int | None = None,
     ) -> dict[str, dict[str, object]]:
         """Load one contained, snapshotted MCP definition without interpolation."""
         normalized = reference.replace("\\", "/")
@@ -625,18 +752,25 @@ class ResourceResolver:
         document = yaml.safe_load(encoded.decode("utf-8")) or {}
         if not isinstance(document, dict):
             raise ValueError("MCP definition must be a mapping")
-        raw_servers = document.get("mcp_servers", document)
-        if "command" in document or "url" in document:
-            raw_servers = {path.stem: document}
-        if not isinstance(raw_servers, dict) or not raw_servers:
-            raise ValueError("MCP definition must contain at least one server")
-        servers: dict[str, dict[str, object]] = {}
-        for name, raw in raw_servers.items():
-            if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
-                raise ValueError(f"invalid MCP server name: {name}")
-            if not isinstance(raw, dict):
-                raise ValueError(f"MCP server {name} must be a mapping")
-            servers[name] = dict(raw)
+        if normalizer_version is not None and supports_phase5_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07, normalizer_version
+        ):
+            servers = normalize_mcp_server_document(
+                document, default_name=path.stem
+            )
+        else:
+            raw_servers = document.get("mcp_servers", document)
+            if "command" in document or "url" in document:
+                raw_servers = {path.stem: document}
+            if not isinstance(raw_servers, dict) or not raw_servers:
+                raise ValueError("MCP definition must contain at least one server")
+            servers = {}
+            for name, raw in raw_servers.items():
+                if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
+                    raise ValueError(f"invalid MCP server name: {name}")
+                if not isinstance(raw, dict):
+                    raise ValueError(f"MCP server {name} must be a mapping")
+                servers[name] = dict(raw)
         if self.sealed_bytes is not None:
             if materializer is None:
                 raise ValueError(
@@ -1049,5 +1183,6 @@ __all__ = [
     "StrictSubstitutionRenderer",
     "VariableContext",
     "iter_output_field_references",
+    "normalize_mcp_server_document",
     "substitution_renderer",
 ]

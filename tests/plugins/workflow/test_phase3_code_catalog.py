@@ -212,7 +212,7 @@ def _catalog_session_package(workflow_writer, root, *, name, nodes=None):
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    return load_workflow(path)
+    return _load_v3(path)
 
 
 def _load_v3(path):
@@ -728,7 +728,7 @@ def _emit_resolution_wait_codes(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v3(path)
     store = RunStore(tmp_path / "resolution-catalog-home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -852,7 +852,7 @@ def _emit_resume_failure_codes(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v3(path)
     store = RunStore(tmp_path / "home")
     language_run = _admit_catalog_snapshot(store, package, key="language-mismatch")
     language_resources_path = store.run_directory(language_run) / "resources.json"

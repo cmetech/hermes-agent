@@ -171,6 +171,12 @@ def test_plugin_install_endpoint_invalidates_hub_cache(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd, "dashboard_install_plugin", lambda *a, **k: {"ok": True}
     )
+    async def _reload(_request):
+        return None
+
+    monkeypatch.setattr(
+        web_server, "_reload_plugin_background_services_or_raise", _reload
+    )
 
     asyncio.run(
         web_server.post_agent_plugin_install(

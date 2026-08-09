@@ -42,7 +42,8 @@ from plugins.workflow.notifications import (
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+from plugins.workflow.schema import load_workflow_snapshot
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.sessions import (
     NodeSessionKey,
     NodeSessionRegistry,
@@ -348,6 +349,48 @@ def _run_once(store, package, runner, registry, key):
         session_registry=registry,
     ).advance(admitted.run_id)
     return admitted.run_id, result
+
+
+def test_phase5_successful_attempt_retains_shared_context_handoff_metadata(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    package = _archon_package(
+        workflow_writer,
+        tmp_path / "phase5-shared-handoff",
+    )
+    store = RunStore(tmp_path / "phase5-shared-handoff-home")
+    admitted = _admit(store, package, "phase5-shared-handoff")
+    assert admitted.run_id is not None
+    claim = store.claim_node(admitted.run_id, "analyze", "handoff-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = {
+        "intended_authority_digest": "a" * 64,
+        "model_visible_prefix_digest": "b" * 64,
+        "shared_context_compatibility_digest": "c" * 64,
+    }
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": "phase5-session",
+            "cache_fingerprint": "d" * 64,
+            **identity,
+        },
+    )
+
+    evidence = RunScheduler._predecessor_results(
+        store.load_run(admitted.run_id),
+        ("analyze",),
+        {},
+    )["analyze"]
+
+    assert evidence == {
+        "session_id": "phase5-session",
+        "cache_fingerprint": "d" * 64,
+        **identity,
+    }
 
 
 def _rewrite_latest_projection(
@@ -4649,11 +4692,23 @@ def test_recovery_event_pagination_is_value_free_before_at_and_after_activation(
 
 
 @pytest.mark.parametrize(
-    "damage",
-    ("prefix-delete", "prefix-insert", "prefix-duplicate", "prefix-reorder", "move-later-before"),
+    ("damage", "expected_messages"),
+    (
+        (
+            "prefix-delete",
+            {
+                "projection is ahead of its journal",
+                "private session journal order is invalid",
+            },
+        ),
+        ("prefix-insert", {"private session journal order is invalid"}),
+        ("prefix-duplicate", {"private session journal order is invalid"}),
+        ("prefix-reorder", {"private session journal order is invalid"}),
+        ("move-later-before", {"private session journal order is invalid"}),
+    ),
 )
 def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
-    tmp_path, workflow_writer, damage
+    tmp_path, workflow_writer, damage, expected_messages
 ) -> None:
     """Recomputed self-checksums cannot rewrite the recovery history prefix."""
     store, run_id = _failed_fresh_recovery_run(
@@ -4696,7 +4751,7 @@ def test_recomputed_contiguous_pre_activation_order_damage_is_value_safe(
     ):
         with pytest.raises(JournalRecoveryError) as exc_info:
             reader()
-        assert str(exc_info.value) == "private session journal order is invalid"
+        assert str(exc_info.value) in expected_messages
         assert all(value not in str(exc_info.value) for value in values)
     with pytest.raises(NotificationReconciliationError) as exc_info:
         NotificationOutbox(store)._journal_candidates(

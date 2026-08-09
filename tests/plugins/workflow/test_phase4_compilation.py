@@ -179,7 +179,7 @@ def _parse_source(path, *, name: str, source: str, precedence: int, sidecar=None
     )
 
 
-def test_current_v4_compilation_preserves_accepted_yaml_native_scalars(
+def test_current_v5_compilation_inherits_v4_yaml_native_scalars(
     tmp_path,
 ) -> None:
     """Catch v4's internal bounds encoder rejecting values accepted by v1-v3."""
@@ -219,7 +219,7 @@ nodes:
         WorkflowCatalogSnapshot.capture((source,)),
     )
 
-    assert compilation.package.language.normalizer_version == 4
+    assert compilation.package.language.normalizer_version == 5
     root_sandbox = compilation.package.definition.options["sandbox"]
     assert root_sandbox["expires"] == date(2026, 1, 1)
     assert root_sandbox["ratio"] == math.inf

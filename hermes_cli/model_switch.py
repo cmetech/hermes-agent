@@ -399,43 +399,15 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
         from hermes_cli.config import load_config
         cfg = load_config()
 
-        # --- model_aliases (dict-based format) ---
-        user_aliases = cfg.get("model_aliases")
-        if isinstance(user_aliases, dict):
-            for name, entry in user_aliases.items():
-                if not isinstance(entry, dict):
-                    continue
-                model = entry.get("model", "")
-                provider = entry.get("provider", "custom")
-                base_url = entry.get("base_url", "")
-                if model:
-                    merged[name.strip().lower()] = DirectAlias(
-                        model=model, provider=provider, base_url=base_url,
-                    )
+        from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 
-        # --- model.aliases (string-based format, from config set) ---
-        model_section = cfg.get("model", {})
-        if isinstance(model_section, dict):
-            simple_aliases = model_section.get("aliases")
-            if isinstance(simple_aliases, dict):
-                current_provider = model_section.get("provider", "")
-                for name, value in simple_aliases.items():
-                    if not isinstance(value, str) or not value.strip():
-                        continue
-                    key = name.strip().lower()
-                    if key in merged:
-                        continue  # don't override explicit model_aliases entries
-                    val = value.strip()
-                    if "/" in val:
-                        provider, model = val.split("/", 1)
-                    else:
-                        provider = current_provider
-                        model = val
-                    merged[key] = DirectAlias(
-                        model=model.strip(),
-                        provider=provider.strip() or current_provider,
-                        base_url="",
-                    )
+        snapshot = parse_workflow_model_config(cfg)
+        for name, entry in snapshot.aliases.items():
+            merged[name] = DirectAlias(
+                model=entry.model,
+                provider=entry.provider,
+                base_url=entry.base_url,
+            )
     except Exception:
         pass
     return merged

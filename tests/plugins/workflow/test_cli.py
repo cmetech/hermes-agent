@@ -14,6 +14,7 @@ import yaml
 
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission_service import assess_production_workflow_admission
 from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
 from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
@@ -314,6 +315,12 @@ def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_
             == machine_contract.operator_command_contract()
         )
 
+    injected_contract = machine_contract.success_envelope(
+        "workflow showcase run",
+        {"command_contract": {"commands": {"run": ["exfiltrate-secret"]}}},
+    )
+    assert injected_contract["result"]["command_contract"] == "[REDACTED]"
+
     untrusted = machine_contract.success_envelope(
         "workflow list", {"confirmation_token": "unrecognized-secret"}
     )
@@ -333,7 +340,13 @@ def _archon_package(workflow_writer, tmp_path, *, field, value):
     node = (
         {"id": "start", "bash": "true", field: value}
         if field == "timeout"
-        else {"id": "start", "prompt": "x", field: value}
+        else {
+            "id": "start",
+            "prompt": "x",
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4",
+            field: value,
+        }
     )
     path = workflow_writer(
         tmp_path / ".hermes" / "workflows",
@@ -424,8 +437,18 @@ def test_current_archon_inherits_phase3_timeout_and_retry_fields(
     assert args.func(args) == 0
     result = _json_result(capsys)
     assert result["valid"] is True
-    assert result["issues"] == []
-    assert result["language"]["normalizer_version"] == 4
+    assert not any(issue["blocking"] for issue in result["issues"])
+    expected_resolution_paths = (
+        {"nodes[0].provider", "nodes[0].model"}
+        if field == "retry"
+        else set()
+    )
+    assert {
+        issue["path"]
+        for issue in result["issues"]
+        if issue["code"] == "provider_profile_resolution"
+    } == expected_resolution_paths
+    assert result["language"]["normalizer_version"] == 5
 
 
 def test_archon_cli_admission_seals_resolved_profile_execution_authority(
@@ -466,11 +489,10 @@ def test_archon_cli_admission_seals_resolved_profile_execution_authority(
         path.stem,
     )
     package = compilation.package
-    risk = build_risk_summary(
-        package,
-        assess_compatibility(package),
-        compilation=compilation,
-    )
+    risk = assess_production_workflow_admission(
+        compilation,
+        requires_ai=False,
+    ).risk
     WorkflowTrustStore(home).trust(
         compilation.composite_digest,
         actor="test",
@@ -529,7 +551,12 @@ def test_archon_phase_2_output_fields_validate(
     assert validate.func(validate) == 0
     result = _json_result(capsys)
     assert result["valid"] is True
-    assert result["issues"] == []
+    assert not any(issue["blocking"] for issue in result["issues"])
+    assert {
+        issue["path"]
+        for issue in result["issues"]
+        if issue["code"] == "provider_profile_resolution"
+    } == {"nodes[0].provider", "nodes[0].model"}
     assert result["language"]["effective_profile"] == "archon-2026-07"
 
 
@@ -884,6 +911,35 @@ def test_runtime_limits_load_from_plugin_entry_without_new_root_config(tmp_path)
 
     assert config.max_parallel_nodes == 2
     assert config.max_total_workers == 3
+
+
+def test_runtime_limits_honor_managed_profile_overlay(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 2\n"
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 5\n"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+
+    config = _runtime_config(profile)
+
+    assert config.max_parallel_nodes == 5
 
 
 def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():
@@ -1747,7 +1803,7 @@ def test_run_status_events_and_runs_sanitize_the_durable_store(
     assert events["truncated"] is True
     assert events["next_cursor"] == events["events"][-1]["sequence"]
     assert events["events"][-1]["payload_truncated"] is True
-    assert len(events["events"][-1]["payload"]["items"]) == 200
+    assert "payload" not in events["events"][-1]
     assert "operator_scope_digest" not in json.dumps(events)
     assert "idempotency_key_digest" not in json.dumps(events)
 

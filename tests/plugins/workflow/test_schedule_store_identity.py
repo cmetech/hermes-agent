@@ -12,6 +12,7 @@ import pytest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import JournalRecoveryError, RunStore
 import plugins.workflow.store as store_module
 
@@ -75,6 +76,62 @@ def _downgrade_to_v13_without_schedule(store: RunStore) -> None:
         connection.execute("DROP INDEX runs_scheduled_queue")
         connection.execute("ALTER TABLE runs DROP COLUMN scheduled_at")
         connection.execute("PRAGMA user_version=13")
+
+
+def test_winning_attempt_shared_context_identity_survives_journal_rebuild(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "shared-context-home"
+    store = RunStore(home)
+    package = load_workflow(
+        workflow_writer(tmp_path / "shared-context-package", name="shared-context")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="shared-context",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    claim = store.claim_node(admitted.run_id, "start", "identity-owner")
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = {
+        "intended_authority_digest": "a" * 64,
+        "model_visible_prefix_digest": "b" * 64,
+        "shared_context_compatibility_digest": "c" * 64,
+    }
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={
+            "session_id": "winning-session",
+            "cache_fingerprint": "d" * 64,
+            **identity,
+        },
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+
+    recovered = RunStore(home).load_run(admitted.run_id)
+    evidence = RunScheduler._predecessor_results(
+        recovered,
+        ("start",),
+        {},
+    )["start"]
+
+    assert evidence == {
+        "session_id": "winning-session",
+        "cache_fingerprint": "d" * 64,
+        **identity,
+    }
 
 
 def _downgrade_to_v13_legacy_namespace(

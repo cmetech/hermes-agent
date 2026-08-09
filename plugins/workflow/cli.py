@@ -32,6 +32,12 @@ from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     language_projection,
     supports_phase4_semantics,
+    supports_phase5_semantics,
+)
+from plugins.workflow.admission_service import (
+    WorkflowAdmissionAssessment,
+    assess_workflow_admission,
+    assess_production_workflow_admission,
 )
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
@@ -111,6 +117,7 @@ from tools.managed_process import ProcessResourceLimits
 
 if TYPE_CHECKING:
     from plugins.workflow.compilation import WorkflowCompilation
+    from plugins.workflow.runner_binding import ExecutionCapabilityContext
 
 
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
@@ -1090,6 +1097,13 @@ def _compilation_trust_material(
 ) -> tuple[WorkflowPackageDigest, CompatibilityReport, WorkflowRiskSummary]:
     """Return the exact digest, compatibility, and risk for one compilation."""
     package = compilation.package
+    assessment = _phase5_admission_assessment(compilation)
+    if assessment is not None:
+        return (
+            assessment.package_digest,
+            assessment.compatibility,
+            assessment.risk,
+        )
     compatibility = assess_compatibility(package)
     risk = build_risk_summary(
         package,
@@ -1098,6 +1112,18 @@ def _compilation_trust_material(
     )
     digest = _admission_package_digest(compilation)
     return digest, compatibility, risk
+
+
+def _phase5_admission_assessment(
+    compilation: WorkflowCompilation,
+) -> WorkflowAdmissionAssessment | None:
+    package = compilation.package
+    if not supports_phase5_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        return None
+    return assess_production_workflow_admission(compilation)
 
 
 def _cron_jobs() -> Iterable[Mapping[str, object]]:
@@ -1164,10 +1190,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         else None
     )
+    assessment = (
+        _phase5_admission_assessment(compilation)
+        if compilation is not None
+        else None
+    )
     detail = show_package(
         compilation.package if compilation is not None else package,
         cron_jobs=_cron_jobs(),
         compilation=compilation,
+        compatibility_report=(
+            assessment.compatibility if assessment is not None else None
+        ),
     )
     if args.json:
         _emit(detail, as_json=True)
@@ -1218,7 +1252,16 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     if compilation is not None:
         package = compilation.package
     issues = validate_package(package)
-    compatibility = assess_compatibility(package)
+    assessment = (
+        _phase5_admission_assessment(compilation)
+        if compilation is not None
+        else None
+    )
+    compatibility = (
+        assessment.compatibility
+        if assessment is not None
+        else assess_compatibility(package)
+    )
     if any(issue.blocking for issue in issues) and compatibility.runnable:
         compatibility = replace(
             compatibility,
@@ -1266,10 +1309,14 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         assert compilation is not None
         payload["compilation"] = compilation_diagnostics(
             compilation,
-            risk_summary=build_risk_summary(
-                package,
-                compatibility,
-                compilation=compilation,
+            risk_summary=(
+                assessment.risk
+                if assessment is not None
+                else build_risk_summary(
+                    package,
+                    compatibility,
+                    compilation=compilation,
+                )
             ),
         )
     try:
@@ -1455,12 +1502,12 @@ def _doctor_compatibility_level(
 
 
 def _profile_config(hermes_home: str | Path) -> Mapping[str, object]:
+    from hermes_cli.config import load_config_readonly
+
     path = Path(hermes_home) / "config.yaml"
-    if not path.is_file():
-        return {}
     try:
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeError, yaml.YAMLError):
+        config = load_config_readonly(path)
+    except (OSError, UnicodeError):
         return {}
     return config if isinstance(config, Mapping) else {}
 
@@ -1522,16 +1569,40 @@ def doctor_package(
     mcp_available: bool = False,
     environment: Mapping[str, str] | None = None,
     runtime_config: WorkflowRuntimeConfig | None = None,
+    execution_context: "ExecutionCapabilityContext | None" = None,
 ) -> DoctorReport:
     """Inspect a package without starting a provider, worker, or MCP server."""
-    compatibility = assess_compatibility(
-        package,
-        available_tools=available_tools,
-        available_services=available_services,
-        provider_capabilities=provider_capabilities,
-        isolated_workdir=isolated_workdir,
-        mcp_available=mcp_available,
-    )
+    assessment = None
+    if compilation is not None and supports_phase5_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        assessment = (
+            assess_workflow_admission(
+                compilation,
+                execution_context,
+                available_tools=available_tools,
+                available_services=available_services,
+                isolated_workdir=isolated_workdir,
+            )
+            if execution_context is not None
+            else assess_production_workflow_admission(
+                compilation,
+                available_tools=available_tools,
+                available_services=available_services,
+                isolated_workdir=isolated_workdir,
+            )
+        )
+        compatibility = assessment.compatibility
+    else:
+        compatibility = assess_compatibility(
+            package,
+            available_tools=available_tools,
+            available_services=available_services,
+            provider_capabilities=provider_capabilities,
+            isolated_workdir=isolated_workdir,
+            mcp_available=mcp_available,
+        )
     findings = list(compatibility.findings)
     if package.language.structured_outputs:
         try:
@@ -1569,15 +1640,23 @@ def doctor_package(
         )
         else None
     )
-    risk = build_risk_summary(
-        package,
-        compatibility,
-        compilation=phase4_compilation,
+    risk = (
+        assessment.risk
+        if assessment is not None
+        else build_risk_summary(
+            package,
+            compatibility,
+            compilation=phase4_compilation,
+        )
     )
     package_digest = (
-        _admission_package_digest(compilation)
-        if compilation is not None
-        else compute_package_digest(package)
+        assessment.package_digest
+        if assessment is not None
+        else (
+            _admission_package_digest(compilation)
+            if compilation is not None
+            else compute_package_digest(package)
+        )
     )
     if phase4_compilation is not None:
         bindings = phase4_compilation.dependency_manifest.resources
@@ -1849,6 +1928,11 @@ def doctor_package(
         resolved_scripts=scripts,
         resolved_mcp_servers=mcp_servers,
         resolved_skills=skills,
+        provider_capability=(
+            None
+            if assessment is None or assessment.capability_summary is None
+            else dict(assessment.capability_summary)
+        ),
     )
 
 
@@ -2103,10 +2187,10 @@ def _runtime_config(
     *,
     sidecar: Mapping[str, object] | None = None,
 ) -> WorkflowRuntimeConfig:
+    from hermes_cli.config import load_config_readonly
+
     path = Path(hermes_home) / "config.yaml"
-    raw: object = {}
-    if path.is_file():
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw: object = load_config_readonly(path)
     if not isinstance(raw, Mapping):
         raise ValueError("config.yaml must contain a mapping")
     plugins = raw.get("plugins", {})
@@ -2196,14 +2280,20 @@ def _cmd_run(
     compilation = _resolve_compilation(args, args.name)
     package = compilation.package
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
-    digest = _admission_package_digest(compilation)
-    compatibility = assess_compatibility(package)
+    assessment = _phase5_admission_assessment(compilation)
+    if assessment is None:
+        digest = _admission_package_digest(compilation)
+        compatibility = assess_compatibility(package)
+        risk = build_risk_summary(
+            package,
+            compatibility,
+            compilation=_admission_compilation(compilation),
+        )
+    else:
+        digest = assessment.package_digest
+        compatibility = assessment.compatibility
+        risk = assessment.risk
     require_runnable(compatibility)
-    risk = build_risk_summary(
-        package,
-        compatibility,
-        compilation=_admission_compilation(compilation),
-    )
     if (
         WorkflowTrustStore(args.hermes_home).check(
             digest.sha256, risk_digest=risk.risk_digest
@@ -2246,6 +2336,9 @@ def _cmd_run(
             digest if _admission_compilation(compilation) is not None else None
         ),
         execution_limits=RunExecutionLimits.resolve(runtime),
+        provider_authority=(
+            assessment.provider_authority if assessment is not None else None
+        ),
     )
     intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(

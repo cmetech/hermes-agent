@@ -9,16 +9,20 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 import threading
+import time
 import unicodedata
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
+from agent.cost_budget import CostBudgetTerminalError
 from agent.plugin_agent import (
     _ProviderAttemptGrantExhausted,
     _reserve_shared_provider_attempt,
     _snapshot_shared_provider_attempts,
+    plugin_agent_python_runtime_identity,
 )
 
 
@@ -53,6 +57,55 @@ _AUTHORITY_LOADER = (
     "os.chdir(r);sys.path[:]=[os.path.dirname(p),r,*sys.path];"
     "sys.argv=[p,*sys.argv[3:]];runpy.run_path(p,run_name='__main__')"
 )
+_PHASE5_AUTHORITY_LOADER = r"""
+import importlib.machinery
+import os
+import runpy
+import sys
+
+root, entry = sys.argv[1:3]
+root = os.path.realpath(root)
+entry_path = os.path.realpath(os.path.join(root, *entry.split('/')))
+stdlib = os.path.realpath(os.path.dirname(os.__file__))
+
+def contained(path, parent):
+    try:
+        return os.path.commonpath((os.path.realpath(path), parent)) == parent
+    except (OSError, ValueError):
+        return False
+
+def permitted(path):
+    normalized = os.path.realpath(path)
+    parts = {part.casefold() for part in normalized.split(os.sep)}
+    return (
+        contained(normalized, root)
+        or (
+            contained(normalized, stdlib)
+            and "site-packages" not in parts
+            and "dist-packages" not in parts
+        )
+    )
+
+class SealedImportGuard:
+    def find_spec(self, fullname, path=None, target=None):
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.origin in {None, "built-in", "frozen"}:
+            return spec
+        origins = [spec.origin, *(spec.submodule_search_locations or ())]
+        if not all(permitted(origin) for origin in origins):
+            raise ImportError(f"unsealed import blocked: {fullname}")
+        return spec
+
+sys.meta_path.insert(0, SealedImportGuard())
+sys.path[:] = [
+    os.path.dirname(entry_path),
+    root,
+    *(path for path in sys.path if path and permitted(path)),
+]
+os.chdir(root)
+sys.argv = [entry_path, *sys.argv[3:]]
+runpy.run_path(entry_path, run_name="__main__")
+"""
 
 
 def _canonical_authority_relative(value: object) -> str:
@@ -618,6 +671,8 @@ def _is_package_spec_argument(value: str, executable: str) -> bool:
 
 def _finalize_authenticated_mcp_config(
     servers: dict[str, dict[str, Any]],
+    *,
+    phase5: bool = False,
 ) -> dict[str, dict[str, Any]]:
     finalized: dict[str, dict[str, Any]] = {}
     validated: dict[str, tuple[Path, Path, dict[str, dict[str, object]]]] = {}
@@ -692,6 +747,8 @@ def _finalize_authenticated_mcp_config(
             return f"{prefix}{root.joinpath(*Path(relative).parts)}", relative
 
         if command is None and isinstance(config.get("url"), str):
+            if phase5:
+                reject_unproven()
             if _uri_disposition(config["url"]) != "network":
                 reject_unproven()
             finalized[name] = config
@@ -706,6 +763,8 @@ def _finalize_authenticated_mcp_config(
             )
         executable = re.split(r"[/\\]", command)[-1].lower().removesuffix(".exe")
         is_python = _PYTHON_EXECUTABLE.fullmatch(executable) is not None
+        if phase5 and command != sys.executable:
+            reject_unproven()
         command_path_hint = _looks_path_like(command) and not is_python
         rewritten_command, _command_relative = rewrite(
             command,
@@ -763,6 +822,28 @@ def _finalize_authenticated_mcp_config(
             ]
 
         if is_python:
+            if phase5:
+                entry = argument_references[0] if argument_references else None
+                if (
+                    not rewritten
+                    or entry is None
+                    or not entry.lower().endswith((".py", ".pyw"))
+                    or rewritten[0].startswith("-")
+                ):
+                    reject_unproven()
+                config["command"] = sys.executable
+                config["args"] = [
+                    "-I",
+                    "-S",
+                    "-c",
+                    _PHASE5_AUTHORITY_LOADER,
+                    str(root),
+                    entry,
+                    *rewritten[1:],
+                ]
+                config[_AUTHORITY_CWD_KEY] = str(root)
+                finalized[name] = config
+                continue
             isolated_args = rewritten[1:] if rewritten[:1] == ["-I"] else rewritten
             isolated_refs = (
                 argument_references[1:]
@@ -924,14 +1005,31 @@ def _compile_node_hook_resources(raw_hooks: Any) -> tuple[dict[str, Any], ...]:
     return tuple(compiled)
 
 
-def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
+class _InstalledNodeHooks(list[dict[str, str]]):
+    def __init__(self) -> None:
+        super().__init__()
+        self._registration = None
+
+    def bind(self, registration) -> None:
+        self._registration = registration
+
+    def close(self) -> None:
+        registration = self._registration
+        self._registration = None
+        if registration is not None:
+            registration.close()
+
+
+def _install_node_hooks(raw_hooks: Any) -> _InstalledNodeHooks:
     resources = _compile_node_hook_resources(raw_hooks)
+    observed = _InstalledNodeHooks()
     if not resources:
-        return []
+        return observed
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
-    observed: list[dict[str, str]] = []
+    hooks: dict[str, list[Any]] = {}
+    middleware_callbacks: dict[str, list[Any]] = {}
 
     def matches(resource: dict[str, Any], kwargs: dict[str, Any]) -> bool:
         matcher = resource["matcher"]
@@ -970,7 +1068,7 @@ def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
             })
             return dict(_response) if isinstance(_response, dict) else None
 
-        manager._hooks.setdefault(hermes_event, []).append(callback)
+        hooks.setdefault(hermes_event, []).append(callback)
         if event == "PreToolUse" and isinstance(response, dict) and "args" in response:
 
             def middleware(
@@ -989,7 +1087,16 @@ def _install_node_hooks(raw_hooks: Any) -> list[dict[str, str]]:
                     "source": "workflow-node-hook",
                 }
 
-            manager._middleware.setdefault("tool_request", []).append(middleware)
+            middleware_callbacks.setdefault("tool_request", []).append(middleware)
+    observed.bind(
+        manager.register_scoped_lifecycle(
+            hooks={name: tuple(callbacks) for name, callbacks in hooks.items()},
+            middleware={
+                name: tuple(callbacks)
+                for name, callbacks in middleware_callbacks.items()
+            },
+        )
+    )
     return observed
 
 
@@ -1002,6 +1109,7 @@ def _build_inline_agent_handler(
     runner_factory,
     emit_progress,
     pause,
+    is_cancelled=None,
 ):
     """Build the synchronous worker-local ``workflow_agent`` dispatcher."""
     admission_lock = threading.Lock()
@@ -1032,8 +1140,29 @@ def _build_inline_agent_handler(
         parent = parent_request
         request = PluginAgentRunRequest(
             prompt=prompt,
-            provider=getattr(parent, "provider", None),
+            provider=(
+                definition.get("provider")
+                or getattr(parent, "provider", None)
+            ),
             model=definition.get("model") or getattr(parent, "model", None),
+            sealed_runtime_authority_required=getattr(
+                parent, "sealed_runtime_authority_required", False
+            ),
+            intended_authority_digest=definition.get(
+                "intended_authority_digest"
+            ),
+            expected_runtime_identity=definition.get(
+                "expected_runtime_identity"
+            ),
+            expected_runtime_route_fingerprint=definition.get(
+                "expected_runtime_route_fingerprint"
+            ),
+            expected_runtime_route_options=definition.get(
+                "expected_runtime_route_options"
+            ),
+            expected_mcp_runtime_identity_digest=getattr(
+                parent, "expected_mcp_runtime_identity_digest", None
+            ),
             allowed_tools=(
                 tuple(definition["allowed_tools"])
                 if definition.get("allowed_tools") is not None
@@ -1054,11 +1183,32 @@ def _build_inline_agent_handler(
             provider_request_timeout_seconds=getattr(
                 parent, "provider_request_timeout_seconds", 300.0
             ),
+            absolute_wall_deadline=getattr(
+                parent, "absolute_wall_deadline", None
+            ),
+            absolute_idle_deadline=getattr(
+                parent, "absolute_idle_deadline", None
+            ),
+            absolute_provider_deadline=getattr(
+                parent, "absolute_provider_deadline", None
+            ),
             approved_action_digest=getattr(parent, "approved_action_digest", None),
-            reasoning_config=getattr(parent, "reasoning_config", None),
-            fallback_model=getattr(parent, "fallback_model", None),
-            request_overrides=getattr(parent, "request_overrides", {}),
+            reasoning_config=(
+                definition["reasoning_config"]
+                if "reasoning_config" in definition
+                else getattr(parent, "reasoning_config", None)
+            ),
+            fallback_model=None,
+            request_overrides=(
+                definition["request_overrides"]
+                if "request_overrides" in definition
+                else getattr(parent, "request_overrides", {})
+            ),
             max_budget_usd=getattr(parent, "max_budget_usd", None),
+            _cost_budget_authority=getattr(
+                parent, "_cost_budget_authority", None
+            ),
+            _cost_budget_contract=getattr(parent, "_cost_budget_contract", None),
             sandbox_policy=getattr(parent, "sandbox_policy", None),
             max_process_tree_rss_bytes=getattr(
                 parent, "max_process_tree_rss_bytes", 2048 * 1024 * 1024
@@ -1073,7 +1223,7 @@ def _build_inline_agent_handler(
             term_grace_seconds=getattr(parent, "term_grace_seconds", 5.0),
             kill_reap_grace_seconds=getattr(parent, "kill_reap_grace_seconds", 2.0),
         )
-        result = runner_factory(plugin_id).run(request)
+        result = runner_factory(plugin_id).run(request, is_cancelled=is_cancelled)
         if result.status == "paused":
             descriptor = dict(result.pending_interaction or {})
             pause(descriptor)
@@ -1210,6 +1360,99 @@ def _persistent_session_missing_failure(plugin_id: str) -> dict[str, Any]:
     }
 
 
+def _prefix_identity_mismatch_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+    model_visible_prefix_digest: str,
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "cache_fingerprint_changed",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+            "model_visible_prefix_digest": model_visible_prefix_digest,
+        },
+        "structured_output": None,
+    }
+
+
+def _runtime_identity_mismatch_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+    mismatched_fields: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "provider_capability_drift",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+            **(
+                {"mismatched_fields": list(mismatched_fields)}
+                if mismatched_fields
+                else {}
+            ),
+        },
+        "structured_output": None,
+    }
+
+
+def _runtime_identity_mismatched_fields(expected, actual) -> tuple[str, ...]:
+    if actual is None:
+        return ("endpoint_sha256",)
+    return tuple(
+        field
+        for field in expected.__dataclass_fields__
+        if getattr(actual, field) != getattr(expected, field)
+    )
+
+
+def _tool_policy_incompatible_failure(
+    plugin_id: str,
+    *,
+    intended_authority_digest: str,
+) -> dict[str, Any]:
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": "",
+        "model": "",
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": "tool_policy_incompatible",
+            "provider_attempts": 0,
+            "model_calls": 0,
+            "known_no_effect": True,
+            "intended_authority_digest": intended_authority_digest,
+        },
+        "structured_output": None,
+    }
+
+
 def _worker_failure_result(plugin_id: str, exc: BaseException) -> dict[str, Any]:
     failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
     if (
@@ -1267,6 +1510,57 @@ def _run(
     if not plugin_id:
         raise ValueError("plugin_id is missing")
 
+    route_constraint = None
+    # Phase 5 binds the request to a pure view of the live configured route
+    # before this process loads dotenv, opens SessionDB, mutates tool globals,
+    # finalizes MCP config, or resolves credentials. A drifted request must be
+    # observationally equivalent to never having entered provider execution.
+    if request.expected_runtime_identity is not None:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import read_raw_config_readonly
+        from hermes_cli.runtime_provider import (
+            execution_runtime_identity_from_sealed_route,
+            select_credential_free_execution_route,
+        )
+
+        expected_runtime_identity = execution_runtime_identity_from_sealed_route(
+            request.expected_runtime_identity
+        )
+        if (
+            expected_runtime_identity.provider == "bedrock"
+            and expected_runtime_identity.api_mode == "anthropic_messages"
+            and bool(os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip())
+        ):
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest or "",
+                mismatched_fields=("api_mode",),
+            )
+        raw_config = read_raw_config_readonly()
+        managed_config = managed_scope.load_managed_config()
+        route_constraint = select_credential_free_execution_route(
+            raw_config,
+            requested_provider=request.provider,
+            target_model=request.model,
+            route_fingerprint=request.expected_runtime_route_fingerprint,
+            expected_runtime_identity=expected_runtime_identity,
+            provider_options=request.expected_runtime_route_options,
+            managed_config=managed_config,
+        )
+        live_runtime_identity = (
+            route_constraint.execution_runtime_identity()
+            if route_constraint is not None
+            else None
+        )
+        if live_runtime_identity != expected_runtime_identity:
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest or "",
+                mismatched_fields=_runtime_identity_mismatched_fields(
+                    expected_runtime_identity, live_runtime_identity
+                ),
+            )
+
     worker_mcp = None
     original_mcp_loader = None
     worker_tool_search = None
@@ -1280,9 +1574,7 @@ def _run(
     original_approval_callback = None
     original_sudo_callback = None
     original_secret_callback = None
-    node_hook_manager = None
-    original_node_hooks = None
-    original_node_middleware = None
+    installed_node_hooks = None
     original_registry_generation = None
     history = None
 
@@ -1295,7 +1587,10 @@ def _run(
         # forging worker-origin zero-attempt evidence.
         from hermes_state import SessionDB
 
-        if request.context_mode == "shared":
+        if (
+            request.context_mode == "shared"
+            and request.intended_authority_digest is None
+        ):
             session_db = SessionDB()
             history = session_db.get_existing_session_conversation(
                 request.session_id
@@ -1322,7 +1617,21 @@ def _run(
             str(name): worker_mcp._interpolate_env_vars(dict(config))
             for name, config in raw_mcp.items()
         }
-        resolved_mcp = _finalize_authenticated_mcp_config(resolved_mcp)
+        if (
+            request.expected_mcp_runtime_identity_digest is not None
+            and plugin_agent_python_runtime_identity()
+            != request.expected_mcp_runtime_identity_digest
+        ):
+            return _runtime_identity_mismatch_failure(
+                plugin_id,
+                intended_authority_digest=(
+                    request.intended_authority_digest or ""
+                ),
+            )
+        resolved_mcp = _finalize_authenticated_mcp_config(
+            resolved_mcp,
+            phase5=request.intended_authority_digest is not None,
+        )
         enabled_mcp_names = {
             name
             for name, config in resolved_mcp.items()
@@ -1358,6 +1667,15 @@ def _run(
         def bounded_provider_timeout(provider: str, model_name: str) -> float:
             profile_timeout = configured_timeout(provider, model_name)
             request_timeout = float(request.provider_request_timeout_seconds)
+            now = time.monotonic()
+            for deadline in (
+                request.absolute_wall_deadline,
+                request.absolute_provider_deadline,
+            ):
+                if deadline is not None:
+                    request_timeout = min(request_timeout, float(deadline) - now)
+            if request_timeout <= 0:
+                raise TimeoutError("plugin-agent provider deadline expired")
             if profile_timeout is None:
                 return request_timeout
             return min(request_timeout, float(profile_timeout))
@@ -1366,18 +1684,47 @@ def _run(
 
         from hermes_cli.runtime_provider import (
             classify_resolved_execution_runtime,
+            execution_runtime_identity,
+            execution_runtime_identity_from_sealed_route,
             resolve_runtime_provider,
             resolve_structured_output_capability,
         )
 
         model = _configured_model(request.model)
         runtime = None
-        if enabled_mcp_names:
+        if enabled_mcp_names or request.expected_runtime_identity is not None:
             runtime = resolve_runtime_provider(
-                requested=request.provider, target_model=model or None
+                requested=request.provider,
+                target_model=model or None,
+                route_constraint=route_constraint,
             )
             runtime_capabilities = classify_resolved_execution_runtime(runtime)
-            if not runtime_capabilities.hermes_managed_tool_loop:
+            if request.expected_runtime_identity is not None:
+                expected_runtime_identity = (
+                    execution_runtime_identity_from_sealed_route(
+                        request.expected_runtime_identity
+                    )
+                )
+                try:
+                    actual_runtime_identity = execution_runtime_identity(
+                        runtime_capabilities
+                    )
+                except ValueError:
+                    actual_runtime_identity = None
+                if actual_runtime_identity != expected_runtime_identity:
+                    return _runtime_identity_mismatch_failure(
+                        plugin_id,
+                        intended_authority_digest=(
+                            request.intended_authority_digest or ""
+                        ),
+                        mismatched_fields=_runtime_identity_mismatched_fields(
+                            expected_runtime_identity, actual_runtime_identity
+                        ),
+                    )
+            if (
+                enabled_mcp_names
+                and not runtime_capabilities.hermes_managed_tool_loop
+            ):
                 raise PackageMCPUnavailable(
                     "package_mcp_unavailable: resolved runtime does not use "
                     "Hermes' tool loop"
@@ -1405,15 +1752,28 @@ def _run(
                     f"did not connect: {', '.join(unavailable)}"
                 )
 
+        allowed = None if request.allowed_tools is None else set(request.allowed_tools)
+        denied = set(request.denied_tools) | {"delegate_task"}
+        inline_agent_reachable = bool(request.inline_agents) and (
+            allowed is None or "workflow_agent" in allowed
+        ) and "workflow_agent" not in denied
+        if (
+            request.inline_agents
+            and not inline_agent_reachable
+            and request.intended_authority_digest is not None
+        ):
+            return _tool_policy_incompatible_failure(
+                plugin_id,
+                intended_authority_digest=request.intended_authority_digest,
+            )
+        if not inline_agent_reachable:
+            denied.add("workflow_agent")
+
         # Import the agent only after the request loader is installed and
         # required MCP servers have registered their tools. Construction stays
         # below runtime classification and tool-policy validation.
-        from run_agent import AIAgent
+        from run_agent import AIAgent, ProviderCapabilityDriftError
 
-        allowed = None if request.allowed_tools is None else set(request.allowed_tools)
-        denied = set(request.denied_tools) | {"delegate_task"}
-        if not request.inline_agents:
-            denied.add("workflow_agent")
         pending: list[dict[str, str]] = []
         approved_action_consumed = False
 
@@ -1423,7 +1783,7 @@ def _run(
             if active is not None:
                 active._interrupt_requested = True
 
-        if request.inline_agents:
+        if inline_agent_reachable:
             from agent.plugin_agent import PluginAgentRunner
 
             inline_handler = _build_inline_agent_handler(
@@ -1437,6 +1797,7 @@ def _run(
                 runner_factory=PluginAgentRunner,
                 emit_progress=lambda **progress: _emit("progress", **progress),
                 pause=pause,
+                is_cancelled=_cancel_event.is_set,
             )
             registry.register(
                 name="workflow_agent",
@@ -1470,6 +1831,20 @@ def _run(
                 {"command": command, "description": description},
             )
             if (
+                request._provider_attempt_authority is not None
+                and request.approved_action_digest == descriptor["action_digest"]
+            ):
+                try:
+                    from agent.plugin_agent import _consume_shared_approved_action
+
+                    if _consume_shared_approved_action(
+                        request._provider_attempt_authority,
+                        descriptor["action_digest"],
+                    ):
+                        return "once"
+                except (RuntimeError, ValueError):
+                    pass
+            elif (
                 not approved_action_consumed
                 and request.approved_action_digest == descriptor["action_digest"]
             ):
@@ -1517,6 +1892,44 @@ def _run(
                 runtime = resolve_runtime_provider(
                     requested=request.provider, target_model=model or None
                 )
+
+            cost_evidence = None
+            cost_contract = None
+            if request._cost_budget_authority is not None:
+                from agent.cost_budget import (
+                    CostBudgetExhausted,
+                    CostBudgetPoisoned,
+                    acquire_cost_lease,
+                    canonical_usd,
+                    poison_cost_lease,
+                    release_unstarted_cost_lease,
+                    settle_cost_lease,
+                    snapshot_cost_budget,
+                )
+                from agent.usage_pricing import AuthoritativeSettlementContract
+
+                raw_contract = dict(request._cost_budget_contract or {})
+                cost_contract = AuthoritativeSettlementContract(
+                    provider=str(raw_contract["provider"]),
+                    strategy=str(raw_contract["strategy"]),
+                    billing_mode=str(raw_contract["billing_mode"]),
+                    covered_outcomes=frozenset(raw_contract["covered_outcomes"]),
+                )
+                cost_evidence = snapshot_cost_budget(
+                    request._cost_budget_authority
+                )
+                if (
+                    cost_evidence["limit_usd"]
+                    != canonical_usd(request.max_budget_usd)
+                    or cost_evidence["provider"] != runtime.get("provider")
+                    or cost_evidence["model"] != model
+                    or cost_evidence["strategy"] != cost_contract.strategy
+                    or cost_contract.provider != runtime.get("provider")
+                ):
+                    raise CostBudgetPoisoned(
+                        "sealed authoritative cost route changed",
+                        failure_code="authoritative_cost_route_mismatch",
+                    )
 
             structured_decision = None
             if request.structured_output is not None:
@@ -1587,12 +2000,18 @@ def _run(
                 model=model,
                 max_iterations=request.max_iterations,
                 provider=runtime.get("provider"),
+                requested_provider=(
+                    route_constraint.requested_provider
+                    if route_constraint is not None
+                    else request.provider
+                ),
                 base_url=runtime.get("base_url"),
                 api_key=runtime.get("api_key"),
                 api_mode=runtime.get("api_mode"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                execution_route_constraint=route_constraint,
                 ephemeral_system_prompt=request.ephemeral_system_prompt,
                 reasoning_config=dict(request.reasoning_config or {}),
                 fallback_model=(
@@ -1616,6 +2035,106 @@ def _run(
                 session_db=session_db,
                 clarify_callback=clarify,
             )
+            if request._cost_budget_authority is not None:
+                from agent.usage_pricing import authoritative_cost_fact
+
+                cost_authority = request._cost_budget_authority
+                cost_state_lock = threading.Lock()
+
+                def cost_deadline() -> float:
+                    deadlines = [
+                        deadline
+                        for deadline in (
+                            request.absolute_wall_deadline,
+                            request.absolute_idle_deadline,
+                            request.absolute_provider_deadline,
+                        )
+                        if deadline is not None
+                    ]
+                    return min(deadlines) if deadlines else (
+                        time.monotonic()
+                        + request.provider_request_timeout_seconds
+                    )
+
+                def acquire_cost_attempt() -> str:
+                    attempt_id = secrets.token_hex(16)
+                    return acquire_cost_lease(
+                        cost_authority,
+                        attempt_id=attempt_id,
+                        provider=str(agent.provider),
+                        model=str(agent.model),
+                        deadline=cost_deadline(),
+                        is_cancelled=lambda: (
+                            _cancel_event.is_set()
+                            or bool(getattr(agent, "_interrupt_requested", False))
+                        ),
+                    )
+
+                def release_unstarted_cost_attempt(attempt_id: str) -> None:
+                    nonlocal cost_evidence
+                    with cost_state_lock:
+                        cost_evidence = release_unstarted_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            provider=str(agent.provider),
+                            model=str(agent.model),
+                        )
+
+                def settle_cost_attempt(
+                    attempt_id: str, response_usage: object
+                ) -> dict[str, Any]:
+                    nonlocal cost_evidence
+                    assert cost_contract is not None
+                    fact = authoritative_cost_fact(
+                        response_usage,
+                        provider=str(agent.provider),
+                        model=str(agent.model),
+                        contract=cost_contract,
+                    )
+                    if fact is None:
+                        with cost_state_lock:
+                            cost_evidence = poison_cost_lease(
+                                cost_authority,
+                                attempt_id=attempt_id,
+                                failure_code="authoritative_settlement_missing",
+                            )
+                        raise CostBudgetPoisoned(
+                            "provider response lacked authoritative billed cost",
+                            failure_code="authoritative_settlement_missing",
+                        )
+                    with cost_state_lock:
+                        cost_evidence = settle_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            provider=fact.provider,
+                            model=fact.model,
+                            strategy=fact.strategy,
+                            amount_usd=fact.amount_usd,
+                            authoritative=fact.authoritative,
+                        )
+                    if cost_evidence["exhausted"]:
+                        raise CostBudgetExhausted(
+                            "authoritative cost budget is exhausted"
+                        )
+                    return cost_evidence
+
+                def poison_cost_attempt(
+                    attempt_id: str, failure_code: str
+                ) -> None:
+                    nonlocal cost_evidence
+                    with cost_state_lock:
+                        cost_evidence = poison_cost_lease(
+                            cost_authority,
+                            attempt_id=attempt_id,
+                            failure_code=failure_code,
+                        )
+
+                agent._cost_budget_acquire_callback = acquire_cost_attempt
+                agent._cost_budget_release_unstarted_callback = (
+                    release_unstarted_cost_attempt
+                )
+                agent._cost_budget_settle_callback = settle_cost_attempt
+                agent._cost_budget_poison_callback = poison_cost_attempt
             agent._api_max_retries = request.max_api_attempts
             provider_attempt_counter = [0]
             provider_attempt_grant_exhausted = [False]
@@ -1626,6 +2145,18 @@ def _run(
             if sealed_provider_grant:
 
                 def reserve_provider_attempt() -> None:
+                    now = time.monotonic()
+                    for deadline in (
+                        request.absolute_wall_deadline,
+                        request.absolute_idle_deadline,
+                        request.absolute_provider_deadline,
+                    ):
+                        if deadline is not None and now >= deadline:
+                            raise TimeoutError(
+                                "plugin-agent absolute deadline expired"
+                            )
+                    if request.intended_authority_digest is not None:
+                        agent.verify_model_visible_prefix()
                     if _cancel_event.is_set() or getattr(
                         agent, "_interrupt_requested", False
                     ):
@@ -1692,19 +2223,117 @@ def _run(
                     provider_attempt_counter[0],
                     provider_attempt_grant_exhausted[0],
                 )
-            _active_agent = agent
-            from hermes_cli.plugins import get_plugin_manager
 
-            node_hook_manager = get_plugin_manager()
-            original_node_hooks = {
-                name: list(callbacks)
-                for name, callbacks in node_hook_manager._hooks.items()
-            }
-            original_node_middleware = {
-                name: list(callbacks)
-                for name, callbacks in node_hook_manager._middleware.items()
-            }
-            hook_events = _install_node_hooks(request.hooks)
+            def run_sealed_fallback(primary_usage: dict[str, Any]):
+                fallback = request.sealed_fallback_route
+                if (
+                    not isinstance(fallback, dict)
+                    or _cancel_event.is_set()
+                    or provider_attempt_state()[1]
+                ):
+                    return None
+                from agent.plugin_agent import (
+                    PluginAgentRunRequest,
+                    PluginAgentRunner,
+                )
+
+                child_request = PluginAgentRunRequest(
+                    prompt=request.prompt,
+                    provider=str(fallback["provider"]),
+                    model=str(fallback["model"]),
+                    context_mode="fresh",
+                    session_id=None,
+                    sealed_runtime_authority_required=(
+                        request.sealed_runtime_authority_required
+                    ),
+                    intended_authority_digest=request.intended_authority_digest,
+                    expected_runtime_identity=dict(
+                        fallback["expected_runtime_identity"]
+                    ),
+                    expected_runtime_route_fingerprint=str(
+                        fallback["expected_runtime_route_fingerprint"]
+                    ),
+                    expected_runtime_route_options=dict(
+                        fallback["expected_runtime_route_options"]
+                    ),
+                    expected_mcp_runtime_identity_digest=(
+                        request.expected_mcp_runtime_identity_digest
+                    ),
+                    enabled_toolsets=request.enabled_toolsets,
+                    allowed_tools=request.allowed_tools,
+                    denied_tools=request.denied_tools,
+                    skills=(),
+                    hooks=request.hooks,
+                    mcp_servers=request.mcp_servers,
+                    inline_agents=request.inline_agents,
+                    reasoning_config=dict(fallback["reasoning_config"]),
+                    fallback_model=None,
+                    sealed_fallback_route=None,
+                    ephemeral_system_prompt=request.ephemeral_system_prompt,
+                    request_overrides=dict(fallback["request_overrides"]),
+                    structured_output=fallback["structured_output"],
+                    max_budget_usd=request.max_budget_usd,
+                    _cost_budget_authority=request._cost_budget_authority,
+                    _cost_budget_contract=request._cost_budget_contract,
+                    sandbox_policy=request.sandbox_policy,
+                    # A one-shot approval consumed or refused by the primary
+                    # context must never be replayed in the fresh fallback.
+                    approved_action_digest=None,
+                    workdir=request.workdir,
+                    max_iterations=request.max_iterations,
+                    max_api_attempts=request.max_api_attempts,
+                    sealed_provider_attempt_grant=(
+                        request.sealed_provider_attempt_grant
+                    ),
+                    _provider_attempt_authority=(
+                        request._provider_attempt_authority
+                    ),
+                    idle_timeout_seconds=request.idle_timeout_seconds,
+                    wall_timeout_seconds=request.wall_timeout_seconds,
+                    provider_request_timeout_seconds=(
+                        request.provider_request_timeout_seconds
+                    ),
+                    absolute_wall_deadline=request.absolute_wall_deadline,
+                    absolute_idle_deadline=request.absolute_idle_deadline,
+                    absolute_provider_deadline=request.absolute_provider_deadline,
+                    max_process_tree_rss_bytes=request.max_process_tree_rss_bytes,
+                    max_process_tree_cpu_seconds=(
+                        request.max_process_tree_cpu_seconds
+                    ),
+                    max_descendants=max(0, request.max_descendants - 1),
+                    cooperative_shutdown_seconds=(
+                        request.cooperative_shutdown_seconds
+                    ),
+                    term_grace_seconds=request.term_grace_seconds,
+                    kill_reap_grace_seconds=request.kill_reap_grace_seconds,
+                )
+                fallback_result = PluginAgentRunner(plugin_id).run(
+                    child_request,
+                    is_cancelled=lambda: _cancel_event.is_set(),
+                )
+                wire = fallback_result.to_wire()
+                wire["usage"] = {
+                    key: sum(
+                        value
+                        for value in (
+                            primary_usage.get(key),
+                            fallback_result.usage.get(key),
+                        )
+                        if isinstance(value, int | float)
+                    )
+                    for key in sorted(
+                        set(primary_usage) | set(fallback_result.usage)
+                    )
+                }
+                wire["audit"] = {
+                    **dict(fallback_result.audit),
+                    "fallback_used": True,
+                    "fallback_context": "fresh",
+                }
+                return wire
+            _active_agent = agent
+            installed_node_hooks = _install_node_hooks(request.hooks)
+            hook_events = installed_node_hooks
             if _cancel_event.is_set():
                 agent._interrupt_requested = True
             visible = {
@@ -1719,6 +2348,31 @@ def _run(
             if not agent.valid_tool_names <= visible:
                 raise RuntimeError("agent tool scope verification failed")
 
+            model_visible_prefix_digest = None
+            if request.intended_authority_digest is not None:
+                model_visible_prefix_digest = agent.seal_model_visible_prefix()
+                expected_prefix = request.expected_model_visible_prefix_digest
+                if (
+                    expected_prefix is not None
+                    and expected_prefix != model_visible_prefix_digest
+                ):
+                    return _prefix_identity_mismatch_failure(
+                        plugin_id,
+                        intended_authority_digest=(
+                            request.intended_authority_digest
+                        ),
+                        model_visible_prefix_digest=(
+                            model_visible_prefix_digest
+                        ),
+                    )
+                if request.context_mode == "shared":
+                    session_db = SessionDB()
+                    history = session_db.get_existing_session_conversation(
+                        request.session_id
+                    )
+                    if history is None:
+                        return _persistent_session_missing_failure(plugin_id)
+
             _emit("progress", phase="running", session_id=agent.session_id)
             if provider_start_gate is not None:
                 provider_start_gate()
@@ -1728,9 +2382,139 @@ def _run(
                 response = agent.run_conversation(
                     prompt, conversation_history=history
                 )
+            except CostBudgetTerminalError as exc:
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
+                provider_attempts = (
+                    shared_attempts
+                    if sealed_provider_grant or counted_provider_methods
+                    else model_calls
+                )
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {},
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": exc.failure_kind,
+                        "provider_attempts": provider_attempts,
+                        "model_calls": model_calls,
+                        "known_no_effect": provider_attempts == 0,
+                        "cost_budget": dict(
+                            cost_evidence
+                            or snapshot_cost_budget(cost_authority)
+                        ),
+                        **(
+                            {
+                                "intended_authority_digest": (
+                                    request.intended_authority_digest
+                                ),
+                                "model_visible_prefix_digest": (
+                                    model_visible_prefix_digest
+                                ),
+                            }
+                            if model_visible_prefix_digest is not None
+                            else {}
+                        ),
+                    },
+                    "structured_output": None,
+                }
+            except ProviderCapabilityDriftError as exc:
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                shared_attempts, shared_exhausted = provider_attempt_state()
+                provider_attempt_grant_exhausted[0] = shared_exhausted
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {},
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": exc.failure_kind,
+                        "provider_attempts": shared_attempts,
+                        "model_calls": model_calls,
+                        "known_no_effect": shared_attempts == 0,
+                        **(
+                            {
+                                "intended_authority_digest": (
+                                    request.intended_authority_digest
+                                ),
+                                "model_visible_prefix_digest": (
+                                    model_visible_prefix_digest
+                                ),
+                            }
+                            if model_visible_prefix_digest is not None
+                            else {}
+                        ),
+                    },
+                    "structured_output": None,
+                }
             except Exception as exc:
+                if request.sealed_fallback_route is not None:
+                    fallback_result = run_sealed_fallback({
+                        "input_tokens": int(
+                            getattr(agent, "session_input_tokens", 0) or 0
+                        ),
+                        "output_tokens": int(
+                            getattr(agent, "session_output_tokens", 0) or 0
+                        ),
+                        "cache_read_tokens": int(
+                            getattr(agent, "session_cache_read_tokens", 0) or 0
+                        ),
+                        "cache_write_tokens": int(
+                            getattr(agent, "session_cache_write_tokens", 0) or 0
+                        ),
+                    })
+                    if fallback_result is not None:
+                        return fallback_result
                 if request.structured_output is None:
-                    raise
+                    if request.intended_authority_digest is None:
+                        raise
+                    model_calls = max(
+                        0, int(getattr(agent, "_api_call_count", 0) or 0)
+                    )
+                    shared_attempts, shared_exhausted = provider_attempt_state()
+                    provider_attempt_grant_exhausted[0] = shared_exhausted
+                    failure_kind = getattr(
+                        exc, "failure_kind", type(exc).__name__
+                    )
+                    if not isinstance(failure_kind, str) or not failure_kind:
+                        failure_kind = type(exc).__name__
+                    return {
+                        "final_response": "",
+                        "session_id": str(agent.session_id or ""),
+                        "provider": str(agent.provider or ""),
+                        "model": str(agent.model or ""),
+                        "status": "failed",
+                        "pending_interaction": None,
+                        "usage": {},
+                        "audit": {
+                            "plugin_id": plugin_id,
+                            "failure_kind": failure_kind,
+                            "provider_attempts": shared_attempts,
+                            "model_calls": model_calls,
+                            "known_no_effect": shared_attempts == 0,
+                            "intended_authority_digest": (
+                                request.intended_authority_digest
+                            ),
+                            "model_visible_prefix_digest": (
+                                model_visible_prefix_digest
+                            ),
+                        },
+                        "structured_output": None,
+                    }
                 assert structured_decision is not None
                 model_calls = max(
                     0, int(getattr(agent, "_api_call_count", 0) or 0)
@@ -1800,6 +2584,15 @@ def _run(
                 if sealed_provider_grant or counted_provider_methods
                 else model_calls
             )
+            if (
+                failed
+                and not shared_exhausted
+                and not pending
+                and request.sealed_fallback_route is not None
+            ):
+                fallback_result = run_sealed_fallback(usage)
+                if fallback_result is not None:
+                    return fallback_result
             structured_evidence = None
             if request.structured_output is not None:
                 assert structured_decision is not None
@@ -1815,7 +2608,6 @@ def _run(
                 "provider_attempts": provider_attempts,
                 "model_calls": model_calls,
                 "hook_events": hook_events,
-                "max_budget_usd": request.max_budget_usd,
                 "sandbox_policy_declared": request.sandbox_policy is not None,
                 **(
                     {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
@@ -1824,6 +2616,20 @@ def _run(
                 ),
                 **(structured_evidence or {}),
             }
+            if cost_evidence is not None:
+                audit["cost_budget"] = dict(cost_evidence)
+            elif request.max_budget_usd is not None:
+                # Preserve the pre-Phase-5 generic plugin-agent audit shape.
+                # Sealed Phase 5 requests cannot reach this branch because
+                # request validation requires an authoritative cost broker.
+                audit["max_budget_usd"] = request.max_budget_usd
+            if model_visible_prefix_digest is not None:
+                audit.update({
+                    "intended_authority_digest": (
+                        request.intended_authority_digest
+                    ),
+                    "model_visible_prefix_digest": model_visible_prefix_digest,
+                })
             if provider_attempt_grant_exhausted[0]:
                 audit["failure_kind"] = (
                     _ProviderAttemptGrantExhausted.failure_kind
@@ -1846,12 +2652,8 @@ def _run(
     finally:
         _active_agent = None
         try:
-            if node_hook_manager is not None and original_node_hooks is not None:
-                node_hook_manager._hooks.clear()
-                node_hook_manager._hooks.update(original_node_hooks)
-            if node_hook_manager is not None and original_node_middleware is not None:
-                node_hook_manager._middleware.clear()
-                node_hook_manager._middleware.update(original_node_middleware)
+            if installed_node_hooks is not None:
+                installed_node_hooks.close()
         finally:
             try:
                 if callbacks_installed:

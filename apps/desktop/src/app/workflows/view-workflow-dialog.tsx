@@ -22,7 +22,11 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
-import { desktopWorkflowLanguageLabel, desktopWorkflowRunDisabledReason } from './catalog-run-policy'
+import {
+  desktopWorkflowLanguageLabel,
+  desktopWorkflowRunDisabledReason,
+  isDesktopProviderCapabilityProjection
+} from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -170,6 +174,9 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
       : null
 
   const ignoredFields = ignoredPolicyFields(compilation?.ignored_policies)
+  const providerCapability = isDesktopProviderCapabilityProjection(detail.data?.provider_capability, 'detail')
+    ? detail.data.provider_capability
+    : null
 
   const hasDependencyDetails =
     sources.length > 0 || dependencyCounts.length > 0 || compositeDigest !== null || ignoredFields.length > 0
@@ -281,6 +288,24 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
                     </div>
                   </div>
                 ) : null}
+              </section>
+            ) : null}
+            {providerCapability ? (
+              <section aria-label={copy.workflowProviderReadiness} className="grid min-w-0 gap-2">
+                <h3 className="text-sm font-medium">{copy.workflowProviderReadiness}</h3>
+                <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-1 text-xs">
+                  <dt className="text-(--ui-text-secondary)">{copy.workflowProviderCapabilityLevel}</dt>
+                  <dd>{providerCapability.level}</dd>
+                  <dt className="text-(--ui-text-secondary)">{copy.workflowProviderAuthorityDigest}</dt>
+                  <dd className="break-all font-mono">{providerCapability.authority_digest}</dd>
+                </dl>
+                <ul className="grid gap-1 text-xs">
+                  {providerCapability.routes?.map((route, index) => (
+                    <li key={`${route.node_id}:${route.role}:${route.inline_agent_id ?? index}`}>
+                      {copy.workflowProviderRoute(route.node_id, route.provider, route.model)}
+                    </li>
+                  ))}
+                </ul>
               </section>
             ) : null}
             <SegmentedControl onChange={setMode} options={modes} value={mode} />

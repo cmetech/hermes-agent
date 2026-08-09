@@ -169,6 +169,10 @@ def _make_execute_only_env(forward_env=None):
     env._cwd_file = "/tmp/hermes-cwd-test123.txt"
     env._cwd_marker = "__HERMES_CWD_test123__"
     env._snapshot_ready = True
+    env._session_mode = "snapshot"
+    env._session_diagnostic = ""
+    env._diagnostic_pending = False
+    env._stdin_mode = "pipe"
     env._last_sync_time = None
     env._init_env_args = []
     return env
@@ -321,9 +325,11 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
             key, value = cmd[index + 1].split("=", 1)
             child_env[key] = value
             index += 2
-        assert cmd[container_index + 1 : container_index + 3] == ["bash", "-c"]
+        assert cmd[container_index + 1 : container_index + 6] == [
+            "bash", "--noprofile", "--norc", "+x", "-c",
+        ]
         return subprocess.Popen(
-            ["bash", "-c", cmd[container_index + 3]],
+            ["bash", "--noprofile", "--norc", "+x", "-c", cmd[container_index + 6]],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,

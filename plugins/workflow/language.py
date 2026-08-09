@@ -32,14 +32,14 @@ from plugins.workflow.models import (
 )
 
 
-LATEST_NORMALIZER_VERSION = 4
 # Pre-language legacy snapshots used this public fallback. Keep it at v2.
 WORKFLOW_NORMALIZER_VERSION = 2
 CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
     WorkflowLanguageProfile.HERMES_LEGACY: 2,
-    WorkflowLanguageProfile.ARCHON_2026_07: 4,
+    WorkflowLanguageProfile.ARCHON_2026_07: 5,
 })
-SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4})
+LATEST_NORMALIZER_VERSION = max(CURRENT_NORMALIZER_BY_PROFILE.values())
+SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
 # The normalized type-tag document expands the already bounded workflow and
@@ -68,6 +68,60 @@ WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
 )
 WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PHASE5_MODEL_TIERS = frozenset({"small", "medium", "large"})
+_PHASE5_HOOK_MATCHER_MAX_CHARS = 512
+_PHASE5_HOOK_REGEX_COMPLEXITY_MAX = 64
+_PHASE5_HOOK_OBLIGATIONS_MAX = 64
+_PHASE5_HOOK_OPERATION_VALUE_MAX_BYTES = 64_000
+_PHASE5_HOOK_TEXT_MAX_CHARS = 16_384
+_PHASE5_HOOK_EVENT_MAP = MappingProxyType({
+    "PreToolUse": "pre_tool_call",
+    "PostToolUse": "post_tool_call",
+    "PostToolUseFailure": "post_tool_call",
+    "SubagentStart": "subagent_start",
+    "SubagentStop": "subagent_stop",
+    "SessionStart": "on_session_start",
+    "SessionEnd": "on_session_end",
+    "UserPromptSubmit": "pre_llm_call",
+    "PermissionRequest": "pre_approval_request",
+    "Setup": "on_session_start",
+    "Elicitation": "pre_approval_request",
+    "ElicitationResult": "post_approval_response",
+    "InstructionsLoaded": "pre_llm_call",
+    "TaskCompleted": "subagent_stop",
+})
+_PHASE5_UNSUPPORTED_HOOK_EVENTS = frozenset({
+    "Notification",
+    "Stop",
+    "PreCompact",
+    "TeammateIdle",
+    "ConfigChange",
+    "WorktreeCreate",
+    "WorktreeRemove",
+})
+_PHASE5_HOOK_EVENTS = frozenset(_PHASE5_HOOK_EVENT_MAP) | (
+    _PHASE5_UNSUPPORTED_HOOK_EVENTS
+)
+_PHASE5_RESPONSE_OPERATIONS = MappingProxyType({
+    "continue": "continue",
+    "decision": "decision",
+    "stopReason": "stop_reason",
+    "suppressOutput": "suppress_output",
+    "systemMessage": "current_turn_context",
+})
+_PHASE5_SPECIFIC_OPERATIONS = MappingProxyType({
+    "permissionDecision": "permission_decision",
+    "permissionDecisionReason": "permission_decision_reason",
+    "updatedInput": "update_input",
+    "additionalContext": "additional_context",
+    "updatedMCPToolOutput": "replace_mcp_tool_output",
+    "action": "elicitation_action",
+    "content": "elicitation_content",
+})
+_PHASE5_HOOK_OPERATION_NAMES = frozenset((
+    *_PHASE5_RESPONSE_OPERATIONS.values(),
+    *_PHASE5_SPECIFIC_OPERATIONS.values(),
+))
 WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE = "workflow_language_profile_unsupported"
 WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE = "workflow_normalizer_version_unsupported"
 UNKNOWN_TOP_LEVEL_FIELD_CODE = "unknown_top_level_field"
@@ -127,6 +181,16 @@ def supports_phase4_semantics(
     return (
         profile is WorkflowLanguageProfile.ARCHON_2026_07
         and normalizer_version >= 4
+    )
+
+
+def supports_phase5_semantics(
+    profile: WorkflowLanguageProfile, normalizer_version: int
+) -> bool:
+    """Return whether this sealed language version enables Phase 5 semantics."""
+    return (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version >= 5
     )
 
 
@@ -279,6 +343,13 @@ def normalize_workflow(
         )
     if supports_phase4_semantics(selection.effective_profile, normalizer_version):
         normalized_definition, structured_outputs, node_semantics = _normalize_v4(
+            normalized_definition,
+            selection.effective_profile,
+            structured_outputs,
+            node_semantics,
+        )
+    if supports_phase5_semantics(selection.effective_profile, normalizer_version):
+        normalized_definition, structured_outputs, node_semantics = _normalize_v5(
             normalized_definition,
             selection.effective_profile,
             structured_outputs,
@@ -601,6 +672,218 @@ def _normalize_v4(
                 "signal_completes": signal_completes,
             },
         })
+    return normalized_definition, structured_outputs, MappingProxyType(semantics)
+
+
+def _phase5_model_reference(value: object) -> Mapping[str, str]:
+    if not isinstance(value, str):
+        raise ValueError("Phase 5 model references must be bounded non-empty strings")
+    reference = value.strip()
+    if not reference or len(reference) > 512:
+        raise ValueError("Phase 5 model references must be bounded non-empty strings")
+    if reference in _PHASE5_MODEL_TIERS:
+        kind = "tier"
+    elif reference.startswith("@"):
+        if len(reference) == 1:
+            raise ValueError("Phase 5 configured model aliases must include a name")
+        kind = "configured_alias"
+    else:
+        kind = "literal"
+    return freeze_value({"kind": kind, "reference": reference})
+
+
+def _validate_phase5_matcher(value: object, *, node: WorkflowNode) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > _PHASE5_HOOK_MATCHER_MAX_CHARS:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "hooks.matcher",
+            "archon_hook_matcher_invalid",
+            "Archon hook matcher must be null or a string of at most 512 characters",
+        )
+    complexity = sum(value.count(token) for token in ("*", "+", "?", "{", "|", "("))
+    if complexity > _PHASE5_HOOK_REGEX_COMPLEXITY_MAX:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "hooks.matcher",
+            "archon_hook_matcher_invalid",
+            "Archon hook matcher exceeds the bounded expression complexity",
+        )
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise WorkflowSemanticNormalizationError(
+            node.source_index,
+            "hooks.matcher",
+            "archon_hook_matcher_invalid",
+            "Archon hook matcher must be a valid regular expression",
+        ) from exc
+    return value
+
+
+def _phase5_hook_operation_value(name: str, value: object) -> object:
+    if name in {"continue", "suppress_output"} and not isinstance(value, bool):
+        raise ValueError(f"Phase 5 hook operation {name} must be boolean")
+    if name == "decision" and (
+        not isinstance(value, str) or value not in {"approve", "block"}
+    ):
+        raise ValueError("Phase 5 hook decision is invalid")
+    if name == "permission_decision" and (
+        not isinstance(value, str) or value not in {"deny", "allow", "ask"}
+    ):
+        raise ValueError("Phase 5 hook permission decision is invalid")
+    if name == "elicitation_action" and (
+        not isinstance(value, str)
+        or value not in {"accept", "decline", "cancel"}
+    ):
+        raise ValueError("Phase 5 hook elicitation action is invalid")
+    if name in {
+        "stop_reason",
+        "current_turn_context",
+        "permission_decision_reason",
+        "additional_context",
+    } and (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _PHASE5_HOOK_TEXT_MAX_CHARS
+    ):
+        raise ValueError(f"Phase 5 hook operation {name} must be bounded text")
+    if name == "update_input" and not isinstance(value, Mapping):
+        raise ValueError("Phase 5 hook input update must be a mapping")
+    try:
+        canonical_json_bytes(
+            _thaw(value), max_bytes=_PHASE5_HOOK_OPERATION_VALUE_MAX_BYTES
+        )
+    except (StructuredOutputError, TypeError, ValueError) as exc:
+        raise ValueError(f"Phase 5 hook operation {name} is not bounded JSON") from exc
+    return freeze_value(_thaw(value))
+
+
+def _phase5_hook_operations(response: Mapping[str, object]) -> tuple[object, ...]:
+    operations: list[dict[str, object]] = []
+    for field_name, operation_name in _PHASE5_RESPONSE_OPERATIONS.items():
+        if field_name in response:
+            operations.append({
+                "name": operation_name,
+                "value": _phase5_hook_operation_value(
+                    operation_name, response[field_name]
+                ),
+            })
+    specific = response.get("hookSpecificOutput")
+    if isinstance(specific, Mapping):
+        for field_name, operation_name in _PHASE5_SPECIFIC_OPERATIONS.items():
+            if field_name in specific:
+                operations.append({
+                    "name": operation_name,
+                    "value": _phase5_hook_operation_value(
+                        operation_name, specific[field_name]
+                    ),
+                })
+    operations.sort(key=lambda item: str(item["name"]))
+    return tuple(freeze_value(item) for item in operations)
+
+
+def _phase5_hook_obligations(
+    hooks: object, *, node: WorkflowNode
+) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(hooks, Mapping):
+        raise ValueError("Phase 5 hooks must be a mapping")
+    obligations: list[Mapping[str, object]] = []
+    for event, entries in hooks.items():
+        if event not in _PHASE5_HOOK_EVENTS or not isinstance(entries, tuple | list):
+            raise ValueError("Phase 5 hook event is invalid")
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Phase 5 hook entry must be a mapping")
+            matcher = _validate_phase5_matcher(entry.get("matcher"), node=node)
+            timeout = entry.get("timeout", 30)
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, int | float)
+                or not math.isfinite(float(timeout))
+                or not 0 < timeout <= 300
+            ):
+                raise ValueError("Phase 5 hook timeout must be between 0 and 300")
+            response = entry.get("response")
+            if not isinstance(response, Mapping):
+                raise ValueError("Phase 5 hook response must be a mapping")
+            obligations.append(
+                freeze_value({
+                    "event": event,
+                    "hermes_event": _PHASE5_HOOK_EVENT_MAP.get(event),
+                    "matcher": matcher,
+                    "operations": _phase5_hook_operations(response),
+                    "timeout_seconds": float(timeout),
+                })
+            )
+            if len(obligations) > _PHASE5_HOOK_OBLIGATIONS_MAX:
+                raise ValueError("Phase 5 hook obligations exceed 64 entries")
+    obligations.sort(
+        key=lambda item: (
+            str(item["event"]),
+            str(item["matcher"] or ""),
+            canonical_json_bytes(
+                _thaw(item["operations"]),
+                max_bytes=_PHASE5_HOOK_OPERATION_VALUE_MAX_BYTES,
+            ),
+        )
+    )
+    return tuple(obligations)
+
+
+def _normalize_v5(
+    normalized_definition: WorkflowDefinition,
+    profile: WorkflowLanguageProfile,
+    structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> tuple[
+    WorkflowDefinition,
+    Mapping[str, WorkflowStructuredOutput],
+    Mapping[str, Mapping[str, object]],
+]:
+    """Add sealed provider-portability obligations without resolving config."""
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return normalized_definition, structured_outputs, node_semantics
+
+    semantics = dict(node_semantics)
+    workflow_options = normalized_definition.options
+    for node in normalized_definition.nodes:
+        if node.node_type not in {"command", "prompt"}:
+            continue
+        portability: dict[str, object] = {}
+        model_references: dict[str, Mapping[str, str]] = {}
+        primary = node.options.get("model", workflow_options.get("model"))
+        fallback = node.options.get(
+            "fallbackModel", workflow_options.get("fallbackModel")
+        )
+        if primary is not None:
+            model_references["primary"] = _phase5_model_reference(primary)
+        if fallback is not None:
+            model_references["fallback"] = _phase5_model_reference(fallback)
+        agents = node.options.get("agents")
+        if isinstance(agents, Mapping):
+            for agent_id, agent in sorted(agents.items()):
+                if not isinstance(agent, Mapping):
+                    continue
+                agent_model = agent.get("model", primary)
+                if agent_model is not None:
+                    model_references[f"inline_agent:{agent_id}"] = (
+                        _phase5_model_reference(agent_model)
+                    )
+        if model_references:
+            portability["model_references"] = freeze_value(model_references)
+        if "hooks" in node.options:
+            portability["hooks"] = _phase5_hook_obligations(
+                node.options["hooks"], node=node
+            )
+        if "mcp" in node.options:
+            portability["mcp_reference"] = node.options["mcp"]
+        if portability:
+            semantics[node.id] = freeze_value({
+                **dict(semantics.get(node.id, {})),
+                "provider_portability": portability,
+            })
     return normalized_definition, structured_outputs, MappingProxyType(semantics)
 
 
@@ -1115,6 +1398,128 @@ def _copy_node_semantics(
     })
 
 
+def _read_phase5_provider_portability(value: object) -> Mapping[str, object]:
+    def invalid() -> WorkflowLanguageCompatibilityError:
+        return WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_invalid",
+            "workflow language snapshot provider portability is invalid",
+        )
+
+    if (
+        not isinstance(value, Mapping)
+        or not value
+        or not set(value) <= {"model_references", "hooks", "mcp_reference"}
+    ):
+        raise invalid()
+    references = value.get("model_references")
+    if references is not None:
+        if not isinstance(references, Mapping) or not 1 <= len(references) <= 130:
+            raise invalid()
+        for route, reference in references.items():
+            route_valid = route in {"primary", "fallback"} or (
+                isinstance(route, str)
+                and route.startswith("inline_agent:")
+                and len(route) > len("inline_agent:")
+            )
+            if (
+                not route_valid
+                or not isinstance(reference, Mapping)
+                or set(reference) != {"kind", "reference"}
+            ):
+                raise invalid()
+            try:
+                expected = _phase5_model_reference(reference["reference"])
+            except ValueError as exc:
+                raise invalid() from exc
+            if dict(reference) != dict(expected):
+                raise invalid()
+
+    hooks = value.get("hooks")
+    if hooks is not None:
+        if not isinstance(hooks, tuple | list) or len(hooks) > 64:
+            raise invalid()
+        sort_keys: list[tuple[str, str, bytes]] = []
+        for hook in hooks:
+            if not isinstance(hook, Mapping) or set(hook) != {
+                "event",
+                "hermes_event",
+                "matcher",
+                "operations",
+                "timeout_seconds",
+            }:
+                raise invalid()
+            event = hook["event"]
+            hermes_event = hook["hermes_event"]
+            matcher = hook["matcher"]
+            timeout = hook["timeout_seconds"]
+            if (
+                not isinstance(event, str)
+                or event not in _PHASE5_HOOK_EVENTS
+                or hermes_event != _PHASE5_HOOK_EVENT_MAP.get(event)
+                or (
+                    matcher is not None
+                    and (
+                        not isinstance(matcher, str)
+                        or len(matcher) > _PHASE5_HOOK_MATCHER_MAX_CHARS
+                    )
+                )
+                or isinstance(timeout, bool)
+                or not isinstance(timeout, int | float)
+                or not math.isfinite(float(timeout))
+                or not 0 < timeout <= 300
+            ):
+                raise invalid()
+            if isinstance(matcher, str):
+                complexity = sum(
+                    matcher.count(token) for token in ("*", "+", "?", "{", "|", "(")
+                )
+                try:
+                    re.compile(matcher)
+                except re.error as exc:
+                    raise invalid() from exc
+                if complexity > _PHASE5_HOOK_REGEX_COMPLEXITY_MAX:
+                    raise invalid()
+            operations = hook["operations"]
+            if not isinstance(operations, tuple | list) or len(operations) > 16:
+                raise invalid()
+            operation_names: list[str] = []
+            for operation in operations:
+                if (
+                    not isinstance(operation, Mapping)
+                    or set(operation) != {"name", "value"}
+                    or not isinstance(operation["name"], str)
+                    or operation["name"] not in _PHASE5_HOOK_OPERATION_NAMES
+                ):
+                    raise invalid()
+                name = operation["name"]
+                try:
+                    _phase5_hook_operation_value(name, operation["value"])
+                except ValueError as exc:
+                    raise invalid() from exc
+                operation_names.append(name)
+            if operation_names != sorted(set(operation_names)):
+                raise invalid()
+            sort_keys.append((
+                event,
+                matcher or "",
+                canonical_json_bytes(
+                    _thaw(operations),
+                    max_bytes=_PHASE5_HOOK_OPERATION_VALUE_MAX_BYTES,
+                ),
+            ))
+        if sort_keys != sorted(sort_keys):
+            raise invalid()
+
+    mcp_reference = value.get("mcp_reference")
+    if mcp_reference is not None and (
+        not isinstance(mcp_reference, str)
+        or not mcp_reference
+        or len(mcp_reference) > 4096
+    ):
+        raise invalid()
+    return freeze_value(_thaw(value))
+
+
 def _read_node_semantics(
     value: object,
     *,
@@ -1138,9 +1543,12 @@ def _read_node_semantics(
         ) from exc
     result: dict[str, Mapping[str, object]] = {}
     phase4 = supports_phase4_semantics(profile, normalizer_version)
+    phase5 = supports_phase5_semantics(profile, normalizer_version)
     allowed_node_keys = {"wall_timeout_seconds", "idle_timeout_seconds", "retry"}
     if phase4:
         allowed_node_keys.add("loop")
+    if phase5:
+        allowed_node_keys.add("provider_portability")
     retry_keys = {
         "explicit",
         "requested_retries",
@@ -1155,7 +1563,11 @@ def _read_node_semantics(
             or not isinstance(raw, Mapping)
             or not raw
             or not set(raw) <= allowed_node_keys
-            or ("retry" not in raw and "loop" not in raw)
+            or (
+                "retry" not in raw
+                and "loop" not in raw
+                and "provider_portability" not in raw
+            )
             or (
                 "wall_timeout_seconds" in raw
                 and "idle_timeout_seconds" in raw
@@ -1165,6 +1577,9 @@ def _read_node_semantics(
                 "workflow_language_snapshot_invalid",
                 "workflow language snapshot node semantics are invalid",
             )
+        portability = raw.get("provider_portability")
+        if portability is not None:
+            _read_phase5_provider_portability(portability)
         loop = raw.get("loop")
         if loop is not None:
             loop_keys = {
@@ -1228,7 +1643,7 @@ def _read_node_semantics(
                     "workflow language snapshot node semantics are invalid",
                 )
         retry = raw.get("retry")
-        if retry is None and set(raw) == {"loop"}:
+        if retry is None and set(raw) <= {"loop", "provider_portability"}:
             result[node_id] = freeze_value(_thaw(raw))
             continue
         if not isinstance(retry, Mapping) or set(retry) != retry_keys:

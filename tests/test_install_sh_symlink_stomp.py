@@ -95,7 +95,7 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     # then the console-script names.
     script = (
         f"set -e\n{block}\n"
-        f'write_command_launchers "{command_link_dir}" "{venv_bin}" hermes\n'
+        f'write_command_launchers "{command_link_dir}" "{venv_bin}" "" hermes\n'
     )
     result = subprocess.run(
         ["bash", "-c", script],

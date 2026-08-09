@@ -14,6 +14,7 @@ from hermes_cli.runtime_provider import (
     classify_execution_runtime,
     snapshot_configured_execution_routes,
 )
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
@@ -44,7 +45,7 @@ from plugins.workflow.models import ExecutionFence
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.trust import WorkflowResourceReadBudget
 from plugins.workflow.store import RunStore
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
@@ -208,6 +209,16 @@ def test_execution_context_seals_structured_output_decisions_into_identity(
     assert direct_context.identity_digest != prompt_context.identity_digest
 
 
+def _load_v4(path: Path):
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    return load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes() if sidecar.exists() else None,
+        normalizer_version=4,
+    )
+
+
 def _structured_package(home: Path, workflow_writer, *, name: str):
     path = workflow_writer(
         home / "workflows",
@@ -227,7 +238,7 @@ def _structured_package(home: Path, workflow_writer, *, name: str):
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    return load_workflow(path)
+    return _load_v4(path)
 
 
 def _structured_route_package(
@@ -246,10 +257,20 @@ def _structured_route_package(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    return load_workflow(path)
+    return _load_v4(path)
 
 
 def _runtime_binding(runtime, *, runtime_provider=None, configured_routes=None):
+    model_config = (
+        parse_workflow_model_config({
+            "model": {
+                "provider": runtime.effective_provider,
+                "default": runtime.model,
+            }
+        })
+        if runtime.effective_provider and runtime.model
+        else parse_workflow_model_config({})
+    )
     return WorkflowRunnerBinding(
         real_runner=object(),
         deterministic_runner=object(),
@@ -257,6 +278,7 @@ def _runtime_binding(runtime, *, runtime_provider=None, configured_routes=None):
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
         runtime_capabilities=runtime,
         configured_provider_routes=configured_routes or {},
+        model_config_snapshot=model_config,
         runtime_capabilities_provider=runtime_provider,
     )
 
@@ -273,6 +295,17 @@ def _direct_openai_runtime():
             "api_mode": "codex_responses",
             "base_url": "https://api.openai.com/v1",
         },
+    )
+
+
+def _direct_anthropic_runtime():
+    return classify_execution_runtime(
+        provider="anthropic",
+        model_config={
+            "provider": "anthropic",
+            "default": "claude-sonnet-4-6",
+        },
+        provider_config={"api_mode": "anthropic_messages"},
     )
 
 
@@ -359,7 +392,7 @@ def test_per_node_provider_overrides_seal_distinct_truthful_decisions(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v4(path)
     context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -408,7 +441,7 @@ def test_unknown_node_provider_override_is_unsupported_and_blocks(
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
-    package = load_workflow(path)
+    package = _load_v4(path)
     context = execution_capability_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -614,7 +647,7 @@ def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
     )
     assert compilation is not None
     package = compilation.package
-    current = {"runtime": _direct_openai_runtime()}
+    current = {"runtime": _direct_anthropic_runtime()}
     binding = _runtime_binding(
         current["runtime"], runtime_provider=lambda: current["runtime"]
     )
@@ -724,14 +757,26 @@ def test_unsupported_structured_output_blocks_before_provider_request(
     )
     assert compilation is not None
     package = compilation.package
-    unsupported_runtime = ExecutionRuntimeCapabilities(
-        api_mode="chat_completions",
-        hermes_managed_tool_loop=True,
-        effective_provider="locked-provider",
-        model="locked-model",
-        declared_structured_output_strategy="unsupported",
-        structured_output_declaration_source="provider_profile",
+    import hermes_cli.runtime_provider as runtime_provider_module
+
+    original_declaration = (
+        runtime_provider_module._structured_output_runtime_declaration
     )
+    monkeypatch.setattr(
+        runtime_provider_module,
+        "_structured_output_runtime_declaration",
+        lambda **kwargs: (
+            (
+                "anthropic",
+                "trusted_direct",
+                "unsupported",
+                "provider_profile",
+            )
+            if kwargs["provider"] == "anthropic"
+            else original_declaration(**kwargs)
+        ),
+    )
+    unsupported_runtime = _direct_anthropic_runtime()
     binding = _runtime_binding(unsupported_runtime)
     context = binding.execution_context(
         surface="background",
@@ -803,7 +848,7 @@ def test_overlong_structured_decision_metadata_blocks_without_residue(
     )
     assert compilation is not None
     package = compilation.package
-    binding = _runtime_binding(_direct_openai_runtime())
+    binding = _runtime_binding(_direct_anthropic_runtime())
     context = binding.execution_context(
         surface="background",
         entitlement=AIEntitlementResolution("real"),
@@ -1658,7 +1703,7 @@ def test_showcase_admission_reuses_signature_checked_verified_cache(
     verification_calls = 0
     projection_calls = 0
     original_verify = showcase_module._verify_and_cache_showcase_packages
-    original_assess = api_admission_module.assess_package_execution
+    original_assess = api_admission_module.assess_workflow_admission
 
     def counted_verify(*args, **kwargs):
         nonlocal verification_calls
@@ -1677,7 +1722,7 @@ def test_showcase_admission_reuses_signature_checked_verified_cache(
     )
     monkeypatch.setattr(
         api_admission_module,
-        "assess_package_execution",
+        "assess_workflow_admission",
         counted_assess,
     )
     monkeypatch.setattr(

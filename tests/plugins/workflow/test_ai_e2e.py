@@ -7,16 +7,27 @@ import time
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
-from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
+from hermes_cli.runtime_provider import (
+    ExecutionRuntimeCapabilities,
+    classify_execution_runtime,
+)
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.provider_authority import (
+    ProviderAuthorityEnvironment,
+    resolve_workflow_provider_authority,
+)
 from plugins.workflow.runner_binding import (
     RunnerCapabilities,
     execution_capability_context,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import parse_workflow_source_bytes
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 class RecordingRunner:
@@ -36,6 +47,13 @@ class RecordingRunner:
         self.requests.append(request)
         evidence = None
         audit = {}
+        if request.intended_authority_digest is not None:
+            audit.update({
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            })
         if request.structured_output is not None:
             evidence = {
                 "provider_attempts": 1,
@@ -61,6 +79,259 @@ class RecordingRunner:
             audit=audit,
             structured_output=evidence,
         )
+
+
+def _admit_phase5_run(
+    tmp_path,
+    workflow_writer,
+    *,
+    name,
+    nodes,
+    normalizer_version=5,
+    store=None,
+    idempotency_key=None,
+):
+    path = workflow_writer(
+        tmp_path / name / "source/workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        nodes=nodes,
+    )
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        source="project",
+        precedence=1,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=normalizer_version,
+    )
+    package = compilation.package
+    model_config = parse_workflow_model_config({
+        "model": {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.4",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    })
+    runtime = classify_execution_runtime(
+        provider="openrouter",
+        model_config={
+            "provider": "openrouter",
+            "default": "openai/gpt-5.4",
+        },
+        provider_config={"base_url": "https://openrouter.ai/api/v1"},
+    )
+    authority = (
+        resolve_workflow_provider_authority(
+            package,
+            model_config=model_config,
+            default_runtime=runtime,
+            environment=ProviderAuthorityEnvironment(
+                session_store_available=True,
+                mcp_available=True,
+                hook_lifecycle_available=True,
+                inline_agent_available=True,
+                web_service_available=True,
+                authoritative_cost_available=False,
+            ),
+        )
+        if normalizer_version >= 5
+        else None
+    )
+    store = store or RunStore(tmp_path / f"{name}-home")
+    prepared = store.prepare_run_snapshot(
+        package,
+        **(
+            {
+                "compilation": compilation,
+                "trusted_package_digest": WorkflowPackageDigest(
+                    compilation.composite_digest,
+                    compilation.covered_relative_paths,
+                ),
+                "provider_authority": authority,
+            }
+            if normalizer_version >= 4
+            else {}
+        ),
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=idempotency_key or name,
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return store, admitted.run_id
+
+
+class _Phase5OutcomeRunner:
+    def __init__(self, *, status: str, failure_kind: str = "") -> None:
+        self.status = status
+        self.failure_kind = failure_kind
+        self.before_return = None
+
+    def run(self, request, **_kwargs):
+        if self.before_return is not None:
+            self.before_return()
+        return PluginAgentRunResult(
+            final_response="outcome",
+            session_id="outcome-session",
+            provider=request.provider or "fake",
+            model=request.model or "fake",
+            status=self.status,
+            pending_interaction=(
+                {"type": "clarification", "question": "continue?"}
+                if self.status == "paused"
+                else None
+            ),
+            usage={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+                **(
+                    {"failure_kind": self.failure_kind}
+                    if self.failure_kind
+                    else {}
+                ),
+            },
+        )
+
+
+def test_distinct_admitted_phase5_nodes_share_only_compatible_prefix(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-shared-context",
+        nodes=[
+            {
+                "id": "first",
+                "prompt": "first user turn",
+                "allowed_tools": ["terminal"],
+            },
+            {
+                "id": "second",
+                "prompt": "second user turn",
+                "depends_on": ["first"],
+                "context": "shared",
+                "allowed_tools": ["terminal"],
+            },
+        ],
+    )
+    runner = RecordingRunner()
+    result = RunScheduler(store, agent_runner=runner).advance(run_id)
+
+    assert result["status"] == "succeeded", result
+    assert len(runner.requests) == 2
+    assert runner.requests[0].intended_authority_digest != (
+        runner.requests[1].intended_authority_digest
+    )
+    assert runner.requests[1].context_mode == "shared"
+    assert runner.requests[1].session_id == "ai-session"
+    assert runner.requests[1].expected_model_visible_prefix_digest == "9" * 64
+    first_metadata = result["nodes"]["first"]["attempts"][-1]["metadata"]
+    assert first_metadata["intended_authority_digest"] == (
+        runner.requests[0].intended_authority_digest
+    )
+    assert first_metadata["model_visible_prefix_digest"] == "9" * 64
+    assert len(first_metadata["shared_context_compatibility_digest"]) == 64
+    second_metadata = result["nodes"]["second"]["attempts"][-1]["metadata"]
+    assert second_metadata["intended_authority_digest"] == (
+        runner.requests[1].intended_authority_digest
+    )
+    assert second_metadata["shared_context_compatibility_digest"] == (
+        first_metadata["shared_context_compatibility_digest"]
+    )
+    for field in (
+        "intended_authority_digest",
+        "model_visible_prefix_digest",
+        "shared_context_compatibility_digest",
+        "cache_fingerprint",
+    ):
+        value = second_metadata[field]
+        assert isinstance(value, str)
+        assert len(value) == 64
+        assert not set(value) - set("0123456789abcdef")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "failure_kind", "node_options", "expected_state"),
+    (
+        pytest.param("failed", "validation", {}, "failed", id="failed"),
+        pytest.param(
+            "failed",
+            "network_disconnect",
+            {
+                "retry": {
+                    "max_attempts": 2,
+                    "delay_ms": 1000,
+                    "on_error": "all",
+                }
+            },
+            "waiting_retry",
+            id="retry-scheduled",
+        ),
+        pytest.param("paused", "", {}, "paused", id="paused"),
+        pytest.param("cancelled", "", {}, "cancelled", id="cancelled"),
+        pytest.param("interrupted", "", {}, "interrupted", id="interrupted"),
+    ),
+)
+def test_phase5_nonwinning_attempt_never_persists_shared_handoff_identity(
+    tmp_path,
+    workflow_writer,
+    outcome,
+    failure_kind,
+    node_options,
+    expected_state,
+) -> None:
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name=f"phase5-nonwinner-{expected_state}",
+        nodes=[{
+            "id": "ask",
+            "prompt": "one turn",
+            "allowed_tools": ["terminal"],
+            **node_options,
+        }],
+    )
+    runner = _Phase5OutcomeRunner(
+        status="cancelled" if outcome == "interrupted" else outcome,
+        failure_kind=failure_kind,
+    )
+    scheduler = RunScheduler(store, agent_runner=runner)
+    if outcome == "interrupted":
+        runner.before_return = scheduler._shutdown.set
+
+    result = scheduler.advance(run_id)
+    attempt = result["nodes"]["ask"]["attempts"][-1]
+
+    assert result["nodes"]["ask"]["state"] == expected_state
+    assert "intended_authority_digest" not in attempt["metadata"]
+    assert "model_visible_prefix_digest" not in attempt["metadata"]
+    assert "shared_context_compatibility_digest" not in attempt["metadata"]
+    assert "cache_fingerprint" not in attempt["metadata"]
 
 
 def test_command_node_runs_from_immutable_snapshot_through_scheduler(

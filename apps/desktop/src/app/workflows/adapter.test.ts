@@ -1,10 +1,10 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
-import type { WorkflowRunSnapshot } from '@/types/hermes'
+import type { WorkflowRunSnapshot, WorkflowRunStatus } from '@/types/hermes'
 
 import { workflowBoardModel } from './adapter'
 
-const run = (status: string): WorkflowRunSnapshot => ({
+const run = (status: WorkflowRunStatus): WorkflowRunSnapshot => ({
   health: status === 'paused' ? 'user_wait' : 'healthy',
   next_actions: ['status'],
   progress: { completed_nodes: status === 'succeeded' ? 2 : 1, kind: 'graph', total_nodes: 2 },
@@ -17,7 +17,8 @@ const run = (status: string): WorkflowRunSnapshot => ({
 
 describe('workflowBoardModel', () => {
   it('keeps lifecycle authority in exact states while grouping for presentation', () => {
-    const model = workflowBoardModel(['queued', 'running', 'paused', 'succeeded', 'failed'].map(run))
+    const statuses = ['queued', 'running', 'paused', 'succeeded', 'failed'] satisfies WorkflowRunStatus[]
+    const model = workflowBoardModel(statuses.map(run))
     expect(model.source).toBe('workflow')
     expect(model.columns.map(column => column.cards[0]?.exactState)).toEqual([
       'queued',
@@ -33,7 +34,7 @@ describe('workflowBoardModel', () => {
     const model = workflowBoardModel([
       run('running'),
       {
-        ...run('stalled'),
+        ...run('running'),
         coordinator: { reason_code: 'leader_lease_expired', status: 'unavailable' },
         current_nodes: ['publish'],
         health: 'coordinator_unavailable',
@@ -67,6 +68,7 @@ describe('workflowBoardModel', () => {
       ],
       { scheduledLabel: 'スケジュール済み', scopeLabel: 'ワークフロー' }
     )
+
     const card = model.columns[0]!.cards[0]!
 
     expect(card.exactState).toBe('スケジュール済み')

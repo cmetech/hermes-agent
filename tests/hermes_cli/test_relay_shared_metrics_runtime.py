@@ -1448,13 +1448,12 @@ def test_subagent_agent_boundary_closes_its_own_scope(
         turn_id="parent-turn",
         task_id="parent-task",
     )
-    child_agent = SimpleNamespace(
-        session_id="child",
-        platform="subagent",
-        _parent_session_id="parent",
-        _session_db=None,
-        _conversation_root_id=lambda: "parent",
-    )
+    child_agent = AIAgent.__new__(AIAgent)
+    child_agent.session_id = "child"
+    child_agent.platform = "subagent"
+    child_agent._parent_session_id = "parent"
+    child_agent._session_db = None
+    child_agent._conversation_root_id = lambda: "parent"
 
     if terminal == "return":
         monkeypatch.setattr(
@@ -2292,4 +2291,3 @@ def test_failed_flush_keeps_daily_export_open_for_later_task(
     assert metrics["hermes.task_run.finished"]["value"] == 2
     assert flush_attempts == 2
     assert "Hermes shared-metrics task flush failed" in caplog.text
-

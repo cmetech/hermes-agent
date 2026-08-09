@@ -140,8 +140,14 @@ def test_showcase_admission_seals_resolved_profile_execution_authority(
         "language_compatibility: archon-2026-07\n", encoding="utf-8"
     )
     home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(
         yaml.safe_dump({
+            "model": {
+                "provider": "openrouter",
+                "default": "openai/gpt-5.4",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
             "plugins": {
                 "entries": {
                     "workflow": {
@@ -159,7 +165,13 @@ def test_showcase_admission_seals_resolved_profile_execution_authority(
         encoding="utf-8",
     )
     package = load_workflow(path)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compilation = showcase_module._compile_showcase_package(package)
+    package = compilation.package
+    risk = build_risk_summary(
+        package,
+        assess_compatibility(package),
+        compilation=compilation,
+    )
     base_scenario = showcase_module.load_showcase_catalog()["resilience"]
     scenario = replace(
         base_scenario,
@@ -196,6 +208,8 @@ def test_showcase_admission_seals_resolved_profile_execution_authority(
         ).read_bytes()
     )
 
+    assert len(resources["provider_resolution_sha256"]) == 64
+    assert "provider-resolution.json" in resources["sealed_paths"]
     assert resources["phase3_execution_semantics"]["limits"] == {
         "ai_idle_timeout_seconds": 120.0,
         "ai_wall_timeout_seconds": 240.0,

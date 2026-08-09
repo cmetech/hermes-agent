@@ -40,6 +40,7 @@ from plugins.workflow.language import (
     make_language_snapshot,
     supports_phase3_semantics,
     supports_phase4_semantics,
+    supports_phase5_semantics,
 )
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
@@ -88,6 +89,8 @@ from plugins.workflow.schedule_time import (
     run_is_scheduled_wait,
 )
 from plugins.workflow.sanitize import (
+    public_cleanup_projection,
+    public_event_projection,
     sanitize_projection,
     workflow_filename_components_are_distinct,
     workflow_input_name_is_portable,
@@ -110,6 +113,7 @@ from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 if TYPE_CHECKING:
     from plugins.workflow.compilation import WorkflowCompilation
+    from plugins.workflow.provider_authority import WorkflowProviderAuthority
 
 
 def _language_has_phase3_semantics(language: object) -> bool:
@@ -127,6 +131,76 @@ def _language_has_phase3_semantics(language: object) -> bool:
             normalizer_version,
         )
     )
+
+
+def _language_has_phase4_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 4 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase4_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
+
+
+def _language_has_phase5_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 5 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase5_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
+
+
+_EXECUTION_AUTHORITY_FIELDS = frozenset({
+    "schema_version",
+    "retry_consumed_before",
+    "remaining_attempts",
+    "iteration_consumed_before",
+    "remaining_iterations",
+    "remaining_wall_seconds",
+})
+
+
+def _validated_execution_authority(value: object) -> dict[str, object]:
+    """Return one exact v1 execution-authority projection or reject it."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _EXECUTION_AUTHORITY_FIELDS
+        or value.get("schema_version") != 1
+        or any(
+            isinstance(value.get(name), bool)
+            or not isinstance(value.get(name), int)
+            or int(value[name]) < 0
+            for name in (
+                "retry_consumed_before",
+                "remaining_attempts",
+                "iteration_consumed_before",
+                "remaining_iterations",
+            )
+        )
+        or isinstance(value.get("remaining_wall_seconds"), bool)
+        or not isinstance(value.get("remaining_wall_seconds"), int | float)
+        or not math.isfinite(float(value["remaining_wall_seconds"]))
+        or float(value["remaining_wall_seconds"]) < 0
+    ):
+        raise ValueError("execution authority is malformed")
+    return dict(value)
 
 
 class InputSnapshotError(ValueError):
@@ -243,8 +317,10 @@ def _session_registry_candidate_payload(
     *,
     retry_count: int = 0,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 1,
+    payload: dict[str, object] = {
+        "schema_version": (
+            2 if candidate.intended_authority_digest is not None else 1
+        ),
         "key": {
             "workflow": candidate.key.workflow,
             "node_id": candidate.key.node_id,
@@ -261,6 +337,12 @@ def _session_registry_candidate_payload(
         "recovery_selected": candidate.recovery_selected,
         "retry_count": retry_count,
     }
+    if candidate.intended_authority_digest is not None:
+        payload["intended_authority_digest"] = candidate.intended_authority_digest
+        payload["model_visible_prefix_digest"] = (
+            candidate.model_visible_prefix_digest
+        )
+    return payload
 
 
 def _private_authority_json(authority: Mapping[str, object]) -> str:
@@ -279,8 +361,10 @@ def _session_recovery_selection_authority(
     activation_event_type: str,
     activation_predecessor_chain_sha256: str,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 3,
+    authority: dict[str, object] = {
+        "schema_version": (
+            4 if selection.intended_authority_digest is not None else 3
+        ),
         "journal_order_version": 1,
         "activation_event_sequence": activation_event_sequence,
         "activation_predecessor_sequence": activation_event_sequence - 1,
@@ -303,6 +387,14 @@ def _session_recovery_selection_authority(
         "source": selection.source,
         "provider_attempts_before_recovery": 0,
     }
+    if selection.intended_authority_digest is not None:
+        authority["intended_authority_digest"] = (
+            selection.intended_authority_digest
+        )
+        authority["model_visible_prefix_digest"] = (
+            selection.model_visible_prefix_digest
+        )
+    return authority
 
 
 def _session_registry_winner_authority(
@@ -344,9 +436,9 @@ def _session_recovery_selection_from_authority(
     }
     activation: int | None = None
     event_type: str | None = None
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         expected_fields.update({"activation_event_sequence", "activation_event_type"})
-        if schema_version == 3:
+        if schema_version in {3, 4}:
             expected_fields.update(
                 {
                     "journal_order_version",
@@ -355,6 +447,10 @@ def _session_recovery_selection_from_authority(
                 }
             )
             _validate_journal_order_authority_fields(value)
+        if schema_version == 4:
+            expected_fields.update(
+                {"intended_authority_digest", "model_visible_prefix_digest"}
+            )
         activation_value = value.get("activation_event_sequence")
         if (
             isinstance(activation_value, bool)
@@ -401,6 +497,10 @@ def _session_recovery_selection_from_authority(
             run_id=value["run_id"],
             attempt_id=value["attempt_id"],
             source=value["source"],
+            intended_authority_digest=value.get("intended_authority_digest"),
+            model_visible_prefix_digest=value.get(
+                "model_visible_prefix_digest"
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise JournalRecoveryError(
@@ -453,8 +553,12 @@ def _session_registry_candidate_from_authority(
 def _session_registry_candidate_from_payload(
     value: object,
 ) -> tuple[SessionRegistryUpdateCandidate, int]:
-    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") not in {1, 2}
+    ):
         raise JournalRecoveryError("session registry obligation is malformed")
+    schema_version = value.get("schema_version")
     key = value.get("key")
     if not isinstance(key, Mapping) or set(key) != {
         "workflow",
@@ -510,12 +614,16 @@ def _session_registry_candidate_from_payload(
             winning_node_id=value["winning_node_id"],
             winning_attempt_id=value["winning_attempt_id"],
             recovery_selected=value["recovery_selected"],
+            intended_authority_digest=value.get("intended_authority_digest"),
+            model_visible_prefix_digest=value.get(
+                "model_visible_prefix_digest"
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise JournalRecoveryError(
             "session registry obligation identity is malformed"
         ) from exc
-    if set(value) != {
+    expected_fields = {
         "schema_version",
         "key",
         "expected_generation",
@@ -526,7 +634,12 @@ def _session_registry_candidate_from_payload(
         "winning_attempt_id",
         "recovery_selected",
         "retry_count",
-    }:
+    }
+    if schema_version == 2:
+        expected_fields.update(
+            {"intended_authority_digest", "model_visible_prefix_digest"}
+        )
+    if set(value) != expected_fields:
         raise JournalRecoveryError("session registry obligation fields are malformed")
     return candidate, retry_count
 
@@ -996,7 +1109,7 @@ def _validate_private_authority_journal_order(
             "session_registry_winner_authority",
         )
         for authority in authorities.get(table, {}).values()
-        if authority.get("schema_version") == 3
+        if authority.get("schema_version") in {3, 4}
     )
     if not ordered_authorities:
         return
@@ -5216,16 +5329,23 @@ class RunStore:
             "source",
             "provider_attempts_before_recovery",
         }
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 4}:
             expected_fields.update(
                 {"activation_event_sequence", "activation_event_type"}
             )
-            if schema_version == 3:
+            if schema_version in {3, 4}:
                 expected_fields.update(
                     {
                         "journal_order_version",
                         "activation_predecessor_sequence",
                         "activation_predecessor_chain_sha256",
+                    }
+                )
+            if schema_version == 4:
+                expected_fields.update(
+                    {
+                        "intended_authority_digest",
+                        "model_visible_prefix_digest",
                     }
                 )
         elif schema_version != 1:
@@ -5271,7 +5391,7 @@ class RunStore:
             if isinstance(recovery, Mapping)
             and recovery.get("attempt_id") == attempt_id
         ] if isinstance(recoveries, list) else []
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 4}:
             activation = selection_authority.get("activation_event_sequence")
             if (
                 isinstance(activation, bool)
@@ -5544,6 +5664,7 @@ class RunStore:
         trusted_package_digest: WorkflowPackageDigest | None = None,
         execution_limits: RunExecutionLimits | None = None,
         compilation: WorkflowCompilation | None = None,
+        provider_authority: "WorkflowProviderAuthority | None" = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -5604,6 +5725,38 @@ class RunStore:
                     package, read_budget=resource_read_budget
                 )
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
+            phase5 = supports_phase5_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            if phase5 and compilation is None:
+                raise InputSnapshotError(
+                    "normalizer-v5 provider authority requires a format-2 compilation"
+                )
+            provider_resolution_sha256 = None
+            if phase5:
+                from plugins.workflow.provider_authority import (
+                    WorkflowProviderAuthority,
+                    read_workflow_provider_authority_bytes,
+                )
+
+                if not isinstance(provider_authority, WorkflowProviderAuthority):
+                    raise InputSnapshotError(
+                        "normalizer-v5 snapshot is missing provider authority"
+                    )
+                provider_bytes = provider_authority.canonical_bytes()
+                try:
+                    read_workflow_provider_authority_bytes(provider_bytes)
+                except ValueError as exc:
+                    raise InputSnapshotError(
+                        "normalizer-v5 provider authority is invalid"
+                    ) from exc
+                provider_resolution_sha256 = _sha256(provider_bytes)
+                (staging / "provider-resolution.json").write_bytes(provider_bytes)
+            elif provider_authority is not None:
+                raise InputSnapshotError(
+                    "provider authority is forbidden before normalizer v5"
+                )
             phase3_execution_semantics = None
             if supports_phase3_semantics(
                 package.language.effective_profile, package.language.normalizer_version
@@ -5844,6 +5997,10 @@ class RunStore:
                 snapshot_resources["dependency_manifest_digest"] = (
                     dependency_manifest_digest
                 )
+            if provider_resolution_sha256 is not None:
+                snapshot_resources["provider_resolution_sha256"] = (
+                    provider_resolution_sha256
+                )
             if phase3_execution_semantics is not None:
                 snapshot_resources["phase3_execution_semantics"] = (
                     phase3_execution_semantics
@@ -5895,6 +6052,7 @@ class RunStore:
                 sealed_snapshot_digest=snapshot_digest,
                 snapshot_format_version=snapshot_format_version,
                 dependency_manifest_digest=dependency_manifest_digest,
+                provider_resolution_sha256=provider_resolution_sha256,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -6131,6 +6289,7 @@ class RunStore:
             snapshot.sealed_snapshot_digest,
             snapshot.snapshot_format_version,
             snapshot.dependency_manifest_digest,
+            snapshot.provider_resolution_sha256,
         )
 
     @staticmethod
@@ -6695,6 +6854,10 @@ class RunStore:
             projection["expanded_nodes"] = [
                 str(node["id"]) for node in snapshot.nodes
             ]
+            if snapshot.provider_resolution_sha256 is not None:
+                projection["provider_resolution_sha256"] = (
+                    snapshot.provider_resolution_sha256
+                )
         event = {
             "sequence": 1,
             "timestamp": now,
@@ -8583,6 +8746,8 @@ class RunStore:
         for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
+            # Retain the recorded v1-v4 direct-reader contract. REST and
+            # evidence readers use events_after(), which closes each event.
             public_events.append(_sanitize(event))
         return tuple(public_events)
 
@@ -8595,12 +8760,13 @@ class RunStore:
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         """Return a bounded monotonic event page for REST/desktop consumers."""
-        events = self.tail_events(
+        raw_events = self.tail_events(
             run_id,
             after_sequence=after,
             limit=max(1, min(int(limit), 200)),
             operator_scope=operator_scope,
         )
+        events = tuple(public_event_projection(event) for event in raw_events)
         return {
             "schema_version": 1,
             "events": events,
@@ -8654,7 +8820,7 @@ class RunStore:
         for event in selected:
             event.pop("projection", None)
             event.pop("projection_sha256", None)
-            public_events.append(sanitize_projection(event))
+            public_events.append(public_event_projection(event))
         return {
             "events": tuple(public_events),
             "truncated": truncated,
@@ -9948,6 +10114,7 @@ class RunStore:
         foreground_owner_epoch: int | None = None,
         require_execution_authority: bool = False,
         max_run_workers: int | None = None,
+        execution_authority: Mapping[str, object] | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -9984,6 +10151,14 @@ class RunStore:
         with workflow_lock(self.admission_lock):
             with workflow_lock(self._run_lock_path(run_id)):
                 projection = json.loads((directory / "run.json").read_text())
+                if _language_has_phase5_semantics(projection.get("language")):
+                    execution_authority = _validated_execution_authority(
+                        execution_authority
+                    )
+                elif execution_authority is not None:
+                    execution_authority = _validated_execution_authority(
+                        execution_authority
+                    )
                 node = projection["nodes"].get(node_id)
                 if (
                     projection.get("desired_status") is not None
@@ -10126,6 +10301,11 @@ class RunStore:
                             else None
                         ),
                         "evidence_paths": resolved_evidence_paths,
+                        **(
+                            {"execution_authority": dict(execution_authority)}
+                            if execution_authority is not None
+                            else {}
+                        ),
                     })
                     reserve = TerminalJournalReserve.for_projection(
                         len(
@@ -12370,11 +12550,8 @@ class RunStore:
                 "_loop_input_consumed", False
             )
             language = projection.get("language")
-            if loop_input_consumed is True and (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
+            if loop_input_consumed is True and _language_has_phase4_semantics(
+                language
             ):
                 node.pop("loop_user_input_artifact", None)
             node["attempts"][-1]["metadata"] = safe_metadata
@@ -12408,6 +12585,9 @@ class RunStore:
                 "usage",
                 "pending_interaction",
                 "retry_consumed",
+                "iteration_consumed",
+                "remaining_iterations",
+                "remaining_wall_seconds",
                 "loop_state",
                 "approval_generation",
                 "approval_rework_attempts",
@@ -12877,12 +13057,7 @@ class RunStore:
                 raise RuntimeError("stale loop iteration")
             safe_state = dict(_sanitize(dict(loop_state)))
             language = projection.get("language")
-            phase4 = (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
-            )
+            phase4 = _language_has_phase4_semantics(language)
             feedback_binding = None
             if phase4:
                 output_path = safe_state.get("output_artifact")
@@ -13058,12 +13233,7 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             language = projection.get("language")
-            if not (
-                isinstance(language, Mapping)
-                and language.get("effective_profile")
-                == WorkflowLanguageProfile.ARCHON_2026_07.value
-                and language.get("normalizer_version") == 4
-            ):
+            if not _language_has_phase4_semantics(language):
                 return None
             candidates = []
             for node_id, node in projection.get("nodes", {}).items():
@@ -17052,6 +17222,7 @@ class RunStore:
                 raise ValueError("reconcile requires exactly one matching interaction")
             selected_id, node = candidates[0]
             recovery = node.get("recovery")
+            reconciled_attempt_id: str | None = None
             if (
                 outcome == "safe-to-retry"
                 and isinstance(recovery, Mapping)
@@ -17060,6 +17231,33 @@ class RunStore:
                 raise RuntimeError(
                     "cannot authorize replay until prior executor termination is proven"
                 )
+            attempt = None
+            if isinstance(recovery, Mapping):
+                attempt_id = recovery.get("attempt_id")
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+            released_execution_authority = None
+            if (
+                outcome == "safe-to-retry"
+                and _language_has_phase5_semantics(projection.get("language"))
+                and isinstance(attempt, Mapping)
+                and isinstance(attempt.get("provider_dispatch"), Mapping)
+                and attempt["provider_dispatch"].get("state") == "released"
+            ):
+                try:
+                    released_execution_authority = _validated_execution_authority(
+                        attempt.get("execution_authority")
+                    )
+                except ValueError as exc:
+                    raise JournalRecoveryError(
+                        "persisted execution authority is malformed"
+                    ) from exc
             node.pop("pending_interaction", None)
             if outcome == "confirmed-succeeded":
                 node["state"] = "succeeded"
@@ -17074,27 +17272,86 @@ class RunStore:
                 recovery["reconciled_outcome"] = outcome
                 recovery["reconciled_at"] = _utc_now()
                 attempt_id = recovery.get("attempt_id")
-                attempt = next(
-                    (
-                        candidate
-                        for candidate in reversed(node.get("attempts", []))
-                        if candidate.get("attempt_id") == attempt_id
-                    ),
-                    None,
+                reconciled_attempt_id = (
+                    attempt_id if isinstance(attempt_id, str) else None
                 )
                 if isinstance(attempt, dict):
                     attempt["reconciliation"] = {
                         "outcome": outcome,
                         "recorded_at": recovery["reconciled_at"],
                     }
+                    provider_dispatch = attempt.get("provider_dispatch")
+                    if (
+                        released_execution_authority is not None
+                        and isinstance(provider_dispatch, Mapping)
+                        and provider_dispatch.get("state") == "released"
+                    ):
+                        consumed_before = released_execution_authority.get(
+                            "retry_consumed_before"
+                        )
+                        remaining_attempts = released_execution_authority.get(
+                            "remaining_attempts"
+                        )
+                        assert isinstance(consumed_before, int)
+                        assert isinstance(remaining_attempts, int)
+                        conservative_consumed = (
+                            consumed_before + remaining_attempts
+                        )
+                        node["retry_consumed"] = max(
+                            int(node.get("retry_consumed", 0)),
+                            conservative_consumed,
+                        )
+                        iteration_consumed_before = released_execution_authority.get(
+                            "iteration_consumed_before"
+                        )
+                        remaining_iterations = released_execution_authority.get(
+                            "remaining_iterations"
+                        )
+                        assert isinstance(iteration_consumed_before, int)
+                        assert isinstance(remaining_iterations, int)
+                        node["iteration_consumed"] = max(
+                            int(node.get("iteration_consumed", 0)),
+                            iteration_consumed_before + remaining_iterations,
+                        )
+                        node["remaining_iterations"] = 0
+                        node["remaining_wall_seconds"] = 0.0
+                        attempt_metadata = attempt.get("metadata")
+                        attempt["metadata"] = {
+                            **(
+                                dict(attempt_metadata)
+                                if isinstance(attempt_metadata, Mapping)
+                                else {}
+                            ),
+                            "retry_consumed": node["retry_consumed"],
+                            "remaining_attempts": 0,
+                            "provider_attempts_exact": False,
+                            "iteration_consumed": node["iteration_consumed"],
+                            "remaining_iterations": 0,
+                            "remaining_wall_seconds": 0.0,
+                        }
                 node.pop("recovery", None)
             self._append_locked(
                 directory,
                 projection,
                 "node_reconciled",
-                {"outcome": outcome, "interaction_id": interaction_id},
+                {
+                    "outcome": outcome,
+                    "interaction_id": interaction_id,
+                    **(
+                        {"retry_consumed": node["retry_consumed"]}
+                        if outcome == "safe-to-retry"
+                        and "retry_consumed" in node
+                        else {}
+                    ),
+                },
                 node_id=selected_id,
             )
+            if reconciled_attempt_id is not None:
+                with self._connect() as connection:
+                    self._release_worker_claim(
+                        reconciled_attempt_id,
+                        connection=connection,
+                    )
             if outcome != "confirmed-failed":
                 return self._request_runnable_locked(
                     directory,
@@ -17468,14 +17725,13 @@ class RunStore:
                 (run_id,),
             ).fetchall()
         return tuple(
-            {
+            public_cleanup_projection({
                 "sequence": row["sequence"],
                 "timestamp": row["timestamp"],
                 "files": row["files"],
                 "bytes": row["bytes"],
                 "outcome": row["outcome"],
-                "details": _sanitize(json.loads(row["payload_json"])),
-            }
+            })
             for row in rows
         )
 

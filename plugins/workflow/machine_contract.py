@@ -167,16 +167,15 @@ def _sanitize_success_result(command: str, result: object) -> object:
         )
     if isinstance(result, Mapping) and isinstance(sanitized, dict):
         raw_contract = result.get("command_contract")
-        safe_contract = sanitized.get("command_contract")
-        if isinstance(raw_contract, Mapping) and isinstance(safe_contract, dict):
-            raw_exits = raw_contract.get("exit_codes")
-            safe_exits = safe_contract.get("exit_codes")
-            if isinstance(raw_exits, Mapping) and isinstance(safe_exits, dict):
-                authorization_exit = raw_exits.get("authorization")
-                if isinstance(authorization_exit, int) and not isinstance(
-                    authorization_exit, bool
-                ):
-                    safe_exits["authorization"] = authorization_exit
+        if (
+            command in _CONFIRMATION_CAPABILITY_COMMANDS
+            and isinstance(raw_contract, Mapping)
+            and raw_contract == operator_command_contract()
+        ):
+            # This is a fixed server-authored argv vocabulary, not workflow
+            # command content. Restore only the exact generated contract so an
+            # arbitrary caller-supplied command mapping remains redacted.
+            sanitized["command_contract"] = operator_command_contract()
     return sanitized
 
 

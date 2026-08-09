@@ -23,12 +23,10 @@ def _version_selection_from_guidance(path: Path) -> dict[str, object]:
     return json.loads(payload)
 
 
-@pytest.mark.integration
-def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
-    tmp_path: Path,
-) -> None:
-    """Exercise installed-filesystem layout through the authorized Nix build path."""
-    artifacts = tmp_path / "artifacts"
+@pytest.fixture(scope="module")
+def installed_distribution(tmp_path_factory):
+    root = tmp_path_factory.mktemp("installed-distribution")
+    artifacts = root / "artifacts"
     generated_paths = (REPO_ROOT / "build", REPO_ROOT / "hermes_agent.egg-info")
     preexisting = {path for path in generated_paths if path.exists()}
     build_env = os.environ.copy()
@@ -58,7 +56,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     wheels = list(artifacts.glob("*.whl"))
     assert len(wheels) == 1
 
-    site = tmp_path / "site"
+    site = root / "site"
     install = subprocess.run(
         [
             "uv",
@@ -71,19 +69,361 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
             "--no-deps",
             str(wheels[0]),
         ],
-        cwd=tmp_path,
+        cwd=root,
         capture_output=True,
         text=True,
         timeout=300,
     )
     assert install.returncode == 0, f"wheel extraction failed:\n{install.stderr}"
 
-    home = tmp_path / "home"
     env = os.environ.copy()
-    env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(site)
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
     env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
+    return site, env, wheels
+
+
+@pytest.mark.integration
+def test_installed_distribution_runs_sealed_openai_credential_transaction(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, base_env, _wheels = installed_distribution
+    probe_path = tmp_path / "sealed_credential_transaction_probe.py"
+    probe_path.write_text(
+        r'''
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import agent.credential_adoption as credential_adoption
+import run_agent
+from agent.credential_adoption import (
+    _CredentialRefreshStatus,
+    _PendingSealedCredentialAdoption,
+    _snapshot_candidate_client_kwargs,
+)
+from hermes_cli import runtime_provider as rp
+from run_agent import AIAgent
+
+base_url = "https://route.test/v1"
+provider = "openai-api"
+runtime = rp.classify_execution_runtime(
+    provider=provider,
+    model_config={"provider": provider, "default": "test-model"},
+    provider_config={"api_mode": "chat_completions", "base_url": base_url},
+)
+identity = rp.execution_runtime_identity(runtime)
+constraint = rp.CredentialFreeExecutionRouteConstraint(
+    route_fingerprint="f" * 64,
+    requested_provider=provider,
+    model="test-model",
+    api_mode="chat_completions",
+    base_url=base_url,
+    provider_config={},
+    identity=identity,
+)
+
+real_openai = run_agent.OpenAI
+old_client = real_openai(api_key="old-key", base_url=base_url)
+agent = object.__new__(AIAgent)
+agent.provider = provider
+agent.requested_provider = provider
+agent.model = "test-model"
+agent.api_mode = "chat_completions"
+agent.base_url = base_url
+agent.api_key = "old-key"
+agent._client_kwargs = {"api_key": "old-key", "base_url": base_url}
+agent._credential_pool_entry_id = "old-entry"
+agent._execution_route_constraint = constraint
+agent._interrupt_requested = False
+agent.client = old_client
+agent._build_keepalive_http_client = lambda *_args, **_kwargs: None
+retired = []
+agent._retire_shared_openai_client = (
+    lambda client, **_kwargs: retired.append(client)
+)
+
+state = agent._begin_credential_recovery_turn()
+candidate = _PendingSealedCredentialAdoption(
+    generation=state.generation,
+    source="pool",
+    route_constraint=constraint,
+    api_key="fresh-key",
+    base_url=base_url,
+    client_kwargs=_snapshot_candidate_client_kwargs(
+        {"api_key": "fresh-key", "base_url": base_url}
+    ),
+    pool_entry_id="fresh-entry",
+)
+constructor_keys = []
+published_clients = []
+
+def deterministic_openai(**kwargs):
+    if kwargs.get("api_key") == "fresh-key":
+        constructor_keys.append(kwargs["api_key"])
+        if len(constructor_keys) == 1:
+            raise RuntimeError("first candidate construction fails")
+    client = real_openai(**kwargs)
+    if kwargs.get("api_key") == "fresh-key":
+        published_clients.append(client)
+    return client
+
+run_agent.OpenAI = deterministic_openai
+try:
+    status = agent._adopt_pending_sealed_openai_candidate(candidate)
+    payload = {
+        "run_agent_file": str(Path(run_agent.__file__).resolve()),
+        "credential_module_file": str(Path(credential_adoption.__file__).resolve()),
+        "status": status.value,
+        "constructor_keys": constructor_keys,
+        "published_concrete": (
+            len(published_clients) == 1
+            and agent.client is published_clients[0]
+        ),
+        "published_key": agent.api_key,
+        "published_entry": agent._credential_pool_entry_id,
+        "retired_old": retired == [old_client],
+        "pending_cleared": (
+            getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        ),
+    }
+    assert status is _CredentialRefreshStatus.ADOPTED
+    print(json.dumps(payload))
+finally:
+    run_agent.OpenAI = real_openai
+    agent._end_credential_recovery_turn(state.generation)
+    if agent.client is not old_client:
+        agent.client.close()
+    old_client.close()
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    env = base_env.copy()
+    env["HERMES_HOME"] = str(tmp_path / "home")
+    result = subprocess.run(
+        [sys.executable, str(probe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["run_agent_file"]).is_relative_to(site.resolve())
+    assert Path(payload["credential_module_file"]).is_relative_to(site.resolve())
+    assert payload == {
+        "run_agent_file": payload["run_agent_file"],
+        "credential_module_file": payload["credential_module_file"],
+        "status": "adopted",
+        "constructor_keys": ["fresh-key", "fresh-key"],
+        "published_concrete": True,
+        "published_key": "fresh-key",
+        "published_entry": "fresh-entry",
+        "retired_old": True,
+        "pending_cleared": True,
+    }
+
+
+@pytest.mark.integration
+def test_installed_distribution_runs_sealed_anthropic_credential_transaction(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, base_env, _wheels = installed_distribution
+    probe_path = tmp_path / "sealed_anthropic_transaction_probe.py"
+    probe_path.write_text(
+        r'''
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import agent.credential_adoption as credential_adoption
+import run_agent
+from agent import anthropic_adapter
+from agent.credential_adoption import (
+    _CredentialRefreshStatus,
+    _PendingSealedCredentialAdoption,
+    _snapshot_candidate_client_kwargs,
+)
+from hermes_cli import runtime_provider as rp
+from run_agent import AIAgent
+
+base_url = "https://api.anthropic.com"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+runtime = rp.classify_execution_runtime(
+    provider=provider,
+    model_config={"provider": provider, "default": model},
+    provider_config={"api_mode": "anthropic_messages", "base_url": base_url},
+)
+identity = rp.execution_runtime_identity(runtime)
+constraint = rp.CredentialFreeExecutionRouteConstraint(
+    route_fingerprint="e" * 64,
+    requested_provider=provider,
+    model=model,
+    api_mode="anthropic_messages",
+    base_url=base_url,
+    provider_config={},
+    identity=identity,
+)
+
+old_key = "sk-ant-api03-old-installed-key"
+fresh_key = "sk-ant-api03-fresh-installed-key"
+old_client = anthropic_adapter.build_anthropic_client(old_key, base_url)
+agent = object.__new__(AIAgent)
+agent.provider = provider
+agent.requested_provider = provider
+agent.model = model
+agent.api_mode = "anthropic_messages"
+agent.base_url = base_url
+agent.api_key = old_key
+agent._client_kwargs = {}
+agent._anthropic_client = old_client
+agent._anthropic_api_key = old_key
+agent._anthropic_base_url = base_url
+agent._is_anthropic_oauth = False
+agent._credential_pool_entry_id = "old-entry"
+agent._execution_route_constraint = constraint
+agent._interrupt_requested = False
+agent._oauth_1m_beta_disabled = True
+
+state = agent._begin_credential_recovery_turn()
+candidate = _PendingSealedCredentialAdoption(
+    generation=state.generation,
+    source="pool",
+    route_constraint=constraint,
+    api_key=fresh_key,
+    base_url=base_url,
+    client_kwargs=_snapshot_candidate_client_kwargs(
+        {"timeout": None, "drop_context_1m_beta": True}
+    ),
+    pool_entry_id="fresh-entry",
+    is_anthropic_oauth=False,
+)
+sdk = anthropic_adapter._get_anthropic_sdk()
+real_anthropic = sdk.Anthropic
+constructor_keys = []
+published_clients = []
+
+def deterministic_anthropic(**kwargs):
+    key = kwargs.get("api_key") or kwargs.get("auth_token")
+    if key == fresh_key:
+        constructor_keys.append(key)
+        if len(constructor_keys) == 1:
+            raise RuntimeError("first candidate construction fails")
+    client = real_anthropic(**kwargs)
+    if key == fresh_key:
+        published_clients.append(client)
+    return client
+
+sdk.Anthropic = deterministic_anthropic
+try:
+    status = agent._adopt_pending_sealed_openai_candidate(candidate)
+    payload = {
+        "run_agent_file": str(Path(run_agent.__file__).resolve()),
+        "credential_module_file": str(Path(credential_adoption.__file__).resolve()),
+        "status": status.value,
+        "constructor_keys": constructor_keys,
+        "published_concrete": (
+            len(published_clients) == 1
+            and agent._anthropic_client is published_clients[0]
+        ),
+        "anthropic_key": agent._anthropic_api_key,
+        "anthropic_base_url": agent._anthropic_base_url,
+        "anthropic_oauth": agent._is_anthropic_oauth,
+        "generic_key": agent.api_key,
+        "generic_base_url": agent.base_url,
+        "published_entry": agent._credential_pool_entry_id,
+        "retired_old": old_client.is_closed(),
+        "pending_cleared": (
+            getattr(agent, "_pending_sealed_credential_adoption", None) is None
+        ),
+    }
+    assert status is _CredentialRefreshStatus.ADOPTED
+    print(json.dumps(payload))
+finally:
+    sdk.Anthropic = real_anthropic
+    agent._end_credential_recovery_turn(state.generation)
+    if agent._anthropic_client is not old_client:
+        agent._anthropic_client.close()
+    if not old_client.is_closed():
+        old_client.close()
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    env = base_env.copy()
+    env["HERMES_HOME"] = str(tmp_path / "home")
+    result = subprocess.run(
+        [sys.executable, str(probe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["run_agent_file"]).is_relative_to(site.resolve())
+    assert Path(payload["credential_module_file"]).is_relative_to(site.resolve())
+    assert payload == {
+        "run_agent_file": payload["run_agent_file"],
+        "credential_module_file": payload["credential_module_file"],
+        "status": "adopted",
+        "constructor_keys": [
+            "sk-ant-api03-fresh-installed-key",
+            "sk-ant-api03-fresh-installed-key",
+        ],
+        "published_concrete": True,
+        "anthropic_key": "sk-ant-api03-fresh-installed-key",
+        "anthropic_base_url": "https://api.anthropic.com",
+        "anthropic_oauth": False,
+        "generic_key": "sk-ant-api03-fresh-installed-key",
+        "generic_base_url": "https://api.anthropic.com",
+        "published_entry": "fresh-entry",
+        "retired_old": True,
+        "pending_cleared": True,
+    }
+
+
+@pytest.mark.integration
+def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    """Exercise installed-filesystem layout through the authorized Nix build path."""
+    site, env, wheels = installed_distribution
+
+    home = tmp_path / "home"
+    env = env.copy()
+    env["HERMES_HOME"] = str(home)
+
+    portable_profile = tmp_path / "portable-profile.yaml"
+    portable_managed = tmp_path / "portable-managed.yaml"
+    portable_profile.write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  aliases:\n"
+        "    legacy: openrouter/legacy-model\n"
+        "model_aliases:\n"
+        "  review:\n"
+        "    provider: openrouter\n"
+        "    model: anthropic/claude-opus-4.6\n"
+        "model_tiers:\n"
+        "  small:\n"
+        "    provider: custom\n"
+        "    model: profile-small\n",
+        encoding="utf-8",
+    )
+    portable_managed.write_text(
+        "model_tiers:\n  small:\n    model: managed-small\n",
+        encoding="utf-8",
+    )
 
     probe = subprocess.run(
         [
@@ -102,6 +442,201 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     )
     assert probe.returncode == 0, probe.stderr
     assert Path(probe.stdout.strip()).is_relative_to(site.resolve())
+
+    provider_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, providers, sys; "
+                "from hermes_cli import provider_capabilities as pc; "
+                "from hermes_cli import workflow_model_resolution as wm; "
+                "profile = providers.get_provider_profile('openrouter'); "
+                "snapshot = wm.load_workflow_model_config_snapshot("
+                "pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])); "
+                "declaration = profile.declare_workflow_capability("
+                "'effort_thinking', model='anthropic/claude-sonnet-4.6', "
+                "option='effort'); "
+                "print(json.dumps({'provider_file': str(pathlib.Path("
+                "providers.__file__).resolve()), 'authority_file': str(pathlib.Path("
+                "pc.__file__).resolve()), 'model_authority_file': str(pathlib.Path("
+                "wm.__file__).resolve()), 'features': sorted(x.value for x in "
+                "pc.WorkflowProviderFeature), 'disposition': declaration['disposition'], "
+                "'model_route': wm.resolve_workflow_model_reference("
+                "snapshot, '@review').to_dict(), 'tier_route': "
+                "wm.resolve_workflow_model_reference(snapshot, 'small').to_dict(), "
+                "'legacy_model': snapshot.aliases['legacy'].model}))"
+            ),
+            str(portable_profile),
+            str(portable_managed),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert provider_probe.returncode == 0, provider_probe.stderr
+    provider_contract = json.loads(provider_probe.stdout)
+    assert Path(provider_contract["provider_file"]).is_relative_to(site.resolve())
+    assert Path(provider_contract["authority_file"]).is_relative_to(site.resolve())
+    assert Path(provider_contract["model_authority_file"]).is_relative_to(site.resolve())
+    assert set(provider_contract["features"]) == {
+        "structured_output",
+        "session_resumption",
+        "tool_restrictions",
+        "hooks",
+        "mcp",
+        "skills_inline_agents",
+        "effort_thinking",
+        "fallback_models",
+        "web_execution",
+        "cost_budgets",
+        "provider_native_sandbox",
+    }
+    assert provider_contract["disposition"] == "degraded_with_explicit_semantics"
+    assert provider_contract["model_route"]["provider"] == "openrouter"
+    assert provider_contract["model_route"]["model"] == "anthropic/claude-opus-4.6"
+    assert provider_contract["tier_route"]["model"] == "managed-small"
+    assert provider_contract["tier_route"]["config_scope"] == "managed"
+    assert provider_contract["legacy_model"] == "legacy-model"
+
+    phase5_probe = tmp_path / "phase5_snapshot_probe.py"
+    phase5_probe.write_text(
+        """
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import shutil
+import sys
+
+from hermes_cli.runtime_provider import classify_execution_runtime
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.provider_authority import (
+    ProviderAuthorityEnvironment,
+    read_workflow_provider_authority_bytes,
+    resolve_workflow_provider_authority,
+)
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
+
+root = Path(sys.argv[1])
+home = Path(sys.argv[2])
+workflow_root = root / "workflows"
+workflow_root.mkdir(parents=True)
+path = workflow_root / "installed-v5.yaml"
+path.write_text(
+    "name: installed-v5\\ndescription: Installed v5 probe\\n"
+    "model: '@primary'\\nnodes:\\n"
+    "  - id: ask\\n    prompt: hello\\n    effort: high\\n",
+    encoding="utf-8",
+)
+policy = b"language_compatibility: archon-2026-07\\n"
+path.with_name("installed-v5.hermes.yaml").write_bytes(policy)
+source = parse_workflow_source_bytes(
+    path,
+    workflow_bytes=path.read_bytes(),
+    sidecar_bytes=policy,
+    source="project",
+    precedence=1,
+)
+compilation = compile_workflow(
+    source,
+    WorkflowCatalogSnapshot.capture((source,)),
+    normalizer_version=5,
+)
+config = parse_workflow_model_config({
+    "model": {
+        "provider": "openrouter",
+        "default": "openai/gpt-5.4",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "model_aliases": {
+        "primary": {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4",
+        }
+    },
+})
+runtime = classify_execution_runtime(
+    provider="openrouter",
+    model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+    provider_config={"base_url": "https://openrouter.ai/api/v1"},
+)
+authority = resolve_workflow_provider_authority(
+    compilation.package,
+    model_config=config,
+    default_runtime=runtime,
+    environment=ProviderAuthorityEnvironment(
+        session_store_available=True,
+        mcp_available=True,
+        hook_lifecycle_available=True,
+        inline_agent_available=True,
+        web_service_available=True,
+        authoritative_cost_available=False,
+    ),
+)
+store = RunStore(home)
+prepared = store.prepare_run_snapshot(
+    compilation.package,
+    compilation=compilation,
+    trusted_package_digest=WorkflowPackageDigest(
+        compilation.composite_digest,
+        compilation.covered_relative_paths,
+    ),
+    provider_authority=authority,
+)
+admitted = store.start_run(
+    RunAdmissionRequest(
+        workflow_name=compilation.package.definition.name,
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key="installed-v5",
+        concurrency_key=compilation.package.definition.name,
+    ),
+    immutable_snapshot=prepared,
+)
+shutil.rmtree(root)
+package, paths, contents = RunScheduler(
+    RunStore(home)
+)._load_verified_run_package(admitted.run_id)
+recovered = read_workflow_provider_authority_bytes(
+    contents["provider-resolution.json"]
+)
+print(json.dumps({
+    "normalizer_version": package.language.normalizer_version,
+    "provider_member": "provider-resolution.json" in paths,
+    "authority_digest": recovered.authority_digest,
+    "expected_digest": authority.authority_digest,
+}))
+""",
+        encoding="utf-8",
+    )
+    phase5_result = subprocess.run(
+        [
+            sys.executable,
+            str(phase5_probe),
+            str(tmp_path / "installed-v5-source"),
+            str(tmp_path / "installed-v5-home"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert phase5_result.returncode == 0, phase5_result.stderr
+    phase5_contract = json.loads(phase5_result.stdout)
+    assert phase5_contract["normalizer_version"] == 5
+    assert phase5_contract["provider_member"] is True
+    assert phase5_contract["authority_digest"] == phase5_contract["expected_digest"]
 
     command = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "workflow", "list", "--json"],
@@ -144,7 +679,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     timeout_schema = installed_contract["definition_schema"]["properties"]["nodes"][
         "items"
     ]["properties"]["timeout"]
-    assert installed_contract["normalizer_version"] == 4
+    assert installed_contract["normalizer_version"] == 5
     assert timeout_schema["x-hermes-unit"] == "milliseconds"
     assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
     assert bash_schema["x-hermes-semantics"] == {
@@ -277,6 +812,7 @@ child = parse_workflow_source_bytes(
 compilation = compile_workflow(
     root,
     WorkflowCatalogSnapshot.capture((root, child)),
+    normalizer_version=4,
 )
 package = compilation.package
 validation = validate_package(package)
@@ -414,7 +950,7 @@ print(json.dumps({
         assert _version_selection_from_guidance(
             installed_references / reference_name
         ) == installed_version_selection
-    assert phase4_result["default_normalizer"] == 4
+    assert phase4_result["default_normalizer"] == 5
     assert phase4_result["explicit_normalizer"] == 4
     assert {
         "include_not_found",
@@ -477,14 +1013,21 @@ nodes:
             """
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import sys
 
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow_snapshot
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 
-package = load_workflow(sys.argv[1])
+path = Path(sys.argv[1])
+package = load_workflow_snapshot(
+    path,
+    workflow_bytes=path.read_bytes(),
+    sidecar_bytes=path.with_name("installed-official.hermes.yaml").read_bytes(),
+    normalizer_version=4,
+)
 store = RunStore(sys.argv[2])
 snapshot = store.prepare_run_snapshot(package)
 admitted = store.start_run(
@@ -735,7 +1278,7 @@ from plugins.workflow.runner_binding import (
     execution_capability_context,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 
 
@@ -809,7 +1352,13 @@ def admit_and_advance(package, store, *, idempotency_key: str):
 
 stage, schemaless_path, structured_path, installed_home = sys.argv[1:]
 store = RunStore(installed_home)
-structured = load_workflow(structured_path)
+structured_path = Path(structured_path)
+structured = load_workflow_snapshot(
+    structured_path,
+    workflow_bytes=structured_path.read_bytes(),
+    sidecar_bytes=structured_path.with_name("structured.hermes.yaml").read_bytes(),
+    normalizer_version=4,
+)
 report = doctor_package(structured, hermes_home=installed_home)
 payload = {
     "validator_present": importlib.util.find_spec("jsonschema") is not None,
