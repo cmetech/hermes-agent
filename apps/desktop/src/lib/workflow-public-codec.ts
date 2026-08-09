@@ -350,10 +350,11 @@ function artifact(value: unknown): value is WorkflowArtifactEvidence {
     value.recovery_status === 'verified' &&
     typeof value.publication_id === 'string' &&
     /^[0-9a-f]{32}$/.test(value.publication_id)
+
   const legacyArtifact =
     value.integrity_status === 'legacy_unverified' &&
     value.recovery_status === 'projection_recovered' &&
-    value.publication_id === undefined
+    (value.publication_id === undefined || value.publication_id === null)
 
   return (
     value.item_type === 'artifact' &&

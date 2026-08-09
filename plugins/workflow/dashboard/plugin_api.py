@@ -224,7 +224,11 @@ class WorkflowArtifactProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_type: Literal["artifact"]
-    publication_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
+    publication_id: str | None = Field(
+        None,
+        pattern=r"^[0-9a-f]{32}$",
+        exclude_if=lambda value: value is None,
+    )
     node_id: str | None = Field(None, max_length=128)
     attempt_id: str | None = Field(None, max_length=128)
     output_type: str | None = Field(None, max_length=128)

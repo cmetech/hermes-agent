@@ -305,7 +305,7 @@ export interface WorkflowRunSnapshot {
   archived_at?: null | string
   archive_version?: null | number
   admission_disposition?: null | string
-  artifacts?: WorkflowTypedArtifact[]
+  artifacts?: WorkflowArtifactEvidence[]
   attempts?: number
   blocked_by_run_id?: null | string
   blocking_reason?: null | string
@@ -632,7 +632,7 @@ export interface WorkflowArtifactEvidence {
   node_id?: null | string
   output_type?: null | string
   produced_at?: null | string
-  publication_id?: string
+  publication_id?: null | string
   recovery_status?: null | string
   schema_fingerprint?: null | string
   sha256?: null | string

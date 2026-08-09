@@ -2037,7 +2037,7 @@ export const ja = defineLocale({
     abandon: '破棄',
     dataStale: 'データが古くなっています。再接続中…',
     loadMore: 'さらに読み込む',
-    workflowUnavailable: 'Workflow プラグインが無効です。hermes plugins enable workflow を実行してください。',
+    workflowUnavailable: 'ワークフローデータを利用できません。接続を確認して、もう一度お試しください。',
     kanbanUnavailable: 'Kanban プラグインが無効です。hermes plugins enable kanban を実行してください。',
     physicalBoard: board => `マシン共有の物理ボード: ${board}`
   },
