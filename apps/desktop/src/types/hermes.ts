@@ -673,7 +673,7 @@ export interface WorkflowAttemptEvidence {
     settlement_count?: null | number
   }
   error?: null | WorkflowPublicError
-  error_code?: 'execution_integrity' | 'package_mcp_unavailable'
+  error_code?: null | 'execution_integrity' | 'package_mcp_unavailable'
   item_type: 'attempt'
   next_attempt_at?: null | string
   node_id: string
