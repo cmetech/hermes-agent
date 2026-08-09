@@ -99,6 +99,9 @@ class ApprovalExecutor:
                     if rework_attempts is None
                     else rework_attempts
                 ),
+                "provider_attempts": 0,
+                "provider_attempts_exact": True,
+                "known_no_effect": True,
             },
         )
 
@@ -325,7 +328,7 @@ class ApprovalExecutor:
                 context.node.options.get("systemPrompt") if phase5 else None
             ),
             workdir=context.run_directory,
-            max_iterations=90,
+            max_iterations=context.max_model_iterations,
             max_api_attempts=granted_provider_attempts,
             sealed_provider_attempt_grant=phase5,
             idle_timeout_seconds=idle_timeout,
@@ -398,7 +401,11 @@ class ApprovalExecutor:
             return NodeExecutionResult(
                 "cancelled",
                 error_code="cancelled",
-                metadata={"provider_attempts": 0},
+                metadata={
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                    "known_no_effect": True,
+                },
             )
         launch_kwargs = {"is_cancelled": context.is_cancelled}
         if phase5 and getattr(agent_runner, "starts_request_mcp", False):
@@ -449,7 +456,25 @@ class ApprovalExecutor:
                 },
             )
         if result.status == "cancelled":
-            return NodeExecutionResult("cancelled", error_code="cancelled")
+            provider_attempts = conservative_provider_retry_count(
+                result.audit.get("provider_attempts"),
+                granted_attempts=granted_provider_attempts,
+            )
+            return NodeExecutionResult(
+                "cancelled",
+                error_code="cancelled",
+                metadata={
+                    "audit": dict(result.audit),
+                    "provider_attempts": provider_attempts,
+                    **(
+                        {"provider_attempts_exact": True}
+                        if phase5
+                        and type(result.audit.get("provider_attempts")) is int
+                        and 1 <= result.audit["provider_attempts"] <= granted_provider_attempts
+                        else ({"provider_attempts_exact": False} if phase5 else {})
+                    ),
+                },
+            )
         execution_identity: dict[str, str] = {}
         if phase5:
             observed_intended = result.audit.get("intended_authority_digest")

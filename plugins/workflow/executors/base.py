@@ -63,6 +63,7 @@ class NodeExecutionContext:
     )
     deadline_budget: DeadlineBudget | None = None
     max_provider_attempts: int = 5
+    max_model_iterations: int = 90
     cancellation_reason: Callable[[], str | None] | None = None
     record_iteration: (
         Callable[[tuple[ArtifactRef, ...], Mapping[str, object]], None] | None

@@ -420,8 +420,10 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase5_admission_parity.py \
       tests/plugins/workflow/test_phase5_adversarial_remediation.py \
       tests/plugins/workflow/test_phase5_cost_budget.py \
+      tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
       tests/plugins/workflow/test_phase5_execution_context.py \
       tests/plugins/workflow/test_phase5_hooks.py \
+      tests/plugins/workflow/test_phase5_identity_convergence.py \
       tests/plugins/workflow/test_phase5_inline_limits.py \
       tests/plugins/workflow/test_phase5_language.py \
       tests/plugins/workflow/test_phase5_mcp.py \
@@ -429,6 +431,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase5_provider_options.py \
       tests/plugins/workflow/test_phase5_provider_snapshot.py \
       tests/plugins/workflow/test_phase5_public_projection_contract.py \
+      tests/plugins/workflow/test_phase5_public_run_evidence_contract.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \

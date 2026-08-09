@@ -150,6 +150,23 @@ def _language_has_phase4_semantics(language: object) -> bool:
     )
 
 
+def _language_has_phase5_semantics(language: object) -> bool:
+    """Return whether a stored language projection inherits Phase 5 behavior."""
+    normalizer_version = (
+        language.get("normalizer_version") if isinstance(language, Mapping) else None
+    )
+    return (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+        and isinstance(normalizer_version, int)
+        and not isinstance(normalizer_version, bool)
+        and supports_phase5_semantics(
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            normalizer_version,
+        )
+    )
+
+
 class InputSnapshotError(ValueError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
@@ -10061,6 +10078,7 @@ class RunStore:
         foreground_owner_epoch: int | None = None,
         require_execution_authority: bool = False,
         max_run_workers: int | None = None,
+        execution_authority: Mapping[str, object] | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -10084,6 +10102,39 @@ class RunStore:
             or max_run_workers <= 0
         ):
             raise ValueError("max_run_workers must be a positive integer")
+        if execution_authority is not None:
+            if (
+                set(execution_authority)
+                != {
+                    "schema_version",
+                    "retry_consumed_before",
+                    "remaining_attempts",
+                    "iteration_consumed_before",
+                    "remaining_iterations",
+                    "remaining_wall_seconds",
+                }
+                or execution_authority.get("schema_version") != 1
+                or any(
+                    isinstance(execution_authority.get(name), bool)
+                    or not isinstance(execution_authority.get(name), int)
+                    or int(execution_authority[name]) < 0
+                    for name in (
+                        "retry_consumed_before",
+                        "remaining_attempts",
+                        "iteration_consumed_before",
+                        "remaining_iterations",
+                    )
+                )
+                or isinstance(execution_authority.get("remaining_wall_seconds"), bool)
+                or not isinstance(
+                    execution_authority.get("remaining_wall_seconds"), int | float
+                )
+                or not math.isfinite(
+                    float(execution_authority["remaining_wall_seconds"])
+                )
+                or float(execution_authority["remaining_wall_seconds"]) < 0
+            ):
+                raise ValueError("execution authority is malformed")
         if (
             isinstance(terminal_journal_reserve_bytes, bool)
             or not isinstance(terminal_journal_reserve_bytes, int)
@@ -10239,6 +10290,11 @@ class RunStore:
                             else None
                         ),
                         "evidence_paths": resolved_evidence_paths,
+                        **(
+                            {"execution_authority": dict(execution_authority)}
+                            if execution_authority is not None
+                            else {}
+                        ),
                     })
                     reserve = TerminalJournalReserve.for_projection(
                         len(
@@ -12518,6 +12574,9 @@ class RunStore:
                 "usage",
                 "pending_interaction",
                 "retry_consumed",
+                "iteration_consumed",
+                "remaining_iterations",
+                "remaining_wall_seconds",
                 "loop_state",
                 "approval_generation",
                 "approval_rework_attempts",
@@ -17152,6 +17211,7 @@ class RunStore:
                 raise ValueError("reconcile requires exactly one matching interaction")
             selected_id, node = candidates[0]
             recovery = node.get("recovery")
+            reconciled_attempt_id: str | None = None
             if (
                 outcome == "safe-to-retry"
                 and isinstance(recovery, Mapping)
@@ -17174,6 +17234,9 @@ class RunStore:
                 recovery["reconciled_outcome"] = outcome
                 recovery["reconciled_at"] = _utc_now()
                 attempt_id = recovery.get("attempt_id")
+                reconciled_attempt_id = (
+                    attempt_id if isinstance(attempt_id, str) else None
+                )
                 attempt = next(
                     (
                         candidate
@@ -17187,14 +17250,101 @@ class RunStore:
                         "outcome": outcome,
                         "recorded_at": recovery["reconciled_at"],
                     }
+                    execution_authority = attempt.get("execution_authority")
+                    provider_dispatch = attempt.get("provider_dispatch")
+                    if (
+                        outcome == "safe-to-retry"
+                        and _language_has_phase5_semantics(
+                            projection.get("language")
+                        )
+                        and isinstance(execution_authority, Mapping)
+                        and isinstance(provider_dispatch, Mapping)
+                        and provider_dispatch.get("state") == "released"
+                    ):
+                        consumed_before = execution_authority.get(
+                            "retry_consumed_before"
+                        )
+                        remaining_attempts = execution_authority.get(
+                            "remaining_attempts"
+                        )
+                        if (
+                            isinstance(consumed_before, bool)
+                            or not isinstance(consumed_before, int)
+                            or consumed_before < 0
+                            or isinstance(remaining_attempts, bool)
+                            or not isinstance(remaining_attempts, int)
+                            or remaining_attempts < 0
+                        ):
+                            raise JournalRecoveryError(
+                                "persisted execution authority is malformed"
+                            )
+                        conservative_consumed = (
+                            consumed_before + remaining_attempts
+                        )
+                        node["retry_consumed"] = max(
+                            int(node.get("retry_consumed", 0)),
+                            conservative_consumed,
+                        )
+                        iteration_consumed_before = execution_authority.get(
+                            "iteration_consumed_before"
+                        )
+                        remaining_iterations = execution_authority.get(
+                            "remaining_iterations"
+                        )
+                        if (
+                            isinstance(iteration_consumed_before, bool)
+                            or not isinstance(iteration_consumed_before, int)
+                            or iteration_consumed_before < 0
+                            or isinstance(remaining_iterations, bool)
+                            or not isinstance(remaining_iterations, int)
+                            or remaining_iterations < 0
+                        ):
+                            raise JournalRecoveryError(
+                                "persisted iteration authority is malformed"
+                            )
+                        node["iteration_consumed"] = max(
+                            int(node.get("iteration_consumed", 0)),
+                            iteration_consumed_before + remaining_iterations,
+                        )
+                        node["remaining_iterations"] = 0
+                        node["remaining_wall_seconds"] = 0.0
+                        attempt_metadata = attempt.get("metadata")
+                        attempt["metadata"] = {
+                            **(
+                                dict(attempt_metadata)
+                                if isinstance(attempt_metadata, Mapping)
+                                else {}
+                            ),
+                            "retry_consumed": node["retry_consumed"],
+                            "remaining_attempts": 0,
+                            "provider_attempts_exact": False,
+                            "iteration_consumed": node["iteration_consumed"],
+                            "remaining_iterations": 0,
+                            "remaining_wall_seconds": 0.0,
+                        }
                 node.pop("recovery", None)
             self._append_locked(
                 directory,
                 projection,
                 "node_reconciled",
-                {"outcome": outcome, "interaction_id": interaction_id},
+                {
+                    "outcome": outcome,
+                    "interaction_id": interaction_id,
+                    **(
+                        {"retry_consumed": node["retry_consumed"]}
+                        if outcome == "safe-to-retry"
+                        and "retry_consumed" in node
+                        else {}
+                    ),
+                },
                 node_id=selected_id,
             )
+            if reconciled_attempt_id is not None:
+                with self._connect() as connection:
+                    self._release_worker_claim(
+                        reconciled_attempt_id,
+                        connection=connection,
+                    )
             if outcome != "confirmed-failed":
                 return self._request_runnable_locked(
                     directory,

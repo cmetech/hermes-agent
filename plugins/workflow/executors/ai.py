@@ -1268,13 +1268,27 @@ class AgentNodeExecutor:
             return failure
 
         if explicit_context == "shared":
+            def shared_context_failure(code: str, message: str) -> NodeExecutionResult:
+                failure = self._failure(code, message)
+                if not phase5:
+                    return failure
+                return replace(
+                    failure,
+                    metadata={
+                        "provider_attempts": 0,
+                        "provider_attempts_exact": True,
+                        "known_no_effect": True,
+                        "archon_terminal_failure": True,
+                    },
+                )
+
             predecessors = [
                 context.predecessor_results.get(dependency)
                 for dependency in node.depends_on
                 if context.predecessor_results.get(dependency) is not None
             ]
             if len(predecessors) != 1:
-                return self._failure(
+                return shared_context_failure(
                     "context_ambiguous",
                     "shared context requires exactly one completed predecessor; use fresh",
                 )
@@ -1309,13 +1323,13 @@ class AgentNodeExecutor:
             else:
                 compatible = predecessor.get("cache_fingerprint") == fingerprint
             if not compatible:
-                return self._failure(
+                return shared_context_failure(
                     "context_incompatible",
                     "shared context cache fingerprint changed; use fresh context",
                 )
             session_id = str(predecessor.get("session_id") or "")
             if not session_id:
-                return self._failure(
+                return shared_context_failure(
                     "context_missing_session",
                     "shared predecessor has no resumable session; use fresh context",
                 )
@@ -1719,7 +1733,7 @@ class AgentNodeExecutor:
                     else None
                 ),
                 workdir=context.run_directory,
-                max_iterations=90,
+                max_iterations=context.max_model_iterations,
                 max_api_attempts=granted_provider_attempts,
                 sealed_provider_attempt_grant=strict_v3,
                 idle_timeout_seconds=idle_timeout,
@@ -1787,7 +1801,11 @@ class AgentNodeExecutor:
                 return NodeExecutionResult(
                     "cancelled",
                     error_code="cancelled",
-                    metadata={"provider_attempts": 0},
+                    metadata={
+                        "provider_attempts": 0,
+                        "provider_attempts_exact": True,
+                        "known_no_effect": True,
+                    },
                 )
 
             def launch_agent(launch_request):
@@ -1835,7 +1853,11 @@ class AgentNodeExecutor:
                         NodeExecutionResult(
                             "cancelled",
                             error_code="cancelled",
-                            metadata={"provider_attempts": 0},
+                            metadata={
+                                "provider_attempts": 0,
+                                "provider_attempts_exact": True,
+                                "known_no_effect": True,
+                            },
                         )
                     )
                 return launch_agent(fresh_request)
