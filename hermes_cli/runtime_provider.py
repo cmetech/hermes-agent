@@ -185,6 +185,17 @@ def _credential_free_route_url(value: object) -> str:
     ).rstrip("/")
 
 
+def credential_free_endpoint_config_sha256(value: object) -> str:
+    """Hash one URL only after the execution endpoint canonicalizer accepts it."""
+    try:
+        normalized = _credential_free_route_url(value)
+    except _UnclassifiedRouteQuery as exc:
+        raise ValueError(_UNCLASSIFIED_ROUTE_QUERY) from exc
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class _ExecutionEndpointIdentity:
     endpoint_sha256: str
@@ -1358,6 +1369,7 @@ def select_credential_free_execution_route(
     )
 
     from hermes_cli.workflow_model_resolution import (
+        _parse_workflow_model_config_v2,
         parse_workflow_model_config,
         resolve_workflow_model_reference,
     )
@@ -1365,65 +1377,64 @@ def select_credential_free_execution_route(
     profile = config if isinstance(config, Mapping) else {}
     managed = managed_config if isinstance(managed_config, Mapping) else {}
     options = provider_options if isinstance(provider_options, Mapping) else {}
-    snapshot = parse_workflow_model_config(profile, managed_config=managed)
     matches: list[CredentialFreeExecutionRouteConstraint] = []
-    try:
-        literal_route = resolve_workflow_model_reference(
-            snapshot,
-            target_model.strip(),
-            node_provider=(
-                requested_provider.strip()
-                if isinstance(requested_provider, str)
-                else None
-            ),
-            node_options=options,
-        )
-    except ValueError:
-        literal_route = None
-    if (
-        literal_route is not None
-        and literal_route.route_fingerprint == route_fingerprint
-    ):
-        constraint = _workflow_route_constraint(
-            snapshot=snapshot,
-            route=literal_route,
-            configured_base_url=(
-                snapshot.active_base_url
-                if literal_route.provider == snapshot.active_provider
-                else ""
-            ),
-            expected=expected,
-        )
-        if constraint is not None:
-            matches.append(constraint)
-    candidates = [
-        (f"@{name}", entry) for name, entry in snapshot.aliases.items()
-    ] + list(snapshot.tiers.items())
-    for reference, entry in candidates:
-        if entry.model != target_model.strip():
-            continue
+    snapshots = (
+        parse_workflow_model_config(profile, managed_config=managed),
+        _parse_workflow_model_config_v2(profile, managed_config=managed),
+    )
+    for snapshot in snapshots:
         try:
-            route = resolve_workflow_model_reference(
+            literal_route = resolve_workflow_model_reference(
                 snapshot,
-                reference,
+                target_model.strip(),
+                node_provider=(
+                    requested_provider.strip()
+                    if isinstance(requested_provider, str)
+                    else None
+                ),
                 node_options=options,
             )
         except ValueError:
-            continue
-        if _canonical_execution_provider(route.provider) != (
-            _canonical_execution_provider(requested_provider)
-        ):
-            continue
-        if route.route_fingerprint != route_fingerprint:
-            continue
-        constraint = _workflow_route_constraint(
-            snapshot=snapshot,
-            route=route,
-            configured_base_url=entry.base_url,
-            expected=expected,
-        )
-        if constraint is not None:
-            matches.append(constraint)
+            literal_route = None
+        if literal_route is not None and literal_route.route_fingerprint == route_fingerprint:
+            constraint = _workflow_route_constraint(
+                snapshot=snapshot,
+                route=literal_route,
+                configured_base_url=(
+                    snapshot.active_base_url
+                    if literal_route.provider == snapshot.active_provider
+                    else ""
+                ),
+                expected=expected,
+            )
+            if constraint is not None:
+                matches.append(constraint)
+        candidates = [
+            (f"@{name}", entry) for name, entry in snapshot.aliases.items()
+        ] + list(snapshot.tiers.items())
+        for reference, entry in candidates:
+            if entry.model != target_model.strip():
+                continue
+            try:
+                route = resolve_workflow_model_reference(
+                    snapshot, reference, node_options=options
+                )
+            except ValueError:
+                continue
+            if _canonical_execution_provider(route.provider) != (
+                _canonical_execution_provider(requested_provider)
+            ):
+                continue
+            if route.route_fingerprint != route_fingerprint:
+                continue
+            constraint = _workflow_route_constraint(
+                snapshot=snapshot,
+                route=route,
+                configured_base_url=entry.base_url,
+                expected=expected,
+            )
+            if constraint is not None:
+                matches.append(constraint)
     return matches[0] if len(matches) == 1 else None
 
 

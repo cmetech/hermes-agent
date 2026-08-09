@@ -7,7 +7,10 @@ import pytest
 import yaml
 
 from hermes_cli.runtime_provider import classify_execution_runtime
-from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+from hermes_cli.workflow_model_resolution import (
+    WORKFLOW_MODEL_RESOLVER_VERSION,
+    parse_workflow_model_config,
+)
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.provider_authority import (
     ProviderAuthorityEnvironment,
@@ -139,7 +142,7 @@ def test_one_snapshot_resolves_primary_fallback_and_inline_routes_with_precedenc
 
     assert isinstance(authority, WorkflowProviderAuthority)
     assert authority.schema_version == 2
-    assert authority.resolver_version == 2
+    assert authority.resolver_version == WORKFLOW_MODEL_RESOLVER_VERSION
     assert set(authority.routes) == {
         "ask:primary",
         "ask:fallback",

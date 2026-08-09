@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.runtime_provider import classify_execution_runtime
-from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+from hermes_cli.workflow_model_resolution import (
+    WORKFLOW_MODEL_RESOLVER_VERSION,
+    parse_workflow_model_config,
+)
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.executors.base import NodeExecutionResult
@@ -148,7 +151,7 @@ def test_v5_format2_seals_exact_canonical_provider_authority(tmp_path, workflow_
     assert projection["provider_resolution_sha256"] == digest
     assert prepared.snapshot_format_version == 2
     assert recovered.schema_version == 2
-    assert recovered.resolver_version == 2
+    assert recovered.resolver_version == WORKFLOW_MODEL_RESOLVER_VERSION
     assert all(route.endpoint_sha256 for route in recovered.routes.values())
     verify_sealed_snapshot(projection, run_directory=run_directory)
 

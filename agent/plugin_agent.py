@@ -204,7 +204,10 @@ def _validated_provider_attempt_authority(
 
 
 def _shared_provider_attempt_request(
-    descriptor: Mapping[str, Any], operation: str
+    descriptor: Mapping[str, Any],
+    operation: str,
+    *,
+    action_digest: str | None = None,
 ) -> Mapping[str, Any]:
     address, authkey = _validated_provider_attempt_authority(descriptor)
     nonce = base64.b64encode(
@@ -214,6 +217,7 @@ def _shared_provider_attempt_request(
         "version": _PROVIDER_AUTHORITY_VERSION,
         "operation": operation,
         "nonce": nonce,
+        **({"action_digest": action_digest} if action_digest is not None else {}),
     }
     try:
         with socket.create_connection(
@@ -283,15 +287,34 @@ def _snapshot_shared_provider_attempts(
     return {"provider_attempts": count, "exhausted": exhausted}
 
 
-class _ProviderAttemptAuthority:
-    """Authenticated request-local broker for one process-tree attempt grant."""
+def _consume_shared_approved_action(
+    descriptor: Mapping[str, Any], action_digest: str
+) -> bool:
+    if re.fullmatch(r"[0-9a-f]{64}", action_digest) is None:
+        raise ValueError("approved action digest is invalid")
+    response = _shared_provider_attempt_request(
+        descriptor, "consume_action", action_digest=action_digest
+    )
+    consumed = response.get("consumed")
+    if not isinstance(consumed, bool):
+        raise RuntimeError("sealed provider attempt authority response is invalid")
+    return consumed
 
-    def __init__(self, grant: int) -> None:
+
+class _ProviderAttemptAuthority:
+    """Authenticated request-tree broker for attempts and one outward action."""
+
+    def __init__(self, grant: int, *, approved_action_digest: str | None = None) -> None:
         if isinstance(grant, bool) or not isinstance(grant, int) or not 1 <= grant <= 5:
             raise ValueError("provider attempt authority grant must be between 1 and 5")
         self._grant = grant
         self._provider_attempts = 0
         self._exhausted = False
+        if approved_action_digest is not None and re.fullmatch(
+            r"[0-9a-f]{64}", approved_action_digest
+        ) is None:
+            raise ValueError("approved action digest is invalid")
+        self._approved_action_digest = approved_action_digest
         self._state_lock = threading.Lock()
         self._authkey = secrets.token_bytes(_PROVIDER_AUTHORITY_AUTHKEY_BYTES)
         self._seen_nonces: set[str] = set()
@@ -355,12 +378,10 @@ class _ProviderAttemptAuthority:
             request = json.loads(
                 _recv_provider_authority_frame(connection).decode("ascii")
             )
-            if not isinstance(request, Mapping) or set(request) != {
-                "version",
-                "operation",
-                "nonce",
-                "mac",
-            }:
+            if not isinstance(request, Mapping) or set(request) not in (
+                {"version", "operation", "nonce", "mac"},
+                {"version", "operation", "nonce", "action_digest", "mac"},
+            ):
                 return
             request = dict(request)
             request_mac = request.pop("mac", None)
@@ -368,9 +389,16 @@ class _ProviderAttemptAuthority:
             operation = request.get("operation")
             if (
                 request.get("version") != _PROVIDER_AUTHORITY_VERSION
-                or operation not in {"reserve", "snapshot"}
+                or operation not in {"reserve", "snapshot", "consume_action"}
                 or not isinstance(nonce, str)
                 or not isinstance(request_mac, str)
+                or (
+                    operation == "consume_action"
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", str(request.get("action_digest") or "")
+                    ) is None
+                )
+                or (operation != "consume_action" and "action_digest" in request)
             ):
                 return
             try:
@@ -405,11 +433,22 @@ class _ProviderAttemptAuthority:
                             "reserved": True,
                             "provider_attempts": self._provider_attempts,
                         }
-                else:
+                elif operation == "snapshot":
                     response = {
                         "provider_attempts": self._provider_attempts,
                         "exhausted": self._exhausted,
                     }
+                else:
+                    requested_digest = str(request["action_digest"])
+                    consumed = (
+                        self._approved_action_digest is not None
+                        and hmac.compare_digest(
+                            self._approved_action_digest, requested_digest
+                        )
+                    )
+                    if consumed:
+                        self._approved_action_digest = None
+                    response = {"consumed": consumed}
             signed = {
                 "version": _PROVIDER_AUTHORITY_VERSION,
                 "nonce": nonce,
@@ -1162,9 +1201,12 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
     if not isinstance(request.sealed_provider_attempt_grant, bool):
         raise ValueError("sealed provider attempt grant must be boolean")
     if request._provider_attempt_authority is not None:
-        if not request.sealed_provider_attempt_grant:
+        if (
+            not request.sealed_provider_attempt_grant
+            and request.approved_action_digest is None
+        ):
             raise ValueError(
-                "provider attempt authority requires a sealed provider grant"
+                "request-tree authority requires a sealed provider or action grant"
             )
         _validated_provider_attempt_authority(request._provider_attempt_authority)
     for label, value in (("provider", request.provider), ("model", request.model)):
@@ -1827,16 +1869,27 @@ def _exchange_worker(
 
     owned_authority: _ProviderAttemptAuthority | None = None
     request = payload.get("request")
-    if (
+    shared_provider_tree = (
         isinstance(request, dict)
         and request.get("sealed_provider_attempt_grant") is True
         and bool(
             request.get("inline_agents") or request.get("sealed_fallback_route")
         )
+    )
+    shared_approval_tree = (
+        isinstance(request, dict)
+        and isinstance(request.get("approved_action_digest"), str)
+        and bool(request.get("inline_agents"))
+    )
+    if (
+        isinstance(request, dict)
+        and (shared_provider_tree or shared_approval_tree)
         and request.get("_provider_attempt_authority") is None
     ):
         grant = request.get("max_api_attempts")
-        owned_authority = _ProviderAttemptAuthority(grant)
+        owned_authority = _ProviderAttemptAuthority(
+            grant, approved_action_digest=request.get("approved_action_digest")
+        )
         payload = {
             **payload,
             "request": {

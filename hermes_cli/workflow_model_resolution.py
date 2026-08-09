@@ -41,7 +41,20 @@ _SECRET_KEY_PARTS = (
     "header",
     "environment",
 )
-WORKFLOW_MODEL_RESOLVER_VERSION = 2
+WORKFLOW_MODEL_RESOLVER_VERSION = 3
+_LEGACY_WORKFLOW_MODEL_RESOLVER_VERSION = 2
+
+
+def _endpoint_config_sha256(value: str, *, resolver_version: int) -> str:
+    if not value:
+        return ""
+    if resolver_version == _LEGACY_WORKFLOW_MODEL_RESOLVER_VERSION:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    from hermes_cli.runtime_provider import credential_free_endpoint_config_sha256
+    try:
+        return credential_free_endpoint_config_sha256(value)
+    except ValueError:
+        return hashlib.sha256(b"hermes-invalid-endpoint-config-v1").hexdigest()
 
 
 class ModelResolutionError(ValueError):
@@ -83,7 +96,7 @@ class ConfiguredModelEntry:
     def __post_init__(self) -> None:
         object.__setattr__(self, "options", _freeze_mapping(self.options))
 
-    def public_identity(self) -> dict[str, Any]:
+    def public_identity(self, *, resolver_version: int) -> dict[str, Any]:
         return {
             "name": self.name,
             "reference_kind": self.reference_kind,
@@ -91,10 +104,8 @@ class ConfiguredModelEntry:
             "model": self.model,
             "options": _thaw(self.options),
             "config_scope": self.config_scope,
-            "base_url_sha256": (
-                hashlib.sha256(self.base_url.encode("utf-8")).hexdigest()
-                if self.base_url
-                else ""
+            "base_url_sha256": _endpoint_config_sha256(
+                self.base_url, resolver_version=resolver_version
             ),
         }
 
@@ -110,8 +121,14 @@ class WorkflowModelConfigSnapshot:
     provider_endpoint_config: Mapping[str, Mapping[str, Any]] = field(repr=False)
     config_fingerprint: str
     issues: tuple[ModelResolutionIssue, ...]
+    resolver_version: int = WORKFLOW_MODEL_RESOLVER_VERSION
 
     def __post_init__(self) -> None:
+        if self.resolver_version not in {
+            _LEGACY_WORKFLOW_MODEL_RESOLVER_VERSION,
+            WORKFLOW_MODEL_RESOLVER_VERSION,
+        }:
+            raise ValueError("workflow model resolver version is unsupported")
         object.__setattr__(self, "tiers", MappingProxyType(dict(self.tiers)))
         object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
         object.__setattr__(
@@ -128,19 +145,17 @@ class WorkflowModelConfigSnapshot:
 
         return {
             "tiers": {
-                name: entry.public_identity()
+                name: entry.public_identity(resolver_version=self.resolver_version)
                 for name, entry in sorted(self.tiers.items())
             },
             "aliases": {
-                name: entry.public_identity()
+                name: entry.public_identity(resolver_version=self.resolver_version)
                 for name, entry in sorted(self.aliases.items())
             },
             "active_provider": self.active_provider,
             "active_provider_scope": self.active_provider_scope,
-            "active_base_url_sha256": (
-                hashlib.sha256(self.active_base_url.encode("utf-8")).hexdigest()
-                if self.active_base_url
-                else ""
+            "active_base_url_sha256": _endpoint_config_sha256(
+                self.active_base_url, resolver_version=self.resolver_version
             ),
             "active_api_mode": self.active_api_mode,
             "provider_endpoint_config_sha256": hashlib.sha256(
@@ -420,21 +435,22 @@ def _fingerprint_payload(
     active_api_mode: str,
     provider_endpoint_config: Mapping[str, Mapping[str, Any]],
     issues: tuple[ModelResolutionIssue, ...],
+    resolver_version: int,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "tiers": {
-            name: entry.public_identity() for name, entry in sorted(tiers.items())
+            name: entry.public_identity(resolver_version=resolver_version)
+            for name, entry in sorted(tiers.items())
         },
         "aliases": {
-            name: entry.public_identity() for name, entry in sorted(aliases.items())
+            name: entry.public_identity(resolver_version=resolver_version)
+            for name, entry in sorted(aliases.items())
         },
         "active_provider": active_provider,
         "active_provider_scope": active_provider_scope,
-        "active_base_url_sha256": (
-            hashlib.sha256(active_base_url.encode("utf-8")).hexdigest()
-            if active_base_url
-            else ""
+        "active_base_url_sha256": _endpoint_config_sha256(
+            active_base_url, resolver_version=resolver_version
         ),
         "active_api_mode": active_api_mode,
         "provider_endpoint_config_sha256": hashlib.sha256(
@@ -458,11 +474,17 @@ def parse_workflow_model_config(
     profile_config: Mapping[str, Any] | object,
     *,
     managed_config: Mapping[str, Any] | object | None = None,
+    _resolver_version: int = WORKFLOW_MODEL_RESOLVER_VERSION,
 ) -> WorkflowModelConfigSnapshot:
     """Parse only profile and managed config authorities into a frozen snapshot."""
 
     profile = dict(profile_config) if isinstance(profile_config, Mapping) else {}
     managed = dict(managed_config) if isinstance(managed_config, Mapping) else {}
+    if _resolver_version not in {
+        _LEGACY_WORKFLOW_MODEL_RESOLVER_VERSION,
+        WORKFLOW_MODEL_RESOLVER_VERSION,
+    }:
+        raise ValueError("workflow model resolver version is unsupported")
     merged = _deep_merge(profile, managed)
     if not isinstance(merged, Mapping):
         merged = {}
@@ -599,6 +621,7 @@ def parse_workflow_model_config(
         active_api_mode=active_api_mode,
         provider_endpoint_config=provider_endpoint_config,
         issues=issue_tuple,
+        resolver_version=_resolver_version,
     )
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -613,6 +636,20 @@ def parse_workflow_model_config(
         provider_endpoint_config=provider_endpoint_config,
         config_fingerprint=fingerprint,
         issues=issue_tuple,
+        resolver_version=_resolver_version,
+    )
+
+
+def _parse_workflow_model_config_v2(
+    profile_config: Mapping[str, Any] | object,
+    *,
+    managed_config: Mapping[str, Any] | object | None = None,
+) -> WorkflowModelConfigSnapshot:
+    """Rebuild the immutable resolver-v2 identity for sealed replay only."""
+    return parse_workflow_model_config(
+        profile_config,
+        managed_config=managed_config,
+        _resolver_version=_LEGACY_WORKFLOW_MODEL_RESOLVER_VERSION,
     )
 
 
@@ -778,7 +815,7 @@ def resolve_workflow_model_reference(
         },
     )
     route_material = {
-        "resolver_version": WORKFLOW_MODEL_RESOLVER_VERSION,
+        "resolver_version": snapshot.resolver_version,
         "requested_reference_sha256": hashlib.sha256(
             reference.encode("utf-8")
         ).hexdigest(),

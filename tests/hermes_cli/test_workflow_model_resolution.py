@@ -17,8 +17,8 @@ from hermes_cli.workflow_model_resolution import (
 )
 
 
-def test_route_fingerprint_uses_version2_normalized_endpoint_identity() -> None:
-    assert model_resolution.WORKFLOW_MODEL_RESOLVER_VERSION == 2
+def test_route_fingerprint_uses_version3_normalized_endpoint_identity() -> None:
+    assert model_resolution.WORKFLOW_MODEL_RESOLVER_VERSION == 3
     first = _config()
     first["model_aliases"]["review"]["base_url"] = (
         "https://OPENROUTER.ai:443/api/v1/"
@@ -28,14 +28,96 @@ def test_route_fingerprint_uses_version2_normalized_endpoint_identity() -> None:
         "https://openrouter.ai/api/v1"
     )
 
-    first_route = resolve_workflow_model_reference(
-        parse_workflow_model_config(first), "@review"
+    first_snapshot = parse_workflow_model_config(first)
+    second_snapshot = parse_workflow_model_config(second)
+    first_route = resolve_workflow_model_reference(first_snapshot, "@review")
+    second_route = resolve_workflow_model_reference(second_snapshot, "@review")
+
+    assert first_snapshot.config_fingerprint == second_snapshot.config_fingerprint
+    assert first_route.endpoint_sha256 == second_route.endpoint_sha256
+    assert first_route.route_fingerprint == second_route.route_fingerprint
+
+
+def _endpoint_config(url: str) -> dict[str, object]:
+    config = _config()
+    config["model_aliases"]["review"]["base_url"] = url
+    return config
+
+
+def _route_identity(route) -> dict[str, str]:
+    return {
+        "provider": route.provider,
+        "model": route.model,
+        "api_mode": route.api_mode,
+        "base_url_trust_class": route.base_url_trust_class,
+        "endpoint_sha256": route.endpoint_sha256,
+        "registration_provenance_digest": route.registration_provenance_digest,
+    }
+
+
+def test_query_order_and_repeated_values_are_normalization_equivalent() -> None:
+    first = _endpoint_config(
+        "https://example.test/v1?region=one&region=two&deployment=three"
     )
-    second_route = resolve_workflow_model_reference(
-        parse_workflow_model_config(second), "@review"
+    second = _endpoint_config(
+        "https://EXAMPLE.test:443/v1?deployment=three&region=two&region=one"
+    )
+    first_snapshot = parse_workflow_model_config(first)
+    second_snapshot = parse_workflow_model_config(second)
+    first_route = resolve_workflow_model_reference(first_snapshot, "@review")
+    second_route = resolve_workflow_model_reference(second_snapshot, "@review")
+
+    assert first_snapshot.config_fingerprint == second_snapshot.config_fingerprint
+    assert first_route.endpoint_sha256 == second_route.endpoint_sha256
+    assert first_route.route_fingerprint == second_route.route_fingerprint
+    assert runtime_provider.select_credential_free_execution_route(
+        second,
+        requested_provider=first_route.provider,
+        target_model=first_route.model,
+        route_fingerprint=first_route.route_fingerprint,
+        expected_runtime_identity=_route_identity(first_route),
+    ) is not None
+
+
+@pytest.mark.parametrize(
+    "changed_url",
+    [
+        "https://other.test/v1?region=one&region=two",
+        "https://example.test:8443/v1?region=one&region=two",
+        "https://example.test/v2?region=one&region=two",
+        "https://example.test/v1?region=one",
+        "https://example.test/v1?region=one&region=three",
+    ],
+)
+def test_meaningful_endpoint_changes_change_all_route_identity(changed_url) -> None:
+    original = _endpoint_config("https://example.test/v1?region=one&region=two")
+    changed = _endpoint_config(changed_url)
+    original_snapshot = parse_workflow_model_config(original)
+    changed_snapshot = parse_workflow_model_config(changed)
+    original_route = resolve_workflow_model_reference(original_snapshot, "@review")
+    changed_route = resolve_workflow_model_reference(changed_snapshot, "@review")
+
+    assert original_snapshot.config_fingerprint != changed_snapshot.config_fingerprint
+    assert original_route.endpoint_sha256 != changed_route.endpoint_sha256
+    assert original_route.route_fingerprint != changed_route.route_fingerprint
+
+
+def test_live_route_selection_reconstructs_sealed_v2_identity() -> None:
+    config = _endpoint_config("https://OPENROUTER.ai:443/api/v1/")
+    old_snapshot = model_resolution._parse_workflow_model_config_v2(config)
+    old_route = resolve_workflow_model_reference(old_snapshot, "@review")
+    current_route = resolve_workflow_model_reference(
+        parse_workflow_model_config(config), "@review"
     )
 
-    assert first_route.endpoint_sha256 == second_route.endpoint_sha256
+    assert old_route.route_fingerprint != current_route.route_fingerprint
+    assert runtime_provider.select_credential_free_execution_route(
+        config,
+        requested_provider=old_route.provider,
+        target_model=old_route.model,
+        route_fingerprint=old_route.route_fingerprint,
+        expected_runtime_identity=_route_identity(old_route),
+    ) is not None
 
 
 @pytest.mark.parametrize(
