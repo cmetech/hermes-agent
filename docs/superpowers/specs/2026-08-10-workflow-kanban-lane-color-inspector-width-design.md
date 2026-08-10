@@ -40,10 +40,10 @@ the lane's lifecycle category and an individual card's health.
 ## Inspector width contract
 
 The workflow run drawer remains a nonmodal, right-anchored complementary panel.
-Its responsive width changes from a `32rem` desktop cap to:
+Its responsive desktop width contract is:
 
 ```text
-w-full sm:w-[min(40rem,calc(100%-2rem))]
+w-full sm:w-[min(45rem,calc(100%-2rem))]
 ```
 
 This keeps the existing full-width narrow-screen behavior and the two-rem
@@ -75,7 +75,7 @@ Focused tests will prove these invariants before implementation:
 2. Expanded and collapsed lane dots use a source-supplied tone, including when
    a lane is empty.
 3. Per-card border color remains derived from card health rather than lane tone.
-4. The workflow drawer uses the `40rem` desktop cap while retaining `w-full` and
+4. The workflow drawer uses the `45rem` desktop cap while retaining `w-full` and
    the existing viewport-margin constraint.
 5. Existing workflow drawer interaction, activity-board accessibility,
    virtualization, typecheck, and lint checks remain green.
@@ -86,7 +86,7 @@ Focused tests will prove these invariants before implementation:
   blue, green, yellow, muted, and red token palette.
 - Empty and collapsed lanes retain their assigned lane color.
 - Workflow card borders continue to communicate individual run health.
-- The run inspector is capped at `40rem` on desktop and remains full width on
+- The run inspector is capped at `45rem` on desktop and remains full width on
   narrow screens.
 - Inspector tabs remain a horizontal row under ordinary desktop widths, with
   horizontal overflow available only as a fallback.
