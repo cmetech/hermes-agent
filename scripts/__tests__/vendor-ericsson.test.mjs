@@ -36,6 +36,14 @@ function write(root, rel, contents) {
   fs.writeFileSync(target, contents)
 }
 
+function pluginPath(entry) {
+  return typeof entry === 'string' ? entry : entry?.path
+}
+
+function pluginId(entry) {
+  return typeof entry === 'string' ? path.basename(entry) : entry?.id
+}
+
 function tmpSource(manifestOverrides = {}) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ecsrc-'))
   const manifest = {
@@ -53,8 +61,14 @@ function tmpSource(manifestOverrides = {}) {
   }
   write(d, 'sets/ericsson.json', JSON.stringify(manifest))
   for (const rel of manifest.skills || []) write(d, `${rel}/SKILL.md`, `---\nname: ${path.basename(rel)}\n---\n`)
-  for (const rel of manifest.plugins || []) {
-    write(d, `${rel}/plugin.yaml`, `name: ${path.basename(rel)}\n`)
+  for (const entry of manifest.plugins || []) {
+    const rel = pluginPath(entry)
+    if (typeof rel !== 'string' || !rel.startsWith('plugins/')) continue
+    const id = pluginId(entry)
+    const kind = typeof entry === 'object' && entry?.enabled === false
+      ? 'standalone'
+      : 'backend'
+    write(d, `${rel}/plugin.yaml`, `name: ${id}\nkind: ${kind}\n`)
     write(d, `${rel}/__init__.py`, '')
   }
   for (const rel of manifest.mcpLocal || []) write(d, `${rel}/run_server.py`, '# srv')
@@ -199,6 +213,146 @@ test('vendor maps manifest paths into the hermes-agent tree', () => {
     'plugins/outlook-mcp',
     'skills/ericsson/opportunity-visuals',
   ])
+})
+
+test('vendor preserves structured standalone metadata and exact descriptor bytes', () => {
+  const connector = {
+    path: 'plugins/connector-one',
+    id: 'connector-one',
+    enabled: false,
+    lifecycleMigration: {
+      id: 'connector-one-backend-to-standalone-v1',
+      from: 'auto_seeded_backend',
+    },
+  }
+  const src = tmpSource({
+    plugins: ['plugins/workflow', connector],
+  })
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  const descriptor = 'name: connector-one\nkind: standalone\ndescription: exact bytes\n'
+  write(src, 'plugins/connector-one/plugin.yaml', descriptor)
+  write(src, 'plugins/connector-one/config.schema.json', '{"exact":true}\n')
+  const sourceCommit = '3'.repeat(40)
+
+  vendor({ sourceDir: src, destRoot: dst, sourceCommit })
+
+  const vendored = JSON.parse(fs.readFileSync(
+    path.join(dst, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  assert.deepEqual(vendored.plugins, ['plugins/workflow', connector])
+  assert.equal(vendored.vendoredFrom, sourceCommit)
+  assert.equal(
+    fs.readFileSync(path.join(dst, 'plugins/connector-one/plugin.yaml'), 'utf8'),
+    descriptor,
+  )
+  assert.deepEqual(
+    treeSnapshot(path.join(dst, 'plugins/connector-one')),
+    treeSnapshot(path.join(src, 'plugins/connector-one')),
+  )
+  assert.ok(readInventory(dst).includes('plugins/connector-one'))
+})
+
+test('managed destinations accepts structured plugin objects in manifest order', () => {
+  const destinations = managedDestinations({
+    plugins: [
+      'plugins/workflow',
+      { path: 'plugins/connector-z', id: 'connector-z', enabled: false },
+      { path: 'plugins/connector-a', id: 'connector-a', enabled: false },
+    ],
+  })
+
+  assert.deepEqual(destinations, ['plugins/connector-a', 'plugins/connector-z'])
+})
+
+test('vendor rejects malformed or duplicate lifecycle metadata before publication', () => {
+  const cases = [
+    [
+      'missing migration id',
+      [{
+        path: 'plugins/connector-one', id: 'connector-one', enabled: false,
+        lifecycleMigration: { from: 'auto_seeded_backend' },
+      }],
+    ],
+    [
+      'wrong transition source',
+      [{
+        path: 'plugins/connector-one', id: 'connector-one', enabled: false,
+        lifecycleMigration: { id: 'connector-migration-v1', from: 'manual' },
+      }],
+    ],
+    [
+      'oversized migration id',
+      [{
+        path: 'plugins/connector-one', id: 'connector-one', enabled: false,
+        lifecycleMigration: { id: 'x'.repeat(65), from: 'auto_seeded_backend' },
+      }],
+    ],
+    [
+      'migration id with trailing newline',
+      [{
+        path: 'plugins/connector-one', id: 'connector-one', enabled: false,
+        lifecycleMigration: {
+          id: 'connector-migration-v1\n', from: 'auto_seeded_backend',
+        },
+      }],
+    ],
+    [
+      'duplicate migration id',
+      [
+        {
+          path: 'plugins/connector-one', id: 'connector-one', enabled: false,
+          lifecycleMigration: { id: 'connector-migration-v1', from: 'auto_seeded_backend' },
+        },
+        {
+          path: 'plugins/connector-two', id: 'connector-two', enabled: false,
+          lifecycleMigration: { id: 'connector-migration-v1', from: 'auto_seeded_backend' },
+        },
+      ],
+    ],
+  ]
+
+  for (const [label, plugins] of cases) {
+    const src = tmpSource({ plugins })
+    const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+    write(dst, 'sentinel.txt', `${label}\n`)
+    const before = treeSnapshot(dst)
+
+    assert.throws(
+      () => vendor({ sourceDir: src, destRoot: dst, sourceCommit: '4'.repeat(40) }),
+      /plugin|lifecycle|migration|metadata/i,
+      label,
+    )
+    assert.deepEqual(treeSnapshot(dst), before, label)
+  }
+})
+
+test('vendor validates structured plugin descriptor identity before publication', () => {
+  for (const [label, descriptor] of [
+    ['missing descriptor', undefined],
+    ['wrong descriptor id', 'name: another-connector\nkind: standalone\n'],
+    ['wrong descriptor kind', 'name: connector-one\nkind: backend\n'],
+  ]) {
+    const entry = {
+      path: 'plugins/connector-one',
+      id: 'connector-one',
+      enabled: false,
+    }
+    const src = tmpSource({ plugins: [entry] })
+    const descriptorPath = path.join(src, 'plugins/connector-one/plugin.yaml')
+    if (descriptor === undefined) fs.rmSync(descriptorPath)
+    else fs.writeFileSync(descriptorPath, descriptor)
+    const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+    write(dst, 'sentinel.txt', `${label}\n`)
+    const before = treeSnapshot(dst)
+
+    assert.throws(
+      () => vendor({ sourceDir: src, destRoot: dst, sourceCommit: '5'.repeat(40) }),
+      /plugin|descriptor|manifest|kind|name/i,
+      label,
+    )
+    assert.deepEqual(treeSnapshot(dst), before, label)
+  }
 })
 
 test('managedDestinations returns sorted unique destination paths', () => {
@@ -933,6 +1087,34 @@ test('command-line vendoring records the full exact source commit', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(dst, 'capabilities/ericsson.json'), 'utf8'))
   assert.equal(manifest.vendoredFrom, exactCommit)
   assert.match(manifest.vendoredFrom, /^[0-9a-f]{40}$/)
+})
+
+test('command-line vendoring records exact structured-plugin revision and bytes', () => {
+  const connector = {
+    path: 'plugins/connector-one',
+    id: 'connector-one',
+    enabled: false,
+  }
+  const src = tmpSource({ plugins: ['plugins/workflow', connector] })
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  const exactCommit = initGitSource(src)
+  const committedDescriptor = execFileSync(
+    'git', ['show', `${exactCommit}:plugins/connector-one/plugin.yaml`],
+    { cwd: src },
+  )
+
+  runVendorCli(src, dst)
+
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(dst, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  assert.equal(manifest.vendoredFrom, exactCommit)
+  assert.deepEqual(manifest.plugins, ['plugins/workflow', connector])
+  assert.deepEqual(
+    fs.readFileSync(path.join(dst, 'plugins/connector-one/plugin.yaml')),
+    committedDescriptor,
+  )
 })
 
 test('command-line vendoring rejects dirty tracked, staged, and untracked source state without mutation', () => {

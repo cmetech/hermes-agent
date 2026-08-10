@@ -20,6 +20,10 @@ const LOCK_MARKER = 'owner.json'
 const LOCK_RECOVERY_CLAIM = 'recovery-claim.json'
 const LOCK_SCHEMA_VERSION = 1
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const PLUGIN_PATH = /^plugins\/[a-z0-9][a-z0-9_-]*$/
+const PLUGIN_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const LIFECYCLE_MIGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const PLUGIN_OBJECT_FIELDS = new Set(['path', 'id', 'enabled', 'lifecycleMigration'])
 
 function assertStrictRelativePath(rel, label) {
   if (typeof rel !== 'string' || rel.length === 0
@@ -80,12 +84,120 @@ function mcpDestinationFromManifest(manifest, { includeLegacyFile = true } = {})
   return destination
 }
 
+function normalizePluginEntries(manifest) {
+  const rawEntries = manifest.plugins ?? []
+  if (!Array.isArray(rawEntries)) throw new Error('plugin metadata must be a list')
+
+  const normalized = []
+  const ids = new Set()
+  const legacyPaths = new Set()
+  const structuredPaths = new Set()
+  const migrationIds = new Set()
+  for (const raw of rawEntries) {
+    if (typeof raw === 'string') {
+      const rel = assertManifestSourcePath(raw, 'plugin')
+      if (!PLUGIN_PATH.test(rel)) throw new Error(`unsafe manifest source path: ${rel}`)
+      if (structuredPaths.has(rel)) throw new Error(`duplicate plugin metadata path: ${rel}`)
+      const id = path.posix.basename(rel)
+      normalized.push({ path: rel, id, enabled: true, structured: false })
+      legacyPaths.add(rel)
+      ids.add(id)
+      continue
+    }
+
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('plugin metadata entries must be paths or objects')
+    }
+    const keys = Object.keys(raw)
+    if (!['path', 'id', 'enabled'].every(key => keys.includes(key))
+      || keys.some(key => !PLUGIN_OBJECT_FIELDS.has(key))) {
+      throw new Error('structured plugin metadata has invalid fields')
+    }
+    const rel = assertManifestSourcePath(raw.path, 'plugin')
+    if (!PLUGIN_PATH.test(rel)) throw new Error(`unsafe manifest source path: ${rel}`)
+    if (typeof raw.id !== 'string' || !PLUGIN_ID.test(raw.id)) {
+      throw new Error('structured plugin metadata id must be a bounded slug')
+    }
+    if (typeof raw.enabled !== 'boolean') {
+      throw new Error('structured plugin metadata enabled must be boolean')
+    }
+    if (legacyPaths.has(rel) || structuredPaths.has(rel) || ids.has(raw.id)) {
+      throw new Error('duplicate structured plugin metadata path or id')
+    }
+
+    let lifecycleMigration
+    if (Object.hasOwn(raw, 'lifecycleMigration')) {
+      const migration = raw.lifecycleMigration
+      if (raw.enabled || !migration || typeof migration !== 'object'
+        || Array.isArray(migration)
+        || Object.keys(migration).sort().join(',') !== 'from,id'
+        || migration.from !== 'auto_seeded_backend'
+        || typeof migration.id !== 'string'
+        || !LIFECYCLE_MIGRATION_ID.test(migration.id)
+        || migrationIds.has(migration.id)) {
+        throw new Error('invalid or duplicate plugin lifecycle migration metadata')
+      }
+      migrationIds.add(migration.id)
+      lifecycleMigration = migration
+    }
+
+    structuredPaths.add(rel)
+    ids.add(raw.id)
+    normalized.push({
+      path: rel,
+      id: raw.id,
+      enabled: raw.enabled,
+      structured: true,
+      lifecycleMigration,
+    })
+  }
+  return normalized
+}
+
+function unquoteYamlScalar(raw) {
+  const value = raw.trim()
+  if (value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replaceAll("''", "'")
+  }
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      return JSON.parse(value)
+    } catch {
+      throw new Error('plugin descriptor contains an invalid quoted scalar')
+    }
+  }
+  return value.split(/\s+#/, 1)[0].trim()
+}
+
+function readPluginDescriptor(sourceDir, entry) {
+  const descriptorRel = path.posix.join(entry.path, 'plugin.yaml')
+  assertNoSymlinkComponents(sourceDir, descriptorRel, 'plugin descriptor')
+  const descriptorPath = path.join(sourceDir, descriptorRel)
+  const stat = lstatIfPresent(descriptorPath)
+  if (!stat || stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`plugin descriptor is not a regular file: ${descriptorRel}`)
+  }
+  const fields = new Map()
+  for (const line of fs.readFileSync(descriptorPath, 'utf8').split(/\r?\n/)) {
+    if (!line || /^\s/.test(line) || /^\s*#/.test(line)) continue
+    const match = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/.exec(line)
+    if (match) fields.set(match[1], unquoteYamlScalar(match[2]))
+  }
+  const expectedKind = entry.enabled ? 'backend' : 'standalone'
+  if (fields.get('name') !== entry.id || fields.get('kind') !== expectedKind) {
+    throw new Error(
+      `plugin descriptor name/kind does not match manifest metadata: ${entry.path}`,
+    )
+  }
+}
+
 function sourceDestinationPairs(manifest) {
+  const plugins = normalizePluginEntries(manifest)
   const pairs = [
     ...(manifest.skills || []).map(rel => [assertManifestSourcePath(rel, 'skill'), rel]),
-    ...(manifest.plugins || [])
-      .filter(rel => rel !== 'plugins/workflow')
-      .map(rel => [assertManifestSourcePath(rel, 'plugin'), rel]),
+    ...plugins
+      .filter(entry => entry.path !== 'plugins/workflow')
+      .map(entry => [entry.path, entry.path]),
     ...(manifest.mcpLocal || []).map(rel => [
       assertManifestSourcePath(rel, 'mcpLocal'),
       path.posix.join('plugins', path.posix.basename(rel)),
@@ -123,10 +235,10 @@ export function managedDestinations(manifest, { includeLegacyMcpFile = true } = 
     assertManagedDestination(rel)
     destinations.push(rel)
   }
-  for (const rel of manifest.plugins || []) {
-    if (rel === 'plugins/workflow') continue
-    assertManagedDestination(rel)
-    destinations.push(rel)
+  for (const entry of normalizePluginEntries(manifest)) {
+    if (entry.path === 'plugins/workflow') continue
+    assertManagedDestination(entry.path)
+    destinations.push(entry.path)
   }
   for (const rel of manifest.mcpLocal || []) {
     assertManifestSourcePath(rel, 'mcpLocal')
@@ -1009,6 +1121,7 @@ export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () =
     faultInjector('lock-acquired', LOCK_DIR)
     assertNoSymlinkComponents(sourceDir, 'sets/ericsson.json', 'source manifest')
     const manifest = JSON.parse(fs.readFileSync(path.join(sourceDir, 'sets/ericsson.json'), 'utf8'))
+    const pluginEntries = normalizePluginEntries(manifest)
     const copyList = sourceDestinationPairs(manifest)
     if (manifest.mcpServers) assertManifestSourcePath(manifest.mcpServers, 'mcpServers')
 
@@ -1016,6 +1129,9 @@ export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () =
     for (const [rel, destRel] of copyList) {
       assertSafeSourceTree(sourceDir, rel)
       assertSafeDestination(destRoot, destRel)
+    }
+    for (const entry of pluginEntries) {
+      if (entry.path !== 'plugins/workflow') readPluginDescriptor(sourceDir, entry)
     }
     if (manifest.mcpServers) assertSafeSourceTree(sourceDir, manifest.mcpServers)
     const mcpDestination = mcpDestinationFromManifest(manifest, { includeLegacyFile: false })
