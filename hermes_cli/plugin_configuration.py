@@ -20,7 +20,8 @@ import threading
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -37,6 +38,9 @@ _MAX_ID = 64
 _MAX_PATTERN = 256
 _MAX_ENUM_VALUES = 64
 _MAX_PLATFORMS = 16
+_MAX_CONNECTOR_INVENTORY = 256
+_MAX_CONNECTOR_RUNTIME_PLUGINS = 256
+_MAX_CONNECTOR_TOOLS = 4096
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _PLATFORM_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -1155,6 +1159,22 @@ class PluginConfigurationService:
     def readiness(self, plugin_id: str, platform: str | None = None) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
+        return self._readiness_for_loaded(
+            loaded,
+            self._registrations(canonical_id),
+            platform=platform,
+        )
+
+    def _readiness_for_loaded(
+        self,
+        loaded,
+        registrations: Mapping[str, Mapping[str, Any]],
+        *,
+        platform: str | None = None,
+    ) -> dict[str, Any]:
+        """Project readiness from an already bounded static inventory item."""
+
+        canonical_id = loaded.manifest.key or loaded.manifest.name
         if not self._is_enabled(loaded):
             return {
                 "plugin_id": canonical_id,
@@ -1186,7 +1206,6 @@ class PluginConfigurationService:
                     else "configuration_required"
                 )
                 reasons.append(f"{reason}:{field.id}")
-        registrations = self._registrations(canonical_id)
         for action_id, registration in registrations.items():
             readiness = registration.get("readiness")
             if readiness is None:
@@ -1451,3 +1470,230 @@ def get_plugin_configuration_service() -> PluginConfigurationService:
     if _configuration_service is None:
         _configuration_service = PluginConfigurationService()
     return _configuration_service
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorCapabilitySnapshot:
+    """Credential-free connector facts for one active profile generation."""
+
+    ready_services: frozenset[str]
+    available_tools: frozenset[str]
+    fingerprint: str
+    _service_fingerprints: tuple[tuple[str, str], ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+
+    def scoped_fingerprint(
+        self,
+        required_services: frozenset[str],
+        required_tools: frozenset[str],
+    ) -> str:
+        """Bind only one workflow's connector service and tool identities."""
+
+        if (
+            len(required_services) > _MAX_FIELDS
+            or len(required_tools) > _MAX_FIELDS * 8
+            or any(
+                not isinstance(value, str) or not value or len(value) > _MAX_TEXT
+                for value in (*required_services, *required_tools)
+            )
+        ):
+            raise PluginConfigurationError("connector capability scope exceeded limit")
+        by_service = dict(self._service_fingerprints)
+        encoded = json.dumps(
+            {
+                "schema_version": 1,
+                "services": [
+                    [service_id, by_service.get(service_id, "")]
+                    for service_id in sorted(required_services)
+                ],
+                "tools": sorted(required_tools),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@contextmanager
+def _connector_profile_scope(profile: str | None):
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        yield
+        return
+
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    canonical = normalize_profile_name(requested)
+    if not profile_exists(canonical):
+        raise FileNotFoundError(f"profile does not exist: {canonical}")
+    token = set_hermes_home_override(str(get_profile_dir(canonical)))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _configuration_value_identity(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def connector_capability_snapshot(
+    profile: str | None = None,
+) -> ConnectorCapabilitySnapshot:
+    """Return immutable admission facts without importing disabled plugin code.
+
+    Static descriptors establish the configurable service inventory. Runtime
+    registrations are accepted only from the plugin-manager generation that
+    belongs to the selected profile. Non-secret values contribute only their
+    one-way canonical identity; credentials contribute presence booleans.
+    """
+
+    with _connector_profile_scope(profile):
+        from hermes_cli.plugins import LoadedPlugin, get_plugin_manager
+        from tools.registry import registry
+
+        manager = get_plugin_manager()
+        service = PluginConfigurationService()
+        profile_id = service._profile_id()
+        generation_current = (
+            getattr(manager, "_discovery_profile_id", None) == profile_id
+        )
+        registered_tool_names = registry.get_all_tool_names()
+        static_inventory = manager.static_plugin_inventory()
+        runtime_inventory = manager.loaded_plugins() if generation_current else ()
+        if (
+            len(registered_tool_names) > _MAX_CONNECTOR_TOOLS
+            or len(static_inventory) > _MAX_CONNECTOR_INVENTORY
+            or len(runtime_inventory) > _MAX_CONNECTOR_RUNTIME_PLUGINS
+        ):
+            fingerprint = hashlib.sha256(
+                b'{"schema_version":1,"state":"capacity_exceeded"}'
+            ).hexdigest()
+            return ConnectorCapabilitySnapshot(
+                ready_services=frozenset(),
+                available_tools=frozenset(),
+                fingerprint=fingerprint,
+            )
+        registered_tools = frozenset(registered_tool_names)
+        plugin_tool_names = frozenset(
+            name
+            for name in getattr(manager, "_plugin_tool_names", ())
+            if isinstance(name, str)
+        )
+        available_tools = set(
+            registered_tools
+            if generation_current
+            else registered_tools.difference(plugin_tool_names)
+        )
+        runtime_by_id = {
+            loaded.manifest.key or loaded.manifest.name: loaded
+            for loaded in runtime_inventory
+        }
+
+        ready_services: set[str] = set()
+        identities: list[dict[str, object]] = []
+        manifests = sorted(
+            (
+                manifest
+                for manifest in static_inventory
+                if manifest.configuration is not None
+            ),
+            key=lambda manifest: manifest.key or manifest.name,
+        )
+        for manifest in manifests:
+            plugin_id = manifest.key or manifest.name
+            descriptor_loaded = LoadedPlugin(manifest=manifest)
+            enabled = service._is_enabled(descriptor_loaded)
+            resolved, invalid = service._resolved(plugin_id, descriptor_loaded)
+            runtime_loaded = runtime_by_id.get(plugin_id)
+            runtime_ready = bool(
+                runtime_loaded is not None
+                and getattr(runtime_loaded, "enabled", False)
+                and getattr(runtime_loaded, "error", None) is None
+            )
+            registered_for_plugin = sorted(
+                name
+                for name in (
+                    getattr(runtime_loaded, "tools_registered", ())
+                    if runtime_loaded is not None
+                    else ()
+                )
+                if isinstance(name, str) and name in registered_tools
+            )
+            readiness = (
+                service._readiness_for_loaded(
+                    descriptor_loaded,
+                    manager.setup_action_registrations(plugin_id),
+                )
+                if enabled and runtime_ready
+                else {"ready": False}
+            )
+            ready = readiness.get("ready") is True
+            if ready:
+                ready_services.add(plugin_id)
+
+            settings_identity: dict[str, str] = {}
+            secret_presence: dict[str, bool] = {}
+            for field in manifest.configuration.fields:
+                if field.storage is FieldStorage.SECRET:
+                    secret_presence[field.id] = field.id in resolved
+                elif field.id in resolved:
+                    settings_identity[field.id] = _configuration_value_identity(
+                        resolved[field.id]
+                    )
+            identities.append({
+                "plugin_id": plugin_id,
+                "enabled": enabled,
+                "runtime_current": runtime_ready,
+                "ready": ready,
+                "invalid_fields": sorted(invalid),
+                "settings": settings_identity,
+                "secrets": secret_presence,
+                "registered_tools": registered_for_plugin,
+            })
+
+        service_fingerprints = tuple(
+            (
+                str(identity["plugin_id"]),
+                hashlib.sha256(
+                    json.dumps(
+                        identity,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            for identity in identities
+        )
+        fingerprint_bytes = json.dumps(
+            {"schema_version": 1, "plugins": identities},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return ConnectorCapabilitySnapshot(
+            ready_services=frozenset(ready_services),
+            available_tools=frozenset(available_tools),
+            fingerprint=hashlib.sha256(fingerprint_bytes).hexdigest(),
+            _service_fingerprints=service_fingerprints,
+        )

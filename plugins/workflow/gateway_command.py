@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import shlex
 
+from hermes_cli.plugin_configuration import connector_capability_snapshot
 from hermes_cli.plugin_invocation import PluginInvocationContext
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import (
@@ -118,7 +119,11 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
     compilation = _resolve_compilation(command_args, args.name)
     package = compilation.package
     runtime = _runtime_config(hermes_home, sidecar=package.sidecar)
-    assessment = _phase5_admission_assessment(compilation)
+    connector_capabilities = connector_capability_snapshot()
+    assessment = _phase5_admission_assessment(
+        compilation,
+        connector_capabilities,
+    )
     if assessment is None:
         digest = _admission_package_digest(compilation)
         compatibility = assess_compatibility(package)
@@ -154,6 +159,7 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
         provider_authority=(
             assessment.provider_authority if assessment is not None else None
         ),
+        connector_capabilities=connector_capabilities,
     )
     provenance = gateway_trigger_provenance(
         invocation, intent_key=args.idempotency_key

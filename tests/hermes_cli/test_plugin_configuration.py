@@ -410,3 +410,265 @@ def test_disabled_bundled_manifest_descriptor_is_discovered_without_import(
     assert loaded["enabled"] is False
     assert loaded["error"] == "disabled via config"
     assert not sentinel.exists()
+
+
+def test_connector_capability_snapshot_is_immutable_credential_free_and_deterministic(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import (
+        ConnectorCapabilitySnapshot,
+        PluginConfigurationService,
+        _secret_storage_key,
+        connector_capability_snapshot,
+        load_plugin_configuration,
+    )
+    from tools.registry import registry
+
+    plugin_root = tmp_path / "connector"
+    plugin_root.mkdir()
+    _write_descriptor(plugin_root, _valid_descriptor())
+    descriptor = load_plugin_configuration(plugin_root, "config.schema.json")
+    manifest = SimpleNamespace(
+        key="generic-connector",
+        name="generic-connector",
+        configuration=descriptor,
+        kind="standalone",
+        source="user",
+    )
+    loaded = SimpleNamespace(
+        manifest=manifest,
+        enabled=True,
+        error=None,
+        tools_registered=["generic_connector_read"],
+    )
+
+    class Manager:
+        _plugin_tool_names = {"generic_connector_read"}
+        _discovery_profile_id = PluginConfigurationService._profile_id()
+        static_inventory_calls = 0
+
+        @classmethod
+        def static_plugin_inventory(cls):
+            cls.static_inventory_calls += 1
+            return [manifest]
+
+        @staticmethod
+        def loaded_plugins():
+            return [loaded]
+
+        @staticmethod
+        def setup_action_registrations(_plugin_id):
+            return {"create-token": {"readiness": lambda _config: True}}
+
+    settings = {"endpoint": "https://configured.example.test"}
+    secrets = {_secret_storage_key("generic-connector", "token"): "NEVER_RETURN_TOKEN"}
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_settings",
+        staticmethod(lambda _plugin_id: dict(settings)),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_profile_secret_values",
+        staticmethod(lambda: dict(secrets)),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_is_enabled",
+        staticmethod(lambda _loaded: True),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_all_tool_names",
+        lambda: ["read_file", "generic_connector_read"],
+    )
+
+    first = connector_capability_snapshot()
+    second = connector_capability_snapshot()
+
+    assert Manager.static_inventory_calls == 2
+    assert (
+        first
+        == second
+        == ConnectorCapabilitySnapshot(
+            ready_services=frozenset({"generic-connector"}),
+            available_tools=frozenset({"generic_connector_read", "read_file"}),
+            fingerprint=first.fingerprint,
+        )
+    )
+    assert len(first.fingerprint) == 64
+    assert set(first.fingerprint) <= set("0123456789abcdef")
+    serialized = repr(first)
+    assert "configured.example.test" not in serialized
+    assert "NEVER_RETURN_TOKEN" not in serialized
+    with pytest.raises((AttributeError, TypeError)):
+        first.fingerprint = "changed"  # type: ignore[misc]
+
+    settings["endpoint"] = "https://changed.example.test"
+    changed_setting = connector_capability_snapshot()
+    assert changed_setting.fingerprint != first.fingerprint
+    assert changed_setting.ready_services == first.ready_services
+    assert changed_setting.available_tools == first.available_tools
+
+    settings["endpoint"] = "https://service.example.test"
+    secrets.clear()
+    missing_secret = connector_capability_snapshot()
+    assert missing_secret.fingerprint != changed_setting.fingerprint
+    assert missing_secret.ready_services == frozenset()
+
+
+def test_connector_capability_snapshot_honors_runtime_profile_generation(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import (
+        PluginConfigurationService,
+        connector_capability_snapshot,
+        load_plugin_configuration,
+    )
+    from tools.registry import registry
+
+    plugin_root = tmp_path / "connector"
+    plugin_root.mkdir()
+    _write_descriptor(plugin_root, _valid_descriptor())
+    descriptor = load_plugin_configuration(plugin_root, "config.schema.json")
+    manifest = SimpleNamespace(
+        key="generic-connector",
+        name="generic-connector",
+        configuration=descriptor,
+        kind="standalone",
+        source="user",
+    )
+    loaded = SimpleNamespace(
+        manifest=manifest,
+        enabled=True,
+        error=None,
+        tools_registered=["generic_connector_read"],
+    )
+
+    class Manager:
+        _plugin_tool_names = {"generic_connector_read"}
+        _discovery_profile_id = "a different profile generation"
+
+        @staticmethod
+        def static_plugin_inventory():
+            return [manifest]
+
+        @staticmethod
+        def loaded_plugins():
+            return [loaded]
+
+        @staticmethod
+        def setup_action_registrations(_plugin_id):
+            raise AssertionError("stale profile callbacks must not run")
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_settings",
+        staticmethod(lambda _plugin_id: {}),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_profile_secret_values",
+        staticmethod(lambda: {}),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_is_enabled",
+        staticmethod(lambda _loaded: True),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_all_tool_names",
+        lambda: ["read_file", "generic_connector_read"],
+    )
+
+    snapshot = connector_capability_snapshot()
+
+    assert snapshot.ready_services == frozenset()
+    assert snapshot.available_tools == frozenset({"read_file"})
+
+
+def test_connector_capability_scoped_fingerprint_ignores_unrelated_services():
+    from hermes_cli.plugin_configuration import ConnectorCapabilitySnapshot
+
+    admitted = ConnectorCapabilitySnapshot(
+        ready_services=frozenset({"service-a", "service-b"}),
+        available_tools=frozenset({"tool_a", "tool_b"}),
+        fingerprint="0" * 64,
+        _service_fingerprints=(("service-a", "a" * 64), ("service-b", "b" * 64)),
+    )
+    unrelated_drift = ConnectorCapabilitySnapshot(
+        ready_services=admitted.ready_services,
+        available_tools=admitted.available_tools,
+        fingerprint="1" * 64,
+        _service_fingerprints=(("service-a", "a" * 64), ("service-b", "c" * 64)),
+    )
+    required_drift = ConnectorCapabilitySnapshot(
+        ready_services=admitted.ready_services,
+        available_tools=admitted.available_tools,
+        fingerprint="2" * 64,
+        _service_fingerprints=(("service-a", "d" * 64), ("service-b", "b" * 64)),
+    )
+    scope = (frozenset({"service-a"}), frozenset({"tool_a"}))
+
+    sealed = admitted.scoped_fingerprint(*scope)
+
+    assert unrelated_drift.scoped_fingerprint(*scope) == sealed
+    assert required_drift.scoped_fingerprint(*scope) != sealed
+    assert (
+        admitted.scoped_fingerprint(
+            frozenset({"service-a"}),
+            frozenset({"different_tool"}),
+        )
+        != sealed
+    )
+
+
+def test_connector_capability_snapshot_fails_closed_at_inventory_bound(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import connector_capability_snapshot
+    from tools.registry import registry
+
+    manifests = [
+        SimpleNamespace(
+            key=f"connector-{index}",
+            name=f"connector-{index}",
+            configuration=object(),
+        )
+        for index in range(257)
+    ]
+
+    class Manager:
+        _plugin_tool_names = {"plugin_tool"}
+        _discovery_profile_id = None
+
+        @staticmethod
+        def static_plugin_inventory():
+            return manifests
+
+        @staticmethod
+        def loaded_plugins():
+            return []
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(
+        registry,
+        "get_all_tool_names",
+        lambda: ["read_file", "plugin_tool"],
+    )
+
+    snapshot = connector_capability_snapshot()
+
+    assert snapshot.ready_services == frozenset()
+    assert snapshot.available_tools == frozenset()
+    assert len(snapshot.fingerprint) == 64

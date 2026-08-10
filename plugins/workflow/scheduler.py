@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
+from hermes_cli.plugin_configuration import connector_capability_snapshot
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.bash_rendering import bash_output_references
 from plugins.workflow.conditions import (
@@ -65,6 +66,7 @@ from plugins.workflow.models import (
     RetryPolicy,
     RunExecutionLimits,
     TerminalJournalReserve,
+    WorkflowConnectorCapabilities,
     WorkflowNode,
     WorkflowLanguageProfile,
     WorkflowPackage,
@@ -162,6 +164,7 @@ class _PreparedRunPackage:
     sealed_resource_bytes: Mapping[str, bytes]
     execution_semantics: Phase3ExecutionSemantics | None
     provider_authority: object | None = None
+    connector_capabilities: WorkflowConnectorCapabilities | None = None
 
     def __iter__(self):
         yield self.package
@@ -3486,6 +3489,33 @@ class RunScheduler:
                 authenticated_bytes=sealed_bytes,
                 projected_digest=projection.get("provider_resolution_sha256"),
             )
+            connector_capabilities = None
+            raw_connector_capabilities = (resources or {}).get(
+                "connector_capabilities"
+            )
+            if raw_connector_capabilities is not None:
+                try:
+                    connector_capabilities = (
+                        WorkflowConnectorCapabilities.from_dict(
+                            raw_connector_capabilities
+                        )
+                    )
+                except ValueError:
+                    if expected_state_version is None:
+                        expected_state_version = int(
+                            projection.get("state_version", -1)
+                        )
+                    self.store._fail_package_validation(
+                        run_id,
+                        expected_state_version=expected_state_version,
+                        error_code="connector_capability_changed",
+                        error_path="resources.connector_capabilities",
+                        error_message=(
+                            "connector capability changed after workflow admission"
+                        ),
+                        schedule_revalidation=schedule_revalidation,
+                    )
+                    return None
             return _PreparedRunPackage(
                 package=package,
                 execution_limits=execution_limits,
@@ -3493,6 +3523,7 @@ class RunScheduler:
                 sealed_resource_bytes=sealed_bytes,
                 execution_semantics=semantics,
                 provider_authority=provider_authority,
+                connector_capabilities=connector_capabilities,
             )
         except WorkflowValidationError as exc:
             if not exc.issues:
@@ -3535,6 +3566,60 @@ class RunScheduler:
                 schedule_revalidation,
             )
             return None
+
+    @staticmethod
+    def _connector_capabilities_match(
+        sealed: WorkflowConnectorCapabilities | None,
+    ) -> bool:
+        if sealed is None:
+            return True
+        try:
+            live = connector_capability_snapshot()
+            if (
+                not sealed.required_services.issubset(live.ready_services)
+                or not sealed.required_tools.issubset(live.available_tools)
+            ):
+                return False
+            scoped_fingerprint = getattr(live, "scoped_fingerprint", None)
+            live_fingerprint = (
+                scoped_fingerprint(
+                    sealed.required_services,
+                    sealed.required_tools,
+                )
+                if callable(scoped_fingerprint)
+                else live.fingerprint
+            )
+            return hmac.compare_digest(sealed.fingerprint, live_fingerprint)
+        except Exception:
+            return False
+
+    def _revalidate_connector_capabilities(
+        self,
+        run_id: str,
+        sealed: WorkflowConnectorCapabilities | None,
+        projection: Mapping[str, object],
+        schedule_revalidation: object | None,
+    ) -> bool:
+        if self._connector_capabilities_match(sealed):
+            return True
+        metadata = projection.get("run_metadata")
+        scheduled_running = bool(
+            projection.get("status") == "running"
+            and isinstance(metadata, Mapping)
+            and isinstance(metadata.get("schedule_at"), str)
+        )
+        self.store._fail_package_validation(
+            run_id,
+            expected_state_version=int(projection.get("state_version", -1)),
+            error_code="connector_capability_changed",
+            error_path="resources.connector_capabilities",
+            error_message="connector capability changed after workflow admission",
+            schedule_revalidation=(
+                None if scheduled_running else schedule_revalidation
+            ),
+            allow_scheduled_running=scheduled_running,
+        )
+        return False
 
     def _authorize_scheduled_promotion(
         self,
@@ -4838,6 +4923,14 @@ class RunScheduler:
             execution_semantics,
         ) = prepared_package
         provider_authority = prepared_package.provider_authority
+        connector_capabilities = prepared_package.connector_capabilities
+        if not self._revalidate_connector_capabilities(
+            run_id,
+            connector_capabilities,
+            self.store.load_run(run_id),
+            authorization,
+        ):
+            return self.store.load_run(run_id)
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -4857,6 +4950,13 @@ class RunScheduler:
                     current_owner_epoch=self.owner_id,
                 )
                 projection = self.store.load_run(run_id)
+                if not self._revalidate_connector_capabilities(
+                    run_id,
+                    connector_capabilities,
+                    projection,
+                    authorization,
+                ):
+                    break
                 if projection["status"] == "queued":
                     if not self._try_promote(
                         run_id,
@@ -4900,6 +5000,14 @@ class RunScheduler:
                     ready.append(node_id)
                     if isinstance(preflight, _StrictReferenceSnapshot):
                         strict_reference_snapshots[node_id] = preflight
+                projection = self.store.load_run(run_id)
+                if not self._revalidate_connector_capabilities(
+                    run_id,
+                    connector_capabilities,
+                    projection,
+                    authorization,
+                ):
+                    break
                 remaining = None if max_nodes is None else max_nodes - executed
                 capacity = min(
                     self.max_parallel_nodes,
@@ -5130,6 +5238,7 @@ class RunScheduler:
         sealed_resource_bytes = {}
         execution_semantics = {}
         provider_authorities = {}
+        connector_capabilities = {}
         package_failures = {}
         prepared_run_ids = []
         for run_id in run_ids:
@@ -5143,12 +5252,23 @@ class RunScheduler:
                 continue
             package, limits, paths, resource_bytes, semantics = prepared_package
             provider_authority = prepared_package.provider_authority
+            connector_capability = prepared_package.connector_capabilities
+            projection = self.store.load_run(run_id)
+            if not self._revalidate_connector_capabilities(
+                run_id,
+                connector_capability,
+                projection,
+                authorizations[run_id],
+            ):
+                package_failures[run_id] = self.store.load_run(run_id)
+                continue
             packages[run_id] = package
             execution_limits[run_id] = limits
             sealed_resource_paths[run_id] = paths
             sealed_resource_bytes[run_id] = resource_bytes
             execution_semantics[run_id] = semantics
             provider_authorities[run_id] = provider_authority
+            connector_capabilities[run_id] = connector_capability
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -5188,6 +5308,13 @@ class RunScheduler:
                         current_owner_epoch=self.owner_id,
                     )
                     projection = self.store.load_run(run_id)
+                    if not self._revalidate_connector_capabilities(
+                        run_id,
+                        connector_capabilities[run_id],
+                        projection,
+                        authorizations[run_id],
+                    ):
+                        continue
                     if projection["status"] == "queued":
                         self._try_promote(
                             run_id,
@@ -5225,6 +5352,20 @@ class RunScheduler:
                         candidates[run_id].append(node_id)
                         if isinstance(preflight, _StrictReferenceSnapshot):
                             strict_reference_snapshots[(run_id, node_id)] = preflight
+                preclaim_active = []
+                for run_id in active:
+                    projection = self.store.load_run(run_id)
+                    if not self._revalidate_connector_capabilities(
+                        run_id,
+                        connector_capabilities[run_id],
+                        projection,
+                        authorizations[run_id],
+                    ):
+                        candidates[run_id].clear()
+                        continue
+                    snapshots[run_id] = projection
+                    preclaim_active.append(run_id)
+                active = preclaim_active
                 if not active and not futures:
                     break
                 claims = []

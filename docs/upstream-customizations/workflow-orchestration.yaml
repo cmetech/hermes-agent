@@ -5396,3 +5396,68 @@ upstream_changes:
   removal_condition: Remove when upstream provides an equivalent dependency-bounded,
     side-effect-free workflow schema entry point ahead of every normal startup seam.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-configured-plugin-toolset-admission
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/plugin_configuration.py
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/models.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/store.py
+  - tests/hermes_cli/test_plugin_configuration.py
+  - tests/plugins/workflow/test_ericsson_connector_toolsets.py
+  - tests/plugins/workflow/test_phase5_admission_parity.py
+  owned_symbols:
+  - ConnectorCapabilitySnapshot
+  - connector_capability_snapshot
+  - WorkflowConnectorCapabilities
+  - connector_capabilities
+  - RunScheduler._connector_capabilities_match
+  - RunScheduler._revalidate_connector_capabilities
+  - RunStore._fail_package_validation
+  - allow_scheduled_running
+  owned_invariants:
+  - one immutable credential-free active-profile capability snapshot feeds each
+    production admission assessment and its authenticated snapshot seal
+  - disabled plugin code remains unimported while static descriptor inventory,
+    current runtime generation, backend readiness, and registered tools are bounded
+    and fail closed
+  - fingerprints contain deterministic non-secret configuration identities and
+    credential-presence booleans but never values, readiness errors, or exception text
+  - admitted fingerprints are scoped to required services and canonical tool identities,
+    so unrelated connector changes do not block a run
+  - connector-dependent Archon runs revalidate authenticated identifiers, readiness,
+    registered tools, and scoped identity immediately before every scheduler claim pass
+  - active claims finish under their admitted authority; drift blocks further claims
+    and terminalizes the claim-free run exactly once with connector_capability_changed
+  - pre-extension workflow snapshots omit the optional metadata and retain their recorded
+    v1 through v5 behavior without a normalizer or snapshot-format version change
+  - exact empty allowed-tools declarations remain empty
+  tests:
+  - tests/hermes_cli/test_plugin_configuration.py
+  - tests/plugins/workflow/test_ericsson_connector_toolsets.py
+  - tests/plugins/workflow/test_phase5_admission_parity.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_scheduler.py
+  expected_commit_subject: 'feat(workflow): admit configured plugin toolsets'
+  upstream_candidate: true
+  merge_guidance: Preserve one current-profile, static-inventory-backed capability
+    snapshot across admission assessment and sealing. Keep its output immutable,
+    credential-free, deterministic, bounded, and generic. Seal only connector-dependent
+    Archon admissions through the existing authenticated resources extension, scope
+    drift to the run's required services and tools, and revalidate both after resume
+    and immediately before claims. Never import disabled plugin code, expose values,
+    mutate prompt/toolsets, reinterpret extension-free snapshots, or fail a run beneath
+    an active provider claim.
+  removal_condition: Remove when upstream supplies equivalent generic configured-plugin
+    service and tool admission, authenticated scoped drift identity, same-snapshot
+    sealing, active-claim-safe prelaunch revalidation, and exact legacy snapshot behavior.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

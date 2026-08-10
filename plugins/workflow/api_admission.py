@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 from typing import Literal, Mapping
 
+from hermes_cli.plugin_configuration import connector_capability_snapshot
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.admission_service import assess_workflow_admission
 from plugins.workflow.coordinator_store import CoordinatorStore
@@ -346,11 +347,14 @@ def start_api_run(
         binding,
         requires_ai=(scenario.requires_ai if scenario is not None else None),
     )
+    connector_capabilities = connector_capability_snapshot()
     try:
         assessment = assess_workflow_admission(
             compilation,
             execution_context,
             read_budget=resource_budget,
+            available_tools=connector_capabilities.available_tools,
+            available_services=connector_capabilities.ready_services,
         )
         package_digest = assessment.package_digest
         compatibility = assessment.compatibility
@@ -465,6 +469,7 @@ def start_api_run(
             trusted_package_digest=package_digest,
             execution_limits=execution_limits,
             provider_authority=assessment.provider_authority,
+            connector_capabilities=connector_capabilities,
         )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(

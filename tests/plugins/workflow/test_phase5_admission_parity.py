@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -207,7 +208,7 @@ def test_cli_show_and_validate_consume_the_common_phase5_assessment(
     monkeypatch.setattr(
         cli_module,
         "assess_production_workflow_admission",
-        lambda candidate: assessment,
+        lambda candidate, **_availability: assessment,
     )
     monkeypatch.setattr(cli_module, "_cron_jobs", lambda: ())
     monkeypatch.setattr(
@@ -256,7 +257,9 @@ def test_cli_gateway_rest_doctor_catalog_and_detail_share_blocking_decision(
     monkeypatch.setattr(
         cli_module,
         "assess_production_workflow_admission",
-        lambda candidate: assess_workflow_admission(candidate, context),
+        lambda candidate, **_availability: assess_workflow_admission(
+            candidate, context
+        ),
     )
     monkeypatch.setattr(cli_module, "_resolve_compilation", lambda *_args: compilation)
     cli_args = argparse.Namespace(
@@ -334,6 +337,15 @@ def test_cli_gateway_rest_doctor_catalog_and_detail_share_blocking_decision(
         "_discover_catalog_compilations",
         lambda *_args: ([compilation], False),
     )
+    monkeypatch.setattr(
+        catalog_module,
+        "connector_capability_snapshot",
+        lambda: SimpleNamespace(
+            ready_services=frozenset(),
+            available_tools=frozenset({"read_file"}),
+            fingerprint="0" * 64,
+        ),
+    )
     catalog, _truncated = catalog_module.build_workflow_catalog(
         hermes_home=tmp_path / "catalog-home",
         workdir=tmp_path,
@@ -368,3 +380,104 @@ def test_cli_gateway_rest_doctor_catalog_and_detail_share_blocking_decision(
     }
     assert detail_capability["routes"]
     assert detail_capability["decisions"]
+
+
+def test_gateway_reuses_one_connector_snapshot_for_admission_and_sealing(
+    tmp_path, workflow_writer, monkeypatch
+):
+    import argparse
+    from types import SimpleNamespace
+
+    import plugins.workflow.cli as cli_module
+    import plugins.workflow.coordinator_store as coordinator_module
+    import plugins.workflow.gateway_command as gateway_module
+    from hermes_cli.plugin_invocation import PluginInvocationContext
+    from plugins.workflow.models import WorkflowRuntimeConfig
+
+    compilation = _compilation(tmp_path, workflow_writer)
+    assessment = assess_workflow_admission(compilation, _context())
+    capabilities = SimpleNamespace(
+        ready_services=frozenset({"generic-service"}),
+        available_tools=frozenset({"read_file"}),
+        fingerprint="4" * 64,
+    )
+    observed = {}
+
+    class ExpectedStop(Exception):
+        pass
+
+    class FakeStore:
+        database = tmp_path / "admission.sqlite3"
+
+        @staticmethod
+        def prepare_run_snapshot(_package, **kwargs):
+            observed["sealed"] = kwargs["connector_capabilities"]
+            raise ExpectedStop
+
+    class FakeCoordinatorStore:
+        def __init__(self, _database):
+            pass
+
+        @staticmethod
+        def health(*, now):
+            return SimpleNamespace(status="healthy")
+
+    def phase5_admission(candidate, snapshot):
+        assert candidate is compilation
+        observed["admitted"] = snapshot
+        return assessment
+
+    monkeypatch.setattr(
+        gateway_module,
+        "connector_capability_snapshot",
+        lambda: capabilities,
+    )
+    monkeypatch.setattr(cli_module, "_resolve_compilation", lambda *_a: compilation)
+    monkeypatch.setattr(
+        cli_module,
+        "_runtime_config",
+        lambda *_a, **_k: WorkflowRuntimeConfig(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_phase5_admission_assessment",
+        phase5_admission,
+    )
+    monkeypatch.setattr(cli_module, "_store", lambda *_a, **_k: FakeStore())
+    monkeypatch.setattr(gateway_module, "require_runnable", lambda _report: None)
+    monkeypatch.setattr(
+        gateway_module.WorkflowTrustStore,
+        "check",
+        lambda *_a, **_k: "trusted",
+    )
+    monkeypatch.setattr(gateway_module, "preflight_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        coordinator_module,
+        "CoordinatorStore",
+        FakeCoordinatorStore,
+    )
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        assurance="verified_adapter",
+        principal="telegram:user:1",
+        operator_scope="telegram:user:1",
+        return_route_capability="telegram:chat:1",
+    )
+
+    with pytest.raises(ExpectedStop):
+        gateway_module._start_gateway_run(
+            argparse.Namespace(
+                name="admission-parity",
+                arguments="",
+                idempotency_key="gateway-snapshot",
+                concurrency_key=None,
+            ),
+            invocation,
+            hermes_home=tmp_path / "home",
+            workdir=tmp_path,
+        )
+
+    assert observed == {
+        "admitted": capabilities,
+        "sealed": capabilities,
+    }

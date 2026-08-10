@@ -519,6 +519,75 @@ class WorkflowPackage:
     validation_issues: tuple[ValidationIssue, ...] = ()
 
 
+_CONNECTOR_CAPABILITY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+_CONNECTOR_CAPABILITY_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowConnectorCapabilities:
+    """Authenticated connector facts scoped to one admitted workflow."""
+
+    required_services: frozenset[str]
+    required_tools: frozenset[str]
+    fingerprint: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        services = frozenset(self.required_services)
+        tools = frozenset(self.required_tools)
+        if (
+            self.schema_version != 1
+            or not services
+            or len(services) > 64
+            or len(tools) > 512
+            or any(
+                _CONNECTOR_CAPABILITY_ID.fullmatch(value) is None for value in services
+            )
+            or any(_CONNECTOR_CAPABILITY_ID.fullmatch(value) is None for value in tools)
+            or not isinstance(self.fingerprint, str)
+            or _CONNECTOR_CAPABILITY_SHA256.fullmatch(self.fingerprint) is None
+        ):
+            raise ValueError("connector capability snapshot is malformed")
+        object.__setattr__(self, "required_services", services)
+        object.__setattr__(self, "required_tools", tools)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "required_services": sorted(self.required_services),
+            "required_tools": sorted(self.required_tools),
+            "fingerprint": self.fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "WorkflowConnectorCapabilities":
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema_version",
+            "required_services",
+            "required_tools",
+            "fingerprint",
+        }:
+            raise ValueError("connector capability snapshot is malformed")
+        services = value.get("required_services")
+        tools = value.get("required_tools")
+        if (
+            not isinstance(services, list)
+            or not isinstance(tools, list)
+            or any(not isinstance(item, str) for item in (*services, *tools))
+            or len(services) != len(set(services))
+            or len(tools) != len(set(tools))
+            or services != sorted(services)
+            or tools != sorted(tools)
+        ):
+            raise ValueError("connector capability snapshot is malformed")
+        return cls(
+            schema_version=value.get("schema_version"),
+            required_services=frozenset(services),
+            required_tools=frozenset(tools),
+            fingerprint=value.get("fingerprint"),
+        )
+
+
 @dataclass(frozen=True)
 class ApprovalDecision:
     """Durable result of a compare-and-set workflow interaction decision."""

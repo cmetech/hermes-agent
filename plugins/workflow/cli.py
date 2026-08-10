@@ -28,6 +28,10 @@ from agent.structured_output import (
     require_structured_output_validator,
 )
 from hermes_constants import get_hermes_home
+from hermes_cli.plugin_configuration import (
+    ConnectorCapabilitySnapshot,
+    connector_capability_snapshot,
+)
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     language_projection,
@@ -1116,6 +1120,7 @@ def _compilation_trust_material(
 
 def _phase5_admission_assessment(
     compilation: WorkflowCompilation,
+    capability_snapshot: ConnectorCapabilitySnapshot | None = None,
 ) -> WorkflowAdmissionAssessment | None:
     package = compilation.package
     if not supports_phase5_semantics(
@@ -1123,7 +1128,12 @@ def _phase5_admission_assessment(
         package.language.normalizer_version,
     ):
         return None
-    return assess_production_workflow_admission(compilation)
+    capabilities = capability_snapshot or connector_capability_snapshot()
+    return assess_production_workflow_admission(
+        compilation,
+        available_tools=capabilities.available_tools,
+        available_services=capabilities.ready_services,
+    )
 
 
 def _cron_jobs() -> Iterable[Mapping[str, object]]:
@@ -2280,7 +2290,8 @@ def _cmd_run(
     compilation = _resolve_compilation(args, args.name)
     package = compilation.package
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
-    assessment = _phase5_admission_assessment(compilation)
+    capabilities = connector_capability_snapshot()
+    assessment = _phase5_admission_assessment(compilation, capabilities)
     if assessment is None:
         digest = _admission_package_digest(compilation)
         compatibility = assess_compatibility(package)
@@ -2339,6 +2350,7 @@ def _cmd_run(
         provider_authority=(
             assessment.provider_authority if assessment is not None else None
         ),
+        connector_capabilities=capabilities,
     )
     intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(

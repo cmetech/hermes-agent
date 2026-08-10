@@ -23,6 +23,7 @@ from typing import Iterator, Literal, Mapping
 import yaml
 
 from cron.jobs import create_job, list_jobs, use_cron_store
+from hermes_cli.plugin_configuration import connector_capability_snapshot
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.admission_service import assess_production_workflow_admission
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
@@ -1201,10 +1202,13 @@ def run_showcase(
                 else None
             ),
         )
+        connector_capabilities = connector_capability_snapshot()
         assessment = (
             assess_production_workflow_admission(
                 compilation,
                 requires_ai=scenario.requires_ai,
+                available_tools=connector_capabilities.available_tools,
+                available_services=connector_capabilities.ready_services,
             )
             if phase5
             else None
@@ -1244,6 +1248,7 @@ def run_showcase(
                 provider_authority=(
                     assessment.provider_authority if assessment is not None else None
                 ),
+                connector_capabilities=connector_capabilities,
             )
         finally:
             if fixture_dir is not None:
