@@ -797,7 +797,9 @@ def _bounded_public_value(
             for secret in redactions:
                 safe_key = safe_key.replace(secret, "[redacted]")
             budget.add_json_bytes(safe_key)
-            budget.add_bytes(2)  # colon and conservative comma allowance
+            # Match json.dumps()'s default ``: `` / ``, `` separators. Count
+            # a comma for every item (including the last) to stay conservative.
+            budget.add_bytes(4)
             projected[safe_key] = _bounded_public_value(
                 item_value,
                 depth=depth + 1,
@@ -812,7 +814,9 @@ def _bounded_public_value(
         for index, item in enumerate(value):
             if index >= _MAX_ACTION_COLLECTION:
                 raise PluginConfigurationError("setup action collection exceeded limit")
-            budget.add_bytes(1)  # conservative comma allowance
+            # Match json.dumps()'s default ``, `` separator, conservatively
+            # counting it for the final item as well.
+            budget.add_bytes(2)
             projected_items.append(
                 _bounded_public_value(
                     item,

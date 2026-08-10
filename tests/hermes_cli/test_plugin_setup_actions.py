@@ -419,6 +419,29 @@ def test_action_output_enforces_aggregate_byte_budget_during_projection(
     assert sys.modules["hermes_plugins.action_plugin"].items_seen < 100
 
 
+def test_near_boundary_mapping_is_rejected_by_traversal_not_final_encoding():
+    from collections.abc import Mapping
+
+    from hermes_cli.plugin_configuration import _bounded_public_value
+
+    class NearBoundaryMapping(Mapping):
+        def __len__(self):
+            return 128
+
+        def __iter__(self):
+            return (f"k{index:03d}" for index in range(128))
+
+        def __getitem__(self, key):
+            return "x" * 501
+
+        def items(self):
+            for index in range(128):
+                yield f"k{index:03d}", "x" * 501
+
+    with pytest.raises(PluginConfigurationError, match="byte limit"):
+        _bounded_public_value(NearBoundaryMapping())
+
+
 def test_context_local_secret_scope_is_delivered_to_setup_action(tmp_path, monkeypatch):
     from agent.secret_scope import reset_secret_scope, set_secret_scope
     from hermes_cli.plugin_configuration import _secret_storage_key
