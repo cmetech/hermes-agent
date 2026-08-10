@@ -2503,14 +2503,29 @@ install_node_deps() {
     fi
 
     if [ -f "$INSTALL_DIR/package.json" ]; then
-        log_info "Installing Node.js dependencies (browser tools)..."
-        cd "$INSTALL_DIR"
-        # Time-boxed: a stalled registry fetch would otherwise hang here with no
-        # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "npm install failed or timed out (browser tools may not work)"
-        }
-        log_success "Node.js dependencies installed"
+        # Fingerprint gate: skip the npm tree walk entirely when the lockfile
+        # and Node major are unchanged since the last SUCCESSFUL install.
+        # See npm_deps_fingerprint() above for the fail-open contract.
+        root_spec="$INSTALL_DIR/package.json"
+        if [ -f "$INSTALL_DIR/package-lock.json" ]; then
+            root_spec="$INSTALL_DIR/package-lock.json"
+        fi
+        root_fingerprint="$(npm_deps_fingerprint "$root_spec")"
+        root_marker="$INSTALL_DIR/node_modules/.npm-deps-fingerprint"
+        if npm_deps_current "$root_marker" "$root_fingerprint"; then
+            log_info "Node.js dependencies unchanged since last install; skipping npm install"
+        else
+            log_info "Installing Node.js dependencies (browser tools)..."
+            cd "$INSTALL_DIR"
+            # Time-boxed: a stalled registry fetch would otherwise hang here with no
+            # progress (same #39219 stall class as the desktop build below).
+            if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+                write_npm_deps_marker "$root_marker" "$root_fingerprint"
+                log_success "Node.js dependencies installed"
+            else
+                log_warn "npm install failed or timed out (browser tools may not work)"
+            fi
+        fi
 
         # Install Playwright browser + system dependencies.
         # Playwright's --with-deps only supports apt-based systems natively.
@@ -2606,13 +2621,30 @@ install_node_deps() {
 
     # Install TUI dependencies
     if [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
-        log_info "Installing TUI dependencies..."
-        cd "$INSTALL_DIR/ui-tui"
-        # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
-        log_success "TUI dependencies installed"
+        # ui-tui carries no lockfile today; hash package.json (weaker but
+        # still invalidates on any dependency-spec change) and upgrade to the
+        # lockfile automatically if one ever appears. The marker lives in the
+        # ROOT node_modules -- npm workspaces hoist there, and wiping
+        # node_modules must invalidate this gate too.
+        tui_spec="$INSTALL_DIR/ui-tui/package.json"
+        if [ -f "$INSTALL_DIR/ui-tui/package-lock.json" ]; then
+            tui_spec="$INSTALL_DIR/ui-tui/package-lock.json"
+        fi
+        tui_fingerprint="$(npm_deps_fingerprint "$tui_spec")"
+        tui_marker="$INSTALL_DIR/node_modules/.npm-deps-fingerprint-tui"
+        if npm_deps_current "$tui_marker" "$tui_fingerprint"; then
+            log_info "TUI dependencies unchanged since last install; skipping npm install"
+        else
+            log_info "Installing TUI dependencies..."
+            cd "$INSTALL_DIR/ui-tui"
+            # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
+            if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+                write_npm_deps_marker "$tui_marker" "$tui_fingerprint"
+                log_success "TUI dependencies installed"
+            else
+                log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
+            fi
+        fi
     fi
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.

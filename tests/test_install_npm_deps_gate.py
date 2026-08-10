@@ -137,3 +137,37 @@ if npm_deps_current "{marker}" "$fp2"; then echo "S4=current"; else echo "S4=sta
     assert "S2=current" in out.stdout  # marker written and matches
     assert "S3=stale" in out.stdout    # empty fingerprint never current
     assert "S4=stale" in out.stdout    # spec changed -> stale
+
+
+@pytest.mark.skipif(not INSTALL_SH.exists(), reason="install.sh missing")
+def test_install_sh_wires_gate_at_both_npm_sites() -> None:
+    text = INSTALL_SH.read_text()
+    fn = _extract_shell_function(text, "install_node_deps")
+
+    # Root site: lockfile preferred as the spec, gate consulted, marker
+    # written only in the npm-success arm.
+    assert 'root_spec="$INSTALL_DIR/package-lock.json"' in fn
+    assert 'root_marker="$INSTALL_DIR/node_modules/.npm-deps-fingerprint"' in fn
+    assert 'if npm_deps_current "$root_marker" "$root_fingerprint"' in fn
+    assert re.search(
+        r'if run_with_timeout "\$NODE_DEPS_TIMEOUT" npm install --silent; then\s*\n'
+        r'\s*write_npm_deps_marker "\$root_marker" "\$root_fingerprint"',
+        fn,
+    ), "root marker must be written only when npm install exits 0"
+
+    # TUI site: ui-tui has no lockfile today, so package.json is the spec
+    # (with a lockfile upgrade path); its marker also lives in the ROOT
+    # node_modules (workspaces hoist there; wiping node_modules must
+    # invalidate both gates).
+    assert 'tui_spec="$INSTALL_DIR/ui-tui/package.json"' in fn
+    assert 'tui_marker="$INSTALL_DIR/node_modules/.npm-deps-fingerprint-tui"' in fn
+    assert 'if npm_deps_current "$tui_marker" "$tui_fingerprint"' in fn
+    assert re.search(
+        r'if run_with_timeout "\$NODE_DEPS_TIMEOUT" npm install --silent; then\s*\n'
+        r'\s*write_npm_deps_marker "\$tui_marker" "\$tui_fingerprint"',
+        fn,
+    ), "tui marker must be written only when npm install exits 0"
+
+    # The Playwright block must NOT be inside the gate's else-branch: a
+    # skipped npm install still verifies the browser engine.
+    assert fn.index("npm_deps_current \"$root_marker\"") < fn.index("Playwright")
