@@ -3027,6 +3027,60 @@ You are Hermes Agent, an intelligent AI assistant created by Nous Research. You 
     }
 }
 
+# ----------------------------------------------------------------------------
+# npm-install fingerprint gate
+# ----------------------------------------------------------------------------
+# `npm install` at the repo root and in ui-tui re-walks the whole dependency
+# tree on every install/update. On Windows that is minutes of small-file I/O
+# amplified by AV real-time scanning -- even when NOTHING changed. Skip it
+# when a marker written on the last SUCCESSFUL install matches a fingerprint
+# of the dependency spec (lockfile when present, else package.json) plus the
+# Node MAJOR version (native-module ABI changes with Node major).
+#
+# Markers live INSIDE node_modules\ so deleting node_modules auto-invalidates,
+# and they are written only after npm exits 0 so a failed install can never
+# be skipped past. Everything is fail-open: no node, no spec, unreadable
+# marker -> empty fingerprint / $false -> npm install runs exactly as before.
+# Mirrors npm_deps_fingerprint()/npm_deps_current()/write_npm_deps_marker()
+# in scripts/install.sh -- keep the fingerprint format identical.
+
+function Get-NpmDepsFingerprint {
+    param([string]$SpecPath)
+    if (-not $SpecPath -or -not (Test-Path $SpecPath)) { return "" }
+    $nodeMajor = ""
+    try {
+        $v = (& node -v) 2>$null
+        if ($v -match '^v?(\d+)') { $nodeMajor = $Matches[1] }
+    } catch { return "" }
+    if (-not $nodeMajor) { return "" }
+    try {
+        $hash = (Get-FileHash -Path $SpecPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch { return "" }
+    return "v1 node=$nodeMajor sha256=$hash"
+}
+
+function Test-NpmDepsCurrent {
+    param([string]$MarkerPath, [string]$Fingerprint)
+    # An empty fingerprint is the fail-open signal; it never satisfies the gate.
+    if (-not $Fingerprint) { return $false }
+    if (-not $MarkerPath -or -not (Test-Path $MarkerPath)) { return $false }
+    try {
+        $stored = (Get-Content $MarkerPath -Raw -ErrorAction Stop).Trim()
+    } catch { return $false }
+    return ($stored -eq $Fingerprint)
+}
+
+function Write-NpmDepsMarker {
+    param([string]$MarkerPath, [string]$Fingerprint)
+    # Only called after npm exit 0. Best-effort: a write failure (e.g. the
+    # node_modules dir does not exist because npm installed elsewhere) just
+    # means the next run reinstalls -- fail-open, never throw.
+    if (-not $Fingerprint) { return }
+    try {
+        Set-Content -Path $MarkerPath -Value $Fingerprint -Encoding ASCII -ErrorAction Stop
+    } catch {}
+}
+
 function Install-NodeDeps {
     if (-not $HasNode) {
         # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME

@@ -171,3 +171,46 @@ def test_install_sh_wires_gate_at_both_npm_sites() -> None:
     # The Playwright block must NOT be inside the gate's else-branch: a
     # skipped npm install still verifies the browser engine.
     assert fn.index("npm_deps_current \"$root_marker\"") < fn.index("Playwright")
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None or not INSTALL_PS1.exists(),
+    reason="PowerShell unavailable; source-level assertions cover this case",
+)
+def test_ps_gate_round_trip(tmp_path: Path) -> None:
+    """Run the real shipped PowerShell helpers end-to-end against a stub node."""
+    text = INSTALL_PS1.read_text()
+    fns = "\n".join(_extract_ps_function(text, n) for n in PS_HELPERS)
+    fn_file = tmp_path / "fns.ps1"
+    fn_file.write_text(fns)
+
+    bindir = tmp_path / "stub-bin"
+    _write_node_stub(bindir, "v22.17.1")
+    lock = tmp_path / "package-lock.json"
+    lock.write_text('{"deps": 1}')
+    nm = tmp_path / "node_modules"
+    nm.mkdir()
+    marker = nm / ".npm-deps-fingerprint"
+
+    script = f'''
+        $env:PATH = "{bindir}" + [IO.Path]::PathSeparator + $env:PATH
+        . "{fn_file}"
+        $fp = Get-NpmDepsFingerprint "{lock}"
+        if (-not ($fp -match '^v1 node=22 sha256=[0-9A-F]+$')) {{ throw "bad fingerprint: [$fp]" }}
+        if (Test-NpmDepsCurrent "{marker}" $fp) {{ throw "current before any write" }}
+        Write-NpmDepsMarker "{marker}" $fp
+        if (-not (Test-NpmDepsCurrent "{marker}" $fp)) {{ throw "stale after write" }}
+        if (Test-NpmDepsCurrent "{marker}" "") {{ throw "empty fingerprint must never be current" }}
+        Set-Content -Path "{lock}" -Value '{{"deps": 2}}'
+        $fp2 = Get-NpmDepsFingerprint "{lock}"
+        if ($fp2 -eq $fp) {{ throw "fingerprint did not change with content" }}
+        if (Test-NpmDepsCurrent "{marker}" $fp2) {{ throw "current after content change" }}
+        if ((Get-NpmDepsFingerprint "{tmp_path}/missing.json") -ne "") {{ throw "missing spec must yield empty" }}
+        Write-Host "RESULT=OK"
+    '''
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "RESULT=OK" in proc.stdout
