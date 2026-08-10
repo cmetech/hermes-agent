@@ -53,6 +53,11 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_configuration import (
+    PluginConfigurationDescriptor,
+    load_plugin_configuration,
+    project_plugin_configuration,
+)
 from hermes_cli.plugin_services import (
     BACKGROUND_SERVICE_NAME_PATTERN,
     BackgroundServiceFactory,
@@ -324,6 +329,9 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Credential-free, statically parsed metadata. Plugin code is not imported
+    # to populate this field, so disabled plugins remain safe to inspect.
+    configuration: Optional[PluginConfigurationDescriptor] = None
 
 
 @dataclass
@@ -1951,6 +1959,11 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            configuration = None
+            if "config_schema" in data:
+                configuration = load_plugin_configuration(
+                    plugin_dir, data.get("config_schema")
+                )
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1963,6 +1976,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                configuration=configuration,
             )
         except Exception as exc:
             logger.warning(
@@ -2362,25 +2376,26 @@ class PluginManager:
         """Return a list of info dicts for all discovered plugins."""
         result: List[Dict[str, Any]] = []
         for key, loaded in sorted(self._plugins.items()):
-            result.append(
-                {
-                    "name": loaded.manifest.name,
-                    "key": loaded.manifest.key or loaded.manifest.name,
-                    "kind": loaded.manifest.kind,
-                    "version": loaded.manifest.version,
-                    "description": loaded.manifest.description,
-                    "source": loaded.manifest.source,
-                    "enabled": loaded.enabled,
-                    "tools": len(loaded.tools_registered),
-                    "hooks": len(loaded.hooks_registered),
-                    "middleware": len(loaded.middleware_registered),
-                    "commands": len(loaded.commands_registered),
-                    "background_services": len(
-                        loaded.background_services_registered
-                    ),
-                    "error": loaded.error,
-                }
-            )
+            item = {
+                "name": loaded.manifest.name,
+                "key": loaded.manifest.key or loaded.manifest.name,
+                "kind": loaded.manifest.kind,
+                "version": loaded.manifest.version,
+                "description": loaded.manifest.description,
+                "source": loaded.manifest.source,
+                "enabled": loaded.enabled,
+                "tools": len(loaded.tools_registered),
+                "hooks": len(loaded.hooks_registered),
+                "middleware": len(loaded.middleware_registered),
+                "commands": len(loaded.commands_registered),
+                "background_services": len(loaded.background_services_registered),
+                "error": loaded.error,
+            }
+            if loaded.manifest.configuration is not None:
+                item["configuration"] = project_plugin_configuration(
+                    loaded.manifest.configuration
+                )
+            result.append(item)
         return result
 
     # -----------------------------------------------------------------------

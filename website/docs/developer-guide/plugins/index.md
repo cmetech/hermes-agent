@@ -74,6 +74,74 @@ provides_hooks:
 
 This tells Hermes: "I'm a plugin called calculator, I provide tools and hooks." The `provides_tools` and `provides_hooks` fields are lists of what the plugin registers.
 
+### Optional static configuration descriptor
+
+A plugin that needs settings can reference an inert JSON descriptor from its
+manifest:
+
+```yaml
+name: calculator
+kind: standalone
+config_schema: config.schema.json
+```
+
+Hermes reads this file during discovery, including while the plugin is
+disabled. It does not import the plugin to do so. The descriptor path must name
+a regular, non-symlink file below the plugin directory. Invalid, oversized, or
+unsafe descriptors are ignored; the plugin remains discoverable.
+
+`config.schema.json` uses the bounded version 1 contract:
+
+```json
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "service_url",
+      "label": "Service URL",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "https://service.example.com",
+      "validation": {"format": "url", "max_length": 2048},
+      "readiness": true
+    },
+    {
+      "id": "access_token",
+      "label": "Access token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "documentation_url": "https://service.example.com/tokens",
+      "validation": {"min_length": 8},
+      "readiness": true
+    }
+  ],
+  "setup_actions": [
+    {
+      "id": "create-token",
+      "label": "Create an access token",
+      "interactive": true,
+      "documentation_url": "https://service.example.com/tokens"
+    }
+  ]
+}
+```
+
+Field `type` is one of `string`, `integer`, `number`, or `boolean`; `storage`
+is `setting` or `secret`. Optional field metadata includes `help`,
+`documentation_url`, `advanced`, `platforms`, and a `visible_when` predicate of
+the form `{"field": "other_id", "equals": <scalar>}`. Validation supports
+type-appropriate `min_length`, `max_length`, `pattern`, `enum`, `minimum`,
+`maximum`, and `format` (`url` or `path`). Defaults must match all declared
+validation and are forbidden for secrets.
+
+Setup actions are display metadata only: `id`, `label`, optional `help`,
+`interactive`, and `documentation_url`. Descriptors cannot declare commands,
+scripts, modules, callbacks, or other executable behavior. Plugin identity and
+activation remain in `plugin.yaml`; do not duplicate the plugin id or `kind` in
+the descriptor.
+
 Optional fields you could add:
 ```yaml
 author: Your Name
