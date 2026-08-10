@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import socket
 import threading
 import time
@@ -13,10 +14,13 @@ import pytest
 from hermes_cli.plugin_services import (
     BackgroundServiceHealth,
     BackgroundServiceHost,
+    BackgroundServiceRegistration,
     BackgroundServiceReloadBlocked,
 )
 from hermes_cli.plugin_configuration import (
+    PluginConfigurationError,
     PluginConfigurationDescriptor,
+    PluginConfigurationService,
     SetupActionMetadata,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -56,6 +60,103 @@ def _context(manager: PluginManager, *, key: str = "example/plugin") -> PluginCo
         PluginManifest(name="example", key=key, source="bundled"),
         manager,
     )
+
+
+def _write_runtime_background_plugin(home) -> None:
+    plugin = home / "plugins" / "runtime-background"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        json.dumps(
+            {
+                "name": "runtime-background",
+                "kind": "standalone",
+                "config_schema": "config.schema.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin / "config.schema.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "fields": [
+                    {
+                        "id": "origin",
+                        "label": "Origin",
+                        "type": "string",
+                        "storage": "setting",
+                        "required": True,
+                        "validation": {"format": "url"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "import threading\n"
+        "from hermes_cli.plugin_services import BackgroundServiceHealth\n"
+        "_context = None\n"
+        "factory_entered = threading.Event()\n"
+        "run_entered = threading.Event()\n"
+        "factory_values = []\n"
+        "class Service:\n"
+        "    def run(self, stop_event):\n"
+        "        run_entered.set()\n"
+        "        stop_event.wait()\n"
+        "    def health(self):\n"
+        "        return BackgroundServiceHealth(state='healthy', code='ready')\n"
+        "def runtime_configuration():\n"
+        "    return _context.configuration()\n"
+        "def register(ctx):\n"
+        "    global _context\n"
+        "    _context = ctx\n"
+        "    def factory(_service_context):\n"
+        "        try:\n"
+        "            factory_values.append(ctx.configuration().setting('origin'))\n"
+        "        except Exception as exc:\n"
+        "            factory_values.append(type(exc).__name__ + ':' + str(exc))\n"
+        "        factory_entered.set()\n"
+        "        return Service()\n"
+        "    ctx.register_background_service('service', factory, hosts={'web'})\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        json.dumps(
+            {"plugins": {"enabled": ["runtime-background"], "disabled": []}}
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_factory_publication_gate_blocks_construction_until_released() -> None:
+    publication = threading.Event()
+    factory_entered = threading.Event()
+    service = _BlockingService(threading.Event(), threading.Event())
+    registration = BackgroundServiceRegistration(
+        qualified_name="publication:service",
+        plugin="publication",
+        name="service",
+        factory=lambda _context: factory_entered.set() or service,
+        hosts=frozenset({"web"}),
+    )
+    host = BackgroundServiceHost(
+        (registration,),
+        host_kind="web",
+        host_instance_id="publication-host",
+        generation=1,
+        shutdown_timeout=1,
+        safe_mode=False,
+        factory_start_event=publication,
+    )
+
+    host.start()
+    assert factory_entered.is_set() is False
+
+    publication.set()
+    assert factory_entered.wait(timeout=1)
+    assert service.entered.wait(timeout=1)
+    assert host.shutdown(timeout=1)
 
 
 def test_registration_is_attributed_filtered_and_duplicate_safe() -> None:
@@ -385,6 +486,137 @@ def test_successful_hosted_reload_starts_next_generation_after_quiescence(
     assert replacements[0].generation == first.generation + 1
     assert new.entered.wait(timeout=1)
     assert replacements[0].shutdown(timeout=1)
+
+
+def test_real_plugin_reload_publishes_configuration_before_replacement_factory(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_cli.plugins as plugins_module
+
+    home = tmp_path / "profile"
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins_module, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(
+        PluginManager, "_scan_entry_points", lambda self, **_kwargs: []
+    )
+    _write_runtime_background_plugin(home)
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    PluginConfigurationService(manager).update(
+        "runtime-background", settings={"origin": "https://profile.invalid"}
+    )
+    old_module = manager._plugins["runtime-background"].module
+    first = manager.start_background_services("web")
+    assert old_module.factory_entered.wait(timeout=1)
+    assert old_module.run_entered.wait(timeout=1)
+    assert old_module.factory_values == ["https://profile.invalid"]
+
+    replacements = manager.reload_background_services(timeout=1)
+    current_module = manager._plugins["runtime-background"].module
+
+    assert current_module is not old_module
+    assert current_module.factory_entered.wait(timeout=1)
+    assert current_module.run_entered.wait(timeout=1)
+    assert current_module.factory_values == ["https://profile.invalid"]
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        old_module.runtime_configuration()
+    assert first.snapshot()[0].lifecycle == "stopped"
+    assert replacements[0].shutdown(timeout=1)
+
+
+def test_failed_real_plugin_reload_keeps_partial_context_and_factory_unpublished(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_cli.plugins as plugins_module
+
+    home = tmp_path / "profile"
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins_module, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(
+        PluginManager, "_scan_entry_points", lambda self, **_kwargs: []
+    )
+    _write_runtime_background_plugin(home)
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    first = manager.start_background_services("web")
+    initial_module = manager._plugins["runtime-background"].module
+    assert initial_module.factory_entered.wait(timeout=1)
+    partial_module = []
+    manifest = manager._plugins["runtime-background"].manifest
+
+    def failed_discovery() -> None:
+        manager._load_plugin(manifest)
+        partial_module.append(manager._plugins["runtime-background"].module)
+        raise RuntimeError("reload discovery failed")
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", failed_discovery)
+    with pytest.raises(RuntimeError, match="reload discovery failed"):
+        manager.reload_background_services(timeout=1)
+
+    assert len(partial_module) == 1
+    assert partial_module[0].factory_entered.is_set() is False
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        partial_module[0].runtime_configuration()
+    assert manager._discovered is False
+    assert manager._discovery_profile_id is None
+    assert first.snapshot()[0].lifecycle == "stopped"
+
+
+def test_replacement_start_failure_releases_gate_without_factory_authority(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_cli.plugins as plugins_module
+
+    home = tmp_path / "profile"
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins_module, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(
+        PluginManager, "_scan_entry_points", lambda self, **_kwargs: []
+    )
+    _write_runtime_background_plugin(home)
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    initial = manager.start_background_services("web")
+    initial_module = manager._plugins["runtime-background"].module
+    assert initial_module.factory_entered.wait(timeout=1)
+    original_start = BackgroundServiceHost.start
+    launched = []
+
+    def start_then_fail(host) -> None:
+        launched.append(host)
+        original_start(host)
+        raise RuntimeError("replacement start failed")
+
+    monkeypatch.setattr(BackgroundServiceHost, "start", start_then_fail)
+    with pytest.raises(RuntimeError, match="replacement start failed"):
+        manager.reload_background_services(timeout=1)
+
+    partial_module = manager._plugins["runtime-background"].module
+    assert partial_module is not initial_module
+    assert partial_module.factory_entered.is_set() is False
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        partial_module.runtime_configuration()
+    assert manager._discovered is False
+    assert manager._discovery_profile_id is None
+    assert len(launched) == 1
+    assert launched[0].is_quiescent
+    assert all(snapshot.thread_alive is False for snapshot in launched[0].snapshot())
+    assert initial.snapshot()[0].lifecycle == "stopped"
 
 
 def test_successful_reload_rebinds_setup_actions_to_the_discovery_profile(

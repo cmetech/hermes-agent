@@ -166,12 +166,13 @@ def register(ctx):
     )
 ```
 
-`ctx.configuration()` returns an immutable accessor for only the fields in that
-plugin's descriptor. It resolves the current profile each time and fails closed
-for a stale plugin generation, disabled plugin, invalid stored value, missing
-value, unknown field, or wrong storage-class lookup. Do not call it at import
-time or cache the accessor or any returned credential across invocations. Never
-log, return, or include secret values in exceptions or tool results.
+`ctx.configuration()` returns an opaque, immutable accessor for only the fields
+in that plugin's descriptor. It does not expose an inspectable settings or
+secrets mapping. It resolves the current profile each time and fails closed for
+a stale plugin generation, disabled plugin, invalid stored value, missing value,
+unknown field, or wrong storage-class lookup. Do not call it at import time or
+cache the accessor or any returned credential across invocations. Never log,
+return, or include secret values in exceptions or tool results.
 
 Optional fields you could add:
 ```yaml

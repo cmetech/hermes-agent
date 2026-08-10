@@ -1686,6 +1686,7 @@ class PluginManager:
         *,
         shutdown_timeout: float,
         delivery_port=None,
+        factory_start_event: threading.Event | None = None,
     ) -> BackgroundServiceHost:
         self._background_service_generation += 1
         host = BackgroundServiceHost(
@@ -1697,6 +1698,7 @@ class PluginManager:
             safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
             delivery_port=delivery_port,
             on_quiescent=self._background_host_quiescent,
+            factory_start_event=factory_start_event,
         )
         self._background_service_hosts[host_kind] = host
         return host
@@ -1773,6 +1775,7 @@ class PluginManager:
         replacements: tuple[BackgroundServiceHost, ...] = ()
         registries_cleared = False
         discovery_profile_id = str(get_hermes_home().resolve())
+        factory_start_event = threading.Event()
         try:
             deadline = time.monotonic() + timeout
             for host in old_hosts:
@@ -1797,6 +1800,7 @@ class PluginManager:
                         host_kind,
                         shutdown_timeout=shutdown_timeout,
                         delivery_port=delivery_port,
+                        factory_start_event=factory_start_event,
                     )
                     for host_kind, shutdown_timeout, delivery_port in host_specs
                 )
@@ -1804,9 +1808,18 @@ class PluginManager:
                 replacement.start()
             with self._background_service_lock:
                 self._discovery_profile_id = discovery_profile_id
+                factory_start_event.set()
         except BaseException:
             if registries_cleared:
-                self._discovered = False
+                with self._background_service_lock:
+                    self._discovered = False
+                    self._discovery_profile_id = None
+            for replacement in replacements:
+                replacement.request_stop()
+            factory_start_event.set()
+            cleanup_deadline = time.monotonic() + timeout
+            for replacement in replacements:
+                replacement.await_stopped(deadline=cleanup_deadline)
             raise
         finally:
             with self._background_service_lock:

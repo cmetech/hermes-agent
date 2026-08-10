@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import subprocess
 import sys
@@ -585,6 +586,23 @@ def test_plugin_context_reads_its_current_profile_configuration_without_projecti
     safe_debug = f"{first!r} {first!s} {[first]}"
     assert "setting-sentinel" not in safe_debug
     assert "secret-sentinel" not in safe_debug
+    for member_name in (
+        "_setting_values",
+        "_secret_values",
+        "_PluginRuntimeConfiguration__setting_lookup",
+        "_PluginRuntimeConfiguration__secret_lookup",
+    ):
+        with pytest.raises(
+            AttributeError, match="^plugin runtime configuration member unavailable$"
+        ):
+            getattr(first, member_name)
+    inspected = inspect.getmembers(first)
+    assert {name for name, _value in inspected} == {"setting", "secret"}
+    inspected_debug = repr(inspected)
+    assert "setting-sentinel" not in inspected_debug
+    assert "secret-sentinel" not in inspected_debug
+    assert "setting-sentinel" not in repr((first, {"configuration": first}))
+    assert "secret-sentinel" not in repr((first, {"configuration": first}))
 
     service.update(
         "runtime-config-plugin",

@@ -5484,7 +5484,9 @@ upstream_changes:
   overlap_policy: owned_symbol
   files:
   - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugin_services.py
   - hermes_cli/plugins.py
+  - tests/hermes_cli/test_plugin_background_services.py
   - tests/hermes_cli/test_plugin_configuration_storage.py
   - tests/hermes_cli/test_plugins.py
   - website/docs/developer-guide/plugins/index.md
@@ -5492,6 +5494,9 @@ upstream_changes:
   - PluginRuntimeConfiguration
   - PluginContext.configuration
   - _runtime_configuration_for_context
+  - BackgroundServiceHost._factory_start_event
+  - BackgroundServiceHost._run_service
+  - PluginManager.reload_background_services
   owned_invariants:
   - an enabled configurable plugin resolves only its own descriptor-authorized
     validated settings and secrets through its already bound PluginContext identity
@@ -5502,18 +5507,24 @@ upstream_changes:
     fail closed with fixed credential-free diagnostics
   - runtime access preserves active profile file, external secret snapshot, installed
     context-local secret scope, and managed environment precedence
-  - immutable accessors, repr, equality, and exceptions do not project values, and
-    registry/model handler kwargs remain unchanged
+  - opaque immutable accessors expose no ordinary raw mapping, debug member, repr,
+    equality, or exception path that projects values, and registry/model handler kwargs
+    remain unchanged
+  - reload replacement factories remain behind a host-owned publication barrier until
+    the fully discovered profile generation stamp is atomically published; failed
+    discovery or replacement startup releases the barrier only for fail-closed cleanup
   tests:
+  - tests/hermes_cli/test_plugin_background_services.py
   - tests/hermes_cli/test_plugin_configuration_storage.py
   - tests/hermes_cli/test_plugins.py
   expected_commit_subject: 'feat(plugins): expose resolved runtime configuration'
   upstream_candidate: true
   merge_guidance: Keep public authority on PluginContext with no caller-supplied plugin
     identity. Resolve lazily per invocation through the existing validated profile and
-    secret authority chain. Do not expose a cross-plugin resolver, raw mutable mapping,
-    credential-bearing repr/error, process-environment fallback, or injected model/tool
-    dispatch argument.
+    secret authority chain. Keep replacement background factories blocked until the
+    complete discovery stamp is published. Do not expose a cross-plugin resolver, raw
+    or ordinarily inspectable mapping, credential-bearing repr/error,
+    process-environment fallback, or injected model/tool dispatch argument.
   removal_condition: Remove when upstream exposes an equivalent plugin-bound immutable
     active-profile runtime configuration accessor with exact discovery-generation,
     storage-class, validation, precedence, and non-projection guarantees.

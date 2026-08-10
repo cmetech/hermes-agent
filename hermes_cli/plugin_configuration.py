@@ -683,39 +683,63 @@ class PluginConfigurationError(ValueError):
 class PluginRuntimeConfiguration:
     """Immutable resolved values exposed only to their owning plugin context."""
 
-    __slots__ = ("_setting_values", "_secret_values")
+    __slots__ = ("__setting_lookup", "__secret_lookup")
 
     def __init__(
         self, setting_values: Mapping[str, Any], secret_values: Mapping[str, Any]
     ) -> None:
+        def lookup(values: Mapping[str, Any]):
+            snapshot = MappingProxyType(dict(values))
+
+            def resolve(field_id: str) -> Any:
+                if not isinstance(field_id, str) or field_id not in snapshot:
+                    raise PluginConfigurationError(
+                        "plugin configuration value unavailable"
+                    )
+                return snapshot[field_id]
+
+            return resolve
+
         object.__setattr__(
-            self, "_setting_values", MappingProxyType(dict(setting_values))
+            self,
+            "_PluginRuntimeConfiguration__setting_lookup",
+            lookup(setting_values),
         )
         object.__setattr__(
-            self, "_secret_values", MappingProxyType(dict(secret_values))
+            self,
+            "_PluginRuntimeConfiguration__secret_lookup",
+            lookup(secret_values),
         )
 
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"setting", "secret"}:
+            return object.__getattribute__(self, name)
+        raise AttributeError("plugin runtime configuration member unavailable")
+
     def __setattr__(self, _name: str, _value: Any) -> None:
-        raise AttributeError("plugin runtime configuration is immutable")
+        raise AttributeError("plugin runtime configuration member unavailable")
+
+    def __dir__(self) -> list[str]:
+        return ["setting", "secret"]
 
     def __repr__(self) -> str:
         return "PluginRuntimeConfiguration(<redacted>)"
 
-    @staticmethod
-    def _value(values: Mapping[str, Any], field_id: str) -> Any:
-        if not isinstance(field_id, str) or field_id not in values:
-            raise PluginConfigurationError("plugin configuration value unavailable")
-        return values[field_id]
-
     def setting(self, field_id: str) -> str | int | float | bool:
         """Return one descriptor-authorized, currently resolved setting."""
 
-        return self._value(self._setting_values, field_id)
+        lookup = object.__getattribute__(
+            self, "_PluginRuntimeConfiguration__setting_lookup"
+        )
+        return lookup(field_id)
 
     def secret(self, field_id: str) -> str | int | float | bool:
         """Return one descriptor-authorized, currently resolved secret."""
 
-        return self._value(self._secret_values, field_id)
+        lookup = object.__getattribute__(
+            self, "_PluginRuntimeConfiguration__secret_lookup"
+        )
+        return lookup(field_id)
 
 
 @dataclass(frozen=True)
