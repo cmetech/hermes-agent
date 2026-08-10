@@ -680,6 +680,44 @@ class PluginConfigurationError(ValueError):
     """Stable caller-facing error for connector configuration operations."""
 
 
+class PluginRuntimeConfiguration:
+    """Immutable resolved values exposed only to their owning plugin context."""
+
+    __slots__ = ("_setting_values", "_secret_values")
+
+    def __init__(
+        self, setting_values: Mapping[str, Any], secret_values: Mapping[str, Any]
+    ) -> None:
+        object.__setattr__(
+            self, "_setting_values", MappingProxyType(dict(setting_values))
+        )
+        object.__setattr__(
+            self, "_secret_values", MappingProxyType(dict(secret_values))
+        )
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("plugin runtime configuration is immutable")
+
+    def __repr__(self) -> str:
+        return "PluginRuntimeConfiguration(<redacted>)"
+
+    @staticmethod
+    def _value(values: Mapping[str, Any], field_id: str) -> Any:
+        if not isinstance(field_id, str) or field_id not in values:
+            raise PluginConfigurationError("plugin configuration value unavailable")
+        return values[field_id]
+
+    def setting(self, field_id: str) -> str | int | float | bool:
+        """Return one descriptor-authorized, currently resolved setting."""
+
+        return self._value(self._setting_values, field_id)
+
+    def secret(self, field_id: str) -> str | int | float | bool:
+        """Return one descriptor-authorized, currently resolved secret."""
+
+        return self._value(self._secret_values, field_id)
+
+
 @dataclass(frozen=True)
 class SetupActionContext:
     """Bounded host-owned context passed to one explicitly invoked action."""
@@ -1461,6 +1499,49 @@ class PluginConfigurationService:
         if run.error is not None:
             result["error"] = run.error
         return result
+
+
+def _runtime_configuration_for_context(
+    manifest: Any, manager: Any
+) -> PluginRuntimeConfiguration:
+    """Resolve one context's own values from the current discovered generation."""
+
+    unavailable = "plugin runtime configuration unavailable"
+    try:
+        profile_id = PluginConfigurationService._profile_id()
+        plugin_id = manifest.key or manifest.name
+        loaded = manager._plugins.get(plugin_id)
+        if (
+            manager._discovered is not True
+            or manager._discovery_profile_id != profile_id
+            or loaded is None
+            or loaded.manifest is not manifest
+            or loaded.module is None
+            or loaded.enabled is not True
+            or loaded.error is not None
+            or manifest.configuration is None
+        ):
+            raise PluginConfigurationError(unavailable)
+
+        service = PluginConfigurationService(manager)
+        if not service._is_enabled(loaded):
+            raise PluginConfigurationError(unavailable)
+        resolved, invalid = service._resolved(plugin_id, loaded)
+        if invalid:
+            raise PluginConfigurationError(unavailable)
+
+        settings: dict[str, Any] = {}
+        secrets: dict[str, Any] = {}
+        for field in manifest.configuration.fields:
+            if field.id not in resolved:
+                continue
+            target = secrets if field.storage is FieldStorage.SECRET else settings
+            target[field.id] = resolved[field.id]
+        return PluginRuntimeConfiguration(settings, secrets)
+    except PluginConfigurationError:
+        raise
+    except Exception:
+        raise PluginConfigurationError(unavailable) from None
 
 
 _configuration_service: PluginConfigurationService | None = None

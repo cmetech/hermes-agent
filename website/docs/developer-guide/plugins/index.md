@@ -148,6 +148,31 @@ the descriptor. Labels and help text cannot contain terminal or Unicode format
 controls, and `documentation_url` must be an HTTP or HTTPS URL with an
 authority/host.
 
+Enabled plugin code reads its own validated values lazily through the context:
+
+```python
+def register(ctx):
+    def read_service(args, **kwargs):
+        configuration = ctx.configuration()  # resolve for this invocation
+        service_url = configuration.setting("service_url")
+        access_token = configuration.secret("access_token")
+        return call_service(service_url, access_token, args)
+
+    ctx.register_tool(
+        name="read_service",
+        toolset="service",
+        schema=READ_SERVICE_SCHEMA,
+        handler=read_service,
+    )
+```
+
+`ctx.configuration()` returns an immutable accessor for only the fields in that
+plugin's descriptor. It resolves the current profile each time and fails closed
+for a stale plugin generation, disabled plugin, invalid stored value, missing
+value, unknown field, or wrong storage-class lookup. Do not call it at import
+time or cache the accessor or any returned credential across invocations. Never
+log, return, or include secret values in exceptions or tool results.
+
 Optional fields you could add:
 ```yaml
 author: Your Name

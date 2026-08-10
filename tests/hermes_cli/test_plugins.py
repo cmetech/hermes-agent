@@ -713,6 +713,48 @@ class TestPluginContext:
     """Tests for the PluginContext facade."""
 
 
+    def test_runtime_configuration_is_not_injected_into_tool_dispatch_kwargs(self):
+        """Plugin configuration stays an explicit plugin-owned lazy lookup."""
+        from tools.registry import registry
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="runtime-config-plugin", source="user"), manager
+        )
+        calls = []
+        context.register_tool(
+            name="_runtime_configuration_dispatch_probe",
+            toolset="runtime-config-plugin",
+            schema={
+                "name": "_runtime_configuration_dispatch_probe",
+                "description": "Probe dispatch context.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: calls.append((args, kwargs))
+            or '{"ok": true}',
+        )
+        try:
+            result = registry.dispatch(
+                "_runtime_configuration_dispatch_probe",
+                {"value": 1},
+                task_id="task-1",
+                session_id="session-1",
+                user_task="user request",
+            )
+        finally:
+            registry.deregister("_runtime_configuration_dispatch_probe")
+
+        assert result == '{"ok": true}'
+        assert calls == [
+            (
+                {"value": 1},
+                {
+                    "task_id": "task-1",
+                    "session_id": "session-1",
+                    "user_task": "user request",
+                },
+            )
+        ]
 
 
     def test_register_tool_override_blocked_without_operator_opt_in(self, tmp_path, monkeypatch):

@@ -5478,3 +5478,43 @@ upstream_changes:
     service and tool admission, authenticated scoped drift identity, same-snapshot
     sealing, active-claim-safe prelaunch revalidation, and exact legacy snapshot behavior.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: plugin-runtime-configuration-access
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugins.py
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugins.py
+  - website/docs/developer-guide/plugins/index.md
+  owned_symbols:
+  - PluginRuntimeConfiguration
+  - PluginContext.configuration
+  - _runtime_configuration_for_context
+  owned_invariants:
+  - an enabled configurable plugin resolves only its own descriptor-authorized
+    validated settings and secrets through its already bound PluginContext identity
+  - each call resolves the current context-local profile and current successful
+    discovery generation without caching credentials at import or registration time
+  - stale generations, different profiles, disabled or descriptor-free plugins, invalid
+    persisted values, missing values, wrong storage classes, and arbitrary field ids
+    fail closed with fixed credential-free diagnostics
+  - runtime access preserves active profile file, external secret snapshot, installed
+    context-local secret scope, and managed environment precedence
+  - immutable accessors, repr, equality, and exceptions do not project values, and
+    registry/model handler kwargs remain unchanged
+  tests:
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugins.py
+  expected_commit_subject: 'feat(plugins): expose resolved runtime configuration'
+  upstream_candidate: true
+  merge_guidance: Keep public authority on PluginContext with no caller-supplied plugin
+    identity. Resolve lazily per invocation through the existing validated profile and
+    secret authority chain. Do not expose a cross-plugin resolver, raw mutable mapping,
+    credential-bearing repr/error, process-environment fallback, or injected model/tool
+    dispatch argument.
+  removal_condition: Remove when upstream exposes an equivalent plugin-bound immutable
+    active-profile runtime configuration accessor with exact discovery-generation,
+    storage-class, validation, precedence, and non-projection guarantees.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

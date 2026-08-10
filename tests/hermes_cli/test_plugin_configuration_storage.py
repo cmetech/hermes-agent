@@ -108,6 +108,75 @@ def _service(tmp_path: Path, *, enabled: bool = True):
     return PluginConfigurationService(manager), manager
 
 
+def _runtime_plugins(home: Path, plugins: dict[str, list[dict] | None]):
+    """Discover real enabled plugins that retain their own PluginContext."""
+
+    plugin_root = home / "plugins"
+    plugin_root.mkdir(parents=True)
+    for plugin_id, fields in plugins.items():
+        root = plugin_root / plugin_id
+        root.mkdir()
+        manifest = {
+            "name": plugin_id,
+            "kind": "standalone",
+        }
+        if fields is not None:
+            manifest["config_schema"] = "config.schema.json"
+            (root / "config.schema.json").write_text(
+                json.dumps({"version": 1, "fields": fields}),
+                encoding="utf-8",
+            )
+        (root / "plugin.yaml").write_text(json.dumps(manifest), encoding="utf-8")
+        (root / "__init__.py").write_text(
+            "_context = None\n"
+            "def register(ctx):\n"
+            "    global _context\n"
+            "    _context = ctx\n"
+            "def runtime_configuration():\n"
+            "    return _context.configuration()\n",
+            encoding="utf-8",
+        )
+    (home / "config.yaml").write_text(
+        json.dumps({"plugins": {"enabled": sorted(plugins), "disabled": []}}),
+        encoding="utf-8",
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    modules = {name: manager._plugins[name].module for name in plugins}
+    assert all(module is not None for module in modules.values())
+    return manager, modules
+
+
+def _runtime_fields(*, prefix: str = "") -> list[dict]:
+    return [
+        {
+            "id": f"{prefix}origin",
+            "label": "Origin",
+            "type": "string",
+            "storage": "setting",
+            "required": True,
+            "validation": {"format": "url"},
+            "readiness": True,
+        },
+        {
+            "id": f"{prefix}pat",
+            "label": "Access token",
+            "type": "string",
+            "storage": "secret",
+            "required": True,
+            "validation": {"min_length": 4},
+            "readiness": True,
+        },
+        {
+            "id": f"{prefix}optional_path",
+            "label": "Optional path",
+            "type": "string",
+            "storage": "setting",
+            "validation": {"format": "path"},
+        },
+    ]
+
+
 def test_settings_and_write_only_secrets_use_active_profile_stores(
     tmp_path, monkeypatch
 ):
@@ -489,3 +558,249 @@ def test_managed_scope_targeted_noop_raises_stable_service_error(tmp_path, monke
     monkeypatch.setattr("hermes_cli.managed_scope.is_env_managed", lambda key: True)
     with pytest.raises(PluginConfigurationError, match="could not be persisted"):
         service.update("sample-connector", secrets={"token": "valid-token"})
+
+
+def test_plugin_context_reads_its_current_profile_configuration_without_projection(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager, modules = _runtime_plugins(
+        home, {"runtime-config-plugin": _runtime_fields()}
+    )
+    service = PluginConfigurationService(manager)
+    service.update(
+        "runtime-config-plugin",
+        settings={"origin": "https://setting-sentinel.invalid"},
+        secrets={"pat": "secret-sentinel-value"},
+    )
+
+    first = modules["runtime-config-plugin"].runtime_configuration()
+
+    assert first.setting("origin") == "https://setting-sentinel.invalid"
+    assert first.secret("pat") == "secret-sentinel-value"
+    assert not hasattr(first, "__dict__")
+    with pytest.raises(AttributeError):
+        first.new_value = "mutable"
+    safe_debug = f"{first!r} {first!s} {[first]}"
+    assert "setting-sentinel" not in safe_debug
+    assert "secret-sentinel" not in safe_debug
+
+    service.update(
+        "runtime-config-plugin",
+        settings={"origin": "https://fresh-setting.invalid"},
+        secrets={"pat": "fresh-secret-value"},
+    )
+    second = modules["runtime-config-plugin"].runtime_configuration()
+    assert second is not first
+    assert second != first
+    assert second.setting("origin") == "https://fresh-setting.invalid"
+    assert second.secret("pat") == "fresh-secret-value"
+    assert first.setting("origin") == "https://setting-sentinel.invalid"
+
+
+def test_plugin_context_profile_switch_and_reload_reject_stale_generation(
+    tmp_path, monkeypatch
+):
+    home_a = tmp_path / "profile-a"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    manager_a, modules_a = _runtime_plugins(
+        home_a, {"runtime-config-plugin": _runtime_fields()}
+    )
+    PluginConfigurationService(manager_a).update(
+        "runtime-config-plugin",
+        settings={"origin": "https://profile-a.invalid"},
+        secrets={"pat": "profile-a-secret"},
+    )
+    old_module_a = modules_a["runtime-config-plugin"]
+    assert (
+        old_module_a.runtime_configuration().setting("origin")
+        == "https://profile-a.invalid"
+    )
+
+    home_b = tmp_path / "profile-b"
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    manager_b, modules_b = _runtime_plugins(
+        home_b, {"runtime-config-plugin": _runtime_fields()}
+    )
+    PluginConfigurationService(manager_b).update(
+        "runtime-config-plugin",
+        settings={"origin": "https://profile-b.invalid"},
+        secrets={"pat": "profile-b-secret"},
+    )
+
+    with pytest.raises(PluginConfigurationError) as stale_profile:
+        old_module_a.runtime_configuration()
+    assert str(stale_profile.value) == "plugin runtime configuration unavailable"
+    assert "profile-a" not in str(stale_profile.value)
+    assert "profile-b" not in str(stale_profile.value)
+    assert (
+        modules_b["runtime-config-plugin"].runtime_configuration().secret("pat")
+        == "profile-b-secret"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    manager_a.discover_and_load(force=True)
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        old_module_a.runtime_configuration()
+    current_module_a = manager_a._plugins["runtime-config-plugin"].module
+    assert (
+        current_module_a.runtime_configuration().setting("origin")
+        == "https://profile-a.invalid"
+    )
+
+
+def test_plugin_context_fails_closed_for_disabled_descriptor_free_and_invalid_state(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.config import load_config, save_config
+
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager, modules = _runtime_plugins(
+        home,
+        {
+            "configured-plugin": _runtime_fields(),
+            "descriptor-free-plugin": None,
+        },
+    )
+    service = PluginConfigurationService(manager)
+    service.update(
+        "configured-plugin",
+        settings={"origin": "https://valid.invalid"},
+        secrets={"pat": "valid-secret"},
+    )
+
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        modules["descriptor-free-plugin"].runtime_configuration()
+
+    config = load_config()
+    config["plugins"]["enabled"] = ["descriptor-free-plugin"]
+    save_config(config, preserve_keys={("plugins", "enabled")})
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        modules["configured-plugin"].runtime_configuration()
+
+    config = load_config()
+    config["plugins"]["enabled"] = ["configured-plugin", "descriptor-free-plugin"]
+    config["plugins"].setdefault("entries", {}).setdefault(
+        "configured-plugin", {}
+    ).setdefault("settings", {})["origin"] = "not-an-http-origin"
+    save_config(
+        config,
+        preserve_keys={
+            ("plugins", "enabled"),
+            ("plugins", "entries", "configured-plugin", "settings", "origin"),
+        },
+    )
+    with pytest.raises(
+        PluginConfigurationError, match="^plugin runtime configuration unavailable$"
+    ):
+        modules["configured-plugin"].runtime_configuration()
+
+
+def test_plugin_context_lookup_is_storage_authorized_and_cross_plugin_isolated(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager, modules = _runtime_plugins(
+        home,
+        {
+            "first-plugin": _runtime_fields(),
+            "second-plugin": _runtime_fields(prefix="other_"),
+            "unconfigured-plugin": _runtime_fields(prefix="missing_"),
+        },
+    )
+    service = PluginConfigurationService(manager)
+    service.update(
+        "first-plugin",
+        settings={"origin": "https://first.invalid"},
+        secrets={"pat": "first-secret-sentinel"},
+    )
+    service.update(
+        "second-plugin",
+        settings={"other_origin": "https://second.invalid"},
+        secrets={"other_pat": "second-secret-sentinel"},
+    )
+    configuration = modules["first-plugin"].runtime_configuration()
+
+    for getter, field_id in (
+        (configuration.setting, "pat"),
+        (configuration.secret, "origin"),
+        (configuration.setting, "optional_path"),
+        (configuration.setting, "arbitrary.setting"),
+        (configuration.secret, "ARBITRARY_ENV"),
+        (configuration.setting, "other_origin"),
+        (configuration.secret, "other_pat"),
+    ):
+        with pytest.raises(PluginConfigurationError) as unavailable:
+            getter(field_id)
+        assert str(unavailable.value) == "plugin configuration value unavailable"
+        assert field_id not in str(unavailable.value)
+        assert "first-secret-sentinel" not in repr(unavailable.value)
+        assert "second-secret-sentinel" not in repr(unavailable.value)
+
+    unconfigured = modules["unconfigured-plugin"].runtime_configuration()
+    for getter, field_id in (
+        (unconfigured.setting, "missing_origin"),
+        (unconfigured.secret, "missing_pat"),
+    ):
+        with pytest.raises(PluginConfigurationError) as unavailable:
+            getter(field_id)
+        assert str(unavailable.value) == "plugin configuration value unavailable"
+
+
+def test_plugin_context_secret_resolution_preserves_host_authority_precedence(
+    tmp_path, monkeypatch
+):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_cli.plugin_configuration import _secret_storage_key
+
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager, modules = _runtime_plugins(
+        home, {"runtime-config-plugin": _runtime_fields()}
+    )
+    service = PluginConfigurationService(manager)
+    service.update(
+        "runtime-config-plugin",
+        settings={"origin": "https://valid.invalid"},
+        secrets={"pat": "profile-file-secret"},
+    )
+    key = _secret_storage_key("runtime-config-plugin", "pat")
+
+    assert (
+        modules["runtime-config-plugin"].runtime_configuration().secret("pat")
+        == "profile-file-secret"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.get_secret_source_values",
+        lambda selected_home: {key: "external-secret"},
+    )
+    assert (
+        modules["runtime-config-plugin"].runtime_configuration().secret("pat")
+        == "external-secret"
+    )
+
+    scope_token = set_secret_scope({key: "installed-scope-secret"})
+    try:
+        assert (
+            modules["runtime-config-plugin"].runtime_configuration().secret("pat")
+            == "installed-scope-secret"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.load_managed_env",
+            lambda: {key: "managed-secret"},
+        )
+        assert (
+            modules["runtime-config-plugin"].runtime_configuration().secret("pat")
+            == "managed-secret"
+        )
+    finally:
+        reset_secret_scope(scope_token)

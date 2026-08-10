@@ -55,6 +55,8 @@ from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 from hermes_cli.plugin_configuration import (
     PluginConfigurationDescriptor,
+    PluginRuntimeConfiguration,
+    _runtime_configuration_for_context,
     load_plugin_configuration,
     project_plugin_configuration,
 )
@@ -462,6 +464,16 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    def configuration(self) -> PluginRuntimeConfiguration:
+        """Resolve this plugin's validated values for the active profile.
+
+        Resolution is intentionally lazy: handlers should call this method for
+        each invocation rather than retaining credentials across calls or
+        profile generations.
+        """
+
+        return _runtime_configuration_for_context(self.manifest, self._manager)
 
     # -- host-owned background services ------------------------------------
 
