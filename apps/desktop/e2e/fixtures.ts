@@ -365,6 +365,8 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  /** Prepare profile-local state before the real Hermes backend starts. */
+  prepareHermesHome?: (hermesHome: string) => Promise<void> | void
 }
 
 /**
@@ -392,6 +394,14 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
     options.modelContextLength,
   )
   writeEnvFile(sandbox.hermesHome)
+
+  try {
+    await options.prepareHermesHome?.(sandbox.hermesHome)
+  } catch (error) {
+    await mock.close()
+    sandbox.cleanup()
+    throw error
+  }
 
   // 3. Build env + launch
   const env = buildAppEnv(sandbox)

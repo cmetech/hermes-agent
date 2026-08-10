@@ -29,3 +29,9 @@ export interface ActivityBoardModel {
   source: 'kanban' | 'workflow'
   stale: boolean
 }
+
+export interface ActivityBoardLaneCopy {
+  collapse: (lane: string) => string
+  empty: string
+  expand: (lane: string) => string
+}

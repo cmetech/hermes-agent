@@ -7,6 +7,18 @@ describe('escape-layers', () => {
     expect(isTopEscapeLayer(ESCAPE_PRIORITY.narrowOverlay)).toBe(true)
   })
 
+  it('keeps the workflow drawer below every shell overlay', () => {
+    const releaseDrawer = pushEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)
+    expect(isTopEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)).toBe(true)
+
+    const releaseNarrow = pushEscapeLayer(ESCAPE_PRIORITY.narrowOverlay)
+    expect(isTopEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)).toBe(false)
+
+    releaseNarrow()
+    expect(isTopEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)).toBe(true)
+    releaseDrawer()
+  })
+
   it('a lower layer yields to a higher open one, and reclaims top when it closes', () => {
     const releaseOverlay = pushEscapeLayer(ESCAPE_PRIORITY.overlay)
 
