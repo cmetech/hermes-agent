@@ -11,6 +11,7 @@ interface SearchFieldProps {
   placeholder: string
   value: string
   onChange: (value: string) => void
+  disabled?: boolean
   /**
    * Data-driven placeholder suggestions ("Try \u201ccreative\u201d") — one is picked at
    * random per mount, the nudge that search understands more than names.
@@ -36,6 +37,7 @@ export function SearchField({
   placeholder,
   value,
   onChange,
+  disabled = false,
   hints,
   containerClassName,
   inputClassName,
@@ -56,13 +58,15 @@ export function SearchField({
 
   return (
     <div
+      aria-disabled={disabled || undefined}
       className={cn(
         // min-w-0 is load-bearing: without it the content-sized input sets the
         // container's flex min-width and the field bulldozes its siblings
         // instead of shrinking to fit its context.
         'inline-flex min-w-0 max-w-full items-center gap-1.5 border-b border-transparent px-0.5 transition-[color,border-color,opacity]',
         // Recede until the user reaches for it.
-        !value && 'opacity-30 focus-within:opacity-100',
+        !value && !disabled && 'opacity-30 focus-within:opacity-100',
+        disabled && 'pointer-events-none opacity-45',
         containerClassName
       )}
     >
@@ -74,19 +78,20 @@ export function SearchField({
           // text; min-w-0 lets it shrink back below content size when the
           // context is narrower — long queries scroll inside the field.
           // text-xs matches the form controls (Input/Select via controlVariants).
-          'h-7 min-w-0 max-w-full bg-transparent text-xs text-foreground [field-sizing:content] placeholder:text-muted-foreground focus:outline-none',
+          'h-7 min-w-0 max-w-full bg-transparent text-xs text-foreground [field-sizing:content] placeholder:text-muted-foreground focus:outline-none disabled:cursor-default',
           inputClassName
         )}
+        disabled={disabled}
         onChange={event => onChange(event.target.value)}
         placeholder={effectivePlaceholder}
         ref={inputRef}
         type="text"
         value={value}
       />
-      {trailingAction}
-      {loading ? (
+      {!disabled && trailingAction}
+      {!disabled && loading ? (
         <Loader2 className="pointer-events-none size-3.5 shrink-0 animate-spin text-muted-foreground/70" />
-      ) : value ? (
+      ) : !disabled && value ? (
         <Tip label={t.ui.search.clear}>
           <Button
             aria-label={t.ui.search.clear}

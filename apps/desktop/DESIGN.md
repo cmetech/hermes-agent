@@ -157,7 +157,8 @@ Notes:
   `Input` / `Textarea` / `SelectTrigger`. New text-entry controls compose it.
 - **`SearchField`** — borderless, underline-on-focus, auto-width. The only
   search input. Don't build boxed search bars; don't wrap it in a bordered tile.
-  Empty lists hide their search field.
+  Empty lists hide their search field. Future search surfaces may use its native
+  `disabled` state; never render an enabled no-op search control.
 - **`SegmentedControl`** — the choice control for small mutually-exclusive sets
   (color mode, tool-call display, usage period). Replaces radio piles and
   pill rows.

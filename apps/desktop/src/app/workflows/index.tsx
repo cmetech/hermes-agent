@@ -3,7 +3,9 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ActivityBoard } from '@/components/activity-board/activity-board'
+import type { ActivityBoardCard } from '@/components/activity-board/types'
 import { PageLoader } from '@/components/page-loader'
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import {
   executeWorkflowCleanup,
@@ -27,9 +29,10 @@ import { AttentionInbox } from './attention-inbox'
 import { WorkflowCatalog } from './catalog'
 import { cancelPendingWorkflowDetailQuery } from './detail-query'
 import { ReviewRunDialog } from './review-run-dialog'
-import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
 import { ViewWorkflowDialog } from './view-workflow-dialog'
+import { WorkflowRunDrawer } from './workflow-run-drawer'
+import { WorkflowViewHeader } from './workflow-view-header'
 
 function isConflict(error: unknown): boolean {
   if (typeof error === 'object' && error !== null && 'statusCode' in error) {
@@ -53,12 +56,19 @@ export function WorkflowsView() {
   const profile = requestProfile ?? 'default'
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
+  const paneVisible = usePaneVisible()
   const actionInFlight = useRef(false)
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  const pageRef = useRef<HTMLElement>(null)
+  const paneVisibleRef = useRef(paneVisible)
   const mounted = useRef(true)
   const reviewGeneration = useRef(0)
+  const runReturnFocusRef = useRef<HTMLButtonElement | null>(null)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [view, setView] = useState<WorkflowRunView>('workflows')
+
+  paneVisibleRef.current = paneVisible
 
   const [viewIntent, setViewIntent] = useState<null | {
     profile: string
@@ -261,8 +271,46 @@ export function WorkflowsView() {
     [nextCursor, runItems, runs.isError, t.operations.workflowScheduled, t.operations.workflows]
   )
 
-  if (view !== 'workflows' && runs.isLoading) {
-    return <PageLoader />
+  const loadedRunCount = model.columns.reduce((total, column) => total + column.cards.length, 0)
+
+  const openRunId = (runId: string, origin?: HTMLButtonElement) => {
+    runReturnFocusRef.current = origin ?? null
+    selectWorkflowRun(runId)
+  }
+
+  const openRun = (card: ActivityBoardCard, origin?: HTMLButtonElement) => openRunId(card.id, origin)
+
+  const closeRunDrawer = () => {
+    const target = runReturnFocusRef.current
+    const restoreFocus = pageRef.current?.contains(activeElement()) ?? false
+
+    runReturnFocusRef.current = null
+    selectWorkflowRun(null)
+
+    if (!restoreFocus) {
+      return
+    }
+
+    requestAnimationFrame(() => {
+      const focusOwner = activeElement()
+      const workflowsOwnFocus = focusOwner === document.body || (pageRef.current?.contains(focusOwner) ?? false)
+
+      if (!paneVisibleRef.current || !workflowsOwnFocus) {
+        return
+      }
+
+      if (target?.isConnected) {
+        target.focus()
+      } else {
+        headingRef.current?.focus()
+      }
+    })
+  }
+
+  const changeView = (next: WorkflowRunView) => {
+    runReturnFocusRef.current = null
+    selectWorkflowRun(null)
+    setView(next)
   }
 
   if (view !== 'workflows' && runs.isError && !runs.data) {
@@ -279,85 +327,90 @@ export function WorkflowsView() {
         cleanupPreview.isPending ||
         cleanupExecute.isPending
       }
-      className={`min-w-0 overflow-x-hidden py-6 ${PAGE_INSET_X}`}
+      className={`relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden py-6 ${PAGE_INSET_X}`}
+      ref={pageRef}
     >
-      <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
-      <div aria-label={t.operations.workflowViews} className="mb-4 flex gap-2" role="tablist">
-        {(['workflows', 'board', 'history', 'archive'] as const).map(candidate => (
-          <Button
-            aria-selected={view === candidate}
-            key={candidate}
-            onClick={() => {
-              setView(candidate)
-              selectWorkflowRun(null)
-            }}
-            role="tab"
-            size="sm"
-            variant={view === candidate ? 'default' : 'secondary'}
-          >
-            {candidate === 'workflows'
-              ? t.operations.workflows
-              : candidate === 'board'
-                ? t.operations.activeBoard
-                : candidate === 'history'
-                  ? t.operations.history
-                  : t.operations.archive}
-          </Button>
-        ))}
-      </div>
+      <WorkflowViewHeader
+        headingRef={headingRef}
+        loadedRunCount={loadedRunCount}
+        onViewChange={changeView}
+        view={view}
+      />
       {view === 'workflows' ? (
-        <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} />
+        <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
+          <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} />
+        </div>
       ) : (
-        <>
-          <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
-          <ActivityBoard
-            model={model}
-            onLoadMore={() => void runs.fetchNextPage()}
-            onOpenCard={card => selectWorkflowRun(card.id)}
-          />
-          {selected.data && (
-            <RunInspector
-              actionsDisabled={actionPending || mutation.isPending || selected.isError}
-              events={events.data?.events}
-              onAction={mutateRun}
-              run={selected.data}
-            />
-          )}
-        </>
-      )}
-      {(view === 'history' || view === 'archive') && (
-        <section aria-label={t.operations.cleanup} className="mt-6 border-t border-(--ui-border) pt-4">
-          <h2 className="text-sm font-medium">{t.operations.cleanup}</h2>
-          <p className="mt-1 text-xs text-(--ui-text-secondary)">{t.operations.cleanupExplanation}</p>
-          <Button
-            className="mt-3"
-            disabled={cleanupPreview.isPending || cleanupExecute.isPending}
-            onClick={() => cleanupPreview.mutate()}
-            size="sm"
-            variant="secondary"
-          >
-            {t.operations.inspectCleanupImpact}
-          </Button>
-          {cleanupPreview.data && (
-            <div className="mt-3 text-sm" role="status">
-              <p>{t.operations.cleanupImpact(cleanupPreview.data.run_ids.length, cleanupPreview.data.files)}</p>
-              {cleanupPreview.data.confirmation_token ? (
-                <Button
-                  className="mt-2"
-                  disabled={cleanupExecute.isPending}
-                  onClick={() => cleanupExecute.mutate(cleanupPreview.data!.confirmation_token!)}
-                  size="sm"
-                  variant="destructive"
-                >
-                  {t.operations.executeCleanup}
-                </Button>
-              ) : (
-                <p className="mt-1 text-(--ui-text-secondary)">{t.operations.cleanupBlocked}</p>
+        <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>
+          {runs.isLoading && !runs.data ? (
+            <PageLoader className="min-h-0 flex-1" />
+          ) : (
+            <>
+              <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
+              <div className="min-h-0 flex-1" data-workflow-board-shell>
+                <ActivityBoard
+                  collapseScope={view}
+                  laneCopy={{
+                    collapse: t.operations.workflowLaneCollapse,
+                    empty: t.operations.workflowLaneEmpty,
+                    expand: t.operations.workflowLaneExpand
+                  }}
+                  layout="collapsible-lanes"
+                  model={model}
+                  onLoadMore={() => void runs.fetchNextPage()}
+                  onOpenCard={openRun}
+                  selectedCardId={selectedRunId}
+                />
+              </div>
+              {(view === 'history' || view === 'archive') && (
+                <section aria-label={t.operations.cleanup} className="mt-6 shrink-0 border-t border-(--ui-border) pt-4">
+                  <h2 className="text-sm font-medium">{t.operations.cleanup}</h2>
+                  <p className="mt-1 text-xs text-(--ui-text-secondary)">{t.operations.cleanupExplanation}</p>
+                  <Button
+                    className="mt-3"
+                    disabled={cleanupPreview.isPending || cleanupExecute.isPending}
+                    onClick={() => cleanupPreview.mutate()}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    {t.operations.inspectCleanupImpact}
+                  </Button>
+                  {cleanupPreview.data && (
+                    <div className="mt-3 text-sm" role="status">
+                      <p>{t.operations.cleanupImpact(cleanupPreview.data.run_ids.length, cleanupPreview.data.files)}</p>
+                      {cleanupPreview.data.confirmation_token ? (
+                        <Button
+                          className="mt-2"
+                          disabled={cleanupExecute.isPending}
+                          onClick={() => cleanupExecute.mutate(cleanupPreview.data!.confirmation_token!)}
+                          size="sm"
+                          variant="destructive"
+                        >
+                          {t.operations.executeCleanup}
+                        </Button>
+                      ) : (
+                        <p className="mt-1 text-(--ui-text-secondary)">{t.operations.cleanupBlocked}</p>
+                      )}
+                    </div>
+                  )}
+                </section>
               )}
-            </div>
+            </>
           )}
-        </section>
+        </div>
       )}
+      {view !== 'workflows' && selectedRunId ? (
+        <WorkflowRunDrawer
+          actionsDisabled={actionPending || mutation.isPending || selected.isError}
+          error={selected.error}
+          events={events.data?.events}
+          loading={selected.isLoading}
+          onAction={mutateRun}
+          onClose={closeRunDrawer}
+          run={selected.data ?? null}
+          selectedRunId={selectedRunId}
+        />
+      ) : null}
       {reviewIntent ? (
         <ReviewRunDialog
           onClose={closeReview}
