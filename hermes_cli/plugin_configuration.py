@@ -41,6 +41,7 @@ _MAX_PLATFORMS = 16
 _MAX_CONNECTOR_INVENTORY = 256
 _MAX_CONNECTOR_RUNTIME_PLUGINS = 256
 _MAX_CONNECTOR_TOOLS = 4096
+_MAX_CONNECTOR_INVENTORY_VISITS = 4096
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _PLATFORM_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -1593,7 +1594,7 @@ def connector_capability_snapshot(
         registered_tool_names = registry.get_all_tool_names()
         try:
             static_inventory = manager.static_plugin_inventory(
-                max_visits=_MAX_CONNECTOR_INVENTORY
+                max_visits=_MAX_CONNECTOR_INVENTORY_VISITS
             )
         except PluginStaticInventoryCapacityError:
             return _connector_capacity_exceeded_snapshot()

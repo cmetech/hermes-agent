@@ -5434,9 +5434,11 @@ upstream_changes:
   - disabled plugin code remains unimported while static descriptor inventory,
     current runtime generation, backend readiness, and registered tools are bounded
     and fail closed
-  - snapshot inventory visits share one pre-sort budget across bundled, platform,
-    user, project, category-recursive, and descriptor-free entry-point records while
-    default runtime discovery precedence remains unchanged
+  - snapshot raw inventory visits share one finite pre-sort budget across bundled,
+    platform, user, project, category-recursive, and descriptor-free entry-point
+    records while default runtime discovery precedence remains unchanged
+  - the raw-visit budget is separate from the lower static-manifest result bound,
+    so realistic unrelated plugin breadth does not disable connector admission
   - snapshot readiness callbacks share the process-global configuration service's
     four worker slots, including callbacks that remain blocked after their timeout
   - fingerprints contain deterministic non-secret configuration identities and

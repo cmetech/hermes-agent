@@ -683,7 +683,7 @@ def test_connector_capability_snapshot_fails_closed_on_static_scan_capacity(
 
     bundled = tmp_path / "bundled"
     bundled.mkdir()
-    for index in range(257):
+    for index in range(4097):
         (bundled / f"empty-{index:03d}").mkdir()
     home = tmp_path / "home"
     (home / "plugins").mkdir(parents=True)
@@ -702,6 +702,50 @@ def test_connector_capability_snapshot_fails_closed_on_static_scan_capacity(
     assert first.ready_services == frozenset()
     assert first.available_tools == frozenset()
     assert len(first.fingerprint) == 64
+
+
+def test_connector_capability_snapshot_allows_raw_breadth_above_manifest_bound(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import connector_capability_snapshot
+    from tools.registry import registry
+
+    class EntryPoints(list):
+        def select(self, *, group):
+            return type(self)(ep for ep in self if ep.group == group)
+
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    home = tmp_path / "home"
+    (home / "plugins").mkdir(parents=True)
+    manager = plugins.PluginManager()
+    raw_entry_points = EntryPoints(
+        SimpleNamespace(
+            name=f"unrelated-{index}",
+            value="module:load",
+            group="unrelated.plugins",
+        )
+        for index in range(257)
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(
+        plugins.importlib.metadata,
+        "entry_points",
+        lambda: raw_entry_points,
+    )
+    monkeypatch.setattr(registry, "get_all_tool_names", lambda: ["read_file"])
+
+    snapshot = connector_capability_snapshot()
+
+    assert snapshot.ready_services == frozenset()
+    assert snapshot.available_tools == frozenset({"read_file"})
 
 
 def test_connector_capability_snapshots_share_the_four_worker_readiness_limit(
