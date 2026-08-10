@@ -388,3 +388,144 @@ def test_setup_readiness_callback_timeout_fails_closed(tmp_path, monkeypatch):
     assert elapsed < 0.5
     assert status["ready"] is False
     assert status["reasons"] == ["setup_required:auth"]
+
+
+def test_action_output_enforces_aggregate_byte_budget_during_projection(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "from collections.abc import Mapping\n"
+            "items_seen = 0\n"
+            "class ManyStrings(Mapping):\n"
+            "    def __len__(self): return 100\n"
+            "    def __iter__(self): return iter(())\n"
+            "    def __getitem__(self, key): raise KeyError(key)\n"
+            "    def items(self):\n"
+            "        global items_seen\n"
+            "        for index in range(100):\n"
+            "            items_seen += 1\n"
+            "            yield f'item-{index}', 'x' * 1000\n"
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: ManyStrings())\n"
+        ),
+    )
+
+    result = _wait(service, service.start_action("action-plugin", "auth")["run_id"])
+
+    assert result["status"] == "failed"
+    assert sys.modules["hermes_plugins.action_plugin"].items_seen < 100
+
+
+def test_context_local_secret_scope_is_delivered_to_setup_action(tmp_path, monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_cli.plugin_configuration import _secret_storage_key
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "process"))
+    profile_token = set_hermes_home_override(tmp_path / "profile")
+    try:
+        service, _, _ = _plugin(
+            tmp_path,
+            source=(
+                "def register(ctx):\n"
+                "    ctx.register_setup_action('auth', lambda run: "
+                "{'received': run.configuration['token'] == 'scope-only-secret'})\n"
+            ),
+        )
+        secret_token = set_secret_scope({
+            _secret_storage_key("action-plugin", "token"): "scope-only-secret"
+        })
+        try:
+            result = _wait(
+                service,
+                service.start_action("action-plugin", "auth")["run_id"],
+            )
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(profile_token)
+
+    assert result["status"] == "succeeded"
+    assert result["result"] == {"received": True}
+
+
+def test_connector_secret_authority_precedence_is_managed_scope_external_file(
+    tmp_path, monkeypatch
+):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_cli.plugin_configuration import _secret_storage_key
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "expected = ''\n"
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: "
+            "{'expected_won': run.configuration['token'] == expected})\n"
+        ),
+    )
+    service.update("action-plugin", secrets={"token": "profile-file-secret"})
+    key = _secret_storage_key("action-plugin", "token")
+    module = sys.modules["hermes_plugins.action_plugin"]
+
+    def assert_authority(value):
+        module.expected = value
+        result = _wait(
+            service,
+            service.start_action("action-plugin", "auth")["run_id"],
+        )
+        assert result["status"] == "succeeded"
+        assert result["result"] == {"expected_won": True}
+
+    assert_authority("profile-file-secret")
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.get_secret_source_values",
+        lambda home: {key: "external-secret"},
+    )
+    assert_authority("external-secret")
+
+    secret_token = set_secret_scope({key: "scoped-secret"})
+    try:
+        assert_authority("scoped-secret")
+    finally:
+        reset_secret_scope(secret_token)
+
+    monkeypatch.setattr(
+        "hermes_cli.managed_scope.load_managed_env",
+        lambda: {key: "managed-secret"},
+    )
+    secret_token = set_secret_scope({key: "scoped-secret"})
+    try:
+        assert_authority("managed-secret")
+    finally:
+        reset_secret_scope(secret_token)
+
+
+def test_new_profile_file_secret_fills_installed_scope_miss(tmp_path, monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: "
+            "{'file_seen': run.configuration['token'] == 'new-file-secret'})\n"
+        ),
+    )
+    secret_token = set_secret_scope({})
+    try:
+        service.update("action-plugin", secrets={"token": "new-file-secret"})
+        result = _wait(
+            service,
+            service.start_action("action-plugin", "auth")["run_id"],
+        )
+    finally:
+        reset_secret_scope(secret_token)
+
+    assert result["status"] == "succeeded"
+    assert result["result"] == {"file_seen": True}

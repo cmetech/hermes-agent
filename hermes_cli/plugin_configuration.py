@@ -722,6 +722,27 @@ _SENSITIVE_RESULT_PARTS = frozenset({
 })
 
 
+@dataclass
+class _ProjectionBudget:
+    """Shared traversal budget that prevents oversized intermediate results."""
+
+    nodes: int = 0
+    encoded_bytes: int = 0
+
+    def add_node(self) -> None:
+        self.nodes += 1
+        if self.nodes > _MAX_ACTION_NODES:
+            raise PluginConfigurationError("setup action output exceeded node limit")
+
+    def add_json_bytes(self, value: Any) -> None:
+        self.add_bytes(len(json.dumps(value, ensure_ascii=False).encode("utf-8")))
+
+    def add_bytes(self, amount: int) -> None:
+        self.encoded_bytes += amount
+        if self.encoded_bytes > _MAX_ACTION_RESULT_BYTES:
+            raise PluginConfigurationError("setup action output exceeded byte limit")
+
+
 def _secret_storage_key(plugin_id: str, field_id: str) -> str:
     """Return a collision-resistant env key without accepting caller key names."""
 
@@ -737,30 +758,34 @@ def _bounded_public_value(
     depth: int = 0,
     key: str = "",
     redactions: tuple[str, ...] = (),
-    budget: list[int] | None = None,
+    budget: _ProjectionBudget | None = None,
 ) -> Any:
     if budget is None:
-        budget = [0]
-    budget[0] += 1
-    if budget[0] > _MAX_ACTION_NODES:
-        raise PluginConfigurationError("setup action output exceeded node limit")
+        budget = _ProjectionBudget()
+    budget.add_node()
     if any(part in key.lower() for part in _SENSITIVE_RESULT_PARTS):
+        budget.add_json_bytes("[redacted]")
         return "[redacted]"
     if depth > _MAX_ACTION_DEPTH:
         raise PluginConfigurationError("setup action output exceeded depth limit")
     if value is None or type(value) in {bool, int}:
+        budget.add_json_bytes(value)
         return value
     if type(value) is float:
-        return value if math.isfinite(value) else None
+        projected_number = value if math.isfinite(value) else None
+        budget.add_json_bytes(projected_number)
+        return projected_number
     if isinstance(value, str):
         if len(value) > _MAX_ACTION_TEXT:
             raise PluginConfigurationError("setup action text exceeded limit")
         projected = value
         for secret in redactions:
             projected = projected.replace(secret, "[redacted]")
+        budget.add_json_bytes(projected)
         return projected
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
+        budget.add_bytes(2)  # opening and closing braces
         for index, (item_key, item_value) in enumerate(value.items()):
             if index >= _MAX_ACTION_COLLECTION:
                 raise PluginConfigurationError("setup action collection exceeded limit")
@@ -771,6 +796,8 @@ def _bounded_public_value(
             safe_key = item_key
             for secret in redactions:
                 safe_key = safe_key.replace(secret, "[redacted]")
+            budget.add_json_bytes(safe_key)
+            budget.add_bytes(2)  # colon and conservative comma allowance
             projected[safe_key] = _bounded_public_value(
                 item_value,
                 depth=depth + 1,
@@ -781,9 +808,11 @@ def _bounded_public_value(
         return projected
     if isinstance(value, (list, tuple)):
         projected_items = []
+        budget.add_bytes(2)  # opening and closing brackets
         for index, item in enumerate(value):
             if index >= _MAX_ACTION_COLLECTION:
                 raise PluginConfigurationError("setup action collection exceeded limit")
+            budget.add_bytes(1)  # conservative comma allowance
             projected_items.append(
                 _bounded_public_value(
                     item,
@@ -889,17 +918,15 @@ class PluginConfigurationService:
         return dict(settings) if isinstance(settings, Mapping) else {}
 
     def _resolved(self, plugin_id: str, loaded) -> tuple[dict[str, Any], set[str]]:
-        from hermes_cli.config import load_env
-
         stored = self._settings(plugin_id)
-        profile_env = load_env()
+        secret_values = self._profile_secret_values()
         resolved: dict[str, Any] = {}
         invalid: set[str] = set()
         for field in loaded.manifest.configuration.fields:
             present = False
             value = None
             if field.storage is FieldStorage.SECRET:
-                value = profile_env.get(_secret_storage_key(plugin_id, field.id))
+                value = secret_values.get(_secret_storage_key(plugin_id, field.id))
                 if value not in {None, ""}:
                     present = True
             elif field.id in stored:
@@ -914,6 +941,40 @@ class PluginConfigurationService:
                 else:
                     invalid.add(field.id)
         return resolved, invalid
+
+    @staticmethod
+    def _profile_secret_values() -> dict[str, str]:
+        """Merge credential authorities without consulting process-global env.
+
+        Lowest to highest precedence is the current profile file, its hydrated
+        external-secret snapshot, the installed context-local secret scope,
+        then administrator-managed env. A scope miss therefore observes a
+        newly persisted profile value, while an explicit scoped/external or
+        managed authority continues to override plaintext profile storage.
+        """
+        from agent.secret_scope import current_secret_scope
+        from hermes_cli import env_loader, managed_scope
+        from hermes_cli.config import load_env
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        values = load_env()
+        try:
+            values.update(env_loader.get_secret_source_values(home))
+        except Exception:
+            pass
+        scope = current_secret_scope()
+        if scope is not None:
+            values.update(scope)
+        try:
+            values.update(managed_scope.load_managed_env())
+        except Exception:
+            pass
+        return {
+            key: value
+            for key, value in values.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
 
     def detail(self, plugin_id: str, platform: str | None = None) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
