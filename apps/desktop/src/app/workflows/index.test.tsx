@@ -295,12 +295,40 @@ describe('WorkflowsView', () => {
 
     await renderView(client)
     const card = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    card.focus()
     fireEvent.click(card)
-    fireEvent.click(await screen.findByRole('button', { name: 'Close' }))
+    const close = await screen.findByRole('button', { name: 'Close' })
+    close.focus()
+    fireEvent.click(close)
 
     await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
     await waitFor(() => expect(globalThis.document.activeElement).toBe(card))
     expect(screen.queryByRole('complementary')).toBeNull()
+  })
+
+  it('does not restore Workflows focus when the drawer closes from another surface', async () => {
+    $workflowSelectedRunId.set(null)
+    getWorkflowRun.mockResolvedValue(run())
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    fireEvent.click(await screen.findByRole('button', { name: /Laptop diagnostic/ }))
+    await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })
+
+    const outside = document.createElement('button')
+    document.body.append(outside)
+
+    try {
+      outside.focus()
+      fireEvent.keyDown(window, { key: 'Escape' })
+
+      await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+      expect(document.activeElement).toBe(outside)
+    } finally {
+      outside.remove()
+    }
   })
 
   it('replaces a stale card origin when Attention opens another run', async () => {
@@ -335,7 +363,9 @@ describe('WorkflowsView', () => {
 
     const attentionOrigin = screen.getByRole('button', { name: 'Open run Second workflow' })
     fireEvent.click(attentionOrigin)
-    fireEvent.click(await screen.findByRole('button', { name: 'Close' }))
+    const close = await screen.findByRole('button', { name: 'Close' })
+    close.focus()
+    fireEvent.click(close)
 
     await waitFor(() => expect(globalThis.document.activeElement).toBe(attentionOrigin))
     expect(globalThis.document.activeElement).not.toBe(firstCard)

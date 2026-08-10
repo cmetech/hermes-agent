@@ -57,6 +57,7 @@ export function WorkflowsView() {
   const selectedRunId = useStore($workflowSelectedRunId)
   const actionInFlight = useRef(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
+  const pageRef = useRef<HTMLElement>(null)
   const mounted = useRef(true)
   const reviewGeneration = useRef(0)
   const runReturnFocusRef = useRef<HTMLButtonElement | null>(null)
@@ -276,9 +277,14 @@ export function WorkflowsView() {
 
   const closeRunDrawer = () => {
     const target = runReturnFocusRef.current
+    const restoreFocus = pageRef.current?.contains(activeElement()) ?? false
 
     runReturnFocusRef.current = null
     selectWorkflowRun(null)
+
+    if (!restoreFocus) {
+      return
+    }
 
     requestAnimationFrame(() => {
       if (target?.isConnected) {
@@ -301,6 +307,7 @@ export function WorkflowsView() {
 
   return (
     <main
+      ref={pageRef}
       aria-busy={
         runs.isFetching ||
         attention.isFetching ||

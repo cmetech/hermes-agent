@@ -2,7 +2,9 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { I18nProvider } from '@/i18n'
+import { ESCAPE_PRIORITY, pushEscapeLayer } from '@/lib/escape-layers'
 import type { WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowRunDrawer } from './workflow-run-drawer'
@@ -92,5 +94,38 @@ describe('WorkflowRunDrawer', () => {
     )
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(2)
+  })
+
+  it('yields Escape to a higher application layer', () => {
+    const onClose = vi.fn()
+    const releaseOverlay = pushEscapeLayer(ESCAPE_PRIORITY.overlay)
+
+    try {
+      render(
+        <I18nProvider configClient={null} initialLocale="en">
+          <WorkflowRunDrawer {...base} onClose={onClose} />
+        </I18nProvider>
+      )
+      fireEvent.keyDown(window, { key: 'Escape' })
+
+      expect(onClose).not.toHaveBeenCalled()
+    } finally {
+      releaseOverlay()
+    }
+  })
+
+  it('does not own Escape while its kept-alive pane is hidden', () => {
+    const onClose = vi.fn()
+
+    render(
+      <PaneVisibleContext.Provider value={false}>
+        <I18nProvider configClient={null} initialLocale="en">
+          <WorkflowRunDrawer {...base} onClose={onClose} />
+        </I18nProvider>
+      </PaneVisibleContext.Provider>
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(onClose).not.toHaveBeenCalled()
   })
 })

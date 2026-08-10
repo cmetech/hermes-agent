@@ -19,6 +19,7 @@
 
 // Higher number = closer to the user. Gaps leave room to slot new layers.
 export const ESCAPE_PRIORITY = {
+  workflowDrawer: 5,
   narrowOverlay: 10,
   layoutEdit: 20,
   zoneEditor: 30,

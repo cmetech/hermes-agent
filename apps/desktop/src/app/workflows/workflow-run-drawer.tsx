@@ -1,10 +1,12 @@
 import { useEffect } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
+import { ESCAPE_PRIORITY, isTopEscapeLayer, pushEscapeLayer } from '@/lib/escape-layers'
 import type { WorkflowRunSnapshot, WorkflowTimelineEvent } from '@/types/hermes'
 
 import { RunInspector } from './run-inspector'
@@ -32,10 +34,20 @@ export function WorkflowRunDrawer({
 }: WorkflowRunDrawerProps) {
   const { t } = useI18n()
   const copy = t.operations
+  const visible = usePaneVisible()
 
   useEffect(() => {
+    if (!visible) {
+      return
+    }
+
+    const releaseLayer = pushEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.defaultPrevented) {
+      if (
+        event.key !== 'Escape' ||
+        event.defaultPrevented ||
+        !isTopEscapeLayer(ESCAPE_PRIORITY.workflowDrawer)
+      ) {
         return
       }
 
@@ -46,8 +58,11 @@ export function WorkflowRunDrawer({
 
     window.addEventListener('keydown', onKeyDown)
 
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      releaseLayer()
+    }
+  }, [onClose, visible])
 
   const label = copy.workflowRunDrawerLabel(run?.workflow ?? selectedRunId)
 
