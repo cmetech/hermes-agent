@@ -199,6 +199,191 @@ afterEach(() => {
 })
 
 describe('WorkflowsView', () => {
+  it.each([
+    ['board', 'Active board'],
+    ['history', 'History'],
+    ['archive', 'Archive']
+  ] as const)('renders the %s view with collapsible lanes and disabled future controls', async (view, label) => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    fireEvent.click(screen.getByRole('tab', { name: label }))
+
+    expect(await screen.findByLabelText('1 loaded workflow run')).toBeTruthy()
+    expect(
+      screen.getByLabelText('Workflows activity board').querySelector('[data-layout="collapsible-lanes"]')
+    ).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Run filters coming soon' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('textbox', { name: 'Search runs — coming soon' }) as HTMLInputElement).disabled).toBe(true)
+    expect(listWorkflowRuns).toHaveBeenCalledWith(undefined, view)
+
+    const runView = screen.getByRole('main').querySelector('[data-workflow-run-view]')!
+    expect(runView.className).toContain('min-h-0')
+    expect(runView.className).toContain('flex-1')
+    expect(runView.className).toContain('overflow-hidden')
+    const boardShell = runView.querySelector('[data-workflow-board-shell]')!
+    expect(boardShell.className).toContain('min-h-0')
+    expect(boardShell.className).toContain('flex-1')
+    expect(boardShell.firstElementChild?.className).toContain('h-full')
+    expect(boardShell.querySelector('[data-layout="collapsible-lanes"]')?.className).toContain('flex-1')
+    expect(boardShell.querySelector('[data-lane-scroll]')?.className).toContain('overflow-y-auto')
+  })
+
+  it('keeps the catalog free of run-only toolbar controls', async () => {
+    $workflowSelectedRunId.set(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    expect(screen.queryByRole('textbox', { name: 'Search runs — coming soon' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Run filters coming soon' })).toBeNull()
+  })
+
+  it('opens selected run detail in a side drawer instead of below the board', async () => {
+    $workflowSelectedRunId.set(null)
+    getWorkflowRun.mockResolvedValue(run())
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    const card = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    fireEvent.click(card)
+
+    const drawer = await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })
+    expect(drawer.className).toContain('absolute')
+    expect(drawer.closest('main')).toBeTruthy()
+    expect(within(drawer).getByRole('complementary', { name: 'Laptop diagnostic run inspector' })).toBeTruthy()
+    expect(screen.getAllByRole('complementary')).toHaveLength(2)
+    expect(card.getAttribute('aria-expanded')).toBe('true')
+    expect(within(drawer).getByRole('tab', { name: 'Overview' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Timeline events' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Attempts' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Logs' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Outputs' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Verified artifacts' })).toBeTruthy()
+    expect(within(drawer).getByRole('tab', { name: 'Recovery' })).toBeTruthy()
+  })
+
+  it('closes the drawer, clears selected polling, and restores card focus', async () => {
+    $workflowSelectedRunId.set(null)
+    getWorkflowRun.mockResolvedValue(run())
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    const card = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    fireEvent.click(card)
+    fireEvent.click(await screen.findByRole('button', { name: 'Close' }))
+
+    await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(card))
+    expect(screen.queryByRole('complementary')).toBeNull()
+  })
+
+  it('replaces a stale card origin when Attention opens another run', async () => {
+    const runTwo = run({ run_id: 'run-2', workflow: 'Second workflow' })
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run(), runTwo], schema_version: 1 })
+    listWorkflowAttention.mockResolvedValue({
+      items: [
+        {
+          cause: 'Approval required',
+          health: 'user_wait',
+          kind: 'approval',
+          next_actions: ['approve'],
+          node_id: 'approval-1',
+          origin: 'workflow',
+          run_id: 'run-2',
+          state_version: 1,
+          status: 'paused',
+          updated_at: '2026-08-09T00:00:00Z',
+          workflow: 'Second workflow'
+        }
+      ],
+      next_cursor: null,
+      schema_version: 1
+    })
+    getWorkflowRun.mockImplementation((id: string) => Promise.resolve(id === 'run-2' ? runTwo : run()))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    const firstCard = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    fireEvent.click(firstCard)
+
+    const attentionOrigin = screen.getByRole('button', { name: 'Open run Second workflow' })
+    fireEvent.click(attentionOrigin)
+    fireEvent.click(await screen.findByRole('button', { name: 'Close' }))
+
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(attentionOrigin))
+    expect(globalThis.document.activeElement).not.toBe(firstCard)
+  })
+
+  it('keeps a selected-run failure inside a closeable drawer', async () => {
+    $workflowSelectedRunId.set(null)
+    getWorkflowRun.mockRejectedValue(new Error('detail failed'))
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    fireEvent.click(await screen.findByRole('button', { name: /Laptop diagnostic/ }))
+
+    const drawer = await screen.findByRole('complementary')
+    expect(await within(drawer).findByText('Could not load run details')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Laptop diagnostic/ })).toBeTruthy()
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('complementary')).toBeNull()
+  })
+
+  it('closes selected detail without stealing focus when navigation changes', async () => {
+    getWorkflowRun.mockResolvedValue(run())
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    expect(await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })).toBeTruthy()
+    const history = screen.getByRole('tab', { name: 'History' })
+    history.focus()
+    fireEvent.click(history)
+
+    expect($workflowSelectedRunId.get()).toBeNull()
+    expect(screen.queryByRole('complementary')).toBeNull()
+    expect(globalThis.document.activeElement).toBe(history)
+  })
+
+  it('resets the inspector to Overview when another run is selected', async () => {
+    const runTwo = run({ run_id: 'run-2', workflow: 'Second workflow' })
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run(), runTwo], schema_version: 1 })
+    getWorkflowRun.mockImplementation((id: string) => Promise.resolve(id === 'run-2' ? runTwo : run()))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    fireEvent.click(await screen.findByRole('button', { name: /Laptop diagnostic/ }))
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Logs' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('button', { name: /Second workflow/ }))
+
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Overview' }).getAttribute('data-state')).toBe('active'))
+  })
+
+  it('does not open a drawer when a background run-list refetch changes cards', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    listWorkflowRuns.mockResolvedValue({
+      next_cursor: null,
+      runs: [run(), run({ run_id: 'run-2', workflow: 'Background arrival' })],
+      schema_version: 1
+    })
+    await client.refetchQueries({ queryKey: ['workflow-runs', 'default', 'board'] })
+
+    expect($workflowSelectedRunId.get()).toBeNull()
+    expect(screen.queryByRole('complementary')).toBeNull()
+  })
+
   it('lists Workflows first and renders the catalog columns, rows, descriptions, and actions', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({

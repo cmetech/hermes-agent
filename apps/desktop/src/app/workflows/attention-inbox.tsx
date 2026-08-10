@@ -5,7 +5,7 @@ import { isLoopSignalConfirmation } from './run-inspector'
 
 interface AttentionInboxProps {
   items: WorkflowAttentionItem[]
-  onOpenRun: (runId: string) => void
+  onOpenRun: (runId: string, origin?: HTMLButtonElement) => void
 }
 
 function ageParts(updatedAt: string): { count: number; unit: 'day' | 'hour' | 'minute' } {
@@ -56,7 +56,7 @@ export function AttentionInbox({ items, onOpenRun }: AttentionInboxProps) {
               <button
                 aria-label={t.operations.openWorkflowRun(item.workflow)}
                 className="w-full min-w-0 rounded-md border border-(--ui-border) p-3 text-left hover:bg-(--ui-bg-hover)"
-                onClick={() => onOpenRun(item.run_id)}
+                onClick={event => onOpenRun(item.run_id, event.currentTarget)}
                 type="button"
               >
                 <span className="block truncate text-sm font-medium">{item.workflow}</span>
