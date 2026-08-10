@@ -255,6 +255,267 @@ def test_v3_condition_reuses_strict_reference_failures() -> None:
     assert absent.value.code == "output_reference_missing"
 
 
+@pytest.mark.parametrize(
+    ("operator", "left", "right", "expected"),
+    (
+        ("==", "release", "release", True),
+        ("!=", "release", "release", False),
+        ("==", "release", "draft", False),
+        ("!=", "release", "draft", True),
+        ("==", 1, 1, True),
+        ("==", 1.0, 1.0, True),
+        ("==", True, True, True),
+        ("==", None, None, True),
+        ("==", 1, 1.0, False),
+        ("!=", 1, 1.0, True),
+        ("==", 1, True, False),
+        ("!=", 1, True, True),
+    ),
+)
+def test_v3_condition_compares_output_references_as_exact_json_scalars(
+    operator: str,
+    left: object,
+    right: object,
+    expected: bool,
+) -> None:
+    """Catch value-only equality coercing distinct canonical JSON scalar types."""
+    outputs = {
+        "left": _resolved({"branch": left}, node_id="left"),
+        "right": _resolved({"branch": right}, node_id="right"),
+    }
+
+    assert evaluate_v3_condition(
+        f"$left.output.branch {operator} $right.output.branch", outputs
+    ) is expected
+
+
+def test_v3_condition_validation_returns_both_operand_references_in_source_order() -> None:
+    """Catch the RHS escaping dependency and structured-path compiler checks."""
+    expression = "$created.output.branch == $approved.output.branch"
+
+    references = validate_v3_condition_syntax(expression)
+
+    assert [
+        (reference.node_id, reference.path, expression[reference.start : reference.end])
+        for reference in references
+    ] == [
+        ("created", ("branch",), "$created.output.branch"),
+        ("approved", ("branch",), "$approved.output.branch"),
+    ]
+
+
+@pytest.mark.parametrize("operator", ("<", "<=", ">", ">="))
+def test_v3_condition_rejects_ordered_output_reference_comparisons(
+    operator: str,
+) -> None:
+    """Catch output references broadening into ordered cross-output comparisons."""
+    with pytest.raises(WorkflowConditionError) as exc:
+        validate_v3_condition_syntax(
+            f"$left.output.branch {operator} $right.output.branch"
+        )
+
+    assert exc.value.code == "condition_runtime_syntax_invalid"
+
+
+@pytest.mark.parametrize(
+    ("right", "code"),
+    (
+        (None, "output_reference_missing"),
+        (
+            WorkflowOutputReferenceError(
+                "output_reference_temporarily_unavailable", "right"
+            ),
+            "output_reference_temporarily_unavailable",
+        ),
+        (
+            WorkflowOutputReferenceError("output_reference_unavailable", "right"),
+            "output_reference_unavailable",
+        ),
+    ),
+)
+def test_v3_condition_rhs_reuses_bounded_output_availability_failures(
+    right: object,
+    code: str,
+) -> None:
+    """Catch missing or unpublished RHS outputs being collapsed to condition false."""
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        evaluate_v3_condition(
+            "$left.output == $right.output",
+            {"left": _resolved("release", node_id="left"), "right": right},
+        )
+
+    assert exc.value.code == code
+    assert len(str(exc.value).encode("utf-8")) <= 2_000
+
+
+@pytest.mark.parametrize(
+    ("right", "expression", "code"),
+    (
+        (
+            _resolved("release", node_id="right", structured=False),
+            "$left.output.branch == $right.output.branch",
+            "output_reference_not_structured",
+        ),
+        (
+            _resolved({"other": "release"}, node_id="right"),
+            "$left.output.branch == $right.output.branch",
+            "output_reference_field_missing",
+        ),
+    ),
+)
+def test_v3_condition_rhs_reuses_bounded_output_path_failures(
+    right: ResolvedNodeOutput,
+    expression: str,
+    code: str,
+) -> None:
+    """Catch invalid RHS paths being traversed or reported with operand values."""
+    with pytest.raises(WorkflowOutputReferenceError) as exc:
+        evaluate_v3_condition(
+            expression,
+            {
+                "left": _resolved({"branch": "release"}, node_id="left"),
+                "right": right,
+            },
+        )
+
+    assert exc.value.code == code
+    assert "release" not in str(exc.value)
+
+
+@pytest.mark.parametrize("right", (["release"], {"branch": "release"}))
+def test_v3_condition_rejects_container_rhs_without_deep_comparison(
+    right: object,
+) -> None:
+    """Catch recursive equality admitting unbounded canonical containers."""
+    with pytest.raises(WorkflowConditionError) as exc:
+        evaluate_v3_condition(
+            "$left.output == $right.output",
+            {
+                "left": _resolved("release", node_id="left"),
+                "right": _resolved(right, node_id="right"),
+            },
+        )
+
+    assert exc.value.code == "condition_operand_type"
+
+
+def test_v3_condition_rejects_corrupted_nonfinite_rhs() -> None:
+    """Catch corrupted RHS floats reaching equality or diagnostic rendering."""
+    right = _resolved(1, node_id="right")
+    object.__setattr__(right, "value", math.nan)
+
+    with pytest.raises(WorkflowConditionError) as exc:
+        evaluate_v3_condition(
+            "$left.output == $right.output",
+            {"left": _resolved(1, node_id="left"), "right": right},
+        )
+
+    assert exc.value.code == "condition_operand_nonfinite"
+
+
+def test_v3_condition_reference_rhs_preserves_logical_short_circuit() -> None:
+    """Catch unreachable RHS-reference clauses performing output resolution."""
+    resolved_nodes: list[str] = []
+    outputs = {
+        "left": _resolved("release", node_id="left"),
+        "right": _resolved("release", node_id="right"),
+    }
+
+    def resolve(node_id: str) -> object:
+        resolved_nodes.append(node_id)
+        if node_id not in outputs:
+            raise AssertionError("short-circuited reference was resolved")
+        return outputs[node_id]
+
+    assert evaluate_v3_condition(
+        "$left.output == $right.output || $missing.output == $also_missing.output",
+        resolve,
+    )
+    assert resolved_nodes == ["left", "right"]
+
+
+def test_v3_condition_compiler_rejects_rhs_outside_direct_dependencies(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch static condition validation checking only the left reference."""
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {"id": "created", "bash": "printf release"},
+            {"id": "approved", "bash": "printf release"},
+            {
+                "id": "write",
+                "bash": "true",
+                "depends_on": ["created"],
+                "when": "$created.output == $approved.output",
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow_snapshot(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+            normalizer_version=3,
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "output_reference_not_declared_dependency"
+    ]
+
+
+def test_v3_condition_compiler_rejects_impossible_rhs_structured_path(
+    tmp_path, workflow_writer
+) -> None:
+    """Catch RHS field paths bypassing the producer's structured output contract."""
+    output_format = {
+        "type": "object",
+        "properties": {"branch": {"type": "string"}},
+        "required": ["branch"],
+        "additionalProperties": False,
+    }
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                "id": "created",
+                "prompt": "create",
+                "output_format": output_format,
+            },
+            {
+                "id": "approved",
+                "prompt": "approve",
+                "output_format": output_format,
+            },
+            {
+                "id": "write",
+                "bash": "true",
+                "depends_on": ["created", "approved"],
+                "when": "$created.output.branch == $approved.output.missing",
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow_snapshot(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+            normalizer_version=3,
+        )
+
+    assert [issue.code for issue in exc.value.issues] == [
+        "structured_output_field_impossible"
+    ]
+
+
 def _start_archon_run(tmp_path, workflow_writer, *, name: str, nodes) -> tuple[RunStore, str]:
     package_path = workflow_writer(tmp_path / name, name=name, nodes=nodes)
     package_path.with_name(f"{package_path.stem}.hermes.yaml").write_text(
@@ -615,6 +876,66 @@ def test_v3_condition_reference_error_fails_before_consumer_executor(
     assert consumer["retry_consumed"] == 0
     assert result["last_error"]["code"] == "output_reference_missing"
     assert executed == ["source"]
+
+
+@pytest.mark.parametrize(
+    ("operator", "approved", "expected_state", "expected_attempts"),
+    (
+        ("==", "release", "succeeded", 1),
+        ("==", "approved", "skipped", 0),
+        ("!=", "release", "skipped", 0),
+        ("!=", "approved", "succeeded", 1),
+    ),
+)
+def test_v3_scheduler_durably_dispatches_from_direct_output_comparison(
+    tmp_path,
+    workflow_writer,
+    operator: str,
+    approved: str,
+    expected_state: str,
+    expected_attempts: int,
+) -> None:
+    """Catch compiler/runtime disagreement or non-durable condition transitions."""
+    store, run_id = _start_archon_run(
+        tmp_path,
+        workflow_writer,
+        name=f"condition-reference-{operator.replace('!', 'not')}-{approved}",
+        nodes=[
+            {"id": "created", "bash": "printf release"},
+            {"id": "approved", "bash": f"printf {approved}"},
+            {
+                "id": "write",
+                "bash": "true",
+                "depends_on": ["created", "approved"],
+                "when": f"$created.output {operator} $approved.output",
+            },
+        ],
+    )
+
+    result = RunScheduler(store).advance(run_id, max_nodes=10)
+
+    write = result["nodes"]["write"]
+    assert result["status"] == "succeeded"
+    assert write["state"] == expected_state
+    assert len(write["attempts"]) == expected_attempts
+    if expected_state == "skipped":
+        assert write["skip_reason"] == "condition_false"
+        assert any(
+            event["event_type"] == "node_skipped"
+            and event["node_id"] == "write"
+            for event in store.tail_events(run_id)
+        )
+    else:
+        assert any(
+            event["event_type"] == "node_succeeded"
+            and event["node_id"] == "write"
+            for event in store.tail_events(run_id)
+        )
+
+    (store.run_directory(run_id) / "run.json").unlink()
+    rebuilt = store.load_run(run_id)
+    assert rebuilt["nodes"]["write"]["state"] == expected_state
+    assert len(rebuilt["nodes"]["write"]["attempts"]) == expected_attempts
 
 
 def test_legacy_condition_adapter_keeps_json_reparse_and_type_behavior() -> None:

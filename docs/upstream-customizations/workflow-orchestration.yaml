@@ -5590,3 +5590,52 @@ upstream_changes:
     current-call admission with final tool/argument and exact registration identity
     binding across direct, middleware, helper, concurrent, sequential, and bridge paths.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-condition-output-comparison
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - plugins/workflow/conditions.py
+  - plugins/workflow/schema.py
+  - tests/plugins/workflow/test_phase3_conditions.py
+  - website/docs/user-guide/features/workflow-yaml-reference.md
+  - skills/software-development/workflow-builder/references/portable-schema.md
+  owned_symbols:
+  - _Clause
+  - _Expression.references
+  - _Parser._parse_clause
+  - _resolve_reference
+  - _canonical_scalar
+  - _evaluate_clause
+  - validate_v3_condition_syntax
+  - _validate_v3_static_output_references
+  owned_invariants:
+  - reference-to-reference comparisons are limited to equality and inequality
+    over direct dependencies using the existing bounded condition grammar
+  - both references are collected in source order and pass through the same
+    static dependency and structured-path validation
+  - runtime resolution uses the existing immutable output boundary and compares
+    only exact same-type canonical JSON scalars without numeric or boolean coercion
+  - containers, non-finite values, missing publications, and invalid paths fail
+    closed with bounded existing diagnostics that do not contain output values
+  - literal conditions, logical short-circuiting, schemaless output behavior,
+    historical normalizers, and durable scheduler transitions remain unchanged
+  tests:
+  - tests/plugins/workflow/test_phase3_conditions.py
+  - tests/plugins/workflow/test_strict_output_references.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_scheduler.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'feat(workflow): compare condition outputs'
+  upstream_candidate: true
+  merge_guidance: Preserve the sealed grammar and use validate_v3_condition_syntax
+    as the single condition-reference authority for static validation. Keep RHS
+    references equality-only, direct-dependency-bound, lazily resolved through
+    ResolvedNodeOutput, exact-type scalar-only, and free of connector-specific logic.
+    Do not add coercion, recursive container comparison, functions, arithmetic,
+    regex, optional references, or transitive dependencies.
+  removal_condition: Remove when upstream provides equivalent bounded output-to-output
+    equality with shared static reference validation, exact canonical scalar typing,
+    durable scheduler coverage, and unchanged historical condition behavior.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
