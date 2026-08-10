@@ -20,6 +20,7 @@ export interface ActivityBoardColumn {
   id: string
   label: string
   nextCursor: null | string
+  tone?: string
 }
 
 export interface ActivityBoardModel {

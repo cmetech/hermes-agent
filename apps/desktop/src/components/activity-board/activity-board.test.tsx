@@ -88,6 +88,39 @@ describe('ActivityBoard', () => {
     expect(screen.getByRole('button', { name: 'Run one, running' })).toBeTruthy()
   })
 
+  it('keeps explicit lane tones across collapsed and expanded lanes without replacing card health tones', () => {
+    const tonedModel = {
+      ...collapsibleModel,
+      columns: [
+        { ...collapsibleModel.columns[0]!, tone: 'var(--ui-blue)' },
+        { ...collapsibleModel.columns[1]!, tone: 'var(--ui-purple)' }
+      ]
+    } satisfies ActivityBoardModel
+
+    render(
+      <ActivityBoard
+        collapseScope="board"
+        laneCopy={laneCopy}
+        layout="collapsible-lanes"
+        model={tonedModel}
+        onLoadMore={vi.fn()}
+        onOpenCard={vi.fn()}
+      />
+    )
+
+    const collapsedQueued = screen.getByRole('region', { name: 'Queued, 0' })
+    expect(collapsedQueued.querySelector<HTMLElement>('span[style]')?.style.backgroundColor).toBe('var(--ui-blue)')
+
+    fireEvent.click(within(collapsedQueued).getByRole('button', { name: 'Expand Queued' }))
+
+    const expandedQueued = screen.getByRole('region', { name: 'Queued, 0' })
+    expect(expandedQueued.querySelector<HTMLElement>('header span[style]')?.style.backgroundColor).toBe('var(--ui-blue)')
+
+    const active = screen.getByRole('region', { name: 'Active, 1' })
+    expect(active.querySelector<HTMLElement>('header span[style]')?.style.backgroundColor).toBe('var(--ui-purple)')
+    expect(screen.getByRole('button', { name: 'Run one, running' }).style.borderLeftColor).toBe('var(--ui-green)')
+  })
+
   it('expands every lane when the entire board is empty', () => {
     const empty = {
       ...collapsibleModel,

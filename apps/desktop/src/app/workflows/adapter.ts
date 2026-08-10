@@ -2,11 +2,11 @@ import type { ActivityBoardColumn, ActivityBoardModel } from '@/components/activ
 import type { WorkflowRunSnapshot } from '@/types/hermes'
 
 const COLUMNS = [
-  ['queued', 'Queued'],
-  ['active', 'Active'],
-  ['attention', 'Needs attention'],
-  ['completed', 'Completed'],
-  ['stopped', 'Failed / stopped']
+  ['queued', 'Queued', 'var(--ui-blue)'],
+  ['active', 'Active', 'var(--ui-green)'],
+  ['attention', 'Needs attention', 'var(--ui-yellow)'],
+  ['completed', 'Completed', 'var(--ui-text-tertiary)'],
+  ['stopped', 'Failed / stopped', 'var(--ui-red)']
 ] as const
 
 const ORIGIN_ICONS: Record<string, string> = {
@@ -82,7 +82,7 @@ export function workflowBoardModel(
     scopeLabel: 'Workflows'
   }
 ): ActivityBoardModel {
-  const columns: ActivityBoardColumn[] = COLUMNS.map(([id, label]) => {
+  const columns: ActivityBoardColumn[] = COLUMNS.map(([id, label, tone]) => {
     const selected = runs.filter(run => columnId(run) === id)
 
     return {
@@ -126,7 +126,8 @@ export function workflowBoardModel(
       count: selected.length,
       id,
       label,
-      nextCursor: options.nextCursor ?? null
+      nextCursor: options.nextCursor ?? null,
+      tone
     }
   })
 

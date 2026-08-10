@@ -55,7 +55,8 @@ export function VirtualCardColumn({
   const parent = useRef<HTMLDivElement>(null)
   const toggle = useRef<HTMLButtonElement>(null)
   const lane = appearance === 'lane'
-  const laneTone = column.cards[0] ? HEALTH_TONE[column.cards[0].health] : 'var(--ui-text-quaternary)'
+  const laneTone =
+    column.tone ?? (column.cards[0] ? HEALTH_TONE[column.cards[0].health] : 'var(--ui-text-quaternary)')
 
   const virtual = useVirtualizer({
     count: column.cards.length,
