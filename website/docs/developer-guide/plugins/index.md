@@ -335,6 +335,33 @@ def unit_convert(args: dict, **kwargs) -> str:
 3. **Never raise:** Catch all exceptions, return error JSON instead.
 4. **Accept `**kwargs`:** Hermes may pass additional context in the future.
 
+### Require host approval inside a plugin tool
+
+A `pre_tool_call` hook can return `{"action": "approve", ...}` to route the
+current invocation through Hermes' existing approval policy. When that gate
+actually permits execution, a tool registered through `ctx.register_tool()`
+receives an immutable `tool_admission` keyword argument:
+
+```python
+def mutate_remote(args: dict, *, tool_admission=None, **kwargs) -> str:
+    if not (
+        tool_admission
+        and tool_admission.approved is True
+        and tool_admission.policy == "plugin_approve"
+        and tool_admission.tool_name == "mutate_remote"
+    ):
+        return json.dumps({"error": "Host approval is required"})
+    return perform_mutation(args)
+```
+
+The value is minted for one effective call only. It includes `tool_call_id`,
+`turn_id`, and `arguments_sha256`, a SHA-256 digest of the final canonical JSON
+arguments after middleware rewrites. It contains no prompt, credential, or
+approval prose. A denied, timed-out, unavailable, or failed gate blocks before
+the handler runs; a call with no `approve` directive runs without this keyword.
+Do not accept approval from `args`, synthesize the object, or retain it for a
+later call.
+
 ## Step 5: Write the registration
 
 Create `__init__.py` — this wires schemas to handlers:

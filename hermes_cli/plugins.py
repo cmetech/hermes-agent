@@ -34,9 +34,11 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import math
 import os
@@ -565,6 +567,7 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            _plugin_context=self,
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
@@ -2655,6 +2658,135 @@ def has_hook(hook_name: str) -> bool:
 _thread_tool_whitelist = threading.local()
 
 
+_PLUGIN_ADMISSION_MINT_KEY = object()
+
+
+def _canonical_tool_arguments_sha256(args: Mapping[str, Any]) -> Optional[str]:
+    """Return the stable digest used to bind an admission to final arguments."""
+    try:
+        encoded = json.dumps(
+            dict(args),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class PluginToolAdmission:
+    """Immutable, credential-free proof of a host-approved plugin tool call.
+
+    Instances are minted by Hermes only after a plugin ``approve`` directive
+    succeeds at the host approval gate. The registration identity and claim
+    state remain private; the public view is safe to log and hand to the
+    registered plugin handler.
+    """
+
+    __slots__ = (
+        "approved",
+        "policy",
+        "tool_name",
+        "tool_call_id",
+        "turn_id",
+        "arguments_sha256",
+        "_claim_once",
+    )
+
+    def __init__(
+        self,
+        *,
+        approved: bool,
+        policy: str,
+        tool_name: str,
+        tool_call_id: str,
+        turn_id: str,
+        arguments_sha256: str,
+        registration_token: object,
+        _mint_key: object,
+    ) -> None:
+        if _mint_key is not _PLUGIN_ADMISSION_MINT_KEY:
+            raise TypeError("PluginToolAdmission instances are minted by Hermes")
+        claim_lock = threading.Lock()
+        claimed = False
+
+        def claim_once(
+            *,
+            claimed_tool_name: str,
+            claimed_arguments_sha256: str,
+            claimed_tool_call_id: str,
+            claimed_turn_id: str,
+            claimed_registration_token: object,
+        ) -> bool:
+            nonlocal claimed
+            if (
+                claimed_tool_name != tool_name
+                or claimed_arguments_sha256 != arguments_sha256
+                or claimed_tool_call_id != tool_call_id
+                or claimed_turn_id != turn_id
+                or claimed_registration_token is not registration_token
+            ):
+                return False
+            with claim_lock:
+                if claimed:
+                    return False
+                claimed = True
+                return True
+
+        object.__setattr__(self, "approved", approved)
+        object.__setattr__(self, "policy", policy)
+        object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "turn_id", turn_id)
+        object.__setattr__(self, "arguments_sha256", arguments_sha256)
+        object.__setattr__(self, "_claim_once", claim_once)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("PluginToolAdmission is immutable")
+
+    def __repr__(self) -> str:
+        return (
+            "PluginToolAdmission("
+            f"approved={self.approved!r}, policy={self.policy!r}, "
+            f"tool_name={self.tool_name!r}, tool_call_id={self.tool_call_id!r}, "
+            f"turn_id={self.turn_id!r}, arguments_sha256={self.arguments_sha256!r})"
+        )
+
+
+@dataclass(frozen=True)
+class PreToolAdmissionDecision:
+    """Resolved host decision for one final effective tool invocation."""
+
+    block_message: Optional[str] = None
+    admission: Optional[PluginToolAdmission] = None
+
+
+def _claim_plugin_tool_admission(
+    admission: object,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any],
+    tool_call_id: str,
+    turn_id: str,
+    registration_token: object,
+) -> bool:
+    """Claim a genuine admission once for its exact registered handler."""
+    if type(admission) is not PluginToolAdmission:
+        return False
+    arguments_sha256 = _canonical_tool_arguments_sha256(args)
+    if arguments_sha256 is None:
+        return False
+    return admission._claim_once(
+        claimed_tool_name=tool_name,
+        claimed_arguments_sha256=arguments_sha256,
+        claimed_tool_call_id=tool_call_id,
+        claimed_turn_id=turn_id,
+        claimed_registration_token=registration_token,
+    )
+
+
 @dataclass(frozen=True)
 class _PreToolCallDirective:
     action: Optional[str] = None
@@ -2803,7 +2935,7 @@ def get_pre_tool_call_block_message(
     return message if directive == "block" else None
 
 
-def resolve_pre_tool_block(
+def resolve_pre_tool_admission(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2812,8 +2944,8 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
+) -> PreToolAdmissionDecision:
+    """Resolve policy and mint an identity-bound admission when appropriate.
 
     Single entry point for every tool-dispatch site: fetches the plugin
     directive and, for an ``approve`` escalation, invokes the human-approval
@@ -2827,13 +2959,32 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
+    normalized_args = args if isinstance(args, dict) else {}
+    registration_token = None
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+        if entry is not None and entry.plugin_owner:
+            registration_token = entry._plugin_registration_token
+    except Exception:
+        registration_token = None
+
+    # The public admission is a handler kwarg, never model/caller JSON.
+    if registration_token is not None and "tool_admission" in normalized_args:
+        return PreToolAdmissionDecision(
+            block_message=(
+                f"BLOCKED: caller-supplied tool admission for {tool_name} is not valid"
+            )
+        )
+
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
     if details.action == "block":
-        return details.message
+        return PreToolAdmissionDecision(block_message=details.message)
     if details.action == "approve":
         try:
             from tools.approval import (
@@ -2865,13 +3016,60 @@ def resolve_pre_tool_block(
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
+            return PreToolAdmissionDecision(
+                block_message=f"BLOCKED: plugin approval gate failed for {tool_name}"
             )
-    return None
+        if not result.get("approved"):
+            return PreToolAdmissionDecision(
+                block_message=str(
+                    result.get("message")
+                    or f"BLOCKED: plugin approval required for {tool_name}"
+                )
+            )
+        if registration_token is not None:
+            arguments_sha256 = _canonical_tool_arguments_sha256(normalized_args)
+            if arguments_sha256 is None:
+                return PreToolAdmissionDecision(
+                    block_message=(
+                        f"BLOCKED: tool arguments cannot be bound for {tool_name}"
+                    )
+                )
+            return PreToolAdmissionDecision(
+                admission=PluginToolAdmission(
+                    approved=True,
+                    policy="plugin_approve",
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    arguments_sha256=arguments_sha256,
+                    registration_token=registration_token,
+                    _mint_key=_PLUGIN_ADMISSION_MINT_KEY,
+                )
+            )
+    return PreToolAdmissionDecision()
+
+
+def resolve_pre_tool_block(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Backward-compatible block-only view of the structured decision."""
+    return resolve_pre_tool_admission(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
+    ).block_message
 
 
 def get_pre_verify_continue_message(

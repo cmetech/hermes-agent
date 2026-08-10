@@ -8927,6 +8927,7 @@ class AIAgent:
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
+                     tool_admission: Any = None,
                      skip_tool_request_middleware: bool = False,
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
                      skip_tool_execution_middleware: bool = False) -> str:
@@ -8937,12 +8938,13 @@ class AIAgent:
             function_name,
             function_args,
             effective_task_id,
-            tool_call_id,
-            messages,
-            pre_tool_block_checked,
-            skip_tool_request_middleware,
-            tool_request_middleware_trace,
-            skip_tool_execution_middleware,
+            tool_call_id=tool_call_id,
+            messages=messages,
+            pre_tool_block_checked=pre_tool_block_checked,
+            tool_admission=tool_admission,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
         )
 
     @staticmethod

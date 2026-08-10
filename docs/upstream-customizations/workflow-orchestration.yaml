@@ -5529,3 +5529,64 @@ upstream_changes:
     active-profile runtime configuration accessor with exact discovery-generation,
     storage-class, validation, precedence, and non-projection guarantees.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: plugin-tool-admission-decisions
+  change_class: plugin-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/agent_runtime_helpers.py
+  - agent/tool_executor.py
+  - hermes_cli/plugins.py
+  - model_tools.py
+  - run_agent.py
+  - tools/registry.py
+  - tests/hermes_cli/test_plugin_tool_admission.py
+  - tests/run_agent/test_plugin_tool_admission_runtime.py
+  - tests/run_agent/test_run_agent.py
+  - tests/run_agent/test_tool_call_guardrail_runtime.py
+  - website/docs/developer-guide/plugins/index.md
+  owned_symbols:
+  - PluginToolAdmission
+  - PreToolAdmissionDecision
+  - resolve_pre_tool_admission
+  - PluginContext.register_tool
+  - ToolEntry._plugin_registration_token
+  - ToolRegistry.dispatch
+  - _run_agent_tool_execution_middleware
+  - invoke_tool
+  - handle_function_call
+  owned_invariants:
+  - only a successful existing host approval gate for a plugin approve directive
+    mints an affirmative immutable credential-free current-call admission
+  - no directive stays distinct from approval, while denial, timeout, unavailable,
+    unbindable arguments, and gate errors block without dispatch or admission
+  - the admission binds the effective underlying tool, final post-middleware
+    canonical argument digest, tool-call and turn ids, and exact PluginContext
+    registration token observed during policy resolution
+  - deregistration or same-owner same-name replacement never transfers approval;
+    claim and delivery require exact registration identity and are atomic one-shot
+  - caller JSON, handler kwargs, reused ids, concurrent calls, cancellation, later
+    invocations, and bridge wrappers cannot forge, inherit, replay, or redirect it
+  - direct, helper, sequential, concurrent, middleware, and tool_call paths gate once
+    and converge before registry delivery, without global or context-local caches
+  - built-in and plain registry handlers preserve their existing call shape and never
+    receive the reserved public kwarg
+  tests:
+  - tests/hermes_cli/test_plugin_tool_admission.py
+  - tests/run_agent/test_plugin_tool_admission_runtime.py
+  - tests/run_agent/test_run_agent.py
+  - tests/run_agent/test_tool_call_guardrail_runtime.py
+  - tests/test_model_tools.py
+  - tests/tools/test_approval.py
+  - tests/tools/test_registry.py
+  expected_commit_subject: 'feat(plugins): expose tool admission decisions'
+  upstream_candidate: true
+  merge_guidance: Preserve the existing approval engine and gate exactly once on the
+    effective final invocation. Keep admission host-minted, immutable, one-shot, bound
+    to exact PluginContext registration identity, and delivered only by the registry.
+    Do not serialize it, accept caller approval, cache it globally or in ContextVars,
+    special-case a connector, or add it to built-in handler kwargs.
+  removal_condition: Remove when upstream provides an equivalent generic plugin-only
+    current-call admission with final tool/argument and exact registration identity
+    binding across direct, middleware, helper, concurrent, sequential, and bridge paths.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

@@ -2882,6 +2882,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
+                 tool_admission: Any = None,
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
                  skip_tool_execution_middleware: bool = False) -> str:
@@ -2912,45 +2913,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
-
-    # Check plugin hooks for a block or approval directive before executing.
-    block_message: Optional[str] = None
-    if not pre_tool_block_checked:
-        try:
-            from hermes_cli.plugins import resolve_pre_tool_block
-            block_message = resolve_pre_tool_block(
-                function_name,
-                function_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                middleware_trace=list(_tool_middleware_trace),
-            )
-        except Exception:
-            block_message = None
-    if block_message is not None:
-        result = json.dumps({"error": block_message}, ensure_ascii=False)
-        try:
-            from model_tools import _emit_post_tool_call_hook
-            _emit_post_tool_call_hook(
-                function_name=function_name,
-                function_args=function_args,
-                result=result,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                status="blocked",
-                error_type="plugin_block",
-                error_message=block_message,
-                middleware_trace=list(_tool_middleware_trace),
-            )
-        except Exception:
-            pass
-        return result
 
     tool_start_time = time.monotonic()
 
@@ -3075,6 +3037,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            if tool_admission is not None:
+                dispatch_kwargs["_tool_admission"] = tool_admission
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             return _ra().handle_function_call(
@@ -3084,15 +3048,62 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 **dispatch_kwargs,
             )
 
+    def _authorized_execute(final_args: dict) -> Any:
+        nonlocal tool_admission
+        if not pre_tool_block_checked:
+            try:
+                from hermes_cli.plugins import resolve_pre_tool_admission
+
+                decision = resolve_pre_tool_admission(
+                    function_name,
+                    final_args,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+            except Exception:
+                decision = None
+            if decision is not None:
+                if decision.block_message is not None:
+                    block_message = decision.block_message
+                    result = json.dumps({"error": block_message}, ensure_ascii=False)
+                    try:
+                        from model_tools import _emit_post_tool_call_hook
+
+                        _emit_post_tool_call_hook(
+                            function_name=function_name,
+                            function_args=final_args,
+                            result=result,
+                            task_id=effective_task_id or "",
+                            session_id=getattr(agent, "session_id", "") or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                            status="blocked",
+                            error_type="plugin_block",
+                            error_message=block_message,
+                            middleware_trace=list(_tool_middleware_trace),
+                        )
+                    except Exception:
+                        pass
+                    return result
+                tool_admission = decision.admission
+        return _execute(final_args)
+
     if skip_tool_execution_middleware:
-        return _execute(function_args)
+        return _authorized_execute(function_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        lambda next_args: _authorized_execute(
+            next_args if isinstance(next_args, dict) else function_args
+        ),
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
