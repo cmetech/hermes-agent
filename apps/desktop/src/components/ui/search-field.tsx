@@ -73,7 +73,6 @@ export function SearchField({
       <Search className="pointer-events-none size-3.5 shrink-0 text-muted-foreground/70" />
       <input
         aria-label={ariaLabel ?? placeholder}
-        disabled={disabled}
         className={cn(
           // `field-sizing: content` grows the input to fit the placeholder/typed
           // text; min-w-0 lets it shrink back below content size when the
@@ -82,6 +81,7 @@ export function SearchField({
           'h-7 min-w-0 max-w-full bg-transparent text-xs text-foreground [field-sizing:content] placeholder:text-muted-foreground focus:outline-none disabled:cursor-default',
           inputClassName
         )}
+        disabled={disabled}
         onChange={event => onChange(event.target.value)}
         placeholder={effectivePlaceholder}
         ref={inputRef}
