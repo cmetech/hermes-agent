@@ -506,3 +506,130 @@ def test_non_plugin_direct_path_does_not_add_reserved_dispatch_kwarg(monkeypatch
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        None,
+        {},
+        {"approved": "false"},
+        {"approved": 1},
+        {"approved": False, "message": object()},
+    ],
+)
+def test_malformed_gate_result_blocks_real_direct_dispatch_with_fixed_failure(
+    monkeypatch, malformed_result
+):
+    called = []
+    _context().register_tool(
+        TOOL_NAME,
+        "admission-test",
+        _schema(),
+        lambda args, **kwargs: called.append((args, kwargs)) or "ok",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **kwargs: [{"action": "approve", "message": "confirm"}],
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: malformed_result,
+    )
+
+    result = handle_function_call(
+        TOOL_NAME,
+        {"value": 1},
+        tool_call_id="call-malformed",
+        turn_id="turn-malformed",
+    )
+
+    assert json.loads(result) == {
+        "error": f"BLOCKED: plugin approval gate failed for {TOOL_NAME}"
+    }
+    assert called == []
+
+
+def test_direct_acp_denial_runs_pre_hook_on_final_args_and_skips_transform(monkeypatch):
+    events = []
+    final_args = {"path": "/final/path", "content": "final"}
+
+    def invoke(hook_name, **kwargs):
+        events.append((hook_name, kwargs.get("args"), kwargs.get("status")))
+        if hook_name == "pre_tool_call":
+            return []
+        if hook_name == "transform_tool_result":
+            return ["REWRITTEN"]
+        return []
+
+    def acp(tool_name, args):
+        events.append(("acp", args, None))
+        return "ACP DENIED EXACT"
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke)
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda hook_name: True)
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware",
+        lambda name, args, next_call, **kwargs: next_call(final_args),
+    )
+    monkeypatch.setattr("acp_adapter.edit_approval.maybe_require_edit_approval", acp)
+    monkeypatch.setattr(
+        "model_tools.registry.dispatch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("denied call must not dispatch")
+        ),
+    )
+
+    result = handle_function_call(
+        "write_file",
+        {"path": "/original/path", "content": "original"},
+        tool_call_id="call-acp",
+        turn_id="turn-acp",
+    )
+
+    assert result == "ACP DENIED EXACT"
+    assert events == [
+        ("pre_tool_call", final_args, None),
+        ("acp", final_args, None),
+        ("post_tool_call", final_args, "blocked"),
+    ]
+
+
+def test_direct_plugin_block_is_returned_exactly_before_acp_or_transform(monkeypatch):
+    events = []
+
+    def invoke(hook_name, **kwargs):
+        events.append((hook_name, kwargs.get("status")))
+        if hook_name == "pre_tool_call":
+            return [{"action": "block", "message": "PLUGIN BLOCK EXACT"}]
+        if hook_name == "transform_tool_result":
+            return ["REWRITTEN"]
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke)
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda hook_name: True)
+    monkeypatch.setattr(
+        "acp_adapter.edit_approval.maybe_require_edit_approval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("plugin block must precede ACP")
+        ),
+    )
+    monkeypatch.setattr(
+        "model_tools.registry.dispatch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("blocked call must not dispatch")
+        ),
+    )
+
+    result = handle_function_call(
+        "write_file",
+        {"path": "/blocked/path", "content": "blocked"},
+        tool_call_id="call-block",
+        turn_id="turn-block",
+    )
+
+    assert json.loads(result) == {"error": "PLUGIN BLOCK EXACT"}
+    assert events == [
+        ("pre_tool_call", None),
+        ("post_tool_call", "blocked"),
+    ]

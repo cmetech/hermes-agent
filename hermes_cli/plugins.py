@@ -3019,11 +3019,24 @@ def resolve_pre_tool_admission(
             return PreToolAdmissionDecision(
                 block_message=f"BLOCKED: plugin approval gate failed for {tool_name}"
             )
-        if not result.get("approved"):
+        gate_failure = PreToolAdmissionDecision(
+            block_message=f"BLOCKED: plugin approval gate failed for {tool_name}"
+        )
+        if not isinstance(result, Mapping):
+            return gate_failure
+        try:
+            approved = result.get("approved")
+            message = result.get("message")
+        except Exception:
+            return gate_failure
+        if approved is not True and approved is not False:
+            return gate_failure
+        if message is not None and not isinstance(message, str):
+            return gate_failure
+        if approved is False:
             return PreToolAdmissionDecision(
-                block_message=str(
-                    result.get("message")
-                    or f"BLOCKED: plugin approval required for {tool_name}"
+                block_message=(
+                    message or f"BLOCKED: plugin approval required for {tool_name}"
                 )
             )
         if registration_token is not None:

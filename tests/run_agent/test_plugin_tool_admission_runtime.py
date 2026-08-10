@@ -265,3 +265,34 @@ def test_shared_invoke_helper_delivers_admission_after_its_execution_middleware(
     assert gate_calls == [True]
     assert plugin_handler[0][0] == expected_args
     assert plugin_handler[0][1]["tool_admission"].tool_call_id == "call-helper"
+
+
+@pytest.mark.parametrize("malformed_result", [None, {"approved": "false"}])
+def test_malformed_gate_result_blocks_real_agent_dispatch(
+    monkeypatch, plugin_handler, malformed_result
+):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **kwargs: (
+            [{"action": "approve", "message": "confirm"}]
+            if hook_name == "pre_tool_call"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: malformed_result,
+    )
+    agent = _make_agent()
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        SimpleNamespace(content="", tool_calls=[_tool_call(4, "call-agent-malformed")]),
+        messages,
+        "task-1",
+    )
+
+    assert json.loads(messages[0]["content"]) == {
+        "error": f"BLOCKED: plugin approval gate failed for {TOOL_NAME}"
+    }
+    assert plugin_handler == []
