@@ -900,7 +900,12 @@ describe('WorkflowsView', () => {
       'workflowExpandedEdges',
       'workflowIncludeDepth',
       'workflowCompositeDigest',
-      'workflowIgnoredPolicies'
+      'workflowIgnoredPolicies',
+      'workflowLaneEmpty',
+      'workflowRunFiltersComingSoon',
+      'workflowRunSearchComingSoon',
+      'workflowRunDetailLoading',
+      'workflowRunDetailError'
     ] as const
 
     const english = TRANSLATIONS.en.operations
@@ -923,11 +928,19 @@ describe('WorkflowsView', () => {
       }
 
       expect(copy.workflowIgnoredPolicyField, `${locale}.workflowIgnoredPolicyField`).toBeTypeOf('function')
+      expect(copy.workflowLaneExpand('Lane')).toBeTypeOf('string')
+      expect(copy.workflowLaneCollapse('Lane')).toBeTypeOf('string')
+      expect(copy.workflowRunDrawerLabel('Workflow')).toBeTypeOf('string')
+      expect(copy.workflowLoadedRunCount(2)).toBeTypeOf('string')
 
       if (locale !== 'en') {
         expect(copy.workflowIgnoredPolicyField('required secrets')).not.toBe(
           english.workflowIgnoredPolicyField('required secrets')
         )
+        expect(copy.workflowLaneExpand('Lane')).not.toBe(english.workflowLaneExpand('Lane'))
+        expect(copy.workflowLaneCollapse('Lane')).not.toBe(english.workflowLaneCollapse('Lane'))
+        expect(copy.workflowRunDrawerLabel('Workflow')).not.toBe(english.workflowRunDrawerLabel('Workflow'))
+        expect(copy.workflowLoadedRunCount(2)).not.toBe(english.workflowLoadedRunCount(2))
       }
     }
   })

@@ -1782,6 +1782,15 @@ export interface Translations {
     workflowRunRequiredInput: (input: string) => string
     workflowRunUnsupportedCommand: (workflow: string) => string
     activeBoard: string
+    workflowLaneExpand: (lane: string) => string
+    workflowLaneCollapse: (lane: string) => string
+    workflowLaneEmpty: string
+    workflowRunFiltersComingSoon: string
+    workflowRunSearchComingSoon: string
+    workflowRunDetailLoading: string
+    workflowRunDetailError: string
+    workflowRunDrawerLabel: (workflow: string) => string
+    workflowLoadedRunCount: (count: number) => string
     history: string
     archive: string
     restore: string
