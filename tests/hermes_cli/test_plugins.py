@@ -15,6 +15,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    PluginStaticInventoryCapacityError,
     get_plugin_command_handler,
     get_plugin_commands,
     get_pre_tool_call_block_message,
@@ -94,7 +95,14 @@ class TestPluginDiscovery:
 
     @pytest.mark.parametrize(
         "layout",
-        ("flat", "nested", "across-roots", "entry-points", "legacy-entry-points"),
+        (
+            "flat",
+            "nested",
+            "across-roots",
+            "entry-points",
+            "mapping-entry-points",
+            "legacy-entry-points",
+        ),
     )
     def test_bounded_static_inventory_limits_visits_before_materialization(
         self, tmp_path, monkeypatch, layout
@@ -121,12 +129,16 @@ class TestPluginDiscovery:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setattr(plugins_module, "get_bundled_plugins_dir", lambda: bundled)
-        if layout in {"entry-points", "legacy-entry-points"}:
+        if layout in {
+            "entry-points",
+            "mapping-entry-points",
+            "legacy-entry-points",
+        }:
 
             class EntryPoints(list):
                 def select(self, *, group):
                     assert group == ENTRY_POINTS_GROUP
-                    return self
+                    return type(self)(ep for ep in self if ep.group == group)
 
             def legacy_entry_points():
                 for index in range(4):
@@ -138,10 +150,29 @@ class TestPluginDiscovery:
                 raise AssertionError("bounded scan consumed a fifth entry point")
 
             entry_points_factory = lambda: EntryPoints(
-                types.SimpleNamespace(name=f"entry-{index}", value="module:load")
+                types.SimpleNamespace(
+                    name=f"entry-{index}",
+                    value="module:load",
+                    group="unrelated.plugins",
+                )
                 for index in range(4)
             )
-            if layout == "legacy-entry-points":
+            if layout == "mapping-entry-points":
+                entry_points_factory = lambda: {
+                    "unrelated.one": [
+                        types.SimpleNamespace(
+                            name=f"entry-{index}", value="module:load"
+                        )
+                        for index in range(2)
+                    ],
+                    "unrelated.two": [
+                        types.SimpleNamespace(
+                            name=f"entry-{index}", value="module:load"
+                        )
+                        for index in range(2, 4)
+                    ],
+                }
+            elif layout == "legacy-entry-points":
                 entry_points_factory = legacy_entry_points
             monkeypatch.setattr(
                 plugins_module.importlib.metadata,
@@ -153,7 +184,7 @@ class TestPluginDiscovery:
                 PluginManager, "_scan_entry_points", lambda self, **_kwargs: []
             )
 
-        with pytest.raises(RuntimeError, match="capacity"):
+        with pytest.raises(PluginStaticInventoryCapacityError, match="capacity"):
             PluginManager().static_plugin_inventory(max_visits=3)
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):

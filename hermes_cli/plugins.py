@@ -2117,26 +2117,34 @@ class PluginManager:
         try:
             eps = importlib.metadata.entry_points()
             # Python 3.12+ returns a SelectableGroups; earlier returns dict
-            if hasattr(eps, "select"):
-                group_eps = eps.select(group=ENTRY_POINTS_GROUP)
-            elif isinstance(eps, dict):
-                group_eps = eps.get(ENTRY_POINTS_GROUP, [])
+            if _visit_budget is None:
+                if hasattr(eps, "select"):
+                    group_eps = eps.select(group=ENTRY_POINTS_GROUP)
+                elif isinstance(eps, dict):
+                    group_eps = eps.get(ENTRY_POINTS_GROUP, [])
+                else:
+                    group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+            elif isinstance(eps, Mapping):
+
+                def matching_mapping_entry_points():
+                    for group, entry_points in eps.items():
+                        for ep in entry_points:
+                            _visit_budget.visit()
+                            if group == ENTRY_POINTS_GROUP:
+                                yield ep
+
+                group_eps = matching_mapping_entry_points()
             else:
 
                 def matching_entry_points():
                     for ep in eps:
-                        if _visit_budget is not None:
-                            _visit_budget.visit()
+                        _visit_budget.visit()
                         if ep.group == ENTRY_POINTS_GROUP:
                             yield ep
 
                 group_eps = matching_entry_points()
 
             for ep in group_eps:
-                if _visit_budget is not None and (
-                    hasattr(eps, "select") or isinstance(eps, dict)
-                ):
-                    _visit_budget.visit()
                 manifest = PluginManifest(
                     name=ep.name,
                     source="entrypoint",
