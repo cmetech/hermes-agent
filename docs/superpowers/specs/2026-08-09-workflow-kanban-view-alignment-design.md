@@ -4,6 +4,8 @@
 
 **Status:** Approved for implementation planning
 
+**Revision:** 2026-08-10 — adversarial findings F1–F8 resolved
+
 **Scope:** Hermes Desktop Workflows page presentation for Active board, History,
 Archive, and the selected-run inspector
 
@@ -167,9 +169,12 @@ interface ActivityBoardProps {
   board or History.
 - `selectedCardId` gives the open run's card a stable selected treatment.
 
-The collapsible layout is a `flex` lane strip with contained horizontal
-overflow. It uses the existing shared grab-scroll hook. The page itself must
-never gain horizontal overflow.
+The collapsible layout is a height-bounded `flex` lane strip with contained
+horizontal overflow. The Workflows run-view column gives `ActivityBoard` the
+remaining height through an unbroken `min-h-0 flex-1` chain; each expanded lane
+then scrolls its own virtualized card body. The strip uses the existing shared
+grab-scroll hook. The page itself must never gain horizontal overflow or become
+the long-lane scroll container.
 
 An expanded lane is 16rem wide, full available board height, and contains:
 
@@ -217,7 +222,8 @@ plugin storage contract.
 ### Workflow cards
 
 The card remains a native button and preserves its existing accessible name.
-Its visual treatment aligns with SDK Kanban cards:
+In `collapsible-lanes` appearance only, its visual treatment aligns with SDK
+Kanban cards:
 
 - elevated surface token;
 - tertiary hairline border;
@@ -230,6 +236,12 @@ Its visual treatment aligns with SDK Kanban cards:
 Health-to-tone mapping is presentation-only and centralized beside the shared
 card renderer. It must use design tokens or existing semantic tokens; no new raw
 color literals are introduced.
+
+The default `grid` appearance retains its existing card classes, badge styling,
+and visual hierarchy byte-for-byte. The built-in Kanban page does not adopt the
+new card chrome in this phase. Both appearances supply the activated native
+button as the optional callback origin, but only the Workflows lane appearance
+uses selected and health-accent styling.
 
 Virtualization remains active above 50 cards per lane. Reordering from a poll or
 delta must preserve focus on the same keyed card.
@@ -301,12 +313,20 @@ The drawer:
 - never opens from polling, attention updates, run completion, or any other
   background event.
 
+The outer drawer's localized complementary-region name is equivalent to
+`<workflow> run details`. It must be distinct from the unchanged inner
+`RunInspector` landmark, whose existing accessible name is `<workflow> run
+inspector`.
+
 The board remains mounted behind the drawer. Opening the drawer does not reset
 lane scroll, pagination, or card virtualization. The selected card stays
 highlighted. `ActivityBoard` supplies the activated native button as the
 optional second `onOpenCard` argument, and `WorkflowsView` retains it only as a
-focus-return ref. Closing returns focus to that card when it is still connected;
-otherwise focus returns to the Workflows heading.
+focus-return ref. `AttentionInbox` likewise supplies its activated native button
+when opening a run. Closing returns focus to the latest foreground activation
+origin when it is still connected; otherwise focus returns to the Workflows
+heading. Switching the selected run through any foreground surface must replace,
+never retain, an older origin.
 
 The drawer's body scrolls independently. Its width must accommodate the existing
 overview definition list, horizontally scrollable tab list, action controls,
@@ -339,12 +359,17 @@ to `run.run_id`.
 overflow.
 
 - The compact header is the first shrink-free row.
-- The catalog continues in the ordinary page content area.
-- Run views render Attention inbox, the collapsible board, and existing cleanup
-  controls inside the main scrollable content region.
-- Attention inbox remains above the board and remains semantically unchanged.
-- Evidence cleanup remains below History and Archive and retains its explicit
-  preview-token flow. Archive never implies deletion.
+- The catalog continues in an ordinary `min-h-0 flex-1 overflow-y-auto` content
+  area.
+- Each run view is a non-scrolling `min-h-0 flex-1 flex-col` region.
+- Attention inbox is a non-scrolling, shrink-free row above the board and
+  remains semantically unchanged.
+- The board receives the remaining height through a `min-h-0 flex-1` wrapper;
+  its lane strip and expanded lane bodies own their respective horizontal and
+  vertical scrolling.
+- Evidence cleanup is a non-scrolling, shrink-free row below History and
+  Archive and retains its explicit preview-token flow. Archive never implies
+  deletion.
 - `WorkflowRunDrawer` is a sibling overlay anchored to the page root, not a
   child appended after `ActivityBoard`.
 
@@ -360,7 +385,8 @@ The data flow remains:
 2. The selected run-list view chooses `listWorkflowRuns(cursor, view)`.
 3. `workflowBoardModel()` maps server snapshots into visual lanes and cards.
 4. `ActivityBoard` renders and locally collapses lanes.
-5. A direct card activation sets `$workflowSelectedRunId`.
+5. A direct card or Attention activation records its native-button origin and
+   sets `$workflowSelectedRunId`.
 6. Existing detail and event queries load the selected run.
 7. `WorkflowRunDrawer` renders loading, error, or `RunInspector` content.
 8. Inspector actions call the existing compare-and-set mutation seam.
@@ -395,6 +421,8 @@ future controls are presentation state only.
   become unreadable.
 - Empty rails retain a stable 2rem width.
 - Header content wraps without overlapping the drawer or escaping page gutters.
+- Header spacing uses logical inline utilities so the toolbar anchors to the
+  correct end in both LTR and RTL locales.
 - On narrow workspaces the drawer covers the page width and keeps a visible
   close control. It remains nonmodal and Escape-dismissable.
 - Opening or closing the drawer must not cause lane geometry animation or mount
@@ -411,7 +439,11 @@ future controls are presentation state only.
   selected card is the control whose run inspector is open.
 - The drawer is a named complementary region, not a modal dialog.
 - Escape closes only the drawer and does not also trigger a control beneath it.
-- Closing restores focus to the originating card or the page heading fallback.
+- Escape from an ordinary inspector text field also closes the drawer and
+  discards that unsubmitted local draft; nested Radix surfaces that consume
+  Escape close themselves first.
+- Closing restores focus to the latest foreground activation origin (board card
+  or Attention button) or the page heading fallback.
 - Disabled future controls are native-disabled, skipped by ordinary tab order,
   and named as unavailable rather than appearing broken.
 - Drawer tabs retain the existing Radix tabs keyboard behavior and horizontal
@@ -438,6 +470,8 @@ No literal user-facing string is added directly to Workflows JSX.
 ### Shared ActivityBoard tests
 
 - default `grid` mode preserves the current consumer contract;
+- default `grid` cards retain their existing visual classes while both modes
+  supply the activated button origin;
 - collapsible mode expands occupied lanes and collapses empty lanes;
 - an all-empty board exposes every lane expanded;
 - rail and header controls toggle one lane without changing card membership;
@@ -447,7 +481,8 @@ No literal user-facing string is added directly to Workflows JSX.
   `selectedCardId`;
 - card activation and bounded Load more callbacks remain exact;
 - focus survives unrelated card reordering;
-- 1,000-card columns remain virtualized;
+- 1,000-card columns remain virtualized in both grid and collapsible-lane
+  appearances;
 - 320, 768, and 1440px layouts contain horizontal overflow inside the board;
 - reduced-motion behavior remains compliant.
 
@@ -462,9 +497,13 @@ No literal user-facing string is added directly to Workflows JSX.
 
 - card click opens a complementary region immediately in loading state;
 - successful detail renders all seven existing tabs in the side drawer;
+- outer run-details and inner run-inspector complementary landmarks have
+  distinct accessible names;
 - drawer content replaces the former below-board inspector placement;
 - close button and Escape clear selected identity once;
 - close restores focus to the originating card;
+- switching from a board card to an Attention item replaces the return origin,
+  and close restores focus to the Attention button;
 - switching among Active board, History, and Archive closes the drawer;
 - selecting another run resets the tab to Overview;
 - detail failure is confined to the drawer and leaves board cards usable;
@@ -484,6 +523,7 @@ No literal user-facing string is added directly to Workflows JSX.
 - History and Archive retain the explicit evidence-cleanup preview/execute
   contract;
 - all new copy is complete across every Desktop locale.
+- Arabic renders the run toolbar with logical end alignment.
 
 ## Acceptance criteria
 
@@ -501,10 +541,16 @@ No literal user-facing string is added directly to Workflows JSX.
 7. Closing the drawer or switching views clears selected-run polling and
    restores sensible focus.
 8. Large columns remain virtualized, and page-level horizontal overflow is
-   absent at 320, 768, and 1440px.
+   absent at 320, 768, and 1440px; at 1440px a 300-card lane scrolls inside the
+   lane rather than making the page the vertical scroll container.
 9. Attention and explicit archive/cleanup semantics are unchanged.
 10. Existing focused tests plus new lane, drawer, responsive, accessibility,
     localization, type-check, and lint checks pass.
+11. The default ActivityBoard grid keeps its existing card chrome; only the
+    Workflows collapsible-lane appearance adopts compact Kanban styling.
+12. The drawer and nested inspector expose distinct localized complementary
+    landmark names, and Attention activation becomes the latest focus-return
+    origin.
 
 ## Expected implementation surface
 
@@ -515,10 +561,9 @@ The implementation plan covers focused changes in:
 - `apps/desktop/src/components/activity-board/types.ts`
 - `apps/desktop/src/components/activity-board/*.test.tsx`
 - `apps/desktop/src/components/ui/search-field.tsx`
-- `apps/desktop/src/components/ui/__tests__/` or the existing SearchField test
-  location
+- `apps/desktop/src/components/ui/search-field.test.tsx`
 - `apps/desktop/src/app/workflows/index.tsx`
-- `apps/desktop/src/app/workflows/run-inspector.tsx`
+- `apps/desktop/src/app/workflows/attention-inbox.tsx`
 - a new focused workflow drawer component and test
 - `apps/desktop/src/app/workflows/index.test.tsx`
 - Desktop locale files for `en`, `ar`, `ja`, `zh`, and `zh-hant`

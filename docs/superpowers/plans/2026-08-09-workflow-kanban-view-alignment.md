@@ -53,6 +53,7 @@ Read before implementation:
 | `apps/desktop/src/app/workflows/workflow-view-header.test.tsx` | Header mode and disabled-control coverage |
 | `apps/desktop/src/app/workflows/workflow-run-drawer.tsx` | Nonmodal right-side run-detail shell |
 | `apps/desktop/src/app/workflows/workflow-run-drawer.test.tsx` | Drawer loading/error/content/dismissal coverage |
+| `apps/desktop/src/app/workflows/attention-inbox.tsx` | Foreground activation origin for drawer focus return |
 | `apps/desktop/src/app/workflows/index.tsx` | Query orchestration and composition of header, board, and drawer |
 | `apps/desktop/src/app/workflows/index.test.tsx` | End-to-end renderer behavior at the feature seam |
 | `apps/desktop/src/i18n/{types,en,ar,ja,zh,zh-hant}.ts` | Complete localized workflow board/drawer copy |
@@ -540,7 +541,7 @@ it('resets lane overrides when the collapse scope changes', () => {
 })
 ```
 
-- [ ] **Step 2: Add failing selected-card and origin tests**
+- [ ] **Step 2: Add failing selected-card, origin, and grid-preservation tests**
 
 ```tsx
 it('exposes the selected card and supplies its native button as the activation origin', () => {
@@ -563,7 +564,29 @@ it('exposes the selected card and supplies its native button as the activation o
   fireEvent.click(card)
   expect(open).toHaveBeenCalledWith(model.columns[0]!.cards[0], card)
 })
+
+it('preserves the existing grid card chrome while supplying its activation origin', () => {
+  const open = vi.fn()
+
+  render(<ActivityBoard model={model} onLoadMore={vi.fn()} onOpenCard={open} />)
+
+  const card = screen.getByRole('button', { name: 'Run one, running' })
+  expect(card.className).toContain('rounded-sm')
+  expect(card.className).toContain('bg-(--ui-bg-quaternary)')
+  expect(card.className).not.toContain('border-l-2')
+  fireEvent.click(card)
+  expect(open).toHaveBeenCalledWith(model.columns[0]!.cards[0], card)
+})
 ```
+
+Also replace the existing first test's exact one-argument assertion with:
+
+```tsx
+expect(open).toHaveBeenCalledWith(model.columns[0]!.cards[0], expect.any(HTMLButtonElement))
+```
+
+This assertion is intentionally RED before Step 6 because grid cards do not yet
+supply the native-button origin.
 
 - [ ] **Step 3: Run ActivityBoard tests and verify the new cases fail**
 
@@ -572,7 +595,9 @@ cd apps/desktop
 npx vitest run src/components/activity-board/activity-board.test.tsx
 ```
 
-Expected: new tests fail because the props and lane rendering do not exist.
+Expected: the lane tests fail because the props/rendering do not exist, and the
+amended grid-origin assertion fails because the current callback receives only
+the card.
 
 - [ ] **Step 4: Add the discriminated ActivityBoard prop contract**
 
@@ -623,11 +648,26 @@ useEffect(() => {
 
 Close the component body after the existing empty/model branches and the two layout branches. The reconciliation effect may execute when polling supplies a new column-array identity; `reconcileLaneCollapseState` returns the existing state object when scope and phases are unchanged, so React does not schedule an additional render.
 
-Keep the existing grid JSX byte-for-byte equivalent when `collapsible` is false. For collapsible mode, render:
+Keep the existing grid JSX byte-for-byte equivalent when `collapsible` is false.
+Make the shared root height-aware only for collapsible mode:
 
 ```tsx
 <div
-  className={cn('flex min-h-0 min-w-0 gap-2 overflow-x-auto overscroll-contain', grabbing && 'cursor-grabbing')}
+  aria-label={`${model.scopeLabel} activity board`}
+  className={cn('min-w-0', collapsible && 'flex h-full min-h-0 flex-col')}
+  data-source={model.source}
+>
+  {model.stale && <p role="status">{t.operations.dataStale}</p>}
+  {collapsible ? collapsibleLanes : gridColumns}
+</div>
+```
+
+`gridColumns` is the current grid div unchanged. Assign the following JSX to
+`collapsibleLanes`:
+
+```tsx
+<div
+  className={cn('flex min-h-0 min-w-0 flex-1 gap-2 overflow-x-auto overscroll-contain', grabbing && 'cursor-grabbing')}
   data-layout="collapsible-lanes"
   onMouseDown={onMouseDown}
   ref={stripRef}
@@ -693,34 +733,38 @@ const HEALTH_TONE: Record<ActivityBoardCard['health'], string> = {
 
 For a collapsed lane, return a named `<section aria-label={`${column.label}, ${column.count}`}>` containing a full-height 2rem button with vertical label, count, `aria-expanded={false}`, and `onClick={onToggleCollapsed}`.
 
-For an expanded lane, use `flex h-full w-64 shrink-0 flex-col` and a compact header with dot, uppercase label, count, and a collapse button carrying `aria-expanded={true}`. In grid appearance, the scroll body retains `max-h-[65dvh]`; in lane appearance it uses `min-h-0 flex-1`. Both retain `ref={parent}`, vertical overflow containment, and the existing virtualization calculation. Render `<p>{emptyLabel}</p>` only when `column.cards.length === 0`.
+For an expanded lane, use `flex h-full w-64 shrink-0 flex-col` and a compact header with dot, uppercase label, count, and a collapse button carrying `aria-expanded={true}`. In grid appearance, the scroll body retains `max-h-[65dvh]`; in lane appearance it uses `min-h-0 flex-1`. Both retain `ref={parent}`, vertical overflow containment, and the existing virtualization calculation. Put `data-lane-scroll` on the scroll body so the bounded-height contract is testable without computed layout. Render `<p>{emptyLabel}</p>` only when `column.cards.length === 0`.
 
-Update each card button to:
+Update each card button with an appearance-gated class and style contract:
 
 ```tsx
 const selected = selectedCardId === card.id
+const lane = appearance === 'lane'
+const virtualStyle = virtualRow
+  ? { position: 'absolute' as const, transform: `translateY(${virtualRow.start}px)`, width: '100%' }
+  : undefined
 
 <button
   aria-expanded={selectedCardId === undefined ? undefined : selected}
   aria-label={card.ariaDescription}
   className={cn(
-    'block w-full rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 text-left transition-colors motion-reduce:transition-none hover:bg-(--ui-row-hover-background) focus-visible:outline focus-visible:outline-(--ui-accent)',
-    selected && 'border-(--ui-accent) bg-(--ui-row-active-background)'
+    lane
+      ? 'block w-full rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 text-left transition-colors motion-reduce:transition-none hover:bg-(--ui-row-hover-background) focus-visible:outline focus-visible:outline-(--ui-accent)'
+      : 'block w-full rounded-sm bg-(--ui-bg-quaternary) p-3 text-left focus-visible:outline focus-visible:outline-(--ui-accent)',
+    lane && selected && 'border-(--ui-accent) bg-(--ui-row-active-background)'
   )}
   data-activity-card-id={card.id}
   key={card.id}
   onClick={event => onOpenCard(card, event.currentTarget)}
-  style={{
-    borderLeftColor: HEALTH_TONE[card.health],
-    ...(virtualRow
-      ? { position: 'absolute', transform: `translateY(${virtualRow.start}px)`, width: '100%' }
-      : {})
-  }}
+  style={lane ? { borderLeftColor: HEALTH_TONE[card.health], ...virtualStyle } : virtualStyle}
   type="button"
 >
 ```
 
-Keep title, exact state, and badges compact. Apply each badge's existing `tone` through token classes (`text-destructive`, `text-(--ui-text-quaternary)`, `text-(--ui-yellow)`, `text-(--ui-green)`) rather than ignoring it.
+Keep the current grid title, exact-state, and badge markup byte-for-byte. In lane
+appearance only, compact that hierarchy and apply each badge's existing `tone`
+through token classes (`text-destructive`, `text-(--ui-text-quaternary)`,
+`text-(--ui-yellow)`, `text-(--ui-green)`).
 
 - [ ] **Step 7: Update responsive and reduced-motion assertions**
 
@@ -729,10 +773,59 @@ Extend the existing width table test to render collapsible mode and assert:
 ```tsx
 const strip = container.querySelector('[data-layout="collapsible-lanes"]')
 expect(strip?.className).toContain('overflow-x-auto')
+expect(strip?.className).toContain('flex-1')
 expect(container.firstElementChild?.className).toContain('min-w-0')
+expect(container.firstElementChild?.className).toContain('h-full')
+expect(container.querySelector('[data-lane-scroll]')?.className).toContain('overflow-y-auto')
 ```
 
 Keep the current no-unqualified-animation loop. Every new transition class must also carry `motion-reduce:transition-none`.
+
+First extract the existing 1,000-card fixture construction in
+`activity-board.performance.test.tsx` into a file-local
+`thousandCardModel(): ActivityBoardModel` helper and use it in the existing grid
+test. Then add lane-mode coverage using the same helper and 600px rect stub:
+
+```tsx
+function thousandCardModel(): ActivityBoardModel {
+  const cards = Array.from({ length: 1000 }, (_, index) => ({
+    ariaDescription: `Run ${index}, running`,
+    badges: [],
+    exactState: 'running',
+    health: 'healthy' as const,
+    id: `run-${index}`,
+    title: `Run ${index}`,
+    updatedAt: index
+  }))
+
+  return {
+    columns: [{ cards, count: cards.length, id: 'active', label: 'Active', nextCursor: null }],
+    revision: '1000',
+    scopeLabel: 'Workflow',
+    source: 'workflow',
+    stale: false
+  }
+}
+
+it('keeps a 1,000-card collapsible lane virtualized', async () => {
+  const model = thousandCardModel()
+
+  render(
+    <ActivityBoard
+      collapseScope="history"
+      laneCopy={{ collapse: lane => `Collapse ${lane}`, empty: 'No runs', expand: lane => `Expand ${lane}` }}
+      layout="collapsible-lanes"
+      model={model}
+      onLoadMore={vi.fn()}
+      onOpenCard={vi.fn()}
+    />
+  )
+
+  await waitFor(() => expect(screen.getAllByRole('button').length).toBeGreaterThan(0))
+  expect(screen.getByRole('region', { name: 'Active, 1000' })).toBeTruthy()
+  expect(screen.getAllByRole('button').length).toBeLessThan(100)
+})
+```
 
 - [ ] **Step 8: Run shared board and performance tests**
 
@@ -742,7 +835,9 @@ npx vitest run src/components/activity-board/lane-collapse.test.ts src/component
 npx tsc -p . --noEmit
 ```
 
-Expected: all shared board tests pass, the 1,000-card test mounts fewer than 100 buttons, and renderer type-check exits 0.
+Expected: all shared board tests pass, both grid and collapsible 1,000-card
+tests mount fewer than 100 buttons, grid cards retain their original classes,
+and renderer type-check exits 0.
 
 - [ ] **Step 9: Commit the presentation change**
 
@@ -770,7 +865,45 @@ git commit -m "feat(desktop): render collapsible activity lanes"
 - Consumes: Task 1 disabled `SearchField`, existing `Button`, `Codicon`, `WorkflowRunView`, and Desktop locale catalog.
 - Produces: `WorkflowViewHeader`, nine typed localized workflow-board strings/functions, and complete non-English copy.
 
-- [ ] **Step 1: Add typed localization keys**
+- [ ] **Step 1: Extend the locale regression test before adding copy**
+
+In the existing `catches signal and dependency copy falling back to English in any locale` test, add these five keys to `stringKeys`:
+
+```ts
+'workflowLaneEmpty',
+'workflowRunFiltersComingSoon',
+'workflowRunSearchComingSoon',
+'workflowRunDetailLoading',
+'workflowRunDetailError'
+```
+
+Add these function assertions inside the locale loop:
+
+```ts
+expect(copy.workflowLaneExpand('Lane')).toBeTypeOf('string')
+expect(copy.workflowLaneCollapse('Lane')).toBeTypeOf('string')
+expect(copy.workflowRunDrawerLabel('Workflow')).toBeTypeOf('string')
+expect(copy.workflowLoadedRunCount(2)).toBeTypeOf('string')
+
+if (locale !== 'en') {
+  expect(copy.workflowLaneExpand('Lane')).not.toBe(english.workflowLaneExpand('Lane'))
+  expect(copy.workflowLaneCollapse('Lane')).not.toBe(english.workflowLaneCollapse('Lane'))
+  expect(copy.workflowRunDrawerLabel('Workflow')).not.toBe(english.workflowRunDrawerLabel('Workflow'))
+  expect(copy.workflowLoadedRunCount(2)).not.toBe(english.workflowLoadedRunCount(2))
+}
+```
+
+- [ ] **Step 2: Run the locale regression and verify the missing-copy failure**
+
+```bash
+cd apps/desktop
+npx vitest run src/app/workflows/index.test.tsx -t "catches signal and dependency copy"
+```
+
+Expected: FAIL because the new string/function keys are absent and the function
+assertions encounter `undefined`.
+
+- [ ] **Step 3: Add typed localization keys**
 
 Add to `Translations['operations']` near `activeBoard`:
 
@@ -782,11 +915,11 @@ workflowRunFiltersComingSoon: string
 workflowRunSearchComingSoon: string
 workflowRunDetailLoading: string
 workflowRunDetailError: string
-workflowRunInspectorLabel: (workflow: string) => string
+workflowRunDrawerLabel: (workflow: string) => string
 workflowLoadedRunCount: (count: number) => string
 ```
 
-- [ ] **Step 2: Add complete translations**
+- [ ] **Step 4: Add complete translations**
 
 Add these exact values:
 
@@ -799,7 +932,7 @@ workflowRunFiltersComingSoon: 'Run filters coming soon',
 workflowRunSearchComingSoon: 'Search runs — coming soon',
 workflowRunDetailLoading: 'Loading run details',
 workflowRunDetailError: 'Could not load run details',
-workflowRunInspectorLabel: workflow => `${workflow} run inspector`,
+workflowRunDrawerLabel: workflow => `${workflow} run details`,
 workflowLoadedRunCount: count => `${count} loaded workflow run${count === 1 ? '' : 's'}`,
 
 // ar
@@ -810,7 +943,7 @@ workflowRunFiltersComingSoon: 'مرشحات التشغيل قريبًا',
 workflowRunSearchComingSoon: 'البحث في عمليات التشغيل — قريبًا',
 workflowRunDetailLoading: 'جار تحميل تفاصيل التشغيل',
 workflowRunDetailError: 'تعذر تحميل تفاصيل التشغيل',
-workflowRunInspectorLabel: workflow => `فاحص تشغيل ${workflow}`,
+workflowRunDrawerLabel: workflow => `تفاصيل تشغيل ${workflow}`,
 workflowLoadedRunCount: count => `${count} من عمليات التشغيل المحملة`,
 
 // ja
@@ -821,7 +954,7 @@ workflowRunFiltersComingSoon: '実行フィルターは近日対応予定です'
 workflowRunSearchComingSoon: '実行を検索 — 近日対応予定',
 workflowRunDetailLoading: '実行の詳細を読み込んでいます',
 workflowRunDetailError: '実行の詳細を読み込めませんでした',
-workflowRunInspectorLabel: workflow => `${workflow} の実行インスペクター`,
+workflowRunDrawerLabel: workflow => `${workflow} の実行詳細`,
 workflowLoadedRunCount: count => `読み込み済みの実行 ${count} 件`,
 
 // zh
@@ -832,7 +965,7 @@ workflowRunFiltersComingSoon: '运行筛选即将推出',
 workflowRunSearchComingSoon: '搜索运行 — 即将推出',
 workflowRunDetailLoading: '正在加载运行详情',
 workflowRunDetailError: '无法加载运行详情',
-workflowRunInspectorLabel: workflow => `${workflow} 运行检查器`,
+workflowRunDrawerLabel: workflow => `${workflow} 运行详情`,
 workflowLoadedRunCount: count => `已加载 ${count} 个运行`,
 
 // zh-hant
@@ -843,39 +976,21 @@ workflowRunFiltersComingSoon: '執行篩選即將推出',
 workflowRunSearchComingSoon: '搜尋執行 — 即將推出',
 workflowRunDetailLoading: '正在載入執行詳細資料',
 workflowRunDetailError: '無法載入執行詳細資料',
-workflowRunInspectorLabel: workflow => `${workflow} 執行檢查器`,
+workflowRunDrawerLabel: workflow => `${workflow} 執行詳細資料`,
 workflowLoadedRunCount: count => `已載入 ${count} 個執行項目`,
 ```
 
-- [ ] **Step 3: Extend the locale regression test**
+- [ ] **Step 5: Re-run the locale regression and verify it passes**
 
-In the existing `catches signal and dependency copy falling back to English in any locale` test, add the five new string keys to `stringKeys`:
-
-```ts
-'workflowLaneEmpty',
-'workflowRunFiltersComingSoon',
-'workflowRunSearchComingSoon',
-'workflowRunDetailLoading',
-'workflowRunDetailError'
+```bash
+cd apps/desktop
+npx vitest run src/app/workflows/index.test.tsx -t "catches signal and dependency copy"
 ```
 
-Add function assertions inside the locale loop:
+Expected: PASS for every Desktop locale; none of the nine new values falls back
+to the English implementation.
 
-```ts
-expect(copy.workflowLaneExpand('Lane')).toBeTypeOf('string')
-expect(copy.workflowLaneCollapse('Lane')).toBeTypeOf('string')
-expect(copy.workflowRunInspectorLabel('Workflow')).toBeTypeOf('string')
-expect(copy.workflowLoadedRunCount(2)).toBeTypeOf('string')
-
-if (locale !== 'en') {
-  expect(copy.workflowLaneExpand('Lane')).not.toBe(english.workflowLaneExpand('Lane'))
-  expect(copy.workflowLaneCollapse('Lane')).not.toBe(english.workflowLaneCollapse('Lane'))
-  expect(copy.workflowRunInspectorLabel('Workflow')).not.toBe(english.workflowRunInspectorLabel('Workflow'))
-  expect(copy.workflowLoadedRunCount(2)).not.toBe(english.workflowLoadedRunCount(2))
-}
-```
-
-- [ ] **Step 4: Write failing header tests**
+- [ ] **Step 6: Write failing header tests**
 
 Create `workflow-view-header.test.tsx`:
 
@@ -934,19 +1049,37 @@ describe('WorkflowViewHeader', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'History' }))
     expect(onViewChange).toHaveBeenCalledWith('history')
   })
+
+  it('uses logical inline spacing for the Arabic run toolbar', () => {
+    const { container } = render(
+      <I18nProvider configClient={null} initialLocale="ar">
+        <WorkflowViewHeader
+          headingRef={createRef<HTMLHeadingElement>()}
+          loadedRunCount={3}
+          onViewChange={vi.fn()}
+          view="board"
+        />
+      </I18nProvider>
+    )
+
+    const toolbar = container.querySelector('[data-workflow-run-toolbar]')
+    expect(toolbar?.className).toContain('ms-auto')
+    expect(toolbar?.className).not.toContain('ml-auto')
+  })
 })
 ```
 
-- [ ] **Step 5: Run the header and locale tests and verify failure**
+- [ ] **Step 7: Run the header tests and verify the missing-module failure**
 
 ```bash
 cd apps/desktop
 npx vitest run src/app/workflows/workflow-view-header.test.tsx src/app/workflows/index.test.tsx
 ```
 
-Expected: FAIL because `WorkflowViewHeader` and the localization keys do not exist.
+Expected: FAIL because `WorkflowViewHeader` does not exist. The locale-only RED
+was already proved and resolved in Steps 1–5.
 
-- [ ] **Step 6: Implement WorkflowViewHeader**
+- [ ] **Step 8: Implement WorkflowViewHeader**
 
 Create `workflow-view-header.tsx` with this interface:
 
@@ -987,7 +1120,7 @@ export function WorkflowViewHeader({
 
   return (
     <header className="flex shrink-0 flex-wrap items-center gap-2">
-      <h1 className="mr-2 text-lg font-medium" ref={headingRef} tabIndex={-1}>
+      <h1 className="me-2 text-lg font-medium" ref={headingRef} tabIndex={-1}>
         {copy.workflows}
       </h1>
       <div aria-label={copy.workflowViews} className="flex flex-wrap gap-2" role="tablist">
@@ -1005,7 +1138,7 @@ export function WorkflowViewHeader({
         ))}
       </div>
       {view !== 'workflows' && (
-        <div className="ml-auto flex min-w-0 items-center gap-1.5">
+        <div className="ms-auto flex min-w-0 items-center gap-1.5" data-workflow-run-toolbar>
           <span
             aria-label={copy.workflowLoadedRunCount(loadedRunCount)}
             className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)"
@@ -1031,7 +1164,7 @@ export function WorkflowViewHeader({
 
 Do not add component-local filter/search state. The no-op `onChange` exists only because the canonical SearchField callback remains required; native disabled state prevents invocation.
 
-- [ ] **Step 7: Run header, locale, type, and formatting checks**
+- [ ] **Step 9: Run header, locale, type, and formatting checks**
 
 ```bash
 cd apps/desktop
@@ -1042,7 +1175,7 @@ npx prettier --check src/app/workflows/workflow-view-header.tsx src/app/workflow
 
 Expected: tests pass, no locale uses an English fallback for the new keys, type-check exits 0, and formatting check exits 0.
 
-- [ ] **Step 8: Commit the localized toolbar**
+- [ ] **Step 10: Commit the localized toolbar**
 
 ```bash
 git add apps/desktop/src/app/workflows/workflow-view-header.tsx apps/desktop/src/app/workflows/workflow-view-header.test.tsx apps/desktop/src/app/workflows/index.test.tsx apps/desktop/src/i18n/types.ts apps/desktop/src/i18n/en.ts apps/desktop/src/i18n/ar.ts apps/desktop/src/i18n/ja.ts apps/desktop/src/i18n/zh.ts apps/desktop/src/i18n/zh-hant.ts
@@ -1077,7 +1210,9 @@ import type { WorkflowRunSnapshot } from '@/types/hermes'
 import { WorkflowRunDrawer } from './workflow-run-drawer'
 
 vi.mock('./run-inspector', () => ({
-  RunInspector: ({ run }: { run: WorkflowRunSnapshot }) => <div>Inspector {run.run_id}</div>
+  RunInspector: ({ run }: { run: WorkflowRunSnapshot }) => (
+    <aside aria-label={`${run.workflow} run inspector`}>Inspector {run.run_id}</aside>
+  )
 }))
 
 const run: WorkflowRunSnapshot = {
@@ -1109,17 +1244,18 @@ afterEach(() => {
 })
 
 describe('WorkflowRunDrawer', () => {
-  it('renders a right-side complementary region with the run inspector', () => {
+  it('renders distinct run-details and run-inspector complementary regions', () => {
     render(
       <I18nProvider configClient={null} initialLocale="en">
         <WorkflowRunDrawer {...base} />
       </I18nProvider>
     )
 
-    const drawer = screen.getByRole('complementary', { name: 'Laptop diagnostic run inspector' })
+    const drawer = screen.getByRole('complementary', { name: 'Laptop diagnostic run details' })
     expect(drawer.className).toContain('absolute')
     expect(drawer.className).toContain('right-0')
-    expect(screen.getByText('Inspector run-1')).toBeTruthy()
+    expect(screen.getByRole('complementary', { name: 'Laptop diagnostic run inspector' })).toBeTruthy()
+    expect(screen.getAllByRole('complementary')).toHaveLength(2)
   })
 
   it('renders bounded loading and error states', () => {
@@ -1225,7 +1361,7 @@ export function WorkflowRunDrawer({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [onClose])
 
-  const label = copy.workflowRunInspectorLabel(run?.workflow ?? selectedRunId)
+  const label = copy.workflowRunDrawerLabel(run?.workflow ?? selectedRunId)
 
   return (
     <aside
@@ -1287,6 +1423,7 @@ git commit -m "feat(desktop): add workflow run drawer"
 **Files:**
 - Modify: `apps/desktop/src/app/workflows/index.tsx:50-402`
 - Modify: `apps/desktop/src/app/workflows/index.test.tsx:120-1560`
+- Modify: `apps/desktop/src/app/workflows/attention-inbox.tsx:6-64`
 
 **Interfaces:**
 - Consumes: Task 3 collapsible `ActivityBoard`, Task 4 `WorkflowViewHeader` and lane copy, Task 5 `WorkflowRunDrawer`, existing queries/mutations, `$workflowSelectedRunId`, `AttentionInbox`, and evidence cleanup.
@@ -1314,6 +1451,17 @@ it.each([
   expect((screen.getByRole('button', { name: 'Run filters coming soon' }) as HTMLButtonElement).disabled).toBe(true)
   expect((screen.getByRole('textbox', { name: 'Search runs — coming soon' }) as HTMLInputElement).disabled).toBe(true)
   expect(listWorkflowRuns).toHaveBeenCalledWith(undefined, view)
+
+  const runView = screen.getByRole('main').querySelector('[data-workflow-run-view]')!
+  expect(runView.className).toContain('min-h-0')
+  expect(runView.className).toContain('flex-1')
+  expect(runView.className).toContain('overflow-hidden')
+  const boardShell = runView.querySelector('[data-workflow-board-shell]')!
+  expect(boardShell.className).toContain('min-h-0')
+  expect(boardShell.className).toContain('flex-1')
+  expect(boardShell.firstElementChild?.className).toContain('h-full')
+  expect(boardShell.querySelector('[data-layout="collapsible-lanes"]')?.className).toContain('flex-1')
+  expect(boardShell.querySelector('[data-lane-scroll]')?.className).toContain('overflow-y-auto')
 })
 
 it('keeps the catalog free of run-only toolbar controls', async () => {
@@ -1340,9 +1488,11 @@ it('opens selected run detail in a side drawer instead of below the board', asyn
   const card = await screen.findByRole('button', { name: /Laptop diagnostic/ })
   fireEvent.click(card)
 
-  const drawer = await screen.findByRole('complementary', { name: 'Laptop diagnostic run inspector' })
+  const drawer = await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })
   expect(drawer.className).toContain('absolute')
   expect(drawer.closest('main')).toBeTruthy()
+  expect(within(drawer).getByRole('complementary', { name: 'Laptop diagnostic run inspector' })).toBeTruthy()
+  expect(screen.getAllByRole('complementary')).toHaveLength(2)
   expect(card.getAttribute('aria-expanded')).toBe('true')
   expect(within(drawer).getByRole('tab', { name: 'Overview' })).toBeTruthy()
   expect(within(drawer).getByRole('tab', { name: 'Timeline events' })).toBeTruthy()
@@ -1369,6 +1519,42 @@ it('closes the drawer, clears selected polling, and restores card focus', async 
   expect(screen.queryByRole('complementary')).toBeNull()
 })
 
+it('replaces a stale card origin when Attention opens another run', async () => {
+  const runTwo = run({ run_id: 'run-2', workflow: 'Second workflow' })
+  $workflowSelectedRunId.set(null)
+  listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run(), runTwo], schema_version: 1 })
+  listWorkflowAttention.mockResolvedValue({
+    items: [{
+      cause: 'Approval required',
+      health: 'user_wait',
+      kind: 'approval',
+      next_actions: ['approve'],
+      node_id: 'approval-1',
+      origin: 'workflow',
+      run_id: 'run-2',
+      state_version: 1,
+      status: 'paused',
+      updated_at: '2026-08-09T00:00:00Z',
+      workflow: 'Second workflow'
+    }],
+    next_cursor: null,
+    schema_version: 1
+  })
+  getWorkflowRun.mockImplementation((id: string) => Promise.resolve(id === 'run-2' ? runTwo : run()))
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+  await renderView(client)
+  const firstCard = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+  fireEvent.click(firstCard)
+
+  const attentionOrigin = screen.getByRole('button', { name: 'Open run Second workflow' })
+  fireEvent.click(attentionOrigin)
+  fireEvent.click(await screen.findByRole('button', { name: 'Close' }))
+
+  await waitFor(() => expect(document.activeElement).toBe(attentionOrigin))
+  expect(document.activeElement).not.toBe(firstCard)
+})
+
 it('keeps a selected-run failure inside a closeable drawer', async () => {
   $workflowSelectedRunId.set(null)
   getWorkflowRun.mockRejectedValue(new Error('detail failed'))
@@ -1386,7 +1572,7 @@ it('keeps a selected-run failure inside a closeable drawer', async () => {
 })
 ```
 
-- [ ] **Step 3: Write failing tests for view changes and inspector reset**
+- [ ] **Step 3: Add view-change guards and a failing inspector-reset test**
 
 ```tsx
 it('closes selected detail without stealing focus when navigation changes', async () => {
@@ -1418,7 +1604,30 @@ it('resets the inspector to Overview when another run is selected', async () => 
 
   await waitFor(() => expect(screen.getByRole('tab', { name: 'Overview' }).getAttribute('data-state')).toBe('active'))
 })
+
+it('does not open a drawer when a background run-list refetch changes cards', async () => {
+  $workflowSelectedRunId.set(null)
+  listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+  await renderView(client)
+  await screen.findByRole('button', { name: /Laptop diagnostic/ })
+  listWorkflowRuns.mockResolvedValue({
+    next_cursor: null,
+    runs: [run(), run({ run_id: 'run-2', workflow: 'Background arrival' })],
+    schema_version: 1
+  })
+  await client.refetchQueries({ queryKey: ['workflow-runs', 'default', 'board'] })
+
+  expect($workflowSelectedRunId.get()).toBeNull()
+  expect(screen.queryByRole('complementary')).toBeNull()
+})
 ```
+
+The navigation test is a pre-existing regression guard and should already pass.
+The background-refetch test protects the existing selection invariant and should
+also pass before integration. The inspector-reset assertion is the RED test in
+this step because the current inline inspector is not keyed by run identity.
 
 - [ ] **Step 4: Run the new integration tests and verify failure**
 
@@ -1427,7 +1636,10 @@ cd apps/desktop
 npx vitest run src/app/workflows/index.test.tsx
 ```
 
-Expected: new tests fail because `WorkflowsView` still renders the old header/grid and appends `RunInspector` below the board.
+Expected: the new composition, drawer, Attention-origin, and inspector-reset
+tests fail because `WorkflowsView` still renders the old header/grid and appends
+`RunInspector` below the board. The catalog isolation, navigation-focus, and
+background-refetch guards pass before and after the change.
 
 - [ ] **Step 5: Add feature-owned focus-return refs and handlers**
 
@@ -1437,10 +1649,12 @@ In `WorkflowsView`, add:
 const headingRef = useRef<HTMLHeadingElement>(null)
 const runReturnFocusRef = useRef<HTMLButtonElement | null>(null)
 
-const openRun = (card: ActivityBoardCard, origin?: HTMLButtonElement) => {
+const openRunId = (runId: string, origin?: HTMLButtonElement) => {
   runReturnFocusRef.current = origin ?? null
-  selectWorkflowRun(card.id)
+  selectWorkflowRun(runId)
 }
+
+const openRun = (card: ActivityBoardCard, origin?: HTMLButtonElement) => openRunId(card.id, origin)
 
 const closeRunDrawer = () => {
   const target = runReturnFocusRef.current
@@ -1464,6 +1678,22 @@ const changeView = (next: WorkflowRunView) => {
 ```
 
 Import `ActivityBoardCard` and `WorkflowRunView` as types. View navigation must call `changeView`; it must not call the focus-restoring drawer close handler.
+
+Update `AttentionInbox` so foreground Attention activation supplies the same
+native-button origin and always replaces any prior card origin:
+
+```tsx
+interface AttentionInboxProps {
+  items: WorkflowAttentionItem[]
+  onOpenRun: (runId: string, origin?: HTMLButtonElement) => void
+}
+
+// Inside the existing button:
+onClick={event => onOpenRun(item.run_id, event.currentTarget)}
+```
+
+Wire the inbox with `onOpenRun={openRunId}`. This is presentation-only callback
+plumbing; it does not change Attention queries or semantics.
 
 - [ ] **Step 6: Replace the page heading/tabs with WorkflowViewHeader**
 
@@ -1515,11 +1745,40 @@ Inside the run-view content region, pass:
 />
 ```
 
-Wrap Attention inbox, board, and cleanup sections in one `min-h-0 flex-1 overflow-y-auto` content region. Preserve Attention before the board and preserve the complete existing cleanup JSX after the board for History and Archive.
+Use a bounded, non-scrolling run-view column instead of one page-level vertical
+scroller:
+
+```tsx
+<div className="flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>
+  <div className="shrink-0">
+    <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
+  </div>
+  <div className="min-h-0 flex-1" data-workflow-board-shell>
+    <ActivityBoard ... />
+  </div>
+  {(view === 'history' || view === 'archive') && (
+    <section className="shrink-0 ...">{/* preserve the complete existing cleanup JSX */}</section>
+  )}
+</div>
+```
+
+The catalog instead receives its own `min-h-0 flex-1 overflow-y-auto` wrapper.
+The header, Attention inbox, and cleanup section do not scroll with long lanes;
+the board receives the remaining height, its lane strip owns horizontal
+scrolling, each expanded lane body owns vertical scrolling, and the drawer body
+scrolls independently. Preserve Attention before the board and the complete
+existing cleanup JSX after the board for History and Archive.
+
+The Step 1 composition assertions cover this complete chain from the semantic
+`main` page root through the board shell, ActivityBoard root, flex-grown strip,
+and lane scroll body. Do not add a test-only production root attribute or infer
+the height contract from descendants alone.
 
 - [ ] **Step 8: Replace the below-board inspector with WorkflowRunDrawer**
 
-Delete the current conditional `selected.data && <RunInspector ... />`. Add this page-root sibling after the scrollable content and before the View/Review dialogs:
+Replace the `RunInspector` import with `WorkflowRunDrawer`. Delete the current
+conditional `selected.data && <RunInspector ... />`. Add this page-root sibling
+after the bounded content and before the View/Review dialogs:
 
 ```tsx
 {view !== 'workflows' && selectedRunId ? (
@@ -1570,7 +1829,7 @@ Expected:
 - [ ] **Step 11: Commit the Workflows integration**
 
 ```bash
-git add apps/desktop/src/app/workflows/index.tsx apps/desktop/src/app/workflows/index.test.tsx
+git add apps/desktop/src/app/workflows/index.tsx apps/desktop/src/app/workflows/index.test.tsx apps/desktop/src/app/workflows/attention-inbox.tsx
 git diff --cached --check
 git commit -m "feat(desktop): align workflow boards with kanban lanes"
 ```
@@ -1585,11 +1844,16 @@ Verify `git diff --cached --name-only` before committing so unrelated working-tr
 - [ ] Filter and search controls are visible, localized, native-disabled, and produce no state/query change.
 - [ ] No profile/filter API or UI logic was introduced.
 - [ ] A card opens the existing seven-tab inspector in the right-side nonmodal drawer.
+- [ ] The outer `<workflow> run details` and inner `<workflow> run inspector` landmarks are distinct.
 - [ ] Loading and selected-detail failure stay inside a closeable drawer.
 - [ ] Close/Escape clears selected identity and returns focus; view navigation keeps focus on the chosen tab.
+- [ ] Opening another run from Attention replaces any stale card focus origin and close returns to the Attention button.
 - [ ] Background refetches never select a run or open the drawer.
 - [ ] Attention inbox and explicit History/Archive cleanup remain semantically unchanged.
+- [ ] At 1440px, a 300-card lane scrolls inside that lane, the page does not scroll vertically, and virtualization remains active.
 - [ ] Large columns remain virtualized and horizontal scrolling stays inside the lane strip.
+- [ ] Default-grid consumers retain their existing card chrome; lane health accents and compact styling appear only in Workflows.
+- [ ] Arabic toolbar spacing uses logical inline utilities and anchors to the correct visual end.
 - [ ] New motion respects reduced-motion preferences.
 - [ ] Every new string is complete in `en`, `ar`, `ja`, `zh`, and `zh-hant`.
 - [ ] No Python, backend, plugin, SDK Kanban, Electron main-process, dependency, config, or environment-variable change exists.
