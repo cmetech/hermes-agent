@@ -93,6 +93,31 @@ class PluginToolOverrideError(PermissionError):
     """
 
 
+class PluginStaticInventoryCapacityError(RuntimeError):
+    """Raised when a bounded static manifest scan exhausts its visit budget."""
+
+
+@dataclass
+class _PluginStaticInventoryVisitBudget:
+    maximum: int
+    visited: int = 0
+
+    def visit(self) -> None:
+        if self.visited >= self.maximum:
+            raise PluginStaticInventoryCapacityError(
+                "static plugin inventory visit capacity exceeded"
+            )
+        self.visited += 1
+
+    def sorted_children(self, path: Path) -> list[Path]:
+        """Collect at most ``maximum`` entries across the complete scan."""
+        children: list[Path] = []
+        for child in path.iterdir():
+            self.visit()
+            children.append(child)
+        return sorted(children)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1461,15 +1486,28 @@ class PluginManager:
             self._discovery_profile_id = None
             raise
 
-    def static_plugin_inventory(self) -> List[PluginManifest]:
+    def static_plugin_inventory(
+        self, *, max_visits: int | None = None
+    ) -> List[PluginManifest]:
         """Return the active profile's manifests without importing plugin code.
 
         Filesystem manifests preserve runtime discovery precedence: bundled,
         user, project, then entry-point sources, with later keys winning.
         Python entry points expose no static configuration descriptor in their
         metadata, so they remain descriptor-free here rather than importing
-        their target merely to inspect it.
+        their target merely to inspect it. ``max_visits`` optionally bounds
+        filesystem entries across all roots and category recursion before any
+        directory breadth is sorted or manifests are parsed, then applies the
+        same budget to entry-point records. The default keeps runtime discovery
+        behavior unchanged.
         """
+        if max_visits is not None and (type(max_visits) is not int or max_visits <= 0):
+            raise ValueError("max_visits must be a positive integer")
+        visit_budget = (
+            None
+            if max_visits is None
+            else _PluginStaticInventoryVisitBudget(maximum=max_visits)
+        )
         manifests: List[PluginManifest] = []
         repo_plugins = get_bundled_plugins_dir()
         manifests.extend(
@@ -1477,21 +1515,36 @@ class PluginManager:
                 repo_plugins,
                 source="bundled",
                 skip_names={"memory", "context_engine", "platforms", "model-providers"},
+                _visit_budget=visit_budget,
             )
         )
         manifests.extend(
-            self._scan_directory(repo_plugins / "platforms", source="bundled")
+            self._scan_directory(
+                repo_plugins / "platforms",
+                source="bundled",
+                _visit_budget=visit_budget,
+            )
         )
         manifests.extend(
-            self._scan_directory(get_hermes_home() / "plugins", source="user")
+            self._scan_directory(
+                get_hermes_home() / "plugins",
+                source="user",
+                _visit_budget=visit_budget,
+            )
         )
         if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
             manifests.extend(
                 self._scan_directory(
-                    Path.cwd() / ".hermes" / "plugins", source="project"
+                    Path.cwd() / ".hermes" / "plugins",
+                    source="project",
+                    _visit_budget=visit_budget,
                 )
             )
-        manifests.extend(self._scan_entry_points())
+        manifests.extend(
+            self._scan_entry_points()
+            if visit_budget is None
+            else self._scan_entry_points(_visit_budget=visit_budget)
+        )
 
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
@@ -1865,6 +1918,8 @@ class PluginManager:
         path: Path,
         source: str,
         skip_names: Optional[Set[str]] = None,
+        *,
+        _visit_budget: _PluginStaticInventoryVisitBudget | None = None,
     ) -> List[PluginManifest]:
         """Read ``plugin.yaml`` manifests from subdirectories of *path*.
 
@@ -1882,7 +1937,12 @@ class PluginManager:
         pass it now that categories are first-class).
         """
         return self._scan_directory_level(
-            path, source, skip_names=skip_names, prefix="", depth=0
+            path,
+            source,
+            skip_names=skip_names,
+            prefix="",
+            depth=0,
+            visit_budget=_visit_budget,
         )
 
     def _scan_directory_level(
@@ -1893,6 +1953,7 @@ class PluginManager:
         skip_names: Optional[Set[str]],
         prefix: str,
         depth: int,
+        visit_budget: _PluginStaticInventoryVisitBudget | None,
     ) -> List[PluginManifest]:
         """Recursive implementation of :meth:`_scan_directory`.
 
@@ -1904,7 +1965,12 @@ class PluginManager:
         if not path.is_dir():
             return manifests
 
-        for child in sorted(path.iterdir()):
+        children = (
+            sorted(path.iterdir())
+            if visit_budget is None
+            else visit_budget.sorted_children(path)
+        )
+        for child in children:
             if not child.is_dir():
                 continue
             if depth == 0 and skip_names and child.name in skip_names:
@@ -1914,9 +1980,7 @@ class PluginManager:
                 manifest_file = child / "plugin.yml"
 
             if manifest_file.exists():
-                manifest = self._parse_manifest(
-                    manifest_file, child, source, prefix
-                )
+                manifest = self._parse_manifest(manifest_file, child, source, prefix)
                 if manifest is not None:
                     manifests.append(manifest)
                 continue
@@ -1936,6 +2000,7 @@ class PluginManager:
                     skip_names=None,
                     prefix=sub_prefix,
                     depth=depth + 1,
+                    visit_budget=visit_budget,
                 )
             )
 
@@ -2042,7 +2107,11 @@ class PluginManager:
     # Entry-point scanning
     # -----------------------------------------------------------------------
 
-    def _scan_entry_points(self) -> List[PluginManifest]:
+    def _scan_entry_points(
+        self,
+        *,
+        _visit_budget: _PluginStaticInventoryVisitBudget | None = None,
+    ) -> List[PluginManifest]:
         """Check ``importlib.metadata`` for pip-installed plugins."""
         manifests: List[PluginManifest] = []
         try:
@@ -2053,9 +2122,21 @@ class PluginManager:
             elif isinstance(eps, dict):
                 group_eps = eps.get(ENTRY_POINTS_GROUP, [])
             else:
-                group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+
+                def matching_entry_points():
+                    for ep in eps:
+                        if _visit_budget is not None:
+                            _visit_budget.visit()
+                        if ep.group == ENTRY_POINTS_GROUP:
+                            yield ep
+
+                group_eps = matching_entry_points()
 
             for ep in group_eps:
+                if _visit_budget is not None and (
+                    hasattr(eps, "select") or isinstance(eps, dict)
+                ):
+                    _visit_budget.visit()
                 manifest = PluginManifest(
                     name=ep.name,
                     source="entrypoint",
@@ -2063,6 +2144,8 @@ class PluginManager:
                     key=ep.name,
                 )
                 manifests.append(manifest)
+        except PluginStaticInventoryCapacityError:
+            raise
         except Exception as exc:
             logger.debug("Entry-point scan failed: %s", exc)
 

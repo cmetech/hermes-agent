@@ -5402,6 +5402,7 @@ upstream_changes:
   overlap_policy: owned_symbol
   files:
   - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugins.py
   - plugins/workflow/api_admission.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/cli.py
@@ -5411,11 +5412,14 @@ upstream_changes:
   - plugins/workflow/showcase.py
   - plugins/workflow/store.py
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugins.py
   - tests/plugins/workflow/test_ericsson_connector_toolsets.py
   - tests/plugins/workflow/test_phase5_admission_parity.py
   owned_symbols:
   - ConnectorCapabilitySnapshot
   - connector_capability_snapshot
+  - PluginManager.static_plugin_inventory
+  - PluginStaticInventoryCapacityError
   - WorkflowConnectorCapabilities
   - connector_capabilities
   - RunScheduler._connector_capabilities_match
@@ -5425,9 +5429,16 @@ upstream_changes:
   owned_invariants:
   - one immutable credential-free active-profile capability snapshot feeds each
     production admission assessment and its authenticated snapshot seal
+  - public workflow list and doctor commands each capture one capability snapshot
+    and project the same ready-service and registered-tool vocabulary as run admission
   - disabled plugin code remains unimported while static descriptor inventory,
     current runtime generation, backend readiness, and registered tools are bounded
     and fail closed
+  - snapshot inventory visits share one pre-sort budget across bundled, platform,
+    user, project, category-recursive, and descriptor-free entry-point records while
+    default runtime discovery precedence remains unchanged
+  - snapshot readiness callbacks share the process-global configuration service's
+    four worker slots, including callbacks that remain blocked after their timeout
   - fingerprints contain deterministic non-secret configuration identities and
     credential-presence booleans but never values, readiness errors, or exception text
   - admitted fingerprints are scoped to required services and canonical tool identities,
@@ -5439,8 +5450,10 @@ upstream_changes:
   - pre-extension workflow snapshots omit the optional metadata and retain their recorded
     v1 through v5 behavior without a normalizer or snapshot-format version change
   - exact empty allowed-tools declarations remain empty
+  - authenticated connector extension schema versions require the exact integer 1
   tests:
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugins.py
   - tests/plugins/workflow/test_ericsson_connector_toolsets.py
   - tests/plugins/workflow/test_phase5_admission_parity.py
   - tests/plugins/workflow/test_catalog_api.py
@@ -5454,9 +5467,11 @@ upstream_changes:
     credential-free, deterministic, bounded, and generic. Seal only connector-dependent
     Archon admissions through the existing authenticated resources extension, scope
     drift to the run's required services and tools, and revalidate both after resume
-    and immediately before claims. Never import disabled plugin code, expose values,
-    mutate prompt/toolsets, reinterpret extension-free snapshots, or fail a run beneath
-    an active provider claim.
+    and immediately before claims. Keep public list/doctor on the same snapshot facts,
+    share readiness worker capacity process-wide, and bound static visits before
+    directory sorting without changing default plugin precedence. Never import disabled
+    plugin code, expose values, mutate prompt/toolsets, reinterpret extension-free
+    snapshots, or fail a run beneath an active provider claim.
   removal_condition: Remove when upstream supplies equivalent generic configured-plugin
     service and tool admission, authenticated scoped drift identity, same-snapshot
     sealing, active-claim-safe prelaunch revalidation, and exact legacy snapshot behavior.

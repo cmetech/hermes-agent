@@ -1554,6 +1554,17 @@ def _configuration_value_identity(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _connector_capacity_exceeded_snapshot() -> ConnectorCapabilitySnapshot:
+    fingerprint = hashlib.sha256(
+        b'{"schema_version":1,"state":"capacity_exceeded"}'
+    ).hexdigest()
+    return ConnectorCapabilitySnapshot(
+        ready_services=frozenset(),
+        available_tools=frozenset(),
+        fingerprint=fingerprint,
+    )
+
+
 def connector_capability_snapshot(
     profile: str | None = None,
 ) -> ConnectorCapabilitySnapshot:
@@ -1566,31 +1577,33 @@ def connector_capability_snapshot(
     """
 
     with _connector_profile_scope(profile):
-        from hermes_cli.plugins import LoadedPlugin, get_plugin_manager
+        from hermes_cli.plugins import (
+            LoadedPlugin,
+            PluginStaticInventoryCapacityError,
+            get_plugin_manager,
+        )
         from tools.registry import registry
 
         manager = get_plugin_manager()
-        service = PluginConfigurationService()
+        service = get_plugin_configuration_service()
         profile_id = service._profile_id()
         generation_current = (
             getattr(manager, "_discovery_profile_id", None) == profile_id
         )
         registered_tool_names = registry.get_all_tool_names()
-        static_inventory = manager.static_plugin_inventory()
+        try:
+            static_inventory = manager.static_plugin_inventory(
+                max_visits=_MAX_CONNECTOR_INVENTORY
+            )
+        except PluginStaticInventoryCapacityError:
+            return _connector_capacity_exceeded_snapshot()
         runtime_inventory = manager.loaded_plugins() if generation_current else ()
         if (
             len(registered_tool_names) > _MAX_CONNECTOR_TOOLS
             or len(static_inventory) > _MAX_CONNECTOR_INVENTORY
             or len(runtime_inventory) > _MAX_CONNECTOR_RUNTIME_PLUGINS
         ):
-            fingerprint = hashlib.sha256(
-                b'{"schema_version":1,"state":"capacity_exceeded"}'
-            ).hexdigest()
-            return ConnectorCapabilitySnapshot(
-                ready_services=frozenset(),
-                available_tools=frozenset(),
-                fingerprint=fingerprint,
-            )
+            return _connector_capacity_exceeded_snapshot()
         registered_tools = frozenset(registered_tool_names)
         plugin_tool_names = frozenset(
             name

@@ -451,7 +451,7 @@ def test_connector_capability_snapshot_is_immutable_credential_free_and_determin
         static_inventory_calls = 0
 
         @classmethod
-        def static_plugin_inventory(cls):
+        def static_plugin_inventory(cls, *, max_visits=None):
             cls.static_inventory_calls += 1
             return [manifest]
 
@@ -557,7 +557,7 @@ def test_connector_capability_snapshot_honors_runtime_profile_generation(
         _discovery_profile_id = "a different profile generation"
 
         @staticmethod
-        def static_plugin_inventory():
+        def static_plugin_inventory(*, max_visits=None):
             return [manifest]
 
         @staticmethod
@@ -653,7 +653,7 @@ def test_connector_capability_snapshot_fails_closed_at_inventory_bound(monkeypat
         _discovery_profile_id = None
 
         @staticmethod
-        def static_plugin_inventory():
+        def static_plugin_inventory(*, max_visits=None):
             return manifests
 
         @staticmethod
@@ -672,3 +672,143 @@ def test_connector_capability_snapshot_fails_closed_at_inventory_bound(monkeypat
     assert snapshot.ready_services == frozenset()
     assert snapshot.available_tools == frozenset()
     assert len(snapshot.fingerprint) == 64
+
+
+def test_connector_capability_snapshot_fails_closed_on_static_scan_capacity(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import connector_capability_snapshot
+    from tools.registry import registry
+
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    for index in range(257):
+        (bundled / f"empty-{index:03d}").mkdir()
+    home = tmp_path / "home"
+    (home / "plugins").mkdir(parents=True)
+
+    manager = plugins.PluginManager()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(manager, "_scan_entry_points", lambda **_kwargs: [])
+    monkeypatch.setattr(registry, "get_all_tool_names", lambda: ["read_file"])
+
+    first = connector_capability_snapshot()
+    second = connector_capability_snapshot()
+
+    assert first == second
+    assert first.ready_services == frozenset()
+    assert first.available_tools == frozenset()
+    assert len(first.fingerprint) == 64
+
+
+def test_connector_capability_snapshots_share_the_four_worker_readiness_limit(
+    tmp_path, monkeypatch
+):
+    import threading
+    from types import SimpleNamespace
+
+    from hermes_cli import plugin_configuration as configuration_module
+    from hermes_cli import plugins
+    from hermes_cli.plugin_configuration import (
+        PluginConfigurationService,
+        _secret_storage_key,
+        connector_capability_snapshot,
+        load_plugin_configuration,
+    )
+    from tools.registry import registry
+
+    plugin_root = tmp_path / "connector"
+    plugin_root.mkdir()
+    _write_descriptor(plugin_root, _valid_descriptor())
+    descriptor = load_plugin_configuration(plugin_root, "config.schema.json")
+    manifest = SimpleNamespace(
+        key="generic-connector",
+        name="generic-connector",
+        configuration=descriptor,
+        kind="standalone",
+        source="user",
+    )
+    loaded = SimpleNamespace(
+        manifest=manifest,
+        enabled=True,
+        error=None,
+        tools_registered=["generic_connector_read"],
+    )
+    release = threading.Event()
+    finished = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    started = 0
+    maximum_active = 0
+
+    def blocking_readiness(_configuration):
+        nonlocal active, started, maximum_active
+        with lock:
+            active += 1
+            started += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            release.wait(2)
+            return True
+        finally:
+            with lock:
+                active -= 1
+                if active == 0:
+                    finished.set()
+
+    shared_service = PluginConfigurationService()
+
+    class Manager:
+        _plugin_tool_names = {"generic_connector_read"}
+        _discovery_profile_id = shared_service._profile_id()
+
+        @staticmethod
+        def static_plugin_inventory(*, max_visits=None):
+            return [manifest]
+
+        @staticmethod
+        def loaded_plugins():
+            return [loaded]
+
+        @staticmethod
+        def setup_action_registrations(_plugin_id):
+            return {"probe": {"readiness": blocking_readiness}}
+
+    monkeypatch.setattr(configuration_module, "_configuration_service", shared_service)
+    monkeypatch.setattr(configuration_module, "_READINESS_TIMEOUT", 0.05)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_settings",
+        staticmethod(lambda _plugin_id: {"endpoint": "https://service.example.test"}),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_profile_secret_values",
+        staticmethod(
+            lambda: {
+                _secret_storage_key("generic-connector", "token"): "present-secret"
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "_is_enabled",
+        staticmethod(lambda _loaded: True),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_all_tool_names",
+        lambda: ["read_file", "generic_connector_read"],
+    )
+
+    try:
+        snapshots = [connector_capability_snapshot() for _ in range(6)]
+        assert started == maximum_active == 4
+        assert all(snapshot.ready_services == frozenset() for snapshot in snapshots)
+    finally:
+        release.set()
+        assert finished.wait(1), "blocking readiness workers did not exit"

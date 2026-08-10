@@ -1167,7 +1167,12 @@ def _cmd_schema(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    entries = build_catalog(_discover(args))
+    capabilities = connector_capability_snapshot()
+    entries = build_catalog(
+        _discover(args),
+        available_tools=capabilities.available_tools,
+        available_services=capabilities.ready_services,
+    )
     if args.json:
         _emit(entries, as_json=True)
         return 0
@@ -1953,11 +1958,15 @@ def _doctor_payload(
     compat_report: bool,
     mode: str | None = None,
     compilation: WorkflowCompilation | None = None,
+    available_tools: AbstractSet[str] | None = None,
+    available_services: AbstractSet[str] | None = None,
 ) -> dict[str, object]:
     report = doctor_package(
         package,
         hermes_home=hermes_home,
         compilation=compilation,
+        available_tools=available_tools,
+        available_services=available_services,
     )
     payload = report.to_dict()
     payload["package"] = sanitize_projection(str(package.root), key="path")
@@ -2058,12 +2067,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     if compilation is not None:
         package = compilation.package
+    capabilities = connector_capability_snapshot()
     payload = _doctor_payload(
         package,
         hermes_home=args.hermes_home,
         compat_report=args.compat_report,
         mode=args.mode,
         compilation=compilation,
+        available_tools=capabilities.available_tools,
+        available_services=capabilities.ready_services,
     )
     blocking = any(
         isinstance(finding, Mapping) and bool(finding.get("blocking"))

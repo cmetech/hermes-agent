@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +173,88 @@ def test_cli_admission_uses_the_active_connector_capability_snapshot(
         ("nodes[0].allowed_tools[0]", "unavailable_tool"),
     }
     assert assessment.next_actions == ("doctor",)
+
+
+def test_public_cli_list_uses_one_connector_capability_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    import plugins.workflow.cli as cli_module
+
+    compilation = _connector_compilation(tmp_path)
+    snapshots = []
+
+    def missing_capabilities():
+        snapshot = SimpleNamespace(
+            ready_services=frozenset(),
+            available_tools=frozenset(),
+            fingerprint="0" * 64,
+        )
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(cli_module, "_discover", lambda _args: (compilation.package,))
+    monkeypatch.setattr(
+        cli_module, "connector_capability_snapshot", missing_capabilities
+    )
+    args = argparse.Namespace(workflow_action="list", json=True)
+
+    assert cli_module.workflow_command(args) == 0
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert len(snapshots) == 1
+    assert envelope["result"][0]["runnable"] is False
+    assert envelope["result"][0]["compatibility"]["blocking_count"] >= 2
+
+
+def test_public_cli_doctor_uses_one_connector_capability_snapshot_and_vocabulary(
+    tmp_path, monkeypatch, capsys
+):
+    import plugins.workflow.cli as cli_module
+
+    compilation = _connector_compilation(tmp_path)
+    snapshots = []
+
+    def missing_capabilities():
+        snapshot = SimpleNamespace(
+            ready_services=frozenset(),
+            available_tools=frozenset(),
+            fingerprint="0" * 64,
+        )
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        cli_module, "_resolve", lambda _args, _name: compilation.package
+    )
+    monkeypatch.setattr(
+        cli_module, "_resolve_compilation", lambda _args, _name: compilation
+    )
+    monkeypatch.setattr(
+        cli_module, "connector_capability_snapshot", missing_capabilities
+    )
+    args = argparse.Namespace(
+        workflow_action="doctor",
+        name=compilation.package.definition.name,
+        hermes_home=str(tmp_path / "home"),
+        compat_report=True,
+        mode=None,
+        json=True,
+    )
+
+    assert cli_module.workflow_command(args) == 7
+
+    envelope = json.loads(capsys.readouterr().out)
+    findings = envelope["result"]["findings"]
+    assert len(snapshots) == 1
+    assert envelope["error"]["code"] == "blocking_doctor_findings"
+    assert {
+        (finding["path"], finding["code"])
+        for finding in findings
+        if finding["blocking"]
+    } >= {
+        ("requires[0]", "required_service"),
+        ("nodes[0].allowed_tools[0]", "unavailable_tool"),
+    }
 
 
 def test_cli_admission_accepts_the_exact_ready_service_and_registered_tool(
@@ -937,6 +1020,21 @@ def test_scheduler_scope_ignores_unrelated_connector_drift_but_not_required_drif
         _service_fingerprints=admitted._service_fingerprints,
     )
     assert RunScheduler._connector_capabilities_match(sealed) is False
+
+
+@pytest.mark.parametrize("schema_version", (True, 1.0))
+def test_connector_capability_extension_requires_an_exact_integer_schema_version(
+    schema_version,
+):
+    from plugins.workflow.models import WorkflowConnectorCapabilities
+
+    with pytest.raises(ValueError, match="malformed"):
+        WorkflowConnectorCapabilities.from_dict({
+            "schema_version": schema_version,
+            "required_services": ["service-a"],
+            "required_tools": ["tool_a"],
+            "fingerprint": "0" * 64,
+        })
 
 
 def test_pre_extension_normalizer_v5_snapshot_remains_readable_without_reinterpretation(

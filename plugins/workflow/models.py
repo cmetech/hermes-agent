@@ -536,7 +536,8 @@ class WorkflowConnectorCapabilities:
         services = frozenset(self.required_services)
         tools = frozenset(self.required_tools)
         if (
-            self.schema_version != 1
+            type(self.schema_version) is not int
+            or self.schema_version != 1
             or not services
             or len(services) > 64
             or len(tools) > 512
