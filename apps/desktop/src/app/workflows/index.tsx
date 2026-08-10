@@ -334,9 +334,7 @@ export function WorkflowsView() {
             <PageLoader className="min-h-0 flex-1" />
           ) : (
             <>
-              <div className="shrink-0">
-                <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
-              </div>
+              <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
               <div className="min-h-0 flex-1" data-workflow-board-shell>
                 <ActivityBoard
                   collapseScope={view}

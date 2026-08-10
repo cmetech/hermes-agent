@@ -30,9 +30,15 @@ export function AttentionInbox({ items, onOpenRun }: AttentionInboxProps) {
   }
 
   return (
-    <section aria-label={t.operations.workflowAttention} className="py-3">
-      <h2 className="text-sm font-medium">{t.operations.needsAttention}</h2>
-      <ul className="mt-2 grid min-w-0 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+    <section
+      aria-label={t.operations.workflowAttention}
+      className="flex max-h-[40%] min-h-0 shrink-0 flex-col py-3"
+    >
+      <h2 className="shrink-0 text-sm font-medium">{t.operations.needsAttention}</h2>
+      <ul
+        className="mt-2 grid min-h-0 min-w-0 overflow-y-auto gap-2 sm:grid-cols-2 xl:grid-cols-3"
+        data-workflow-attention-list
+      >
         {items.map(item => {
           const age = ageParts(item.updated_at)
           const action = item.next_actions.find(candidate => !['events', 'status'].includes(candidate))

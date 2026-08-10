@@ -1739,6 +1739,18 @@ describe('WorkflowsView', () => {
       expect(await screen.findByText(workflow)).toBeTruthy()
     }
 
+    const runView = screen.getByRole('main').querySelector('[data-workflow-run-view]')!
+    const attention = screen.getByRole('region', { name: 'Workflow attention' })
+    const attentionList = attention.querySelector('[data-workflow-attention-list]')!
+
+    expect(attention.parentElement).toBe(runView)
+    expect(attention.className).toContain('max-h-[40%]')
+    expect(attention.className).toContain('min-h-0')
+    expect(attention.className).toContain('shrink-0')
+    expect(attentionList.className).toContain('min-h-0')
+    expect(attentionList.className).toContain('overflow-y-auto')
+    expect(runView.querySelector('[data-workflow-board-shell]')).toBeTruthy()
+
     expect(screen.getByText('approval required')).toBeTruthy()
     expect(screen.getByText('outcome uncertain')).toBeTruthy()
     expect(screen.getAllByText(/1 minute ago/i)).toHaveLength(6)
