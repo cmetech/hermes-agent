@@ -27,6 +27,13 @@ describe('workflowBoardModel', () => {
       'succeeded',
       'failed'
     ])
+    expect(model.columns.map(column => [column.id, column.tone])).toEqual([
+      ['queued', 'var(--ui-blue)'],
+      ['active', 'var(--ui-green)'],
+      ['attention', 'var(--ui-yellow)'],
+      ['completed', 'var(--ui-text-tertiary)'],
+      ['stopped', 'var(--ui-red)']
+    ])
     expect(model.columns[3]!.cards[0]!.badges[0]!.label).toBe('2/2')
   })
 
