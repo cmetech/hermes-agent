@@ -571,3 +571,51 @@ The implementation plan covers focused changes in:
 
 No Python, workflow plugin, gateway, Electron main-process, SDK Kanban plugin,
 or dashboard bundle file should be required.
+
+## Adversarial implementation-review remediation
+
+The Fable 5 implementation review identified three shell-integration defects.
+They are resolved within the existing presentation-only boundary; workflow
+queries, mutations, selection authority, inspector behavior, and plugin code do
+not change.
+
+### Escape ownership and focus restoration
+
+The run drawer participates in the existing application escape-layer registry
+at a new page-drawer priority below narrow overlays. It registers only while the
+Workflows pane is visible, yields Escape to every higher layer, and unregisters
+when hidden or unmounted. This preserves the normal in-page behavior while
+preventing a hidden drawer from consuming Escape behind another pane or overlay.
+
+Closing still clears selected-run identity. Focus returns to the activation
+origin or Workflows heading only when keyboard focus is currently within the
+Workflows page; closing from another focused surface does not steal focus.
+
+### Drawer separator ownership
+
+The drawer remains a nonmodal right-side `aside`, but its left hairline is
+painted by an inner full-height wrapper. The pane shell intentionally strips
+edge chrome from zone-level `aside` elements, so the inner wrapper owns the
+in-page drawer separator without weakening the global shell rule.
+
+### Bounded Attention layout
+
+The Attention region remains above the board and remains shrink-free, but it is
+bounded to a minority of the available run-view height. Its item list owns
+vertical overflow after that cap, keeping the Attention heading visible while
+guaranteeing that the board and History/Archive cleanup controls retain a
+reachable layout. No item semantics, ordering, actions, or backend data change.
+
+### Regression proof
+
+Tests are added before production changes and must fail for the reviewed defect:
+
+- a higher-priority app layer prevents the drawer from handling Escape;
+- a mounted-but-hidden Workflows pane does not register or handle drawer Escape;
+- closing does not restore focus when focus is outside the Workflows page;
+- the drawer separator belongs to an inner element rather than the shell-reset
+  `aside`;
+- the Attention region exposes a bounded, internally scrolling list contract.
+
+Targeted tests run after each correction. Final verification reruns the complete
+workflow UI suite, all Desktop TypeScript projects, lint, and `git diff --check`.
