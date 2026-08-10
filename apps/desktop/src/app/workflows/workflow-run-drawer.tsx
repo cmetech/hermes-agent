@@ -70,7 +70,7 @@ export function WorkflowRunDrawer({
     <aside
       aria-busy={loading && !run}
       aria-label={label}
-      className="absolute inset-y-0 right-0 z-20 w-full bg-(--ui-bg-elevated) sm:w-[min(40rem,calc(100%-2rem))]"
+      className="absolute inset-y-0 right-0 z-20 w-full bg-(--ui-bg-elevated) sm:w-[min(45rem,calc(100%-2rem))]"
       id="workflow-run-drawer"
     >
       <div
