@@ -70,30 +70,35 @@ export function WorkflowRunDrawer({
     <aside
       aria-busy={loading && !run}
       aria-label={label}
-      className="absolute inset-y-0 right-0 z-20 flex w-full flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) sm:w-[min(32rem,calc(100%-2rem))]"
+      className="absolute inset-y-0 right-0 z-20 w-full bg-(--ui-bg-elevated) sm:w-[min(32rem,calc(100%-2rem))]"
       id="workflow-run-drawer"
     >
-      <header className="flex shrink-0 justify-end px-3 pt-3">
-        <Button aria-label={t.common.close} onClick={onClose} size="icon-xs" variant="ghost">
-          <Codicon name="close" size="0.9rem" />
-        </Button>
-      </header>
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
-        {run ? (
-          <RunInspector
-            actionsDisabled={actionsDisabled}
-            events={events}
-            key={run.run_id}
-            onAction={onAction}
-            run={run}
-          />
-        ) : error ? (
-          <ErrorState className="mt-12" title={copy.workflowRunDetailError} />
-        ) : (
-          <div className="grid h-40 place-items-center">
-            <Loader label={copy.workflowRunDetailLoading} type="lemniscate-bloom" />
-          </div>
-        )}
+      <div
+        className="flex h-full min-h-0 flex-col border-l border-(--ui-stroke-tertiary)"
+        data-workflow-run-drawer-frame
+      >
+        <header className="flex shrink-0 justify-end px-3 pt-3">
+          <Button aria-label={t.common.close} onClick={onClose} size="icon-xs" variant="ghost">
+            <Codicon name="close" size="0.9rem" />
+          </Button>
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
+          {run ? (
+            <RunInspector
+              actionsDisabled={actionsDisabled}
+              events={events}
+              key={run.run_id}
+              onAction={onAction}
+              run={run}
+            />
+          ) : error ? (
+            <ErrorState className="mt-12" title={copy.workflowRunDetailError} />
+          ) : (
+            <div className="grid h-40 place-items-center">
+              <Loader label={copy.workflowRunDetailLoading} type="lemniscate-bloom" />
+            </div>
+          )}
+        </div>
       </div>
     </aside>
   )

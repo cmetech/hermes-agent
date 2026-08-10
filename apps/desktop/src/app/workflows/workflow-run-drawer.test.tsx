@@ -52,8 +52,14 @@ describe('WorkflowRunDrawer', () => {
     )
 
     const drawer = screen.getByRole('complementary', { name: 'Laptop diagnostic run details' })
+    const classTokens = (element: Element) => element.className.split(/\s+/)
+    const frame = drawer.querySelector('[data-workflow-run-drawer-frame]')!
+
     expect(drawer.className).toContain('absolute')
     expect(drawer.className).toContain('right-0')
+    expect(classTokens(drawer)).not.toContain('border-l')
+    expect(classTokens(frame)).toContain('border-l')
+    expect(classTokens(frame)).toContain('h-full')
     expect(screen.getByRole('complementary', { name: 'Laptop diagnostic run inspector' })).toBeTruthy()
     expect(screen.getAllByRole('complementary')).toHaveLength(2)
   })
