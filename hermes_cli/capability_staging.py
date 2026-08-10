@@ -39,7 +39,8 @@ _AUTHENTICATED_RESOURCE_ROOTS = (
     Path("capabilities/workflow-packages"),
     Path("plugins/workflow/showcases"),
 )
-_PLUGIN_PATH_RE = re.compile(r"^plugins/[a-z0-9][a-z0-9_-]*$")
+_LEGACY_PLUGIN_PATH_RE = re.compile(r"^plugins/[^/\\]+$")
+_STRUCTURED_PLUGIN_PATH_RE = re.compile(r"^plugins/[a-z0-9][a-z0-9_-]*$")
 _PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _LIFECYCLE_MIGRATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MAX_LIFECYCLE_MIGRATIONS = 256
@@ -332,7 +333,12 @@ def _validated_manifest_plugins(
     migration_ids: set[str] = set()
     for raw in raw_entries:
         if isinstance(raw, str):
-            if not _PLUGIN_PATH_RE.fullmatch(raw):
+            legacy_name = raw.rsplit("/", 1)[-1]
+            if (
+                not _LEGACY_PLUGIN_PATH_RE.fullmatch(raw)
+                or legacy_name in {".", ".."}
+                or "\x00" in legacy_name
+            ):
                 return None
             plugin_id = Path(raw).name
             # Duplicate legacy strings historically collapse during the union.
@@ -362,7 +368,7 @@ def _validated_manifest_plugins(
         enabled = raw.get("enabled")
         if (
             not isinstance(rel, str)
-            or not _PLUGIN_PATH_RE.fullmatch(rel)
+            or not _STRUCTURED_PLUGIN_PATH_RE.fullmatch(rel)
             or not isinstance(plugin_id, str)
             or not _PLUGIN_ID_RE.fullmatch(plugin_id)
             or type(enabled) is not bool

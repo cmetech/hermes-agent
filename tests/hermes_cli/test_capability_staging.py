@@ -245,6 +245,22 @@ def test_structured_enabled_backend_retains_legacy_activation_behavior(
     ]
 
 
+def test_legacy_non_slug_plugin_path_is_copied_and_enabled(tmp_path, home, fake_config):
+    store, _ = fake_config
+    bundle = make_bundle(
+        tmp_path,
+        plugins=["plugins/workflow", "plugins/legacy.plugin"],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert (home / "plugins/legacy.plugin/plugin.yaml").is_file()
+    assert store["config"]["plugins"]["enabled"] == [
+        "workflow",
+        "legacy.plugin",
+    ]
+
+
 def test_restaging_preserves_explicit_enabled_and_disabled_choices(
     tmp_path, home, fake_config
 ):

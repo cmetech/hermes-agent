@@ -261,3 +261,44 @@ def test_baked_startup_applies_connector_lifecycle_migration_once(
         "ericsson-jira",
     ]
     assert after_restage["plugins"]["lifecycle_migrations_applied"] == [migration_id]
+
+
+def test_baked_startup_enables_historically_accepted_non_slug_plugin_path(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import capability_staging as staging
+
+    distribution = tmp_path / "distribution"
+    home = tmp_path / "profile"
+    home.mkdir()
+    capability = distribution / "capabilities/legacy-fixture.json"
+    capability.parent.mkdir(parents=True)
+    capability.write_text(
+        json.dumps({
+            "name": "legacy-fixture",
+            "plugins": ["plugins/legacy.plugin"],
+        }),
+        encoding="utf-8",
+    )
+    plugin = distribution / "plugins/legacy.plugin"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        "name: legacy.plugin\nkind: backend\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text("", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(staging, "_repo_root", lambda: distribution)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: distribution / "plugins",
+    )
+
+    staging.seed_baked_capabilities(home)
+
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["legacy.plugin"]

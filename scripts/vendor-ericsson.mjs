@@ -20,7 +20,7 @@ const LOCK_MARKER = 'owner.json'
 const LOCK_RECOVERY_CLAIM = 'recovery-claim.json'
 const LOCK_SCHEMA_VERSION = 1
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const PLUGIN_PATH = /^plugins\/[a-z0-9][a-z0-9_-]*$/
+const STRUCTURED_PLUGIN_PATH = /^plugins\/[a-z0-9][a-z0-9_-]*$/
 const PLUGIN_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/
 const LIFECYCLE_MIGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/
 const PLUGIN_OBJECT_FIELDS = new Set(['path', 'id', 'enabled', 'lifecycleMigration'])
@@ -96,7 +96,6 @@ function normalizePluginEntries(manifest) {
   for (const raw of rawEntries) {
     if (typeof raw === 'string') {
       const rel = assertManifestSourcePath(raw, 'plugin')
-      if (!PLUGIN_PATH.test(rel)) throw new Error(`unsafe manifest source path: ${rel}`)
       if (structuredPaths.has(rel)) throw new Error(`duplicate plugin metadata path: ${rel}`)
       const id = path.posix.basename(rel)
       normalized.push({ path: rel, id, enabled: true, structured: false })
@@ -114,7 +113,7 @@ function normalizePluginEntries(manifest) {
       throw new Error('structured plugin metadata has invalid fields')
     }
     const rel = assertManifestSourcePath(raw.path, 'plugin')
-    if (!PLUGIN_PATH.test(rel)) throw new Error(`unsafe manifest source path: ${rel}`)
+    if (!STRUCTURED_PLUGIN_PATH.test(rel)) throw new Error(`unsafe manifest source path: ${rel}`)
     if (typeof raw.id !== 'string' || !PLUGIN_ID.test(raw.id)) {
       throw new Error('structured plugin metadata id must be a bounded slug')
     }

@@ -215,6 +215,27 @@ test('vendor maps manifest paths into the hermes-agent tree', () => {
   ])
 })
 
+test('vendor preserves historically accepted non-slug legacy plugin paths', () => {
+  const legacyPath = 'plugins/legacy.plugin'
+  const src = tmpSource({
+    skills: [],
+    plugins: [legacyPath],
+    mcpServers: undefined,
+    mcpLocal: [],
+    workflowPackages: [],
+  })
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+
+  assert.deepEqual(managedDestinations({ plugins: [legacyPath] }), [legacyPath])
+  vendor({ sourceDir: src, destRoot: dst, sourceCommit: '2'.repeat(40) })
+
+  assert.equal(
+    fs.readFileSync(path.join(dst, legacyPath, 'plugin.yaml'), 'utf8'),
+    'name: legacy.plugin\nkind: backend\n',
+  )
+  assert.deepEqual(readInventory(dst), [legacyPath])
+})
+
 test('vendor preserves structured standalone metadata and exact descriptor bytes', () => {
   const connector = {
     path: 'plugins/connector-one',
