@@ -331,6 +331,45 @@ describe('WorkflowsView', () => {
     }
   })
 
+  it('does not pull focus back after another surface takes focus before restoration runs', async () => {
+    $workflowSelectedRunId.set(null)
+    getWorkflowRun.mockResolvedValue(run())
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+    const card = await screen.findByRole('button', { name: /Laptop diagnostic/ })
+    card.focus()
+    fireEvent.click(card)
+    const close = await screen.findByRole('button', { name: 'Close' })
+    close.focus()
+
+    const frames: FrameRequestCallback[] = []
+    const requestFrame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(callback => {
+      frames.push(callback)
+
+      return frames.length
+    })
+
+    const outside = globalThis.document.createElement('button')
+    globalThis.document.body.append(outside)
+
+    try {
+      fireEvent.click(close)
+      await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
+      expect(frames).toHaveLength(1)
+
+      outside.focus()
+
+      frames[0]?.(performance.now())
+
+      expect(globalThis.document.activeElement).toBe(outside)
+    } finally {
+      requestFrame.mockRestore()
+      outside.remove()
+    }
+  })
+
   it('replaces a stale card origin when Attention opens another run', async () => {
     const runTwo = run({ run_id: 'run-2', workflow: 'Second workflow' })
     $workflowSelectedRunId.set(null)

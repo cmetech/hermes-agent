@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import type { ActivityBoardCard } from '@/components/activity-board/types'
 import { PageLoader } from '@/components/page-loader'
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import {
   executeWorkflowCleanup,
@@ -55,15 +56,19 @@ export function WorkflowsView() {
   const profile = requestProfile ?? 'default'
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
+  const paneVisible = usePaneVisible()
   const actionInFlight = useRef(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const pageRef = useRef<HTMLElement>(null)
+  const paneVisibleRef = useRef(paneVisible)
   const mounted = useRef(true)
   const reviewGeneration = useRef(0)
   const runReturnFocusRef = useRef<HTMLButtonElement | null>(null)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [view, setView] = useState<WorkflowRunView>('workflows')
+
+  paneVisibleRef.current = paneVisible
 
   const [viewIntent, setViewIntent] = useState<null | {
     profile: string
@@ -287,6 +292,13 @@ export function WorkflowsView() {
     }
 
     requestAnimationFrame(() => {
+      const focusOwner = activeElement()
+      const workflowsOwnFocus = focusOwner === document.body || (pageRef.current?.contains(focusOwner) ?? false)
+
+      if (!paneVisibleRef.current || !workflowsOwnFocus) {
+        return
+      }
+
       if (target?.isConnected) {
         target.focus()
       } else {
