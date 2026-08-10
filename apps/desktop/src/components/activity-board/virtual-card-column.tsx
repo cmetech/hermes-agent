@@ -1,4 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
+import type { MouseEvent } from 'react'
 import { useRef } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -52,12 +53,15 @@ export function VirtualCardColumn({
   selectedCardId
 }: VirtualCardColumnProps) {
   const parent = useRef<HTMLDivElement>(null)
+  const toggle = useRef<HTMLButtonElement>(null)
   const lane = appearance === 'lane'
   const laneTone = column.cards[0] ? HEALTH_TONE[column.cards[0].health] : 'var(--ui-text-quaternary)'
 
   const virtual = useVirtualizer({
     count: column.cards.length,
     estimateSize: () => 82,
+    gap: 8,
+    getItemKey: index => column.cards[index]?.id ?? index,
     getScrollElement: () => parent.current,
     initialRect: { height: 600, width: 320 },
     overscan: 8
@@ -72,6 +76,16 @@ export function VirtualCardColumn({
         : column.cards.slice(0, 16).map((_, index) => ({ index, start: index * 82 }))
       : column.cards.map((_, index) => ({ index }))
 
+  const toggleCollapsed = (event: MouseEvent<HTMLButtonElement>) => {
+    const restoreFocus = globalThis.document.activeElement === event.currentTarget
+
+    onToggleCollapsed?.()
+
+    if (restoreFocus) {
+      requestAnimationFrame(() => toggle.current?.focus())
+    }
+  }
+
   if (lane && collapsed) {
     return (
       <section aria-label={`${column.label}, ${column.count}`} className="h-full w-8 shrink-0" data-column={column.id}>
@@ -79,7 +93,8 @@ export function VirtualCardColumn({
           aria-expanded={false}
           aria-label={expandLabel}
           className="flex h-full w-full flex-col items-center gap-1.5 rounded-lg p-2 transition-colors motion-reduce:transition-none hover:bg-(--ui-bg-quinary)"
-          onClick={onToggleCollapsed}
+          onClick={toggleCollapsed}
+          ref={toggle}
           type="button"
         >
           <span className="grid h-5 shrink-0 place-items-center">
@@ -117,7 +132,8 @@ export function VirtualCardColumn({
             aria-expanded={true}
             aria-label={collapseLabel}
             className="ms-auto grid size-5 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity motion-reduce:transition-none hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/col:opacity-100"
-            onClick={onToggleCollapsed}
+            onClick={toggleCollapsed}
+            ref={toggle}
             type="button"
           >
             <Codicon name="chevron-left" size="0.75rem" />
@@ -137,7 +153,7 @@ export function VirtualCardColumn({
           <p className="px-1 py-2 text-[0.6875rem] text-(--ui-text-quaternary)">{emptyLabel}</p>
         ) : null}
         <div
-          className="relative space-y-2"
+          className={cn('relative', column.cards.length <= 50 && 'space-y-2')}
           style={column.cards.length > 50 ? { height: `${virtual.getTotalSize()}px` } : undefined}
         >
           {rows.map(row => {
@@ -169,8 +185,10 @@ export function VirtualCardColumn({
                   lane && selected && 'border-(--ui-accent) bg-(--ui-row-active-background)'
                 )}
                 data-activity-card-id={card.id}
+                data-index={virtualRow?.index}
                 key={card.id}
                 onClick={event => onOpenCard(card, event.currentTarget)}
+                ref={virtualRow ? virtual.measureElement : undefined}
                 style={lane ? { borderLeftColor: HEALTH_TONE[card.health], ...virtualStyle } : virtualStyle}
                 type="button"
               >

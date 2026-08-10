@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import type { ActivityBoardCard } from '@/components/activity-board/types'
+import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import {
   executeWorkflowCleanup,
@@ -322,56 +323,62 @@ export function WorkflowsView() {
         </div>
       ) : (
         <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>
-          <div className="shrink-0">
-            <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
-          </div>
-          <div className="min-h-0 flex-1" data-workflow-board-shell>
-            <ActivityBoard
-              collapseScope={view}
-              laneCopy={{
-                collapse: t.operations.workflowLaneCollapse,
-                empty: t.operations.workflowLaneEmpty,
-                expand: t.operations.workflowLaneExpand
-              }}
-              layout="collapsible-lanes"
-              model={model}
-              onLoadMore={() => void runs.fetchNextPage()}
-              onOpenCard={openRun}
-              selectedCardId={selectedRunId}
-            />
-          </div>
-          {(view === 'history' || view === 'archive') && (
-            <section aria-label={t.operations.cleanup} className="mt-6 shrink-0 border-t border-(--ui-border) pt-4">
-              <h2 className="text-sm font-medium">{t.operations.cleanup}</h2>
-              <p className="mt-1 text-xs text-(--ui-text-secondary)">{t.operations.cleanupExplanation}</p>
-              <Button
-                className="mt-3"
-                disabled={cleanupPreview.isPending || cleanupExecute.isPending}
-                onClick={() => cleanupPreview.mutate()}
-                size="sm"
-                variant="secondary"
-              >
-                {t.operations.inspectCleanupImpact}
-              </Button>
-              {cleanupPreview.data && (
-                <div className="mt-3 text-sm" role="status">
-                  <p>{t.operations.cleanupImpact(cleanupPreview.data.run_ids.length, cleanupPreview.data.files)}</p>
-                  {cleanupPreview.data.confirmation_token ? (
-                    <Button
-                      className="mt-2"
-                      disabled={cleanupExecute.isPending}
-                      onClick={() => cleanupExecute.mutate(cleanupPreview.data!.confirmation_token!)}
-                      size="sm"
-                      variant="destructive"
-                    >
-                      {t.operations.executeCleanup}
-                    </Button>
-                  ) : (
-                    <p className="mt-1 text-(--ui-text-secondary)">{t.operations.cleanupBlocked}</p>
+          {runs.isLoading && !runs.data ? (
+            <PageLoader className="min-h-0 flex-1" />
+          ) : (
+            <>
+              <div className="shrink-0">
+                <AttentionInbox items={attention.data?.items ?? []} onOpenRun={openRunId} />
+              </div>
+              <div className="min-h-0 flex-1" data-workflow-board-shell>
+                <ActivityBoard
+                  collapseScope={view}
+                  laneCopy={{
+                    collapse: t.operations.workflowLaneCollapse,
+                    empty: t.operations.workflowLaneEmpty,
+                    expand: t.operations.workflowLaneExpand
+                  }}
+                  layout="collapsible-lanes"
+                  model={model}
+                  onLoadMore={() => void runs.fetchNextPage()}
+                  onOpenCard={openRun}
+                  selectedCardId={selectedRunId}
+                />
+              </div>
+              {(view === 'history' || view === 'archive') && (
+                <section aria-label={t.operations.cleanup} className="mt-6 shrink-0 border-t border-(--ui-border) pt-4">
+                  <h2 className="text-sm font-medium">{t.operations.cleanup}</h2>
+                  <p className="mt-1 text-xs text-(--ui-text-secondary)">{t.operations.cleanupExplanation}</p>
+                  <Button
+                    className="mt-3"
+                    disabled={cleanupPreview.isPending || cleanupExecute.isPending}
+                    onClick={() => cleanupPreview.mutate()}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    {t.operations.inspectCleanupImpact}
+                  </Button>
+                  {cleanupPreview.data && (
+                    <div className="mt-3 text-sm" role="status">
+                      <p>{t.operations.cleanupImpact(cleanupPreview.data.run_ids.length, cleanupPreview.data.files)}</p>
+                      {cleanupPreview.data.confirmation_token ? (
+                        <Button
+                          className="mt-2"
+                          disabled={cleanupExecute.isPending}
+                          onClick={() => cleanupExecute.mutate(cleanupPreview.data!.confirmation_token!)}
+                          size="sm"
+                          variant="destructive"
+                        >
+                          {t.operations.executeCleanup}
+                        </Button>
+                      ) : (
+                        <p className="mt-1 text-(--ui-text-secondary)">{t.operations.cleanupBlocked}</p>
+                      )}
+                    </div>
                   )}
-                </div>
+                </section>
               )}
-            </section>
+            </>
           )}
         </div>
       )}

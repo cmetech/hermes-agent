@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
@@ -58,7 +58,7 @@ describe('ActivityBoard', () => {
     expect(screen.getByRole('region', { name: 'Active, 1' })).toBeTruthy()
   })
 
-  it('renders empty lanes as accessible rails and toggles them without moving cards', () => {
+  it('renders empty lanes as accessible rails and toggles them without moving cards or focus', async () => {
     render(
       <ActivityBoard
         collapseScope="board"
@@ -71,10 +71,20 @@ describe('ActivityBoard', () => {
     )
 
     const queued = screen.getByRole('region', { name: 'Queued, 0' })
-    expect(within(queued).getByRole('button', { name: 'Expand Queued' }).getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(within(queued).getByRole('button', { name: 'Expand Queued' }))
+    const expand = within(queued).getByRole('button', { name: 'Expand Queued' })
+
+    expect(expand.getAttribute('aria-expanded')).toBe('false')
+    expand.focus()
+    fireEvent.click(expand)
     expect(within(queued).getByText('No runs')).toBeTruthy()
-    expect(within(queued).getByRole('button', { name: 'Collapse Queued' }).getAttribute('aria-expanded')).toBe('true')
+    const collapse = within(queued).getByRole('button', { name: 'Collapse Queued' })
+
+    expect(collapse.getAttribute('aria-expanded')).toBe('true')
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(collapse))
+    fireEvent.click(collapse)
+    await waitFor(() =>
+      expect(globalThis.document.activeElement).toBe(within(queued).getByRole('button', { name: 'Expand Queued' }))
+    )
     expect(screen.getByRole('button', { name: 'Run one, running' })).toBeTruthy()
   })
 

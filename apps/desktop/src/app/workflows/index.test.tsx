@@ -241,6 +241,27 @@ describe('WorkflowsView', () => {
     expect(screen.queryByRole('button', { name: 'Run filters coming soon' })).toBeNull()
   })
 
+  it('keeps navigation mounted around a bounded initial run-list loader', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof listWorkflowRuns>>>()
+
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockReturnValue(pending.promise)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    const history = screen.getByRole('tab', { name: 'History' })
+
+    history.focus()
+    fireEvent.click(history)
+
+    expect(screen.getByRole('status', { name: 'Loading' })).toBeTruthy()
+    expect(screen.queryByLabelText('Workflows activity board')).toBeNull()
+    expect(globalThis.document.activeElement).toBe(history)
+
+    pending.resolve({ next_cursor: null, runs: [run()], schema_version: 1 })
+    expect(await screen.findByLabelText('Workflows activity board')).toBeTruthy()
+  })
+
   it('opens selected run detail in a side drawer instead of below the board', async () => {
     $workflowSelectedRunId.set(null)
     getWorkflowRun.mockResolvedValue(run())
