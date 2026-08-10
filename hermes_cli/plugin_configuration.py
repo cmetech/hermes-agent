@@ -14,6 +14,7 @@ import math
 import os
 import re
 import stat
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -68,6 +69,7 @@ _SETUP_ACTION_KEYS = frozenset({
     "interactive",
     "documentation_url",
 })
+_SAFE_PATTERN_ESCAPES = frozenset(r"\.^$[]-*+?{}()|/dDsSwW")
 
 
 class FieldStorage(str, Enum):
@@ -147,7 +149,12 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _bounded_text(value: Any, *, maximum: int = _MAX_TEXT) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
+    ):
         raise _InvalidDescriptor("expected bounded non-empty text")
     return value
 
@@ -156,6 +163,31 @@ def _identifier(value: Any) -> str:
     value = _bounded_text(value, maximum=_MAX_ID)
     if _ID_PATTERN.fullmatch(value) is None:
         raise _InvalidDescriptor("invalid identifier")
+    return value
+
+
+def _safe_http_url(value: str) -> bool:
+    if "\\" in value or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and (port is None or 0 < port < 65536)
+    )
+
+
+def _documentation_url(value: Any) -> str:
+    value = _bounded_text(value, maximum=2048)
+    if not _safe_http_url(value):
+        raise _InvalidDescriptor("documentation URL must use HTTP(S) with authority")
     return value
 
 
@@ -178,6 +210,52 @@ def _value_matches_type(value: Any, field_type: str) -> bool:
     if field_type == "boolean":
         return type(value) is bool
     return False
+
+
+def _validate_fixed_width_pattern(pattern: str) -> None:
+    """Accept only regex syntax whose match cost is linear in input length.
+
+    V1 patterns may use optional outer anchors, literals, single-character
+    categories/escapes, ``.``, and character classes. Repetition, grouping,
+    alternation, lookaround, and backreferences are deliberately unavailable.
+    Every accepted atom therefore consumes at most one character, so the
+    existing bounded pattern/input sizes bound ``re.search`` work.
+    """
+
+    index = 0
+    if pattern.startswith("^"):
+        index = 1
+    end = len(pattern) - (1 if pattern.endswith("$") else 0)
+    while index < end:
+        character = pattern[index]
+        if character == "\\":
+            index += 1
+            if index >= end or pattern[index] not in _SAFE_PATTERN_ESCAPES:
+                raise _InvalidDescriptor("unsafe pattern escape")
+        elif character == "[":
+            index += 1
+            class_atoms = 0
+            if index < end and pattern[index] == "^":
+                index += 1
+            while index < end and pattern[index] != "]":
+                if pattern[index] == "[":
+                    raise _InvalidDescriptor("nested character class")
+                if pattern[index] == "\\":
+                    index += 1
+                    if index >= end or pattern[index] not in _SAFE_PATTERN_ESCAPES:
+                        raise _InvalidDescriptor("unsafe character-class escape")
+                class_atoms += 1
+                index += 1
+            if index >= end or pattern[index] != "]" or class_atoms == 0:
+                raise _InvalidDescriptor("unterminated or empty character class")
+        elif character in "*+?{}()|^$":
+            raise _InvalidDescriptor("pattern uses variable or branching syntax")
+        index += 1
+
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise _InvalidDescriptor("invalid fixed-width pattern") from exc
 
 
 def _parse_validation(raw: Any, field_type: str) -> ValidationConstraints:
@@ -207,10 +285,7 @@ def _parse_validation(raw: Any, field_type: str) -> ValidationConstraints:
     pattern = raw.get("pattern")
     if pattern is not None:
         pattern = _bounded_text(pattern, maximum=_MAX_PATTERN)
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            raise _InvalidDescriptor("invalid regular expression") from exc
+        _validate_fixed_width_pattern(pattern)
 
     field_format = raw.get("format")
     if field_format is not None and field_format not in _FORMATS:
@@ -261,8 +336,7 @@ def _default_satisfies(
         if rules.pattern is not None and re.search(rules.pattern, value) is None:
             return False
         if rules.format == "url":
-            parsed = urlsplit(value)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if not _safe_http_url(value):
                 return False
         if rules.format == "path" and "\x00" in value:
             return False
@@ -299,7 +373,7 @@ def _parse_field(raw: Any) -> PluginConfigurationField:
         help_text = _bounded_text(help_text)
     documentation_url = raw.get("documentation_url")
     if documentation_url is not None:
-        documentation_url = _bounded_text(documentation_url, maximum=2048)
+        documentation_url = _documentation_url(documentation_url)
 
     platforms_raw = raw.get("platforms", [])
     if not isinstance(platforms_raw, list) or len(platforms_raw) > _MAX_PLATFORMS:
@@ -373,7 +447,7 @@ def _parse_setup_action(raw: Any) -> SetupActionMetadata:
         help_text = _bounded_text(help_text)
     documentation_url = raw.get("documentation_url")
     if documentation_url is not None:
-        documentation_url = _bounded_text(documentation_url, maximum=2048)
+        documentation_url = _documentation_url(documentation_url)
     return SetupActionMetadata(
         id=_identifier(raw["id"]),
         label=_bounded_text(raw["label"], maximum=_MAX_LABEL),

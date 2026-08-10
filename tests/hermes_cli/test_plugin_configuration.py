@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -187,6 +188,69 @@ def test_visible_when_accepts_null_as_a_json_scalar(tmp_path):
     assert loaded.fields[1].visible_when.equals is None
 
 
+def test_adversarial_pattern_fails_closed_without_backtracking(tmp_path):
+    from hermes_cli.plugin_configuration import load_plugin_configuration
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    descriptor = _valid_descriptor()
+    descriptor["fields"][0].pop("default")
+    descriptor["fields"][0]["validation"] = {"pattern": "^(a+)+$"}
+    _write_descriptor(plugin_dir, descriptor)
+
+    started = time.monotonic()
+    loaded = load_plugin_configuration(plugin_dir, "config.schema.json")
+    elapsed = time.monotonic() - started
+
+    assert loaded is None
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda data: data["fields"][0].update(label="URL\x1b[31m"),
+        lambda data: data["fields"][0].update(help="Line one\nLine two"),
+        lambda data: data["setup_actions"][0].update(label="Token\u202e"),
+        lambda data: data["setup_actions"][0].update(help="Hidden\x7f"),
+    ],
+    ids=["field-label", "field-help", "setup-label", "setup-help"],
+)
+def test_display_metadata_rejects_terminal_and_format_controls(tmp_path, mutate):
+    from hermes_cli.plugin_configuration import load_plugin_configuration
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    descriptor = _valid_descriptor()
+    mutate(descriptor)
+    _write_descriptor(plugin_dir, descriptor)
+
+    assert load_plugin_configuration(plugin_dir, "config.schema.json") is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda data: data["fields"][0].update(documentation_url="javascript:alert(1)"),
+        lambda data: data["fields"][0].update(documentation_url="https:///missing"),
+        lambda data: data["setup_actions"][0].update(
+            documentation_url="file:///tmp/help"
+        ),
+    ],
+    ids=["field-script-scheme", "field-missing-authority", "setup-file-scheme"],
+)
+def test_documentation_urls_require_http_or_https_authority(tmp_path, mutate):
+    from hermes_cli.plugin_configuration import load_plugin_configuration
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    descriptor = _valid_descriptor()
+    mutate(descriptor)
+    _write_descriptor(plugin_dir, descriptor)
+
+    assert load_plugin_configuration(plugin_dir, "config.schema.json") is None
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -281,6 +345,45 @@ def test_disabled_manifest_descriptor_is_discovered_without_import_and_disable_w
     manager.discover_and_load()
 
     loaded = manager.list_plugins()[0]
+    assert loaded["kind"] == "standalone"
+    assert loaded["configuration"]["fields"][0]["id"] == "endpoint"
+    assert loaded["enabled"] is False
+    assert loaded["error"] == "disabled via config"
+    assert not sentinel.exists()
+
+
+def test_disabled_bundled_manifest_descriptor_is_discovered_without_import(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins
+
+    bundled_dir = tmp_path / "bundled"
+    plugin_dir = bundled_dir / "bundled-static"
+    plugin_dir.mkdir(parents=True)
+    hermes_home = tmp_path / "home"
+    (hermes_home / "plugins").mkdir(parents=True)
+    sentinel = tmp_path / "bundled-imported"
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: bundled-static\nkind: standalone\nconfig_schema: config.schema.json\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    _write_descriptor(plugin_dir, _valid_descriptor())
+
+    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled_dir)
+    monkeypatch.setattr(plugins, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(plugins, "_get_enabled_plugins", lambda: {"bundled-static"})
+    monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: {"bundled-static"})
+    monkeypatch.setattr(plugins.PluginManager, "_scan_entry_points", lambda self: [])
+
+    manager = plugins.PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager.list_plugins()[0]
+    assert loaded["source"] == "bundled"
     assert loaded["kind"] == "standalone"
     assert loaded["configuration"]["fields"][0]["id"] == "endpoint"
     assert loaded["enabled"] is False

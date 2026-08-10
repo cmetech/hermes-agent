@@ -176,6 +176,8 @@ before you opt in to a plugin.
 Secret fields are always redacted in this output. They expose only `is_set`;
 the secret value is never returned. Invalid descriptors are omitted, and a
 plugin without `config_schema` keeps the same listing behavior as before.
+Descriptor display text rejects terminal controls, documentation links are
+limited to HTTP(S), and validation patterns use a bounded fixed-width subset.
 Changing a plugin's enabled or disabled state still takes effect on the next
 session; configuration discovery does not rewrite an active conversation's
 prompt or toolset.

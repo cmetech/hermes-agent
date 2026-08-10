@@ -134,13 +134,19 @@ is `setting` or `secret`. Optional field metadata includes `help`,
 the form `{"field": "other_id", "equals": <scalar>}`. Validation supports
 type-appropriate `min_length`, `max_length`, `pattern`, `enum`, `minimum`,
 `maximum`, and `format` (`url` or `path`). Defaults must match all declared
-validation and are forbidden for secrets.
+validation and are forbidden for secrets. Version 1 `pattern` is deliberately
+fixed-width: it supports optional outer `^`/`$` anchors, literals,
+single-character escapes/categories, `.`, and character classes. Repetition,
+grouping, alternation, lookaround, and backreferences are rejected so matching
+remains bounded.
 
 Setup actions are display metadata only: `id`, `label`, optional `help`,
 `interactive`, and `documentation_url`. Descriptors cannot declare commands,
 scripts, modules, callbacks, or other executable behavior. Plugin identity and
 activation remain in `plugin.yaml`; do not duplicate the plugin id or `kind` in
-the descriptor.
+the descriptor. Labels and help text cannot contain terminal or Unicode format
+controls, and `documentation_url` must be an HTTP or HTTPS URL with an
+authority/host.
 
 Optional fields you could add:
 ```yaml
