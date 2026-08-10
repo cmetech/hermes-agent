@@ -28,7 +28,102 @@ from hermes_cli.tools_config import (
     _visible_providers,
     provider_readiness_status,
     tools_command,
+    plugin_configuration_command,
 )
+
+
+@pytest.mark.parametrize("action", ["configure", "status", "auth", "enroll"])
+def test_plugin_configuration_cli_dispatches_to_generic_service(action, monkeypatch):
+    calls = []
+
+    class Service:
+        def detail(self, plugin_id, platform=None):
+            calls.append(("detail", plugin_id, platform))
+            return {
+                "plugin_id": plugin_id,
+                "enabled": True,
+                "fields": [],
+                "setup_actions": [
+                    {"id": "auth", "label": "Auth", "available": True},
+                    {"id": "enroll", "label": "Enroll", "available": True},
+                ],
+            }
+
+        def update(self, plugin_id, *, settings=None, secrets=None):
+            calls.append(("update", plugin_id, settings, secrets))
+            return {"plugin_id": plugin_id, "enabled": True, "fields": []}
+
+        def start_action(self, plugin_id, action_id, unattended=False):
+            calls.append(("start", plugin_id, action_id, unattended))
+            return {"run_id": "run-1", "plugin_id": plugin_id, "action": action_id, "status": "running"}
+
+        def action_status(self, run_id):
+            return {"run_id": run_id, "plugin_id": "sample", "action": "auth", "status": "succeeded", "result": {}}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_plugin_configuration_service", lambda: Service()
+    )
+    args = type("Args", (), {"tools_action": action, "plugin_id": "sample", "platform": "cli", "settings": [], "secrets": [], "clear_secrets": []})()
+
+    assert plugin_configuration_command(args) == 0
+    assert calls
+
+
+def test_plugin_configuration_cli_returns_nonzero_for_invalid_operation(monkeypatch):
+    from hermes_cli.plugin_configuration import PluginConfigurationError
+
+    class Service:
+        def detail(self, plugin_id, platform=None):
+            raise PluginConfigurationError("plugin unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_plugin_configuration_service", lambda: Service()
+    )
+    args = type("Args", (), {"tools_action": "status", "plugin_id": "missing", "platform": "cli"})()
+
+    assert plugin_configuration_command(args) != 0
+
+
+def test_plugin_configuration_cli_prompts_secrets_and_coerces_setting_types(monkeypatch):
+    updates = []
+
+    class Service:
+        def detail(self, plugin_id, platform=None):
+            return {
+                "plugin_id": plugin_id,
+                "enabled": True,
+                "fields": [
+                    {"id": "retries", "type": "integer", "storage": "setting"},
+                    {"id": "verify", "type": "boolean", "storage": "setting"},
+                    {"id": "token", "type": "string", "storage": "secret", "is_set": False},
+                ],
+            }
+
+        def update(self, plugin_id, *, settings=None, secrets=None):
+            updates.append((settings, secrets))
+            return self.detail(plugin_id)
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_plugin_configuration_service", lambda: Service()
+    )
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted-secret")
+    args = type(
+        "Args",
+        (),
+        {
+            "tools_action": "configure",
+            "plugin_id": "sample",
+            "platform": "cli",
+            "settings": ["retries=3", "verify=true"],
+            "secrets": ["token"],
+            "clear_secrets": [],
+        },
+    )()
+
+    assert plugin_configuration_command(args) == 0
+    assert updates == [
+        ({"retries": 3, "verify": True}, {"token": "prompted-secret"})
+    ]
 
 
 

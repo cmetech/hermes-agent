@@ -455,6 +455,27 @@ class PluginContext:
             hosts=hosts,
         )
 
+    # -- host-owned setup actions ------------------------------------------
+
+    def register_setup_action(
+        self,
+        name: str,
+        handler: Callable,
+        *,
+        readiness: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> None:
+        """Register a descriptor-declared action while this plugin imports.
+
+        Actions are invoked only through the host configuration service. They
+        are deliberately separate from the model tool registry.
+        """
+        self._manager._register_setup_action(
+            plugin=self.manifest.key or self.manifest.name,
+            name=name,
+            handler=handler,
+            readiness=readiness,
+        )
+
     # -- tool registration --------------------------------------------------
 
     def register_tool(
@@ -1379,6 +1400,8 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         self._background_services: Dict[str, BackgroundServiceRegistration] = {}
+        self._setup_actions: Dict[str, Dict[str, dict[str, Any]]] = {}
+        self._registering_plugin_id: str | None = None
         self._background_service_hosts: Dict[
             BackgroundServiceHostKind, BackgroundServiceHost
         ] = {}
@@ -1448,6 +1471,8 @@ class PluginManager:
         self._aux_tasks.clear()
         self._slack_action_handlers.clear()
         self._background_services.clear()
+        self._setup_actions.clear()
+        self._registering_plugin_id = None
         self._context_engine = None
 
     def _register_background_service(
@@ -1489,6 +1514,35 @@ class PluginManager:
                 factory=factory,
                 hosts=host_set,
             )
+
+    def _register_setup_action(
+        self,
+        *,
+        plugin: str,
+        name: str,
+        handler: Callable,
+        readiness: Callable[[Mapping[str, Any]], bool] | None,
+    ) -> None:
+        if self._registering_plugin_id != plugin:
+            raise RuntimeError("setup actions may register only during plugin import")
+        loaded_manifest = None
+        # The manifest being imported is not in _plugins until registration
+        # completes, so _load_plugin records it transiently for this check.
+        manifest = getattr(self, "_registering_manifest", None)
+        if manifest is not None and (manifest.key or manifest.name) == plugin:
+            loaded_manifest = manifest
+        descriptor = getattr(loaded_manifest, "configuration", None)
+        declared = {action.id for action in descriptor.setup_actions} if descriptor else set()
+        if name not in declared:
+            raise ValueError(f"undeclared setup action: {name}")
+        if not callable(handler):
+            raise TypeError("setup action handler must be callable")
+        if readiness is not None and not callable(readiness):
+            raise TypeError("setup action readiness must be callable")
+        actions = self._setup_actions.setdefault(plugin, {})
+        if name in actions:
+            raise ValueError(f"duplicate setup action registration: {plugin}:{name}")
+        actions[name] = {"handler": handler, "readiness": readiness}
 
     def _background_host_quiescent(self, host: BackgroundServiceHost) -> None:
         with self._background_service_lock:
@@ -2124,7 +2178,13 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
-                register_fn(ctx)
+                self._registering_plugin_id = _plugin_id
+                self._registering_manifest = manifest
+                try:
+                    register_fn(ctx)
+                finally:
+                    self._registering_plugin_id = None
+                    self._registering_manifest = None
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
@@ -2166,6 +2226,7 @@ class PluginManager:
                     set(self._background_services) - _services_before
                 ):
                     self._background_services.pop(qualified_name, None)
+            self._setup_actions.pop(_plugin_id, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
