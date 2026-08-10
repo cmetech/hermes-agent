@@ -3208,9 +3208,28 @@ function Install-NodeDeps {
 
     # Browser tools
     if (Test-Path "$InstallDir\package.json") {
-        Write-Info "Installing Node.js dependencies (browser tools)..."
-        $browserLog = "$env:TEMP\hermes-npm-browser-$(Get-Random).log"
-        $browserNpmOk = _Run-NpmInstall "Browser tools" $InstallDir $browserLog $npmExe
+        # Fingerprint gate: skip the npm tree walk when the lockfile and Node
+        # major are unchanged since the last SUCCESSFUL install. On skip,
+        # $browserNpmOk is still set so the Playwright verification below runs
+        # (it is a fast no-op when Chromium is already cached). See
+        # Get-NpmDepsFingerprint above for the fail-open contract.
+        $rootSpec = "$InstallDir\package.json"
+        if (Test-Path "$InstallDir\package-lock.json") {
+            $rootSpec = "$InstallDir\package-lock.json"
+        }
+        $rootFingerprint = Get-NpmDepsFingerprint $rootSpec
+        $rootMarker = "$InstallDir\node_modules\.npm-deps-fingerprint"
+        if (Test-NpmDepsCurrent $rootMarker $rootFingerprint) {
+            Write-Info "Node.js dependencies unchanged since last install; skipping npm install"
+            $browserNpmOk = $true
+        } else {
+            Write-Info "Installing Node.js dependencies (browser tools)..."
+            $browserLog = "$env:TEMP\hermes-npm-browser-$(Get-Random).log"
+            $browserNpmOk = _Run-NpmInstall "Browser tools" $InstallDir $browserLog $npmExe
+            if ($browserNpmOk) {
+                Write-NpmDepsMarker $rootMarker $rootFingerprint
+            }
+        }
 
         # Install Playwright Chromium (mirrors scripts/install.sh behaviour for
         # Linux).  Without this, tools/browser_tool.py::check_browser_requirements
@@ -3312,9 +3331,26 @@ function Install-NodeDeps {
     # TUI
     $tuiDir = "$InstallDir\ui-tui"
     if (Test-Path "$tuiDir\package.json") {
-        Write-Info "Installing TUI dependencies..."
-        $tuiLog = "$env:TEMP\hermes-npm-tui-$(Get-Random).log"
-        [void](_Run-NpmInstall "TUI" $tuiDir $tuiLog $npmExe)
+        # ui-tui carries no lockfile today; hash package.json (upgrading to a
+        # lockfile automatically if one ever appears). The marker lives in the
+        # ROOT node_modules -- npm workspaces hoist there, and wiping
+        # node_modules must invalidate this gate too.
+        $tuiSpec = "$tuiDir\package.json"
+        if (Test-Path "$tuiDir\package-lock.json") {
+            $tuiSpec = "$tuiDir\package-lock.json"
+        }
+        $tuiFingerprint = Get-NpmDepsFingerprint $tuiSpec
+        $tuiMarker = "$InstallDir\node_modules\.npm-deps-fingerprint-tui"
+        if (Test-NpmDepsCurrent $tuiMarker $tuiFingerprint) {
+            Write-Info "TUI dependencies unchanged since last install; skipping npm install"
+        } else {
+            Write-Info "Installing TUI dependencies..."
+            $tuiLog = "$env:TEMP\hermes-npm-tui-$(Get-Random).log"
+            $tuiNpmOk = _Run-NpmInstall "TUI" $tuiDir $tuiLog $npmExe
+            if ($tuiNpmOk) {
+                Write-NpmDepsMarker $tuiMarker $tuiFingerprint
+            }
+        }
     }
 }
 

@@ -214,3 +214,35 @@ def test_ps_gate_round_trip(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "RESULT=OK" in proc.stdout
+
+
+@pytest.mark.skipif(not INSTALL_PS1.exists(), reason="install.ps1 missing")
+def test_install_ps1_wires_gate_at_both_npm_sites() -> None:
+    text = INSTALL_PS1.read_text()
+    fn = _extract_ps_function(text, "Install-NodeDeps")
+
+    # Root site: gate consulted; a skip must still mark browser npm OK so the
+    # Playwright verification block runs.
+    assert 'Test-NpmDepsCurrent $rootMarker $rootFingerprint' in fn
+    assert '\\node_modules\\.npm-deps-fingerprint"' in fn
+    assert re.search(
+        r'if \(Test-NpmDepsCurrent \$rootMarker \$rootFingerprint\) \{\s*\n'
+        r'[^\n]*\n?\s*Write-Info[^\n]*skipping npm install[^\n]*\n'
+        r'\s*\$browserNpmOk = \$true',
+        fn,
+    ), "root skip path must set browserNpmOk so the Playwright check still runs"
+    assert re.search(
+        r'if \(\$browserNpmOk\) \{\s*\n\s*Write-NpmDepsMarker \$rootMarker \$rootFingerprint',
+        fn,
+    ), "root marker must be written only on npm success"
+
+    # TUI site: result captured (no [void]) and marker written on success;
+    # the marker lives in the ROOT node_modules like the bash side.
+    assert '\\node_modules\\.npm-deps-fingerprint-tui"' in fn
+    assert 'Test-NpmDepsCurrent $tuiMarker $tuiFingerprint' in fn
+    assert '[void](_Run-NpmInstall' not in fn
+    assert re.search(
+        r'\$tuiNpmOk = _Run-NpmInstall[^\n]*\n\s*if \(\$tuiNpmOk\) \{\s*\n'
+        r'\s*Write-NpmDepsMarker \$tuiMarker \$tuiFingerprint',
+        fn,
+    ), "tui marker must be written only on npm success"
