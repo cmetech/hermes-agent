@@ -12,6 +12,8 @@ const refreshPluginReadiness = vi.fn()
 const startPluginSetupAction = vi.fn()
 const getPluginSetupAction = vi.fn()
 const cancelPluginSetupAction = vi.fn()
+const isPluginConfigurationRouteMissingError = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
   setApiRequestProfile: vi.fn(),
@@ -24,12 +26,13 @@ vi.mock('@/hermes', () => ({
   refreshPluginReadiness: (pluginId: string) => refreshPluginReadiness(pluginId),
   startPluginSetupAction: (pluginId: string, actionId: string) => startPluginSetupAction(pluginId, actionId),
   getPluginSetupAction: (runId: string) => getPluginSetupAction(runId),
-  cancelPluginSetupAction: (runId: string) => cancelPluginSetupAction(runId)
+  cancelPluginSetupAction: (runId: string) => cancelPluginSetupAction(runId),
+  isPluginConfigurationRouteMissingError: (error: unknown) => isPluginConfigurationRouteMissingError(error)
 }))
 
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),
-  notifyError: vi.fn()
+  notifyError: (error: unknown, fallback: string) => notifyError(error, fallback)
 }))
 
 function detail(overrides: Partial<PluginConfigurationDetail> = {}): PluginConfigurationDetail {
@@ -109,6 +112,7 @@ beforeEach(() => {
     action: 'connect',
     status: 'cancelled'
   })
+  isPluginConfigurationRouteMissingError.mockReturnValue(false)
 })
 
 afterEach(() => {
@@ -318,5 +322,30 @@ describe('PluginToolsetConfigPanel', () => {
     expect(await screen.findByDisplayValue('https://profile-b.example.test')).toBeTruthy()
     expect((screen.getByLabelText('Access token') as HTMLInputElement).value).toBe('')
     expect(screen.getByRole('button', { name: 'Connect' })).toBeTruthy()
+  })
+
+  it('omits the connector section silently when an older backend lacks the catalog route', async () => {
+    const missingRoute = { body: { detail: 'Not Found' }, status: 404 }
+    getPluginConfigurations.mockRejectedValueOnce(missingRoute)
+    isPluginConfigurationRouteMissingError.mockImplementation(error => error === missingRoute)
+    const { PluginToolsetConfigPanel } = await import('./plugin-toolset-config-panel')
+    const { container } = render(<PluginToolsetConfigPanel />)
+
+    await waitFor(() => expect(getPluginConfigurations).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(container.textContent).toBe(''))
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ body: { detail: 'Internal Server Error' }, status: 500 }],
+    [{ body: { detail: { code: 'plugin_not_found', message: 'Plugin configuration was not found.' } }, status: 404 }]
+  ])('retains recovery UI for supported-route failures %#', async error => {
+    getPluginConfigurations.mockRejectedValueOnce(error)
+    const { PluginToolsetConfigPanel } = await import('./plugin-toolset-config-panel')
+    render(<PluginToolsetConfigPanel />)
+
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeTruthy()
+    expect(notifyError).toHaveBeenCalledWith(error, expect.any(String))
   })
 })

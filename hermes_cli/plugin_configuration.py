@@ -847,25 +847,53 @@ class PluginConfigurationService:
     def _plugin_manager(self):
         if self._manager is not None:
             return self._manager
-        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from hermes_cli.plugins import get_plugin_manager
 
-        discover_plugins()
         return get_plugin_manager()
 
+    def _inventory(self):
+        if self._manager is not None:
+            return self._manager.loaded_plugins()
+        from hermes_cli.plugins import LoadedPlugin
+
+        return [
+            LoadedPlugin(manifest=manifest)
+            for manifest in self._plugin_manager().static_plugin_inventory()
+        ]
+
     def _loaded(self, plugin_id: str):
-        manager = self._plugin_manager()
-        loaded = manager._plugins.get(plugin_id)
-        if loaded is None:
-            matches = [
+        inventory = self._inventory()
+        loaded = next(
+            (
                 item
-                for item in manager._plugins.values()
-                if item.manifest.name == plugin_id
-            ]
+                for item in inventory
+                if (item.manifest.key or item.manifest.name) == plugin_id
+            ),
+            None,
+        )
+        if loaded is None:
+            matches = [item for item in inventory if item.manifest.name == plugin_id]
             if len(matches) == 1:
                 loaded = matches[0]
         if loaded is None or loaded.manifest.configuration is None:
             raise PluginConfigurationError("plugin configuration unavailable")
         return loaded
+
+    def inventory(self, platform: str | None = None) -> list[dict[str, Any]]:
+        """Project all configurable descriptors in the active profile."""
+        plugin_ids = sorted(
+            loaded.manifest.key or loaded.manifest.name
+            for loaded in self._inventory()
+            if loaded.manifest.configuration is not None
+        )
+        return [self.detail(plugin_id, platform=platform) for plugin_id in plugin_ids]
+
+    def _registrations(self, plugin_id: str) -> dict[str, dict[str, Any]]:
+        if self._manager is not None:
+            # Explicitly injected managers are a test/embedding seam and do
+            # not participate in the process-global discovery lifecycle.
+            return dict(getattr(self._manager, "_setup_actions", {}).get(plugin_id, {}))
+        return self._plugin_manager().setup_action_registrations(plugin_id)
 
     @staticmethod
     def _fields(loaded) -> dict[str, PluginConfigurationField]:
@@ -1004,9 +1032,7 @@ class PluginConfigurationService:
             "enabled": enabled,
             "readiness": self.readiness(canonical_id, platform=platform),
         })
-        registrations = getattr(self._plugin_manager(), "_setup_actions", {}).get(
-            canonical_id, {}
-        )
+        registrations = self._registrations(canonical_id)
         for action in result.get("setup_actions", []):
             action["available"] = bool(enabled and action["id"] in registrations)
         return result
@@ -1017,6 +1043,7 @@ class PluginConfigurationService:
         *,
         settings: Mapping[str, Any] | None = None,
         secrets: Mapping[str, Any] | None = None,
+        platform: str | None = None,
     ) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
@@ -1097,9 +1124,11 @@ class PluginConfigurationService:
                 raise PluginConfigurationError(
                     "plugin configuration could not be persisted"
                 ) from exc
-        return self.detail(canonical_id)
+        return self.detail(canonical_id, platform=platform)
 
-    def clear_secret(self, plugin_id: str, field_id: str) -> dict[str, Any]:
+    def clear_secret(
+        self, plugin_id: str, field_id: str, *, platform: str | None = None
+    ) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
         field = self._fields(loaded).get(field_id)
@@ -1121,7 +1150,7 @@ class PluginConfigurationService:
             raise PluginConfigurationError(
                 "plugin configuration could not be persisted"
             ) from exc
-        return self.detail(canonical_id)
+        return self.detail(canonical_id, platform=platform)
 
     def readiness(self, plugin_id: str, platform: str | None = None) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
@@ -1157,9 +1186,7 @@ class PluginConfigurationService:
                     else "configuration_required"
                 )
                 reasons.append(f"{reason}:{field.id}")
-        registrations = getattr(self._plugin_manager(), "_setup_actions", {}).get(
-            canonical_id, {}
-        )
+        registrations = self._registrations(canonical_id)
         for action_id, registration in registrations.items():
             readiness = registration.get("readiness")
             if readiness is None:
@@ -1220,9 +1247,7 @@ class PluginConfigurationService:
             raise PluginConfigurationError("deadline must be between 0 and 300 seconds")
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
-        registrations = getattr(self._plugin_manager(), "_setup_actions", {}).get(
-            canonical_id, {}
-        )
+        registrations = self._registrations(canonical_id)
         registration = registrations.get(action_id)
         if not self._is_enabled(loaded) or registration is None:
             raise PluginConfigurationError("setup action unavailable")

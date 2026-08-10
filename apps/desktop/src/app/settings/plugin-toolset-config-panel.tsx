@@ -11,6 +11,7 @@ import {
   clearPluginConfigurationSecret,
   getPluginConfigurations,
   getPluginSetupAction,
+  isPluginConfigurationRouteMissingError,
   refreshPluginReadiness,
   setPluginConfigurationEnabled,
   startPluginSetupAction,
@@ -464,6 +465,7 @@ function ProfileScopedPluginToolsetConfigPanel({ activeProfile }: ProfileScopedP
   const [details, setDetails] = useState<PluginConfigurationDetail[]>([])
   const [loading, setLoading] = useState(true)
   const [loadFailed, setLoadFailed] = useState(false)
+  const [routeMissing, setRouteMissing] = useState(false)
   const mountedRef = useRef(false)
   const catalogGenerationRef = useRef(0)
   const mutationGenerationsRef = useRef(new Map<string, number>())
@@ -499,8 +501,12 @@ function ProfileScopedPluginToolsetConfigPanel({ activeProfile }: ProfileScopedP
       }
     } catch (error) {
       if (mountedRef.current && catalogGenerationRef.current === generation) {
-        setLoadFailed(true)
-        notifyError(error, copy.loadFailed)
+        if (isPluginConfigurationRouteMissingError(error)) {
+          setRouteMissing(true)
+        } else {
+          setLoadFailed(true)
+          notifyError(error, copy.loadFailed)
+        }
       }
     } finally {
       if (mountedRef.current && catalogGenerationRef.current === generation) {
@@ -589,6 +595,10 @@ function ProfileScopedPluginToolsetConfigPanel({ activeProfile }: ProfileScopedP
         <Loader label={copy.loading} type="lemniscate-bloom" />
       </section>
     )
+  }
+
+  if (routeMissing) {
+    return null
   }
 
   return (

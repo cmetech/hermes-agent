@@ -79,6 +79,31 @@ def _write_plugin(home: Path, *, import_sentinel: Path | None = None) -> Path:
     return plugin
 
 
+def _write_named_plugin(
+    plugins_dir: Path,
+    plugin_id: str,
+    *,
+    schema: dict | None = None,
+    init_code: str = "def register(ctx):\n    return None\n",
+) -> Path:
+    plugin = plugins_dir / plugin_id
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        yaml.safe_dump({
+            "name": plugin_id,
+            "version": "1.0.0",
+            "description": f"{plugin_id} connector",
+            "config_schema": "config.schema.json",
+        }),
+        encoding="utf-8",
+    )
+    (plugin / "config.schema.json").write_text(
+        json.dumps(schema or _schema()), encoding="utf-8"
+    )
+    (plugin / "__init__.py").write_text(init_code, encoding="utf-8")
+    return plugin
+
+
 def _write_config(home: Path, *, enabled=(), disabled=()) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
@@ -396,3 +421,268 @@ def test_existing_toolset_route_serialization_is_unchanged(api):
     assert response.content == json.dumps(
         direct, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
+
+
+def test_catalog_inventory_and_setup_actions_follow_the_requested_profile(
+    tmp_path, monkeypatch
+):
+    """Disabled descriptors are static; runtime callbacks never cross profiles."""
+    from hermes_cli import plugins, web_server
+
+    home = tmp_path / ".hermes"
+    profile_a = home / "profiles" / "profile-a"
+    profile_b = home / "profiles" / "profile-b"
+    bundled = tmp_path / "bundled-plugins"
+    sentinel_a = tmp_path / "connector-a-imported"
+    sentinel_b = tmp_path / "connector-b-imported"
+    shared_init = """def register(ctx):
+    ctx.register_setup_action('connect', lambda configuration: {'ok': True})
+"""
+
+    _write_config(home)
+    _write_config(profile_a, enabled=["shared"], disabled=["connector-a"])
+    _write_config(profile_b, enabled=["shared"], disabled=["connector-b"])
+    _write_named_plugin(
+        profile_a / "plugins",
+        "connector-a",
+        init_code=f"from pathlib import Path\nPath({str(sentinel_a)!r}).write_text('imported')\n",
+    )
+    _write_named_plugin(
+        profile_b / "plugins",
+        "connector-b",
+        init_code=f"from pathlib import Path\nPath({str(sentinel_b)!r}).write_text('imported')\n",
+    )
+    _write_named_plugin(bundled, "shared", init_code=shared_init)
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled)
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+    manager = PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.plugin_configuration.get_plugin_configuration_service",
+        lambda: PluginConfigurationService(),
+    )
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_a))
+    try:
+        manager.discover_and_load()
+    finally:
+        reset_hermes_home_override(token)
+
+    previous = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.auth_required = False
+    try:
+        with TestClient(web_server.app) as client:
+            client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+            catalog_a = client.get(
+                "/api/plugin-configurations", params={"profile": "profile-a"}
+            )
+            catalog_b = client.get(
+                "/api/plugin-configurations", params={"profile": "profile-b"}
+            )
+            detail_b = client.get(
+                "/api/plugin-configurations/connector-b",
+                params={"profile": "profile-b"},
+            )
+            absent_enable = client.put(
+                "/api/plugin-configurations/connector-a/enabled",
+                json={"enabled": True, "profile": "profile-b"},
+            )
+            absent_action = client.post(
+                "/api/plugin-configurations/connector-a/actions/connect",
+                json={"profile": "profile-b"},
+            )
+    finally:
+        if previous is None:
+            delattr(web_server.app.state, "auth_required")
+        else:
+            web_server.app.state.auth_required = previous
+
+    assert catalog_a.status_code == catalog_b.status_code == 200
+    rows_a = {row["plugin_id"]: row for row in catalog_a.json()}
+    rows_b = {row["plugin_id"]: row for row in catalog_b.json()}
+    assert "connector-a" in rows_a and "connector-b" not in rows_a
+    assert "connector-b" in rows_b and "connector-a" not in rows_b
+    assert rows_a["shared"]["setup_actions"][0]["available"] is True
+    assert rows_b["shared"]["setup_actions"][0]["available"] is False
+    assert detail_b.status_code == 200
+    assert detail_b.json()["plugin_id"] == "connector-b"
+    for response in (absent_enable, absent_action):
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": {
+                "code": "plugin_not_found",
+                "message": "Plugin configuration was not found.",
+            }
+        }
+    assert not sentinel_a.exists()
+    assert not sentinel_b.exists()
+
+
+def test_unstamped_partial_discovery_callbacks_fail_closed():
+    manager = PluginManager()
+    manager._setup_actions[PLUGIN_ID] = {
+        "connect": {"handler": lambda _context: {}, "readiness": None}
+    }
+
+    assert manager.setup_action_registrations(PLUGIN_ID) == {}
+
+
+def test_desktop_readiness_is_authoritative_after_every_mutation(api):
+    client, _home, _profile, service, manager = api
+    plugin = manager._plugins[PLUGIN_ID]
+    descriptor = plugin.manifest.configuration
+    assert descriptor is not None
+
+    from dataclasses import replace
+    from hermes_cli.plugin_configuration import (
+        PluginConfigurationField,
+        ReadinessContribution,
+    )
+
+    desktop_field = PluginConfigurationField(
+        id="desktop_name",
+        label="Desktop name",
+        type="string",
+        storage=descriptor.fields[0].storage,
+        required=True,
+        platforms=("desktop",),
+        readiness=ReadinessContribution(enabled=True),
+    )
+    plugin.manifest.configuration = replace(
+        descriptor,
+        fields=(
+            *(replace(field, required=False) for field in descriptor.fields),
+            desktop_field,
+        ),
+    )
+    manager._plugins[PLUGIN_ID] = plugin
+
+    client.put(
+        f"/api/plugin-configurations/{PLUGIN_ID}/enabled", json={"enabled": True}
+    )
+    responses = [
+        client.get(f"/api/plugin-configurations/{PLUGIN_ID}"),
+        client.put(
+            f"/api/plugin-configurations/{PLUGIN_ID}",
+            json={"settings": {"endpoint": "https://desktop.example.test"}},
+        ),
+        client.put(
+            f"/api/plugin-configurations/{PLUGIN_ID}",
+            json={"secrets": {"token": "desktop-secret"}},
+        ),
+        client.delete(f"/api/plugin-configurations/{PLUGIN_ID}/secrets/token"),
+        client.post(f"/api/plugin-configurations/{PLUGIN_ID}/readiness", json={}),
+    ]
+    expected = ["configuration_required:desktop_name"]
+    for index, response in enumerate(responses):
+        assert response.status_code == 200
+        payload = response.json()
+        readiness = payload if index == len(responses) - 1 else payload["readiness"]
+        assert readiness["reasons"] == expected
+
+
+_PROFILE_INGRESS_CASES = [
+    ("get", "/api/plugin-configurations", None, "query"),
+    ("get", f"/api/plugin-configurations/{PLUGIN_ID}", None, "query"),
+    ("put", f"/api/plugin-configurations/{PLUGIN_ID}", {"settings": {}}, "body"),
+    (
+        "put",
+        f"/api/plugin-configurations/{PLUGIN_ID}/enabled",
+        {"enabled": True},
+        "body",
+    ),
+    ("delete", f"/api/plugin-configurations/{PLUGIN_ID}/secrets/token", None, "query"),
+    ("post", f"/api/plugin-configurations/{PLUGIN_ID}/readiness", {}, "body"),
+    ("post", f"/api/plugin-configurations/{PLUGIN_ID}/actions/connect", {}, "body"),
+    ("get", "/api/plugin-configurations/actions/run-one", None, "query"),
+    ("delete", "/api/plugin-configurations/actions/run-one", None, "query"),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "body", "ingress"), _PROFILE_INGRESS_CASES)
+@pytest.mark.parametrize("profile", ["../credential-value", "x" * 129])
+def test_profile_ingress_rejects_invalid_values_with_fixed_error(
+    api, method, path, body, ingress, profile
+):
+    client, *_rest = api
+    kwargs = {"params": {"profile": profile}}
+    if body is not None:
+        kwargs["json"] = {**body, **({"profile": profile} if ingress == "body" else {})}
+    response = getattr(client, method)(path, **kwargs)
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {"code": "invalid_profile", "message": "Profile is invalid."}
+    }
+    assert "credential-value" not in response.text
+    assert profile not in response.text
+
+
+@pytest.mark.parametrize(("method", "path", "body", "ingress"), _PROFILE_INGRESS_CASES)
+def test_profile_ingress_rejects_missing_profile_with_fixed_error(
+    api, method, path, body, ingress
+):
+    client, *_rest = api
+    profile = "missing-profile"
+    kwargs = {"params": {"profile": profile}}
+    if body is not None:
+        kwargs["json"] = {**body, **({"profile": profile} if ingress == "body" else {})}
+    response = getattr(client, method)(path, **kwargs)
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "profile_not_found",
+            "message": "Profile was not found.",
+        }
+    }
+    assert profile not in response.text
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("put", f"/api/plugin-configurations/{PLUGIN_ID}", {"settings": {}}),
+        (
+            "put",
+            f"/api/plugin-configurations/{PLUGIN_ID}/enabled",
+            {"enabled": True},
+        ),
+        ("post", f"/api/plugin-configurations/{PLUGIN_ID}/readiness", {}),
+        ("post", f"/api/plugin-configurations/{PLUGIN_ID}/actions/connect", {}),
+    ],
+)
+def test_body_profile_does_not_hide_invalid_query_profile(api, method, path, body):
+    client, *_rest = api
+    response = getattr(client, method)(
+        path,
+        params={"profile": "../credential-value"},
+        json={**body, "profile": "work"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {"code": "invalid_profile", "message": "Profile is invalid."}
+    }
+    assert "credential-value" not in response.text
+
+
+def test_body_profile_does_not_hide_missing_query_profile(api):
+    client, *_rest = api
+    response = client.put(
+        f"/api/plugin-configurations/{PLUGIN_ID}",
+        params={"profile": "missing-profile"},
+        json={"settings": {}, "profile": "work"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "profile_not_found",
+            "message": "Profile was not found.",
+        }
+    }
+    assert "missing-profile" not in response.text

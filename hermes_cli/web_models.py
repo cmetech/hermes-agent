@@ -684,7 +684,7 @@ class ToolsetPostSetup(BaseModel):
 class _PluginConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    profile: Optional[str] = Field(default=None, max_length=128)
+    profile: Optional[str] = None
 
 
 class PluginConfigurationUpdate(_PluginConfigurationRequest):

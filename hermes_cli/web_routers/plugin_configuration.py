@@ -8,6 +8,7 @@ scope, and maps internal diagnostics to stable credential-free HTTP errors.
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -30,6 +31,7 @@ router = APIRouter(prefix="/api/plugin-configurations")
 _config_profile_scope = late("_config_profile_scope")
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _OPAQUE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _RequestModel = TypeVar("_RequestModel", bound=BaseModel)
 
 
@@ -57,6 +59,37 @@ def _request(model: type[_RequestModel], raw: Any) -> _RequestModel:
         return model.model_validate(raw)
     except ValidationError as exc:
         raise _error(400, "invalid_request", "Request body is invalid.") from exc
+
+
+@contextmanager
+def _profile_scope(profile: str | None):
+    _validate_profile(profile)
+    scope = _config_profile_scope(profile)
+    try:
+        entered = scope.__enter__()
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise _error(404, "profile_not_found", "Profile was not found.") from exc
+        raise _error(400, "invalid_profile", "Profile is invalid.") from exc
+    try:
+        yield entered
+    except BaseException as exc:
+        if not scope.__exit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        scope.__exit__(None, None, None)
+
+
+def _validate_profile(profile: str | None) -> None:
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        return
+    if requested != "default" and _PROFILE_ID.fullmatch(requested) is None:
+        raise _error(400, "invalid_profile", "Profile is invalid.")
+    from hermes_cli.profiles import profile_exists
+
+    if not profile_exists(requested):
+        raise _error(404, "profile_not_found", "Profile was not found.")
 
 
 def _service_error(exc: PluginConfigurationError) -> HTTPException:
@@ -101,19 +134,10 @@ def _detail(plugin_id: str, *, platform: str = "desktop") -> dict[str, Any]:
 
 @router.get("")
 async def list_plugin_configurations(profile: str | None = Query(default=None)):
-    with _config_profile_scope(profile):
+    with _profile_scope(profile):
         service = get_plugin_configuration_service()
         try:
-            manager = service._plugin_manager()
-            plugin_ids = sorted(
-                loaded.manifest.key or loaded.manifest.name
-                for loaded in manager._plugins.values()
-                if loaded.manifest.configuration is not None
-            )
-            return [
-                service.detail(plugin_id, platform="desktop")
-                for plugin_id in plugin_ids
-            ]
+            return service.inventory(platform="desktop")
         except PluginConfigurationError as exc:
             raise _service_error(exc) from exc
 
@@ -124,7 +148,7 @@ async def get_plugin_setup_action(
     profile: str | None = Query(default=None),
 ):
     _run_identifier(run_id)
-    with _config_profile_scope(profile):
+    with _profile_scope(profile):
         try:
             return get_plugin_configuration_service().action_status(run_id)
         except PluginConfigurationError as exc:
@@ -137,7 +161,7 @@ async def cancel_plugin_setup_action(
     profile: str | None = Query(default=None),
 ):
     _run_identifier(run_id)
-    with _config_profile_scope(profile):
+    with _profile_scope(profile):
         try:
             return get_plugin_configuration_service().cancel_action(run_id)
         except PluginConfigurationError as exc:
@@ -150,7 +174,7 @@ async def get_plugin_configuration(
     profile: str | None = Query(default=None),
 ):
     _identifier(plugin_id)
-    with _config_profile_scope(profile):
+    with _profile_scope(profile):
         return _detail(plugin_id)
 
 
@@ -162,13 +186,15 @@ async def update_plugin_configuration(
 ):
     _identifier(plugin_id)
     body = _request(PluginConfigurationUpdate, raw)
+    _validate_profile(profile)
     secrets = {key: value.get_secret_value() for key, value in body.secrets.items()}
-    with _config_profile_scope(body.profile or profile):
+    with _profile_scope(body.profile or profile):
         try:
             return get_plugin_configuration_service().update(
                 plugin_id,
                 settings=body.settings,
                 secrets=secrets,
+                platform="desktop",
             )
         except PluginConfigurationError as exc:
             raise _service_error(exc) from exc
@@ -182,7 +208,8 @@ async def update_plugin_enabled(
 ):
     _identifier(plugin_id)
     body = _request(PluginEnabledUpdate, raw)
-    with _config_profile_scope(body.profile or profile):
+    _validate_profile(profile)
+    with _profile_scope(body.profile or profile):
         from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
 
         result = dashboard_set_agent_plugin_enabled(plugin_id, enabled=body.enabled)
@@ -199,9 +226,11 @@ async def clear_plugin_secret(
 ):
     _identifier(plugin_id)
     _identifier(field_id)
-    with _config_profile_scope(profile):
+    with _profile_scope(profile):
         try:
-            return get_plugin_configuration_service().clear_secret(plugin_id, field_id)
+            return get_plugin_configuration_service().clear_secret(
+                plugin_id, field_id, platform="desktop"
+            )
         except PluginConfigurationError as exc:
             raise _service_error(exc) from exc
 
@@ -214,7 +243,8 @@ async def refresh_plugin_readiness(
 ):
     _identifier(plugin_id)
     body = _request(PluginReadinessRequest, raw)
-    with _config_profile_scope(body.profile or profile):
+    _validate_profile(profile)
+    with _profile_scope(body.profile or profile):
         try:
             return get_plugin_configuration_service().readiness(
                 plugin_id, platform="desktop"
@@ -233,7 +263,8 @@ async def start_plugin_setup_action(
     _identifier(plugin_id)
     _identifier(action_id)
     body = _request(PluginSetupActionStart, raw)
-    with _config_profile_scope(body.profile or profile):
+    _validate_profile(profile)
+    with _profile_scope(body.profile or profile):
         try:
             return get_plugin_configuration_service().start_action(
                 plugin_id,
