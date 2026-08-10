@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 
-**Status:** Proposed for implementation planning
+**Status:** Approved for implementation planning
 
 **Scope:** Hermes Desktop Workflows page presentation for Active board, History,
 Archive, and the selected-run inspector
@@ -427,6 +427,7 @@ Simplified Chinese, and Traditional Chinese Desktop locales. This includes:
 - empty workflow lane copy;
 - run filters coming-soon label;
 - disabled run-search placeholder;
+- selected-run drawer accessible name;
 - selected-run drawer loading/error labels if existing common copy is
   insufficient.
 
