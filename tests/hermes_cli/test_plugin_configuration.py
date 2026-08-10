@@ -207,6 +207,27 @@ def test_adversarial_pattern_fails_closed_without_backtracking(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("pattern", "default"),
+    [(r"\$", "$"), (r"\^", "^"), (r"USD\$", "USD$")],
+    ids=["dollar", "caret", "dollar-after-literal"],
+)
+def test_escaped_outer_anchor_characters_remain_literals(tmp_path, pattern, default):
+    from hermes_cli.plugin_configuration import load_plugin_configuration
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    descriptor = _valid_descriptor()
+    descriptor["fields"][0]["default"] = default
+    descriptor["fields"][0]["validation"] = {"pattern": pattern}
+    _write_descriptor(plugin_dir, descriptor)
+
+    loaded = load_plugin_configuration(plugin_dir, "config.schema.json")
+
+    assert loaded is not None
+    assert loaded.fields[0].validation.pattern == pattern
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         lambda data: data["fields"][0].update(label="URL\x1b[31m"),

@@ -225,7 +225,16 @@ def _validate_fixed_width_pattern(pattern: str) -> None:
     index = 0
     if pattern.startswith("^"):
         index = 1
-    end = len(pattern) - (1 if pattern.endswith("$") else 0)
+    end = len(pattern)
+    if pattern.endswith("$"):
+        preceding_backslashes = 0
+        while (
+            end - preceding_backslashes > 1
+            and pattern[end - preceding_backslashes - 2] == "\\"
+        ):
+            preceding_backslashes += 1
+        if preceding_backslashes % 2 == 0:
+            end -= 1
     while index < end:
         character = pattern[index]
         if character == "\\":
