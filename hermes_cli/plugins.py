@@ -1707,6 +1707,7 @@ class PluginManager:
 
         replacements: tuple[BackgroundServiceHost, ...] = ()
         registries_cleared = False
+        discovery_profile_id = str(get_hermes_home().resolve())
         try:
             deadline = time.monotonic() + timeout
             for host in old_hosts:
@@ -1734,6 +1735,10 @@ class PluginManager:
                     )
                     for host_kind, shutdown_timeout, delivery_port in host_specs
                 )
+            for replacement in replacements:
+                replacement.start()
+            with self._background_service_lock:
+                self._discovery_profile_id = discovery_profile_id
         except BaseException:
             if registries_cleared:
                 self._discovered = False
@@ -1743,8 +1748,6 @@ class PluginManager:
                 self._background_reload_in_progress = False
                 self._background_reload_thread_id = None
                 self._background_reload_condition.notify_all()
-        for replacement in replacements:
-            replacement.start()
         return replacements
 
     def _discover_and_load_inner(self) -> None:

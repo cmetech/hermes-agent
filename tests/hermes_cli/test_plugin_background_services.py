@@ -15,6 +15,10 @@ from hermes_cli.plugin_services import (
     BackgroundServiceHost,
     BackgroundServiceReloadBlocked,
 )
+from hermes_cli.plugin_configuration import (
+    PluginConfigurationDescriptor,
+    SetupActionMetadata,
+)
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
 
@@ -381,6 +385,94 @@ def test_successful_hosted_reload_starts_next_generation_after_quiescence(
     assert replacements[0].generation == first.generation + 1
     assert new.entered.wait(timeout=1)
     assert replacements[0].shutdown(timeout=1)
+
+
+def test_successful_reload_rebinds_setup_actions_to_the_discovery_profile(
+    tmp_path, monkeypatch
+) -> None:
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    manager = PluginManager()
+    old = _BlockingService(threading.Event(), threading.Event())
+    _context(manager, key="reload-actions").register_background_service(
+        "service", lambda _context: old, hosts={"web"}
+    )
+    first = manager.start_background_services("web")
+    assert old.entered.wait(timeout=1)
+
+    descriptor = PluginConfigurationDescriptor(
+        version=1,
+        fields=(),
+        setup_actions=(SetupActionMetadata(id="connect", label="Connect"),),
+    )
+    manifest = PluginManifest(
+        name="reload-actions",
+        key="reload-actions",
+        source="bundled",
+        path="unused",
+        kind="backend",
+        configuration=descriptor,
+    )
+    replacement = _BlockingService(threading.Event(), threading.Event())
+
+    def register(context: PluginContext) -> None:
+        context.register_background_service(
+            "service", lambda _context: replacement, hosts={"web"}
+        )
+        context.register_setup_action("connect", lambda _context: {"ok": True})
+
+    monkeypatch.setattr(manager, "static_plugin_inventory", lambda: [manifest])
+    monkeypatch.setattr(
+        manager,
+        "_load_directory_module",
+        lambda _manifest: SimpleNamespace(register=register),
+    )
+
+    replacements = manager.reload_background_services(timeout=1)
+
+    same_profile = manager.setup_action_registrations("reload-actions")
+    assert sorted(same_profile) == ["connect"]
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_b))
+    try:
+        assert manager.setup_action_registrations("reload-actions") == {}
+    finally:
+        reset_hermes_home_override(token)
+    assert sorted(manager.setup_action_registrations("reload-actions")) == ["connect"]
+    assert first.snapshot()[0].lifecycle == "stopped"
+    assert replacements[0].shutdown(timeout=1)
+
+
+def test_failed_reload_never_publishes_partial_setup_action_authority(
+    tmp_path, monkeypatch
+) -> None:
+    profile = tmp_path / "profile-a"
+    profile.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    manager = PluginManager()
+    old = _BlockingService(threading.Event(), threading.Event())
+    _context(manager, key="reload-actions").register_background_service(
+        "service", lambda _context: old, hosts={"web"}
+    )
+    host = manager.start_background_services("web")
+    assert old.entered.wait(timeout=1)
+
+    def partial_discovery() -> None:
+        manager._setup_actions["reload-actions"] = {
+            "connect": {"handler": lambda _context: {}, "readiness": None}
+        }
+        raise RuntimeError("reload discovery failed")
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", partial_discovery)
+    with pytest.raises(RuntimeError, match="reload discovery failed"):
+        manager.reload_background_services(timeout=1)
+
+    assert manager.setup_action_registrations("reload-actions") == {}
 
 
 def test_provider_reload_blocks_callers_until_new_registry_is_published(
