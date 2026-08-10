@@ -56,6 +56,9 @@ import type {
   PaginatedSessions,
   PairingResponse,
   PairingUser,
+  PluginConfigurationDetail,
+  PluginConfigurationReadiness,
+  PluginSetupActionRun,
   ProfileCreatePayload,
   ProfileDesktopOverlay,
   ProfileSetupCommand,
@@ -1277,6 +1280,75 @@ export function setToolsetEnabled(
     path: `/api/tools/toolsets/${encodeURIComponent(name)}`,
     method: 'PUT',
     body: { enabled }
+  })
+}
+
+export function getPluginConfigurations(): Promise<PluginConfigurationDetail[]> {
+  return window.hermesDesktop.api<PluginConfigurationDetail[]>({
+    ...profileScoped(),
+    path: '/api/plugin-configurations'
+  })
+}
+
+export function setPluginConfigurationEnabled(pluginId: string, enabled: boolean): Promise<PluginConfigurationDetail> {
+  return window.hermesDesktop.api<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/enabled`,
+    method: 'PUT',
+    body: { enabled }
+  })
+}
+
+export function updatePluginConfiguration(
+  pluginId: string,
+  body: { secrets?: Record<string, string>; settings?: Record<string, unknown> }
+): Promise<PluginConfigurationDetail> {
+  return window.hermesDesktop.api<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}`,
+    method: 'PUT',
+    body
+  })
+}
+
+export function clearPluginConfigurationSecret(pluginId: string, fieldId: string): Promise<PluginConfigurationDetail> {
+  return window.hermesDesktop.api<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/secrets/${encodeURIComponent(fieldId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function refreshPluginReadiness(pluginId: string): Promise<PluginConfigurationReadiness> {
+  return window.hermesDesktop.api<PluginConfigurationReadiness>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/readiness`,
+    method: 'POST',
+    body: {}
+  })
+}
+
+export function startPluginSetupAction(pluginId: string, actionId: string): Promise<PluginSetupActionRun> {
+  return window.hermesDesktop.api<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(actionId)}`,
+    method: 'POST',
+    body: {}
+  })
+}
+
+export function getPluginSetupAction(runId: string): Promise<PluginSetupActionRun> {
+  return window.hermesDesktop.api<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/actions/${encodeURIComponent(runId)}`
+  })
+}
+
+export function cancelPluginSetupAction(runId: string): Promise<PluginSetupActionRun> {
+  return window.hermesDesktop.api<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/actions/${encodeURIComponent(runId)}`,
+    method: 'DELETE'
   })
 }
 

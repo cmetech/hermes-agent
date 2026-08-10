@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, field_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
@@ -677,6 +677,44 @@ class ToolsetPostSetup(BaseModel):
     profile: Optional[str] = None
 
 
+# Standalone plugin configuration requests are parsed explicitly by their
+# focused router so validation diagnostics never echo write-only credential
+# input. The models still provide one typed, fail-closed contract for every
+# request shape.
+class _PluginConfigurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile: Optional[str] = Field(default=None, max_length=128)
+
+
+class PluginConfigurationUpdate(_PluginConfigurationRequest):
+    settings: Dict[str, Any] = Field(default_factory=dict, max_length=64)
+    secrets: Dict[str, SecretStr] = Field(default_factory=dict, max_length=64)
+
+    @field_validator("settings", "secrets")
+    @classmethod
+    def _validate_field_ids(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        import re
+
+        identifier = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+        if any(len(key) > 64 or identifier.fullmatch(key) is None for key in values):
+            raise ValueError("invalid configuration field id")
+        return values
+
+
+class PluginEnabledUpdate(_PluginConfigurationRequest):
+    enabled: StrictBool
+
+
+class PluginReadinessRequest(_PluginConfigurationRequest):
+    pass
+
+
+class PluginSetupActionStart(_PluginConfigurationRequest):
+    unattended: StrictBool = False
+    timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
+
 # --- from web_server.py (originally lines 16823-16825) ---
 
 class TerminalBackendSelect(BaseModel):
@@ -722,4 +760,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

@@ -320,6 +320,43 @@ export interface Translations {
       empty: string
       kinds: { bundled: string; disk: string; runtime: string }
     }
+    connectorPlugins: {
+      title: string
+      blurb: string
+      count: (n: number) => string
+      loading: string
+      loadFailed: string
+      empty: string
+      enabled: string
+      disabled: string
+      ready: string
+      notReady: string
+      required: string
+      secretSet: string
+      secretNotSet: string
+      saveField: (field: string) => string
+      setField: (field: string) => string
+      clearField: (field: string) => string
+      unsupportedField: (field: string) => string
+      saveFailed: (field: string) => string
+      clearFailed: (field: string) => string
+      toggleFailed: (plugin: string) => string
+      readinessFailed: (plugin: string) => string
+      refreshReadiness: (plugin: string) => string
+      enablePlugin: (plugin: string) => string
+      disablePlugin: (plugin: string) => string
+      authenticationRequired: (field: string) => string
+      configurationRequired: (field: string) => string
+      invalidConfiguration: (field: string) => string
+      setupRequired: (action: string) => string
+      availableNextSession: string
+      actionFailed: (action: string) => string
+      actionStatusFailed: string
+      actionCancelFailed: string
+      checkActionStatus: string
+      cancelAction: string
+      actionStatuses: Record<'cancelled' | 'failed' | 'queued' | 'running' | 'succeeded' | 'timed_out', string>
+    }
     notifications: {
       title: string
       intro: string
