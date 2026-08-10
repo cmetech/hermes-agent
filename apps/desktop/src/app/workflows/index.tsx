@@ -307,7 +307,6 @@ export function WorkflowsView() {
 
   return (
     <main
-      ref={pageRef}
       aria-busy={
         runs.isFetching ||
         attention.isFetching ||
@@ -317,6 +316,7 @@ export function WorkflowsView() {
         cleanupExecute.isPending
       }
       className={`relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden py-6 ${PAGE_INSET_X}`}
+      ref={pageRef}
     >
       <WorkflowViewHeader
         headingRef={headingRef}
