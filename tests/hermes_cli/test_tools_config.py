@@ -84,6 +84,54 @@ def test_plugin_configuration_cli_returns_nonzero_for_invalid_operation(monkeypa
     assert plugin_configuration_command(args) != 0
 
 
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled", "timed_out"])
+def test_plugin_configuration_cli_returns_nonzero_for_failed_terminal_action(
+    terminal_status, monkeypatch
+):
+    class Service:
+        def detail(self, plugin_id, platform=None):
+            return {
+                "plugin_id": plugin_id,
+                "enabled": True,
+                "fields": [],
+                "setup_actions": [
+                    {"id": "auth", "label": "Auth", "available": True}
+                ],
+            }
+
+        def start_action(self, plugin_id, action_id, unattended=False):
+            return {
+                "run_id": "run-1",
+                "plugin_id": plugin_id,
+                "action": action_id,
+                "status": "running",
+            }
+
+        def action_status(self, run_id):
+            return {
+                "run_id": run_id,
+                "plugin_id": "sample",
+                "action": "auth",
+                "status": terminal_status,
+                "error": "setup action failed",
+            }
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_plugin_configuration_service", lambda: Service()
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "tools_action": "auth",
+            "plugin_id": "sample",
+            "platform": "cli",
+        },
+    )()
+
+    assert plugin_configuration_command(args) != 0
+
+
 def test_plugin_configuration_cli_prompts_secrets_and_coerces_setting_types(monkeypatch):
     updates = []
 

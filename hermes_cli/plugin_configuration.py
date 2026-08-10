@@ -9,6 +9,7 @@ listing the plugin without trusting the descriptor.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import hashlib
 import math
@@ -22,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -693,14 +695,23 @@ class _SetupActionRun:
     action: str
     deadline: float
     cancel_event: threading.Event
+    profile_id: str
     status: str = "queued"
     result: Mapping[str, Any] | None = None
     error: str | None = None
+    timer: threading.Timer | None = None
 
 
 _MAX_ACTION_TIMEOUT = 300.0
 _MAX_ACTION_RESULT_BYTES = 64 * 1024
 _MAX_ACTION_TEXT = 4096
+_MAX_ACTION_COLLECTION = 128
+_MAX_ACTION_DEPTH = 8
+_MAX_ACTION_NODES = 4096
+_MAX_ACTION_WORKERS = 8
+_MAX_ACTION_RUNS = 128
+_MAX_READINESS_WORKERS = 4
+_READINESS_TIMEOUT = 0.2
 _SENSITIVE_RESULT_PARTS = frozenset({
     "authorization",
     "credential",
@@ -715,7 +726,7 @@ def _secret_storage_key(plugin_id: str, field_id: str) -> str:
     """Return a collision-resistant env key without accepting caller key names."""
 
     identity = f"{plugin_id}\0{field_id}".encode("utf-8")
-    digest = hashlib.sha256(identity).hexdigest()[:16].upper()
+    digest = hashlib.sha256(identity).hexdigest()[:32].upper()
     slug = re.sub(r"[^A-Z0-9]+", "_", field_id.upper()).strip("_")[:32]
     return f"HERMES_PLUGIN_{digest}_{slug or 'SECRET'}"
 
@@ -726,37 +737,63 @@ def _bounded_public_value(
     depth: int = 0,
     key: str = "",
     redactions: tuple[str, ...] = (),
+    budget: list[int] | None = None,
 ) -> Any:
+    if budget is None:
+        budget = [0]
+    budget[0] += 1
+    if budget[0] > _MAX_ACTION_NODES:
+        raise PluginConfigurationError("setup action output exceeded node limit")
     if any(part in key.lower() for part in _SENSITIVE_RESULT_PARTS):
         return "[redacted]"
-    if depth > 8:
-        return "[truncated]"
+    if depth > _MAX_ACTION_DEPTH:
+        raise PluginConfigurationError("setup action output exceeded depth limit")
     if value is None or type(value) in {bool, int}:
         return value
     if type(value) is float:
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        projected = value[:_MAX_ACTION_TEXT]
+        if len(value) > _MAX_ACTION_TEXT:
+            raise PluginConfigurationError("setup action text exceeded limit")
+        projected = value
         for secret in redactions:
             projected = projected.replace(secret, "[redacted]")
         return projected
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
-        for item_key, item_value in list(value.items())[:128]:
-            safe_key = str(item_key)[:128]
+        for index, (item_key, item_value) in enumerate(value.items()):
+            if index >= _MAX_ACTION_COLLECTION:
+                raise PluginConfigurationError("setup action collection exceeded limit")
+            if not isinstance(item_key, str) or len(item_key) > 128:
+                raise PluginConfigurationError(
+                    "setup action result keys must be bounded strings"
+                )
+            safe_key = item_key
+            for secret in redactions:
+                safe_key = safe_key.replace(secret, "[redacted]")
             projected[safe_key] = _bounded_public_value(
                 item_value,
                 depth=depth + 1,
                 key=safe_key,
                 redactions=redactions,
+                budget=budget,
             )
         return projected
     if isinstance(value, (list, tuple)):
-        return [
-            _bounded_public_value(item, depth=depth + 1, redactions=redactions)
-            for item in list(value)[:128]
-        ]
-    return str(value)[:_MAX_ACTION_TEXT]
+        projected_items = []
+        for index, item in enumerate(value):
+            if index >= _MAX_ACTION_COLLECTION:
+                raise PluginConfigurationError("setup action collection exceeded limit")
+            projected_items.append(
+                _bounded_public_value(
+                    item,
+                    depth=depth + 1,
+                    redactions=redactions,
+                    budget=budget,
+                )
+            )
+        return projected_items
+    raise PluginConfigurationError("setup action result must be JSON-native")
 
 
 def _validate_value(field: PluginConfigurationField, value: Any) -> None:
@@ -771,6 +808,8 @@ class PluginConfigurationService:
         self._manager = manager
         self._runs: dict[str, _SetupActionRun] = {}
         self._runs_lock = threading.RLock()
+        self._worker_slots = threading.BoundedSemaphore(_MAX_ACTION_WORKERS)
+        self._readiness_slots = threading.BoundedSemaphore(_MAX_READINESS_WORKERS)
 
     def _plugin_manager(self):
         if self._manager is not None:
@@ -800,6 +839,39 @@ class PluginConfigurationService:
         return {field.id: field for field in loaded.manifest.configuration.fields}
 
     @staticmethod
+    def _profile_id() -> str:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home().resolve())
+
+    @staticmethod
+    def _is_enabled(loaded) -> bool:
+        """Resolve enablement from the active profile without re-importing code."""
+        from hermes_cli.config import load_config
+
+        manifest = loaded.manifest
+        lookup_key = manifest.key or manifest.name
+        config = load_config()
+        plugins = config.get("plugins")
+        if not isinstance(plugins, Mapping):
+            plugins = {}
+        disabled = plugins.get("disabled", [])
+        if isinstance(disabled, list) and (
+            lookup_key in disabled or manifest.name in disabled
+        ):
+            return False
+        if manifest.kind == "exclusive":
+            return False
+        if manifest.kind == "model-provider":
+            return True
+        if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+            return True
+        enabled = plugins.get("enabled")
+        return isinstance(enabled, list) and (
+            lookup_key in enabled or manifest.name in enabled
+        )
+
+    @staticmethod
     def _settings(plugin_id: str) -> dict[str, Any]:
         from hermes_cli.config import load_config
 
@@ -816,26 +888,38 @@ class PluginConfigurationService:
         settings = entry.get("settings")
         return dict(settings) if isinstance(settings, Mapping) else {}
 
-    def _resolved(self, plugin_id: str, loaded) -> dict[str, Any]:
-        from hermes_cli.config import get_env_value
+    def _resolved(self, plugin_id: str, loaded) -> tuple[dict[str, Any], set[str]]:
+        from hermes_cli.config import load_env
 
         stored = self._settings(plugin_id)
+        profile_env = load_env()
         resolved: dict[str, Any] = {}
+        invalid: set[str] = set()
         for field in loaded.manifest.configuration.fields:
+            present = False
+            value = None
             if field.storage is FieldStorage.SECRET:
-                value = get_env_value(_secret_storage_key(plugin_id, field.id))
+                value = profile_env.get(_secret_storage_key(plugin_id, field.id))
                 if value not in {None, ""}:
-                    resolved[field.id] = value
+                    present = True
             elif field.id in stored:
-                resolved[field.id] = stored[field.id]
+                value = stored[field.id]
+                present = True
             elif field.has_default:
-                resolved[field.id] = field.default
-        return resolved
+                value = field.default
+                present = True
+            if present:
+                if _default_satisfies(value, field.type, field.validation):
+                    resolved[field.id] = value
+                else:
+                    invalid.add(field.id)
+        return resolved, invalid
 
     def detail(self, plugin_id: str, platform: str | None = None) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
-        resolved = self._resolved(canonical_id, loaded)
+        resolved, _invalid = self._resolved(canonical_id, loaded)
+        enabled = self._is_enabled(loaded)
         descriptor = loaded.manifest.configuration
         settings = {
             field.id: resolved[field.id]
@@ -852,14 +936,14 @@ class PluginConfigurationService:
         )
         result.update({
             "plugin_id": canonical_id,
-            "enabled": bool(loaded.enabled),
+            "enabled": enabled,
             "readiness": self.readiness(canonical_id, platform=platform),
         })
         registrations = getattr(self._plugin_manager(), "_setup_actions", {}).get(
             canonical_id, {}
         )
         for action in result.get("setup_actions", []):
-            action["available"] = bool(loaded.enabled and action["id"] in registrations)
+            action["available"] = bool(enabled and action["id"] in registrations)
         return result
 
     def update(
@@ -874,21 +958,32 @@ class PluginConfigurationService:
         fields = self._fields(loaded)
         settings = settings or {}
         secrets = secrets or {}
-        for field_id, value in {**settings, **secrets}.items():
-            field = fields.get(field_id)
-            if field is None:
-                raise PluginConfigurationError(f"unknown field '{field_id}'")
-            expected = (
-                FieldStorage.SETTING if field_id in settings else FieldStorage.SECRET
+        overlap = set(settings).intersection(secrets)
+        if overlap:
+            raise PluginConfigurationError(
+                "fields cannot appear in both settings and secrets: "
+                + ", ".join(sorted(overlap))
             )
-            if field.storage is not expected:
-                raise PluginConfigurationError(
-                    f"field '{field_id}' has incompatible storage"
-                )
-            _validate_value(field, value)
+        for values, expected in (
+            (settings, FieldStorage.SETTING),
+            (secrets, FieldStorage.SECRET),
+        ):
+            for field_id, value in values.items():
+                field = fields.get(field_id)
+                if field is None:
+                    raise PluginConfigurationError(f"unknown field '{field_id}'")
+                if field.storage is not expected:
+                    raise PluginConfigurationError(
+                        f"field '{field_id}' has incompatible storage"
+                    )
+                _validate_value(field, value)
 
         if settings:
-            from hermes_cli.config import load_config, save_config
+            from hermes_cli.config import (
+                ConfigurationPersistenceError,
+                load_config,
+                save_config,
+            )
 
             config = load_config()
             plugins = config.setdefault("plugins", {})
@@ -908,28 +1003,35 @@ class PluginConfigurationService:
                 stored = {}
                 entry["settings"] = stored
             stored.update(settings)
-            save_config(
-                config,
-                preserve_keys={
-                    ("plugins", "entries", canonical_id, "settings", field_id)
-                    for field_id in settings
-                },
-            )
+            try:
+                save_config(
+                    config,
+                    preserve_keys={
+                        ("plugins", "entries", canonical_id, "settings", field_id)
+                        for field_id in settings
+                    },
+                    strict=True,
+                )
+            except ConfigurationPersistenceError as exc:
+                raise PluginConfigurationError(
+                    "plugin configuration could not be persisted"
+                ) from exc
 
         if secrets:
-            from hermes_cli.config import save_env_value
+            from hermes_cli.config import ConfigurationPersistenceError, save_env_value
 
-            for field_id, value in secrets.items():
-                key = _secret_storage_key(canonical_id, field_id)
-                previous = os.environ.get(key)
-                save_env_value(key, value)
-                # The existing writer mirrors values into process-global env.
-                # Connector reads are profile-scoped, so do not let that mirror
-                # survive a later in-process profile switch.
-                if previous is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = previous
+            try:
+                for field_id, value in secrets.items():
+                    save_env_value(
+                        _secret_storage_key(canonical_id, field_id),
+                        value,
+                        mirror_process_env=False,
+                        strict=True,
+                    )
+            except ConfigurationPersistenceError as exc:
+                raise PluginConfigurationError(
+                    "plugin configuration could not be persisted"
+                ) from exc
         return self.detail(canonical_id)
 
     def clear_secret(self, plugin_id: str, field_id: str) -> dict[str, Any]:
@@ -942,32 +1044,44 @@ class PluginConfigurationService:
             raise PluginConfigurationError(
                 f"field '{field_id}' has incompatible storage"
             )
-        from hermes_cli.config import remove_env_value
+        from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
 
-        remove_env_value(_secret_storage_key(canonical_id, field_id))
+        try:
+            remove_env_value(
+                _secret_storage_key(canonical_id, field_id),
+                mirror_process_env=False,
+                strict=True,
+            )
+        except ConfigurationPersistenceError as exc:
+            raise PluginConfigurationError(
+                "plugin configuration could not be persisted"
+            ) from exc
         return self.detail(canonical_id)
 
     def readiness(self, plugin_id: str, platform: str | None = None) -> dict[str, Any]:
         loaded = self._loaded(plugin_id)
         canonical_id = loaded.manifest.key or loaded.manifest.name
-        if not loaded.enabled:
+        if not self._is_enabled(loaded):
             return {
                 "plugin_id": canonical_id,
                 "ready": False,
                 "reasons": ["plugin_not_enabled"],
             }
-        resolved = self._resolved(canonical_id, loaded)
+        resolved, invalid = self._resolved(canonical_id, loaded)
         reasons: list[str] = []
         for field in loaded.manifest.configuration.fields:
-            if not field.required or not field.readiness.enabled:
-                continue
             if field.platforms and (
                 platform is None or platform not in field.platforms
             ):
                 continue
-            if (
-                field.visible_when is not None
-                and resolved.get(field.visible_when.field) != field.visible_when.equals
+            if field.id in invalid:
+                reasons.append(f"invalid_configuration:{field.id}")
+                continue
+            if not field.required or not field.readiness.enabled:
+                continue
+            if field.visible_when is not None and (
+                field.visible_when.field in invalid
+                or resolved.get(field.visible_when.field) != field.visible_when.equals
             ):
                 continue
             value = resolved.get(field.id)
@@ -985,10 +1099,7 @@ class PluginConfigurationService:
             readiness = registration.get("readiness")
             if readiness is None:
                 continue
-            try:
-                ready = readiness(dict(resolved))
-            except Exception:
-                ready = False
+            ready = self._bounded_readiness(readiness, resolved)
             if ready is not True:
                 reasons.append(f"setup_required:{action_id}")
         return {
@@ -996,6 +1107,36 @@ class PluginConfigurationService:
             "ready": not reasons,
             "reasons": reasons,
         }
+
+    def _bounded_readiness(self, callback, configuration: Mapping[str, Any]) -> bool:
+        if not self._readiness_slots.acquire(blocking=False):
+            return False
+        completed = threading.Event()
+        result = [False]
+        context = contextvars.copy_context()
+
+        def invoke() -> None:
+            try:
+                result[0] = callback(MappingProxyType(dict(configuration))) is True
+            except Exception:
+                result[0] = False
+            finally:
+                self._readiness_slots.release()
+                completed.set()
+
+        worker = threading.Thread(
+            target=lambda: context.run(invoke),
+            daemon=True,
+            name="plugin-setup-readiness",
+        )
+        try:
+            worker.start()
+        except BaseException:
+            self._readiness_slots.release()
+            return False
+        if not completed.wait(_READINESS_TIMEOUT):
+            return False
+        return result[0]
 
     def start_action(
         self,
@@ -1018,7 +1159,7 @@ class PluginConfigurationService:
             canonical_id, {}
         )
         registration = registrations.get(action_id)
-        if not loaded.enabled or registration is None:
+        if not self._is_enabled(loaded) or registration is None:
             raise PluginConfigurationError("setup action unavailable")
         metadata = next(
             (
@@ -1034,17 +1175,8 @@ class PluginConfigurationService:
             raise PluginConfigurationError(
                 "interactive setup action cannot run unattended"
             )
-
-        run = _SetupActionRun(
-            run_id=uuid.uuid4().hex,
-            plugin_id=canonical_id,
-            action=action_id,
-            deadline=time.monotonic() + float(timeout_seconds),
-            cancel_event=threading.Event(),
-        )
-        with self._runs_lock:
-            self._runs[run.run_id] = run
-        configuration = self._resolved(canonical_id, loaded)
+        profile_id = self._profile_id()
+        configuration, _invalid = self._resolved(canonical_id, loaded)
         redactions = tuple(
             str(configuration[field.id])
             for field in loaded.manifest.configuration.fields
@@ -1052,9 +1184,23 @@ class PluginConfigurationService:
             and field.id in configuration
             and configuration[field.id] not in {None, ""}
         )
+        run = _SetupActionRun(
+            run_id=uuid.uuid4().hex,
+            plugin_id=canonical_id,
+            action=action_id,
+            deadline=time.monotonic() + float(timeout_seconds),
+            cancel_event=threading.Event(),
+            profile_id=profile_id,
+        )
+        context = contextvars.copy_context()
         worker = threading.Thread(
-            target=self._execute_action,
-            args=(run, registration["handler"], configuration, redactions),
+            target=lambda: context.run(
+                self._execute_action,
+                run,
+                registration["handler"],
+                MappingProxyType(dict(configuration)),
+                redactions,
+            ),
             daemon=True,
             name=f"plugin-setup-{canonical_id[:24]}",
         )
@@ -1062,9 +1208,59 @@ class PluginConfigurationService:
             float(timeout_seconds), self._timeout_run, args=(run.run_id,)
         )
         timer.daemon = True
-        worker.start()
-        timer.start()
+        run.timer = timer
+        if not self._worker_slots.acquire(blocking=False):
+            raise PluginConfigurationError("setup action worker capacity exhausted")
+        with self._runs_lock:
+            if not self._make_run_capacity_locked():
+                self._worker_slots.release()
+                raise PluginConfigurationError("setup action run capacity exhausted")
+            self._runs[run.run_id] = run
+        try:
+            timer.start()
+            worker.start()
+        except BaseException:
+            timer.cancel()
+            with self._runs_lock:
+                self._runs.pop(run.run_id, None)
+            self._worker_slots.release()
+            raise
         return self._public_run(run)
+
+    def _make_run_capacity_locked(self) -> bool:
+        while len(self._runs) >= _MAX_ACTION_RUNS:
+            terminal_id = next(
+                (
+                    run_id
+                    for run_id, record in self._runs.items()
+                    if record.status not in {"queued", "running"}
+                ),
+                None,
+            )
+            if terminal_id is None:
+                return False
+            record = self._runs.pop(terminal_id)
+            if record.timer is not None:
+                record.timer.cancel()
+                record.timer = None
+        return True
+
+    @staticmethod
+    def _finish_run_locked(
+        run: _SetupActionRun,
+        status: str,
+        *,
+        result: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        if run.status not in {"queued", "running"}:
+            return
+        run.status = status
+        run.result = result
+        run.error = error
+        if run.timer is not None:
+            run.timer.cancel()
+            run.timer = None
 
     def _timeout_run(self, run_id: str) -> None:
         with self._runs_lock:
@@ -1072,15 +1268,16 @@ class PluginConfigurationService:
             if run is None or run.status not in {"queued", "running"}:
                 return
             run.cancel_event.set()
-            run.status = "timed_out"
-            run.error = "setup action deadline exceeded"
+            self._finish_run_locked(
+                run, "timed_out", error="setup action deadline exceeded"
+            )
 
     def _execute_action(self, run, handler, configuration, redactions) -> None:
-        with self._runs_lock:
-            if run.status != "queued":
-                return
-            run.status = "running"
         try:
+            with self._runs_lock:
+                if run.status != "queued":
+                    return
+                run.status = "running"
             value = handler(
                 SetupActionContext(
                     plugin_id=run.plugin_id,
@@ -1097,28 +1294,36 @@ class PluginConfigurationService:
             with self._runs_lock:
                 if run.status in {"cancelled", "timed_out"}:
                     return
-                run.result = public
-                run.status = "succeeded"
+                self._finish_run_locked(run, "succeeded", result=public)
         except Exception:
             with self._runs_lock:
                 if run.status in {"cancelled", "timed_out"}:
                     return
-                run.status = "failed"
                 # Plugin exceptions may embed credentials or remote payloads.
                 # Keep the public diagnostic stable and credential-free.
-                run.error = "setup action failed"
+                self._finish_run_locked(run, "failed", error="setup action failed")
+        finally:
+            self._worker_slots.release()
 
     def _expire(self, run: _SetupActionRun) -> None:
         if run.status in {"queued", "running"} and time.monotonic() >= run.deadline:
             run.cancel_event.set()
-            run.status = "timed_out"
-            run.error = "setup action deadline exceeded"
+            self._finish_run_locked(
+                run, "timed_out", error="setup action deadline exceeded"
+            )
+
+    def _require_run_profile(self, run: _SetupActionRun) -> None:
+        if run.profile_id != self._profile_id():
+            raise PluginConfigurationError(
+                "setup action run belongs to a different profile"
+            )
 
     def action_status(self, run_id: str) -> dict[str, Any]:
         with self._runs_lock:
             run = self._runs.get(run_id)
             if run is None:
                 raise PluginConfigurationError("setup action run not found")
+            self._require_run_profile(run)
             self._expire(run)
             return self._public_run(run)
 
@@ -1127,9 +1332,10 @@ class PluginConfigurationService:
             run = self._runs.get(run_id)
             if run is None:
                 raise PluginConfigurationError("setup action run not found")
+            self._require_run_profile(run)
             if run.status in {"queued", "running"}:
                 run.cancel_event.set()
-                run.status = "cancelled"
+                self._finish_run_locked(run, "cancelled")
             return self._public_run(run)
 
     @staticmethod

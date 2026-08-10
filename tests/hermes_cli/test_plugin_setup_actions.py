@@ -53,6 +53,14 @@ def _plugin(tmp_path: Path, *, enabled: bool = True, source: str | None = None):
         manager._plugins["action-plugin"] = LoadedPlugin(
             manifest=manifest, enabled=False
         )
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    config["plugins"] = {
+        "enabled": ["action-plugin"] if enabled else [],
+        "disabled": [],
+    }
+    save_config(config, preserve_keys={("plugins", "enabled")})
     return PluginConfigurationService(manager), manager, manifest
 
 
@@ -213,3 +221,170 @@ def test_action_result_redacts_resolved_secret_even_under_neutral_key(
     assert result["status"] == "succeeded"
     assert result["result"] == {"value": "prefix-[redacted]"}
     assert "resolved-secret" not in json.dumps(result)
+
+
+def test_action_result_redacts_secret_bearing_mapping_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "def register(ctx):\n"
+            "    def auth(run):\n"
+            "        return {run.configuration['token']: 'safe'}\n"
+            "    ctx.register_setup_action('auth', auth)\n"
+        ),
+    )
+    service.update("action-plugin", secrets={"token": "key-secret"})
+
+    result = _wait(service, service.start_action("action-plugin", "auth")["run_id"])
+
+    assert result["status"] == "succeeded"
+    assert "key-secret" not in json.dumps(result)
+
+
+def test_action_result_rejects_non_json_objects_without_stringifying(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "class SecretObject:\n"
+            "    def __str__(self): return 'object-secret'\n"
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: {'value': SecretObject()})\n"
+        ),
+    )
+
+    result = _wait(service, service.start_action("action-plugin", "auth")["run_id"])
+
+    assert result["status"] == "failed"
+    assert "object-secret" not in json.dumps(result)
+
+
+def test_action_result_rejects_oversized_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: {'value': 'x' * 70000})\n"
+        ),
+    )
+
+    result = _wait(service, service.start_action("action-plugin", "auth")["run_id"])
+
+    assert result["status"] == "failed"
+    assert result["error"] == "setup action failed"
+
+
+def test_setup_run_is_bound_to_context_local_profile(tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "process"))
+    token = set_hermes_home_override(tmp_path / "profile-a")
+    try:
+        plugin_root = tmp_path / "plugin"
+        plugin_root.mkdir()
+        service, _, _ = _plugin(plugin_root)
+        started = service.start_action("action-plugin", "auth")
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(tmp_path / "profile-b")
+    try:
+        with pytest.raises(PluginConfigurationError, match="profile"):
+            service.action_status(started["run_id"])
+        with pytest.raises(PluginConfigurationError, match="profile"):
+            service.cancel_action(started["run_id"])
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_disabled_active_profile_cannot_use_cached_action_registration(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.config import load_config, save_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "process"))
+    token = set_hermes_home_override(tmp_path / "enabled")
+    try:
+        plugin_root = tmp_path / "plugin"
+        plugin_root.mkdir()
+        service, _, _ = _plugin(plugin_root)
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(tmp_path / "disabled")
+    try:
+        config = load_config()
+        config["plugins"] = {"enabled": [], "disabled": []}
+        save_config(config, preserve_keys={("plugins", "enabled")})
+        with pytest.raises(PluginConfigurationError, match="unavailable"):
+            service.start_action("action-plugin", "auth")
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_noncooperative_workers_are_capacity_bounded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "import threading\n"
+            "release = threading.Event()\n"
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: (release.wait(), {})[1])\n"
+        ),
+    )
+    started = [
+        service.start_action("action-plugin", "auth", timeout_seconds=1)
+        for _ in range(8)
+    ]
+
+    with pytest.raises(PluginConfigurationError, match="capacity"):
+        service.start_action("action-plugin", "auth", timeout_seconds=1)
+
+    sys.modules["hermes_plugins.action_plugin"].release.set()
+    for run in started:
+        _wait(service, run["run_id"])
+
+
+def test_terminal_runs_cancel_owned_timers_and_history_is_pruned(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(tmp_path)
+    run_ids = []
+    for _ in range(140):
+        run = service.start_action("action-plugin", "auth", timeout_seconds=1)
+        run_ids.append(run["run_id"])
+        _wait(service, run["run_id"])
+
+    assert all(
+        record.timer is None or not record.timer.is_alive()
+        for record in service._runs.values()
+    )
+    with pytest.raises(PluginConfigurationError, match="not found"):
+        service.action_status(run_ids[0])
+    assert len(service._runs) <= 128
+
+
+def test_setup_readiness_callback_timeout_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    service, _, _ = _plugin(
+        tmp_path,
+        source=(
+            "import time\n"
+            "def register(ctx):\n"
+            "    ctx.register_setup_action('auth', lambda run: {}, "
+            "readiness=lambda config: (time.sleep(1), True)[1])\n"
+        ),
+    )
+
+    started = time.monotonic()
+    status = service.readiness("action-plugin", platform="cli")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert status["ready"] is False
+    assert status["reasons"] == ["setup_required:auth"]

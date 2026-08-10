@@ -144,6 +144,8 @@ def plugin_configuration_command(args) -> int:
         _print_error(str(exc)[:4096])
         return 2
     print(_json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if action in {"auth", "enroll"} and result.get("status") != "succeeded":
+        return 3
     return 0
 
 
