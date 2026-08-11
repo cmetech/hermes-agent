@@ -5,12 +5,39 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import shutil
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.schema import parse_workflow_source_bytes
+from tests.ericsson_connector_source import resolve_ericsson_connector_source
+
+
+def _real_jira_to_gitlab_compilation(tmp_path):
+    source = resolve_ericsson_connector_source()
+    source_path = source.workflow
+    sidecar_path = source.workflow_sidecar
+    workflow_root = tmp_path / "real-source" / "workflows"
+    workflow_root.mkdir(parents=True)
+    copied = workflow_root / source_path.name
+    copied.write_bytes(source_path.read_bytes())
+    copied_sidecar = workflow_root / sidecar_path.name
+    copied_sidecar.write_bytes(sidecar_path.read_bytes())
+    source = parse_workflow_source_bytes(
+        copied,
+        workflow_bytes=copied.read_bytes(),
+        sidecar_bytes=copied_sidecar.read_bytes(),
+        source="project",
+        precedence=1,
+    )
+    return compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=5,
+    )
 
 
 def _connector_compilation(tmp_path):
@@ -130,6 +157,126 @@ def test_flat_connector_contract_compiles_before_availability_is_assessed(tmp_pa
     assert compilation.package.definition.nodes[0].options["allowed_tools"] == (
         "gitlab_read_file",
     )
+
+
+def test_real_archon_package_blocks_unready_connector_and_preserves_empty_tool_nodes(
+    tmp_path,
+):
+    """Task 12: real source bytes use Task 7's backend-authored admission facts."""
+    from plugins.workflow.admission_service import assess_workflow_admission
+    from tests.plugins.workflow.test_phase5_admission_parity import _context
+
+    compilation = _real_jira_to_gitlab_compilation(tmp_path)
+    all_declared_tools = frozenset(
+        tool
+        for node in compilation.package.definition.nodes
+        for tool in node.options.get("allowed_tools", ())
+    )
+
+    blocked = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset({"ericsson-jira"}),
+        available_tools=all_declared_tools,
+    )
+    admitted = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset({"ericsson-jira", "ericsson-gitlab"}),
+        available_tools=all_declared_tools,
+    )
+
+    assert any(
+        finding.code == "required_service"
+        and finding.path == "requires[0]"
+        for finding in blocked.compatibility.blocking_findings
+    )
+    assert not any(
+        finding.code in {"required_service", "unavailable_tool"}
+        for finding in admitted.compatibility.blocking_findings
+    )
+    reason = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "reason-about-fix"
+    )
+    assert reason.options["allowed_tools"] == ()
+
+
+def test_real_gitlab_write_receives_only_host_minted_current_invocation_admission(
+    tmp_path, monkeypatch
+):
+    """Workflow-authored args cannot mint or replace the backend admission fact."""
+    from hermes_cli import plugins as plugins_module
+    from hermes_cli.plugin_configuration import PluginConfigurationService
+    from hermes_cli.plugins import PluginManager
+    from model_tools import handle_function_call
+    from tools.registry import registry
+
+    source = resolve_ericsson_connector_source()
+    home = tmp_path / "profile"
+    plugin_root = home / "plugins" / "ericsson-gitlab"
+    plugin_root.parent.mkdir(parents=True)
+    shutil.copytree(source.plugin, plugin_root)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["ericsson-gitlab"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    PluginConfigurationService(manager).update(
+        "ericsson-gitlab",
+        settings={"origin": "https://gitlab.example.test"},
+        secrets={"pat": "profile-token"},
+    )
+    module = manager._plugins["ericsson-gitlab"].module
+    assert module is not None
+    captured = {}
+    monkeypatch.setattr(
+        module.gitlab_tools,
+        "invoke",
+        lambda name, args, configuration, **kwargs: captured.update(
+            name=name, args=args, configuration=configuration, kwargs=kwargs
+        )
+        or {"status": "created", "branch_name": "fix/ERIC-123-safe"},
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: {"approved": True, "message": None},
+    )
+
+    schema = registry._tools["gitlab_create_branch"].schema
+    assert "approved" not in schema["parameters"].get("properties", {})
+    result = json.loads(
+        handle_function_call(
+            "gitlab_create_branch",
+            {
+                "project": "group/project",
+                "source_branch": "main",
+                "prefix": "fix",
+                "ticket_key": "ERIC-123",
+                "summary": "Safe change",
+                "dry_run": False,
+            },
+            enabled_toolsets=["ericsson-gitlab"],
+            tool_call_id="workflow-write-1",
+            turn_id="workflow-turn-1",
+        )
+    )
+
+    assert result["success"] is True
+    assert captured["name"] == "gitlab_create_branch"
+    assert "tool_admission" not in captured["args"]
+    assert "approved" not in captured["args"]
+    # The plugin consumed the host-minted admission before invoking its backend.
+    assert captured["kwargs"].keys() == {"cancel_check"}
+
+    for name in tuple(registry.get_all_tool_names()):
+        if name.startswith("gitlab_"):
+            registry.deregister(name)
 
 
 def test_cli_admission_uses_the_active_connector_capability_snapshot(
