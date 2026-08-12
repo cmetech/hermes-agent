@@ -36,6 +36,9 @@ Hermes cron/Kanban profile isolation.
   symlink.
 - Use the root source virtual environment directly rather than creating a
   second environment.
+- Create a Hermes linked worktree from the approved-plan commit on `base` and
+  make all vendoring/test changes on its feature branch. Fast-forward that
+  branch into `base` only after verification.
 - Make source commits in `ericsson-capabilities` before vendoring.
 - Vendor only from a clean source commit by setting
   `ERICSSON_CAPABILITIES_DIR` explicitly.
@@ -43,7 +46,7 @@ Hermes cron/Kanban profile isolation.
   brand branches are out of scope.
 - Preserve every unrelated untracked file currently present in Hermes.
 
-## Task 1: Create an isolated source worktree and prove the baseline
+## Task 1: Create isolated source and Hermes worktrees and prove the baselines
 
 **Files:** No production changes.
 
@@ -60,17 +63,33 @@ git worktree add \
 Expected: the new worktree reports branch `feat/gitlab-read-exploration`, and
 the dirty root checkout is unchanged.
 
-**Step 2: Record the source worktree path**
+**Step 2: Create the Hermes worktree**
+
+```bash
+cd /Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
+git worktree add \
+  .worktrees/gitlab-read-exploration \
+  -b feat/gitlab-read-exploration \
+  60db0056d
+```
+
+Expected: the worktree starts from the committed approved design and plan;
+the main checkout remains on `base` with all unrelated untracked files
+untouched.
+
+**Step 3: Record the worktree paths**
 
 ```bash
 SOURCE_WT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/ericsson-capabilities/.worktrees/gitlab-read-exploration
 SOURCE_PY=/Users/coreyellis/code/github.com/cmetech/otto_hermes/ericsson-capabilities/.venv/bin/python
+HERMES_WT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.worktrees/gitlab-read-exploration
 git -C "$SOURCE_WT" status --short --branch
+git -C "$HERMES_WT" status --short --branch
 ```
 
-Expected: a clean worktree.
+Expected: both worktrees are clean.
 
-**Step 3: Run the focused source baseline**
+**Step 4: Run the focused source baseline**
 
 ```bash
 cd "$SOURCE_WT"
@@ -83,6 +102,19 @@ cd "$SOURCE_WT"
 
 Expected: PASS before any new tests are added. If it fails, stop and diagnose
 the baseline rather than changing production behavior opportunistically.
+
+**Step 5: Run the focused Hermes baseline**
+
+```bash
+cd "$HERMES_WT"
+./.venv/bin/python -m pytest -q \
+  tests/hermes_cli/test_ericsson_connector_surfaces.py \
+  tests/hermes_cli/test_ericsson_connector_distribution.py \
+  tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
+  tests/cron/test_cron_profile_isolation.py
+```
+
+Expected: PASS before vendoring or cross-surface test changes.
 
 ## Task 2: Add recursive group and project discovery
 
@@ -518,6 +550,9 @@ test-only correction is needed, commit it in source before continuing.
 
 **Step 1: Write failing Hermes contract tests before vendoring**
 
+Run every step in this task from `HERMES_WT`, not from the main `base`
+checkout.
+
 Update expected tool/skill sets to derive the new focused reads and activity
 skill. Add tests that prove:
 
@@ -648,16 +683,28 @@ files, run it and commit only deterministic fixes.
 **Step 3: Verify branch and worktree state**
 
 ```bash
-git branch --show-current
-git status --short --branch
+git -C "$HERMES_WT" branch --show-current
+git -C "$HERMES_WT" status --short --branch
 git -C "$SOURCE_WT" status --short --branch
 ```
 
-Expected: Hermes remains on `base`; source is clean on
-`feat/gitlab-read-exploration`; unrelated user files are still present and
-untouched.
+Expected: both feature worktrees are clean; unrelated user files in the main
+Hermes and source checkouts are still present and untouched.
 
-**Step 4: Prepare read-only installed UAT prompts**
+**Step 4: Fast-forward the completed Hermes feature into `base`**
+
+```bash
+HERMES_ROOT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
+test "$(git -C "$HERMES_ROOT" branch --show-current)" = base
+git -C "$HERMES_ROOT" merge --ff-only feat/gitlab-read-exploration
+test "$(git -C "$HERMES_ROOT" branch --show-current)" = base
+git -C "$HERMES_ROOT" status --short --branch
+```
+
+Expected: `base` points at the verified feature commit, the checkout remains on
+`base`, and unrelated untracked files are unchanged.
+
+**Step 5: Prepare read-only installed UAT prompts**
 
 The handoff must include natural-language prompts for:
 
