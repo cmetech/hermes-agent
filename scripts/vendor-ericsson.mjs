@@ -201,6 +201,13 @@ function sourceDestinationPairs(manifest) {
       assertManifestSourcePath(rel, 'mcpLocal'),
       path.posix.join('plugins', path.posix.basename(rel)),
     ]),
+    ...(manifest.workflows || []).map(rel => {
+      assertStrictRelativePath(rel, 'manifest source path')
+      if (!/^workflows\/[^/]+$/.test(rel) && !/^capabilities\/workflows\/[^/]+$/.test(rel)) {
+        throw new Error(`unsafe manifest source path: ${rel}`)
+      }
+      return [rel, path.posix.join('capabilities/workflows', path.posix.basename(rel))]
+    }),
     ...(manifest.workflowPackages || []).map(entry => {
       if (!entry || Object.keys(entry).sort().join(',') !== 'digestManifest,path') {
         throw new Error('workflowPackages entries require digestManifest and path')
@@ -620,6 +627,43 @@ function previousManagedInventory(destRoot) {
   return managedInventoryFromMetadata(previousManifest, ledger)
 }
 
+function compatibilityManifestOverlay(destRoot, sourceManifest, previousManifest, previous) {
+  if (!previousManifest) return sourceManifest
+  const priorManaged = new Set(previous)
+  const sourceSkills = new Set(sourceManifest.skills || [])
+  const overlaySkills = []
+  for (const rel of previousManifest.skills || []) {
+    assertManifestSourcePath(rel, 'skill')
+    if (sourceSkills.has(rel) || priorManaged.has(rel)) continue
+    const target = path.join(destRoot, rel)
+    const stat = lstatIfPresent(target)
+    if (!stat) continue
+    assertSafeExistingTree(destRoot, rel)
+    if (!stat.isDirectory()) {
+      throw new Error(`compatibility overlay skill is not a directory: ${rel}`)
+    }
+    overlaySkills.push(rel)
+  }
+
+  const vendored = {
+    ...sourceManifest,
+    skills: [...(sourceManifest.skills || []), ...overlaySkills],
+  }
+  if (!Object.hasOwn(sourceManifest, 'configDefaults')
+    && Object.hasOwn(previousManifest, 'configDefaults')) {
+    const defaults = previousManifest.configDefaults
+    if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
+      throw new Error('compatibility overlay configDefaults must be an object')
+    }
+    const encoded = JSON.stringify(defaults)
+    if (encoded.length > 256_000) {
+      throw new Error('compatibility overlay configDefaults exceeds the size limit')
+    }
+    vendored.configDefaults = defaults
+  }
+  return vendored
+}
+
 export function reconcileManagedPaths({ destRoot, previous, current }) {
   const previousPaths = [...new Set(previous.map(assertManagedDestination))].sort()
   const keep = new Set(current.map(assertManagedDestination))
@@ -946,7 +990,8 @@ function recoverPendingTransaction(destRoot, current, mcpDestination) {
 }
 
 function stageSnapshot({
-  sourceDir, destRoot, manifest, copyList, previous, current, sourceCommit, faultInjector,
+  sourceDir, destRoot, manifest, vendoredManifest, copyList, previous, current,
+  sourceCommit, faultInjector,
 }) {
   const transactionId = randomUUID()
   const txnRoot = path.join(destRoot, `${TRANSACTION_PREFIX}${transactionId}`)
@@ -978,7 +1023,7 @@ function stageSnapshot({
       )
     }
     const vendored = {
-      ...manifest,
+      ...vendoredManifest,
       vendoredFrom: sourceCommit,
       workflowPackages: manifest.workflowPackages || [],
     }
@@ -1141,11 +1186,19 @@ export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () =
     ]) assertNoSymlinkComponents(destRoot, rel, 'vendor output')
     const current = managedDestinations(manifest, { includeLegacyMcpFile: false })
     recoverPendingTransaction(destRoot, current, mcpDestination)
+    const previousManifest = readJsonIfPresent(path.join(destRoot, MANIFEST_FILE))
     const previous = previousManagedInventory(destRoot)
+    const vendoredManifest = compatibilityManifestOverlay(
+      destRoot,
+      manifest,
+      previousManifest,
+      previous,
+    )
     const staged = stageSnapshot({
       sourceDir,
       destRoot,
       manifest,
+      vendoredManifest,
       copyList,
       previous,
       current,

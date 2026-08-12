@@ -440,6 +440,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_schedule_revalidation.py \
       tests/plugins/workflow/test_ai_entitlement.py \
       tests/plugins/workflow/test_node_mcp.py \
+      tests/plugins/workflow/test_ericsson_connector_toolsets.py \
       tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_runner_binding.py \
       tests/plugins/workflow/test_typed_publication.py \

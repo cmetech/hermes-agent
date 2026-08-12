@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 from typing import Literal, Mapping
@@ -76,6 +77,28 @@ class ApiAdmissionError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
+
+
+_REQUEST_MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_]+__[A-Za-z0-9_]+$")
+
+
+def _request_scoped_mcp_tools(
+    package: WorkflowPackage,
+    *,
+    mcp_available: bool,
+) -> frozenset[str]:
+    """Return backend-minted MCP names that static plugin discovery cannot see."""
+    if not mcp_available:
+        return frozenset()
+    tools: set[str] = set()
+    for node in package.definition.nodes:
+        if "mcp" not in node.options:
+            continue
+        for field in ("allowed_tools", "denied_tools"):
+            for name in node.options.get(field, ()):
+                if isinstance(name, str) and _REQUEST_MCP_TOOL.fullmatch(name):
+                    tools.add(name)
+    return frozenset(tools)
 
 
 def normalize_api_schedule_at(
@@ -348,12 +371,18 @@ def start_api_run(
         requires_ai=(scenario.requires_ai if scenario is not None else None),
     )
     connector_capabilities = connector_capability_snapshot()
+    available_tools = connector_capabilities.available_tools.union(
+        _request_scoped_mcp_tools(
+            package,
+            mcp_available=execution_context.mcp_available,
+        )
+    )
     try:
         assessment = assess_workflow_admission(
             compilation,
             execution_context,
             read_budget=resource_budget,
-            available_tools=connector_capabilities.available_tools,
+            available_tools=available_tools,
             available_services=connector_capabilities.ready_services,
         )
         package_digest = assessment.package_digest

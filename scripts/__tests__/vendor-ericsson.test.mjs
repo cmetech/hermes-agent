@@ -400,6 +400,168 @@ test('managedDestinations returns sorted unique destination paths', () => {
   ])
 })
 
+test('vendor atomically publishes source-shaped workflows alongside workflow packages', () => {
+  const workflows = [
+    'workflows/inbox-digest.yml',
+    'workflows/jira-to-gitlab.yml',
+  ]
+  const src = tmpSource({ workflows })
+  write(src, workflows[0], 'name: inbox digest\nsource: exact fixture bytes\n')
+  write(src, workflows[1], 'name: jira to gitlab\nsource: exact fixture bytes\n')
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  seedCurrentSnapshot(dst)
+  write(dst, 'capabilities/workflows/unrelated.yml', 'user-owned workflow\n')
+  const before = treeSnapshot(dst)
+  let injected = false
+
+  assert.throws(() => vendor({
+    sourceDir: src,
+    destRoot: dst,
+    sourceCommit: '6'.repeat(40),
+    faultInjector(point, rel) {
+      if (!injected
+          && point === 'staged-publish'
+          && rel === 'capabilities/workflows/jira-to-gitlab.yml') {
+        injected = true
+        throw new Error('injected workflow publish failure')
+      }
+    },
+  }), /injected workflow publish failure/)
+  assert.equal(injected, true)
+  assert.deepEqual(treeSnapshot(dst), before)
+  assert.deepEqual(transactionArtifacts(dst), [])
+
+  vendor({ sourceDir: src, destRoot: dst, sourceCommit: '6'.repeat(40) })
+
+  assert.equal(
+    fs.readFileSync(path.join(dst, 'capabilities/workflows/inbox-digest.yml'), 'utf8'),
+    'name: inbox digest\nsource: exact fixture bytes\n',
+  )
+  assert.equal(
+    fs.readFileSync(path.join(dst, 'capabilities/workflows/jira-to-gitlab.yml'), 'utf8'),
+    'name: jira to gitlab\nsource: exact fixture bytes\n',
+  )
+  assert.ok(!fs.existsSync(path.join(dst, 'capabilities/workflows/w.yml')))
+  assert.equal(
+    fs.readFileSync(path.join(dst, 'capabilities/workflows/unrelated.yml'), 'utf8'),
+    'user-owned workflow\n',
+  )
+  assert.deepEqual(readInventory(dst), [
+    'capabilities/mcp-servers.yaml',
+    'capabilities/workflow-packages/ericsson',
+    'capabilities/workflows/inbox-digest.yml',
+    'capabilities/workflows/jira-to-gitlab.yml',
+    'plugins/ericsson-jira',
+    'plugins/outlook-mcp',
+    'skills/ericsson/opportunity-visuals',
+  ])
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(dst, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  assert.deepEqual(manifest.workflows, workflows)
+  assert.deepEqual(manifest.workflowPackages, [{
+    path: 'capabilities/workflow-packages/ericsson',
+    digestManifest: 'capabilities/workflow-packages/ericsson/digests.json',
+  }])
+  assert.deepEqual(transactionArtifacts(dst), [])
+})
+
+test('vendor preserves only safe unowned manifest compatibility overlays', () => {
+  const src = tmpSource()
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  const overlaySkill = 'skills/ericsson/compatibility-overlay'
+  const staleManagedSkill = 'skills/ericsson/removed-managed-skill'
+  const configDefaults = {
+    browser: {
+      default_profile: '',
+      profiles: {
+        enrolled: {
+          kind: 'enrolled',
+          cdp_port: 9333,
+          trusted_origins: ['https://*.example.test'],
+        },
+      },
+    },
+  }
+  write(dst, 'capabilities/ericsson.json', JSON.stringify({
+    skills: [staleManagedSkill, overlaySkill],
+    plugins: ['plugins/stale-connector'],
+    configDefaults,
+  }, null, 2) + '\n')
+  write(dst, 'capabilities/ericsson-vendored-paths.json', JSON.stringify([
+    staleManagedSkill,
+  ], null, 2) + '\n')
+  write(dst, `${staleManagedSkill}/SKILL.md`, 'stale managed bytes\n')
+  write(dst, `${overlaySkill}/SKILL.md`, 'compatibility overlay bytes\n')
+  write(dst, 'plugins/stale-connector/plugin.yaml', 'unmanaged plugin bytes\n')
+
+  vendor({ sourceDir: src, destRoot: dst, sourceCommit: '7'.repeat(40) })
+
+  const vendored = JSON.parse(fs.readFileSync(
+    path.join(dst, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  assert.deepEqual(vendored.skills, [
+    ...JSON.parse(fs.readFileSync(path.join(src, 'sets/ericsson.json'), 'utf8')).skills,
+    overlaySkill,
+  ])
+  assert.deepEqual(vendored.configDefaults, configDefaults)
+  assert.deepEqual(vendored.plugins, ['plugins/workflow', 'plugins/ericsson-jira'])
+  assert.equal(
+    fs.readFileSync(path.join(dst, `${overlaySkill}/SKILL.md`), 'utf8'),
+    'compatibility overlay bytes\n',
+  )
+  assert.ok(!fs.existsSync(path.join(dst, staleManagedSkill)))
+  assert.ok(fs.existsSync(path.join(dst, 'plugins/stale-connector/plugin.yaml')))
+  assert.ok(!readInventory(dst).includes(overlaySkill))
+})
+
+test('source-owned manifest fields override compatibility overlays', () => {
+  const sourceDefaults = { browser: { default_profile: 'source-owned' } }
+  const src = tmpSource({ configDefaults: sourceDefaults })
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  write(dst, 'capabilities/ericsson.json', JSON.stringify({
+    configDefaults: { browser: { default_profile: 'stale-overlay' } },
+  }))
+
+  vendor({ sourceDir: src, destRoot: dst, sourceCommit: '8'.repeat(40) })
+
+  const vendored = JSON.parse(fs.readFileSync(
+    path.join(dst, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  assert.deepEqual(vendored.configDefaults, sourceDefaults)
+})
+
+test('vendor rejects unsafe unmanaged skill overlays before mutation', () => {
+  const src = tmpSource()
+  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ecoutside-'))
+  const overlaySkill = 'skills/ericsson/compatibility-overlay'
+  write(outside, 'SKILL.md', 'outside bytes\n')
+  write(dst, 'capabilities/ericsson.json', JSON.stringify({
+    skills: [overlaySkill],
+  }))
+  fs.mkdirSync(path.dirname(path.join(dst, overlaySkill)), { recursive: true })
+  try {
+    fs.symlinkSync(outside, path.join(dst, overlaySkill), 'dir')
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+      return
+    }
+    throw error
+  }
+  write(dst, 'sentinel.txt', 'destination must remain unchanged\n')
+  const before = treeSnapshot(dst)
+
+  assert.throws(
+    () => vendor({ sourceDir: src, destRoot: dst, sourceCommit: '9'.repeat(40) }),
+    /overlay|symbolic link|reparse point|managed destination/i,
+  )
+  assert.deepEqual(treeSnapshot(dst), before)
+})
+
 test('vendor upgrades a legacy snapshot by reconciling destinations proven by its prior manifest', () => {
   const src = tmpSource()
   const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))

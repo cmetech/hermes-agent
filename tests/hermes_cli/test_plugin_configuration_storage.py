@@ -529,6 +529,41 @@ def test_active_profile_enablement_overrides_cached_loaded_state(tmp_path):
     assert detail["readiness"]["reasons"] == ["plugin_not_enabled"]
 
 
+def test_configuration_reads_preserve_an_existing_profile_tree(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        json.dumps(
+            {
+                "plugins": {
+                    "enabled": ["sample-connector"],
+                    "disabled": [],
+                    "entries": {
+                        "sample-connector": {
+                            "settings": {"endpoint": "https://configured.test"}
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    descriptor_root = tmp_path / "descriptor"
+    descriptor_root.mkdir()
+    service, _ = _service(descriptor_root)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    before = sorted(
+        path.relative_to(home).as_posix() for path in home.rglob("*")
+    )
+
+    detail = service.detail("sample-connector", platform="cli")
+
+    assert detail["enabled"] is True
+    endpoint = next(field for field in detail["fields"] if field["id"] == "endpoint")
+    assert endpoint["value"] == "https://configured.test"
+    assert sorted(path.relative_to(home).as_posix() for path in home.rglob("*")) == before
+
+
 def test_managed_persistence_noop_raises_stable_service_error(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()

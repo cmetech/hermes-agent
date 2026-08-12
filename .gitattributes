@@ -13,6 +13,7 @@ docker/entrypoint.sh text eol=lf
 # must never rewrite their LF bytes to CRLF or a clean managed checkout will
 # fail distribution digest verification before capability defaults are seeded.
 capabilities/workflow-packages/** text eol=lf
+capabilities/workflows/** text eol=lf
 plugins/workflow/showcases/** text eol=lf
 tests/plugins/workflow/fixtures/store/**/*.json text eol=lf
 tests/plugins/workflow/fixtures/store/**/*.jsonl text eol=lf

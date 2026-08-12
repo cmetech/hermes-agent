@@ -975,11 +975,11 @@ class PluginConfigurationService:
     @staticmethod
     def _is_enabled(loaded) -> bool:
         """Resolve enablement from the active profile without re-importing code."""
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path, load_config_readonly
 
         manifest = loaded.manifest
         lookup_key = manifest.key or manifest.name
-        config = load_config()
+        config = load_config_readonly(config_path=get_config_path())
         plugins = config.get("plugins")
         if not isinstance(plugins, Mapping):
             plugins = {}
@@ -1001,9 +1001,9 @@ class PluginConfigurationService:
 
     @staticmethod
     def _settings(plugin_id: str) -> dict[str, Any]:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path, load_config_readonly
 
-        config = load_config()
+        config = load_config_readonly(config_path=get_config_path())
         plugins = config.get("plugins")
         if not isinstance(plugins, Mapping):
             return {}
