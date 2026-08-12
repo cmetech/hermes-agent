@@ -68,4 +68,5 @@ read or edit raw RunStore files to understand failures, warnings, or completion.
 ## Troubleshooting
 
 Report failed, interrupted, in-progress, stalled, rejected, and cancelled distinctly.
-Resume through `PRODUCT_CLI workflow`; reconcile uncertain side effects before retry.
+Resume through `PRODUCT_CLI workflow`; reconcile uncertain side effects before retry
+or rerun.

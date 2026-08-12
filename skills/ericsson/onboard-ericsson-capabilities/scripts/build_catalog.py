@@ -4,21 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 from pathlib import Path
 
-from catalog_lib import build_catalog, serialize_catalog
-
-
-CATALOG_PATH = (
-    "skills/ericsson/onboard-ericsson-capabilities/references/catalog.json"
+from catalog_lib import (
+    CatalogError,
+    build_catalog,
+    collect_repository_inventory,
+    load_entries,
+    serialize_catalog,
+    validate_repository,
 )
+
+
+CATALOG_PATH = "skills/ericsson/onboard-ericsson-capabilities/references/catalog.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[4])
+    parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parents[4]
+    )
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
 
@@ -42,16 +50,26 @@ def _atomic_write(path: Path, content: str) -> None:
 def main() -> int:
     args = parse_args()
     repo = args.repo.resolve()
-    expected = serialize_catalog(build_catalog(repo))
-    target = repo / CATALOG_PATH
-    if args.check:
-        current = target.read_bytes() if target.is_file() else None
-        if current != expected.encode("utf-8"):
-            print("catalog is stale")
+    try:
+        entries = load_entries(repo)
+        inventory = collect_repository_inventory(repo)
+        problems = validate_repository(repo, entries, inventory=inventory)
+        if problems:
+            print(json.dumps({"ok": False, "problems": sorted(set(problems))}))
             return 1
+        expected = serialize_catalog(build_catalog(repo, entries=entries))
+        target = repo / CATALOG_PATH
+        if args.check:
+            current = target.read_bytes() if target.is_file() else None
+            if current != expected.encode("utf-8"):
+                print("catalog is stale")
+                return 1
+            return 0
+        _atomic_write(target, expected)
         return 0
-    _atomic_write(target, expected)
-    return 0
+    except CatalogError as exc:
+        print(json.dumps({"ok": False, "problems": [str(exc)]}))
+        return 1
 
 
 if __name__ == "__main__":
