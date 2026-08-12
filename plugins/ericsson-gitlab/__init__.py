@@ -29,6 +29,10 @@ _PLUGIN_SKILLS = (
         "ci-investigation",
         "Investigate bounded GitLab CI evidence.",
     ),
+    (
+        "gitlab-activity-digest",
+        "Use for one-time or recurring GitLab commit and merge-request activity digests.",
+    ),
 )
 
 

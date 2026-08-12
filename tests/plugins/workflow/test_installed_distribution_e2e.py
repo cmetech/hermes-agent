@@ -29,9 +29,10 @@ def _temporary_source_vendor(build_source: Path) -> None:
     shutil.copytree(
         source.plugin,
         build_source / "plugins" / "ericsson-gitlab",
+        dirs_exist_ok=True,
     )
     router = build_source / "skills" / "ericsson" / "gitlab"
-    router.mkdir(parents=True)
+    router.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source.router_skill, router / "SKILL.md")
 
 
@@ -195,6 +196,7 @@ def test_installed_distribution_contains_complete_gitlab_connector(
         "missing_files": [],
         "plugin_skills": [
             "ci-investigation",
+            "gitlab-activity-digest",
             "merge-request-review",
             "repository-research",
         ],
