@@ -15,6 +15,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    PluginStaticInventoryCapacityError,
     get_plugin_command_handler,
     get_plugin_commands,
     get_pre_tool_call_block_message,
@@ -92,6 +93,99 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    @pytest.mark.parametrize(
+        "layout",
+        (
+            "flat",
+            "nested",
+            "across-roots",
+            "entry-points",
+            "mapping-entry-points",
+            "legacy-entry-points",
+        ),
+    )
+    def test_bounded_static_inventory_limits_visits_before_materialization(
+        self, tmp_path, monkeypatch, layout
+    ):
+        """Bounded static scans fail before excess source breadth is held."""
+        import hermes_cli.plugins as plugins_module
+
+        bundled = tmp_path / "bundled"
+        user = tmp_path / "home" / "plugins"
+        bundled.mkdir(parents=True)
+        user.mkdir(parents=True)
+        if layout == "flat":
+            for index in range(4):
+                (bundled / f"empty-{index}").mkdir()
+        elif layout == "nested":
+            category = bundled / "category"
+            category.mkdir()
+            for index in range(4):
+                (category / f"empty-{index}").mkdir()
+        elif layout == "across-roots":
+            for root in (bundled, user):
+                for index in range(2):
+                    (root / f"empty-{index}").mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(plugins_module, "get_bundled_plugins_dir", lambda: bundled)
+        if layout in {
+            "entry-points",
+            "mapping-entry-points",
+            "legacy-entry-points",
+        }:
+
+            class EntryPoints(list):
+                def select(self, *, group):
+                    assert group == ENTRY_POINTS_GROUP
+                    return type(self)(ep for ep in self if ep.group == group)
+
+            def legacy_entry_points():
+                for index in range(4):
+                    yield types.SimpleNamespace(
+                        name=f"entry-{index}",
+                        value="module:load",
+                        group="unrelated.plugins",
+                    )
+                raise AssertionError("bounded scan consumed a fifth entry point")
+
+            entry_points_factory = lambda: EntryPoints(
+                types.SimpleNamespace(
+                    name=f"entry-{index}",
+                    value="module:load",
+                    group="unrelated.plugins",
+                )
+                for index in range(4)
+            )
+            if layout == "mapping-entry-points":
+                entry_points_factory = lambda: {
+                    "unrelated.one": [
+                        types.SimpleNamespace(
+                            name=f"entry-{index}", value="module:load"
+                        )
+                        for index in range(2)
+                    ],
+                    "unrelated.two": [
+                        types.SimpleNamespace(
+                            name=f"entry-{index}", value="module:load"
+                        )
+                        for index in range(2, 4)
+                    ],
+                }
+            elif layout == "legacy-entry-points":
+                entry_points_factory = legacy_entry_points
+            monkeypatch.setattr(
+                plugins_module.importlib.metadata,
+                "entry_points",
+                entry_points_factory,
+            )
+        else:
+            monkeypatch.setattr(
+                PluginManager, "_scan_entry_points", lambda self, **_kwargs: []
+            )
+
+        with pytest.raises(PluginStaticInventoryCapacityError, match="capacity"):
+            PluginManager().static_plugin_inventory(max_visits=3)
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -619,6 +713,48 @@ class TestPluginContext:
     """Tests for the PluginContext facade."""
 
 
+    def test_runtime_configuration_is_not_injected_into_tool_dispatch_kwargs(self):
+        """Plugin configuration stays an explicit plugin-owned lazy lookup."""
+        from tools.registry import registry
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="runtime-config-plugin", source="user"), manager
+        )
+        calls = []
+        context.register_tool(
+            name="_runtime_configuration_dispatch_probe",
+            toolset="runtime-config-plugin",
+            schema={
+                "name": "_runtime_configuration_dispatch_probe",
+                "description": "Probe dispatch context.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: calls.append((args, kwargs))
+            or '{"ok": true}',
+        )
+        try:
+            result = registry.dispatch(
+                "_runtime_configuration_dispatch_probe",
+                {"value": 1},
+                task_id="task-1",
+                session_id="session-1",
+                user_task="user request",
+            )
+        finally:
+            registry.deregister("_runtime_configuration_dispatch_probe")
+
+        assert result == '{"ok": true}'
+        assert calls == [
+            (
+                {"value": 1},
+                {
+                    "task_id": "task-1",
+                    "session_id": "session-1",
+                    "user_task": "user request",
+                },
+            )
+        ]
 
 
     def test_register_tool_override_blocked_without_operator_opt_in(self, tmp_path, monkeypatch):

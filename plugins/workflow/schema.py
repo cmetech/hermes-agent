@@ -55,7 +55,6 @@ from plugins.workflow.language_schema import (
     contains_output_reference,
     is_reference_safe_node_id,
     iter_output_references,
-    iter_when_output_references,
     loop_field_names,
     retry_field_names,
     sidecar_field_names,
@@ -1188,12 +1187,7 @@ def _validate_v3_static_output_references(
         ):
             try:
                 if surface_path.endswith(".when"):
-                    references = tuple(
-                        iter_when_output_references(
-                            template,
-                            normalizer_version=normalizer_version,
-                        )
-                    )
+                    references = validate_v3_condition_syntax(template)
                 elif surface_path.endswith((".bash", ".until_bash")):
                     references = bash_output_references(
                         template,

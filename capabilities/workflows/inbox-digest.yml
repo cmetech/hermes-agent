@@ -1,0 +1,32 @@
+name: inbox-digest
+description: Digest of recent unread Outlook email (Windows / Outlook required)
+version: 1.0.0
+tags: [ericsson, outlook, email]
+requires:
+  toolsets: []              # Outlook arrives via MCP; validated at runtime
+  mcp_servers: [outlook]
+  env: []
+inputs:
+  - {name: since, default: 1d}
+  - {name: limit, default: "15"}
+nodes:
+  - id: collect
+    kind: tool
+    tools: [message_list, message_read]
+    prompt: >
+      Using the Outlook MCP message_list tool, list unread inbox mail using this run's
+      `since` and `limit` input values (shown in the `inputs` field of the workflow_ctl
+      next/status output; defaults: last 1 day, 15 messages). For any message that looks
+      important but truncated, use message_read for the full body. Save the
+      collected data as inbox.json.
+    output: inbox.json
+  - id: digest
+    kind: prompt
+    depends_on: [collect]
+    prompt: >
+      Read inbox.json and write digest.md: group by sender/thread, one line
+      each with why it matters; end with an "action needed" list (max 5).
+    output: digest.md
+report:
+  kanban: auto
+  notify: []

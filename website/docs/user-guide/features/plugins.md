@@ -165,6 +165,23 @@ hermes plugins disable <name>     # remove from allow-list + add to disabled
 
 After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`.
 
+### Configuration metadata for disabled plugins
+
+Plugins may advertise a versioned static configuration descriptor through
+`config_schema` in `plugin.yaml`. `hermes plugins list --json` includes the
+validated descriptor even when the plugin is disabled, without importing or
+running its Python code. This lets setup surfaces explain required settings
+before you opt in to a plugin.
+
+Secret fields are always redacted in this output. They expose only `is_set`;
+the secret value is never returned. Invalid descriptors are omitted, and a
+plugin without `config_schema` keeps the same listing behavior as before.
+Descriptor display text rejects terminal controls, documentation links are
+limited to HTTP(S), and validation patterns use a bounded fixed-width subset.
+Changing a plugin's enabled or disabled state still takes effect on the next
+session; configuration discovery does not rewrite an active conversation's
+prompt or toolset.
+
 ### What the allow-list does NOT gate
 
 Several categories of plugin bypass `plugins.enabled` — they're part of Hermes' built-in surface and would break basic functionality if gated off by default:

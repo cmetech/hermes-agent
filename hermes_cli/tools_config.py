@@ -37,6 +37,118 @@ from utils import base_url_hostname, is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _field_assignments(values: List[str]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for assignment in values:
+        field, separator, value = assignment.partition("=")
+        if not separator or not field:
+            raise ValueError("configuration assignments must use FIELD=VALUE")
+        result[field] = value
+    return result
+
+
+def _coerce_plugin_settings(
+    assignments: Dict[str, str], fields: Dict[str, dict]
+) -> Dict[str, object]:
+    coerced: Dict[str, object] = {}
+    for field_id, raw in assignments.items():
+        metadata = fields.get(field_id)
+        if metadata is None or metadata.get("storage") != "setting":
+            raise ValueError(f"unknown setting field '{field_id}'")
+        field_type = metadata.get("type")
+        if field_type == "string":
+            coerced[field_id] = raw
+            continue
+        try:
+            value = _json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid {field_type} value for '{field_id}'") from exc
+        expected = {
+            "boolean": bool,
+            "integer": int,
+            "number": (int, float),
+        }.get(field_type)
+        if expected is None or isinstance(value, bool) and field_type != "boolean":
+            raise ValueError(f"invalid {field_type} value for '{field_id}'")
+        if not isinstance(value, expected):
+            raise ValueError(f"invalid {field_type} value for '{field_id}'")
+        coerced[field_id] = value
+    return coerced
+
+
+def get_plugin_configuration_service():
+    from hermes_cli.plugin_configuration import get_plugin_configuration_service as get
+
+    return get()
+
+
+def plugin_configuration_command(args) -> int:
+    """Dispatch descriptor-backed plugin configuration through one service."""
+    from hermes_cli.plugin_configuration import PluginConfigurationError
+
+    service = get_plugin_configuration_service()
+    action = getattr(args, "tools_action", None)
+    plugin_id = getattr(args, "plugin_id", "")
+    try:
+        if action == "status":
+            result = service.detail(plugin_id, platform=getattr(args, "platform", "cli"))
+        elif action == "configure":
+            import getpass
+
+            detail = service.detail(
+                plugin_id, platform=getattr(args, "platform", "cli")
+            )
+            fields = {field["id"]: field for field in detail.get("fields", [])}
+            settings = _coerce_plugin_settings(
+                _field_assignments(getattr(args, "settings", []) or []), fields
+            )
+            secrets = {}
+            for field_id in getattr(args, "secrets", []) or []:
+                metadata = fields.get(field_id)
+                if metadata is None or metadata.get("storage") != "secret":
+                    raise ValueError(f"unknown secret field '{field_id}'")
+                secrets[field_id] = getpass.getpass(
+                    f"{metadata.get('label') or field_id}: "
+                )
+            for field_id in getattr(args, "clear_secrets", []) or []:
+                service.clear_secret(plugin_id, field_id)
+            result = (
+                service.update(plugin_id, settings=settings, secrets=secrets)
+                if settings or secrets
+                else service.detail(plugin_id, platform=getattr(args, "platform", "cli"))
+            )
+        elif action in {"auth", "enroll"}:
+            detail = service.detail(plugin_id)
+            available = {
+                item["id"] for item in detail.get("setup_actions", []) if item.get("available")
+            }
+            candidates = (
+                ("auth", "authenticate", "sign_in", "test_connection")
+                if action == "auth"
+                else ("enroll", "sign_in", "authenticate")
+            )
+            action_id = next((name for name in candidates if name in available), None)
+            if action_id is None:
+                raise PluginConfigurationError(f"{action} setup action unavailable")
+            result = service.start_action(
+                plugin_id, action_id, unattended=not sys.stdin.isatty()
+            )
+            while result.get("status") in {"queued", "running"}:
+                import time
+
+                time.sleep(0.05)
+                result = service.action_status(result["run_id"])
+        else:
+            raise PluginConfigurationError("invalid plugin configuration operation")
+    except (PluginConfigurationError, ValueError) as exc:
+        _print_error(str(exc)[:4096])
+        return 2
+    print(_json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if action in {"auth", "enroll"} and result.get("status") != "succeeded":
+        return 3
+    return 0
+
+
 def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
     """Win32 creationflags that stop post-setup children flashing a console.
 

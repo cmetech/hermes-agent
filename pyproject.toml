@@ -456,8 +456,22 @@ plugins = [
   "**/plugin.yaml",
   "**/plugin.yml",
   "**/README.md",
+  # Standalone plugin configuration and guidance are runtime contracts too.
+  # Keep these generic so a newly bundled plugin does not require a named
+  # packaging exception merely to retain its descriptor or linked skill files.
+  "**/config.schema.json",
+  "**/skills/**/*",
   # Authenticated, read-only workflow showcase catalog and package resources.
   "workflow/showcases/**/*",
+]
+[tool.setuptools.exclude-package-data]
+plugins = [
+  "**/__pycache__/**",
+  "**/.pytest_cache/**",
+  "**/.pytest-cache/**",
+  "**/.ruff_cache/**",
+  "**/*.pyc",
+  "**/*.pyo",
 ]
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]

@@ -14187,8 +14187,10 @@ def _clear_skills_prompt_cache() -> None:
 
 
 
+from hermes_cli.web_routers import plugin_configuration as _plugin_configuration_routes  # noqa: E402
 from hermes_cli.web_routers import tools as _tools_routes  # noqa: E402
 
+app.include_router(_plugin_configuration_routes.router)
 app.include_router(_tools_routes.router)
 from hermes_cli.web_routers.tools import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     get_toolsets,

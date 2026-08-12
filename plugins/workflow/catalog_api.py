@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, NotRequired, TypedDict
 
+from hermes_cli.plugin_configuration import (
+    ConnectorCapabilitySnapshot,
+    connector_capability_snapshot,
+)
 from plugins.workflow.compilation import (
     WorkflowCatalogSnapshot,
     WorkflowCompilation,
@@ -1120,6 +1124,7 @@ def _catalog_entry(
     compilation: WorkflowCompilation | None = None,
     verified_showcase: "VerifiedShowcasePackage | None" = None,
     execution_context: ExecutionCapabilityContext,
+    connector_capabilities: ConnectorCapabilitySnapshot,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
     phase4_compilation = (
@@ -1140,6 +1145,8 @@ def _catalog_entry(
             compilation,
             execution_context,
             read_budget=resource_budget,
+            available_tools=connector_capabilities.available_tools,
+            available_services=connector_capabilities.ready_services,
         )
         compatibility, risk = assessment.compatibility, assessment.risk
     elif phase4_compilation is None:
@@ -1232,6 +1239,7 @@ def build_workflow_catalog(
     """Return at most 500 stable entries without executing workflow code."""
     home = Path(hermes_home).expanduser().resolve()
     binding = runner_binding or production_workflow_runner_binding()
+    connector_capabilities = connector_capability_snapshot()
     discovered, truncated = _discover_catalog_compilations(
         Path(workdir).expanduser().resolve(), home
     )
@@ -1297,6 +1305,7 @@ def build_workflow_catalog(
                         binding,
                         requires_ai=verified.scenario.requires_ai,
                     ),
+                    connector_capabilities=connector_capabilities,
                 )
             )
     except (
@@ -1347,6 +1356,7 @@ def build_workflow_catalog(
                         binding,
                         requires_ai=None,
                     ),
+                    connector_capabilities=connector_capabilities,
                 )
             )
         except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
@@ -1425,6 +1435,7 @@ def build_workflow_detail(
         raise WorkflowDetailNotFoundError(name)
     home = Path(hermes_home).expanduser().resolve()
     binding = runner_binding or production_workflow_runner_binding()
+    connector_capabilities = connector_capability_snapshot()
     resource_budget = WorkflowResourceReadBudget(
         max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -1496,6 +1507,8 @@ def build_workflow_detail(
                 compilation,
                 execution_context,
                 read_budget=resource_budget,
+                available_tools=connector_capabilities.available_tools,
+                available_services=connector_capabilities.ready_services,
             )
             if compilation is not None
             and supports_phase5_semantics(

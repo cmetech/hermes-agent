@@ -94,3 +94,53 @@ def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path)
     ]
 
 
+def test_cmd_list_json_exposes_disabled_static_configuration_without_import(
+    monkeypatch, tmp_path, capsys
+):
+    bundled_dir = tmp_path / "bundled"
+    user_dir = tmp_path / "user"
+    plugin_dir = user_dir / "connector"
+    bundled_dir.mkdir()
+    plugin_dir.mkdir(parents=True)
+    sentinel = tmp_path / "imported"
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: connector\nkind: standalone\nconfig_schema: config.schema.json\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "config.schema.json").write_text(
+        json.dumps({
+            "version": 1,
+            "fields": [
+                {
+                    "id": "token",
+                    "label": "Access token",
+                    "type": "string",
+                    "storage": "secret",
+                    "required": True,
+                    "readiness": True,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(plugins_cmd, "_plugins_dir", lambda: user_dir)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: bundled_dir,
+    )
+    monkeypatch.setattr(plugins_cmd, "_discover_entrypoint_plugins", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"connector"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"connector"})
+
+    plugins_cmd.cmd_list(_args(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["status"] == "disabled"
+    assert payload[0]["configuration"]["fields"][0]["is_set"] is False
+    assert "value" not in payload[0]["configuration"]["fields"][0]
+    assert not sentinel.exists()

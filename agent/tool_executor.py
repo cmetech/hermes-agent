@@ -402,6 +402,7 @@ def _run_agent_tool_execution_middleware(
     effective_task_id: str,
     tool_call_id: str,
     execute,
+    execute_with_admission=None,
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
@@ -452,15 +453,16 @@ def _run_agent_tool_execution_middleware(
             begin_execution(callback)
 
         block_message = scope_block
+        tool_admission = None
         block_error_type = "tool_scope_block"
         if block_message is None:
             block_error_type = "plugin_block"
 
-            def _resolve_pre_tool_block():
+            def _resolve_pre_tool_admission():
                 try:
-                    from hermes_cli.plugins import resolve_pre_tool_block
+                    from hermes_cli.plugins import resolve_pre_tool_admission
 
-                    return resolve_pre_tool_block(
+                    return resolve_pre_tool_admission(
                         function_name,
                         final_args,
                         task_id=effective_task_id or "",
@@ -474,11 +476,14 @@ def _run_agent_tool_execution_middleware(
                 except Exception:
                     return None
 
-            block_message = (
-                _resolve_pre_tool_block()
+            decision = (
+                _resolve_pre_tool_admission()
                 if authorization_gate is None
-                else authorization_gate.run(_resolve_pre_tool_block)
+                else authorization_gate.run(_resolve_pre_tool_admission)
             )
+            if decision is not None:
+                block_message = decision.block_message
+                tool_admission = decision.admission
 
         guardrail_decision = None
         if block_message is None:
@@ -522,6 +527,8 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
+        if execute_with_admission is not None:
+            return execute_with_admission(final_args, tool_admission)
         return execute(final_args)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
@@ -872,7 +879,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         try:
             try:
-                def _execute(next_args: dict[str, Any]) -> Any:
+                def _execute_with_admission(
+                    next_args: dict[str, Any], tool_admission: Any
+                ) -> Any:
                     return agent._invoke_tool(
                         function_name,
                         next_args,
@@ -880,6 +889,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         tool_call.id,
                         messages=messages,
                         pre_tool_block_checked=True,
+                        tool_admission=tool_admission,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
@@ -891,7 +901,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
-                    execute=_execute,
+                    execute=_execute_with_admission,
+                    execute_with_admission=_execute_with_admission,
                     scope_block=scope_block,
                     display_index=index + 1,
                     middleware_trace=middleware_trace,
@@ -1799,7 +1810,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                def _execute(next_args: dict) -> Any:
+                def _execute_with_admission(
+                    next_args: dict, tool_admission: Any
+                ) -> Any:
                     return _ra().handle_function_call(
                         function_name,
                         next_args,
@@ -1820,6 +1833,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        **(
+                            {"_tool_admission": tool_admission}
+                            if tool_admission is not None
+                            else {}
+                        ),
                     )
 
                 (
@@ -1835,7 +1853,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         function_args=function_args,
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
-                        execute=_execute,
+                        execute=_execute_with_admission,
+                        execute_with_admission=_execute_with_admission,
                         scope_block=_ts_scope_block,
                         display_index=i,
                         middleware_trace=middleware_trace,
@@ -1878,7 +1897,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                def _execute(next_args: dict) -> Any:
+                def _execute_with_admission(
+                    next_args: dict, tool_admission: Any
+                ) -> Any:
                     return _ra().handle_function_call(
                         function_name,
                         next_args,
@@ -1899,6 +1920,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        **(
+                            {"_tool_admission": tool_admission}
+                            if tool_admission is not None
+                            else {}
+                        ),
                     )
 
                 (
@@ -1914,7 +1940,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         function_args=function_args,
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
-                        execute=_execute,
+                        execute=_execute_with_admission,
+                        execute_with_admission=_execute_with_admission,
                         scope_block=_ts_scope_block,
                         display_index=i,
                         middleware_trace=middleware_trace,

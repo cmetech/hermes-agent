@@ -5,12 +5,19 @@
   "skills": [
     "skills/ericsson/opportunity-visuals",
     "skills/ericsson/onboard-ericsson-capabilities",
+    "skills/ericsson/gitlab",
+    "skills/ericsson/jira-to-gitlab",
     "skills/ericsson/confluence-research"
   ],
   "plugins": [
-    "plugins/workflow",
     "plugins/ericsson-jira",
-    "plugins/ericsson-teams"
+    "plugins/ericsson-teams",
+    "plugins/workflow",
+    {
+      "path": "plugins/ericsson-gitlab",
+      "id": "ericsson-gitlab",
+      "enabled": false
+    }
   ],
   "mcpServers": "mcp/mcp-servers.yaml",
   "mcpLocal": [
@@ -23,25 +30,12 @@
       "digestManifest": "capabilities/workflow-packages/ericsson/digests.json"
     }
   ],
+  "workflows": [
+    "workflows/my-tickets-summary.yml",
+    "workflows/inbox-digest.yml",
+    "workflows/jira-to-gitlab.yml"
+  ],
   "personas": [],
-  "configDefaults": {
-    "browser": {
-      "default_profile": "",
-      "profiles": {
-        "enrolled": {
-          "kind": "enrolled",
-          "executable": "auto",
-          "user_data_dir": "${HERMES_HOME}/browser-profiles/enrolled",
-          "cdp_port": 9333,
-          "headed": true,
-          "trusted_origins": [
-            "https://*.ericsson.com",
-            "https://*.ericsson.net"
-          ]
-        }
-      }
-    }
-  },
   "env": [
     {
       "key": "JIRA_BASE_URL",
@@ -66,6 +60,24 @@
       "category": "tool"
     }
   ],
-  "vendoredFrom": "dae405ede7049b621e502d9259f97481c940a65b",
+  "configDefaults": {
+    "browser": {
+      "default_profile": "",
+      "profiles": {
+        "enrolled": {
+          "kind": "enrolled",
+          "executable": "auto",
+          "user_data_dir": "${HERMES_HOME}/browser-profiles/enrolled",
+          "cdp_port": 9333,
+          "headed": true,
+          "trusted_origins": [
+            "https://*.ericsson.com",
+            "https://*.ericsson.net"
+          ]
+        }
+      }
+    }
+  },
+  "vendoredFrom": "922a162e21ac88498cdd918d78132bea76704d4d",
   "mcpServersFile": "mcp-servers.yaml"
 }

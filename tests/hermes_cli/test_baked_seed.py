@@ -98,6 +98,14 @@ def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
     source.mkdir()
     shutil.copy2(REPO_ROOT / ".gitattributes", source / ".gitattributes")
     shutil.copytree(REPO_ROOT / "capabilities", source / "capabilities")
+    manifest = json.loads(
+        (source / "capabilities/ericsson.json").read_text(encoding="utf-8")
+    )
+    for plugin in manifest.get("plugins", []):
+        if not isinstance(plugin, dict):
+            continue
+        relative = Path(plugin["path"])
+        shutil.copytree(REPO_ROOT / relative, source / relative)
 
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(

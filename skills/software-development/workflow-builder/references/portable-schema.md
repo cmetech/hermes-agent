@@ -227,6 +227,12 @@ field of a closed object is blocked with
 and schema branches that permit the field remain admissible for runtime
 evaluation.
 
+Equality conditions may compare two direct-dependency references, for example
+`when: $created.output.branch == $approved.output.branch`. This form supports
+only `==` and `!=` and requires exact matching canonical JSON scalar types;
+there is no numeric, boolean, or string coercion. List both producers in the
+consumer's `depends_on` array.
+
 Schemas must be self-contained Draft 2020-12 documents. `$ref` may point only
 below the same document's `$defs`; reject external, absolute, unresolved, and
 cyclic references, `$dynamicRef`, `$id`, `$anchor`, and `$dynamicAnchor`.

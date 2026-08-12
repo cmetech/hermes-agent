@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,13 @@ _AUTHENTICATED_RESOURCE_ROOTS = (
     Path("capabilities/workflow-packages"),
     Path("plugins/workflow/showcases"),
 )
+_LEGACY_PLUGIN_PATH_RE = re.compile(r"^plugins/[^/\\]+$")
+_STRUCTURED_PLUGIN_PATH_RE = re.compile(r"^plugins/[a-z0-9][a-z0-9_-]*$")
+_PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_LIFECYCLE_MIGRATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_MAX_LIFECYCLE_MIGRATIONS = 256
+_PLUGIN_OBJECT_KEYS = frozenset({"path", "id", "enabled", "lifecycleMigration"})
+_PLUGIN_OBJECT_REQUIRED_KEYS = frozenset({"path", "id", "enabled"})
 
 
 def _valid_bundle(path: Path, set_name: str) -> bool:
@@ -301,6 +309,192 @@ def _merge_workflow_agent_defaults(config: dict, plugin_names: list[str]) -> boo
     return changed
 
 
+def _validated_manifest_plugins(
+    raw_entries: object,
+    bundle: Path,
+) -> list[dict] | None:
+    """Normalize capability plugin metadata without guessing through damage.
+
+    String entries retain the original enabled-backend contract. Structured
+    entries carry an explicit id and enabled state; their static descriptor is
+    checked before staging so lifecycle metadata can never de-seed a different
+    plugin. Any malformed structured metadata invalidates the whole plugin
+    section, leaving unrelated plugin config untouched.
+    """
+    if not isinstance(raw_entries, list):
+        return None
+
+    import yaml
+
+    normalized: list[dict] = []
+    ids: set[str] = set()
+    legacy_paths: set[str] = set()
+    structured_paths: set[str] = set()
+    migration_ids: set[str] = set()
+    for raw in raw_entries:
+        if isinstance(raw, str):
+            legacy_name = raw.rsplit("/", 1)[-1]
+            if (
+                not _LEGACY_PLUGIN_PATH_RE.fullmatch(raw)
+                or legacy_name in {".", ".."}
+                or "\x00" in legacy_name
+            ):
+                return None
+            plugin_id = Path(raw).name
+            # Duplicate legacy strings historically collapse during the union.
+            # A structured entry may not compete with an earlier legacy path/id.
+            if raw in structured_paths:
+                return None
+            normalized.append({
+                "enabled": True,
+                "id": plugin_id,
+                "legacy": True,
+                "migration": None,
+                "path": raw,
+            })
+            legacy_paths.add(raw)
+            ids.add(plugin_id)
+            continue
+
+        if not isinstance(raw, dict):
+            return None
+        if (
+            not _PLUGIN_OBJECT_REQUIRED_KEYS <= set(raw)
+            or not set(raw) <= _PLUGIN_OBJECT_KEYS
+        ):
+            return None
+        rel = raw.get("path")
+        plugin_id = raw.get("id")
+        enabled = raw.get("enabled")
+        if (
+            not isinstance(rel, str)
+            or not _STRUCTURED_PLUGIN_PATH_RE.fullmatch(rel)
+            or not isinstance(plugin_id, str)
+            or not _PLUGIN_ID_RE.fullmatch(plugin_id)
+            or type(enabled) is not bool
+            or rel in legacy_paths
+            or rel in structured_paths
+            or plugin_id in ids
+        ):
+            return None
+
+        source = bundle / rel
+        descriptor = source / "plugin.yaml"
+        if (
+            source.is_symlink()
+            or not source.is_dir()
+            or descriptor.is_symlink()
+            or not descriptor.is_file()
+        ):
+            return None
+        try:
+            descriptor_data = yaml.safe_load(descriptor.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
+            return None
+        expected_kind = "backend" if enabled else "standalone"
+        if (
+            not isinstance(descriptor_data, dict)
+            or descriptor_data.get("name") != plugin_id
+            or descriptor_data.get("kind") != expected_kind
+        ):
+            return None
+
+        migration = None
+        if "lifecycleMigration" in raw:
+            migration_raw = raw.get("lifecycleMigration")
+            if (
+                enabled
+                or not isinstance(migration_raw, dict)
+                or set(migration_raw) != {"id", "from"}
+                or migration_raw.get("from") != "auto_seeded_backend"
+            ):
+                return None
+            migration_id = migration_raw.get("id")
+            if (
+                not isinstance(migration_id, str)
+                or not _LIFECYCLE_MIGRATION_ID_RE.fullmatch(migration_id)
+                or migration_id in migration_ids
+            ):
+                return None
+            migration_ids.add(migration_id)
+            migration = migration_id
+
+        structured_paths.add(rel)
+        ids.add(plugin_id)
+        normalized.append({
+            "enabled": enabled,
+            "id": plugin_id,
+            "legacy": False,
+            "migration": migration,
+            "path": rel,
+        })
+    return normalized
+
+
+def _merge_plugin_manifest_defaults(config: dict, entries: list[dict]) -> bool:
+    """Apply activation defaults and one-time lifecycle transitions atomically."""
+    current = config.get("plugins")
+    if current is None:
+        plugins: dict = {}
+    elif isinstance(current, dict):
+        plugins = current
+    else:
+        return False
+
+    enabled_raw = plugins.get("enabled", [])
+    disabled_raw = plugins.get("disabled", [])
+    applied_raw = plugins.get("lifecycle_migrations_applied", [])
+    if (
+        not isinstance(enabled_raw, list)
+        or not all(isinstance(item, str) for item in enabled_raw)
+        or not isinstance(disabled_raw, list)
+        or not all(isinstance(item, str) for item in disabled_raw)
+        or not isinstance(applied_raw, list)
+        or len(applied_raw) > _MAX_LIFECYCLE_MIGRATIONS
+        or not all(
+            isinstance(item, str) and _LIFECYCLE_MIGRATION_ID_RE.fullmatch(item)
+            for item in applied_raw
+        )
+        or len(set(applied_raw)) != len(applied_raw)
+    ):
+        return False
+
+    disabled = set(disabled_raw)
+    enabled = list(enabled_raw)
+    enabled_defaults = [
+        entry["id"]
+        for entry in entries
+        if entry["enabled"] and entry["id"] not in disabled
+    ]
+    for plugin_id in enabled_defaults:
+        if plugin_id not in enabled:
+            enabled.append(plugin_id)
+
+    applied = list(applied_raw)
+    unseen = [
+        entry
+        for entry in entries
+        if entry["migration"] is not None and entry["migration"] not in applied
+    ]
+    if len(applied) + len(unseen) > _MAX_LIFECYCLE_MIGRATIONS:
+        return False
+    for entry in unseen:
+        enabled = [item for item in enabled if item != entry["id"]]
+        applied.append(entry["migration"])
+
+    changed = False
+    if enabled != enabled_raw:
+        plugins["enabled"] = enabled
+        changed = True
+    if applied != applied_raw:
+        plugins["lifecycle_migrations_applied"] = applied
+        changed = True
+    if changed and current is None:
+        config["plugins"] = plugins
+    changed |= _merge_workflow_agent_defaults(config, enabled_defaults)
+    return changed
+
+
 def resolve_capability_bundle(set_name: str, source_url: str | None,
                               home: Path | str, root: Path | None = None) -> Path | None:
     """Resolve a named capability set to a local checkout directory.
@@ -561,6 +755,7 @@ def stage_bundle(
 
     home = Path(home)
     manifest = json.loads((bundle / "sets" / f"{set_name}.json").read_text(encoding="utf-8"))
+    plugin_entries = _validated_manifest_plugins(manifest.get("plugins"), bundle)
 
     # skills: preserve the repo-relative layout under skills/ (keeps the category dir)
     for rel in manifest.get("skills") or []:
@@ -574,23 +769,35 @@ def stage_bundle(
         rel_under = Path(rel).relative_to("skills") if rel.startswith("skills/") else Path(src.name)
         _copy_tree(src, home / "skills" / rel_under)
 
-    # plugins + local MCP servers both land in $HERMES_HOME/plugins/<basename>
-    plugin_names: list[str] = []
-    for key in ("plugins", "mcpLocal"):
-        for rel in manifest.get(key) or []:
+    # Manifest plugins and local MCP servers both land in
+    # $HERMES_HOME/plugins/<basename>. Invalid structured plugin metadata
+    # fails closed for the entire plugin section, while MCP staging remains
+    # independent.
+    staged_plugin_entries: list[dict] = []
+    if plugin_entries is not None:
+        for entry in plugin_entries:
+            rel = entry["path"]
             p = Path(rel)
             if p.is_absolute() or ".." in p.parts:
-                log.debug("skipping %s entry %r: path traversal", key, rel)
+                log.debug("skipping plugins entry %r: path traversal", rel)
                 continue
             src = bundle / rel
-            if key == "plugins" and p.as_posix() == "plugins/workflow":
-                plugin_names.append("workflow")
+            if p.as_posix() == "plugins/workflow":
+                staged_plugin_entries.append(entry)
                 continue
             if not src.is_dir():
                 continue
             _copy_tree(src, home / "plugins" / src.name)
-            if key == "plugins":
-                plugin_names.append(src.name)
+            staged_plugin_entries.append(entry)
+
+    for rel in manifest.get("mcpLocal") or []:
+        p = Path(rel)
+        if p.is_absolute() or ".." in p.parts:
+            log.debug("skipping mcpLocal entry %r: path traversal", rel)
+            continue
+        src = bundle / rel
+        if src.is_dir():
+            _copy_tree(src, home / "plugins" / src.name)
 
     for entry in manifest.get("workflowPackages") or []:
         _stage_workflow_package(
@@ -639,13 +846,8 @@ def stage_bundle(
             if merged != cfg.get("disabled_toolsets"):
                 cfg["disabled_toolsets"] = merged
                 changed = True
-        if plugin_names:
-            plugins_cfg = cfg.setdefault("plugins", {})
-            merged = _union(plugins_cfg.get("enabled"), plugin_names)
-            if merged != plugins_cfg.get("enabled"):
-                plugins_cfg["enabled"] = merged
-                changed = True
-            changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
+        if staged_plugin_entries:
+            changed |= _merge_plugin_manifest_defaults(cfg, staged_plugin_entries)
 
         if changed:
             config_mod.save_config(cfg)
@@ -800,14 +1002,11 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                     entries = (yaml.safe_load(frag.read_text(encoding="utf-8")) or {}).get("mcp_servers") or {}
                 except Exception:
                     entries = {}
-            plugin_names = [
-                Path(rel).name
-                for rel in manifest.get("plugins") or []
-                if isinstance(rel, str) and rel.startswith("plugins/")
-            ]
-            if entries or plugin_names:
+            plugin_entries = _validated_manifest_plugins(
+                manifest.get("plugins"), _repo_root()
+            )
+            if entries or plugin_entries:
                 from hermes_cli import config as config_mod
-                from hermes_cli.brand_config import _union
                 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
                 token = set_hermes_home_override(str(home))
                 try:
@@ -816,13 +1015,8 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                     if entries:
                         existing = cfg.setdefault("mcp_servers", {})
                         changed |= _merge_mcp_server_defaults(existing, entries, text_sub)
-                    if plugin_names:
-                        plugins_cfg = cfg.setdefault("plugins", {})
-                        merged = _union(plugins_cfg.get("enabled"), plugin_names)
-                        if merged != plugins_cfg.get("enabled"):
-                            plugins_cfg["enabled"] = merged
-                            changed = True
-                        changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
+                    if plugin_entries:
+                        changed |= _merge_plugin_manifest_defaults(cfg, plugin_entries)
                     if changed:
                         config_mod.save_config(cfg)
                 finally:

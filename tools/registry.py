@@ -165,11 +165,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "plugin_owner", "_plugin_registration_token",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 plugin_owner=None, plugin_registration_token=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -188,6 +190,11 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Explicit provenance: only PluginContext registrations populate these.
+        # The token is fresh for every registration, including same-name
+        # replacements, and is never forwarded to tool handlers.
+        self.plugin_owner = plugin_owner
+        self._plugin_registration_token = plugin_registration_token
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +593,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        _plugin_context=None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -633,6 +641,13 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
+            plugin_owner = None
+            if _plugin_context is not None:
+                manifest = getattr(_plugin_context, "manifest", None)
+                plugin_owner = (
+                    getattr(manifest, "key", None)
+                    or getattr(manifest, "name", None)
+                )
             self._tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
@@ -645,6 +660,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                plugin_owner=plugin_owner,
+                plugin_registration_token=object() if plugin_owner else None,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -823,6 +840,33 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        host_admission = kwargs.pop("_tool_admission", None)
+        # ``tool_admission`` is host-owned. Ordinary registry callers cannot
+        # smuggle a lookalike through handler kwargs.
+        kwargs.pop("tool_admission", None)
+        if entry.plugin_owner and isinstance(args, dict) and "tool_admission" in args:
+            return tool_error(
+                f"BLOCKED: caller-supplied tool admission for {name} is not valid"
+            )
+        if host_admission is not None:
+            try:
+                from hermes_cli.plugins import _claim_plugin_tool_admission
+
+                valid_admission = _claim_plugin_tool_admission(
+                    host_admission,
+                    tool_name=name,
+                    args=args,
+                    tool_call_id=str(kwargs.get("tool_call_id") or ""),
+                    turn_id=str(kwargs.get("turn_id") or ""),
+                    registration_token=entry._plugin_registration_token,
+                )
+            except Exception:
+                valid_admission = False
+            if not entry.plugin_owner or not valid_admission:
+                return tool_error(
+                    f"BLOCKED: host tool admission is not valid for {name}"
+                )
+            kwargs["tool_admission"] = host_admission
         try:
             if entry.is_async:
                 from model_tools import _run_async

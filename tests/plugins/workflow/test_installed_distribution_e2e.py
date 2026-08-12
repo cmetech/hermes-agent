@@ -11,9 +11,79 @@ from pathlib import Path
 
 import pytest
 
+from tests.ericsson_connector_source import (
+    EricssonConnectorSource,
+    resolve_ericsson_connector_source,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
+
+
+def _temporary_source_vendor(build_source: Path) -> None:
+    """Stage approved connector bytes into an isolated wheel-build tree."""
+    source = resolve_ericsson_connector_source(repo_root=build_source)
+    if source.vendored:
+        return
+    shutil.copytree(
+        source.plugin,
+        build_source / "plugins" / "ericsson-gitlab",
+    )
+    router = build_source / "skills" / "ericsson" / "gitlab"
+    router.mkdir(parents=True)
+    shutil.copy2(source.router_skill, router / "SKILL.md")
+
+
+def test_temporary_source_vendor_uses_complete_copied_vendor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_source = tmp_path / "copied-repository"
+    plugin = build_source / "plugins" / "generic-vendor"
+    plugin.mkdir(parents=True)
+    router = build_source / "skills" / "vendor" / "router" / "SKILL.md"
+    router.parent.mkdir(parents=True)
+    router.write_text("committed router\n", encoding="utf-8")
+    workflow = build_source / "capabilities" / "workflows" / "workflow.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("committed workflow\n", encoding="utf-8")
+    sidecar = workflow.with_name("workflow.hermes.yaml")
+    sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
+    manifest = build_source / "capabilities" / "vendor.json"
+    manifest.write_text('{"vendoredFrom":"' + "a" * 40 + '"}\n', encoding="utf-8")
+    source = EricssonConnectorSource(
+        root=build_source,
+        revision="a" * 40,
+        plugin=plugin,
+        router_skill=router,
+        workflow=workflow,
+        workflow_sidecar=sidecar,
+        capability_manifest=manifest,
+        vendored=True,
+    )
+
+    def resolve(*, repo_root: Path | None = None) -> EricssonConnectorSource:
+        assert repo_root == build_source
+        return source
+
+    monkeypatch.setitem(
+        _temporary_source_vendor.__globals__,
+        "resolve_ericsson_connector_source",
+        resolve,
+    )
+    monkeypatch.setattr(
+        shutil,
+        "copytree",
+        lambda *_args, **_kwargs: pytest.fail("committed vendor must not be restaged"),
+    )
+    monkeypatch.setattr(
+        shutil,
+        "copy2",
+        lambda *_args, **_kwargs: pytest.fail("committed router must not be restaged"),
+    )
+
+    _temporary_source_vendor(build_source)
+    assert router.read_text(encoding="utf-8") == "committed router\n"
 
 
 def _version_selection_from_guidance(path: Path) -> dict[str, object]:
@@ -27,31 +97,44 @@ def _version_selection_from_guidance(path: Path) -> dict[str, object]:
 def installed_distribution(tmp_path_factory):
     root = tmp_path_factory.mktemp("installed-distribution")
     artifacts = root / "artifacts"
-    generated_paths = (REPO_ROOT / "build", REPO_ROOT / "hermes_agent.egg-info")
-    preexisting = {path for path in generated_paths if path.exists()}
+    build_source = root / "source"
+    shutil.copytree(
+        REPO_ROOT,
+        build_source,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".worktrees",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".pytest-cache",
+            ".ruff_cache",
+            "build",
+            "hermes_agent.egg-info",
+        ),
+    )
+    _temporary_source_vendor(build_source)
     build_env = os.environ.copy()
     build_env["HERMES_NIX_BUILD"] = "1"
-    try:
-        build = subprocess.run(
-            [
-                "uv",
-                "build",
-                "--wheel",
-                "--no-build-logs",
-                "--out-dir",
-                str(artifacts),
-                ".",
-            ],
-            cwd=REPO_ROOT,
-            env=build_env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-    finally:
-        for path in generated_paths:
-            if path not in preexisting:
-                shutil.rmtree(path, ignore_errors=True)
+    build_env["UV_PYTHON"] = sys.executable
+    build = subprocess.run(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-logs",
+            "--out-dir",
+            str(artifacts),
+            ".",
+        ],
+        cwd=build_source,
+        env=build_env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
     assert build.returncode == 0, f"uv build failed:\n{build.stderr}"
     wheels = list(artifacts.glob("*.whl"))
     assert len(wheels) == 1
@@ -81,6 +164,42 @@ def installed_distribution(tmp_path_factory):
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
     env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
     return site, env, wheels
+
+
+def test_installed_distribution_contains_complete_gitlab_connector(
+    installed_distribution,
+) -> None:
+    site, _env, _wheels = installed_distribution
+    plugin = site / "plugins" / "ericsson-gitlab"
+    required_files = {
+        "plugin.yaml",
+        "config.schema.json",
+        "__init__.py",
+        "auth.py",
+        "client.py",
+        "models.py",
+        "operations.py",
+        "tools.py",
+    }
+    actual_files = {path.name for path in plugin.iterdir() if path.is_file()}
+    actual_plugin_skills = {
+        path.parent.name for path in plugin.glob("skills/*/SKILL.md")
+    }
+    assert {
+        "missing_files": sorted(required_files - actual_files),
+        "plugin_skills": sorted(actual_plugin_skills),
+        "router_present": (
+            site / "skills" / "ericsson" / "gitlab" / "SKILL.md"
+        ).is_file(),
+    } == {
+        "missing_files": [],
+        "plugin_skills": [
+            "ci-investigation",
+            "merge-request-review",
+            "repository-research",
+        ],
+        "router_present": True,
+    }
 
 
 @pytest.mark.integration

@@ -5396,3 +5396,246 @@ upstream_changes:
   removal_condition: Remove when upstream provides an equivalent dependency-bounded,
     side-effect-free workflow schema entry point ahead of every normal startup seam.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-configured-plugin-toolset-admission
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugins.py
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/models.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/store.py
+  - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/plugins/workflow/test_ericsson_connector_toolsets.py
+  - tests/plugins/workflow/test_phase5_admission_parity.py
+  owned_symbols:
+  - ConnectorCapabilitySnapshot
+  - connector_capability_snapshot
+  - PluginManager.static_plugin_inventory
+  - PluginStaticInventoryCapacityError
+  - WorkflowConnectorCapabilities
+  - connector_capabilities
+  - RunScheduler._connector_capabilities_match
+  - RunScheduler._revalidate_connector_capabilities
+  - RunStore._fail_package_validation
+  - allow_scheduled_running
+  owned_invariants:
+  - one immutable credential-free active-profile capability snapshot feeds each
+    production admission assessment and its authenticated snapshot seal
+  - public workflow list and doctor commands each capture one capability snapshot
+    and project the same ready-service and registered-tool vocabulary as run admission
+  - disabled plugin code remains unimported while static descriptor inventory,
+    current runtime generation, backend readiness, and registered tools are bounded
+    and fail closed
+  - snapshot raw inventory visits share one finite pre-sort budget across bundled,
+    platform, user, project, category-recursive, and descriptor-free entry-point
+    records while default runtime discovery precedence remains unchanged
+  - the raw-visit budget is separate from the lower static-manifest result bound,
+    so realistic unrelated plugin breadth does not disable connector admission
+  - snapshot readiness callbacks share the process-global configuration service's
+    four worker slots, including callbacks that remain blocked after their timeout
+  - fingerprints contain deterministic non-secret configuration identities and
+    credential-presence booleans but never values, readiness errors, or exception text
+  - admitted fingerprints are scoped to required services and canonical tool identities,
+    so unrelated connector changes do not block a run
+  - connector-dependent Archon runs revalidate authenticated identifiers, readiness,
+    registered tools, and scoped identity immediately before every scheduler claim pass
+  - active claims finish under their admitted authority; drift blocks further claims
+    and terminalizes the claim-free run exactly once with connector_capability_changed
+  - pre-extension workflow snapshots omit the optional metadata and retain their recorded
+    v1 through v5 behavior without a normalizer or snapshot-format version change
+  - exact empty allowed-tools declarations remain empty
+  - authenticated connector extension schema versions require the exact integer 1
+  tests:
+  - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/plugins/workflow/test_ericsson_connector_toolsets.py
+  - tests/plugins/workflow/test_phase5_admission_parity.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_scheduler.py
+  expected_commit_subject: 'feat(workflow): admit configured plugin toolsets'
+  upstream_candidate: true
+  merge_guidance: Preserve one current-profile, static-inventory-backed capability
+    snapshot across admission assessment and sealing. Keep its output immutable,
+    credential-free, deterministic, bounded, and generic. Seal only connector-dependent
+    Archon admissions through the existing authenticated resources extension, scope
+    drift to the run's required services and tools, and revalidate both after resume
+    and immediately before claims. Keep public list/doctor on the same snapshot facts,
+    share readiness worker capacity process-wide, and bound static visits before
+    directory sorting without changing default plugin precedence. Never import disabled
+    plugin code, expose values, mutate prompt/toolsets, reinterpret extension-free
+    snapshots, or fail a run beneath an active provider claim.
+  removal_condition: Remove when upstream supplies equivalent generic configured-plugin
+    service and tool admission, authenticated scoped drift identity, same-snapshot
+    sealing, active-claim-safe prelaunch revalidation, and exact legacy snapshot behavior.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: plugin-runtime-configuration-access
+  change_class: configuration-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugin_services.py
+  - hermes_cli/plugins.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugins.py
+  - website/docs/developer-guide/plugins/index.md
+  owned_symbols:
+  - PluginRuntimeConfiguration
+  - PluginContext.configuration
+  - _runtime_configuration_for_context
+  - BackgroundServiceHost._factory_start_event
+  - BackgroundServiceHost._run_service
+  - PluginManager.reload_background_services
+  owned_invariants:
+  - an enabled configurable plugin resolves only its own descriptor-authorized
+    validated settings and secrets through its already bound PluginContext identity
+  - each call resolves the current context-local profile and current successful
+    discovery generation without caching credentials at import or registration time
+  - stale generations, different profiles, disabled or descriptor-free plugins, invalid
+    persisted values, missing values, wrong storage classes, and arbitrary field ids
+    fail closed with fixed credential-free diagnostics
+  - runtime access preserves active profile file, external secret snapshot, installed
+    context-local secret scope, and managed environment precedence
+  - opaque immutable accessors expose no ordinary raw mapping, debug member, repr,
+    equality, or exception path that projects values, and registry/model handler kwargs
+    remain unchanged
+  - reload replacement factories remain behind a host-owned publication barrier until
+    the fully discovered profile generation stamp is atomically published; failed
+    discovery or replacement startup releases the barrier only for fail-closed cleanup
+  tests:
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugins.py
+  expected_commit_subject: 'feat(plugins): expose resolved runtime configuration'
+  upstream_candidate: true
+  merge_guidance: Keep public authority on PluginContext with no caller-supplied plugin
+    identity. Resolve lazily per invocation through the existing validated profile and
+    secret authority chain. Keep replacement background factories blocked until the
+    complete discovery stamp is published. Do not expose a cross-plugin resolver, raw
+    or ordinarily inspectable mapping, credential-bearing repr/error,
+    process-environment fallback, or injected model/tool dispatch argument.
+  removal_condition: Remove when upstream exposes an equivalent plugin-bound immutable
+    active-profile runtime configuration accessor with exact discovery-generation,
+    storage-class, validation, precedence, and non-projection guarantees.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: plugin-tool-admission-decisions
+  change_class: plugin-generic
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - agent/agent_runtime_helpers.py
+  - agent/tool_executor.py
+  - hermes_cli/plugins.py
+  - model_tools.py
+  - run_agent.py
+  - tools/registry.py
+  - tests/hermes_cli/test_plugin_tool_admission.py
+  - tests/run_agent/test_plugin_tool_admission_runtime.py
+  - tests/run_agent/test_run_agent.py
+  - tests/run_agent/test_tool_call_guardrail_runtime.py
+  - website/docs/developer-guide/plugins/index.md
+  owned_symbols:
+  - PluginToolAdmission
+  - PreToolAdmissionDecision
+  - resolve_pre_tool_admission
+  - PluginContext.register_tool
+  - ToolEntry._plugin_registration_token
+  - ToolRegistry.dispatch
+  - _run_agent_tool_execution_middleware
+  - invoke_tool
+  - handle_function_call
+  owned_invariants:
+  - only a successful existing host approval gate for a plugin approve directive
+    mints an affirmative immutable credential-free current-call admission
+  - no directive stays distinct from approval, while denial, timeout, unavailable,
+    unbindable arguments, and gate errors block without dispatch or admission
+  - the admission binds the effective underlying tool, final post-middleware
+    canonical argument digest, tool-call and turn ids, and exact PluginContext
+    registration token observed during policy resolution
+  - deregistration or same-owner same-name replacement never transfers approval;
+    claim and delivery require exact registration identity and are atomic one-shot
+  - caller JSON, handler kwargs, reused ids, concurrent calls, cancellation, later
+    invocations, and bridge wrappers cannot forge, inherit, replay, or redirect it
+  - direct, helper, sequential, concurrent, middleware, and tool_call paths gate once
+    and converge before registry delivery, without global or context-local caches
+  - built-in and plain registry handlers preserve their existing call shape and never
+    receive the reserved public kwarg
+  tests:
+  - tests/hermes_cli/test_plugin_tool_admission.py
+  - tests/run_agent/test_plugin_tool_admission_runtime.py
+  - tests/run_agent/test_run_agent.py
+  - tests/run_agent/test_tool_call_guardrail_runtime.py
+  - tests/test_model_tools.py
+  - tests/tools/test_approval.py
+  - tests/tools/test_registry.py
+  expected_commit_subject: 'feat(plugins): expose tool admission decisions'
+  upstream_candidate: true
+  merge_guidance: Preserve the existing approval engine and gate exactly once on the
+    effective final invocation. Keep admission host-minted, immutable, one-shot, bound
+    to exact PluginContext registration identity, and delivered only by the registry.
+    Do not serialize it, accept caller approval, cache it globally or in ContextVars,
+    special-case a connector, or add it to built-in handler kwargs.
+  removal_condition: Remove when upstream provides an equivalent generic plugin-only
+    current-call admission with final tool/argument and exact registration identity
+    binding across direct, middleware, helper, concurrent, sequential, and bridge paths.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: workflow-condition-output-comparison
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - plugins/workflow/conditions.py
+  - plugins/workflow/schema.py
+  - tests/plugins/workflow/test_phase3_conditions.py
+  - website/docs/user-guide/features/workflow-yaml-reference.md
+  - skills/software-development/workflow-builder/references/portable-schema.md
+  owned_symbols:
+  - _Clause
+  - _Expression.references
+  - _Parser._parse_clause
+  - _resolve_reference
+  - _canonical_scalar
+  - _evaluate_clause
+  - validate_v3_condition_syntax
+  - _validate_v3_static_output_references
+  owned_invariants:
+  - reference-to-reference comparisons are limited to equality and inequality
+    over direct dependencies using the existing bounded condition grammar
+  - both references are collected in source order and pass through the same
+    static dependency and structured-path validation
+  - runtime resolution uses the existing immutable output boundary and compares
+    only exact same-type canonical JSON scalars without numeric or boolean coercion
+  - containers, non-finite values, missing publications, and invalid paths fail
+    closed with bounded existing diagnostics that do not contain output values
+  - literal conditions, logical short-circuiting, schemaless output behavior,
+    historical normalizers, and durable scheduler transitions remain unchanged
+  tests:
+  - tests/plugins/workflow/test_phase3_conditions.py
+  - tests/plugins/workflow/test_strict_output_references.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_scheduler.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'feat(workflow): compare condition outputs'
+  upstream_candidate: true
+  merge_guidance: Preserve the sealed grammar and use validate_v3_condition_syntax
+    as the single condition-reference authority for static validation. Keep RHS
+    references equality-only, direct-dependency-bound, lazily resolved through
+    ResolvedNodeOutput, exact-type scalar-only, and free of connector-specific logic.
+    Do not add coercion, recursive container comparison, functions, arithmetic,
+    regex, optional references, or transitive dependencies.
+  removal_condition: Remove when upstream provides equivalent bounded output-to-output
+    equality with shared static reference validation, exact canonical scalar typing,
+    durable scheduler coverage, and unchanged historical condition behavior.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

@@ -63,7 +63,7 @@ class _Literal:
 class _Clause:
     reference: OutputReferenceToken
     operator: str
-    literal: _Literal
+    right: _Literal | OutputReferenceToken
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +72,13 @@ class _Expression:
 
     @property
     def references(self) -> tuple[OutputReferenceToken, ...]:
-        return tuple(
-            clause.reference for group in self.or_groups for clause in group
-        )
+        references: list[OutputReferenceToken] = []
+        for group in self.or_groups:
+            for clause in group:
+                references.append(clause.reference)
+                if isinstance(clause.right, OutputReferenceToken):
+                    references.append(clause.right)
+        return tuple(references)
 
 
 class _Parser:
@@ -139,9 +143,16 @@ class _Parser:
             self.position += len(operator)
             self._count_token()
             self._skip_whitespace()
-            literal = self._parse_literal()
+            if self.position < len(self.expression) and self.expression[
+                self.position
+            ] == "$":
+                if operator not in ARCHON_V3_CONDITION_EQUALITY_OPERATORS:
+                    self._syntax_error()
+                right: _Literal | OutputReferenceToken = self._parse_reference()
+            else:
+                right = self._parse_literal()
             self._skip_whitespace()
-            return _Clause(reference, operator, literal)
+            return _Clause(reference, operator, right)
         finally:
             self._leave()
 
@@ -258,11 +269,10 @@ def _numeric_left(value: object, *, schemaless_text: bool) -> Decimal:
     raise WorkflowConditionError("condition_operand_type")
 
 
-def _evaluate_clause(
-    clause: _Clause,
+def _resolve_reference(
+    reference: OutputReferenceToken,
     output_for: Callable[[str], object],
-) -> bool:
-    reference = clause.reference
+) -> tuple[object, bool]:
     raw_output = output_for(reference.node_id)
     if isinstance(raw_output, WorkflowOutputReferenceError):
         raise raw_output
@@ -289,14 +299,43 @@ def _evaluate_clause(
         and raw_output.schema_fingerprint is None
         and not reference.path
     )
+    return left, schemaless_text
+
+
+def _canonical_scalar(value: object) -> tuple[str, object]:
+    if value is None:
+        return "null", None
+    if type(value) is bool:
+        return "boolean", value
+    if type(value) is int:
+        return "integer", value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise WorkflowConditionError("condition_operand_nonfinite")
+        return "number", value
+    if type(value) is str:
+        return "string", value
+    raise WorkflowConditionError("condition_operand_type")
+
+
+def _evaluate_clause(
+    clause: _Clause,
+    output_for: Callable[[str], object],
+) -> bool:
+    left, schemaless_text = _resolve_reference(clause.reference, output_for)
+
+    if isinstance(clause.right, OutputReferenceToken):
+        right, _ = _resolve_reference(clause.right, output_for)
+        equal = _canonical_scalar(left) == _canonical_scalar(right)
+        return equal if clause.operator == "==" else not equal
 
     if (
         clause.operator in ARCHON_V3_CONDITION_EQUALITY_OPERATORS
-        and clause.literal.quoted
+        and clause.right.quoted
     ):
         if not isinstance(left, str):
             raise WorkflowConditionError("condition_operand_type")
-        equal = left == clause.literal.text
+        equal = left == clause.right.text
         return equal if clause.operator == "==" else not equal
 
     left_decimal = _numeric_left(
@@ -306,7 +345,7 @@ def _evaluate_clause(
             and clause.operator in ARCHON_V3_CONDITION_ORDERED_OPERATORS
         ),
     )
-    right_decimal = _decimal_text(clause.literal.text)
+    right_decimal = _decimal_text(clause.right.text)
     operations = {
         "==": left_decimal == right_decimal,
         "!=": left_decimal != right_decimal,
