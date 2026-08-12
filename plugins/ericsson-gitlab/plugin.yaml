@@ -6,6 +6,14 @@ kind: standalone
 config_schema: config.schema.json
 provides_tools:
   - gitlab_resolve_project
+  - gitlab_list_group_projects
+  - gitlab_list_commits
+  - gitlab_read_commit
+  - gitlab_list_commit_comments
+  - gitlab_list_commit_discussions
+  - gitlab_list_merge_requests
+  - gitlab_list_merge_request_commits
+  - gitlab_list_merge_request_discussions
   - gitlab_list_repository_tree
   - gitlab_read_file
   - gitlab_read_merge_request

@@ -1,6 +1,6 @@
 ---
 name: gitlab
-description: Routes users to qualified Ericsson GitLab guidance. Use when a user asks to enable, configure, or discover GitLab connector capabilities.
+description: Use when a user asks to enable or configure Ericsson GitLab, explore groups or repositories, inspect commits or merge requests, investigate CI, or schedule an activity digest.
 metadata:
   hermes:
     tags: [Ericsson, GitLab, Onboarding]
@@ -14,7 +14,7 @@ Check whether the ericsson-gitlab plugin is disabled. Guide the user through ena
 </quick_start>
 
 <routing>
-When the plugin is configured and ready, route repository questions to ericsson-gitlab:repository-research, reviews to ericsson-gitlab:merge-request-review, and CI questions to ericsson-gitlab:ci-investigation.
+When the plugin is configured and ready, route group, subgroup, project, file, “latest commit,” commit-comment, and commit-discussion questions to `ericsson-gitlab:repository-research`. Route merge-request discovery, “recent merge request,” commits, discussions, and reviews to `ericsson-gitlab:merge-request-review`. Route pipeline and CI questions to `ericsson-gitlab:ci-investigation`. Route one-time summaries and a recurring or daily digest of commits or merge requests to `ericsson-gitlab:gitlab-activity-digest`.
 </routing>
 
 <boundaries>

@@ -19,6 +19,14 @@ from tests.ericsson_connector_source import (
 
 TOOL_NAMES = {
     "gitlab_resolve_project",
+    "gitlab_list_group_projects",
+    "gitlab_list_commits",
+    "gitlab_read_commit",
+    "gitlab_list_commit_comments",
+    "gitlab_list_commit_discussions",
+    "gitlab_list_merge_requests",
+    "gitlab_list_merge_request_commits",
+    "gitlab_list_merge_request_discussions",
     "gitlab_list_repository_tree",
     "gitlab_read_file",
     "gitlab_read_merge_request",
@@ -32,6 +40,7 @@ PLUGIN_SKILLS = {
     "ericsson-gitlab:repository-research",
     "ericsson-gitlab:merge-request-review",
     "ericsson-gitlab:ci-investigation",
+    "ericsson-gitlab:gitlab-activity-digest",
 }
 
 
@@ -201,6 +210,7 @@ def test_disabled_router_and_fresh_session_activation_are_cache_stable(
     assert "configure" in router_text.lower()
     assert "fresh conversation" in router_text.lower()
     assert "ericsson-gitlab:repository-research" in router_text
+    assert "ericsson-gitlab:gitlab-activity-digest" in router_text
     assert (
         json.loads(skill_view("ericsson-gitlab:repository-research", preprocess=False))[
             "success"
@@ -237,6 +247,15 @@ def test_disabled_router_and_fresh_session_activation_are_cache_stable(
     assert loaded["success"] is True
     assert loaded["name"] == "ericsson-gitlab:repository-research"
     assert "profile-only-token" not in json.dumps(loaded)
+
+    digest = json.loads(
+        skill_view("ericsson-gitlab:gitlab-activity-digest", preprocess=False)
+    )
+    assert digest["success"] is True
+    assert "lookback_hours=24" in digest["content"]
+    assert "Do not call `cronjob`" in digest["content"]
+    assert "return exactly `[SILENT]`" in digest["content"]
+    assert "profile-only-token" not in json.dumps(digest)
 
     for name in TOOL_NAMES:
         registry.deregister(name)

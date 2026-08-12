@@ -44,6 +44,9 @@
       "displayName": "GitLab Tools",
       "entry": "references/capabilities/gitlab-tools.md",
       "goals": [
+        "Explore nested groups, subgroups, and visible projects recursively.",
+        "Inspect recent commits, commit details, comments, and discussions.",
+        "Discover merge requests and inspect their commits and discussions.",
         "Research a GitLab repository or merge request with bounded evidence.",
         "Inspect GitLab pipelines and CI configuration without reading variable values.",
         "Preview and perform an explicitly approved GitLab branch, commit, or merge request write."

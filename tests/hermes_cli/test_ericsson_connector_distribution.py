@@ -13,9 +13,31 @@ from hermes_cli import capability_staging as staging
 from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
+EXPECTED_GITLAB_READ_EXPLORATION_TOOLS = {
+    "gitlab_list_group_projects",
+    "gitlab_list_commits",
+    "gitlab_read_commit",
+    "gitlab_list_commit_comments",
+    "gitlab_list_commit_discussions",
+    "gitlab_list_merge_requests",
+    "gitlab_list_merge_request_commits",
+    "gitlab_list_merge_request_discussions",
+}
+
+
 def _write(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(contents, encoding="utf-8")
+
+
+def test_checked_in_gitlab_bundle_exposes_read_exploration_and_digest() -> None:
+    """The shipped bundle, not only its authority repo, carries the UAT surface."""
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_root = repo_root / "plugins" / "ericsson-gitlab"
+    manifest = yaml.safe_load((plugin_root / "plugin.yaml").read_text(encoding="utf-8"))
+
+    assert EXPECTED_GITLAB_READ_EXPLORATION_TOOLS <= set(manifest["provides_tools"])
+    assert (plugin_root / "skills" / "gitlab-activity-digest" / "SKILL.md").is_file()
 
 
 def test_baked_distribution_exposes_but_does_not_enable_standalone_plugins(
@@ -156,4 +178,9 @@ def test_actual_gitlab_source_stages_disabled_with_complete_static_assets(
     assert {
         path.parent.name
         for path in plugin_root.glob("skills/*/SKILL.md")
-    } == {"repository-research", "merge-request-review", "ci-investigation"}
+    } == {
+        "repository-research",
+        "merge-request-review",
+        "ci-investigation",
+        "gitlab-activity-digest",
+    }

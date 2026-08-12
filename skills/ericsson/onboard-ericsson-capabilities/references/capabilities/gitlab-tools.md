@@ -3,6 +3,9 @@ id: gitlab-tools
 display_name: GitLab Tools
 aliases: [Ericsson GitLab, repository tools, merge request tools, GitLab CI tools]
 goals:
+  - Explore nested groups, subgroups, and visible projects recursively.
+  - Inspect recent commits, commit details, comments, and discussions.
+  - Discover merge requests and inspect their commits and discussions.
   - Research a GitLab repository or merge request with bounded evidence.
   - Inspect GitLab pipelines and CI configuration without reading variable values.
   - Preview and perform an explicitly approved GitLab branch, commit, or merge request write.
@@ -16,9 +19,17 @@ implementation:
   workflows: []
   tools:
     - gitlab_resolve_project
+    - gitlab_list_group_projects
     - gitlab_list_repository_tree
     - gitlab_read_file
     - gitlab_read_merge_request
+    - gitlab_list_commits
+    - gitlab_read_commit
+    - gitlab_list_commit_comments
+    - gitlab_list_commit_discussions
+    - gitlab_list_merge_requests
+    - gitlab_list_merge_request_commits
+    - gitlab_list_merge_request_discussions
     - gitlab_list_pipelines
     - gitlab_inspect_ci
     - gitlab_create_branch
@@ -42,7 +53,7 @@ configuration:
     kind: static-setting
     required: false
     guidance: Optionally configure a bounded regular-file mTLS key path together with its certificate.
-reads: [canonical project identity, bounded repository files and trees, merge requests, pipelines, CI structure and variable metadata]
+reads: [canonical group and project identity, recursive subgroup and project discovery, bounded repository files and trees, commit history and feedback, merge request discovery and discussions, pipelines, CI structure and variable metadata]
 writes: [explicitly previewed and host-approved branches, atomic commits, and merge requests]
 artifacts: [canonical GitLab links, bounded evidence, continuation and warning facts, dry-run previews, reconciled write identities]
 demonstrations: [read-only-live, approved-live]
@@ -53,13 +64,18 @@ troubleshooting: [plugin disabled, missing or invalid configuration, permission 
 
 ## What it solves
 
-The standalone Ericsson GitLab plugin provides six bounded read tools and three
-approval-gated write tools for repository research, merge-request review, CI
-investigation, branches, atomic commits, and merge requests.
+The standalone Ericsson GitLab plugin provides bounded read tools for recursive
+group discovery, repository research, commit history and feedback, merge-request
+exploration and review, and CI investigation. Its three write tools remain
+approval-gated for branches, atomic commits, and merge requests.
 
 ## Try saying
 
 - “Research this project at its default branch and explain the relevant files.”
+- “Show me every subgroup and project under sd-macs-att-rnam-hosting.”
+- “What was the latest commit in this repo, and are there comments on it?”
+- “What merge requests were created in the last 24 hours?”
+- “Send me a daily digest of new commits and merge requests for this project.”
 - “Review merge request 42 from bounded GitLab evidence.”
 - “Inspect this pipeline and CI include structure without variable values.”
 
@@ -84,7 +100,8 @@ The plugin is disabled by default. Enable `ericsson-gitlab`, configure `origin` 
 the protected `pat`, optionally configure both mTLS paths, pass readiness, then
 start a fresh conversation. Qualified guidance appears as
 `ericsson-gitlab:repository-research`, `ericsson-gitlab:merge-request-review`, and
-`ericsson-gitlab:ci-investigation` only while the plugin is enabled.
+`ericsson-gitlab:ci-investigation`, and
+`ericsson-gitlab:gitlab-activity-digest` only while the plugin is enabled.
 
 ## Demonstration
 
