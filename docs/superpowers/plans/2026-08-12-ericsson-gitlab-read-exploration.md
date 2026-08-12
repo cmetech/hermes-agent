@@ -70,7 +70,7 @@ cd /Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
 git worktree add \
   .worktrees/gitlab-read-exploration \
   -b feat/gitlab-read-exploration \
-  60db0056d
+  base
 ```
 
 Expected: the worktree starts from the committed approved design and plan;
