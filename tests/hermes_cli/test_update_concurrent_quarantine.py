@@ -321,7 +321,9 @@ def _fake_psutil_tree(tree, venv_exe, worker_exe, dead=None):
 @patch.object(cli_main, "_is_windows", return_value=True)
 def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
     """The worker's venv-side parent is reported so the guard set is covered."""
-    venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
+    venv_exe = str(
+        (cli_main.PROJECT_ROOT / "venv").resolve() / "Scripts" / "python.exe"
+    )
     worker_exe = r"C:\Users\x\AppData\Roaming\uv\python\cpython-3.11\python.exe"
 
     # worker 200 -> launcher 100 (even == venv-side)
@@ -366,7 +368,9 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
     import hermes_cli.gateway as gateway_mod
     import gateway.status as status_mod
 
-    venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
+    venv_exe = str(
+        (cli_main.PROJECT_ROOT / "venv").resolve() / "Scripts" / "python.exe"
+    )
     worker_exe = r"C:\Users\x\AppData\Roaming\uv\python\cpython-3.11\python.exe"
 
     profile_home = tmp_path / "profiles" / "default"
@@ -522,7 +526,6 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
-
 
 
 
