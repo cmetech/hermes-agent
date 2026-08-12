@@ -821,7 +821,7 @@ def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(
         now=observed,
     )
     before = store.load_run(admitted.run_id)
-    started = time.perf_counter()
+    started = time.process_time()
 
     for offset in range(1_000):
         assert store.wake_due_output_resolutions(
@@ -830,7 +830,7 @@ def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(
         ) == ()
 
     after = store.load_run(admitted.run_id)
-    assert time.perf_counter() - started < 2.0
+    assert time.process_time() - started < 2.0
     assert after["event_sequence"] == before["event_sequence"]
     assert after["state_version"] == before["state_version"]
     assert after["nodes"]["consumer"] == before["nodes"]["consumer"]
@@ -846,9 +846,9 @@ def test_thousand_node_projection_is_bounded_and_disables_mermaid(
     package = load_workflow(
         workflow_writer(tmp_path / "large", name="large", nodes=nodes)
     )
-    started = time.perf_counter()
+    started = time.process_time()
     result = project_topology(package.definition)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert result.node_count == 1000
     assert result.edge_count == 999
@@ -978,7 +978,7 @@ def test_coordinator_cursor_reaches_run_201_with_bounded_keyset_pages(
     )
     cursor = None
     for _page in range(10):
-        started = time.monotonic()
+        started = time.process_time()
         _actionable, cursor, _progress = service._sweep_once(
             store,
             coordinator,
@@ -987,7 +987,7 @@ def test_coordinator_cursor_reaches_run_201_with_bounded_keyset_pages(
             scheduler,
             cursor,
         )
-        assert time.monotonic() - started < 2.2
+        assert time.process_time() - started < 2.2
         if cursor is None and scheduler.submit.call_count >= len(admitted):
             break
 

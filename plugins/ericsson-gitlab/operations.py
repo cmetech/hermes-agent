@@ -394,6 +394,8 @@ class GitLabOperations:
         path = unquote(parsed.path).strip("/")
         if not path or "/-/" in path or path.endswith(".git"):
             raise GitLabError("invalid_input")
+        if path.startswith("groups/"):
+            path = path.removeprefix("groups/")
         return _namespace_path(path, remote=False)
 
     def resolve_project(
@@ -489,7 +491,7 @@ class GitLabOperations:
         web_url = _canonical_remote_url(
             payload.get("web_url"),
             self.client.auth.origin,
-            f"/{full_path}",
+            f"/groups/{full_path}",
         )
         return {
             "id": group_id,
