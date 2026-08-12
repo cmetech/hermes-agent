@@ -274,8 +274,11 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     with (
         patch("agent.relay_tools.execute", side_effect=relay_execute),
         patch(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            side_effect=observe_plugin,
+            "hermes_cli.plugins.resolve_pre_tool_admission",
+            side_effect=lambda name, args, **kwargs: SimpleNamespace(
+                block_message=observe_plugin(name, args, **kwargs),
+                admission=None,
+            ),
         ),
         patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
         patch(
@@ -331,7 +334,12 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     messages = []
 
     with (
-        patch("hermes_cli.plugins.resolve_pre_tool_block", return_value="plugin policy"),
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_admission",
+            return_value=SimpleNamespace(
+                block_message="plugin policy", admission=None
+            ),
+        ),
         patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
     ):
         agent._execute_tool_calls_sequential(msg, messages, "task-1")

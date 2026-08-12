@@ -14,7 +14,7 @@
         "Explain what is missing before CI audits can run."
       ],
       "id": "ci-file-auditor",
-      "maturity": "planned-not-implemented",
+      "maturity": "partially-ported",
       "recommendationEligible": false
     },
     {
@@ -33,6 +33,24 @@
       "id": "ericsson-capability-onboarding",
       "maturity": "available",
       "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Ericsson GitLab",
+        "repository tools",
+        "merge request tools",
+        "GitLab CI tools"
+      ],
+      "displayName": "GitLab Tools",
+      "entry": "references/capabilities/gitlab-tools.md",
+      "goals": [
+        "Research a GitLab repository or merge request with bounded evidence.",
+        "Inspect GitLab pipelines and CI configuration without reading variable values.",
+        "Preview and perform an explicitly approved GitLab branch, commit, or merge request write."
+      ],
+      "id": "gitlab-tools",
+      "maturity": "available",
+      "recommendationEligible": true
     },
     {
       "aliases": [
@@ -99,8 +117,8 @@
         "Tell me what is missing before ticket-to-MR automation can run."
       ],
       "id": "jira-to-gitlab",
-      "maturity": "partially-ported",
-      "recommendationEligible": false
+      "maturity": "available",
+      "recommendationEligible": true
     },
     {
       "aliases": [

@@ -189,6 +189,7 @@ class BackgroundServiceHost:
         safe_mode: bool,
         delivery_port: PluginDeliveryPort | None = None,
         on_quiescent: Callable[["BackgroundServiceHost"], None] | None = None,
+        factory_start_event: threading.Event | None = None,
     ) -> None:
         if host_kind not in VALID_BACKGROUND_SERVICE_HOSTS:
             raise ValueError(f"unknown background service host: {host_kind}")
@@ -201,6 +202,7 @@ class BackgroundServiceHost:
         self._safe_mode = safe_mode
         self.delivery_port = delivery_port
         self._on_quiescent = on_quiescent
+        self._factory_start_event = factory_start_event
         self._states = tuple(
             _HostedServiceState(registration=registration)
             for registration in sorted(
@@ -243,6 +245,13 @@ class BackgroundServiceHost:
 
     def _run_service(self, state: _HostedServiceState) -> None:
         registration = state.registration
+        publication = self._factory_start_event
+        if publication is not None:
+            while not publication.wait(0.05):
+                if state.stop_event.is_set():
+                    return
+            if state.stop_event.is_set():
+                return
         context = BackgroundServiceContext(
             host_kind=self.host_kind,
             host_instance_id=self.host_instance_id,

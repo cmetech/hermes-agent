@@ -1147,16 +1147,31 @@ def cmd_list(args: Any | None = None) -> None:
     entries = _filter_plugin_entries(entries, args, enabled, disabled)
 
     if getattr(args, "json", False):
-        payload = [
-            {
+        from hermes_cli.plugin_configuration import (
+            load_plugin_configuration,
+            project_plugin_configuration,
+        )
+
+        payload = []
+        for name, version, description, source, plugin_dir, key in entries:
+            item = {
                 "name": name,
                 "status": _plugin_status(name, enabled, disabled, key=key),
                 "version": str(version),
                 "description": description,
                 "source": source,
             }
-            for name, version, description, source, _dir, key in entries
-        ]
+            if isinstance(plugin_dir, Path):
+                manifest = _read_manifest(plugin_dir)
+                if "config_schema" in manifest:
+                    descriptor = load_plugin_configuration(
+                        plugin_dir, manifest.get("config_schema")
+                    )
+                    if descriptor is not None:
+                        item["configuration"] = project_plugin_configuration(
+                            descriptor
+                        )
+            payload.append(item)
         print(json.dumps(payload, indent=2))
         return
 

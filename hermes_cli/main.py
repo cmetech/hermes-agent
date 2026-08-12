@@ -11268,6 +11268,10 @@ def cmd_tools(args):
         from hermes_cli.tools_config import run_post_setup_command
 
         sys.exit(run_post_setup_command(args))
+    elif action in {"configure", "status", "auth", "enroll"}:
+        from hermes_cli.tools_config import plugin_configuration_command
+
+        sys.exit(plugin_configuration_command(args))
     else:
         _require_tty("tools")
         from hermes_cli.tools_config import tools_command

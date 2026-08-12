@@ -73,6 +73,41 @@ def build_tools_parser(subparsers, *, cmd_tools: Callable) -> None:
         help="Platform to apply to (default: cli)",
     )
 
+    for action, help_text in (
+        ("configure", "Configure a descriptor-backed plugin"),
+        ("status", "Show backend-authored plugin readiness"),
+        ("auth", "Run a plugin authentication setup action"),
+        ("enroll", "Run a plugin enrollment setup action"),
+    ):
+        action_parser = tools_sub.add_parser(action, help=help_text)
+        action_parser.add_argument("plugin_id", metavar="PLUGIN_ID")
+        action_parser.add_argument(
+            "--platform", default="cli", help="Readiness platform (default: cli)"
+        )
+        if action == "configure":
+            action_parser.add_argument(
+                "--set",
+                dest="settings",
+                action="append",
+                default=[],
+                metavar="FIELD=VALUE",
+            )
+            action_parser.add_argument(
+                "--secret",
+                dest="secrets",
+                action="append",
+                default=[],
+                metavar="FIELD",
+                help="Prompt securely for a write-only secret field",
+            )
+            action_parser.add_argument(
+                "--clear-secret",
+                dest="clear_secrets",
+                action="append",
+                default=[],
+                metavar="FIELD",
+            )
+
     # hermes tools post-setup <key>
     tools_postsetup_p = tools_sub.add_parser(
         "post-setup",

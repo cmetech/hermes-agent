@@ -74,6 +74,106 @@ provides_hooks:
 
 This tells Hermes: "I'm a plugin called calculator, I provide tools and hooks." The `provides_tools` and `provides_hooks` fields are lists of what the plugin registers.
 
+### Optional static configuration descriptor
+
+A plugin that needs settings can reference an inert JSON descriptor from its
+manifest:
+
+```yaml
+name: calculator
+kind: standalone
+config_schema: config.schema.json
+```
+
+Hermes reads this file during discovery, including while the plugin is
+disabled. It does not import the plugin to do so. The descriptor path must name
+a regular, non-symlink file below the plugin directory. Invalid, oversized, or
+unsafe descriptors are ignored; the plugin remains discoverable.
+
+`config.schema.json` uses the bounded version 1 contract:
+
+```json
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "service_url",
+      "label": "Service URL",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "https://service.example.com",
+      "validation": {"format": "url", "max_length": 2048},
+      "readiness": true
+    },
+    {
+      "id": "access_token",
+      "label": "Access token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "documentation_url": "https://service.example.com/tokens",
+      "validation": {"min_length": 8},
+      "readiness": true
+    }
+  ],
+  "setup_actions": [
+    {
+      "id": "create-token",
+      "label": "Create an access token",
+      "interactive": true,
+      "documentation_url": "https://service.example.com/tokens"
+    }
+  ]
+}
+```
+
+Field `type` is one of `string`, `integer`, `number`, or `boolean`; `storage`
+is `setting` or `secret`. Optional field metadata includes `help`,
+`documentation_url`, `advanced`, `platforms`, and a `visible_when` predicate of
+the form `{"field": "other_id", "equals": <scalar>}`. Validation supports
+type-appropriate `min_length`, `max_length`, `pattern`, `enum`, `minimum`,
+`maximum`, and `format` (`url` or `path`). Defaults must match all declared
+validation and are forbidden for secrets. Version 1 `pattern` is deliberately
+fixed-width: it supports optional outer `^`/`$` anchors, literals,
+single-character escapes/categories, `.`, and character classes. Repetition,
+grouping, alternation, lookaround, and backreferences are rejected so matching
+remains bounded.
+
+Setup actions are display metadata only: `id`, `label`, optional `help`,
+`interactive`, and `documentation_url`. Descriptors cannot declare commands,
+scripts, modules, callbacks, or other executable behavior. Plugin identity and
+activation remain in `plugin.yaml`; do not duplicate the plugin id or `kind` in
+the descriptor. Labels and help text cannot contain terminal or Unicode format
+controls, and `documentation_url` must be an HTTP or HTTPS URL with an
+authority/host.
+
+Enabled plugin code reads its own validated values lazily through the context:
+
+```python
+def register(ctx):
+    def read_service(args, **kwargs):
+        configuration = ctx.configuration()  # resolve for this invocation
+        service_url = configuration.setting("service_url")
+        access_token = configuration.secret("access_token")
+        return call_service(service_url, access_token, args)
+
+    ctx.register_tool(
+        name="read_service",
+        toolset="service",
+        schema=READ_SERVICE_SCHEMA,
+        handler=read_service,
+    )
+```
+
+`ctx.configuration()` returns an opaque, immutable accessor for only the fields
+in that plugin's descriptor. It does not expose an inspectable settings or
+secrets mapping. It resolves the current profile each time and fails closed for
+a stale plugin generation, disabled plugin, invalid stored value, missing value,
+unknown field, or wrong storage-class lookup. Do not call it at import time or
+cache the accessor or any returned credential across invocations. Never log,
+return, or include secret values in exceptions or tool results.
+
 Optional fields you could add:
 ```yaml
 author: Your Name
@@ -234,6 +334,33 @@ def unit_convert(args: dict, **kwargs) -> str:
 2. **Return:** Always a JSON string. Success and errors alike.
 3. **Never raise:** Catch all exceptions, return error JSON instead.
 4. **Accept `**kwargs`:** Hermes may pass additional context in the future.
+
+### Require host approval inside a plugin tool
+
+A `pre_tool_call` hook can return `{"action": "approve", ...}` to route the
+current invocation through Hermes' existing approval policy. When that gate
+actually permits execution, a tool registered through `ctx.register_tool()`
+receives an immutable `tool_admission` keyword argument:
+
+```python
+def mutate_remote(args: dict, *, tool_admission=None, **kwargs) -> str:
+    if not (
+        tool_admission
+        and tool_admission.approved is True
+        and tool_admission.policy == "plugin_approve"
+        and tool_admission.tool_name == "mutate_remote"
+    ):
+        return json.dumps({"error": "Host approval is required"})
+    return perform_mutation(args)
+```
+
+The value is minted for one effective call only. It includes `tool_call_id`,
+`turn_id`, and `arguments_sha256`, a SHA-256 digest of the final canonical JSON
+arguments after middleware rewrites. It contains no prompt, credential, or
+approval prose. A denied, timed-out, unavailable, or failed gate blocks before
+the handler runs; a call with no `approve` directive runs without this keyword.
+Do not accept approval from `args`, synthesize the object, or retain it for a
+later call.
 
 ## Step 5: Write the registration
 

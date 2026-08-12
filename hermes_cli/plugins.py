@@ -34,9 +34,11 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import math
 import os
@@ -53,6 +55,13 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_configuration import (
+    PluginConfigurationDescriptor,
+    PluginRuntimeConfiguration,
+    _runtime_configuration_for_context,
+    load_plugin_configuration,
+    project_plugin_configuration,
+)
 from hermes_cli.plugin_services import (
     BACKGROUND_SERVICE_NAME_PATTERN,
     BackgroundServiceFactory,
@@ -86,6 +95,31 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class PluginStaticInventoryCapacityError(RuntimeError):
+    """Raised when a bounded static manifest scan exhausts its visit budget."""
+
+
+@dataclass
+class _PluginStaticInventoryVisitBudget:
+    maximum: int
+    visited: int = 0
+
+    def visit(self) -> None:
+        if self.visited >= self.maximum:
+            raise PluginStaticInventoryCapacityError(
+                "static plugin inventory visit capacity exceeded"
+            )
+        self.visited += 1
+
+    def sorted_children(self, path: Path) -> list[Path]:
+        """Collect at most ``maximum`` entries across the complete scan."""
+        children: list[Path] = []
+        for child in path.iterdir():
+            self.visit()
+            children.append(child)
+        return sorted(children)
 
 
 logger = logging.getLogger(__name__)
@@ -324,6 +358,9 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Credential-free, statically parsed metadata. Plugin code is not imported
+    # to populate this field, so disabled plugins remain safe to inspect.
+    configuration: Optional[PluginConfigurationDescriptor] = None
 
 
 @dataclass
@@ -430,6 +467,16 @@ class PluginContext:
         except Exception:
             return "default"
 
+    def configuration(self) -> PluginRuntimeConfiguration:
+        """Resolve this plugin's validated values for the active profile.
+
+        Resolution is intentionally lazy: handlers should call this method for
+        each invocation rather than retaining credentials across calls or
+        profile generations.
+        """
+
+        return _runtime_configuration_for_context(self.manifest, self._manager)
+
     # -- host-owned background services ------------------------------------
 
     def register_background_service(
@@ -445,6 +492,27 @@ class PluginContext:
             name=name,
             factory=factory,
             hosts=hosts,
+        )
+
+    # -- host-owned setup actions ------------------------------------------
+
+    def register_setup_action(
+        self,
+        name: str,
+        handler: Callable,
+        *,
+        readiness: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> None:
+        """Register a descriptor-declared action while this plugin imports.
+
+        Actions are invoked only through the host configuration service. They
+        are deliberately separate from the model tool registry.
+        """
+        self._manager._register_setup_action(
+            plugin=self.manifest.key or self.manifest.name,
+            name=name,
+            handler=handler,
+            readiness=readiness,
         )
 
     # -- tool registration --------------------------------------------------
@@ -499,6 +567,7 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            _plugin_context=self,
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
@@ -1371,6 +1440,9 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         self._background_services: Dict[str, BackgroundServiceRegistration] = {}
+        self._setup_actions: Dict[str, Dict[str, dict[str, Any]]] = {}
+        self._discovery_profile_id: str | None = None
+        self._registering_plugin_id: str | None = None
         self._background_service_hosts: Dict[
             BackgroundServiceHostKind, BackgroundServiceHost
         ] = {}
@@ -1412,6 +1484,7 @@ class PluginManager:
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
                 self._discovered = True
+                self._discovery_profile_id = str(get_hermes_home().resolve())
                 return
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -1422,9 +1495,86 @@ class PluginManager:
         self._discovered = True
         try:
             self._discover_and_load_inner()
+            self._discovery_profile_id = str(get_hermes_home().resolve())
         except BaseException:
             self._discovered = False
+            self._discovery_profile_id = None
             raise
+
+    def static_plugin_inventory(
+        self, *, max_visits: int | None = None
+    ) -> List[PluginManifest]:
+        """Return the active profile's manifests without importing plugin code.
+
+        Filesystem manifests preserve runtime discovery precedence: bundled,
+        user, project, then entry-point sources, with later keys winning.
+        Python entry points expose no static configuration descriptor in their
+        metadata, so they remain descriptor-free here rather than importing
+        their target merely to inspect it. ``max_visits`` optionally bounds
+        filesystem entries across all roots and category recursion before any
+        directory breadth is sorted or manifests are parsed, then applies the
+        same budget to entry-point records. The default keeps runtime discovery
+        behavior unchanged.
+        """
+        if max_visits is not None and (type(max_visits) is not int or max_visits <= 0):
+            raise ValueError("max_visits must be a positive integer")
+        visit_budget = (
+            None
+            if max_visits is None
+            else _PluginStaticInventoryVisitBudget(maximum=max_visits)
+        )
+        manifests: List[PluginManifest] = []
+        repo_plugins = get_bundled_plugins_dir()
+        manifests.extend(
+            self._scan_directory(
+                repo_plugins,
+                source="bundled",
+                skip_names={"memory", "context_engine", "platforms", "model-providers"},
+                _visit_budget=visit_budget,
+            )
+        )
+        manifests.extend(
+            self._scan_directory(
+                repo_plugins / "platforms",
+                source="bundled",
+                _visit_budget=visit_budget,
+            )
+        )
+        manifests.extend(
+            self._scan_directory(
+                get_hermes_home() / "plugins",
+                source="user",
+                _visit_budget=visit_budget,
+            )
+        )
+        if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+            manifests.extend(
+                self._scan_directory(
+                    Path.cwd() / ".hermes" / "plugins",
+                    source="project",
+                    _visit_budget=visit_budget,
+                )
+            )
+        manifests.extend(
+            self._scan_entry_points()
+            if visit_budget is None
+            else self._scan_entry_points(_visit_budget=visit_budget)
+        )
+
+        winners: Dict[str, PluginManifest] = {}
+        for manifest in manifests:
+            winners[manifest.key or manifest.name] = manifest
+        return list(winners.values())
+
+    def loaded_plugins(self) -> List[LoadedPlugin]:
+        """Return a snapshot of this manager's runtime plugin registry."""
+        return list(self._plugins.values())
+
+    def setup_action_registrations(self, plugin_id: str) -> Dict[str, dict[str, Any]]:
+        """Return callbacks only for the profile that registered them."""
+        if self._discovery_profile_id != str(get_hermes_home().resolve()):
+            return {}
+        return dict(self._setup_actions.get(plugin_id, {}))
 
     def _clear_plugin_registries(self) -> None:
         self._plugins.clear()
@@ -1440,6 +1590,9 @@ class PluginManager:
         self._aux_tasks.clear()
         self._slack_action_handlers.clear()
         self._background_services.clear()
+        self._setup_actions.clear()
+        self._discovery_profile_id = None
+        self._registering_plugin_id = None
         self._context_engine = None
 
     def _register_background_service(
@@ -1482,6 +1635,35 @@ class PluginManager:
                 hosts=host_set,
             )
 
+    def _register_setup_action(
+        self,
+        *,
+        plugin: str,
+        name: str,
+        handler: Callable,
+        readiness: Callable[[Mapping[str, Any]], bool] | None,
+    ) -> None:
+        if self._registering_plugin_id != plugin:
+            raise RuntimeError("setup actions may register only during plugin import")
+        loaded_manifest = None
+        # The manifest being imported is not in _plugins until registration
+        # completes, so _load_plugin records it transiently for this check.
+        manifest = getattr(self, "_registering_manifest", None)
+        if manifest is not None and (manifest.key or manifest.name) == plugin:
+            loaded_manifest = manifest
+        descriptor = getattr(loaded_manifest, "configuration", None)
+        declared = {action.id for action in descriptor.setup_actions} if descriptor else set()
+        if name not in declared:
+            raise ValueError(f"undeclared setup action: {name}")
+        if not callable(handler):
+            raise TypeError("setup action handler must be callable")
+        if readiness is not None and not callable(readiness):
+            raise TypeError("setup action readiness must be callable")
+        actions = self._setup_actions.setdefault(plugin, {})
+        if name in actions:
+            raise ValueError(f"duplicate setup action registration: {plugin}:{name}")
+        actions[name] = {"handler": handler, "readiness": readiness}
+
     def _background_host_quiescent(self, host: BackgroundServiceHost) -> None:
         with self._background_service_lock:
             if self._background_service_hosts.get(host.host_kind) is host:
@@ -1507,6 +1689,7 @@ class PluginManager:
         *,
         shutdown_timeout: float,
         delivery_port=None,
+        factory_start_event: threading.Event | None = None,
     ) -> BackgroundServiceHost:
         self._background_service_generation += 1
         host = BackgroundServiceHost(
@@ -1518,6 +1701,7 @@ class PluginManager:
             safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
             delivery_port=delivery_port,
             on_quiescent=self._background_host_quiescent,
+            factory_start_event=factory_start_event,
         )
         self._background_service_hosts[host_kind] = host
         return host
@@ -1593,6 +1777,8 @@ class PluginManager:
 
         replacements: tuple[BackgroundServiceHost, ...] = ()
         registries_cleared = False
+        discovery_profile_id = str(get_hermes_home().resolve())
+        factory_start_event = threading.Event()
         try:
             deadline = time.monotonic() + timeout
             for host in old_hosts:
@@ -1617,77 +1803,37 @@ class PluginManager:
                         host_kind,
                         shutdown_timeout=shutdown_timeout,
                         delivery_port=delivery_port,
+                        factory_start_event=factory_start_event,
                     )
                     for host_kind, shutdown_timeout, delivery_port in host_specs
                 )
+            for replacement in replacements:
+                replacement.start()
+            with self._background_service_lock:
+                self._discovery_profile_id = discovery_profile_id
+                factory_start_event.set()
         except BaseException:
             if registries_cleared:
-                self._discovered = False
+                with self._background_service_lock:
+                    self._discovered = False
+                    self._discovery_profile_id = None
+            for replacement in replacements:
+                replacement.request_stop()
+            factory_start_event.set()
+            cleanup_deadline = time.monotonic() + timeout
+            for replacement in replacements:
+                replacement.await_stopped(deadline=cleanup_deadline)
             raise
         finally:
             with self._background_service_lock:
                 self._background_reload_in_progress = False
                 self._background_reload_thread_id = None
                 self._background_reload_condition.notify_all()
-        for replacement in replacements:
-            replacement.start()
         return replacements
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
-        manifests: List[PluginManifest] = []
-
-        # 1. Bundled plugins (<repo>/plugins/<name>/)
-        #
-        # Repo-shipped plugins live next to hermes_cli/. Two layouts are
-        # supported (see ``_scan_directory`` for details):
-        #
-        #   - flat: ``plugins/disk-cleanup/plugin.yaml`` (standalone)
-        #   - category: ``plugins/image_gen/openai/plugin.yaml`` (backend)
-        #
-        # ``memory/``, ``context_engine/``, and ``model-providers/`` are
-        # skipped at the top level — they have their own discovery systems
-        # (plugins/memory/__init__.py, providers/__init__.py). ``platforms/``
-        # is a category holding platform adapters (scanned one level deeper
-        # below).
-        repo_plugins = get_bundled_plugins_dir()
-        logger.debug("Scanning bundled plugins: %s", repo_plugins)
-        bundled = self._scan_directory(
-            repo_plugins,
-            source="bundled",
-            skip_names={"memory", "context_engine", "platforms", "model-providers"},
-        )
-        logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
-        manifests.extend(bundled)
-        bundled_platforms = self._scan_directory(
-            repo_plugins / "platforms", source="bundled"
-        )
-        logger.debug("  bundled/platforms: %d manifest(s)", len(bundled_platforms))
-        manifests.extend(bundled_platforms)
-
-        # 2. User plugins (~/.hermes/plugins/)
-        user_dir = get_hermes_home() / "plugins"
-        logger.debug("Scanning user plugins: %s", user_dir)
-        user_manifests = self._scan_directory(user_dir, source="user")
-        logger.debug("  user: %d manifest(s)", len(user_manifests))
-        manifests.extend(user_manifests)
-
-        # 3. Project plugins (./.hermes/plugins/)
-        if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
-            project_dir = Path.cwd() / ".hermes" / "plugins"
-            logger.debug("Scanning project plugins: %s", project_dir)
-            project_manifests = self._scan_directory(project_dir, source="project")
-            logger.debug("  project: %d manifest(s)", len(project_manifests))
-            manifests.extend(project_manifests)
-        else:
-            logger.debug(
-                "Project plugins disabled (set HERMES_ENABLE_PROJECT_PLUGINS=1 to enable)"
-            )
-
-        # 4. Pip / entry-point plugins
-        ep_manifests = self._scan_entry_points()
-        logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
-        manifests.extend(ep_manifests)
+        manifests = self.static_plugin_inventory()
 
         # Load each manifest (skip user-disabled plugins).
         # Later sources override earlier ones on key collision — user
@@ -1698,10 +1844,7 @@ class PluginManager:
         # don't collide even when both manifests say ``name: openai``.
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
-        winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
-        for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
             # Explicit disable always wins (matches on key or on legacy
@@ -1803,6 +1946,8 @@ class PluginManager:
         path: Path,
         source: str,
         skip_names: Optional[Set[str]] = None,
+        *,
+        _visit_budget: _PluginStaticInventoryVisitBudget | None = None,
     ) -> List[PluginManifest]:
         """Read ``plugin.yaml`` manifests from subdirectories of *path*.
 
@@ -1820,7 +1965,12 @@ class PluginManager:
         pass it now that categories are first-class).
         """
         return self._scan_directory_level(
-            path, source, skip_names=skip_names, prefix="", depth=0
+            path,
+            source,
+            skip_names=skip_names,
+            prefix="",
+            depth=0,
+            visit_budget=_visit_budget,
         )
 
     def _scan_directory_level(
@@ -1831,6 +1981,7 @@ class PluginManager:
         skip_names: Optional[Set[str]],
         prefix: str,
         depth: int,
+        visit_budget: _PluginStaticInventoryVisitBudget | None,
     ) -> List[PluginManifest]:
         """Recursive implementation of :meth:`_scan_directory`.
 
@@ -1842,7 +1993,12 @@ class PluginManager:
         if not path.is_dir():
             return manifests
 
-        for child in sorted(path.iterdir()):
+        children = (
+            sorted(path.iterdir())
+            if visit_budget is None
+            else visit_budget.sorted_children(path)
+        )
+        for child in children:
             if not child.is_dir():
                 continue
             if depth == 0 and skip_names and child.name in skip_names:
@@ -1852,9 +2008,7 @@ class PluginManager:
                 manifest_file = child / "plugin.yml"
 
             if manifest_file.exists():
-                manifest = self._parse_manifest(
-                    manifest_file, child, source, prefix
-                )
+                manifest = self._parse_manifest(manifest_file, child, source, prefix)
                 if manifest is not None:
                     manifests.append(manifest)
                 continue
@@ -1874,6 +2028,7 @@ class PluginManager:
                     skip_names=None,
                     prefix=sub_prefix,
                     depth=depth + 1,
+                    visit_budget=visit_budget,
                 )
             )
 
@@ -1951,6 +2106,11 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            configuration = None
+            if "config_schema" in data:
+                configuration = load_plugin_configuration(
+                    plugin_dir, data.get("config_schema")
+                )
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1963,6 +2123,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                configuration=configuration,
             )
         except Exception as exc:
             logger.warning(
@@ -1974,18 +2135,42 @@ class PluginManager:
     # Entry-point scanning
     # -----------------------------------------------------------------------
 
-    def _scan_entry_points(self) -> List[PluginManifest]:
+    def _scan_entry_points(
+        self,
+        *,
+        _visit_budget: _PluginStaticInventoryVisitBudget | None = None,
+    ) -> List[PluginManifest]:
         """Check ``importlib.metadata`` for pip-installed plugins."""
         manifests: List[PluginManifest] = []
         try:
             eps = importlib.metadata.entry_points()
             # Python 3.12+ returns a SelectableGroups; earlier returns dict
-            if hasattr(eps, "select"):
-                group_eps = eps.select(group=ENTRY_POINTS_GROUP)
-            elif isinstance(eps, dict):
-                group_eps = eps.get(ENTRY_POINTS_GROUP, [])
+            if _visit_budget is None:
+                if hasattr(eps, "select"):
+                    group_eps = eps.select(group=ENTRY_POINTS_GROUP)
+                elif isinstance(eps, dict):
+                    group_eps = eps.get(ENTRY_POINTS_GROUP, [])
+                else:
+                    group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+            elif isinstance(eps, Mapping):
+
+                def matching_mapping_entry_points():
+                    for group, entry_points in eps.items():
+                        for ep in entry_points:
+                            _visit_budget.visit()
+                            if group == ENTRY_POINTS_GROUP:
+                                yield ep
+
+                group_eps = matching_mapping_entry_points()
             else:
-                group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+
+                def matching_entry_points():
+                    for ep in eps:
+                        _visit_budget.visit()
+                        if ep.group == ENTRY_POINTS_GROUP:
+                            yield ep
+
+                group_eps = matching_entry_points()
 
             for ep in group_eps:
                 manifest = PluginManifest(
@@ -1995,6 +2180,8 @@ class PluginManager:
                     key=ep.name,
                 )
                 manifests.append(manifest)
+        except PluginStaticInventoryCapacityError:
+            raise
         except Exception as exc:
             logger.debug("Entry-point scan failed: %s", exc)
 
@@ -2110,7 +2297,13 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
-                register_fn(ctx)
+                self._registering_plugin_id = _plugin_id
+                self._registering_manifest = manifest
+                try:
+                    register_fn(ctx)
+                finally:
+                    self._registering_plugin_id = None
+                    self._registering_manifest = None
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
@@ -2152,6 +2345,7 @@ class PluginManager:
                     set(self._background_services) - _services_before
                 ):
                     self._background_services.pop(qualified_name, None)
+            self._setup_actions.pop(_plugin_id, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -2362,25 +2556,26 @@ class PluginManager:
         """Return a list of info dicts for all discovered plugins."""
         result: List[Dict[str, Any]] = []
         for key, loaded in sorted(self._plugins.items()):
-            result.append(
-                {
-                    "name": loaded.manifest.name,
-                    "key": loaded.manifest.key or loaded.manifest.name,
-                    "kind": loaded.manifest.kind,
-                    "version": loaded.manifest.version,
-                    "description": loaded.manifest.description,
-                    "source": loaded.manifest.source,
-                    "enabled": loaded.enabled,
-                    "tools": len(loaded.tools_registered),
-                    "hooks": len(loaded.hooks_registered),
-                    "middleware": len(loaded.middleware_registered),
-                    "commands": len(loaded.commands_registered),
-                    "background_services": len(
-                        loaded.background_services_registered
-                    ),
-                    "error": loaded.error,
-                }
-            )
+            item = {
+                "name": loaded.manifest.name,
+                "key": loaded.manifest.key or loaded.manifest.name,
+                "kind": loaded.manifest.kind,
+                "version": loaded.manifest.version,
+                "description": loaded.manifest.description,
+                "source": loaded.manifest.source,
+                "enabled": loaded.enabled,
+                "tools": len(loaded.tools_registered),
+                "hooks": len(loaded.hooks_registered),
+                "middleware": len(loaded.middleware_registered),
+                "commands": len(loaded.commands_registered),
+                "background_services": len(loaded.background_services_registered),
+                "error": loaded.error,
+            }
+            if loaded.manifest.configuration is not None:
+                item["configuration"] = project_plugin_configuration(
+                    loaded.manifest.configuration
+                )
+            result.append(item)
         return result
 
     # -----------------------------------------------------------------------
@@ -2461,6 +2656,135 @@ def has_hook(hook_name: str) -> bool:
 
 
 _thread_tool_whitelist = threading.local()
+
+
+_PLUGIN_ADMISSION_MINT_KEY = object()
+
+
+def _canonical_tool_arguments_sha256(args: Mapping[str, Any]) -> Optional[str]:
+    """Return the stable digest used to bind an admission to final arguments."""
+    try:
+        encoded = json.dumps(
+            dict(args),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class PluginToolAdmission:
+    """Immutable, credential-free proof of a host-approved plugin tool call.
+
+    Instances are minted by Hermes only after a plugin ``approve`` directive
+    succeeds at the host approval gate. The registration identity and claim
+    state remain private; the public view is safe to log and hand to the
+    registered plugin handler.
+    """
+
+    __slots__ = (
+        "approved",
+        "policy",
+        "tool_name",
+        "tool_call_id",
+        "turn_id",
+        "arguments_sha256",
+        "_claim_once",
+    )
+
+    def __init__(
+        self,
+        *,
+        approved: bool,
+        policy: str,
+        tool_name: str,
+        tool_call_id: str,
+        turn_id: str,
+        arguments_sha256: str,
+        registration_token: object,
+        _mint_key: object,
+    ) -> None:
+        if _mint_key is not _PLUGIN_ADMISSION_MINT_KEY:
+            raise TypeError("PluginToolAdmission instances are minted by Hermes")
+        claim_lock = threading.Lock()
+        claimed = False
+
+        def claim_once(
+            *,
+            claimed_tool_name: str,
+            claimed_arguments_sha256: str,
+            claimed_tool_call_id: str,
+            claimed_turn_id: str,
+            claimed_registration_token: object,
+        ) -> bool:
+            nonlocal claimed
+            if (
+                claimed_tool_name != tool_name
+                or claimed_arguments_sha256 != arguments_sha256
+                or claimed_tool_call_id != tool_call_id
+                or claimed_turn_id != turn_id
+                or claimed_registration_token is not registration_token
+            ):
+                return False
+            with claim_lock:
+                if claimed:
+                    return False
+                claimed = True
+                return True
+
+        object.__setattr__(self, "approved", approved)
+        object.__setattr__(self, "policy", policy)
+        object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "turn_id", turn_id)
+        object.__setattr__(self, "arguments_sha256", arguments_sha256)
+        object.__setattr__(self, "_claim_once", claim_once)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("PluginToolAdmission is immutable")
+
+    def __repr__(self) -> str:
+        return (
+            "PluginToolAdmission("
+            f"approved={self.approved!r}, policy={self.policy!r}, "
+            f"tool_name={self.tool_name!r}, tool_call_id={self.tool_call_id!r}, "
+            f"turn_id={self.turn_id!r}, arguments_sha256={self.arguments_sha256!r})"
+        )
+
+
+@dataclass(frozen=True)
+class PreToolAdmissionDecision:
+    """Resolved host decision for one final effective tool invocation."""
+
+    block_message: Optional[str] = None
+    admission: Optional[PluginToolAdmission] = None
+
+
+def _claim_plugin_tool_admission(
+    admission: object,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any],
+    tool_call_id: str,
+    turn_id: str,
+    registration_token: object,
+) -> bool:
+    """Claim a genuine admission once for its exact registered handler."""
+    if type(admission) is not PluginToolAdmission:
+        return False
+    arguments_sha256 = _canonical_tool_arguments_sha256(args)
+    if arguments_sha256 is None:
+        return False
+    return admission._claim_once(
+        claimed_tool_name=tool_name,
+        claimed_arguments_sha256=arguments_sha256,
+        claimed_tool_call_id=tool_call_id,
+        claimed_turn_id=turn_id,
+        claimed_registration_token=registration_token,
+    )
 
 
 @dataclass(frozen=True)
@@ -2611,7 +2935,7 @@ def get_pre_tool_call_block_message(
     return message if directive == "block" else None
 
 
-def resolve_pre_tool_block(
+def resolve_pre_tool_admission(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2620,8 +2944,8 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
+) -> PreToolAdmissionDecision:
+    """Resolve policy and mint an identity-bound admission when appropriate.
 
     Single entry point for every tool-dispatch site: fetches the plugin
     directive and, for an ``approve`` escalation, invokes the human-approval
@@ -2635,13 +2959,32 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
+    normalized_args = args if isinstance(args, dict) else {}
+    registration_token = None
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+        if entry is not None and entry.plugin_owner:
+            registration_token = entry._plugin_registration_token
+    except Exception:
+        registration_token = None
+
+    # The public admission is a handler kwarg, never model/caller JSON.
+    if registration_token is not None and "tool_admission" in normalized_args:
+        return PreToolAdmissionDecision(
+            block_message=(
+                f"BLOCKED: caller-supplied tool admission for {tool_name} is not valid"
+            )
+        )
+
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
     if details.action == "block":
-        return details.message
+        return PreToolAdmissionDecision(block_message=details.message)
     if details.action == "approve":
         try:
             from tools.approval import (
@@ -2673,13 +3016,73 @@ def resolve_pre_tool_block(
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
+            return PreToolAdmissionDecision(
+                block_message=f"BLOCKED: plugin approval gate failed for {tool_name}"
             )
-    return None
+        gate_failure = PreToolAdmissionDecision(
+            block_message=f"BLOCKED: plugin approval gate failed for {tool_name}"
+        )
+        if not isinstance(result, Mapping):
+            return gate_failure
+        try:
+            approved = result.get("approved")
+            message = result.get("message")
+        except Exception:
+            return gate_failure
+        if approved is not True and approved is not False:
+            return gate_failure
+        if message is not None and not isinstance(message, str):
+            return gate_failure
+        if approved is False:
+            return PreToolAdmissionDecision(
+                block_message=(
+                    message or f"BLOCKED: plugin approval required for {tool_name}"
+                )
+            )
+        if registration_token is not None:
+            arguments_sha256 = _canonical_tool_arguments_sha256(normalized_args)
+            if arguments_sha256 is None:
+                return PreToolAdmissionDecision(
+                    block_message=(
+                        f"BLOCKED: tool arguments cannot be bound for {tool_name}"
+                    )
+                )
+            return PreToolAdmissionDecision(
+                admission=PluginToolAdmission(
+                    approved=True,
+                    policy="plugin_approve",
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    arguments_sha256=arguments_sha256,
+                    registration_token=registration_token,
+                    _mint_key=_PLUGIN_ADMISSION_MINT_KEY,
+                )
+            )
+    return PreToolAdmissionDecision()
+
+
+def resolve_pre_tool_block(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Backward-compatible block-only view of the structured decision."""
+    return resolve_pre_tool_admission(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
+    ).block_message
 
 
 def get_pre_verify_continue_message(

@@ -461,6 +461,10 @@ Archon v3 and v4 use the closed `$ID.output(.path)*` grammar. The producer must 
 direct dependency. Whole schemaless output remains text; field traversal
 requires structured output. Conditions compare typed scalar values with
 `==`, `!=`, `<`, `<=`, `>`, and `>=`, joined by bounded `&&` and `||`.
+For `==` and `!=`, the right operand may instead be another direct-dependency
+output reference. Both resolved values must be canonical JSON scalars of the
+same exact type; integers, floats, and booleans are distinct, and ordered
+comparisons between two output references are rejected during validation.
 Structured strings never become numbers implicitly, and a missing or invalid
 operand fails before an executor attempt instead of becoming false.
 

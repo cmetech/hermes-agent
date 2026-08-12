@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
+
+from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
 def _make_task(kb, *, assignee: str):
@@ -161,3 +164,55 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_resolves_gitlab_from_the_executing_profile(
+    monkeypatch, tmp_path
+):
+    """The dispatcher's ambient profile must not replace the worker profile."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import plugins as plugins_module
+    from tools.registry import registry
+
+    source = resolve_ericsson_connector_source()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    (profile / "plugins").mkdir(parents=True)
+    shutil.copytree(source.plugin, profile / "plugins" / "ericsson-gitlab")
+    root.joinpath("config.yaml").write_text(
+        "plugins:\n  enabled: []\n  disabled: [ericsson-gitlab]\n",
+        encoding="utf-8",
+    )
+    profile.joinpath("config.yaml").write_text(
+        "plugins:\n  enabled: [ericsson-gitlab]\n  disabled: []\n"
+        "platform_toolsets:\n  cli: [skills]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        plugins_module.PluginManager, "_scan_entry_points", lambda self: []
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 4343
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace)) == 4343
+
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert captured["env"]["HERMES_HOME"] == str(profile)
+    assert "ericsson-gitlab" in pinned
+
+    for name in tuple(registry.get_all_tool_names()):
+        if name.startswith("gitlab_"):
+            registry.deregister(name)

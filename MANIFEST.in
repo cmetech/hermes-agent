@@ -3,6 +3,10 @@ graft optional-skills
 graft optional-mcps
 graft locales
 graft capabilities
+# Preserve complete bundled plugin source assets in sdists. Wheels use the
+# plugins package-data rules; this generic graft covers static descriptors and
+# nested plugin-owned skill references without plugin-specific exceptions.
+graft plugins
 # Bundled plugin manifests (plugin.yaml / plugin.yml). Without these the
 # PluginManager scan (hermes_cli/plugins.py) finds zero plugins on installs
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data
@@ -12,4 +16,6 @@ recursive-include plugins/workflow/showcases *
 # Gateway assets include images plus YAML catalogs such as status_phrases.yaml.
 recursive-include gateway/assets *
 global-exclude __pycache__
-global-exclude *.py[cod]
+global-exclude .pytest_cache .pytest-cache .ruff_cache
+global-exclude */__pycache__/* */.pytest_cache/* */.pytest-cache/* */.ruff_cache/*
+global-exclude *.pyc *.pyo
