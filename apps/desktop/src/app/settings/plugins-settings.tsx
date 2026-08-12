@@ -11,6 +11,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Package } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
+import { PluginToolsetConfigPanel } from './plugin-toolset-config-panel'
 import { EmptyState, ListRow, Pill, SectionHeading, SettingsContent } from './primitives'
 
 const KIND_ORDER: Record<PluginRecord['kind'], number> = { disk: 0, runtime: 1, bundled: 2 }
@@ -127,6 +128,8 @@ export function PluginsSettings() {
           ))}
         </div>
       )}
+
+      <PluginToolsetConfigPanel />
     </SettingsContent>
   )
 }

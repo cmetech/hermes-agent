@@ -1157,6 +1157,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    _tool_admission: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1296,6 +1297,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                _tool_admission=_tool_admission,
             )
 
     _tool_original_args = dict(function_args)
@@ -1333,91 +1335,6 @@ def handle_function_call(
         # gate denied/timed-out/errored (fail-closed). Observer plugins see
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
-        if not skip_pre_tool_call_hook:
-            block_message: Optional[str] = None
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-            except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
-
-            if block_message is not None:
-                result = tool_error(block_message)
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=result,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return result
-
-        # ACP/Zed edit approval runs before any file mutation.  The requester
-        # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
-        # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
-
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=edit_block_message,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="edit_approval_denied",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                result = tool_error("Edit approval denied: approval guard failed")
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=result,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="edit_approval_error",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return result
-
-        # Notify the read-loop tracker when a non-read/search tool runs,
-        # so the *consecutive* counter resets (reads after other work are fine).
-        if function_name not in _READ_SEARCH_TOOLS:
-            try:
-                from tools.file_tools import notify_other_tool_call
-                notify_other_tool_call(task_id or "default")
-            except Exception:
-                pass  # file_tools may not be loaded yet
-
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
@@ -1439,24 +1356,123 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            _authorization_block: Optional[
+                tuple[Any, Dict[str, Any], str, Optional[str]]
+            ] = None
+
+            def _record_authorization_block(
+                result: Any,
+                final_args: Dict[str, Any],
+                error_type: str,
+                error_message: Optional[str] = None,
+            ) -> Any:
+                nonlocal _authorization_block
+                _authorization_block = (
+                    result,
+                    final_args,
+                    error_type,
+                    error_message,
+                )
+                return result
+
+            def _authorized_registry_dispatch(
+                next_args: Dict[str, Any], dispatch_kwargs: Dict[str, Any]
+            ) -> Any:
+                admission = _tool_admission
+                if not skip_pre_tool_call_hook:
+                    try:
+                        from hermes_cli.plugins import resolve_pre_tool_admission
+
+                        decision = resolve_pre_tool_admission(
+                            function_name,
+                            next_args,
+                            task_id=task_id or "",
+                            session_id=session_id or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id=turn_id or "",
+                            api_request_id=api_request_id or "",
+                            middleware_trace=list(_tool_middleware_trace),
+                        )
+                    except Exception as _hook_err:
+                        logger.debug("pre_tool_call hook error: %s", _hook_err)
+                        decision = None
+                    if decision is not None:
+                        if decision.block_message is not None:
+                            return _record_authorization_block(
+                                tool_error(decision.block_message),
+                                next_args,
+                                "plugin_block",
+                                decision.block_message,
+                            )
+                        admission = decision.admission
+
+                # Preserve the established authorization order: the plugin
+                # pre-hook runs before ACP, and both inspect the same final
+                # post-middleware arguments.
+                try:
+                    from acp_adapter.edit_approval import maybe_require_edit_approval
+
+                    edit_block_message = maybe_require_edit_approval(
+                        function_name, next_args
+                    )
+                    if edit_block_message is not None:
+                        return _record_authorization_block(
+                            edit_block_message,
+                            next_args,
+                            "edit_approval_denied",
+                        )
+                except Exception as _edit_approval_err:
+                    logger.debug(
+                        "ACP edit approval guard error: %s", _edit_approval_err
+                    )
+                    if function_name in {"write_file", "patch"}:
+                        edit_error = tool_error(
+                            "Edit approval denied: approval guard failed"
+                        )
+                        return _record_authorization_block(
+                            edit_error,
+                            next_args,
+                            "edit_approval_error",
+                        )
+                if admission is not None:
+                    dispatch_kwargs["_tool_admission"] = admission
+                # A blocked call never ran, so it must not reset the
+                # consecutive read/search loop tracker.
+                if function_name not in _READ_SEARCH_TOOLS:
+                    try:
+                        from tools.file_tools import notify_other_tool_call
+
+                        notify_other_tool_call(task_id or "default")
+                    except Exception:
+                        pass
+                return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        enabled_tools=sandbox_enabled,
+                    return _authorized_registry_dispatch(
+                        next_args,
+                        dict(
+                            task_id=task_id,
+                            session_id=session_id,
+                            tool_call_id=tool_call_id,
+                            turn_id=turn_id,
+                            enabled_tools=sandbox_enabled,
+                        ),
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
+                    return _authorized_registry_dispatch(
+                        next_args,
+                        dict(
+                            task_id=task_id,
+                            session_id=session_id,
+                            tool_call_id=tool_call_id,
+                            turn_id=turn_id,
+                            user_task=user_task,
+                        ),
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
@@ -1481,6 +1497,29 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+
+        # Authorization blocks are terminal. Emit the observer event once and
+        # return the exact blocked result before normal result transforms.
+        if _authorization_block is not None:
+            blocked_result, blocked_args, block_error_type, block_error_message = (
+                _authorization_block
+            )
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=blocked_args,
+                result=blocked_result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=duration_ms,
+                status="blocked",
+                error_type=block_error_type,
+                error_message=block_error_message,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return blocked_result
 
         _emit_post_tool_call_hook(
             function_name=function_name,

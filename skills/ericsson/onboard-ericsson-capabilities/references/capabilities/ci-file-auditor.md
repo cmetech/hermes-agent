@@ -6,15 +6,15 @@ goals:
   - Audit these GitLab projects for CI policy coverage.
   - Find unsafe CI variables or pipeline practices.
   - Explain what is missing before CI audits can run.
-maturity: planned-not-implemented
+maturity: partially-ported
 recommendation_eligible: false
 source_flows: [docs/flows/ci-file-auditor.md]
 implementation:
   skills: []
-  plugins: []
+  plugins: [plugins/ericsson-gitlab]
   mcp_servers: []
   workflows: []
-  tools: []
+  tools: [gitlab_resolve_project, gitlab_read_file, gitlab_list_pipelines, gitlab_inspect_ci]
 platforms: [macos, linux, windows]
 configuration: []
 reads: [planned project list and read-only GitLab CI pipeline and variable metadata]
@@ -28,8 +28,8 @@ troubleshooting: [GitLab capability absent, included file warning, permission de
 
 ## What it solves
 
-The documented design would inspect GitLab CI evidence and evaluate security,
-engineering-practice, and named-policy coverage. It is not implemented.
+The implemented GitLab reads inspect bounded CI files, pipelines, includes, and
+variable metadata. Multi-project policy scoring and report generation remain deferred.
 
 ## Try saying
 
@@ -37,34 +37,35 @@ engineering-practice, and named-policy coverage. It is not implemented.
 - “Explain the planned CI policy coverage report.”
 - “What is missing before CI File Auditor can run?”
 
-Filters, preview, output format, destination, exclusions, warnings, and rerun behavior
-can be discussed as planned design only; none is currently executable.
+Clarify project filters, ref, output format and destination, exclusions, warnings,
+preview the bounded collection scope, and set safe read-only rerun behavior.
 
 ## Questions
 
-Co-Worker may clarify the informational question but must not solicit credentials or
-project files for a capability that cannot run.
+Clarify whether the user wants current bounded evidence or the deferred named-policy
+report. Credentials belong only in the product configuration surface.
 
 ## Reads and writes
 
-No current component reads or writes this data. A future design would use read-only
-GitLab metadata and local reports, never CI variable values.
+The GitLab plugin performs read-only bounded collection and never returns CI variable
+values. The cross-project findings and policy-coverage artifact writer is not ported.
 
 ## Readiness
 
-`planned-not-implemented`: GitLab tools, bounded collection, validated analysis,
-evidence persistence, workflow, and tests are absent. Do not run readiness probes.
+`partially-ported`: GitLab collection and CI investigation guidance are available;
+the legacy multi-project workflow, policy evaluator, and persisted reports are not.
 
 ## Demonstration
 
-No demonstration is available; do not simulate an audit as successful live output.
+A read-only live inspection can demonstrate the implemented evidence boundary. Do
+not present it as a completed policy audit or proof of deployed security.
 
 ## Artifacts
 
-No artifact is generated. Evidence/findings/policy reports describe the planned
-format only and must not be presented at a destination as actual results.
+Current output is bounded evidence with warning and truncation facts. Findings and
+policy reports remain planned and must not be presented at a destination as actual.
 
 ## Troubleshooting
 
-The blocker is missing implementation, not user configuration. Do not claim a
-penetration test, proof of deployed security, or a safe rerun path.
+Distinguish disabled plugin, configuration, permission, unsupported includes, and
+incomplete evidence from the deferred policy layer. Safe reads may be rerun.

@@ -16,12 +16,14 @@ import {
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getPluginConfigurations,
   getProfiles,
   getSessionMessages,
   getStatus,
   getWorkflowArtifactPreview,
   getWorkflowEvidence,
   getWorkflowRun,
+  isPluginConfigurationRouteMissingError,
   listAllProfileSessions,
   listSessions,
   listSidebarSessions,
@@ -55,12 +57,14 @@ const emptySessionsResponse = {
 
 describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
+  let apiStructured: ReturnType<typeof vi.fn>
   let nativeCancelDownload: ReturnType<typeof vi.fn>
   let nativeDownload: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
     resetSidebarBatchCapability()
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
+    apiStructured = vi.fn().mockResolvedValue({ ok: true, value: [] })
     nativeCancelDownload = vi.fn().mockResolvedValue({ cancelled: true })
     nativeDownload = vi.fn().mockResolvedValue({
       filename: 'diagnostic.json',
@@ -72,6 +76,7 @@ describe('Hermes REST helpers', () => {
       configurable: true,
       value: {
         api,
+        apiStructured,
         cancelWorkflowArtifactDownload: nativeCancelDownload,
         downloadWorkflowArtifact: nativeDownload
       }
@@ -93,6 +98,43 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('recognizes only the older-backend connector catalog route-missing error', async () => {
+    apiStructured.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      body: { detail: 'No such API endpoint: /api/plugin-configurations' }
+    })
+
+    let failure: unknown
+
+    try {
+      await getPluginConfigurations()
+    } catch (error) {
+      failure = error
+    }
+
+    expect(isPluginConfigurationRouteMissingError(failure)).toBe(true)
+    expect(api).not.toHaveBeenCalled()
+    expect(apiStructured).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/plugin-configurations' }))
+  })
+
+  it.each([
+    { body: { detail: { code: 'plugin_not_found', message: 'Plugin configuration was not found.' } }, status: 404 },
+    { body: { detail: 'Internal Server Error' }, status: 500 }
+  ])('does not treat a supported connector API failure as route-missing: $status', async response => {
+    apiStructured.mockResolvedValueOnce({ ok: false, ...response })
+
+    let failure: unknown
+
+    try {
+      await getPluginConfigurations()
+    } catch (error) {
+      failure = error
+    }
+
+    expect(isPluginConfigurationRouteMissingError(failure)).toBe(false)
   })
 
   it('uses a longer timeout for the all-profile session list', async () => {

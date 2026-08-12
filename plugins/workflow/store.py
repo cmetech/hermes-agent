@@ -63,6 +63,7 @@ from plugins.workflow.models import (
     RunExecutionLimits,
     TerminalJournalReserve,
     WorkflowLanguageProfile,
+    WorkflowConnectorCapabilities,
     WorkflowPackage,
 )
 from plugins.workflow.provenance import (
@@ -5665,6 +5666,7 @@ class RunStore:
         execution_limits: RunExecutionLimits | None = None,
         compilation: WorkflowCompilation | None = None,
         provider_authority: "WorkflowProviderAuthority | None" = None,
+        connector_capabilities: object | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
@@ -5734,6 +5736,7 @@ class RunStore:
                     "normalizer-v5 provider authority requires a format-2 compilation"
                 )
             provider_resolution_sha256 = None
+            sealed_connector_capabilities = None
             if phase5:
                 from plugins.workflow.provider_authority import (
                     WorkflowProviderAuthority,
@@ -5757,6 +5760,56 @@ class RunStore:
                 raise InputSnapshotError(
                     "provider authority is forbidden before normalizer v5"
                 )
+            required_services = frozenset(
+                package.definition.options.get("requires", ())
+            )
+            if phase5 and required_services:
+                if connector_capabilities is None:
+                    from hermes_cli.plugin_configuration import (
+                        connector_capability_snapshot,
+                    )
+
+                    connector_capabilities = connector_capability_snapshot()
+                try:
+                    ready_services = frozenset(
+                        connector_capabilities.ready_services
+                    )
+                    available_tools = frozenset(
+                        connector_capabilities.available_tools
+                    )
+                    from plugins.workflow.compat import resolve_tool_name
+
+                    required_tools = frozenset(
+                        resolve_tool_name(tool)
+                        for node in package.definition.nodes
+                        for tool in node.options.get("allowed_tools", ())
+                    )
+                    if (
+                        not required_services.issubset(ready_services)
+                        or not required_tools.issubset(available_tools)
+                    ):
+                        raise InputSnapshotError(
+                            "connector capability changed during workflow admission"
+                        )
+                    scoped_fingerprint = getattr(
+                        connector_capabilities,
+                        "scoped_fingerprint",
+                        None,
+                    )
+                    fingerprint = (
+                        scoped_fingerprint(required_services, required_tools)
+                        if callable(scoped_fingerprint)
+                        else connector_capabilities.fingerprint
+                    )
+                    sealed_connector_capabilities = WorkflowConnectorCapabilities(
+                        required_services=required_services,
+                        required_tools=required_tools,
+                        fingerprint=fingerprint,
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise InputSnapshotError(
+                        "connector capability snapshot is invalid"
+                    ) from exc
             phase3_execution_semantics = None
             if supports_phase3_semantics(
                 package.language.effective_profile, package.language.normalizer_version
@@ -6004,6 +6057,10 @@ class RunStore:
             if phase3_execution_semantics is not None:
                 snapshot_resources["phase3_execution_semantics"] = (
                     phase3_execution_semantics
+                )
+            if sealed_connector_capabilities is not None:
+                snapshot_resources["connector_capabilities"] = (
+                    sealed_connector_capabilities.to_dict()
                 )
             snapshot_manifest = json.dumps(
                 snapshot_resources,
@@ -8048,6 +8105,7 @@ class RunStore:
         error_path: str,
         error_message: str,
         schedule_revalidation: object | None = None,
+        allow_scheduled_running: bool = False,
     ) -> bool:
         """Atomically fail a claim-free run on authenticated package validation."""
         if (
@@ -8056,6 +8114,8 @@ class RunStore:
             or expected_state_version < 1
         ):
             raise ValueError("expected_state_version must be a positive integer")
+        if not isinstance(allow_scheduled_running, bool):
+            raise ValueError("allow_scheduled_running must be a boolean")
         bounded = (
             ("error_code", error_code, 128),
             ("error_path", error_path, 1_024),
@@ -8110,7 +8170,9 @@ class RunStore:
                         raise RuntimeError(
                             "scheduled package failure requires server admission evidence"
                         )
-                elif scheduled_at is not None:
+                elif scheduled_at is not None and not (
+                    allow_scheduled_running and status == "running"
+                ):
                     connection.rollback()
                     return False
 

@@ -1,5 +1,11 @@
 import ast
+import importlib.util
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tarfile
 import tomllib
 from pathlib import Path
 
@@ -7,6 +13,33 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def packaging_setup(tmp_path, monkeypatch):
+    """Load the real setup helpers without invoking setuptools commands."""
+    import setuptools
+
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    monkeypatch.setenv("HERMES_NIX_BUILD", "1")
+    spec = importlib.util.spec_from_file_location(
+        f"task12_setup_{id(tmp_path)}", REPO_ROOT / "setup.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module._ROOT = tmp_path
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.setuptools]\ndata-files = {}\n", encoding="utf-8"
+    )
+    return module
+
+
+def _skill_file(root: Path, relative: str, contents: bytes = b"x") -> Path:
+    path = root / "skills" / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(contents)
+    return path
 
 
 def _distribution_name(requirement: str) -> str:
@@ -125,6 +158,403 @@ def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     assert "recursive-include plugins" in manifest and "plugin.yaml" in manifest, (
         "MANIFEST.in must recursive-include plugins plugin.yaml/plugin.yml (sdist)"
     )
+
+
+def test_generic_plugin_descriptors_and_skills_are_declared_for_both_artifacts():
+    """Static metadata must cover arbitrary bundled plugins, not named vendors."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin_data = data["tool"]["setuptools"]["package-data"]["plugins"]
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+    assert "**/config.schema.json" in plugin_data
+    assert "**/skills/**/*" in plugin_data
+    excluded = data["tool"]["setuptools"]["exclude-package-data"]["plugins"]
+    for cache_name in ("__pycache__", ".pytest_cache", ".pytest-cache", ".ruff_cache"):
+        assert any(cache_name in pattern for pattern in excluded)
+    assert any(pattern.endswith("*.pyc") for pattern in excluded)
+    assert any(pattern.endswith("*.pyo") for pattern in excluded)
+    assert "graft plugins" in manifest
+    for cache_name in ("__pycache__", ".pytest_cache", ".pytest-cache", ".ruff_cache"):
+        assert cache_name in manifest
+
+
+def test_skill_inventory_rejects_symlink_or_non_directory_root(
+    packaging_setup, tmp_path
+):
+    real = tmp_path / "real-skills"
+    real.mkdir()
+    (tmp_path / "skills").symlink_to(real, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="root.*symlink"):
+        packaging_setup._recursive_skill_data_files()
+
+    (tmp_path / "skills").unlink()
+    (tmp_path / "skills").write_text("not a directory", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="root.*directory"):
+        packaging_setup._recursive_skill_data_files()
+
+
+def test_skill_inventory_counts_every_entry_before_collection(
+    packaging_setup, tmp_path, monkeypatch
+):
+    _skill_file(tmp_path, "one.md")
+    _skill_file(tmp_path, "two.md")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_ENTRIES", 2)
+    exact = packaging_setup._recursive_skill_data_files()
+    assert exact == [("skills", ["skills/one.md", "skills/two.md"])]
+
+    ignored = tmp_path / "skills" / ".pytest-cache"
+    ignored.mkdir()
+    with pytest.raises(RuntimeError, match="entry count"):
+        packaging_setup._recursive_skill_data_files()
+
+
+def test_skill_inventory_stops_streaming_at_adjacent_entry(
+    packaging_setup, tmp_path, monkeypatch
+):
+    for index in range(20):
+        _skill_file(tmp_path, f"asset-{index:02d}.md")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_ENTRIES", 2)
+    original_scandir = os.scandir
+    advances = 0
+    closed = False
+
+    class TrackingIterator:
+        def __init__(self, path):
+            self._inner = original_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal advances
+            advances += 1
+            return next(self._inner)
+
+        def close(self):
+            nonlocal closed
+            closed = True
+            self._inner.close()
+
+    monkeypatch.setattr(packaging_setup.os, "scandir", TrackingIterator)
+    with pytest.raises(RuntimeError, match="entry count"):
+        packaging_setup._recursive_skill_data_files()
+    assert advances == 3
+    assert closed is True
+
+
+def test_skill_inventory_counts_nonfiles_before_kind_checks(
+    packaging_setup, tmp_path, monkeypatch
+):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO fixture requires POSIX")
+    _skill_file(tmp_path, "one.md")
+    os.mkfifo(tmp_path / "skills" / "pipe")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_ENTRIES", 1)
+    with pytest.raises(RuntimeError, match="entry count"):
+        packaging_setup._recursive_skill_data_files()
+
+
+def test_skill_inventory_file_count_exact_and_adjacent(
+    packaging_setup, tmp_path, monkeypatch
+):
+    _skill_file(tmp_path, "a.md")
+    _skill_file(tmp_path, "b.md")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_FILES", 2)
+    assert packaging_setup._recursive_skill_data_files() == [
+        ("skills", ["skills/a.md", "skills/b.md"])
+    ]
+    _skill_file(tmp_path, "c.md")
+    with pytest.raises(RuntimeError, match="file count"):
+        packaging_setup._recursive_skill_data_files()
+
+
+def test_skill_inventory_byte_caps_are_exact_and_atomic(
+    packaging_setup, tmp_path, monkeypatch
+):
+    first = _skill_file(tmp_path, "a.md", b"1234")
+    _skill_file(tmp_path, "b.md", b"5678")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_FILE_BYTES", 4)
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_BYTES", 8)
+    expected = [("skills", ["skills/a.md", "skills/b.md"])]
+    assert packaging_setup._recursive_skill_data_files() == expected
+
+    first.write_bytes(b"12345")
+    with pytest.raises(RuntimeError, match="per-file"):
+        packaging_setup._recursive_skill_data_files()
+    first.write_bytes(b"1234")
+    _skill_file(tmp_path, "c.md", b"9")
+    with pytest.raises(RuntimeError, match="total"):
+        packaging_setup._recursive_skill_data_files()
+    (tmp_path / "skills" / "c.md").unlink()
+    assert packaging_setup._recursive_skill_data_files() == expected
+
+
+def test_skill_inventory_depth_exact_and_adjacent(
+    packaging_setup, tmp_path, monkeypatch
+):
+    _skill_file(tmp_path, "one/leaf.md")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_DEPTH", 1)
+    assert packaging_setup._recursive_skill_data_files() == [
+        ("skills/one", ["skills/one/leaf.md"])
+    ]
+    _skill_file(tmp_path, "one/two/overflow.md")
+    with pytest.raises(RuntimeError, match="depth"):
+        packaging_setup._recursive_skill_data_files()
+
+
+def test_skill_inventory_closes_root_and_child_descriptors_on_error(
+    packaging_setup, tmp_path, monkeypatch
+):
+    _skill_file(tmp_path, "one/two/overflow.md")
+    monkeypatch.setattr(packaging_setup, "_MAX_SKILL_ASSET_DEPTH", 1)
+    original_close = os.close
+    closed: list[int] = []
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(packaging_setup.os, "close", tracking_close)
+    with pytest.raises(RuntimeError, match="depth"):
+        packaging_setup._recursive_skill_data_files()
+    assert len(closed) == 2
+    assert len(set(closed)) == 2
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_skill_inventory_skips_nested_symlinks(
+    packaging_setup, tmp_path, kind
+):
+    _skill_file(tmp_path, "kept.md")
+    target = tmp_path / f"target-{kind}"
+    if kind == "directory":
+        target.mkdir()
+        link = tmp_path / "skills" / "linked-directory"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+    else:
+        target.write_text("outside\n", encoding="utf-8")
+        link = tmp_path / "skills" / "linked-file.md"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(target)
+    assert packaging_setup._recursive_skill_data_files() == [
+        ("skills", ["skills/kept.md"])
+    ]
+
+
+def test_configured_data_files_reject_symlink_and_nonregular_sources(
+    packaging_setup, tmp_path
+):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    target = tmp_path / "target.txt"
+    target.write_text("target\n", encoding="utf-8")
+    (assets / "linked.txt").symlink_to(target)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.data-files]\nassets = ["assets/*"]\n', encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="regular file"):
+        packaging_setup._configured_data_files()
+
+    (assets / "linked.txt").unlink()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(assets / "pipe")
+        with pytest.raises(RuntimeError, match="regular file"):
+            packaging_setup._configured_data_files()
+
+
+def test_configured_data_files_reject_symlinked_parent(
+    packaging_setup, tmp_path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "asset.txt").write_text("outside\n", encoding="utf-8")
+    (tmp_path / "linked-assets").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.data-files]\nassets = ["linked-assets/*.txt"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="configured data-file.*symlink"):
+        packaging_setup._configured_data_files()
+
+
+def test_skill_inventory_merges_in_stable_target_and_file_order(
+    packaging_setup, tmp_path
+):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    for name in ("z.txt", "a.txt"):
+        (assets / name).write_text(name, encoding="utf-8")
+    _skill_file(tmp_path, "z-last/SKILL.md")
+    _skill_file(tmp_path, "a-first/z.md")
+    _skill_file(tmp_path, "a-first/a.md")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.data-files]\nstatic = ["assets/*"]\n', encoding="utf-8"
+    )
+    assert packaging_setup._recursive_skill_data_files() == [
+        ("skills/a-first", ["skills/a-first/a.md", "skills/a-first/z.md"]),
+        ("skills/z-last", ["skills/z-last/SKILL.md"]),
+        ("static", ["assets/a.txt", "assets/z.txt"]),
+    ]
+
+
+def test_generic_recursive_build_preserves_plugin_and_top_level_skill_paths(
+    tmp_path,
+):
+    """A real wheel and sdist retain arbitrary source-relative skill assets."""
+    source = tmp_path / "source"
+    shutil.copytree(
+        REPO_ROOT,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".worktrees",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".pytest-cache",
+            ".ruff_cache",
+            "build",
+            "dist",
+            "hermes_agent.egg-info",
+        ),
+    )
+    plugin = source / "plugins" / "generic_fixture"
+    plugin_skill = plugin / "skills" / "investigate"
+    plugin_skill.mkdir(parents=True)
+    (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
+    (plugin / "plugin.yaml").write_text("name: generic-fixture\n")
+    (plugin / "config.schema.json").write_text('{"version":1,"fields":[]}\n')
+    (plugin_skill / "SKILL.md").write_text("---\nname: investigate\n---\nGeneric.\n")
+    router = source / "skills" / "vendor_fixture" / "router"
+    router.mkdir(parents=True)
+    (router / "SKILL.md").write_text("---\nname: router\n---\nRoute.\n")
+    symlink_target = source / "artifact-link-target.md"
+    symlink_target.write_text("must not be copied through a link\n", encoding="utf-8")
+    symlink_directory = source / "artifact-link-directory"
+    symlink_directory.mkdir()
+    (symlink_directory / "nested.md").write_text(
+        "must not be copied through a directory link\n", encoding="utf-8"
+    )
+    plugin_symlinks = {
+        plugin_skill / "linked-file.md": symlink_target,
+        plugin_skill / "linked-directory": symlink_directory,
+    }
+    for link, target in plugin_symlinks.items():
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    top_level_symlinks = {
+        router / "linked-file.md": symlink_target,
+        router / "linked-directory": symlink_directory,
+    }
+    for link, target in top_level_symlinks.items():
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    cache_names = ("__pycache__", ".pytest_cache", ".pytest-cache", ".ruff_cache")
+    ignored_relatives = set()
+    for base in (
+        plugin_skill,
+        source / "skills" / "vendor_fixture" / "router",
+    ):
+        for cache_name in cache_names:
+            ignored = base / cache_name
+            ignored.mkdir()
+            cached = ignored / "cached.bin"
+            cached.write_bytes(b"not-package-data")
+            ignored_relatives.add(cached.relative_to(source).as_posix())
+        for suffix in ("pyc", "pyo"):
+            cached = base / f"cached.{suffix}"
+            cached.write_bytes(b"not-package-data")
+            ignored_relatives.add(cached.relative_to(source).as_posix())
+
+    artifacts = tmp_path / "artifacts"
+    env = os.environ.copy()
+    env["HERMES_NIX_BUILD"] = "1"
+    env["UV_PYTHON"] = sys.executable
+    built_wheel = subprocess.run(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-logs",
+            "--out-dir",
+            str(artifacts),
+            ".",
+        ],
+        cwd=source,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert built_wheel.returncode == 0, built_wheel.stderr
+    built_sdist = subprocess.run(
+        [
+            "uv",
+            "build",
+            "--sdist",
+            "--no-build-logs",
+            "--out-dir",
+            str(artifacts),
+            ".",
+        ],
+        cwd=source,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert built_sdist.returncode == 0, built_sdist.stderr
+    wheel = next(artifacts.glob("*.whl"))
+    sdist = next(artifacts.glob("*.tar.gz"))
+    installed = tmp_path / "site"
+    extracted = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(installed),
+            "--no-deps",
+            str(wheel),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert extracted.returncode == 0, extracted.stderr
+
+    required = {
+        "plugins/generic_fixture/config.schema.json",
+        "plugins/generic_fixture/skills/investigate/SKILL.md",
+        "skills/vendor_fixture/router/SKILL.md",
+    }
+    assert all((installed / relative).is_file() for relative in required)
+    assert all(not (installed / relative).exists() for relative in ignored_relatives)
+    linked_relatives = {
+        link.relative_to(source).as_posix()
+        for link in (*plugin_symlinks, *top_level_symlinks)
+    }
+    assert all(not (installed / relative).exists() for relative in linked_relatives)
+    with tarfile.open(sdist, "r:gz") as archive:
+        members = {
+            "/".join(name.split("/")[1:])
+            for name in archive.getnames()
+            if "/" in name
+        }
+    assert required <= members
+    assert not (members & ignored_relatives)
+    assert not (members & linked_relatives)
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in

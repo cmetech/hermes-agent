@@ -1,0 +1,18 @@
+name: ericsson-gitlab
+version: 1.0.0
+description: "Bounded Ericsson GitLab reads and approval-gated writes."
+author: Ericsson (cmetech)
+kind: standalone
+config_schema: config.schema.json
+provides_tools:
+  - gitlab_resolve_project
+  - gitlab_list_repository_tree
+  - gitlab_read_file
+  - gitlab_read_merge_request
+  - gitlab_list_pipelines
+  - gitlab_inspect_ci
+  - gitlab_create_branch
+  - gitlab_commit_changes
+  - gitlab_create_merge_request
+provides_hooks:
+  - pre_tool_call

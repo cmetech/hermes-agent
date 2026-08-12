@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hermes_cli import capability_staging as cs
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
@@ -20,7 +21,31 @@ def _write(p: Path, text: str = "x") -> Path:
     return p
 
 
-def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
+def _standalone_plugin(
+    plugin_id: str,
+    *,
+    migration_id: str | None = None,
+) -> dict:
+    entry = {
+        "path": f"plugins/{plugin_id}",
+        "id": plugin_id,
+        "enabled": False,
+    }
+    if migration_id is not None:
+        entry["lifecycleMigration"] = {
+            "id": migration_id,
+            "from": "auto_seeded_backend",
+        }
+    return entry
+
+
+def make_bundle(
+    root: Path,
+    version: str = "0.2.0",
+    requires_env=None,
+    *,
+    plugins: list[object] | None = None,
+) -> Path:
     """A minimal on-disk capability bundle matching the ericsson repo layout."""
     b = root / "bundle"
     manifest = {
@@ -28,7 +53,9 @@ def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
         "requiresEnv": requires_env if requires_env is not None else {},
         "disabledByDefault": {"skills": [], "toolsets": ["ericsson-jira"]},
         "skills": [],
-        "plugins": ["plugins/workflow", "plugins/ericsson-jira"],
+        "plugins": plugins
+        if plugins is not None
+        else ["plugins/workflow", "plugins/ericsson-jira"],
         "mcpServers": "mcp/mcp-servers.yaml",
         "mcpLocal": ["mcp/outlook-mcp"],
         "workflowPackages": [{
@@ -38,8 +65,21 @@ def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
         "personas": [], "env": [],
     }
     _write(b / "sets/ericsson.json", json.dumps(manifest))
-    _write(b / "plugins/ericsson-jira/plugin.yaml", "name: ericsson-jira\n")
-    _write(b / "plugins/ericsson-jira/__init__.py", "")
+    for entry in manifest["plugins"]:
+        rel = entry if isinstance(entry, str) else entry.get("path")
+        if rel == "plugins/workflow" or not isinstance(rel, str):
+            continue
+        plugin_id = entry.get("id") if isinstance(entry, dict) else Path(rel).name
+        kind = (
+            "standalone"
+            if isinstance(entry, dict) and entry.get("enabled") is False
+            else "backend"
+        )
+        _write(
+            b / rel / "plugin.yaml",
+            f"name: {plugin_id}\nkind: {kind}\n",
+        )
+        _write(b / rel / "__init__.py", "")
     _write(b / "mcp/outlook-mcp/run_server.py", "# server")
     _write(b / "mcp/mcp-servers.yaml",
            "mcp_servers:\n"
@@ -153,6 +193,289 @@ def test_stage_bundle_full(tmp_path, home, fake_config):
         "allow_model_override": True,
         "allow_provider_override": True,
     }
+
+
+def test_new_profile_copies_standalone_connectors_without_enabling_them(
+    tmp_path, home, fake_config
+):
+    store, saved = fake_config
+    standalone_ids = (
+        "ericsson-jira",
+        "ericsson-gitlab",
+        "ericsson-sharepoint",
+        "ericsson-confluence",
+    )
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            *[_standalone_plugin(plugin_id) for plugin_id in standalone_ids],
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    for plugin_id in standalone_ids:
+        assert (home / "plugins" / plugin_id / "plugin.yaml").is_file()
+    assert store["config"]["plugins"]["enabled"] == ["workflow"]
+    assert saved["count"] == 1
+
+
+def test_structured_enabled_backend_retains_legacy_activation_behavior(
+    tmp_path, home, fake_config
+):
+    store, _ = fake_config
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            {
+                "path": "plugins/backend-object",
+                "id": "backend-object",
+                "enabled": True,
+            },
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert store["config"]["plugins"]["enabled"] == [
+        "workflow",
+        "backend-object",
+    ]
+
+
+def test_legacy_non_slug_plugin_path_is_copied_and_enabled(tmp_path, home, fake_config):
+    store, _ = fake_config
+    bundle = make_bundle(
+        tmp_path,
+        plugins=["plugins/workflow", "plugins/legacy.plugin"],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert (home / "plugins/legacy.plugin/plugin.yaml").is_file()
+    assert store["config"]["plugins"]["enabled"] == [
+        "workflow",
+        "legacy.plugin",
+    ]
+
+
+def test_restaging_preserves_explicit_enabled_and_disabled_choices(
+    tmp_path, home, fake_config
+):
+    store, _ = fake_config
+    store["config"] = {
+        "plugins": {
+            "enabled": ["unrelated", "ericsson-gitlab"],
+            "disabled": ["ericsson-jira"],
+        }
+    }
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            "plugins/ericsson-jira",
+            _standalone_plugin("ericsson-gitlab"),
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+    first = json.loads(json.dumps(store["config"]))
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert store["config"] == first
+    assert store["config"]["plugins"]["enabled"] == [
+        "unrelated",
+        "ericsson-gitlab",
+        "workflow",
+    ]
+    assert store["config"]["plugins"]["disabled"] == ["ericsson-jira"]
+
+
+def test_unseen_backend_lifecycle_migration_deseeds_only_its_target_once(
+    tmp_path, home, fake_config
+):
+    store, saved = fake_config
+    migration_id = "ericsson-jira-backend-to-standalone-v1"
+    store["config"] = {
+        "plugins": {
+            "enabled": [
+                "workflow",
+                "ericsson-jira",
+                "ericsson-teams",
+                "unrelated",
+            ],
+            "disabled": ["explicitly-disabled"],
+            "entries": {"unrelated": {"settings": {"keep": True}}},
+        }
+    }
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            _standalone_plugin("ericsson-jira", migration_id=migration_id),
+            "plugins/ericsson-teams",
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    plugins = store["config"]["plugins"]
+    assert plugins["enabled"] == ["workflow", "ericsson-teams", "unrelated"]
+    assert plugins["disabled"] == ["explicitly-disabled"]
+    assert plugins["entries"]["unrelated"] == {"settings": {"keep": True}}
+    assert plugins["lifecycle_migrations_applied"] == [migration_id]
+    assert saved["count"] == 1
+
+    # A later explicit enable must survive forever because the marker is durable.
+    plugins["enabled"].append("ericsson-jira")
+    cs.stage_bundle(bundle, "ericsson", home)
+    cs.stage_bundle(bundle, "ericsson", home)
+    restaged_plugins = store["config"]["plugins"]
+    assert restaged_plugins["enabled"] == [
+        "workflow",
+        "ericsson-teams",
+        "unrelated",
+        "ericsson-jira",
+    ]
+    assert restaged_plugins["lifecycle_migrations_applied"] == [migration_id]
+
+
+def test_lifecycle_migration_uses_real_profile_config_io(tmp_path, monkeypatch):
+    ambient_home = tmp_path / "ambient"
+    ambient_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    staged_home = tmp_path / "staged"
+    staged_home.mkdir()
+    (staged_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled: [workflow, ericsson-jira, ericsson-teams]\n"
+        "  disabled: [explicitly-disabled]\n",
+        encoding="utf-8",
+    )
+    migration_id = "ericsson-jira-backend-to-standalone-v1"
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            _standalone_plugin("ericsson-jira", migration_id=migration_id),
+            "plugins/ericsson-teams",
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", staged_home)
+
+    raw = yaml.safe_load((staged_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["workflow", "ericsson-teams"]
+    assert raw["plugins"]["disabled"] == ["explicitly-disabled"]
+    assert raw["plugins"]["lifecycle_migrations_applied"] == [migration_id]
+    assert not (ambient_home / "config.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "mutate_manifest",
+    [
+        lambda plugins: plugins[1].pop("enabled"),
+        lambda plugins: plugins[1].update({
+            "lifecycleMigration": {"from": "auto_seeded_backend"}
+        }),
+        lambda plugins: plugins[1].update({
+            "lifecycleMigration": {
+                "id": "x" * 65,
+                "from": "auto_seeded_backend",
+            }
+        }),
+        lambda plugins: plugins[1].update({
+            "lifecycleMigration": {
+                "id": "connector-migration-v1\n",
+                "from": "auto_seeded_backend",
+            }
+        }),
+        lambda plugins: plugins.append({
+            **_standalone_plugin("second-connector"),
+            "lifecycleMigration": {
+                "id": "connector-migration-v1",
+                "from": "auto_seeded_backend",
+            },
+        }),
+    ],
+    ids=(
+        "missing-enabled",
+        "missing-id",
+        "oversized-id",
+        "newline-id",
+        "duplicate-id",
+    ),
+)
+def test_malformed_lifecycle_metadata_does_not_change_unrelated_plugin_state(
+    tmp_path, home, fake_config, mutate_manifest
+):
+    store, _ = fake_config
+    original_plugins = {
+        "enabled": ["workflow", "connector", "unrelated"],
+        "disabled": ["explicitly-disabled"],
+        "entries": {"unrelated": {"settings": {"keep": True}}},
+    }
+    store["config"] = {"plugins": json.loads(json.dumps(original_plugins))}
+    migration = {
+        **_standalone_plugin("connector"),
+        "lifecycleMigration": {
+            "id": "connector-migration-v1",
+            "from": "auto_seeded_backend",
+        },
+    }
+    bundle = make_bundle(
+        tmp_path,
+        plugins=["plugins/workflow", migration],
+    )
+    manifest_path = bundle / "sets/ericsson.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate_manifest(manifest["plugins"])
+    if len(manifest["plugins"]) > 2:
+        _write(
+            bundle / "plugins/second-connector/plugin.yaml",
+            "name: second-connector\nkind: standalone\n",
+        )
+        _write(bundle / "plugins/second-connector/__init__.py", "")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert store["config"]["plugins"] == original_plugins
+
+
+@pytest.mark.parametrize(
+    "ledger",
+    [
+        "not-a-list",
+        ["valid-migration", 7],
+        ["x" * 65],
+        [f"migration-{index}" for index in range(257)],
+    ],
+    ids=("wrong-type", "non-string-id", "oversized-id", "too-many-ids"),
+)
+def test_invalid_lifecycle_ledger_fails_closed_for_plugin_state(
+    tmp_path, home, fake_config, ledger
+):
+    store, _ = fake_config
+    original_plugins = {
+        "enabled": ["workflow", "connector", "unrelated"],
+        "disabled": ["explicitly-disabled"],
+        "lifecycle_migrations_applied": ledger,
+    }
+    store["config"] = {"plugins": json.loads(json.dumps(original_plugins))}
+    bundle = make_bundle(
+        tmp_path,
+        plugins=[
+            "plugins/workflow",
+            _standalone_plugin("connector", migration_id="connector-migration-v1"),
+        ],
+    )
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    assert store["config"]["plugins"] == original_plugins
 
 
 def test_stage_bundle_preserves_explicit_workflow_agent_override_denials(

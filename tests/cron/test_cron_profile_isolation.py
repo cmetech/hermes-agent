@@ -17,7 +17,10 @@ was filed for. These tests pin per-profile isolation so a stale-branch merge or
 a re-anchor "fix" can't silently flip it back.
 """
 import importlib
+import shutil
 from pathlib import Path
+
+from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
 def _set_profile_env(monkeypatch, root: Path, profile_home: Path) -> None:
@@ -67,3 +70,112 @@ def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
         importlib.reload(jobs)
 
 
+def test_cron_connector_uses_ambient_profile_and_denies_interactive_approval(
+    tmp_path, monkeypatch
+):
+    """Cron has no per-job profile escape and no waiting interactive gate."""
+    import cron.scheduler as scheduler
+    from gateway.session_context import get_session_env
+    from hermes_cli import plugins as plugins_module
+    from tools import approval
+    from tools.registry import registry
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "scheduler-selected"
+    plugin_root = profile / "plugins" / "ericsson-gitlab"
+    plugin_root.parent.mkdir(parents=True)
+    source = resolve_ericsson_connector_source()
+    shutil.copytree(source.plugin, plugin_root)
+    profile.joinpath("config.yaml").write_text(
+        "plugins:\n  enabled: [ericsson-gitlab]\n  disabled: []\n"
+        "platform_toolsets:\n  cron: [skills]\n"
+        "approvals:\n  cron_mode: deny\n",
+        encoding="utf-8",
+    )
+    root.mkdir(exist_ok=True)
+    root.joinpath("config.yaml").write_text(
+        "plugins:\n  enabled: []\n  disabled: [ericsson-gitlab]\n",
+        encoding="utf-8",
+    )
+    _set_profile_env(monkeypatch, root, profile)
+    monkeypatch.setenv("HERMES_MODEL", "test-model")
+    captured = {}
+
+    class DummyDB:
+        def set_session_title(self, *args, **kwargs):
+            pass
+
+        def end_session(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, prompt):
+            captured["home_during_run"] = str(scheduler._get_hermes_home())
+            captured["cron_context"] = get_session_env("HERMES_CRON_SESSION")
+            captured["approval"] = approval.check_execute_code_guard(
+                "print('cron')", "local"
+            )
+            return {
+                "completed": True,
+                "failed": False,
+                "final_response": "done",
+                "turn_exit_reason": "",
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", DummyDB)
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "hermes_constants.resolve_reasoning_config", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "test-key",
+            "base_url": None,
+            "provider": "test-provider",
+            "requested_provider": "test-provider",
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: [])
+    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda _cfg: [])
+    monkeypatch.setattr(scheduler, "_guard_job_credential_exfil", lambda _job: None)
+    monkeypatch.setattr(
+        plugins_module.PluginManager, "_scan_entry_points", lambda self: []
+    )
+
+    success, _output, response, error = scheduler.run_job(
+        {
+            "id": "profile-connector",
+            "name": "Profile Connector",
+            "prompt": "Inspect GitLab",
+            "schedule_display": "manual",
+            # There is deliberately no supported per-job profile field.
+            "profile": "wrong-profile-must-not-switch",
+        }
+    )
+
+    assert success is True
+    assert response == "done"
+    assert error is None
+    assert captured["platform"] == "cron"
+    assert captured["home_during_run"] == str(profile)
+    assert captured["cron_context"] == "1"
+    assert "ericsson-gitlab" in captured["enabled_toolsets"]
+    assert captured["approval"]["approved"] is False
+    assert captured["approval"]["outcome"] == "blocked"
+
+    for name in tuple(registry.get_all_tool_names()):
+        if name.startswith("gitlab_"):
+            registry.deregister(name)

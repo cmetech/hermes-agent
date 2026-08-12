@@ -291,6 +291,12 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+
+
+class ConfigurationPersistenceError(RuntimeError):
+    """A requested configuration mutation could not be persisted."""
+
+
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -3579,7 +3585,8 @@ def save_config(
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
     merge_existing: bool = False,
-):
+    strict: bool = False,
+) -> bool | None:
     """Save configuration to ~/.hermes/config.yaml.\n
 
     Default values from ``DEFAULT_CONFIG`` are not written to disk unless
@@ -3596,8 +3603,10 @@ def save_config(
     """
     with _CONFIG_LOCK:
         if is_managed():
+            if strict:
+                raise ConfigurationPersistenceError("configuration is managed")
             managed_error("save configuration")
-            return
+            return None
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -3609,6 +3618,18 @@ def save_config(
         if managed_keys:
             config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
             if _stripped:
+                requested = {".".join(path) for path in (preserve_keys or set())}
+                blocks_requested = any(
+                    requested_path == managed_path
+                    or requested_path.startswith(f"{managed_path}.")
+                    or managed_path.startswith(f"{requested_path}.")
+                    for requested_path in requested
+                    for managed_path in _stripped
+                )
+                if strict and blocks_requested:
+                    raise ConfigurationPersistenceError(
+                        "requested configuration setting is managed"
+                    )
                 print(
                     f"Note: {len(_stripped)} managed setting(s) were not saved "
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
@@ -3687,6 +3708,7 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        return True if strict else None
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -3933,16 +3955,50 @@ def _env_line_defines_key(line: str, key: str) -> bool:
     return stripped.startswith(f"{key}=")
 
 
-def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+def save_env_value(
+    key: str,
+    value: str,
+    *,
+    mirror_process_env: bool = True,
+    strict: bool = False,
+) -> bool | None:
+    """Save or update a value in the active profile's ``.env``.
+
+    ``mirror_process_env`` preserves the legacy caller contract by default.
+    Profile-scoped services can disable it so credentials are never exposed to
+    unrelated contexts or child processes. ``strict`` turns managed no-ops
+    into a stable exception instead of allowing a caller to report success.
+    """
+    with _CONFIG_LOCK:
+        return _save_env_value_locked(
+            key,
+            value,
+            mirror_process_env=mirror_process_env,
+            strict=strict,
+        )
+
+
+def _save_env_value_locked(
+    key: str,
+    value: str,
+    *,
+    mirror_process_env: bool,
+    strict: bool,
+) -> bool | None:
     if is_managed():
+        if strict:
+            raise ConfigurationPersistenceError("environment is managed")
         managed_error(f"set {key}")
-        return
+        return None
     # Managed scope guard: a managed env key can't be set by the user — the
     # managed .env wins at load anyway. Distinct from is_managed() above.
     from hermes_cli import managed_scope
 
     if managed_scope.is_env_managed(key):
+        if strict:
+            raise ConfigurationPersistenceError(
+                f"environment variable {key} is managed"
+            )
         managed_dir = managed_scope.get_managed_dir()
         src = (managed_dir / ".env") if managed_dir else "the managed scope"
         print(
@@ -3950,7 +4006,7 @@ def save_env_value(key: str, value: str):
             f"and cannot be changed.",
             file=sys.stderr,
         )
-        return
+        return None
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     _reject_denylisted_env_var(key)
@@ -4023,8 +4079,10 @@ def save_env_value(key: str, value: str):
             pass
         raise
 
-    os.environ[key] = value
+    if mirror_process_env:
+        os.environ[key] = value
     invalidate_env_cache()
+    return True if strict else None
 
 
 def custom_endpoint_key_env(identity: str) -> str:
@@ -4046,18 +4104,43 @@ def custom_endpoint_key_env(identity: str) -> str:
     return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 
 
-def remove_env_value(key: str) -> bool:
+def remove_env_value(
+    key: str,
+    *,
+    mirror_process_env: bool = True,
+    strict: bool = False,
+) -> bool:
     """Remove a key from ~/.hermes/.env and os.environ.
 
     Returns True if the key was found and removed, False otherwise.
     """
+    with _CONFIG_LOCK:
+        return _remove_env_value_locked(
+            key,
+            mirror_process_env=mirror_process_env,
+            strict=strict,
+        )
+
+
+def _remove_env_value_locked(
+    key: str,
+    *,
+    mirror_process_env: bool,
+    strict: bool,
+) -> bool:
     if is_managed():
+        if strict:
+            raise ConfigurationPersistenceError("environment is managed")
         managed_error(f"remove {key}")
         return False
     # Managed scope guard: a managed env key can't be removed by the user.
     from hermes_cli import managed_scope
 
     if managed_scope.is_env_managed(key):
+        if strict:
+            raise ConfigurationPersistenceError(
+                f"environment variable {key} is managed"
+            )
         managed_dir = managed_scope.get_managed_dir()
         src = (managed_dir / ".env") if managed_dir else "the managed scope"
         print(
@@ -4070,7 +4153,8 @@ def remove_env_value(key: str) -> bool:
         raise ValueError(f"Invalid environment variable name: {key!r}")
     env_path = get_env_path()
     if not env_path.exists():
-        os.environ.pop(key, None)
+        if mirror_process_env:
+            os.environ.pop(key, None)
         return False
 
     read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
@@ -4114,7 +4198,8 @@ def remove_env_value(key: str) -> bool:
                 pass
             raise
 
-    os.environ.pop(key, None)
+    if mirror_process_env:
+        os.environ.pop(key, None)
     invalidate_env_cache()
     return found
 

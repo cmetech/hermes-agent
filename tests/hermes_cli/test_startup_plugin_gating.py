@@ -21,12 +21,15 @@ Two invariants:
 from __future__ import annotations
 
 import io
+import json
 import re
 import sys
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.main import (
     _BUILTIN_SUBCOMMANDS,
@@ -184,3 +187,118 @@ def test_deferred_platform_loader_registers_cli_command_before_parser_table():
     assert command_name in choices
     parsed = parser.parse_args([command_name])
     assert parsed.command == command_name
+
+
+def test_baked_startup_applies_connector_lifecycle_migration_once(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import capability_staging as staging
+
+    distribution = tmp_path / "distribution"
+    home = tmp_path / "profile"
+    home.mkdir()
+    migration_id = "ericsson-jira-backend-to-standalone-v1"
+    manifest = {
+        "name": "startup-fixture",
+        "plugins": [
+            "plugins/workflow",
+            {
+                "path": "plugins/ericsson-jira",
+                "id": "ericsson-jira",
+                "enabled": False,
+                "lifecycleMigration": {
+                    "id": migration_id,
+                    "from": "auto_seeded_backend",
+                },
+            },
+            "plugins/ericsson-teams",
+        ],
+    }
+    capability = distribution / "capabilities/startup-fixture.json"
+    capability.parent.mkdir(parents=True)
+    capability.write_text(json.dumps(manifest), encoding="utf-8")
+    for plugin_id, kind in (
+        ("workflow", "backend"),
+        ("ericsson-jira", "standalone"),
+        ("ericsson-teams", "backend"),
+    ):
+        plugin = distribution / "plugins" / plugin_id
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            f"name: {plugin_id}\nkind: {kind}\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text("", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled: [workflow, ericsson-jira, ericsson-teams]\n"
+        "  disabled: [explicitly-disabled]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(staging, "_repo_root", lambda: distribution)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: distribution / "plugins",
+    )
+
+    staging.seed_baked_capabilities(home)
+
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["workflow", "ericsson-teams"]
+    assert raw["plugins"]["disabled"] == ["explicitly-disabled"]
+    assert raw["plugins"]["lifecycle_migrations_applied"] == [migration_id]
+
+    raw["plugins"]["enabled"].append("ericsson-jira")
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+    )
+    staging.seed_baked_capabilities(home)
+    after_restage = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert after_restage["plugins"]["enabled"] == [
+        "workflow",
+        "ericsson-teams",
+        "ericsson-jira",
+    ]
+    assert after_restage["plugins"]["lifecycle_migrations_applied"] == [migration_id]
+
+
+def test_baked_startup_enables_historically_accepted_non_slug_plugin_path(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import capability_staging as staging
+
+    distribution = tmp_path / "distribution"
+    home = tmp_path / "profile"
+    home.mkdir()
+    capability = distribution / "capabilities/legacy-fixture.json"
+    capability.parent.mkdir(parents=True)
+    capability.write_text(
+        json.dumps({
+            "name": "legacy-fixture",
+            "plugins": ["plugins/legacy.plugin"],
+        }),
+        encoding="utf-8",
+    )
+    plugin = distribution / "plugins/legacy.plugin"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        "name: legacy.plugin\nkind: backend\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text("", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(staging, "_repo_root", lambda: distribution)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: distribution / "plugins",
+    )
+
+    staging.seed_baked_capabilities(home)
+
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["legacy.plugin"]

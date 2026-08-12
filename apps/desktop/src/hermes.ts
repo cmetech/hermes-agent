@@ -56,6 +56,9 @@ import type {
   PaginatedSessions,
   PairingResponse,
   PairingUser,
+  PluginConfigurationDetail,
+  PluginConfigurationReadiness,
+  PluginSetupActionRun,
   ProfileCreatePayload,
   ProfileDesktopOverlay,
   ProfileSetupCommand,
@@ -1277,6 +1280,125 @@ export function setToolsetEnabled(
     path: `/api/tools/toolsets/${encodeURIComponent(name)}`,
     method: 'PUT',
     body: { enabled }
+  })
+}
+
+export class PluginConfigurationApiError extends Error {
+  readonly body: unknown
+  readonly code?: string
+  readonly status: number
+
+  constructor(response: { body: unknown; status: number }) {
+    const body =
+      typeof response.body === 'object' && response.body !== null
+        ? (response.body as Record<string, unknown>)
+        : undefined
+
+    const detail =
+      typeof body?.detail === 'object' && body.detail !== null ? (body.detail as Record<string, unknown>) : undefined
+
+    const message = typeof detail?.message === 'string' ? detail.message : `HTTP ${response.status}`
+
+    super(message)
+    this.name = 'PluginConfigurationApiError'
+    this.body = response.body
+    this.code = typeof detail?.code === 'string' ? detail.code : undefined
+    this.status = response.status
+  }
+}
+
+async function requestPluginConfigurationApi<T>(
+  request: Parameters<Window['hermesDesktop']['apiStructured']>[0]
+): Promise<T> {
+  const response = await window.hermesDesktop.apiStructured<T>(request)
+
+  if (response.ok) {
+    return response.value
+  }
+
+  throw new PluginConfigurationApiError(response)
+}
+
+export function isPluginConfigurationRouteMissingError(error: unknown): boolean {
+  if (!(error instanceof PluginConfigurationApiError) || error.status !== 404 || error.code) {
+    return false
+  }
+
+  if (typeof error.body !== 'object' || error.body === null) {
+    return false
+  }
+
+  const detail = (error.body as Record<string, unknown>).detail
+
+  return typeof detail === 'string' && (detail === 'Not Found' || /^No such API endpoint:/i.test(detail))
+}
+
+export function getPluginConfigurations(): Promise<PluginConfigurationDetail[]> {
+  return requestPluginConfigurationApi<PluginConfigurationDetail[]>({
+    ...profileScoped(),
+    path: '/api/plugin-configurations'
+  })
+}
+
+export function setPluginConfigurationEnabled(pluginId: string, enabled: boolean): Promise<PluginConfigurationDetail> {
+  return requestPluginConfigurationApi<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/enabled`,
+    method: 'PUT',
+    body: { enabled }
+  })
+}
+
+export function updatePluginConfiguration(
+  pluginId: string,
+  body: { secrets?: Record<string, string>; settings?: Record<string, unknown> }
+): Promise<PluginConfigurationDetail> {
+  return requestPluginConfigurationApi<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}`,
+    method: 'PUT',
+    body
+  })
+}
+
+export function clearPluginConfigurationSecret(pluginId: string, fieldId: string): Promise<PluginConfigurationDetail> {
+  return requestPluginConfigurationApi<PluginConfigurationDetail>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/secrets/${encodeURIComponent(fieldId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function refreshPluginReadiness(pluginId: string): Promise<PluginConfigurationReadiness> {
+  return requestPluginConfigurationApi<PluginConfigurationReadiness>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/readiness`,
+    method: 'POST',
+    body: {}
+  })
+}
+
+export function startPluginSetupAction(pluginId: string, actionId: string): Promise<PluginSetupActionRun> {
+  return requestPluginConfigurationApi<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(actionId)}`,
+    method: 'POST',
+    body: {}
+  })
+}
+
+export function getPluginSetupAction(runId: string): Promise<PluginSetupActionRun> {
+  return requestPluginConfigurationApi<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/actions/${encodeURIComponent(runId)}`
+  })
+}
+
+export function cancelPluginSetupAction(runId: string): Promise<PluginSetupActionRun> {
+  return requestPluginConfigurationApi<PluginSetupActionRun>({
+    ...profileScoped(),
+    path: `/api/plugin-configurations/actions/${encodeURIComponent(runId)}`,
+    method: 'DELETE'
   })
 }
 

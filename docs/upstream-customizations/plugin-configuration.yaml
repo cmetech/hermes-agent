@@ -1,0 +1,238 @@
+schema_version: 1
+feature: plugin-configuration
+# Generic host seams for descriptor-backed edge connectors. No connector id,
+# endpoint, credential name, or brand-specific default belongs in these files.
+upstream_changes:
+- id: static-plugin-configuration-descriptors
+  change_class: plugin-host-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugins.py
+  - tests/hermes_cli/test_plugin_configuration.py
+  owned_symbols:
+  - FieldStorage
+  - ValidationConstraints
+  - VisibilityCondition
+  - ReadinessContribution
+  - PluginConfigurationField
+  - SetupActionMetadata
+  - PluginConfigurationDescriptor
+  - load_plugin_configuration
+  - project_plugin_configuration
+  - PluginManifest
+  - LoadedPlugin
+  - PluginManager.static_plugin_inventory
+  owned_invariants:
+  - plugin configuration metadata is inert bounded JSON loaded without importing plugin code
+  - malformed descriptors omit configuration surfaces without preventing plugin discovery
+  - field ids, types, defaults, visibility, validation, readiness, platform projection, and setup-action metadata are bounded and fail closed
+  - descriptors declare generic host behavior and never grant connector execution authority
+  tests:
+  - tests/hermes_cli/test_plugin_configuration.py
+  expected_commit_subject: 'feat(plugins): expose static configuration descriptors'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve static, side-effect-free descriptor discovery:
+    reading plugin.yaml/config.schema.json must never import the plugin. Keep
+    schema bounds, duplicate-key rejection, regular-file/no-symlink checks,
+    fixed-width regex validation, URL validation, exact structured-plugin
+    identity, and platform filtering. Plugin discovery must remain available
+    when a descriptor is invalid, but no invalid field or action may project.
+    Do not add connector ids or vendor-specific defaults to this generic seam.
+  removal_condition: >-
+    Remove when upstream provides an equivalent bounded static plugin
+    configuration descriptor with side-effect-free discovery, generic field and
+    action projection, and the same fail-closed path/schema guarantees.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+
+- id: profile-plugin-configuration-and-setup-actions
+  change_class: plugin-host-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/plugin_configuration.py
+  - hermes_cli/plugins.py
+  - hermes_cli/main.py
+  - hermes_cli/subcommands/tools.py
+  - hermes_cli/tools_config.py
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugin_setup_actions.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/hermes_cli/test_tools_config.py
+  owned_symbols:
+  - PluginConfigurationError
+  - PluginRuntimeConfiguration
+  - SetupActionContext
+  - PluginConfigurationService
+  - _runtime_configuration_for_context
+  - get_plugin_configuration_service
+  - ConnectorCapabilitySnapshot
+  - connector_capability_snapshot
+  - PluginContext.configuration
+  - PluginContext.register_setup_action
+  - PluginManager.setup_action_registrations
+  - plugin_configuration_command
+  owned_invariants:
+  - settings are profile-local config while secrets use profile-local secret storage and never enter config.yaml or public projections
+  - runtime plugin access exposes only descriptor-declared resolved fields and distinguishes setting from secret access
+  - setup actions are registered by loaded plugin code but admitted only through matching static action metadata
+  - setup actions are bounded by concurrency, timeout, output, result, cancellation, profile ownership, and redaction contracts
+  - readiness and configured-toolset snapshots are backend-authored, bounded, immutable for one operation, and connector-id agnostic
+  - read-only configuration and readiness projections use the explicit profile config path and never bootstrap or mutate HERMES_HOME
+  - CLI and tools configuration dispatch through the same service used by other host surfaces
+  tests:
+  - tests/hermes_cli/test_plugin_configuration_storage.py
+  - tests/hermes_cli/test_plugin_setup_actions.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/hermes_cli/test_tools_config.py
+  expected_commit_subject: 'feat(plugins): configure profile connectors and setup actions'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Retain one profile-scoped service as the authority for CLI,
+    Desktop, workflow admission, and plugin runtime access. Never place secrets
+    in config.yaml, callback arguments, logs, status output, or connector
+    fingerprints. Keep static action declarations separate from runtime handler
+    registration, preserve reload publication barriers, and fail closed on
+    mismatched profiles, unknown ids, capacity exhaustion, callback failures,
+    or malformed readiness values. Do not special-case a connector in generic
+    production code.
+  removal_condition: >-
+    Remove when upstream ships equivalent profile-local plugin configuration,
+    secret storage, bounded setup-action lifecycle, runtime access, readiness,
+    and CLI projection through one connector-neutral service.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+
+- id: desktop-plugin-configuration-projection
+  change_class: desktop-capability-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/web_models.py
+  - hermes_cli/web_routers/plugin_configuration.py
+  - hermes_cli/web_server.py
+  - apps/desktop/src/app/settings/plugin-toolset-config-panel.tsx
+  - apps/desktop/src/app/settings/plugins-settings.tsx
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ar.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - tests/hermes_cli/test_plugin_configuration_api.py
+  - apps/desktop/src/app/settings/plugin-toolset-config-panel.test.tsx
+  owned_symbols:
+  - PluginConfigurationUpdate
+  - PluginEnabledUpdate
+  - PluginReadinessRequest
+  - PluginSetupActionStart
+  - list_plugin_configurations
+  - get_plugin_configuration
+  - update_plugin_configuration
+  - update_plugin_enabled
+  - clear_plugin_secret
+  - refresh_plugin_readiness
+  - start_plugin_setup_action
+  - get_plugin_setup_action
+  - cancel_plugin_setup_action
+  - PluginToolsetConfigPanel
+  - getPluginConfigurations
+  - setPluginConfigurationEnabled
+  - updatePluginConfiguration
+  - clearPluginConfigurationSecret
+  - refreshPluginReadiness
+  - startPluginSetupAction
+  - getPluginSetupAction
+  - cancelPluginSetupAction
+  - PluginConfigurationReadiness
+  - PluginConfigurationField
+  - PluginSetupAction
+  - PluginSetupActionRun
+  - PluginConfigurationDetail
+  owned_invariants:
+  - REST and Desktop render only backend-authored descriptor projections and never receive stored secret values
+  - every mutation is bound to one explicit active profile and stale responses cannot overwrite a newer profile or mutation
+  - setup-action polling and cancellation preserve run-profile ownership and bounded terminal states
+  - documentation links accept only safe HTTP or HTTPS URLs
+  - route absence remains distinguishable for compatibility with an older managed Hermes runtime
+  tests:
+  - tests/hermes_cli/test_plugin_configuration_api.py
+  - apps/desktop/src/app/settings/plugin-toolset-config-panel.test.tsx
+  - apps/desktop/src/app/settings/toolset-config-panel.test.tsx
+  expected_commit_subject: 'feat(desktop): configure standalone connector plugins'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Keep the API a thin profile-scoped projection of
+    PluginConfigurationService and preserve structured bounded errors. Desktop
+    must use those backend facts rather than reconstructing schemas or
+    readiness, must discard stale profile/mutation responses, and must never
+    render a secret value. Preserve the old-runtime missing-route fallback and
+    safe-link filtering. Keep translations structurally complete in every
+    declared locale and run typecheck as well as UI tests after merges.
+  removal_condition: >-
+    Remove when upstream provides an equivalent Desktop/API surface for generic
+    descriptor-backed plugin fields, readiness, enablement, secrets, and setup
+    actions with profile isolation and old-runtime compatibility.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+
+- id: optional-plugin-capability-staging-and-vendoring
+  change_class: capability-staging-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - .gitattributes
+  - hermes_cli/capability_staging.py
+  - scripts/vendor-ericsson.mjs
+  - scripts/__tests__/vendor-ericsson.test.mjs
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_ericsson_connector_distribution.py
+  - tests/hermes_cli/test_startup_plugin_gating.py
+  owned_symbols:
+  - _validated_manifest_plugins
+  - _merge_plugin_manifest_defaults
+  - stage_bundle
+  - seed_baked_capabilities
+  - sourceDestinationPairs
+  - compatibilityManifestOverlay
+  - managedDestinations
+  - reconcileManagedPaths
+  - vendor
+  - resolveCleanSourceCommit
+  - vendorFromCleanGitSource
+  owned_invariants:
+  - structured plugin entries carry exact path id enabled and bounded lifecycle-migration metadata while legacy string entries remain compatible
+  - disabled standalone plugins are copied and inventoried but are not auto-seeded as enabled backends
+  - source-shaped workflow snapshots and complete workflow packages publish in the same atomic exact-replacement transaction
+  - source-owned manifest fields replace prior managed state while safe source-absent compatibility skill and config-default overlays remain unowned and byte-stable
+  - digest-authenticated workflow resources retain LF bytes across Git for Windows checkouts
+  - vendoring records a full clean committed source SHA and copies committed index bytes rather than mutable worktree bytes
+  - inventory reconciliation can delete only destinations proven by the prior manifest and authenticated ledger
+  - source and destination paths, descriptors, symlinks, transaction journals, recovery, locks, and digests fail closed
+  tests:
+  - scripts/__tests__/vendor-ericsson.test.mjs
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_ericsson_connector_distribution.py
+  - tests/hermes_cli/test_startup_plugin_gating.py
+  expected_commit_subject: 'feat(capabilities): stage optional standalone plugins'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve string-manifest compatibility and the structured
+    standalone lifecycle without auto-enabling it. Keep every managed source
+    path in both the validated copy list and exact destination inventory;
+    workflows map to capabilities/workflows by basename while workflow package
+    roots remain intact. Keep source-absent compatibility overlays outside the
+    managed inventory, preserve them only when their existing trees are safe,
+    and never allow them to override source-owned fields. Digest-authenticated
+    workflow paths must remain LF-pinned. The vendor must remain manifest-last, lock-protected,
+    rollback-safe, committed-index based, and exact-replacement only. Never
+    weaken provenance or broaden deletion authority to make a merge pass.
+  removal_condition: >-
+    Remove when upstream supports equivalent structured optional-plugin
+    staging and a clean-commit, committed-index, exact-byte atomic vendor with
+    authenticated inventory reconciliation for workflows and packages.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

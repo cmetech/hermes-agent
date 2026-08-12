@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "origin",
+      "label": "GitLab origin",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Exact HTTP(S) GitLab origin, without a path.",
+      "documentation_url": "https://docs.gitlab.com/user/profile/personal_access_tokens/",
+      "validation": {
+        "format": "url",
+        "min_length": 8,
+        "max_length": 2048
+      },
+      "readiness": true
+    },
+    {
+      "id": "pat",
+      "label": "Personal access token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "help": "Write-only GitLab personal access token.",
+      "documentation_url": "https://docs.gitlab.com/user/profile/personal_access_tokens/",
+      "validation": {
+        "min_length": 1,
+        "max_length": 4096
+      },
+      "readiness": true
+    },
+    {
+      "id": "client_certificate_path",
+      "label": "Client certificate path",
+      "type": "string",
+      "storage": "setting",
+      "help": "Optional mTLS certificate; used only with a usable client key.",
+      "default": "~/.config/edpctl/auth/client.pem",
+      "advanced": true,
+      "validation": {
+        "format": "path",
+        "max_length": 4096
+      }
+    },
+    {
+      "id": "client_key_path",
+      "label": "Client key path",
+      "type": "string",
+      "storage": "setting",
+      "help": "Optional mTLS private key; used only with a usable certificate.",
+      "default": "~/.config/edpctl/auth/client-key.pem",
+      "advanced": true,
+      "validation": {
+        "format": "path",
+        "max_length": 4096
+      }
+    }
+  ]
+}

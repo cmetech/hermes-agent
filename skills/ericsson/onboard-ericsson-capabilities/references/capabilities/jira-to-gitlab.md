@@ -6,15 +6,15 @@ goals:
   - Fix this Jira defect and open a GitLab merge request.
   - Explain what is already available for Jira to GitLab.
   - Tell me what is missing before ticket-to-MR automation can run.
-maturity: partially-ported
-recommendation_eligible: false
+maturity: available
+recommendation_eligible: true
 source_flows: [docs/flows/jira-to-gitlab.md]
 implementation:
-  skills: []
-  plugins: []
+  skills: [skills/ericsson/jira-to-gitlab]
+  plugins: [plugins/ericsson-jira, plugins/ericsson-gitlab]
   mcp_servers: []
-  workflows: []
-  tools: []
+  workflows: [workflows/jira-to-gitlab.yml]
+  tools: [jira_get_issue, jira_add_comment, gitlab_resolve_project, gitlab_list_repository_tree, gitlab_read_file, gitlab_read_merge_request, gitlab_create_branch, gitlab_commit_changes, gitlab_create_merge_request]
 platforms: [macos, linux, windows]
 configuration: []
 reads: [historical Jira issue and linked GitLab source and merge-request context]
@@ -28,8 +28,8 @@ troubleshooting: [GitLab tools absent, end-to-end workflow absent, approval cont
 
 ## What it solves
 
-The legacy intent connects a Jira defect to a proposed GitLab fix, merge request,
-reviews, and Jira comment. Only Jira foundations exist; the flow cannot run.
+The bounded workflow connects an exact Jira ticket to repository research, an
+active-agent fix proposal, approval-gated GitLab writes, review, and a Jira comment.
 
 ## Try saying
 
@@ -37,35 +37,35 @@ reviews, and Jira comment. Only Jira foundations exist; the flow cannot run.
 - “Explain which parts of Jira to GitLab are ported.”
 - “What is missing before ticket-to-MR automation can run?”
 
-Ticket/file filters, write preview, fix format, artifact destination, exclusions,
-warnings, and rerun policy can be explained only as a future safety contract.
+Clarify ticket and file filters, inspect each write preview, choose fix format and
+artifact destination, record exclusions and warnings, and never blindly rerun a write.
 
 ## Questions
 
-Clarify whether the user wants status or a safe alternative. Do not request GitLab
-credentials or approval for nonexistent automation.
+Clarify the exact ticket key, GitLab project, intended change, and output expectations.
+Credentials stay in product settings; approvals apply to exact current actions.
 
 ## Reads and writes
 
-No end-to-end port performs these operations. Jira reads/comments exist separately;
-GitLab branches, commits, MRs, and review reads are missing.
+The workflow reads Jira and bounded GitLab evidence. Branches, one atomic commit,
+merge requests, and Jira comments each remain behind visible approval boundaries.
 
 ## Readiness
 
-`partially-ported`: Jira tools and workflow state machinery do not supply GitLab API
-tools, validated fix schema, approvals, workflow, or tests. Do not run this flow.
+`available`: enable and configure the GitLab plugin, verify Jira readiness, and use
+the reviewed `jira-to-gitlab` workflow with its exact tool and approval contracts.
 
 ## Demonstration
 
-No demonstration is available. Never create a branch, commit, MR, or Jira comment as
-a test and never present a mocked sequence as live success.
+Demonstrate bounded reads and dry-run previews first. Never create a branch, commit,
+MR, or Jira comment solely to prove the workflow works.
 
 ## Artifacts
 
-No current fix or review artifact is generated. Listed artifacts describe the legacy
-and planned contract, not output at a usable destination.
+Inspect per-ticket status, canonical branch/commit/MR links, review evidence,
+warnings, and the approved Jira comment at the chosen destination.
 
 ## Troubleshooting
 
-The failure is incomplete product maturity. Offer Jira summarization or a manually
-supervised coding path; an uncertain write must never be blindly rerun.
+Separate readiness, permission, not_found, incomplete evidence, rejected approval,
+and uncertain writes. Reconcile uncertainty before any rerun.

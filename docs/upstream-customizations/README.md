@@ -115,3 +115,18 @@ are revalidated after every invariant group, including the final group. A
 retryable failed attempt is also revalidated before its retry, so dependency
 drift is terminal rather than a flaky pass. Setup failure is terminal, and the
 dependency view disappears with the detached worktree on every exit path.
+
+## Manifest index
+
+- `agent-browser-probe-cache.yaml` — bounded agent-browser availability caching.
+- `browser-profiles.yaml` — enrolled browser profile trust and launch seams.
+- `desktop-loader.yaml` — non-blocking declarative Desktop loader animation.
+- `desktop-test-infra.yaml` — Desktop test and dependency-view infrastructure.
+- `gateway-autostart.yaml` — Desktop gateway automation startup and visibility.
+- `kanban-attachment-access.yaml` — bounded kanban attachment access.
+- `platform-test-skips.yaml` — explicit platform-specific test exclusions.
+- `plugin-configuration.yaml` — generic static plugin descriptors, profile setup actions, Desktop/CLI projection, and capability staging.
+- `python-isolation.yaml` — managed Python environment isolation.
+- `test-harness.yaml` — generic test harness customizations.
+- `windows-npm-toolchain.yaml` — Windows npm compatibility enforcement.
+- `workflow-orchestration.yaml` — workflow language, admission, execution, and merge invariants.

@@ -1747,6 +1747,69 @@ export interface ToolsetInfo {
   tools: string[]
 }
 
+export interface PluginConfigurationReadiness {
+  plugin_id: string
+  ready: boolean
+  reasons: string[]
+}
+
+export interface PluginConfigurationField {
+  id: string
+  label: string
+  type: string
+  storage: 'secret' | 'setting'
+  required: boolean
+  advanced: boolean
+  readiness: boolean
+  help?: string
+  documentation_url?: string
+  default?: unknown
+  platforms?: string[]
+  visible_when?: { field: string; equals: boolean | number | string | null }
+  validation?: {
+    enum?: unknown[]
+    format?: string
+    maximum?: number
+    max_length?: number
+    minimum?: number
+    min_length?: number
+    pattern?: string
+  }
+  /** Present only for non-secret settings. */
+  value?: unknown
+  /** Present only for secrets; the value itself is never returned. */
+  is_set?: boolean
+}
+
+export interface PluginSetupAction {
+  id: string
+  label: string
+  interactive: boolean
+  available: boolean
+  help?: string
+  documentation_url?: string
+}
+
+export type PluginSetupActionStatus = 'cancelled' | 'failed' | 'queued' | 'running' | 'succeeded' | 'timed_out'
+
+export interface PluginSetupActionRun {
+  run_id: string
+  plugin_id: string
+  action: string
+  status: PluginSetupActionStatus
+  error?: string
+  result?: Record<string, unknown>
+}
+
+export interface PluginConfigurationDetail {
+  plugin_id: string
+  version: number
+  enabled: boolean
+  fields: PluginConfigurationField[]
+  readiness: PluginConfigurationReadiness
+  setup_actions?: PluginSetupAction[]
+}
+
 export interface ToolEnvVar {
   key: string
   prompt: string

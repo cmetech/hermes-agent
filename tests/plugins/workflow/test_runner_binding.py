@@ -1867,7 +1867,7 @@ def test_package_mcp_capability_is_general_for_trusted_user_workflow(
                 "id": "inspect",
                 "command": "inspect-evidence",
                 "mcp": "echo.yaml",
-                "allowed_tools": ["mcp__node_echo__echo"],
+                "allowed_tools": ["mcp__node_echo__echo_tool"],
             }
         ],
     )
@@ -1970,6 +1970,75 @@ def test_package_mcp_capability_is_general_for_trusted_user_workflow(
     assert exc_info.value.code == "workflow_compatibility_blocked"
     assert list(incapable_store.runs_root.rglob("run.json")) == []
     assert list(incapable_store.staging_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    (
+        "mcp__node-echo__echo_tool",
+        "mcp__node_echo__echo-tool",
+    ),
+)
+def test_request_scoped_mcp_tools_reject_noncanonical_component_characters(
+    tmp_path: Path,
+    workflow_writer,
+    tool_name: str,
+) -> None:
+    home = tmp_path / "home"
+    workflow = workflow_writer(
+        home / "workflows",
+        name="noncanonical-request-mcp",
+        filename="noncanonical-request-mcp.yaml",
+        nodes=[
+            {
+                "id": "inspect",
+                "command": "inspect-evidence",
+                "mcp": "echo.yaml",
+                "allowed_tools": [tool_name],
+            }
+        ],
+    )
+    (home / "commands").mkdir(parents=True)
+    (home / "commands/inspect-evidence.md").write_text(
+        "Inspect the synthetic evidence.", encoding="utf-8"
+    )
+    (home / "mcp").mkdir(parents=True)
+    (home / "mcp/echo.yaml").write_text(
+        "command: python\nargs: [mcp/echo-server.py]\nenv: {}\n",
+        encoding="utf-8",
+    )
+    (home / "mcp/echo-server.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    compatibility = assess_compatibility(package, mcp_available=True)
+    risk = build_risk_summary(package, compatibility)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="runner-binding-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    with pytest.raises(ApiAdmissionError) as exc_info:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name="noncanonical-request-mcp",
+            values={},
+            idempotency_key=f"noncanonical-{tool_name}",
+            concurrency_policy="queue",
+            authority=_authority(),
+            catalog_source="profile",
+            runner_binding=_binding(runtime_managed=True),
+        )
+
+    assert exc_info.value.code == "workflow_compatibility_blocked"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_coordinator_uses_the_same_production_binding_and_request_has_no_seam(
