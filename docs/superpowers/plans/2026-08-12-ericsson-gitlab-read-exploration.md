@@ -83,6 +83,7 @@ untouched.
 SOURCE_WT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/ericsson-capabilities/.worktrees/gitlab-read-exploration
 SOURCE_PY=/Users/coreyellis/code/github.com/cmetech/otto_hermes/ericsson-capabilities/.venv/bin/python
 HERMES_WT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.worktrees/gitlab-read-exploration
+HERMES_PY=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python
 git -C "$SOURCE_WT" status --short --branch
 git -C "$HERMES_WT" status --short --branch
 ```
@@ -107,7 +108,7 @@ the baseline rather than changing production behavior opportunistically.
 
 ```bash
 cd "$HERMES_WT"
-./.venv/bin/python -m pytest -q \
+"$HERMES_PY" -m pytest -q \
   tests/hermes_cli/test_ericsson_connector_surfaces.py \
   tests/hermes_cli/test_ericsson_connector_distribution.py \
   tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
@@ -576,7 +577,7 @@ cron store or Kanban board.
 **Step 2: Confirm the new expectations are RED against the old vendor**
 
 ```bash
-./.venv/bin/python -m pytest -q \
+"$HERMES_PY" -m pytest -q \
   tests/hermes_cli/test_ericsson_connector_surfaces.py \
   tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
   tests/cron/test_cron_profile_isolation.py \
@@ -607,7 +608,7 @@ test identifies a real generic defect.
 **Step 5: Run the focused Hermes suite**
 
 ```bash
-./.venv/bin/python -m pytest -q \
+"$HERMES_PY" -m pytest -q \
   tests/hermes_cli/test_ericsson_connector_surfaces.py \
   tests/hermes_cli/test_ericsson_connector_distribution.py \
   tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
@@ -658,7 +659,7 @@ SOURCE_WT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/ericsson-capabil
 SOURCE_SHA=$(git -C "$SOURCE_WT" rev-parse HEAD)
 ERICSSON_CAPABILITIES_DIR="$SOURCE_WT" \
 ERICSSON_CAPABILITIES_TEST_EXPECTED_SHA="$SOURCE_SHA" \
-./.venv/bin/python -m pytest -q \
+"$HERMES_PY" -m pytest -q \
   tests/hermes_cli/test_ericsson_connector_surfaces.py \
   tests/hermes_cli/test_ericsson_connector_distribution.py \
   tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
@@ -669,11 +670,11 @@ ERICSSON_CAPABILITIES_TEST_EXPECTED_SHA="$SOURCE_SHA" \
 **Step 2: Run the relevant broad Hermes gates**
 
 ```bash
-./.venv/bin/python -m pytest -q \
+"$HERMES_PY" -m pytest -q \
   tests/hermes_cli \
   tests/cron \
   tests/plugins/workflow
-./scripts/run_tests.sh
+HERMES_PYTHON="$HERMES_PY" ./scripts/run_tests.sh
 git diff --check
 ```
 
