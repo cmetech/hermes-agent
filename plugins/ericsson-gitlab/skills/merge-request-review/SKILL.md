@@ -1,20 +1,20 @@
 ---
 name: merge-request-review
-description: Reviews bounded GitLab merge request evidence. Use when a user asks for an active-agent code review of a merge request.
+description: Use when a user asks to find, list, inspect, or review GitLab merge requests, their commits, review comments, discussion threads, or resolution state.
 metadata:
   hermes:
     tags: [Ericsson, GitLab, Review]
 ---
 <objective>
-Perform one read-only merge request review from bounded, canonical GitLab evidence using the active agent.
+Explore or review merge requests read-only from bounded, canonical GitLab evidence using the active agent.
 </objective>
 
 <quick_start>
-Resolve identity with <tool name="gitlab_resolve_project" mode="read">gitlab_resolve_project</tool>, then read the merge request with <tool name="gitlab_read_merge_request" mode="read">gitlab_read_merge_request</tool>. Use <tool name="gitlab_list_repository_tree" mode="read">gitlab_list_repository_tree</tool> and <tool name="gitlab_read_file" mode="read">gitlab_read_file</tool> only for files relevant to the review.
+Resolve identity with <tool name="gitlab_resolve_project" mode="read">gitlab_resolve_project</tool>. Use <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> for discovery. “New in the last 24 hours” means created in that window; “recently active” means updated in that window. Read a selected merge request with <tool name="gitlab_read_merge_request" mode="read">gitlab_read_merge_request</tool>, list its commits with <tool name="gitlab_list_merge_request_commits" mode="read">gitlab_list_merge_request_commits</tool>, and inspect review threads with <tool name="gitlab_list_merge_request_discussions" mode="read">gitlab_list_merge_request_discussions</tool>. Use <tool name="gitlab_list_repository_tree" mode="read">gitlab_list_repository_tree</tool> and <tool name="gitlab_read_file" mode="read">gitlab_read_file</tool> only for files relevant to the review.
 </quick_start>
 
 <workflow>
-The active agent evaluates correctness, regression risk, tests, and maintainability from the returned evidence. Preserve warnings and truncation. Distinguish verified findings from questions. A user who wants a branch, commit, comment, or merge request separately requests that action, which remains subject to visible host approval.
+For exploration, report state, draft status, branches, author, timestamps, labels, and canonical URL. For review, the active agent evaluates correctness, regression risk, tests, maintainability, commits, and unresolved discussions from returned evidence. Preserve warnings and truncation. Distinguish verified findings from questions. A user who wants a branch, commit, comment, or merge request mutation separately requests that action, which remains subject to visible host approval.
 </workflow>
 
 <boundaries>

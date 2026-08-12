@@ -6,7 +6,7 @@ import subprocess
 from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
-def _make_task(kb, *, assignee: str):
+def _make_task(kb, *, assignee: str, skills: list[str] | None = None):
     return kb.Task(
         id="t_spawn_tools",
         title="spawn tools",
@@ -24,6 +24,7 @@ def _make_task(kb, *, assignee: str):
         claim_expires=None,
         tenant=None,
         current_run_id=7,
+        skills=skills,
     )
 
 
@@ -207,11 +208,22 @@ def test_default_spawn_resolves_gitlab_from_the_executing_profile(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    assert kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace)) == 4343
+    assert kb._default_spawn(
+        _make_task(
+            kb,
+            assignee="elias",
+            skills=["ericsson-gitlab:gitlab-activity-digest"],
+        ),
+        str(workspace),
+    ) == 4343
 
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert "ericsson-gitlab" in pinned
+    skill_index = captured["cmd"].index("--skills")
+    assert captured["cmd"][skill_index + 1] == (
+        "ericsson-gitlab:gitlab-activity-digest"
+    )
 
     for name in tuple(registry.get_all_tool_names()):
         if name.startswith("gitlab_"):

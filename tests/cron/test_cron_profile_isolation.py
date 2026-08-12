@@ -116,6 +116,7 @@ def test_cron_connector_uses_ambient_profile_and_denies_interactive_approval(
             captured.update(kwargs)
 
         def run_conversation(self, prompt):
+            captured["effective_prompt"] = prompt
             captured["home_during_run"] = str(scheduler._get_hermes_home())
             captured["cron_context"] = get_session_env("HERMES_CRON_SESSION")
             captured["approval"] = approval.check_execute_code_guard(
@@ -159,7 +160,12 @@ def test_cron_connector_uses_ambient_profile_and_denies_interactive_approval(
         {
             "id": "profile-connector",
             "name": "Profile Connector",
-            "prompt": "Inspect GitLab",
+            "prompt": (
+                "For sd-macs-att-rnam-hosting/oscar_app/eventmesh, summarize "
+                "commits and merge requests created in the rolling last 24 hours."
+            ),
+            "skills": ["ericsson-gitlab:gitlab-activity-digest"],
+            "enabled_toolsets": ["skills", "ericsson-gitlab"],
             "schedule_display": "manual",
             # There is deliberately no supported per-job profile field.
             "profile": "wrong-profile-must-not-switch",
@@ -173,6 +179,14 @@ def test_cron_connector_uses_ambient_profile_and_denies_interactive_approval(
     assert captured["home_during_run"] == str(profile)
     assert captured["cron_context"] == "1"
     assert "ericsson-gitlab" in captured["enabled_toolsets"]
+    effective_prompt = captured["effective_prompt"]
+    assert "ericsson-gitlab:gitlab-activity-digest" in effective_prompt
+    assert "sd-macs-att-rnam-hosting/oscar_app/eventmesh" in effective_prompt
+    assert "lookback_hours=24" in effective_prompt
+    assert "Do not call `cronjob`" in effective_prompt
+    assert "return exactly `[SILENT]`" in effective_prompt
+    assert "client-key.pem" not in effective_prompt
+    assert "PRIVATE-TOKEN" not in effective_prompt
     assert captured["approval"]["approved"] is False
     assert captured["approval"]["outcome"] == "blocked"
 

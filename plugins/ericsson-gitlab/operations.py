@@ -24,6 +24,18 @@ else:  # Standalone source tests import modules directly from the plugin root.
 
 _MAX_PROJECT_REFERENCE = 2048
 _MAX_PROJECT_SLUG = 1024
+_MAX_GROUP_REFERENCE = 2048
+_MAX_GROUP_SLUG = 1024
+_MAX_GROUPS = 2000
+_MAX_GROUP_PROJECTS = 5000
+_MAX_COMMITS = 2000
+_MAX_COMMIT_TEXT = 128 * 1024
+_MAX_COMMIT_STAT = 1_000_000_000
+_MAX_COMMENTS = 2000
+_MAX_DISCUSSIONS = 1000
+_MAX_NOTES_PER_DISCUSSION = 500
+_MAX_NOTE_BODY = 128 * 1024
+_MAX_MERGE_REQUESTS = 2000
 _MAX_REF = 512
 _MAX_PATH = 4096
 _MAX_TREE_ITEMS = 2000
@@ -201,6 +213,97 @@ def _project_endpoint(project: str | int) -> str:
     return quote(value, safe="")
 
 
+def _namespace_path(value: Any, *, remote: bool) -> str:
+    category = "invalid_remote_data" if remote else "invalid_input"
+    maximum = _MAX_GROUP_SLUG if remote else _MAX_GROUP_REFERENCE
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise GitLabError(category)
+    if value != value.strip() or value.startswith("/") or value.endswith("/"):
+        raise GitLabError(category)
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise GitLabError(category)
+    if "\x00" in value:
+        raise GitLabError(category)
+    return value
+
+
+def _group_endpoint(group: str | int) -> str:
+    if isinstance(group, bool):
+        raise GitLabError("invalid_input")
+    if isinstance(group, int):
+        if group <= 0:
+            raise GitLabError("invalid_input")
+        return str(group)
+    value = _bounded_string(group, _MAX_GROUP_SLUG)
+    if value.isdigit():
+        numeric_group = int(value)
+        if numeric_group <= 0:
+            raise GitLabError("invalid_input")
+        return str(numeric_group)
+    return quote(_namespace_path(value, remote=False), safe="")
+
+
+def _continuation_source(value: Any) -> tuple[int, int]:
+    if value is None:
+        return 1, 0
+    if not isinstance(value, Mapping) or not set(value).issubset(
+        {"page", "next_page", "offset"}
+    ):
+        raise GitLabError("invalid_input")
+    if "page" in value and "next_page" in value:
+        raise GitLabError("invalid_input")
+    page = value.get("page", value.get("next_page", 1))
+    offset = value.get("offset", 0)
+    if (
+        isinstance(page, bool)
+        or not isinstance(page, int)
+        or page <= 0
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or offset >= 100
+    ):
+        raise GitLabError("invalid_input")
+    return page, offset
+
+
+def _rfc3339(value: Any, *, remote: bool) -> tuple[datetime, str]:
+    category = "invalid_remote_data" if remote else "invalid_input"
+    if not isinstance(value, str) or not value or len(value) > 128:
+        raise GitLabError(category)
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        raise GitLabError(category) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise GitLabError(category)
+    utc = parsed.astimezone(timezone.utc)
+    return utc, utc.isoformat().replace("+00:00", "Z")
+
+
+def _commit_sha(value: Any, *, short: bool = False, remote: bool = True) -> str:
+    category = "invalid_remote_data" if remote else "invalid_input"
+    minimum = 7 if short else 40
+    maximum = 40
+    if (
+        not isinstance(value, str)
+        or not minimum <= len(value) <= maximum
+        or re.fullmatch(r"[0-9a-fA-F]+", value) is None
+    ):
+        raise GitLabError(category)
+    return value.lower()
+
+
+def _remote_repo_path(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_PATH:
+        raise GitLabError("invalid_remote_data")
+    if value != value.strip() or value.startswith("/") or any(
+        part in {"", ".", ".."} for part in value.split("/")
+    ):
+        raise GitLabError("invalid_remote_data")
+    return value
+
+
 def _build_branch_name(prefix: Any, ticket_key: Any, summary: Any) -> str:
     prefix = _bounded_string(prefix, _MAX_REF).rstrip("/")
     ticket_key = _bounded_string(ticket_key, 128)
@@ -215,8 +318,14 @@ def _build_branch_name(prefix: Any, ticket_key: Any, summary: Any) -> str:
 
 
 class GitLabOperations:
-    def __init__(self, client: GitLabClient) -> None:
+    def __init__(
+        self,
+        client: GitLabClient,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.client = client
+        self._now = now or (lambda: datetime.now(timezone.utc))
 
     def _parse_project_reference(self, reference: str | int) -> dict[str, Any]:
         if isinstance(reference, int) and not isinstance(reference, bool):
@@ -256,8 +365,45 @@ class GitLabOperations:
             raise GitLabError("invalid_input")
         return {"project": slug, "link_kind": kind, "link_suffix": remainder}
 
-    def resolve_project(self, reference: str | int) -> dict[str, Any]:
-        deadline = self.client.operation_deadline()
+    def _parse_group_reference(self, reference: str | int) -> str:
+        if isinstance(reference, int) and not isinstance(reference, bool):
+            if reference <= 0:
+                raise GitLabError("invalid_input")
+            return str(reference)
+        value = _bounded_string(reference, _MAX_GROUP_REFERENCE)
+        if value.isdigit():
+            numeric_group = int(value)
+            if numeric_group <= 0:
+                raise GitLabError("invalid_input")
+            return str(numeric_group)
+        if not value.startswith(("http://", "https://")):
+            return _namespace_path(value, remote=False)
+
+        parsed = urlsplit(value)
+        configured = urlsplit(self.client.auth.origin)
+        if (
+            parsed.scheme != configured.scheme
+            or parsed.hostname != configured.hostname
+            or parsed.port != configured.port
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise GitLabError("invalid_input")
+        path = unquote(parsed.path).strip("/")
+        if not path or "/-/" in path or path.endswith(".git"):
+            raise GitLabError("invalid_input")
+        return _namespace_path(path, remote=False)
+
+    def resolve_project(
+        self,
+        reference: str | int,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        if deadline is None:
+            deadline = self.client.operation_deadline()
         parsed = self._parse_project_reference(reference)
         endpoint = _project_endpoint(parsed["project"])
         payload = _as_object(
@@ -322,6 +468,875 @@ class GitLabOperations:
             ),
         }
         return result
+
+    def _normalize_group(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        group_id = _remote_positive_int(payload.get("id"))
+        name = payload.get("name")
+        full_path = _namespace_path(payload.get("full_path"), remote=True)
+        parent_id = payload.get("parent_id")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 512
+            or name != name.strip()
+            or (parent_id is not None and (
+                isinstance(parent_id, bool)
+                or not isinstance(parent_id, int)
+                or parent_id <= 0
+            ))
+        ):
+            raise GitLabError("invalid_remote_data")
+        web_url = _canonical_remote_url(
+            payload.get("web_url"),
+            self.client.auth.origin,
+            f"/{full_path}",
+        )
+        return {
+            "id": group_id,
+            "name": name,
+            "full_path": full_path,
+            "parent_id": parent_id,
+            "web_url": web_url,
+        }
+
+    def _normalize_group_project(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        root_path: str,
+    ) -> dict[str, Any]:
+        project_id = _remote_positive_int(payload.get("id"))
+        name = payload.get("name")
+        path = _namespace_path(payload.get("path_with_namespace"), remote=True)
+        if "/" not in path or not isinstance(name, str) or not name or len(name) > 512:
+            raise GitLabError("invalid_remote_data")
+        namespace = _as_object(payload.get("namespace"))
+        namespace_kind = namespace.get("kind")
+        namespace_path = _namespace_path(namespace.get("full_path"), remote=True)
+        if namespace_kind not in {"group", "user"} or path.rsplit("/", 1)[0] != namespace_path:
+            raise GitLabError("invalid_remote_data")
+        archived = payload.get("archived")
+        if not isinstance(archived, bool):
+            raise GitLabError("invalid_remote_data")
+        default_branch = payload.get("default_branch")
+        if default_branch in {None, ""}:
+            default_branch = None
+        else:
+            default_branch = _validate_remote_ref(default_branch)
+        web_url = _canonical_remote_url(
+            payload.get("web_url"),
+            self.client.auth.origin,
+            f"/{path}",
+        )
+        shared = not (
+            namespace_path == root_path or namespace_path.startswith(root_path + "/")
+        )
+        return {
+            "id": project_id,
+            "name": name,
+            "path_with_namespace": path,
+            "owning_namespace": namespace_path,
+            "namespace_kind": namespace_kind,
+            "default_branch": default_branch,
+            "archived": archived,
+            "shared": shared,
+            "web_url": web_url,
+        }
+
+    def list_group_projects(
+        self,
+        group: str | int,
+        *,
+        recursive: bool = True,
+        include_shared: bool = False,
+        include_archived: bool = False,
+        search: str | None = None,
+        max_groups: int = 200,
+        max_projects: int = 500,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not all(
+            isinstance(value, bool)
+            for value in (recursive, include_shared, include_archived)
+        ):
+            raise GitLabError("invalid_input")
+        max_groups = _positive_bound(max_groups, _MAX_GROUPS)
+        max_projects = _positive_bound(max_projects, _MAX_GROUP_PROJECTS)
+        if search is not None:
+            search = _bounded_string(search, 512)
+        if continuation is None:
+            continuation = {}
+        if not isinstance(continuation, Mapping) or not set(continuation).issubset(
+            {"groups", "projects"}
+        ):
+            raise GitLabError("invalid_input")
+        group_page, group_offset = _continuation_source(continuation.get("groups"))
+        project_page, project_offset = _continuation_source(
+            continuation.get("projects")
+        )
+
+        deadline = self.client.operation_deadline()
+        reference = self._parse_group_reference(group)
+        endpoint = _group_endpoint(reference)
+        root = self._normalize_group(
+            _as_object(
+                self.client.get_json(
+                    f"/api/v4/groups/{endpoint}",
+                    deadline=deadline,
+                )
+            )
+        )
+        groups: list[dict[str, Any]] = [root]
+        if recursive and max_groups > 1:
+            group_pages = self._paginate(
+                f"/api/v4/groups/{root['id']}/descendant_groups",
+                params={"order_by": "full_path", "sort": "asc"},
+                max_items=max_groups - 1,
+                normalize=self._normalize_group,
+                deadline=deadline,
+                start_page=group_page,
+                start_offset=group_offset,
+            )
+            groups.extend(group_pages.items)
+        elif recursive:
+            group_pages = PageResult((), True, group_page, group_offset)
+        else:
+            if "groups" in continuation:
+                raise GitLabError("invalid_input")
+            group_pages = PageResult((), False, None, None)
+
+        project_params: dict[str, Any] = {
+            "include_subgroups": str(recursive).lower(),
+            "with_shared": str(include_shared).lower(),
+            "archived": str(include_archived).lower(),
+            "order_by": "path",
+            "sort": "asc",
+        }
+        if search is not None:
+            project_params["search"] = search
+        project_pages = self._paginate(
+            f"/api/v4/groups/{root['id']}/projects",
+            params=project_params,
+            max_items=max_projects,
+            normalize=lambda item: self._normalize_group_project(
+                item, root_path=root["full_path"]
+            ),
+            deadline=deadline,
+            start_page=project_page,
+            start_offset=project_offset,
+        )
+        projects = [
+            project
+            for project in project_pages.items
+            if (include_shared or not project["shared"])
+            and (include_archived or not project["archived"])
+        ]
+        project_counts: dict[str, int] = {}
+        for project in projects:
+            namespace = project["owning_namespace"]
+            project_counts[namespace] = project_counts.get(namespace, 0) + 1
+        normalized_groups = [
+            {**value, "project_count": project_counts.get(value["full_path"], 0)}
+            for value in groups
+        ]
+        normalized_groups.sort(key=lambda value: (value["full_path"], value["id"]))
+        projects.sort(key=lambda value: (value["path_with_namespace"], value["id"]))
+        next_sources = {
+            source: value
+            for source, value in (
+                ("groups", self._continuation(group_pages)),
+                ("projects", self._continuation(project_pages)),
+            )
+            if value is not None
+        }
+        truncated = group_pages.truncated or project_pages.truncated
+        return {
+            "root_group": next(
+                value for value in normalized_groups if value["id"] == root["id"]
+            ),
+            "recursive": recursive,
+            "include_shared": include_shared,
+            "include_archived": include_archived,
+            "search": search,
+            "groups": normalized_groups,
+            "projects": projects,
+            "group_count": len(normalized_groups),
+            "project_count": len(projects),
+            "warnings": [],
+            "truncated": truncated,
+            "complete": not truncated,
+            "continuation": next_sources or None,
+        }
+
+    @staticmethod
+    def _project_summary(project: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": project["id"],
+            "name": project["name"],
+            "path_with_namespace": project["path_with_namespace"],
+            "default_branch": project["default_branch"],
+            "web_url": project["web_url"],
+        }
+
+    def _normalize_commit(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        project_path: str,
+        include_stats: bool = False,
+    ) -> dict[str, Any]:
+        sha = _commit_sha(payload.get("id"))
+        short_sha = _commit_sha(payload.get("short_id"), short=True)
+        if not sha.startswith(short_sha):
+            raise GitLabError("invalid_remote_data")
+        title = payload.get("title")
+        message = payload.get("message")
+        author_name = payload.get("author_name")
+        committer_name = payload.get("committer_name")
+        if any(
+            not isinstance(value, str)
+            or not value
+            or "\x00" in value
+            or len(value) > maximum
+            for value, maximum in (
+                (title, _MAX_COMMIT_TEXT),
+                (message, _MAX_COMMIT_TEXT),
+                (author_name, 512),
+                (committer_name, 512),
+            )
+        ):
+            raise GitLabError("invalid_remote_data")
+        _authored, authored_at = _rfc3339(payload.get("authored_date"), remote=True)
+        _committed, committed_at = _rfc3339(
+            payload.get("committed_date"), remote=True
+        )
+        _created, created_at = _rfc3339(payload.get("created_at"), remote=True)
+        parent_values = _as_list(payload.get("parent_ids"))
+        if len(parent_values) > 100:
+            raise GitLabError("invalid_remote_data")
+        parents = [_commit_sha(value) for value in parent_values]
+        web_url = _canonical_remote_url(
+            payload.get("web_url"),
+            self.client.auth.origin,
+            f"/{project_path}/-/commit/{sha}",
+        )
+        result: dict[str, Any] = {
+            "sha": sha,
+            "short_sha": short_sha,
+            "title": title,
+            "message": message,
+            "author_name": author_name,
+            "committer_name": committer_name,
+            "authored_at": authored_at,
+            "committed_at": committed_at,
+            "created_at": created_at,
+            "parent_shas": parents,
+            "web_url": web_url,
+        }
+        if include_stats:
+            stats = _as_object(payload.get("stats"))
+            if set(stats) != {"additions", "deletions", "total"}:
+                raise GitLabError("invalid_remote_data")
+            normalized_stats: dict[str, int] = {}
+            for field in ("additions", "deletions", "total"):
+                value = stats.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value <= _MAX_COMMIT_STAT
+                ):
+                    raise GitLabError("invalid_remote_data")
+                normalized_stats[field] = value
+            if normalized_stats["total"] != (
+                normalized_stats["additions"] + normalized_stats["deletions"]
+            ):
+                raise GitLabError("invalid_remote_data")
+            result["stats"] = normalized_stats
+        return result
+
+    def list_commits(
+        self,
+        project: str | int,
+        *,
+        ref: str | None = None,
+        path: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        lookback_hours: int | None = None,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        max_items = _positive_bound(max_items, _MAX_COMMITS)
+        if ref is not None:
+            ref = _validate_ref(ref)
+        if path is not None:
+            path = _validate_path(path, allow_empty=False)
+        if lookback_hours is not None:
+            lookback_hours = _positive_bound(lookback_hours, 24 * 365)
+            if since is not None:
+                raise GitLabError("invalid_input")
+            now = self._now()
+            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+                raise GitLabError("invalid_configuration")
+            since_dt = now.astimezone(timezone.utc) - timedelta(hours=lookback_hours)
+            since = since_dt.isoformat().replace("+00:00", "Z")
+        since_dt = None
+        until_dt = None
+        if since is not None:
+            since_dt, since = _rfc3339(since, remote=False)
+        if until is not None:
+            until_dt, until = _rfc3339(until, remote=False)
+        if since_dt is not None and until_dt is not None and since_dt > until_dt:
+            raise GitLabError("invalid_input")
+        start_page, start_offset = _continuation_source(continuation)
+
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        selected_ref = ref or resolved["default_branch"]
+        params: dict[str, Any] = {
+            "ref_name": selected_ref,
+            "order": "default",
+        }
+        if path is not None:
+            params["path"] = path
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/repository/commits",
+            params=params,
+            max_items=max_items,
+            normalize=lambda item: self._normalize_commit(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "ref": selected_ref,
+            "path": path,
+            "time_window": {
+                "since": since,
+                "until": until,
+                "lookback_hours": lookback_hours,
+            },
+            "commits": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def read_commit(
+        self,
+        project: str | int,
+        commit: str,
+    ) -> dict[str, Any]:
+        commit = _validate_ref(_bounded_string(commit, _MAX_REF))
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        payload = _as_object(
+            self.client.get_json(
+                f"/api/v4/projects/{resolved['id']}/repository/commits/{quote(commit, safe='')}",
+                params={"stats": "true"},
+                deadline=deadline,
+            )
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "requested_commit": commit,
+            "commit": self._normalize_commit(
+                payload,
+                project_path=resolved["path_with_namespace"],
+                include_stats=True,
+            ),
+        }
+
+    @staticmethod
+    def _normalize_user(payload: Any) -> dict[str, Any]:
+        user = _as_object(payload)
+        user_id = _remote_positive_int(user.get("id"))
+        values: dict[str, str] = {}
+        for field, maximum in (("username", 255), ("name", 512), ("state", 64)):
+            value = user.get(field)
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or len(value) > maximum
+                or "\x00" in value
+            ):
+                raise GitLabError("invalid_remote_data")
+            values[field] = value
+        return {"id": user_id, **values}
+
+    def _normalize_commit_comment(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        body = payload.get("note")
+        if (
+            not isinstance(body, str)
+            or len(body) > _MAX_NOTE_BODY
+            or "\x00" in body
+        ):
+            raise GitLabError("invalid_remote_data")
+        _created, created_at = _rfc3339(payload.get("created_at"), remote=True)
+        path = payload.get("path")
+        line = payload.get("line")
+        line_type = payload.get("line_type")
+        if path is not None:
+            path = _remote_repo_path(path)
+        if line is not None and (
+            isinstance(line, bool) or not isinstance(line, int) or line <= 0
+        ):
+            raise GitLabError("invalid_remote_data")
+        if line_type not in {None, "new", "old"}:
+            raise GitLabError("invalid_remote_data")
+        if (path is None) != (line is None) or (line is None) != (line_type is None):
+            raise GitLabError("invalid_remote_data")
+        return {
+            "body": body,
+            "author": self._normalize_user(payload.get("author")),
+            "created_at": created_at,
+            "path": path,
+            "line": line,
+            "line_type": line_type,
+        }
+
+    @staticmethod
+    def _normalize_position(payload: Any) -> dict[str, Any] | None:
+        if payload is None:
+            return None
+        position = _as_object(payload)
+        if position.get("position_type") != "text":
+            raise GitLabError("invalid_remote_data")
+        output: dict[str, Any] = {"position_type": "text"}
+        for field in ("base_sha", "start_sha", "head_sha"):
+            output[field] = _commit_sha(position.get(field))
+        for field in ("old_path", "new_path"):
+            output[field] = _remote_repo_path(position.get(field))
+        for field in ("old_line", "new_line"):
+            value = position.get(field)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise GitLabError("invalid_remote_data")
+            output[field] = value
+        if output["old_line"] is None and output["new_line"] is None:
+            raise GitLabError("invalid_remote_data")
+        return output
+
+    def _normalize_note(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        note_id = _remote_positive_int(payload.get("id"))
+        body = payload.get("body")
+        if (
+            not isinstance(body, str)
+            or len(body) > _MAX_NOTE_BODY
+            or "\x00" in body
+        ):
+            raise GitLabError("invalid_remote_data")
+        _created, created_at = _rfc3339(payload.get("created_at"), remote=True)
+        _updated, updated_at = _rfc3339(payload.get("updated_at"), remote=True)
+        system = payload.get("system")
+        resolvable = payload.get("resolvable")
+        resolved = payload.get("resolved")
+        if not all(isinstance(value, bool) for value in (system, resolvable, resolved)):
+            raise GitLabError("invalid_remote_data")
+        resolved_by_payload = payload.get("resolved_by")
+        resolved_by = (
+            None
+            if resolved_by_payload is None
+            else self._normalize_user(resolved_by_payload)
+        )
+        resolved_at_payload = payload.get("resolved_at")
+        if resolved_at_payload is None:
+            resolved_at = None
+        else:
+            _resolved_at, resolved_at = _rfc3339(
+                resolved_at_payload, remote=True
+            )
+        if resolved and (resolved_by is None or resolved_at is None):
+            raise GitLabError("invalid_remote_data")
+        if not resolved and (resolved_by is not None or resolved_at is not None):
+            raise GitLabError("invalid_remote_data")
+        return {
+            "id": note_id,
+            "body": body,
+            "author": self._normalize_user(payload.get("author")),
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "system": system,
+            "resolvable": resolvable,
+            "resolved": resolved,
+            "resolved_by": resolved_by,
+            "resolved_at": resolved_at,
+            "position": self._normalize_position(payload.get("position")),
+        }
+
+    def _normalize_discussion(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        max_notes: int,
+    ) -> dict[str, Any]:
+        discussion_id = payload.get("id")
+        individual_note = payload.get("individual_note")
+        if (
+            not isinstance(discussion_id, str)
+            or not discussion_id
+            or len(discussion_id) > 256
+            or "\x00" in discussion_id
+            or not isinstance(individual_note, bool)
+        ):
+            raise GitLabError("invalid_remote_data")
+        raw_notes = _as_list(payload.get("notes"))
+        notes = [
+            self._normalize_note(_as_object(value))
+            for value in raw_notes[:max_notes]
+        ]
+        return {
+            "id": discussion_id,
+            "individual_note": individual_note,
+            "notes": notes,
+            "note_count": len(raw_notes),
+            "returned_note_count": len(notes),
+            "notes_truncated": len(raw_notes) > max_notes,
+        }
+
+    def list_commit_comments(
+        self,
+        project: str | int,
+        commit: str,
+        *,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        commit = _validate_ref(_bounded_string(commit, _MAX_REF))
+        max_items = _positive_bound(max_items, _MAX_COMMENTS)
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/repository/commits/{quote(commit, safe='')}/comments",
+            params={},
+            max_items=max_items,
+            normalize=self._normalize_commit_comment,
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "commit": commit,
+            "comments": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def list_commit_discussions(
+        self,
+        project: str | int,
+        commit: str,
+        *,
+        max_discussions: int = 100,
+        max_notes_per_discussion: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        commit = _validate_ref(_bounded_string(commit, _MAX_REF))
+        max_discussions = _positive_bound(max_discussions, _MAX_DISCUSSIONS)
+        max_notes_per_discussion = _positive_bound(
+            max_notes_per_discussion, _MAX_NOTES_PER_DISCUSSION
+        )
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/repository/commits/{quote(commit, safe='')}/discussions",
+            params={},
+            max_items=max_discussions,
+            normalize=lambda item: self._normalize_discussion(
+                item, max_notes=max_notes_per_discussion
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        discussions = list(pages.items)
+        return {
+            "project": self._project_summary(resolved),
+            "commit": commit,
+            "discussions": discussions,
+            "count": len(discussions),
+            "notes_truncated": any(
+                discussion["notes_truncated"] for discussion in discussions
+            ),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def _normalize_merge_request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        project_path: str,
+    ) -> dict[str, Any]:
+        identifier = _remote_positive_int(payload.get("id"))
+        iid = _remote_positive_int(payload.get("iid"))
+        title = payload.get("title")
+        state = payload.get("state")
+        draft = payload.get("draft")
+        if (
+            not isinstance(title, str)
+            or not title
+            or len(title) > _MAX_MR_TITLE_INPUT
+            or "\x00" in title
+            or state not in {"opened", "closed", "merged", "locked"}
+            or not isinstance(draft, bool)
+        ):
+            raise GitLabError("invalid_remote_data")
+        source_branch = _validate_remote_ref(payload.get("source_branch"))
+        target_branch = _validate_remote_ref(payload.get("target_branch"))
+        _created, created_at = _rfc3339(payload.get("created_at"), remote=True)
+        _updated, updated_at = _rfc3339(payload.get("updated_at"), remote=True)
+
+        optional_times: dict[str, str | None] = {}
+        for source, target in (("merged_at", "merged_at"), ("closed_at", "closed_at")):
+            value = payload.get(source)
+            if value is None:
+                optional_times[target] = None
+            else:
+                _parsed, optional_times[target] = _rfc3339(value, remote=True)
+        raw_labels = _as_list(payload.get("labels"))
+        if len(raw_labels) > 100:
+            raise GitLabError("invalid_remote_data")
+        labels: list[str] = []
+        for label in raw_labels:
+            if (
+                not isinstance(label, str)
+                or not label
+                or len(label) > 255
+                or "\x00" in label
+            ):
+                raise GitLabError("invalid_remote_data")
+            labels.append(label)
+        note_count = payload.get("user_notes_count")
+        all_resolved = payload.get("blocking_discussions_resolved")
+        if (
+            isinstance(note_count, bool)
+            or not isinstance(note_count, int)
+            or note_count < 0
+            or not isinstance(all_resolved, bool)
+        ):
+            raise GitLabError("invalid_remote_data")
+        web_url = _canonical_remote_url(
+            payload.get("web_url"),
+            self.client.auth.origin,
+            f"/{project_path}/-/merge_requests/{iid}",
+        )
+        return {
+            "id": identifier,
+            "iid": iid,
+            "title": title,
+            "state": state,
+            "draft": draft,
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "author": self._normalize_user(payload.get("author")),
+            "created_at": created_at,
+            "updated_at": updated_at,
+            **optional_times,
+            "labels": labels,
+            "note_count": note_count,
+            "discussion_resolution": {"all_resolved": all_resolved},
+            "web_url": web_url,
+        }
+
+    def list_merge_requests(
+        self,
+        project: str | int,
+        *,
+        state: str = "opened",
+        source_branch: str | None = None,
+        target_branch: str | None = None,
+        search: str | None = None,
+        order_by: str = "created_at",
+        sort: str = "desc",
+        created_after: str | None = None,
+        updated_after: str | None = None,
+        lookback_hours: int | None = None,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = "opened" if state == "open" else state
+        if state not in {"opened", "closed", "merged", "all"}:
+            raise GitLabError("invalid_input")
+        if order_by not in {"created_at", "updated_at"} or sort not in {"asc", "desc"}:
+            raise GitLabError("invalid_input")
+        if source_branch is not None:
+            source_branch = _validate_ref(source_branch)
+        if target_branch is not None:
+            target_branch = _validate_ref(target_branch)
+        if search is not None:
+            search = _bounded_string(search, 512)
+        if sum(
+            value is not None for value in (lookback_hours, created_after, updated_after)
+        ) > 1:
+            raise GitLabError("invalid_input")
+        if lookback_hours is not None:
+            lookback_hours = _positive_bound(lookback_hours, 24 * 365)
+            now = self._now()
+            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+                raise GitLabError("invalid_configuration")
+            created_after = (
+                now.astimezone(timezone.utc) - timedelta(hours=lookback_hours)
+            ).isoformat().replace("+00:00", "Z")
+        if created_after is not None:
+            _created_after, created_after = _rfc3339(
+                created_after, remote=False
+            )
+        if updated_after is not None:
+            _updated_after, updated_after = _rfc3339(
+                updated_after, remote=False
+            )
+        max_items = _positive_bound(max_items, _MAX_MERGE_REQUESTS)
+        start_page, start_offset = _continuation_source(continuation)
+
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        params: dict[str, Any] = {
+            "state": state,
+            "scope": "all",
+            "order_by": order_by,
+            "sort": sort,
+        }
+        for key, value in (
+            ("source_branch", source_branch),
+            ("target_branch", target_branch),
+            ("search", search),
+            ("created_after", created_after),
+            ("updated_after", updated_after),
+        ):
+            if value is not None:
+                params[key] = value
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/merge_requests",
+            params=params,
+            max_items=max_items,
+            normalize=lambda item: self._normalize_merge_request(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        activity_basis = (
+            "created"
+            if created_after is not None
+            else "updated"
+            if updated_after is not None
+            else None
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "filters": {
+                "state": state,
+                "source_branch": source_branch,
+                "target_branch": target_branch,
+                "search": search,
+                "order_by": order_by,
+                "sort": sort,
+                "created_after": created_after,
+                "updated_after": updated_after,
+                "lookback_hours": lookback_hours,
+            },
+            "activity_basis": activity_basis,
+            "merge_requests": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def list_merge_request_commits(
+        self,
+        project: str | int,
+        iid: int,
+        *,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        iid = _positive_bound(iid, 2_147_483_647)
+        max_items = _positive_bound(max_items, _MAX_COMMITS)
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/merge_requests/{iid}/commits",
+            params={},
+            max_items=max_items,
+            normalize=lambda item: self._normalize_commit(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "iid": iid,
+            "commits": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def list_merge_request_discussions(
+        self,
+        project: str | int,
+        iid: int,
+        *,
+        max_discussions: int = 100,
+        max_notes_per_discussion: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        iid = _positive_bound(iid, 2_147_483_647)
+        max_discussions = _positive_bound(max_discussions, _MAX_DISCUSSIONS)
+        max_notes_per_discussion = _positive_bound(
+            max_notes_per_discussion, _MAX_NOTES_PER_DISCUSSION
+        )
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/merge_requests/{iid}/discussions",
+            params={},
+            max_items=max_discussions,
+            normalize=lambda item: self._normalize_discussion(
+                item, max_notes=max_notes_per_discussion
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        discussions = list(pages.items)
+        notes = [note for discussion in discussions for note in discussion["notes"]]
+        resolvable_notes = [note for note in notes if note["resolvable"]]
+        resolved_notes = [note for note in resolvable_notes if note["resolved"]]
+        return {
+            "project": self._project_summary(resolved),
+            "iid": iid,
+            "discussions": discussions,
+            "count": len(discussions),
+            "resolution_summary": {
+                "resolvable_notes": len(resolvable_notes),
+                "resolved_notes": len(resolved_notes),
+                "unresolved_notes": len(resolvable_notes) - len(resolved_notes),
+            },
+            "summary_complete": not pages.truncated
+            and not any(value["notes_truncated"] for value in discussions),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
 
     def _list_named_refs(
         self, project_id: int, kind: str, *, deadline: float
@@ -390,9 +1405,23 @@ class GitLabOperations:
         params: Mapping[str, Any],
         max_items: int,
         normalize: Callable[[Mapping[str, Any]], dict[str, Any]],
+        deadline: float | None = None,
+        start_page: int = 1,
+        start_offset: int = 0,
     ) -> PageResult:
-        deadline = self.client.operation_deadline()
-        page = 1
+        if deadline is None:
+            deadline = self.client.operation_deadline()
+        if (
+            isinstance(start_page, bool)
+            or not isinstance(start_page, int)
+            or start_page <= 0
+            or isinstance(start_offset, bool)
+            or not isinstance(start_offset, int)
+            or not 0 <= start_offset < 100
+        ):
+            raise GitLabError("invalid_input")
+        page = start_page
+        first_page = True
         items: list[dict[str, Any]] = []
         truncated = False
         next_page: int | None = None
@@ -404,7 +1433,10 @@ class GitLabOperations:
                 path, params=query, deadline=deadline
             )
             values = _as_list(payload)
-            for offset, raw in enumerate(values):
+            offset_base = start_offset if first_page else 0
+            if offset_base > len(values):
+                raise GitLabError("invalid_input")
+            for offset, raw in enumerate(values[offset_base:], start=offset_base):
                 if len(items) >= max_items:
                     truncated = True
                     next_page = page
@@ -413,6 +1445,7 @@ class GitLabOperations:
                 items.append(normalize(_as_object(raw)))
             if truncated:
                 break
+            first_page = False
             next_header = str(headers.get("x-next-page", "")).strip()
             if not next_header and len(values) < 100:
                 break
