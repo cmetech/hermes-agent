@@ -360,6 +360,36 @@ async def test_async_operation_honors_retry_after_and_completes():
 
 
 @pytest.mark.anyio
+async def test_start_async_operation_posts_once_then_polls_trusted_location():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                202,
+                headers={"Location": "https://graph.microsoft.com/v1.0/monitor/copy-1"},
+            )
+        return httpx.Response(200, json={"status": "completed", "resourceId": "copy"})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    result = await client.start_async_operation(
+        "/drives/d/items/i/copy",
+        json_body={"parentReference": {"driveId": "d", "id": "parent"}},
+        max_polls=2,
+    )
+
+    assert result == {"status": "completed", "resourceId": "copy"}
+    assert [(call.method, str(call.url)) for call in calls] == [
+        ("POST", "https://graph.microsoft.com/v1.0/drives/d/items/i/copy"),
+        ("GET", "https://graph.microsoft.com/v1.0/monitor/copy-1"),
+    ]
+
+
+@pytest.mark.anyio
 async def test_async_operation_terminal_failure_is_bounded_and_redacted():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

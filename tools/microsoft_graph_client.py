@@ -487,6 +487,61 @@ class MicrosoftGraphClient:
             "Microsoft Graph async operation exceeded its poll limit."
         )
 
+    async def start_async_operation(
+        self,
+        path: str,
+        *,
+        json_body: Any,
+        max_polls: int,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        """Submit one async write, then poll its trusted monitor exactly once.
+
+        A transport failure during the initiating POST is deliberately not
+        replayed here: the generic request path classifies it, and callers must
+        reconcile an ambiguous write rather than create a duplicate object.
+        """
+        self._check_control(deadline=deadline, cancel_check=cancel_check)
+        url = self._resolve_url(path)
+        token = await self.token_provider.get_access_token()
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout), transport=self._transport
+            ) as client:
+                response = await client.post(
+                    url,
+                    json=json_body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                        "User-Agent": self.user_agent,
+                    },
+                )
+        except httpx.HTTPError:
+            raise MicrosoftGraphAmbiguousWriteError(
+                "Microsoft Graph async write is ambiguous; reconcile before retrying."
+            ) from None
+        if response.status_code in {200, 201}:
+            payload = self._decode_json(response)
+            return payload if isinstance(payload, dict) else {"status": "completed"}
+        if response.status_code != 202:
+            raise self._build_api_error("POST", url, response)
+        location = response.headers.get("Location")
+        if not location:
+            raise MicrosoftGraphAsyncOperationError(
+                "Microsoft Graph async operation returned no monitor location."
+            )
+        self._validate_graph_origin(location)
+        return await self.poll_async_operation(
+            location,
+            max_polls=max_polls,
+            deadline=deadline,
+            cancel_check=cancel_check,
+            poll_interval=poll_interval,
+        )
+
     async def _request(
         self,
         method: str,
