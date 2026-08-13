@@ -1,0 +1,631 @@
+name: jira-to-gitlab
+description: Bounded Jira ticket research, approved GitLab fix, review, and status update
+tags: [ericsson, jira, gitlab]
+requires: [ericsson-gitlab, ericsson-jira]
+nodes:
+  - id: read-ticket
+    prompt: >
+      Use the jira_get_issue tool for the exact bounded workflow input
+      $ARGUMENTS. Return the ticket key, summary, and explicit GitLab project
+      path with status success. For zero-ticket, not_found, permission,
+      incomplete, or failed results, return that exact status, null unavailable
+      identities, bounded warnings, and attention needed; do not infer content.
+    allowed_tools: [jira_get_issue]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, ticket_summary, project_path, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        ticket_summary: {type: [string, "null"], maxLength: 2048}
+        project_path: {type: [string, "null"], maxLength: 2048}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            ticket_summary: {type: string, minLength: 1}
+            project_path: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: resolve-project
+    depends_on: [read-ticket]
+    when: "$read-ticket.output.status == 'success'"
+    prompt: >
+      Use the gitlab_resolve_project tool for ticket
+      $read-ticket.output.ticket_key, summary
+      $read-ticket.output.ticket_summary, and the explicit project
+      $read-ticket.output.project_path with upstream status
+      $read-ticket.output.status, warnings $read-ticket.output.warnings, and
+      attention $read-ticket.output.attention_needed and when upstream is not
+      success, do not call the tool; preserve its exact failure status.
+      Otherwise return exact canonical identity and default branch.
+    allowed_tools: [gitlab_resolve_project]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, ticket_summary, project_id, project_path, default_branch, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        ticket_summary: {type: [string, "null"], maxLength: 2048}
+        project_id: {type: [integer, "null"], minimum: 1}
+        project_path: {type: [string, "null"], maxLength: 2048}
+        default_branch: {type: [string, "null"], maxLength: 512}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            ticket_summary: {type: string, minLength: 1}
+            project_id: {type: integer}
+            project_path: {type: string, minLength: 1}
+            default_branch: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: research-repository
+    depends_on: [resolve-project]
+    when: "$resolve-project.output.status == 'success'"
+    prompt: >
+      For ticket $resolve-project.output.ticket_key, use the
+      gitlab_list_repository_tree tool and gitlab_read_file tool only against
+      exact project $resolve-project.output.project_id at branch
+      $resolve-project.output.default_branch for summary
+      $resolve-project.output.ticket_summary and canonical path
+      $resolve-project.output.project_path while carrying status
+      $resolve-project.output.status, warnings $resolve-project.output.warnings,
+      and attention $resolve-project.output.attention_needed and when upstream is not
+      success, call no tool and preserve the exact failure status;
+      otherwise gather bounded evidence and every continuation fact.
+    allowed_tools: [gitlab_list_repository_tree, gitlab_read_file]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, ticket_summary, project_id, project_path, default_branch, evidence_summary, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        ticket_summary: {type: [string, "null"], maxLength: 2048}
+        project_id: {type: [integer, "null"], minimum: 1}
+        project_path: {type: [string, "null"], maxLength: 2048}
+        default_branch: {type: [string, "null"], maxLength: 512}
+        evidence_summary: {type: [string, "null"], maxLength: 16384}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            ticket_summary: {type: string, minLength: 1}
+            project_id: {type: integer}
+            project_path: {type: string, minLength: 1}
+            default_branch: {type: string, minLength: 1}
+            evidence_summary: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: reason-about-fix
+    depends_on: [research-repository]
+    when: "$research-repository.output.status == 'success'"
+    prompt: >
+      As the active agent, reason about exact project
+      $research-repository.output.project_id at
+      $research-repository.output.project_path for ticket
+      $research-repository.output.ticket_key and summary
+      $research-repository.output.ticket_summary on default branch
+      $research-repository.output.default_branch while carrying status
+      $research-repository.output.status, warnings
+      $research-repository.output.warnings, and attention
+      $research-repository.output.attention_needed and when upstream is not success,
+      preserve its exact failure status without identities. Otherwise use bounded evidence
+      $research-repository.output.evidence_summary to produce exact actions,
+      their canonical digest, branch, commit, merge-request options, gaps, and tests.
+    allowed_tools: []
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, ticket_summary, project_id, project_path, default_branch, branch_prefix, proposed_branch, branch_summary, commit_message, actions, actions_digest, mr_title, mr_description, mr_target_branch, remove_source_branch, squash, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        ticket_summary: {type: [string, "null"], maxLength: 2048}
+        project_id: {type: [integer, "null"], minimum: 1}
+        project_path: {type: [string, "null"], maxLength: 2048}
+        default_branch: {type: [string, "null"], maxLength: 512}
+        branch_prefix: {type: [string, "null"], maxLength: 512}
+        proposed_branch: {type: [string, "null"], maxLength: 512}
+        branch_summary: {type: [string, "null"], maxLength: 4096}
+        commit_message: {type: [string, "null"], maxLength: 4096}
+        actions:
+          type: [array, "null"]
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [action, file_path]
+            properties:
+              action: {type: string, enum: [create, update, delete]}
+              file_path: {type: string, minLength: 1, maxLength: 4096}
+              content: {type: string, maxLength: 524288}
+              last_commit_id: {type: string, minLength: 1, maxLength: 512}
+        actions_digest: {type: [string, "null"], maxLength: 256}
+        mr_title: {type: [string, "null"], maxLength: 255}
+        mr_description: {type: [string, "null"], maxLength: 65536}
+        mr_target_branch: {type: [string, "null"], maxLength: 512}
+        remove_source_branch: {type: [boolean, "null"]}
+        squash: {type: [boolean, "null"]}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            ticket_summary: {type: string, minLength: 1}
+            project_id: {type: integer}
+            project_path: {type: string, minLength: 1}
+            default_branch: {type: string, minLength: 1}
+            branch_prefix: {type: string, minLength: 1}
+            proposed_branch: {type: string, minLength: 1}
+            branch_summary: {type: string, minLength: 1}
+            commit_message: {type: string, minLength: 1}
+            actions: {type: array, minItems: 1}
+            actions_digest: {type: string, minLength: 1}
+            mr_title: {type: string, minLength: 1}
+            mr_description: {type: string}
+            mr_target_branch: {type: string, minLength: 1}
+            remove_source_branch: {type: boolean}
+            squash: {type: boolean}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: approve-code-writes
+    depends_on: [read-ticket, resolve-project, research-repository, reason-about-fix]
+    when: "$read-ticket.output.status == 'success' && $resolve-project.output.status == 'success' && $research-repository.output.status == 'success' && $reason-about-fix.output.status == 'success'"
+    approval:
+      message: >
+        Review one exact GitLab write plan. Status
+        $reason-about-fix.output.status; project ID
+        $reason-about-fix.output.project_id; project path
+        $reason-about-fix.output.project_path; source/default ref
+        $reason-about-fix.output.default_branch; prefix
+        $reason-about-fix.output.branch_prefix; ticket
+        $reason-about-fix.output.ticket_key; ticket summary
+        $reason-about-fix.output.ticket_summary; proposed branch
+        $reason-about-fix.output.proposed_branch; proposal
+        $reason-about-fix.output.branch_summary; commit message
+        $reason-about-fix.output.commit_message; full bounded actions
+        $reason-about-fix.output.actions; canonical action digest
+        $reason-about-fix.output.actions_digest; MR title
+        $reason-about-fix.output.mr_title; MR description
+        $reason-about-fix.output.mr_description; MR target
+        $reason-about-fix.output.mr_target_branch; remove source branch
+        $reason-about-fix.output.remove_source_branch; squash
+        $reason-about-fix.output.squash; warnings
+        $reason-about-fix.output.warnings; attention
+        $reason-about-fix.output.attention_needed
+      capture_response: true
+
+  - id: create-branch
+    depends_on: [approve-code-writes, reason-about-fix]
+    when: "$reason-about-fix.output.status == 'success'"
+    prompt: >
+      Use the gitlab_create_branch tool for exact project
+      $reason-about-fix.output.project_id, source branch
+      $reason-about-fix.output.default_branch, prefix
+      $reason-about-fix.output.branch_prefix, ticket
+      $reason-about-fix.output.ticket_key, ticket summary
+      $reason-about-fix.output.ticket_summary, project path
+      $reason-about-fix.output.project_path, and approved proposal
+      $reason-about-fix.output.branch_summary; the dry-run branch and created or
+      reused branch must equal the exact approved proposed branch
+      $reason-about-fix.output.proposed_branch byte-for-byte while checking upstream status
+      $reason-about-fix.output.status and warnings
+      $reason-about-fix.output.warnings and when status is not success, call no tool
+      and preserve the exact failure status. Otherwise set dry_run true and compare
+      the preview to the exact approved intent. If either returned branch differs
+      from the approved proposed branch, return failed with attention needed and
+      do not continue. Only then request visible host
+      approval for the current invocation and create the branch. Stop on
+      uncertain output; do not retry an ambiguous mutation.
+    allowed_tools: [gitlab_create_branch]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, project_path, branch_name, source_branch, web_url, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        project_path: {type: [string, "null"], maxLength: 2048}
+        branch_name: {type: [string, "null"], maxLength: 512}
+        source_branch: {type: [string, "null"], maxLength: 512}
+        web_url: {type: [string, "null"], maxLength: 4096}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            project_path: {type: string, minLength: 1}
+            branch_name: {type: string, minLength: 1}
+            source_branch: {type: string, minLength: 1}
+            web_url: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: commit-changes
+    depends_on: [create-branch, reason-about-fix]
+    when: "$reason-about-fix.output.status == 'success' && $create-branch.output.status == 'success' && $create-branch.output.branch_name == $reason-about-fix.output.proposed_branch"
+    prompt: >
+      Use the gitlab_commit_changes tool for exact project
+      $reason-about-fix.output.project_id and branch
+      $create-branch.output.branch_name with message
+      $reason-about-fix.output.commit_message and reconcile only these proposed
+      actions $reason-about-fix.output.actions under approved intent
+      $reason-about-fix.output.branch_summary with digest
+      $reason-about-fix.output.actions_digest while requiring proposal status
+      $reason-about-fix.output.status and branch status
+      $create-branch.output.status; require returned branch
+      $create-branch.output.branch_name to equal the exact approved proposed
+      branch $reason-about-fix.output.proposed_branch byte-for-byte; on mismatch,
+      return failed with attention needed and do not call the tool. Preserve proposal warnings
+      $reason-about-fix.output.warnings and branch warnings
+      $create-branch.output.warnings and when either status is not success, call no
+      tool and preserve the exact failure status. Otherwise set dry_run true and compare
+      the reconciled actions to the exact approved intent. Only then request
+      visible host approval for the current invocation and perform the one
+      atomic commit. Stop on uncertain output and do not retry.
+    allowed_tools: [gitlab_commit_changes]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, branch_name, commit_id, web_url, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        branch_name: {type: [string, "null"], maxLength: 512}
+        commit_id: {type: [string, "null"], maxLength: 256}
+        web_url: {type: [string, "null"], maxLength: 4096}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            branch_name: {type: string, minLength: 1}
+            commit_id: {type: string, minLength: 1}
+            web_url: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: create-merge-request
+    depends_on: [commit-changes, create-branch, reason-about-fix]
+    when: "$reason-about-fix.output.status == 'success' && $create-branch.output.status == 'success' && $create-branch.output.branch_name == $reason-about-fix.output.proposed_branch && $commit-changes.output.status == 'success'"
+    prompt: >
+      Use the gitlab_create_merge_request tool for exact project
+      $reason-about-fix.output.project_id, source branch
+      $create-branch.output.branch_name, target branch
+      $reason-about-fix.output.mr_target_branch, title
+      $reason-about-fix.output.mr_title, and description
+      $reason-about-fix.output.mr_description and bind the proposal
+      $reason-about-fix.output.branch_summary to confirmed commit
+      $commit-changes.output.commit_id with remove-source option
+      $reason-about-fix.output.remove_source_branch, and squash option
+      $reason-about-fix.output.squash while requiring proposal status
+      $reason-about-fix.output.status, branch status
+      $create-branch.output.status, and commit status
+      $commit-changes.output.status; require returned branch
+      $create-branch.output.branch_name to equal the exact approved proposed
+      branch $reason-about-fix.output.proposed_branch byte-for-byte; on mismatch,
+      return failed with attention needed and do not call the tool. Preserve their warnings
+      $reason-about-fix.output.warnings, $create-branch.output.warnings, and
+      $commit-changes.output.warnings and when any status is not success, call no
+      tool and preserve the exact failure status. Otherwise set dry_run true and compare its
+      source, target, and title to the exact approved intent. Only then request
+      visible host approval for the current invocation and create or reconcile
+      the merge request. Do not retry an uncertain result.
+    allowed_tools: [gitlab_create_merge_request]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, iid, source_branch, target_branch, title, state, web_url, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        iid: {type: [integer, "null"], minimum: 1, maximum: 2147483647}
+        source_branch: {type: [string, "null"], maxLength: 512}
+        target_branch: {type: [string, "null"], maxLength: 512}
+        title: {type: [string, "null"], maxLength: 255}
+        state: {type: [string, "null"], maxLength: 64}
+        web_url: {type: [string, "null"], maxLength: 4096}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            iid: {type: integer}
+            source_branch: {type: string, minLength: 1}
+            target_branch: {type: string, minLength: 1}
+            title: {type: string, minLength: 1}
+            state: {type: string, minLength: 1}
+            web_url: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: review-merge-request
+    depends_on: [create-merge-request, commit-changes]
+    when: "$create-merge-request.output.status == 'success' && $commit-changes.output.status == 'success'"
+    prompt: >
+      Use the gitlab_read_merge_request tool and gitlab_read_file tool for one
+      bounded active-agent review of merge request
+      $create-merge-request.output.web_url with iid
+      $create-merge-request.output.iid in project
+      $create-merge-request.output.project_id for ticket
+      $create-merge-request.output.ticket_key while confirming commit
+      $commit-changes.output.commit_id while requiring MR status
+      $create-merge-request.output.status and commit status
+      $commit-changes.output.status; preserve MR warnings
+      $create-merge-request.output.warnings and commit warnings
+      $commit-changes.output.warnings and when either status is not success, call no
+      tool and preserve the exact failure status. Otherwise return exact review facts, warnings,
+      Jira comment text, and attention needed.
+    allowed_tools: [gitlab_read_merge_request, gitlab_read_file]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, iid, merge_request_url, verdict, review_summary, jira_comment, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        iid: {type: [integer, "null"], minimum: 1, maximum: 2147483647}
+        merge_request_url: {type: [string, "null"], maxLength: 4096}
+        verdict: {type: [string, "null"], maxLength: 64}
+        review_summary: {type: [string, "null"], maxLength: 16384}
+        jira_comment: {type: [string, "null"], maxLength: 16384}
+        status: {type: string}
+        warnings:
+          type: array
+          maxItems: 128
+          items: {type: string, maxLength: 4096}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            iid: {type: integer}
+            merge_request_url: {type: string, minLength: 1}
+            verdict: {type: string, minLength: 1}
+            review_summary: {type: string, minLength: 1}
+            jira_comment: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: approve-jira-update
+    depends_on: [review-merge-request]
+    when: "$review-merge-request.output.status == 'success' && $review-merge-request.output.jira_comment != ''"
+    approval:
+      message: >
+        Review one exact Jira comment plan. Status
+        $review-merge-request.output.status; ticket
+        $review-merge-request.output.ticket_key; project ID
+        $review-merge-request.output.project_id; MR iid
+        $review-merge-request.output.iid; MR URL
+        $review-merge-request.output.merge_request_url; verdict
+        $review-merge-request.output.verdict; review
+        $review-merge-request.output.review_summary; warnings
+        $review-merge-request.output.warnings; exact comment
+        $review-merge-request.output.jira_comment; attention
+        $review-merge-request.output.attention_needed
+      capture_response: true
+
+  - id: update-jira
+    depends_on: [approve-jira-update, review-merge-request, reason-about-fix]
+    when: "$reason-about-fix.output.status == 'success' && $review-merge-request.output.status == 'success' && $review-merge-request.output.jira_comment != ''"
+    prompt: >
+      Use the jira_add_comment tool only for exact ticket
+      $review-merge-request.output.ticket_key in project
+      $review-merge-request.output.project_id for MR iid
+      $review-merge-request.output.iid and URL
+      $review-merge-request.output.merge_request_url, verdict
+      $review-merge-request.output.verdict, warnings
+      $review-merge-request.output.warnings, and exact approved review
+      $review-merge-request.output.review_summary with exact comment
+      $review-merge-request.output.jira_comment while requiring review status
+      $review-merge-request.output.status and proposal status
+      $reason-about-fix.output.status and when either status is not success, call no
+      tool and preserve the exact failure status. Otherwise request visible host approval for
+      this current invocation. Do not retry if uncertain.
+    allowed_tools: [jira_add_comment]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, iid, merge_request_url, comment_status, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        iid: {type: [integer, "null"], minimum: 1, maximum: 2147483647}
+        merge_request_url: {type: [string, "null"], maxLength: 4096}
+        comment_status: {type: [string, "null"], maxLength: 4096}
+        status: {type: string}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            iid: {type: integer}
+            merge_request_url: {type: string, minLength: 1}
+            comment_status: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}
+
+  - id: report-ticket-failure
+    depends_on: [read-ticket]
+    when: "$read-ticket.output.status != 'success'"
+    prompt: >
+      Return the exact failed ticket status for $read-ticket.output.ticket_key;
+      $read-ticket.output.status, warnings $read-ticket.output.warnings, and
+      attention $read-ticket.output.attention_needed; preserve not_found,
+      permission, incomplete, failed, skipped, or zero_ticket without writes.
+    allowed_tools: []
+    output_format: &failure_terminal
+      type: object
+      additionalProperties: false
+      required: [ticket_key, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        status: {type: string, enum: [failed, incomplete, not_found, permission, skipped, zero_ticket]}
+        warnings: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+        attention_needed: {type: boolean}
+
+  - id: report-project-failure
+    depends_on: [resolve-project]
+    when: "$resolve-project.output.status != 'success'"
+    prompt: >
+      Return the exact failed project-resolution status for
+      $resolve-project.output.ticket_key; status $resolve-project.output.status,
+      warnings $resolve-project.output.warnings, and attention
+      $resolve-project.output.attention_needed; do not claim later work.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-research-failure
+    depends_on: [research-repository]
+    when: "$research-repository.output.status != 'success'"
+    prompt: >
+      Return the exact failed repository-research status for
+      $research-repository.output.ticket_key; status $research-repository.output.status,
+      warnings $research-repository.output.warnings, and attention
+      $research-repository.output.attention_needed; do not claim later work.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-proposal-failure
+    depends_on: [reason-about-fix]
+    when: "$reason-about-fix.output.status != 'success'"
+    prompt: >
+      Return the exact failed proposal status for $reason-about-fix.output.ticket_key;
+      $reason-about-fix.output.status, warnings $reason-about-fix.output.warnings,
+      and attention $reason-about-fix.output.attention_needed; preserve not_found,
+      permission, incomplete, failed, skipped, or zero_ticket without writes.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-branch-failure
+    depends_on: [create-branch, reason-about-fix]
+    when: "$create-branch.output.status != 'success' || $create-branch.output.branch_name != $reason-about-fix.output.proposed_branch"
+    prompt: >
+      Return a bounded failed attention result for ticket
+      $create-branch.output.ticket_key; preserve branch status
+      $create-branch.output.status, warnings $create-branch.output.warnings, and
+      attention $create-branch.output.attention_needed; the returned branch
+      $create-branch.output.branch_name must equal approved branch
+      $reason-about-fix.output.proposed_branch; a mismatch is failed and no
+      later write occurred.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-commit-failure
+    depends_on: [commit-changes]
+    when: "$commit-changes.output.status != 'success'"
+    prompt: >
+      Return the exact failed commit status for $commit-changes.output.ticket_key;
+      $commit-changes.output.status, warnings $commit-changes.output.warnings,
+      and attention $commit-changes.output.attention_needed; do not claim an MR.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-merge-request-failure
+    depends_on: [create-merge-request]
+    when: "$create-merge-request.output.status != 'success'"
+    prompt: >
+      Return the exact failed merge-request status for
+      $create-merge-request.output.ticket_key; status
+      $create-merge-request.output.status, warnings
+      $create-merge-request.output.warnings, and attention
+      $create-merge-request.output.attention_needed; do not claim review or Jira.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-review-failure
+    depends_on: [review-merge-request]
+    when: "$review-merge-request.output.status != 'success'"
+    prompt: >
+      Return the exact failed review status for
+      $review-merge-request.output.ticket_key; status $review-merge-request.output.status,
+      warnings $review-merge-request.output.warnings, and attention
+      $review-merge-request.output.attention_needed; do not claim a Jira update.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-jira-failure
+    depends_on: [update-jira]
+    when: "$update-jira.output.status != 'success'"
+    prompt: >
+      Return the exact failed Jira-update status for $update-jira.output.ticket_key;
+      $update-jira.output.status, warnings $update-jira.output.warnings, and
+      attention $update-jira.output.attention_needed; preserve the failure and
+      never claim completion.
+    allowed_tools: []
+    output_format: *failure_terminal
+
+  - id: report-completion-status
+    depends_on: [update-jira, review-merge-request, reason-about-fix]
+    when: "$reason-about-fix.output.status == 'success' && $review-merge-request.output.status == 'success' && $update-jira.output.status == 'success'"
+    prompt: >
+      Return truthful per-ticket post-write status for ticket
+      $review-merge-request.output.ticket_key in project
+      $review-merge-request.output.project_id for MR iid
+      $review-merge-request.output.iid and URL
+      $review-merge-request.output.merge_request_url while requiring exact
+      successful pre-write proposal status $reason-about-fix.output.status and
+      including review status $review-merge-request.output.status, review
+      $review-merge-request.output.review_summary, verdict
+      $review-merge-request.output.verdict, warnings
+      $review-merge-request.output.warnings, Jira status
+      $update-jira.output.status, and comment outcome
+      $update-jira.output.comment_status while preserving not_found, permission,
+      incomplete, failed, skipped, zero-ticket, null identities, and attention
+      needed. Never convert an uncertain write into success or retry it.
+    allowed_tools: []
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, project_id, iid, merge_request_url, jira_status, review_status, status, warnings, attention_needed]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        project_id: {type: [integer, "null"], minimum: 1}
+        iid: {type: [integer, "null"], minimum: 1, maximum: 2147483647}
+        merge_request_url: {type: [string, "null"], maxLength: 4096}
+        jira_status: {type: [string, "null"], maxLength: 4096}
+        review_status: {type: [string, "null"], maxLength: 4096}
+        status: {type: string}
+        warnings:
+          type: array
+          maxItems: 128
+          items: {type: string, maxLength: 4096}
+        attention_needed: {type: boolean}
+      oneOf:
+        - properties:
+            status: {const: success}
+            ticket_key: {type: string, minLength: 1}
+            project_id: {type: integer}
+            iid: {type: integer}
+            merge_request_url: {type: string, minLength: 1}
+            jira_status: {type: string, minLength: 1}
+            review_status: {type: string, minLength: 1}
+        - properties:
+            status: {enum: [not_found, permission, incomplete, failed, skipped, zero_ticket]}

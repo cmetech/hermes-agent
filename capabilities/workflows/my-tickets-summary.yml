@@ -1,42 +1,41 @@
 name: my-tickets-summary
-description: Digest of my open Jira tickets, optionally emailed after approval
-version: 1.0.0
+description: Bounded read-only summary of unresolved Jira tickets assigned to the current user
 tags: [ericsson, jira]
-requires:
-  toolsets: [ericsson-jira]
-  mcp_servers: [outlook]
-  env: [JIRA_BASE_URL, JIRA_PAT]
-inputs:
-  - {name: deliver_to, default: chat}   # chat | email
+requires: [ericsson-jira]
 nodes:
-  - id: fetch
-    kind: tool
-    tools: [jira_my_tickets]
+  - id: fetch-tickets
     prompt: >
-      Fetch my open Jira tickets with the jira_my_tickets tool (max 25).
-      Save the raw JSON result to tickets.json in the run dir.
-    output: tickets.json
-  - id: summarize
-    kind: prompt
-    depends_on: [fetch]
+      Use jira_my_tickets with max_results 25. Return every bounded issue in
+      priority order with exact key, summary, status, priority, GitLab links,
+      warnings, and an explicit status. A Jira failure is not an empty workload.
+    allowed_tools: [jira_my_tickets]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [tickets, status, warnings]
+      properties:
+        tickets:
+          type: array
+          maxItems: 25
+          items: {type: object}
+        status: {type: string, enum: [success, zero_ticket, failed, permission, incomplete]}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}
+
+  - id: summarize-tickets
+    depends_on: [fetch-tickets]
     prompt: >
-      Read tickets.json and write summary.md: a markdown digest grouped by
-      priority — one line per ticket (key, summary, status, any GitLab links),
-      then a short "suggested focus" section (max 3 bullets).
-    output: summary.md
-  - id: approve_send
-    kind: approval
-    depends_on: [summarize]
-    when: "$inputs.deliver_to == 'email'"
-    message: Review summary.md before it is emailed to you.
-  - id: send
-    kind: tool
-    tools: [message_send]
-    depends_on: [approve_send]
-    side_effects: true
-    prompt: >
-      Email summary.md to me using the Outlook message_send tool
-      (subject "My Jira tickets digest", body = the file content, send=true).
-report:
-  kanban: auto
-  notify: []
+      Summarize the exact bounded tickets from $fetch-tickets.output.tickets
+      while preserving upstream status $fetch-tickets.output.status and warnings
+      $fetch-tickets.output.warnings; group successful tickets by priority, one
+      line per key with summary, status, and GitLab links, then add at most three
+      suggested-focus bullets. For failure or incomplete status, report that
+      status and do not claim an empty workload.
+    allowed_tools: []
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [summary, status, warnings]
+      properties:
+        summary: {type: string, maxLength: 32768}
+        status: {type: string}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}

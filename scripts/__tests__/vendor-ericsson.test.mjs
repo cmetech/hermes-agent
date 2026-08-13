@@ -408,6 +408,11 @@ test('vendor atomically publishes source-shaped workflows alongside workflow pac
   const src = tmpSource({ workflows })
   write(src, workflows[0], 'name: inbox digest\nsource: exact fixture bytes\n')
   write(src, workflows[1], 'name: jira to gitlab\nsource: exact fixture bytes\n')
+  write(
+    src,
+    'workflows/jira-to-gitlab.hermes.yaml',
+    'language_compatibility: archon-2026-07\n',
+  )
   const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
   seedCurrentSnapshot(dst)
   write(dst, 'capabilities/workflows/unrelated.yml', 'user-owned workflow\n')
@@ -441,6 +446,13 @@ test('vendor atomically publishes source-shaped workflows alongside workflow pac
     fs.readFileSync(path.join(dst, 'capabilities/workflows/jira-to-gitlab.yml'), 'utf8'),
     'name: jira to gitlab\nsource: exact fixture bytes\n',
   )
+  assert.equal(
+    fs.readFileSync(
+      path.join(dst, 'capabilities/workflows/jira-to-gitlab.hermes.yaml'),
+      'utf8',
+    ),
+    'language_compatibility: archon-2026-07\n',
+  )
   assert.ok(!fs.existsSync(path.join(dst, 'capabilities/workflows/w.yml')))
   assert.equal(
     fs.readFileSync(path.join(dst, 'capabilities/workflows/unrelated.yml'), 'utf8'),
@@ -450,6 +462,7 @@ test('vendor atomically publishes source-shaped workflows alongside workflow pac
     'capabilities/mcp-servers.yaml',
     'capabilities/workflow-packages/ericsson',
     'capabilities/workflows/inbox-digest.yml',
+    'capabilities/workflows/jira-to-gitlab.hermes.yaml',
     'capabilities/workflows/jira-to-gitlab.yml',
     'plugins/ericsson-jira',
     'plugins/outlook-mcp',

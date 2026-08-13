@@ -1,0 +1,14 @@
+language_compatibility: archon-2026-07
+delivery_defaults:
+  inputs:
+    arguments:
+      kind: text
+      required: true
+      max_bytes: 4096
+overlap_policy: forbid
+outward_action_nodes:
+  - create-branch
+  - commit-changes
+  - create-merge-request
+  - update-jira
+outward_action_policy: approval_required
