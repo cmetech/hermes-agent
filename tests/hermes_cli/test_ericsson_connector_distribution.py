@@ -23,6 +23,13 @@ EXPECTED_GITLAB_READ_EXPLORATION_TOOLS = {
     "gitlab_list_merge_request_commits",
     "gitlab_list_merge_request_discussions",
 }
+EXPECTED_JIRA_TOOLS = {
+    "jira_my_tickets",
+    "jira_search_issues",
+    "jira_get_issue",
+    "jira_add_comment",
+}
+JIRA_LIFECYCLE_MIGRATION = "ericsson-jira-backend-to-standalone-v1"
 
 
 def _write(path: Path, contents: str) -> None:
@@ -38,6 +45,39 @@ def test_checked_in_gitlab_bundle_exposes_read_exploration_and_digest() -> None:
 
     assert EXPECTED_GITLAB_READ_EXPLORATION_TOOLS <= set(manifest["provides_tools"])
     assert (plugin_root / "skills" / "gitlab-activity-digest" / "SKILL.md").is_file()
+
+
+def test_checked_in_jira_bundle_is_standalone_and_complete() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_root = repo_root / "plugins" / "ericsson-jira"
+    descriptor = yaml.safe_load(
+        (plugin_root / "plugin.yaml").read_text(encoding="utf-8")
+    )
+    manifest = json.loads(
+        (repo_root / "capabilities" / "ericsson.json").read_text(encoding="utf-8")
+    )
+
+    assert descriptor["kind"] == "standalone"
+    assert set(descriptor["provides_tools"]) == EXPECTED_JIRA_TOOLS
+    assert (plugin_root / "config.schema.json").is_file()
+    assert {path.parent.name for path in plugin_root.glob("skills/*/SKILL.md")} == {
+        "ticket-research",
+        "defect-triage",
+    }
+    jira = next(
+        entry
+        for entry in manifest["plugins"]
+        if isinstance(entry, dict) and entry.get("id") == "ericsson-jira"
+    )
+    assert jira == {
+        "path": "plugins/ericsson-jira",
+        "id": "ericsson-jira",
+        "enabled": False,
+        "lifecycleMigration": {
+            "id": JIRA_LIFECYCLE_MIGRATION,
+            "from": "auto_seeded_backend",
+        },
+    }
 
 
 def test_baked_distribution_exposes_but_does_not_enable_standalone_plugins(
@@ -184,3 +224,66 @@ def test_actual_gitlab_source_stages_disabled_with_complete_static_assets(
         "ci-investigation",
         "gitlab-activity-digest",
     }
+
+
+def test_real_upgraded_profile_deseeds_jira_once_and_retains_configuration(
+    tmp_path, monkeypatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "upgraded-profile"
+    home.mkdir()
+    config = {
+        "plugins": {
+            "enabled": ["workflow", "ericsson-jira", "ericsson-teams"],
+            "disabled": [],
+            "entries": {
+                "ericsson-jira": {
+                    "settings": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "bearer",
+                    }
+                }
+            },
+        },
+        "users": {"legacy-person": {"plugins": ["ericsson-jira"]}},
+    }
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+    )
+    secret_bytes = b"HERMES_PLUGIN_ERICSSON_JIRA_PAT=retained-secret\n"
+    (home / ".env").write_bytes(secret_bytes)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(staging, "_repo_root", lambda: repo_root)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: repo_root / "plugins",
+    )
+
+    staging.seed_baked_capabilities(home)
+
+    migrated = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert migrated["plugins"]["enabled"] == ["workflow", "ericsson-teams"]
+    assert migrated["plugins"]["disabled"] == []
+    assert migrated["plugins"]["lifecycle_migrations_applied"] == [
+        JIRA_LIFECYCLE_MIGRATION
+    ]
+    assert migrated["plugins"]["entries"]["ericsson-jira"] == (
+        config["plugins"]["entries"]["ericsson-jira"]
+    )
+    assert migrated["users"] == config["users"]
+    assert (home / ".env").read_bytes() == secret_bytes
+
+    migrated["plugins"]["enabled"].append("ericsson-jira")
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(migrated, sort_keys=False), encoding="utf-8"
+    )
+    staging.seed_baked_capabilities(home)
+    restaged = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert restaged["plugins"]["enabled"] == [
+        "workflow",
+        "ericsson-teams",
+        "ericsson-jira",
+    ]
+    assert restaged["plugins"]["lifecycle_migrations_applied"] == [
+        JIRA_LIFECYCLE_MIGRATION
+    ]

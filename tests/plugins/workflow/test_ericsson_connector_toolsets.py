@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
@@ -38,6 +39,101 @@ def _real_jira_to_gitlab_compilation(tmp_path):
         WorkflowCatalogSnapshot.capture((source,)),
         normalizer_version=5,
     )
+
+
+def _real_jira_showcase_compilation(tmp_path):
+    repo_root = Path(__file__).resolve().parents[3]
+    source_path = repo_root / "capabilities" / "workflows" / "jira-single-ticket-showcase.yml"
+    sidecar_path = source_path.with_name("jira-single-ticket-showcase.hermes.yaml")
+    workflow_root = tmp_path / "real-jira-source" / "workflows"
+    workflow_root.mkdir(parents=True)
+    copied = workflow_root / source_path.name
+    copied.write_bytes(source_path.read_bytes())
+    copied_sidecar = workflow_root / sidecar_path.name
+    copied_sidecar.write_bytes(sidecar_path.read_bytes())
+    source = parse_workflow_source_bytes(
+        copied,
+        workflow_bytes=copied.read_bytes(),
+        sidecar_bytes=copied_sidecar.read_bytes(),
+        source="ericsson",
+        precedence=1,
+    )
+    return compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=5,
+    )
+
+
+def test_real_jira_showcase_has_exact_tools_and_ready_unready_admission(tmp_path):
+    from plugins.workflow.admission_service import assess_workflow_admission
+    from tests.plugins.workflow.test_phase5_admission_parity import _context
+
+    compilation = _real_jira_showcase_compilation(tmp_path)
+    package = compilation.package
+    exact_tools = frozenset(
+        tool
+        for node in package.definition.nodes
+        for tool in node.options.get("allowed_tools", ())
+    )
+    assert package.definition.options["requires"] == ("ericsson-jira",)
+    assert exact_tools == {"jira_get_issue", "jira_add_comment"}
+
+    blocked = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset(),
+        available_tools=frozenset(),
+    )
+    admitted = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset({"ericsson-jira"}),
+        available_tools=exact_tools,
+    )
+    assert blocked.compatibility.runnable is False
+    assert admitted.compatibility.runnable is True
+
+
+def test_real_jira_showcase_blocks_before_run_creation_when_unready(
+    tmp_path, monkeypatch
+):
+    import plugins.workflow.cli as cli_module
+    from plugins.workflow.admission_service import assess_workflow_admission
+    from plugins.workflow.compat import WorkflowCompatibilityBlockedError
+    from tests.plugins.workflow.test_phase5_admission_parity import _context
+
+    compilation = _real_jira_showcase_compilation(tmp_path)
+    snapshot = SimpleNamespace(
+        ready_services=frozenset(),
+        available_tools=frozenset(),
+        fingerprint="0" * 64,
+    )
+    monkeypatch.setattr(cli_module, "_resolve_compilation", lambda *_a: compilation)
+    monkeypatch.setattr(cli_module, "_runtime_config", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "connector_capability_snapshot", lambda: snapshot)
+    monkeypatch.setattr(
+        cli_module,
+        "assess_production_workflow_admission",
+        lambda candidate, **availability: assess_workflow_admission(
+            candidate, _context(), **availability
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module.WorkflowTrustStore,
+        "check",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("trust/store path ran before Jira connector admission")
+        ),
+    )
+
+    with pytest.raises(WorkflowCompatibilityBlockedError):
+        cli_module._cmd_run(
+            argparse.Namespace(
+                name="jira-single-ticket-showcase",
+                hermes_home=str(tmp_path / "home"),
+            )
+        )
 
 
 def _connector_compilation(tmp_path):

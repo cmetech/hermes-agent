@@ -42,6 +42,16 @@ PLUGIN_SKILLS = {
     "ericsson-gitlab:ci-investigation",
     "ericsson-gitlab:gitlab-activity-digest",
 }
+JIRA_TOOL_NAMES = {
+    "jira_my_tickets",
+    "jira_search_issues",
+    "jira_get_issue",
+    "jira_add_comment",
+}
+JIRA_PLUGIN_SKILLS = {
+    "ericsson-jira:ticket-research",
+    "ericsson-jira:defect-triage",
+}
 
 
 def _vendor_source(home: Path) -> None:
@@ -168,6 +178,94 @@ def test_source_resolver_rejects_explicit_nonrepository(tmp_path, monkeypatch):
 def _reachable_tool_names(definitions: list[dict]) -> set[str]:
     serialized = json.dumps(definitions, sort_keys=True)
     return {name for name in TOOL_NAMES if name in serialized}
+
+
+def _reachable_jira_tool_names(definitions: list[dict]) -> set[str]:
+    serialized = json.dumps(definitions, sort_keys=True)
+    return {name for name in JIRA_TOOL_NAMES if name in serialized}
+
+
+def test_jira_router_and_tools_follow_fresh_enabled_session_boundary(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+    from hermes_cli.plugin_configuration import PluginConfigurationService
+    from hermes_cli.plugins import PluginManager
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+    from tools.skills_tool import skill_view, skills_list
+
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "jira-profile"
+    home.mkdir()
+    shutil.copytree(repo_root / "plugins" / "ericsson-jira", home / "plugins" / "ericsson-jira")
+    shutil.copytree(
+        repo_root / "skills" / "ericsson" / "jira",
+        home / "skills" / "ericsson" / "jira",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": [], "disabled": ["ericsson-jira"]}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+
+    disabled_manager = PluginManager()
+    disabled_manager.discover_and_load()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", disabled_manager)
+    disabled_surface = get_tool_definitions(
+        enabled_toolsets=["skills", "ericsson-jira"], quiet_mode=True
+    )
+    assert _reachable_jira_tool_names(disabled_surface) == set()
+    assert disabled_manager.list_plugin_skills("ericsson-jira") == []
+    assert "jira" in json.dumps(json.loads(skills_list())).lower()
+    router = json.loads(skill_view("ericsson/jira", preprocess=False))
+    assert router["success"] is True
+    assert "enable" in router["content"].lower()
+    assert "configure" in router["content"].lower()
+    assert "fresh conversation" in router["content"].lower()
+    assert "ericsson-jira:ticket-research" in router["content"]
+    assert json.loads(
+        skill_view("ericsson-jira:ticket-research", preprocess=False)
+    )["success"] is False
+
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": ["ericsson-jira"], "disabled": []}}
+        ),
+        encoding="utf-8",
+    )
+    enabled_manager = PluginManager()
+    enabled_manager.discover_and_load()
+    PluginConfigurationService(enabled_manager).update(
+        "ericsson-jira",
+        settings={
+            "base_url": "https://jira.example.test",
+            "auth_mode": "bearer",
+        },
+        secrets={"pat": "profile-only-jira-token"},
+    )
+    monkeypatch.setattr(plugins_module, "_plugin_manager", enabled_manager)
+    fresh_surface = get_tool_definitions(
+        enabled_toolsets=["skills", "ericsson-jira"], quiet_mode=True
+    )
+
+    assert _reachable_jira_tool_names(disabled_surface) == set()
+    assert _reachable_jira_tool_names(fresh_surface) == JIRA_TOOL_NAMES
+    assert {
+        f"ericsson-jira:{name}"
+        for name in enabled_manager.list_plugin_skills("ericsson-jira")
+    } == JIRA_PLUGIN_SKILLS
+    loaded = json.loads(
+        skill_view("ericsson-jira:ticket-research", preprocess=False)
+    )
+    assert loaded["success"] is True
+    assert "profile-only-jira-token" not in json.dumps(loaded)
+
+    for name in JIRA_TOOL_NAMES:
+        registry.deregister(name)
 
 
 def test_disabled_router_and_fresh_session_activation_are_cache_stable(
