@@ -1,0 +1,20 @@
+name: ericsson-sharepoint
+version: 1.0.0
+description: "Bounded Ericsson SharePoint files, folders, sites, and permission audits."
+author: Ericsson (cmetech)
+kind: standalone
+config_schema: config.schema.json
+provides_tools:
+  - sharepoint_resolve_url
+  - sharepoint_get_item
+  - sharepoint_list_items
+  - sharepoint_download
+  - sharepoint_list_owned_sites
+  - sharepoint_audit_permissions
+  - sharepoint_upload
+  - sharepoint_create_folder
+  - sharepoint_move_item
+  - sharepoint_copy_item
+  - sharepoint_recycle_item
+provides_hooks:
+  - pre_tool_call

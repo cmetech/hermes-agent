@@ -30,6 +30,19 @@ EXPECTED_JIRA_TOOLS = {
     "jira_get_issue",
     "jira_add_comment",
 }
+EXPECTED_SHAREPOINT_TOOLS = {
+    "sharepoint_resolve_url",
+    "sharepoint_get_item",
+    "sharepoint_list_items",
+    "sharepoint_download",
+    "sharepoint_list_owned_sites",
+    "sharepoint_audit_permissions",
+    "sharepoint_upload",
+    "sharepoint_create_folder",
+    "sharepoint_move_item",
+    "sharepoint_copy_item",
+    "sharepoint_recycle_item",
+}
 JIRA_LIFECYCLE_MIGRATION = "ericsson-jira-backend-to-standalone-v1"
 
 
@@ -79,6 +92,47 @@ def test_checked_in_jira_bundle_is_standalone_and_complete() -> None:
             "from": "auto_seeded_backend",
         },
     }
+
+
+def test_checked_in_sharepoint_bundle_is_disabled_complete_and_profiled() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_root = repo_root / "plugins" / "ericsson-sharepoint"
+    descriptor = yaml.safe_load(
+        (plugin_root / "plugin.yaml").read_text(encoding="utf-8")
+    )
+    configuration = json.loads(
+        (plugin_root / "config.schema.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads(
+        (repo_root / "capabilities" / "ericsson.json").read_text(encoding="utf-8")
+    )
+
+    assert descriptor["kind"] == "standalone"
+    assert set(descriptor["provides_tools"]) == EXPECTED_SHAREPOINT_TOOLS
+    assert {action["id"] for action in configuration["setup_actions"]} == {
+        "authenticate",
+        "test_connection",
+        "enroll_browser",
+        "clear_session",
+    }
+    assert {path.parent.name for path in plugin_root.glob("skills/*/SKILL.md")} == {
+        "sharepoint-navigation",
+        "sharepoint-file-operations",
+        "sharepoint-permission-audit",
+    }
+    sharepoint = next(
+        entry
+        for entry in manifest["plugins"]
+        if isinstance(entry, dict) and entry.get("id") == "ericsson-sharepoint"
+    )
+    assert sharepoint == {
+        "path": "plugins/ericsson-sharepoint",
+        "id": "ericsson-sharepoint",
+        "enabled": False,
+    }
+    workflow = repo_root / "capabilities/workflows/sharepoint-document-intake.yml"
+    assert workflow.is_file()
+    assert workflow.with_name("sharepoint-document-intake.hermes.yaml").is_file()
 
 
 def test_fresh_profile_discovers_every_distributed_jira_workflow(

@@ -65,6 +65,73 @@ def _real_jira_showcase_compilation(tmp_path):
     )
 
 
+def _real_sharepoint_compilation(tmp_path):
+    repo_root = Path(__file__).resolve().parents[3]
+    source_path = (
+        repo_root / "capabilities" / "workflows" / "sharepoint-document-intake.yml"
+    )
+    sidecar_path = source_path.with_name("sharepoint-document-intake.hermes.yaml")
+    workflow_root = tmp_path / "real-sharepoint-source" / "workflows"
+    workflow_root.mkdir(parents=True)
+    copied = workflow_root / source_path.name
+    copied.write_bytes(source_path.read_bytes())
+    copied_sidecar = workflow_root / sidecar_path.name
+    copied_sidecar.write_bytes(sidecar_path.read_bytes())
+    source = parse_workflow_source_bytes(
+        copied,
+        workflow_bytes=copied.read_bytes(),
+        sidecar_bytes=copied_sidecar.read_bytes(),
+        source="ericsson",
+        precedence=1,
+    )
+    return compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=5,
+    )
+
+
+def test_real_sharepoint_intake_has_exact_tools_and_ready_unready_admission(tmp_path):
+    from plugins.workflow.admission_service import assess_workflow_admission
+    from tests.plugins.workflow.test_phase5_admission_parity import _context
+
+    compilation = _real_sharepoint_compilation(tmp_path)
+    package = compilation.package
+    exact_tools = frozenset(
+        tool
+        for node in package.definition.nodes
+        for tool in node.options.get("allowed_tools", ())
+    )
+    assert package.definition.options["requires"] == ("ericsson-sharepoint",)
+    assert exact_tools == {
+        "sharepoint_resolve_url",
+        "sharepoint_list_items",
+        "sharepoint_download",
+    }
+
+    blocked = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset(),
+        available_tools=exact_tools,
+    )
+    admitted = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset({"ericsson-sharepoint"}),
+        available_tools=exact_tools,
+    )
+    missing_tool = assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=frozenset({"ericsson-sharepoint"}),
+        available_tools=exact_tools - {"sharepoint_download"},
+    )
+    assert blocked.compatibility.runnable is False
+    assert admitted.compatibility.runnable is True
+    assert missing_tool.compatibility.runnable is False
+
+
 def test_real_jira_showcase_has_exact_tools_and_ready_unready_admission(tmp_path):
     from plugins.workflow.admission_service import assess_workflow_admission
     from tests.plugins.workflow.test_phase5_admission_parity import _context

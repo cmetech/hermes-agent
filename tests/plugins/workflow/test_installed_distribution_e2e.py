@@ -204,6 +204,62 @@ def test_installed_distribution_contains_complete_gitlab_connector(
     }
 
 
+def test_installed_distribution_contains_complete_sharepoint_connector(
+    installed_distribution,
+) -> None:
+    site, _env, _wheels = installed_distribution
+    plugin = site / "plugins" / "ericsson-sharepoint"
+    required_files = {
+        "plugin.yaml",
+        "config.schema.json",
+        "__init__.py",
+        "audit.py",
+        "auth.py",
+        "client.py",
+        "models.py",
+        "operations.py",
+        "tools.py",
+        "url_parser.py",
+    }
+    actual_files = {path.name for path in plugin.iterdir() if path.is_file()}
+    actual_plugin_skills = {
+        path.parent.name for path in plugin.glob("skills/*/SKILL.md")
+    }
+    assert {
+        "missing_files": sorted(required_files - actual_files),
+        "plugin_skills": sorted(actual_plugin_skills),
+        "router_present": (
+            site / "skills" / "ericsson" / "sharepoint" / "SKILL.md"
+        ).is_file(),
+        "workflow_present": (
+            site
+            / "capabilities"
+            / "workflow-packages"
+            / "ericsson"
+            / "workflows"
+            / "sharepoint-document-intake.yaml"
+        ).is_file(),
+        "workflow_sidecar_present": (
+            site
+            / "capabilities"
+            / "workflow-packages"
+            / "ericsson"
+            / "workflows"
+            / "sharepoint-document-intake.hermes.yaml"
+        ).is_file(),
+    } == {
+        "missing_files": [],
+        "plugin_skills": [
+            "sharepoint-file-operations",
+            "sharepoint-navigation",
+            "sharepoint-permission-audit",
+        ],
+        "router_present": True,
+        "workflow_present": True,
+        "workflow_sidecar_present": True,
+    }
+
+
 @pytest.mark.integration
 def test_installed_distribution_runs_sealed_openai_credential_transaction(
     tmp_path: Path,

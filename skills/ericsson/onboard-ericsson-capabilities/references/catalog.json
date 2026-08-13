@@ -227,6 +227,23 @@
     },
     {
       "aliases": [
+        "SharePoint connector",
+        "SharePoint files",
+        "SharePoint permission audit"
+      ],
+      "displayName": "Ericsson SharePoint Tools",
+      "entry": "references/capabilities/sharepoint-tools.md",
+      "goals": [
+        "Resolve and inspect an Ericsson SharePoint link.",
+        "Download a bounded set of SharePoint files for separate document processing.",
+        "Collect bounded SharePoint permission evidence."
+      ],
+      "id": "sharepoint-tools",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
         "Microsoft Teams tools",
         "Teams channels",
         "Graph device code"
