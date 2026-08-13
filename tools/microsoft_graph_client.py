@@ -11,6 +11,7 @@ import httpx
 
 from agent.retry_utils import parse_retry_after_seconds
 from tools.microsoft_graph_auth import GraphCredentials, MicrosoftGraphTokenProvider
+from tools.microsoft_graph_identity import GraphAccessTokenProvider
 
 
 DEFAULT_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -48,7 +49,7 @@ class MicrosoftGraphClient:
 
     def __init__(
         self,
-        token_provider: MicrosoftGraphTokenProvider,
+        token_provider: GraphAccessTokenProvider,
         *,
         base_url: str = DEFAULT_GRAPH_BASE_URL,
         timeout: float = 60.0,

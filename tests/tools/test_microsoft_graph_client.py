@@ -31,6 +31,32 @@ def _make_provider() -> MicrosoftGraphTokenProvider:
 
 @pytest.mark.anyio
 class TestMicrosoftGraphClient:
+    async def test_accepts_generic_provider_without_app_only_credentials(self):
+        class DelegatedProvider:
+            def __init__(self):
+                self.calls = []
+
+            async def get_access_token(self, *, force_refresh=False):
+                self.calls.append(force_refresh)
+                return "delegated-token"
+
+            def clear_cache(self):
+                return None
+
+        provider = DelegatedProvider()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == "Bearer delegated-token"
+            return httpx.Response(200, json={"ok": True})
+
+        client = MicrosoftGraphClient(
+            provider,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert provider.calls == [False]
+
     async def test_attaches_bearer_token_header(self):
         captured_auth: list[str] = []
 
