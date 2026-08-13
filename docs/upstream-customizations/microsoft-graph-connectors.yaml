@@ -1,0 +1,111 @@
+schema_version: 1
+feature: microsoft-graph-connectors
+# Connector-neutral Microsoft Graph primitives shared by existing Teams
+# behavior and independently distributed edge connectors. Generic production
+# code must not contain a downstream connector id, tenant, endpoint, scope, or
+# credential default.
+upstream_changes:
+- id: generic-microsoft-graph-delegated-identity
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - tools/microsoft_graph_auth.py
+  - tools/microsoft_graph_identity.py
+  - tests/tools/test_microsoft_graph_auth.py
+  - tests/tools/test_microsoft_graph_identity.py
+  owned_symbols:
+  - _redact_value
+  - GraphAuthMode
+  - MicrosoftGraphIdentityError
+  - MicrosoftGraphIdentityConfigError
+  - MicrosoftGraphTokenCacheError
+  - MicrosoftGraphInteractiveAuthRequired
+  - MicrosoftGraphDelegatedTokenError
+  - GraphAccessTokenProvider
+  - GraphIdentityConfig
+  - select_auth_mode
+  - GraphIdentityReadiness
+  - inspect_identity_readiness
+  - GraphTokenCacheStore
+  - DelegatedMicrosoftGraphTokenProvider
+  - AzureCliMicrosoftGraphTokenProvider
+  - create_graph_token_provider
+  owned_invariants:
+  - identity configuration and readiness are immutable connector-neutral values with explicit mode selection and no ambient credential guessing
+  - app-only, delegated device-code, enrolled-browser, and Azure CLI identities implement one token-provider protocol without changing existing app-only callers
+  - persistent delegated token caches are profile-owned regular files with bounded permissions, atomic writes, and no token-bearing public representation
+  - silent delegated acquisition fails closed into an explicit interactive-auth requirement and never starts user interaction inside ordinary tool execution
+  - token acquisition errors redact configured secrets and token providers expose no credential material through repr or readiness projections
+  tests:
+  - tests/tools/test_microsoft_graph_auth.py
+  - tests/tools/test_microsoft_graph_identity.py
+  - tests/gateway/test_teams_pipeline_runtime_wiring.py
+  - tests/plugins/test_teams_pipeline_plugin.py
+  expected_commit_subject: 'feat(graph): support generic delegated identities'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve MicrosoftGraphTokenProvider as the compatible
+    app-only implementation of GraphAccessTokenProvider while retaining
+    explicit connector-supplied GraphIdentityConfig for delegated modes. Keep
+    token caches profile-local, regular-file-only, atomically replaced, and
+    secret-safe. Interactive acquisition remains an explicit setup action;
+    ordinary tool execution may use silent acquisition only and must fail
+    closed when interaction is required. Do not add connector ids, tenant
+    defaults, scopes, or browser ownership policy to these generic modules.
+    Rerun the Graph identity tests and the Teams pipeline tests after any merge.
+  removal_condition: >-
+    Remove when upstream provides an equivalent connector-neutral Graph token
+    provider protocol with explicit app-only and delegated identity selection,
+    profile-owned safe cache persistence, silent-versus-interactive separation,
+    secret redaction, and unchanged Teams app-only behavior.
+  last_verified_upstream: da59906aaad8f9cb023fb66426c6f60ff5afa04a
+
+- id: bounded-microsoft-graph-client-operations
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - tools/microsoft_graph_client.py
+  - tests/tools/test_microsoft_graph_client.py
+  - tests/tools/test_microsoft_graph_large_transfer.py
+  owned_symbols:
+  - GRAPH_UPLOAD_FRAGMENT_BYTES
+  - MicrosoftGraphLimitError
+  - MicrosoftGraphCancelledError
+  - MicrosoftGraphDeadlineError
+  - MicrosoftGraphUploadSessionExpired
+  - MicrosoftGraphAmbiguousWriteError
+  - MicrosoftGraphAsyncOperationError
+  - MicrosoftGraphClient
+  owned_invariants:
+  - existing JSON request, pagination, retry, and streaming-download behavior remains compatible for Teams callers
+  - Graph pagination and async monitor URLs remain on the configured Graph origin and error URLs omit queries and fragments
+  - download redirects require absolute credential-free HTTPS targets and never receive a Microsoft Graph bearer token
+  - downloads and uploads use atomic file boundaries plus explicit byte, chunk, poll, deadline, and cooperative-cancellation limits
+  - upload session fragments are aligned to the Graph fragment size and resume only from validated server offsets
+  - writes with an ambiguous transport or server outcome are not replayed automatically and require caller reconciliation
+  - asynchronous writes validate one same-origin monitor and stop at explicit terminal states or bounded failure
+  tests:
+  - tests/tools/test_microsoft_graph_client.py
+  - tests/tools/test_microsoft_graph_large_transfer.py
+  - tests/gateway/test_teams_pipeline_runtime_wiring.py
+  - tests/plugins/test_teams_pipeline_plugin.py
+  expected_commit_subject: 'feat(graph): add bounded large transfer operations'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Retain the old MicrosoftGraphClient call signatures and
+    default retry behavior for existing reads while preserving explicit
+    retry_ambiguous controls for mutations. Never forward Authorization to a
+    download redirect or upload-session URL. Keep origin validation, safe URL
+    rendering, temporary-file cleanup, Graph-aligned resume validation, and all
+    caller-supplied operation bounds. Transport-ambiguous mutations must remain
+    non-replayed. Run both Graph client suites and Teams pipeline regression
+    after changes to request, pagination, retry, or transfer behavior.
+  removal_condition: >-
+    Remove when upstream provides equivalent bounded Graph transfers and async
+    operations with same-origin monitor validation, bearer-safe redirects,
+    atomic file handling, cancellation and deadline controls, validated upload
+    resume offsets, and non-replay of ambiguous mutations while preserving the
+    existing Teams client contract.
+  last_verified_upstream: da59906aaad8f9cb023fb66426c6f60ff5afa04a

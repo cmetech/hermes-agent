@@ -82,11 +82,13 @@ upstream_changes:
   - readiness and configured-toolset snapshots are backend-authored, bounded, immutable for one operation, and connector-id agnostic
   - read-only configuration and readiness projections use the explicit profile config path and never bootstrap or mutate HERMES_HOME
   - CLI and tools configuration dispatch through the same service used by other host surfaces
+  - disabled standalone plugins may project inert static setup metadata but publish no runtime handlers, tools, or plugin skills until an enabled fresh plugin manager loads them
   tests:
   - tests/hermes_cli/test_plugin_configuration_storage.py
   - tests/hermes_cli/test_plugin_setup_actions.py
   - tests/hermes_cli/test_plugins.py
   - tests/hermes_cli/test_tools_config.py
+  - tests/hermes_cli/test_ericsson_connector_surfaces.py
   expected_commit_subject: 'feat(plugins): configure profile connectors and setup actions'
   upstream_candidate: true
   merge_guidance: >-
@@ -97,7 +99,8 @@ upstream_changes:
     registration, preserve reload publication barriers, and fail closed on
     mismatched profiles, unknown ids, capacity exhaustion, callback failures,
     or malformed readiness values. Do not special-case a connector in generic
-    production code.
+    production code. Preserve the fresh-manager publication boundary: changing
+    profile enablement does not mutate an already-published tool surface.
   removal_condition: >-
     Remove when upstream ships equivalent profile-local plugin configuration,
     secret storage, bounded setup-action lifecycle, runtime access, readiness,
