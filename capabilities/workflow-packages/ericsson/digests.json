@@ -2,6 +2,8 @@
   "schemaVersion": 1,
   "packages": {
     "inbox-digest": "b959fcfc7b0b9d360c14c19047c9f7371981883271d1333daf12e21d3732ade4",
-    "my-tickets-summary": "abe270cac341a90b6671f1de7d820a8c9dd77fdff007988987ff6731b1829953"
+    "jira-single-ticket-showcase": "f5cc950888423faf8b1a3eb0688aa934f0b4d4d2b77591d573f1507c572cc9f7",
+    "jira-to-gitlab": "31fe86858108283e2f4aed8cb22e7291d7d6c1df02646a24156b02523893166c",
+    "my-tickets-summary": "6a002d7c292098a92fadbeca8f5d686fcd5c40c84f7a81695ea939181e581e7e"
   }
 }

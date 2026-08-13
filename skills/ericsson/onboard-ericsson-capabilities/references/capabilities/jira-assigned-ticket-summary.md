@@ -10,24 +10,26 @@ maturity: available
 recommendation_eligible: true
 source_flows: [docs/flows/jira-assigned-tickets-summary.md]
 implementation:
-  skills: []
+  skills: [skills/ericsson/jira]
   plugins: [plugins/ericsson-jira]
   mcp_servers: []
   workflows: [workflows/my-tickets-summary.yml]
   tools: [jira_my_tickets]
 platforms: [macos, linux, windows]
 configuration:
-  - {name: JIRA_BASE_URL, kind: static-setting, required: true, guidance: Configure the Jira site URL in protected Tools & Keys.}
-  - {name: JIRA_PAT, kind: static-secret, required: true, guidance: Enter the Jira token only in protected Tools & Keys and never in chat.}
-  - {name: deliver_to, kind: workflow-input, required: false, guidance: Choose chat by default or email only when the optional Windows Outlook delivery path is ready.}
-  - {name: Windows, kind: local-software, required: false, guidance: Required only for optional email delivery; chat delivery remains cross-platform.}
-  - {name: Classic Outlook desktop, kind: local-software, required: false, guidance: Required only for optional email delivery and must be open signed in and online.}
-  - {name: PowerShell and Outlook COM, kind: local-software, required: false, guidance: Required only for optional email delivery.}
-  - {name: Outlook mailbox access, kind: permission, required: false, guidance: Required only for optional email delivery to the authorized mailbox.}
-  - {name: Outlook MCP, kind: local-software, required: false, guidance: Required only for optional email delivery and must be discoverable and ready.}
+  - {name: base_url, kind: static-setting, required: true, guidance: Configure the exact Jira origin through the standalone connector's Tools settings.}
+  - {name: auth_mode, kind: static-setting, required: true, guidance: Choose bearer PAT or basic email/API-token authentication through Tools.}
+  - {name: pat, kind: static-secret, required: true, guidance: When bearer mode is selected store the token only through the protected write-only Tools field.}
+  - {name: email, kind: static-setting, required: true, guidance: Configure the Jira account email when basic mode is selected.}
+  - {name: api_token, kind: static-secret, required: true, guidance: When basic mode is selected store the API token only through the protected write-only Tools field.}
+  - {name: rest_api_version, kind: static-setting, required: true, guidance: Keep automatic v3-to-classified-v2 compatibility unless the deployment requires an explicit version.}
+  - {name: transport, kind: static-setting, required: true, guidance: Prefer native or automatic transport and select curl only for a proven compatibility deployment.}
+  - {name: curl_executable, kind: static-setting, required: false, guidance: Select an approved absolute executable only when compatibility transport is required.}
+  - {name: request_timeout_seconds, kind: static-setting, required: false, guidance: Keep the request deadline within its bounded Tools range.}
+  - {name: default_max_results, kind: static-setting, required: false, guidance: Keep the finite default result count within its bounded Tools range.}
 reads: [assigned unresolved Jira issues and fields needed for the digest]
-writes: [workflow run artifacts, optional approved Outlook email]
-artifacts: [tickets JSON, summary Markdown, workflow state]
+writes: [workflow run state only]
+artifacts: [bounded ticket and summary workflow outputs]
 demonstrations: [synthetic-offline, read-only-live]
 troubleshooting: [missing Jira configuration, authentication failure, empty or truncated result, interrupted approved email]
 ---
@@ -51,22 +53,20 @@ assigned-and-unresolved filter is fixed.
 
 ## Questions
 
-Expect one question about chat versus optional approved email delivery.
-The bundled workflow is fixed at 25; it does not accept an adjustable limit input.
+The bundled workflow is fixed at 25 and read-only; it does not accept an adjustable
+limit input. Use bounded Jira search for a different explicit query.
 
 ## Reads and writes
 
-It reads assigned Jira issues. The workflow writes local run artifacts; email is a
-separate side effect shown for approval after the summary exists.
+It reads assigned Jira issues and returns bounded workflow state. It performs no Jira
+write or email delivery.
 
 ## Readiness
 
-Chat readiness requires packaging, Jira tool discovery, both Jira configuration names
-without values, authentication, then a small read-only query.
+Readiness requires the explicitly enabled standalone connector, protected Tools
+configuration without revealing values, authentication, permission, then a small read-only query.
 A direct `jira_my_tickets(max_results=...)` probe is separate from workflow execution
 and may use a smaller result count; the bundled workflow remains fixed at 25.
-Email readiness additionally requires Windows, classic Outlook, PowerShell/COM,
-mailbox permission, and Outlook MCP discovery and authentication.
 
 ## Demonstration
 
@@ -82,8 +82,8 @@ mode may add a Jira comment or send email merely to prove configuration.
 
 ## Artifacts
 
-Inspect `tickets.json`, `summary.md`, and workflow state in the reported run
-directory. An empty result after a read error is not a valid empty-workload summary.
+Inspect the bounded fetch and summary outputs in workflow state. An empty result after
+a read error is not a valid empty-workload summary.
 
 ## Troubleshooting
 

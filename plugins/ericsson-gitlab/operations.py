@@ -592,7 +592,7 @@ class GitLabOperations:
         if recursive and max_groups > 1:
             group_pages = self._paginate(
                 f"/api/v4/groups/{root['id']}/descendant_groups",
-                params={"order_by": "full_path", "sort": "asc"},
+                params={"order_by": "path", "sort": "asc"},
                 max_items=max_groups - 1,
                 normalize=self._normalize_group,
                 deadline=deadline,

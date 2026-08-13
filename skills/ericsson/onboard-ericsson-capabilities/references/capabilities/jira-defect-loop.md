@@ -21,7 +21,7 @@ reads: [historical assigned Jira issues and linked GitLab repository and review 
 writes: [historical comments branches commits merge requests and optional email]
 artifacts: [planned triage classifications, per-ticket run records, reviews, skipped reasons, aggregate summary]
 demonstrations: []
-troubleshooting: [single-ticket flow absent, safe loop semantics absent, GitLab tools absent, batch side-effect risk]
+troubleshooting: [Phase 6 loop_group absent, batch aggregation absent, per-ticket uncertainty, batch side-effect risk]
 ---
 
 # Jira Defect Loop
@@ -29,7 +29,7 @@ troubleshooting: [single-ticket flow absent, safe loop semantics absent, GitLab 
 ## What it solves
 
 The legacy batch flow triages assigned defects and composes per-ticket fix outcomes.
-Jira and orchestration foundations exist, but safe batch execution does not.
+Jira/GitLab foundations and explicitly single-ticket paths exist, but safe batch execution does not.
 
 ## Try saying
 
@@ -52,8 +52,9 @@ many high-consequence GitLab/Jira writes and optional Outlook delivery.
 
 ## Readiness
 
-`partially-ported`: single-ticket GitLab automation, safe loop/controller behavior,
-per-ticket approvals/idempotency, reviews, aggregate workflow, and tests are missing.
+`partially-ported`: ticket research/triage and supervised one-ticket workflows are
+available. Exact batch iteration, per-ticket isolation under concurrency, aggregate
+terminal state, and safe rerun semantics remain deferred to Phase 6 `loop_group`.
 
 ## Demonstration
 
@@ -67,5 +68,5 @@ are not available at any destination.
 
 ## Troubleshooting
 
-Do not treat model triage as permission or claim workflow schema v1 supports loops.
-There is no safe batch rerun; offer current Jira summary instead.
+Do not treat model triage as permission or claim the single-ticket showcase is batch
+parity. There is no safe batch rerun; offer Jira summary, search, or one ticket instead.
