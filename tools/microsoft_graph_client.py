@@ -117,8 +117,15 @@ class MicrosoftGraphClient:
         *,
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
+        retry_ambiguous: bool = True,
     ) -> Any:
-        response = await self._request("POST", path, json_body=json_body, headers=headers)
+        response = await self._request(
+            "POST",
+            path,
+            json_body=json_body,
+            headers=headers,
+            retry_ambiguous=retry_ambiguous,
+        )
         return self._decode_json(response)
 
     async def patch_json(
@@ -127,8 +134,15 @@ class MicrosoftGraphClient:
         *,
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
+        retry_ambiguous: bool = True,
     ) -> Any:
-        response = await self._request("PATCH", path, json_body=json_body, headers=headers)
+        response = await self._request(
+            "PATCH",
+            path,
+            json_body=json_body,
+            headers=headers,
+            retry_ambiguous=retry_ambiguous,
+        )
         if response.status_code == 204 or not response.content:
             return {}
         return self._decode_json(response)
@@ -138,8 +152,11 @@ class MicrosoftGraphClient:
         path: str,
         *,
         headers: dict[str, str] | None = None,
+        retry_ambiguous: bool = True,
     ) -> dict[str, Any]:
-        response = await self._request("DELETE", path, headers=headers)
+        response = await self._request(
+            "DELETE", path, headers=headers, retry_ambiguous=retry_ambiguous
+        )
         if response.status_code == 204 or not response.content:
             return {"deleted": True, "status_code": response.status_code}
         return self._decode_json(response)
@@ -384,6 +401,7 @@ class MicrosoftGraphClient:
             path,
             content=data,
             headers=upload_headers,
+            retry_ambiguous=False,
         )
         return self._decode_json(response)
 
@@ -609,6 +627,7 @@ class MicrosoftGraphClient:
         json_body: Any | None = None,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
+        retry_ambiguous: bool = True,
     ) -> httpx.Response:
         url = self._resolve_url(path_or_url)
         attempt = 0
@@ -642,6 +661,10 @@ class MicrosoftGraphClient:
                         headers=request_headers,
                     )
             except httpx.HTTPError:
+                if not retry_ambiguous:
+                    raise MicrosoftGraphAmbiguousWriteError(
+                        "Microsoft Graph write is ambiguous; reconcile before retrying."
+                    ) from None
                 last_error = MicrosoftGraphClientError(
                     "Microsoft Graph request transport failed."
                 )
@@ -664,6 +687,13 @@ class MicrosoftGraphClient:
                 await self._sleep(self._retry_delay(response, attempt))
                 attempt += 1
                 continue
+
+            if not retry_ambiguous and (
+                response.status_code == 408 or response.status_code >= 500
+            ):
+                raise MicrosoftGraphAmbiguousWriteError(
+                    "Microsoft Graph write is ambiguous; reconcile before retrying."
+                )
 
             if self._should_retry(response) and attempt < self.max_retries:
                 await self._sleep(self._retry_delay(response, attempt))

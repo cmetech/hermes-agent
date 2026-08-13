@@ -170,6 +170,68 @@ async def test_small_upload_uses_bounded_binary_put():
 
 
 @pytest.mark.anyio
+async def test_small_upload_does_not_replay_ambiguous_transport_failure():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise httpx.ReadError("response lost", request=request)
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler), max_retries=3
+    )
+
+    with pytest.raises(graph.MicrosoftGraphAmbiguousWriteError):
+        await client.upload_small("/content", b"abc", max_bytes=3)
+
+    assert len(requests) == 1
+
+
+@pytest.mark.anyio
+async def test_small_upload_does_not_replay_ambiguous_server_failure():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": {"code": "unavailable"}})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler), max_retries=3
+    )
+
+    with pytest.raises(graph.MicrosoftGraphAmbiguousWriteError):
+        await client.upload_small("/content", b"abc", max_bytes=3)
+
+    assert len(requests) == 1
+
+
+@pytest.mark.anyio
+async def test_small_upload_may_retry_definite_rate_limit():
+    requests = []
+
+    async def no_sleep(_delay):
+        return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(201, json={"id": "uploaded"})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(),
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        sleep=no_sleep,
+    )
+
+    result = await client.upload_small("/content", b"abc", max_bytes=3)
+
+    assert result == {"id": "uploaded"}
+    assert len(requests) == 2
+
+
+@pytest.mark.anyio
 async def test_upload_session_sends_aligned_ranges_without_bearer(tmp_path):
     source = tmp_path / "upload.bin"
     source.write_bytes(b"a" * 700_000)
