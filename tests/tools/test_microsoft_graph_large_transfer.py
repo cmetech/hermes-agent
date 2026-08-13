@@ -312,6 +312,37 @@ async def test_upload_session_honors_server_resume_offset(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_upload_session_rejects_misaligned_server_resume_offset(tmp_path):
+    source = tmp_path / "upload.bin"
+    source.write_bytes(b"a" * 700_000)
+    ranges = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(
+                200,
+                json={"uploadUrl": "https://upload.example/misaligned"},
+            )
+        ranges.append(request.headers["content-range"])
+        return httpx.Response(202, json={"nextExpectedRanges": ["327681-"]})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(graph.MicrosoftGraphClientError, match="unsafe resume offset"):
+        await client.upload_via_session(
+            "/session",
+            source,
+            max_bytes=800_000,
+            chunk_size=327_680,
+            max_chunks=3,
+        )
+
+    assert ranges == ["bytes 0-327679/700000"]
+
+
+@pytest.mark.anyio
 async def test_upload_session_retries_same_range_after_rate_limit(tmp_path):
     source = tmp_path / "upload.bin"
     source.write_bytes(b"a" * 10)
