@@ -482,6 +482,40 @@ async def test_async_operation_honors_retry_after_and_completes():
 
 
 @pytest.mark.anyio
+async def test_async_operation_retry_delay_cannot_outlive_deadline():
+    calls = []
+    sleeps = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            202,
+            json={"status": "inProgress"},
+            headers={"Retry-After": "86400"},
+        )
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    client = graph.MicrosoftGraphClient(
+        _provider(),
+        transport=httpx.MockTransport(handler),
+        sleep=sleep,
+        clock=lambda: 10.0,
+    )
+
+    with pytest.raises(graph.MicrosoftGraphDeadlineError):
+        await client.poll_async_operation(
+            "https://graph.microsoft.com/v1.0/monitor/1",
+            max_polls=2,
+            deadline=15.0,
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+@pytest.mark.anyio
 async def test_start_async_operation_posts_once_then_polls_trusted_location():
     calls = []
 

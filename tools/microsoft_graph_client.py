@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import time
@@ -18,6 +19,8 @@ from tools.microsoft_graph_identity import GraphAccessTokenProvider
 
 DEFAULT_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_UPLOAD_FRAGMENT_BYTES = 320 * 1024
+MAX_GRAPH_RETRY_DELAY_SECONDS = 60.0
+CONTROL_SLEEP_SLICE_SECONDS = 0.25
 
 
 class MicrosoftGraphClientError(RuntimeError):
@@ -107,8 +110,17 @@ class MicrosoftGraphClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Any:
-        response = await self._request("GET", path, params=params, headers=headers)
+        response = await self._request(
+            "GET",
+            path,
+            params=params,
+            headers=headers,
+            deadline=deadline,
+            cancel_check=cancel_check,
+        )
         return self._decode_json(response)
 
     async def post_json(
@@ -118,6 +130,8 @@ class MicrosoftGraphClient:
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
         retry_ambiguous: bool = True,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Any:
         response = await self._request(
             "POST",
@@ -125,6 +139,8 @@ class MicrosoftGraphClient:
             json_body=json_body,
             headers=headers,
             retry_ambiguous=retry_ambiguous,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         return self._decode_json(response)
 
@@ -135,6 +151,8 @@ class MicrosoftGraphClient:
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
         retry_ambiguous: bool = True,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Any:
         response = await self._request(
             "PATCH",
@@ -142,6 +160,8 @@ class MicrosoftGraphClient:
             json_body=json_body,
             headers=headers,
             retry_ambiguous=retry_ambiguous,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         if response.status_code == 204 or not response.content:
             return {}
@@ -153,9 +173,16 @@ class MicrosoftGraphClient:
         *,
         headers: dict[str, str] | None = None,
         retry_ambiguous: bool = True,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         response = await self._request(
-            "DELETE", path, headers=headers, retry_ambiguous=retry_ambiguous
+            "DELETE",
+            path,
+            headers=headers,
+            retry_ambiguous=retry_ambiguous,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         if response.status_code == 204 or not response.content:
             return {"deleted": True, "status_code": response.status_code}
@@ -167,6 +194,8 @@ class MicrosoftGraphClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         next_url: str | None = self._resolve_url(path)
         next_params = dict(params or {})
@@ -176,6 +205,8 @@ class MicrosoftGraphClient:
                 next_url,
                 params=next_params or None,
                 headers=headers,
+                deadline=deadline,
+                cancel_check=cancel_check,
             )
             payload = self._decode_json(response)
             if not isinstance(payload, dict):
@@ -198,9 +229,17 @@ class MicrosoftGraphClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> list[Any]:
         items: list[Any] = []
-        async for page in self.iterate_pages(path, params=params, headers=headers):
+        async for page in self.iterate_pages(
+            path,
+            params=params,
+            headers=headers,
+            deadline=deadline,
+            cancel_check=cancel_check,
+        ):
             value = page.get("value")
             if isinstance(value, list):
                 items.extend(value)
@@ -248,7 +287,7 @@ class MicrosoftGraphClient:
 
                 try:
                     async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(self.timeout),
+                        timeout=httpx.Timeout(self._request_timeout(deadline)),
                         transport=self._transport,
                     ) as client:
                         async with client.stream(
@@ -296,10 +335,10 @@ class MicrosoftGraphClient:
                     if api_error.status_code == 401:
                         self.token_provider.clear_cache()
                     delay = api_error.retry_after_seconds
-                    await self._sleep(
-                        delay
-                        if delay is not None
-                        else min(8.0, 0.5 * (2**attempt))
+                    await self._controlled_sleep(
+                        delay if delay is not None else self._retry_delay(None, attempt),
+                        deadline=deadline,
+                        cancel_check=cancel_check,
                     )
                     attempt += 1
                     continue
@@ -312,7 +351,11 @@ class MicrosoftGraphClient:
                         raise MicrosoftGraphClientError(
                             f"Microsoft Graph download failed for GET {self._safe_url(url)}."
                         ) from None
-                    await self._sleep(self._retry_delay(None, attempt))
+                    await self._controlled_sleep(
+                        self._retry_delay(None, attempt),
+                        deadline=deadline,
+                        cancel_check=cancel_check,
+                    )
                     attempt += 1
                     continue
                 os.replace(tmp_target, target)
@@ -387,6 +430,8 @@ class MicrosoftGraphClient:
         *,
         max_bytes: int,
         headers: dict[str, str] | None = None,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Any:
         """PUT a bounded in-memory payload to a Graph content endpoint."""
         if len(data) > max(0, int(max_bytes)):
@@ -402,6 +447,8 @@ class MicrosoftGraphClient:
             content=data,
             headers=upload_headers,
             retry_ambiguous=False,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         return self._decode_json(response)
 
@@ -438,6 +485,8 @@ class MicrosoftGraphClient:
             json_body={
                 "item": {"@microsoft.graph.conflictBehavior": conflict_behavior}
             },
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
         parsed_upload_url = httpx.URL(upload_url) if isinstance(upload_url, str) else None
@@ -506,7 +555,7 @@ class MicrosoftGraphClient:
             self._check_control(deadline=deadline, cancel_check=cancel_check)
             try:
                 async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(self.timeout),
+                    timeout=httpx.Timeout(self._request_timeout(deadline)),
                     transport=self._transport,
                 ) as client:
                     response = await client.put(
@@ -517,13 +566,18 @@ class MicrosoftGraphClient:
                             "Content-Range": content_range,
                         },
                     )
+                self._check_control(deadline=deadline, cancel_check=cancel_check)
             except httpx.HTTPError:
                 raise MicrosoftGraphAmbiguousWriteError(
                     "Microsoft Graph upload completion is ambiguous; reconcile the existing session."
                 ) from None
             if not self._should_retry(response) or attempt >= self.max_retries:
                 return response
-            await self._sleep(self._retry_delay(response, attempt))
+            await self._controlled_sleep(
+                self._retry_delay(response, attempt),
+                deadline=deadline,
+                cancel_check=cancel_check,
+            )
         raise MicrosoftGraphClientError("Microsoft Graph upload retry loop exhausted.")
 
     async def poll_async_operation(
@@ -541,7 +595,12 @@ class MicrosoftGraphClient:
             raise MicrosoftGraphLimitError("Async operation poll count must be positive.")
         for poll_number in range(max_polls):
             self._check_control(deadline=deadline, cancel_check=cancel_check)
-            response = await self._request("GET", location)
+            response = await self._request(
+                "GET",
+                location,
+                deadline=deadline,
+                cancel_check=cancel_check,
+            )
             payload = self._decode_json(response)
             if not isinstance(payload, dict):
                 raise MicrosoftGraphAsyncOperationError(
@@ -556,8 +615,10 @@ class MicrosoftGraphClient:
                 )
             if poll_number + 1 < max_polls:
                 retry_after = parse_retry_after_seconds(response.headers)
-                await self._sleep(
-                    retry_after if retry_after is not None else max(0.0, poll_interval)
+                await self._controlled_sleep(
+                    retry_after if retry_after is not None else max(0.0, poll_interval),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
                 )
         raise MicrosoftGraphLimitError(
             "Microsoft Graph async operation exceeded its poll limit."
@@ -584,7 +645,8 @@ class MicrosoftGraphClient:
         token = await self.token_provider.get_access_token()
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout), transport=self._transport
+                timeout=httpx.Timeout(self._request_timeout(deadline)),
+                transport=self._transport,
             ) as client:
                 response = await client.post(
                     url,
@@ -595,6 +657,7 @@ class MicrosoftGraphClient:
                         "User-Agent": self.user_agent,
                     },
                 )
+            self._check_control(deadline=deadline, cancel_check=cancel_check)
         except httpx.HTTPError:
             raise MicrosoftGraphAmbiguousWriteError(
                 "Microsoft Graph async write is ambiguous; reconcile before retrying."
@@ -628,15 +691,19 @@ class MicrosoftGraphClient:
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
         retry_ambiguous: bool = True,
+        deadline: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> httpx.Response:
         url = self._resolve_url(path_or_url)
         attempt = 0
         last_error: Exception | None = None
 
         while attempt <= self.max_retries:
+            self._check_control(deadline=deadline, cancel_check=cancel_check)
             token = await self.token_provider.get_access_token(
                 force_refresh=attempt > 0 and self._should_refresh_token(last_error)
             )
+            self._check_control(deadline=deadline, cancel_check=cancel_check)
             request_headers = {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -649,7 +716,7 @@ class MicrosoftGraphClient:
 
             try:
                 async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(self.timeout),
+                    timeout=httpx.Timeout(self._request_timeout(deadline)),
                     transport=self._transport,
                 ) as client:
                     response = await client.request(
@@ -660,6 +727,7 @@ class MicrosoftGraphClient:
                         content=content,
                         headers=request_headers,
                     )
+                self._check_control(deadline=deadline, cancel_check=cancel_check)
             except httpx.HTTPError:
                 if not retry_ambiguous:
                     raise MicrosoftGraphAmbiguousWriteError(
@@ -672,7 +740,11 @@ class MicrosoftGraphClient:
                     raise MicrosoftGraphClientError(
                         f"Microsoft Graph request failed for {method} {self._safe_url(url)}."
                     ) from None
-                await self._sleep(self._retry_delay(None, attempt))
+                await self._controlled_sleep(
+                    self._retry_delay(None, attempt),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
                 attempt += 1
                 continue
 
@@ -684,7 +756,11 @@ class MicrosoftGraphClient:
 
             if response.status_code == 401 and attempt < self.max_retries:
                 self.token_provider.clear_cache()
-                await self._sleep(self._retry_delay(response, attempt))
+                await self._controlled_sleep(
+                    self._retry_delay(response, attempt),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
                 attempt += 1
                 continue
 
@@ -696,7 +772,11 @@ class MicrosoftGraphClient:
                 )
 
             if self._should_retry(response) and attempt < self.max_retries:
-                await self._sleep(self._retry_delay(response, attempt))
+                await self._controlled_sleep(
+                    self._retry_delay(response, attempt),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
                 attempt += 1
                 continue
 
@@ -739,6 +819,49 @@ class MicrosoftGraphClient:
             raise MicrosoftGraphCancelledError("Microsoft Graph operation was cancelled.")
         if deadline is not None and self._clock() >= deadline:
             raise MicrosoftGraphDeadlineError("Microsoft Graph operation deadline expired.")
+
+    def _request_timeout(self, deadline: float | None) -> float:
+        if deadline is None:
+            return self.timeout
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise MicrosoftGraphDeadlineError(
+                "Microsoft Graph operation deadline expired."
+            )
+        return min(self.timeout, remaining)
+
+    async def _controlled_sleep(
+        self,
+        delay: float,
+        *,
+        deadline: float | None,
+        cancel_check: Callable[[], bool] | None,
+    ) -> None:
+        self._check_control(deadline=deadline, cancel_check=cancel_check)
+        bounded_delay = float(delay)
+        if not math.isfinite(bounded_delay):
+            bounded_delay = MAX_GRAPH_RETRY_DELAY_SECONDS
+        bounded_delay = min(
+            MAX_GRAPH_RETRY_DELAY_SECONDS,
+            max(0.0, bounded_delay),
+        )
+        if deadline is not None:
+            remaining_budget = deadline - self._clock()
+            if bounded_delay >= remaining_budget:
+                raise MicrosoftGraphDeadlineError(
+                    "Microsoft Graph retry delay exceeds the operation deadline."
+                )
+
+        remaining_delay = bounded_delay
+        while remaining_delay > 0:
+            sleep_for = (
+                min(CONTROL_SLEEP_SLICE_SECONDS, remaining_delay)
+                if cancel_check is not None
+                else remaining_delay
+            )
+            await self._sleep(sleep_for)
+            remaining_delay -= sleep_for
+            self._check_control(deadline=deadline, cancel_check=cancel_check)
 
     @staticmethod
     def _next_upload_offset(payload: Any, total: int) -> int:
@@ -789,7 +912,7 @@ class MicrosoftGraphClient:
         if response is not None:
             retry_after = parse_retry_after_seconds(response.headers)
             if retry_after is not None:
-                return retry_after
+                return min(MAX_GRAPH_RETRY_DELAY_SECONDS, max(0.0, retry_after))
         return min(8.0, 0.5 * (2 ** attempt))
 
     @staticmethod
