@@ -111,7 +111,6 @@
       "label": "curl executable",
       "type": "string",
       "storage": "setting",
-      "default": "/usr/bin/curl",
       "help": "Exact executable used by the private curl compatibility transport.",
       "advanced": true,
       "validation": {

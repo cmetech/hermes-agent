@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+import sys
 from urllib.parse import urlsplit
 
 if __package__:
@@ -15,6 +16,12 @@ else:
 _MAX_ORIGIN = 2048
 _MAX_SECRET = 4096
 _MAX_EMAIL = 320
+
+
+def _default_curl_executable() -> str:
+    if sys.platform == "win32":
+        return r"C:\Windows\System32\curl.exe"
+    return "/usr/bin/curl"
 
 
 def _setting(configuration, field_id: str, default):
@@ -76,7 +83,11 @@ def authentication_from_configuration(configuration) -> JiraAuth:
     auth_mode = _setting(configuration, "auth_mode", "bearer")
     rest_api_version = _setting(configuration, "rest_api_version", "auto")
     transport = _setting(configuration, "transport", "auto")
-    curl_executable = _setting(configuration, "curl_executable", "/usr/bin/curl")
+    curl_executable = _setting(configuration, "curl_executable", None)
+    if curl_executable is None or (
+        sys.platform == "win32" and curl_executable == "/usr/bin/curl"
+    ):
+        curl_executable = _default_curl_executable()
     timeout = _bounded_integer(
         _setting(configuration, "request_timeout_seconds", 30), 1, 120
     )
@@ -93,7 +104,10 @@ def authentication_from_configuration(configuration) -> JiraAuth:
         not isinstance(curl_executable, str)
         or len(curl_executable) > 4096
         or "\x00" in curl_executable
-        or not Path(curl_executable).is_absolute()
+        or (
+            transport in {"auto", "curl"}
+            and not Path(curl_executable).is_absolute()
+        )
     ):
         raise JiraError("invalid_configuration")
 

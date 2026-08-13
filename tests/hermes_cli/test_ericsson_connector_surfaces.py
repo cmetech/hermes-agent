@@ -268,6 +268,75 @@ def test_jira_router_and_tools_follow_fresh_enabled_session_boundary(
         registry.deregister(name)
 
 
+def test_jira_comment_session_approval_reprompts_for_different_arguments(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+    from hermes_cli.plugins import PluginManager, resolve_pre_tool_admission
+    from tools import approval
+    from tools.registry import registry
+
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "jira-approval-profile"
+    home.mkdir()
+    shutil.copytree(
+        repo_root / "plugins" / "ericsson-jira",
+        home / "plugins" / "ericsson-jira",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": ["ericsson-jira"], "disabled": []}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+    cached = set()
+    prompts = []
+    monkeypatch.setattr(
+        approval, "get_current_session_key", lambda default="default": "jira-session"
+    )
+    monkeypatch.setattr(approval, "is_approved", lambda _session, key: key in cached)
+    monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(
+        approval,
+        "prompt_dangerous_approval",
+        lambda target, reason, **_kwargs: prompts.append((target, reason)) or "session",
+    )
+    monkeypatch.setattr(
+        approval, "approve_session", lambda _session, key: cached.add(key)
+    )
+    monkeypatch.setattr(approval, "approve_permanent", lambda _key: None)
+    monkeypatch.setattr(approval, "save_permanent_allowlist", lambda _values: None)
+
+    first = resolve_pre_tool_admission(
+        "jira_add_comment",
+        {"key": "ABC-1", "body": "first body"},
+        tool_call_id="jira-call-1",
+    )
+    second = resolve_pre_tool_admission(
+        "jira_add_comment",
+        {"key": "XYZ-9", "body": "second body"},
+        tool_call_id="jira-call-2",
+    )
+
+    assert first.block_message is None and second.block_message is None
+    assert len(prompts) == 2
+    assert "ABC-1" in prompts[0][1] and "first body" in prompts[0][1]
+    assert "XYZ-9" in prompts[1][1] and "second body" in prompts[1][1]
+    assert len(cached) == 2
+
+    for name in JIRA_TOOL_NAMES:
+        registry.deregister(name)
+
+
 def test_disabled_router_and_fresh_session_activation_are_cache_stable(
     tmp_path, monkeypatch
 ):

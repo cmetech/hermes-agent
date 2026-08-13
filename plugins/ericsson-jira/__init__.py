@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -117,10 +118,25 @@ def register(ctx) -> None:
     def require_write_approval(tool_name: str, args: dict, **_kwargs):
         if tool_name not in _WRITE_TOOLS:
             return None
+        canonical_args = json.dumps(
+            args if isinstance(args, dict) else {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        issue_key = args.get("key") if isinstance(args, dict) else None
+        body = args.get("body") if isinstance(args, dict) else None
         return {
             "action": "approve",
-            "message": "Approve Ericsson Jira comment",
-            "rule_key": tool_name,
+            "message": (
+                "Approve Ericsson Jira comment\n"
+                f"Issue: {json.dumps(issue_key, ensure_ascii=True)}\n"
+                f"Body: {json.dumps(body, ensure_ascii=True)}"
+            ),
+            "rule_key": (
+                f"{tool_name}:"
+                f"{hashlib.sha256(canonical_args.encode('utf-8')).hexdigest()}"
+            ),
         }
 
     ctx.register_hook("pre_tool_call", require_write_approval)

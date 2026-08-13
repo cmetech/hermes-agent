@@ -10,6 +10,7 @@ import sys
 import yaml
 
 from hermes_cli import capability_staging as staging
+from plugins.workflow.discovery import discover_workflows
 from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
@@ -78,6 +79,38 @@ def test_checked_in_jira_bundle_is_standalone_and_complete() -> None:
             "from": "auto_seeded_backend",
         },
     }
+
+
+def test_fresh_profile_discovers_every_distributed_jira_workflow(
+    tmp_path, monkeypatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "jira-profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(staging, "_repo_root", lambda: repo_root)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir",
+        lambda: repo_root / "plugins",
+    )
+
+    staging.seed_baked_capabilities(home)
+    discovered = {
+        package.definition.name: package
+        for package in discover_workflows(home, home, home)
+    }
+
+    assert {
+        "my-tickets-summary",
+        "jira-single-ticket-showcase",
+        "jira-to-gitlab",
+    } <= set(discovered)
+    for name in (
+        "my-tickets-summary",
+        "jira-single-ticket-showcase",
+        "jira-to-gitlab",
+    ):
+        assert "ericsson-jira" in discovered[name].definition.options["requires"]
 
 
 def test_baked_distribution_exposes_but_does_not_enable_standalone_plugins(
