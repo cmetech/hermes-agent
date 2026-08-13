@@ -1,16 +1,25 @@
 {
   "name": "ericsson",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Shared Ericsson coworker capabilities (OTTO + LOOP24)",
   "skills": [
     "skills/ericsson/opportunity-visuals",
     "skills/ericsson/onboard-ericsson-capabilities",
     "skills/ericsson/gitlab",
+    "skills/ericsson/jira",
     "skills/ericsson/jira-to-gitlab",
     "skills/ericsson/confluence-research"
   ],
   "plugins": [
-    "plugins/ericsson-jira",
+    {
+      "path": "plugins/ericsson-jira",
+      "id": "ericsson-jira",
+      "enabled": false,
+      "lifecycleMigration": {
+        "id": "ericsson-jira-backend-to-standalone-v1",
+        "from": "auto_seeded_backend"
+      }
+    },
     "plugins/ericsson-teams",
     "plugins/workflow",
     {
@@ -33,21 +42,11 @@
   "workflows": [
     "workflows/my-tickets-summary.yml",
     "workflows/inbox-digest.yml",
+    "workflows/jira-single-ticket-showcase.yml",
     "workflows/jira-to-gitlab.yml"
   ],
   "personas": [],
   "env": [
-    {
-      "key": "JIRA_BASE_URL",
-      "description": "Ericsson Jira base URL",
-      "category": "tool"
-    },
-    {
-      "key": "JIRA_PAT",
-      "description": "Jira personal access token",
-      "category": "tool",
-      "password": true
-    },
     {
       "key": "GLEAN_API_TOKEN",
       "description": "Glean API token",
@@ -78,6 +77,6 @@
       }
     }
   },
-  "vendoredFrom": "634ca3bc9d4c543a1dc02e1ec01e2e1c604ee2e8",
+  "vendoredFrom": "6b178d170b6f0c81f71fd19fa00f18370e985b5c",
   "mcpServersFile": "mcp-servers.yaml"
 }
