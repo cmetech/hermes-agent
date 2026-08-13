@@ -190,7 +190,7 @@ function readPluginDescriptor(sourceDir, entry) {
   }
 }
 
-function sourceDestinationPairs(manifest) {
+function sourceDestinationPairs(manifest, sourceDir = null) {
   const plugins = normalizePluginEntries(manifest)
   const pairs = [
     ...(manifest.skills || []).map(rel => [assertManifestSourcePath(rel, 'skill'), rel]),
@@ -201,12 +201,25 @@ function sourceDestinationPairs(manifest) {
       assertManifestSourcePath(rel, 'mcpLocal'),
       path.posix.join('plugins', path.posix.basename(rel)),
     ]),
-    ...(manifest.workflows || []).map(rel => {
+    ...(manifest.workflows || []).flatMap(rel => {
       assertStrictRelativePath(rel, 'manifest source path')
       if (!/^workflows\/[^/]+$/.test(rel) && !/^capabilities\/workflows\/[^/]+$/.test(rel)) {
         throw new Error(`unsafe manifest source path: ${rel}`)
       }
-      return [rel, path.posix.join('capabilities/workflows', path.posix.basename(rel))]
+      const workflowPair = [
+        rel,
+        path.posix.join('capabilities/workflows', path.posix.basename(rel)),
+      ]
+      if (sourceDir === null || !/\.ya?ml$/.test(rel)) return [workflowPair]
+      const sidecar = rel.replace(/\.ya?ml$/, '.hermes.yaml')
+      if (!lstatIfPresent(path.join(sourceDir, sidecar))) return [workflowPair]
+      return [
+        workflowPair,
+        [
+          sidecar,
+          path.posix.join('capabilities/workflows', path.posix.basename(sidecar)),
+        ],
+      ]
     }),
     ...(manifest.workflowPackages || []).map(entry => {
       if (!entry || Object.keys(entry).sort().join(',') !== 'digestManifest,path') {
@@ -1166,7 +1179,7 @@ export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () =
     assertNoSymlinkComponents(sourceDir, 'sets/ericsson.json', 'source manifest')
     const manifest = JSON.parse(fs.readFileSync(path.join(sourceDir, 'sets/ericsson.json'), 'utf8'))
     const pluginEntries = normalizePluginEntries(manifest)
-    const copyList = sourceDestinationPairs(manifest)
+    const copyList = sourceDestinationPairs(manifest, sourceDir)
     if (manifest.mcpServers) assertManifestSourcePath(manifest.mcpServers, 'mcpServers')
 
     // Validate every read/write path before the first reconciliation or copy.
@@ -1184,7 +1197,10 @@ export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () =
       INVENTORY_FILE,
       ...(mcpDestination ? [mcpDestination] : []),
     ]) assertNoSymlinkComponents(destRoot, rel, 'vendor output')
-    const current = managedDestinations(manifest, { includeLegacyMcpFile: false })
+    const current = [...new Set([
+      ...copyList.map(([_source, destination]) => destination),
+      ...(mcpDestination ? [mcpDestination] : []),
+    ])].sort()
     recoverPendingTransaction(destRoot, current, mcpDestination)
     const previousManifest = readJsonIfPresent(path.join(destRoot, MANIFEST_FILE))
     const previous = previousManagedInventory(destRoot)
@@ -1269,7 +1285,7 @@ export function resolveCleanSourceCommit(sourceDir) {
     const manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'sets/ericsson.json'), 'utf8'))
     const copiedSourcePaths = [
       'sets/ericsson.json',
-      ...sourceDestinationPairs(manifest).map(([sourceRel]) => sourceRel),
+      ...sourceDestinationPairs(manifest, sourceRoot).map(([sourceRel]) => sourceRel),
       ...(manifest.mcpServers
         ? [assertManifestSourcePath(manifest.mcpServers, 'mcpServers')]
         : []),
