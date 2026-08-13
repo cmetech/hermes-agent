@@ -201,6 +201,50 @@ def test_recursive_group_listing_normalizes_descendants_and_projects() -> None:
     assert result["complete"] is True
 
 
+def test_recursive_group_listing_uses_supported_descendant_ordering() -> None:
+    """Recursive exploration must not send GitLab an unsupported order field."""
+    client_module, models_module, operations_module = _load_connector_modules()
+
+    def gitlab(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v4/groups/sd-macs-att-rnam-hosting":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 42,
+                    "name": "RNAM Hosting",
+                    "full_path": "sd-macs-att-rnam-hosting",
+                    "parent_id": None,
+                    "web_url": (
+                        "https://gitlab.example.test/groups/"
+                        "sd-macs-att-rnam-hosting"
+                    ),
+                },
+            )
+        if request.url.path == "/api/v4/groups/42/descendant_groups":
+            if request.url.params.get("order_by") not in {"name", "path", "id"}:
+                return httpx.Response(400, json={"message": "order_by is invalid"})
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v4/groups/42/projects":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "404 Not Found"})
+
+    client = _client_with_transport(client_module, models_module, gitlab)
+    try:
+        result = operations_module.GitLabOperations(client).list_group_projects(
+            "sd-macs-att-rnam-hosting",
+            recursive=True,
+            max_groups=50,
+            max_projects=100,
+        )
+    finally:
+        client.close()
+
+    assert result["root_group"]["full_path"] == "sd-macs-att-rnam-hosting"
+    assert result["groups"] == [result["root_group"]]
+    assert result["projects"] == []
+    assert result["complete"] is True
+
+
 def test_group_listing_still_rejects_cross_origin_group_urls() -> None:
     """Canonical path handling must not permit a remote response origin change."""
     client_module, models_module, operations_module = _load_connector_modules()
