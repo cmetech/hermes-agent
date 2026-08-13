@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 from . import audit, auth, client, operations, tools  # noqa: F401
 from .models import (
     SharePointAmbiguousWriteError,
+    SharePointCancelledError,
     SharePointConfigurationError,
+    SharePointDeadlineError,
     SharePointFileBoundaryError,
     SharePointResolutionError,
     SharePointWriteError,
@@ -53,6 +56,21 @@ def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _graph_control_category(error: Exception) -> str | None:
+    try:
+        from tools.microsoft_graph_client import (
+            MicrosoftGraphCancelledError,
+            MicrosoftGraphDeadlineError,
+        )
+    except ImportError:
+        return None
+    if isinstance(error, MicrosoftGraphCancelledError):
+        return "cancelled"
+    if isinstance(error, MicrosoftGraphDeadlineError):
+        return "limit_exceeded"
+    return None
+
+
 def register(ctx) -> None:
     """Register user-invoked setup actions; tools are added by later slices."""
     ctx.register_setup_action(
@@ -62,13 +80,26 @@ def register(ctx) -> None:
     ctx.register_setup_action("enroll_browser", auth.enroll_browser)
     ctx.register_setup_action("clear_session", auth.clear_session)
 
-    def require_write_approval(tool_name, _arguments, **_kwargs):
+    def require_write_approval(tool_name, arguments, **_kwargs):
         if tool_name not in _WRITE_TOOLS:
             return None
+        canonical_arguments = json.dumps(
+            arguments if isinstance(arguments, dict) else {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         return {
             "action": "approve",
-            "message": "Approve Ericsson SharePoint mutation",
-            "rule_key": tool_name,
+            "message": (
+                "Approve Ericsson SharePoint mutation\n"
+                f"Tool: {tool_name}\n"
+                f"Arguments: {canonical_arguments}"
+            ),
+            "rule_key": (
+                f"{tool_name}:"
+                f"{hashlib.sha256(canonical_arguments.encode('utf-8')).hexdigest()}"
+            ),
         }
 
     ctx.register_hook("pre_tool_call", require_write_approval)
@@ -117,22 +148,31 @@ def register(ctx) -> None:
                 category = "permission_denied"
             except SharePointAmbiguousWriteError:
                 category = "ambiguous_write"
+            except SharePointCancelledError:
+                category = "cancelled"
+            except SharePointDeadlineError:
+                category = "limit_exceeded"
             except SharePointWriteError:
                 category = "invalid_input"
             except (SharePointResolutionError, ValueError, TypeError, KeyError):
                 category = "invalid_input"
-            except Exception:
-                category = "remote_unavailable"
+            except Exception as error:
+                category = _graph_control_category(error) or "remote_unavailable"
+            safe_messages = {
+                "ambiguous_write": (
+                    "SharePoint write outcome is uncertain; inspect the remote "
+                    "destination before any retry."
+                ),
+                "cancelled": "SharePoint operation was cancelled.",
+                "limit_exceeded": "SharePoint operation exceeded its time limit.",
+            }
             return _json(
                 {
                     "success": False,
                     "error": {
                         "category": category,
-                        "message": (
-                            "SharePoint write outcome is uncertain; inspect the remote "
-                            "destination before any retry."
-                            if category == "ambiguous_write"
-                            else "SharePoint operation could not be completed."
+                        "message": safe_messages.get(
+                            category, "SharePoint operation could not be completed."
                         ),
                     },
                 }

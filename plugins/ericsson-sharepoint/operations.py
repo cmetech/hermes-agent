@@ -8,6 +8,7 @@ import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import threading
@@ -35,6 +36,9 @@ _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
     | {f"lpt{number}" for number in range(1, 10)}
+)
+_COPY_MONITOR_PATH = re.compile(
+    r"^/(?:(?:sites|teams)/[^/]+/)?_api/v2\.[01]/monitor/[A-Za-z0-9._~-]+/?$"
 )
 
 
@@ -80,6 +84,21 @@ def _control(
         raise SharePointCancelledError("SharePoint operation was cancelled")
     if deadline is not None and clock() >= deadline:
         raise SharePointDeadlineError("SharePoint operation deadline exceeded")
+
+
+def _translated_graph_control(error: Exception) -> RuntimeError | None:
+    try:
+        from tools.microsoft_graph_client import (
+            MicrosoftGraphCancelledError,
+            MicrosoftGraphDeadlineError,
+        )
+    except ImportError:
+        return None
+    if isinstance(error, MicrosoftGraphCancelledError):
+        return SharePointCancelledError("SharePoint operation was cancelled")
+    if isinstance(error, MicrosoftGraphDeadlineError):
+        return SharePointDeadlineError("SharePoint operation deadline exceeded")
+    return None
 
 
 def _bounded_text(value: Any, label: str, maximum: int = 4096) -> str:
@@ -170,7 +189,13 @@ async def list_items_with_client(
     clock=time.monotonic,
 ) -> dict[str, Any]:
     _control(deadline=deadline, cancel_check=cancel_check, clock=clock)
-    resolved = await client.get_item(url=url, drive_id=drive_id, item_id=item_id)
+    resolved = await client.get_item(
+        url=url,
+        drive_id=drive_id,
+        item_id=item_id,
+        deadline=deadline,
+        cancel_check=cancel_check,
+    )
     root = resolved["item"]
     if root.get("kind") != "folder":
         raise SharePointResolutionError("listing requires a folder DriveItem")
@@ -226,6 +251,8 @@ async def list_items_with_client(
                 "$select": "id,name,size,folder,file,webUrl,lastModifiedDateTime,parentReference",
                 "$top": min(200, item_limit),
             },
+            deadline=deadline,
+            cancel_check=cancel_check,
         ):
             _control(deadline=deadline, cancel_check=cancel_check, clock=clock)
             pages += 1
@@ -405,7 +432,13 @@ async def download_with_client(
     cancel_check=None,
 ) -> dict[str, Any]:
     _control(deadline=deadline, cancel_check=cancel_check)
-    resolved = await client.get_item(url=url, drive_id=drive_id, item_id=item_id)
+    resolved = await client.get_item(
+        url=url,
+        drive_id=drive_id,
+        item_id=item_id,
+        deadline=deadline,
+        cancel_check=cancel_check,
+    )
     item = resolved["item"]
     if item.get("kind") != "file":
         raise SharePointFileBoundaryError("download target is a folder, not a file")
@@ -495,8 +528,15 @@ def client_from_configuration(configuration: Mapping[str, Any]) -> SharePointCli
     )
 
 
-async def resolve_url(configuration: Mapping[str, Any], url: str) -> dict[str, Any]:
-    return await client_from_configuration(configuration).resolve_url(url)
+async def resolve_url(
+    configuration: Mapping[str, Any], url: str, *, cancel_check=None
+) -> dict[str, Any]:
+    config = SharePointConfiguration.from_runtime(configuration)
+    return await client_from_configuration(configuration).resolve_url(
+        url,
+        deadline=time.monotonic() + config.timeout_seconds,
+        cancel_check=cancel_check,
+    )
 
 
 async def get_item(
@@ -505,9 +545,15 @@ async def get_item(
     url: str | None = None,
     drive_id: str | None = None,
     item_id: str | None = None,
+    cancel_check=None,
 ) -> dict[str, Any]:
+    config = SharePointConfiguration.from_runtime(configuration)
     return await client_from_configuration(configuration).get_item(
-        url=url, drive_id=drive_id, item_id=item_id
+        url=url,
+        drive_id=drive_id,
+        item_id=item_id,
+        deadline=time.monotonic() + config.timeout_seconds,
+        cancel_check=cancel_check,
     )
 
 
@@ -588,7 +634,12 @@ async def list_owned_sites_with_graph(
     clock=time.monotonic,
 ):
     _control(deadline=deadline, cancel_check=cancel_check, clock=clock)
-    await graph.get_json("/me", params={"$select": "id,displayName"})
+    await graph.get_json(
+        "/me",
+        params={"$select": "id,displayName"},
+        deadline=deadline,
+        cancel_check=cancel_check,
+    )
     sites = []
     warnings = []
     reasons = []
@@ -597,6 +648,8 @@ async def list_owned_sites_with_graph(
     async for page in graph.iterate_pages(
         "/me/ownedObjects/microsoft.graph.group",
         params={"$select": "id,displayName", "$top": min(200, max_sites)},
+        deadline=deadline,
+        cancel_check=cancel_check,
     ):
         _control(deadline=deadline, cancel_check=cancel_check, clock=clock)
         if pages >= max_pages:
@@ -621,6 +674,8 @@ async def list_owned_sites_with_graph(
                     params={
                         "$select": "id,displayName,webUrl,description,createdDateTime"
                     },
+                    deadline=deadline,
+                    cancel_check=cancel_check,
                 )
                 if not isinstance(raw, Mapping):
                     raise ValueError
@@ -636,7 +691,12 @@ async def list_owned_sites_with_graph(
                     "group_id": group_id,
                     "group_name": _bounded_text(group.get("displayName"), "group name"),
                 }
-            except Exception:
+            except (SharePointCancelledError, SharePointDeadlineError):
+                raise
+            except Exception as error:
+                control_error = _translated_graph_control(error)
+                if control_error is not None:
+                    raise control_error from None
                 warnings.append(
                     {"group_id": group_id, "category": "remote_unavailable"}
                 )
@@ -788,10 +848,38 @@ def _write_name(value: Any, label="name") -> str:
     return name
 
 
+def _validate_copy_monitor_url(location: str, tenant_host: str) -> None:
+    try:
+        parts = urlsplit(location)
+        port = parts.port
+    except (TypeError, ValueError):
+        raise SharePointWriteError("copy monitor URL is invalid") from None
+    if (
+        parts.scheme.casefold() != "https"
+        or (parts.hostname or "").casefold().rstrip(".")
+        != str(tenant_host).casefold().rstrip(".")
+        or parts.username is not None
+        or parts.password is not None
+        or port not in {None, 443}
+        or bool(parts.fragment)
+        or _COPY_MONITOR_PATH.fullmatch(parts.path) is None
+    ):
+        raise SharePointWriteError("copy monitor URL escaped tenant authority")
+
+
 async def create_folder_with_client(
-    client, *, parent_url, name, exist_ok=False, etag=None
+    client,
+    *,
+    parent_url,
+    name,
+    exist_ok=False,
+    etag=None,
+    deadline=None,
+    cancel_check=None,
 ):
-    parent = await client.get_item(url=parent_url)
+    parent = await client.get_item(
+        url=parent_url, deadline=deadline, cancel_check=cancel_check
+    )
     if parent["item"].get("kind") != "folder":
         raise SharePointWriteError("destination must be a folder")
     safe_name = _write_name(name, "folder name")
@@ -804,6 +892,8 @@ async def create_folder_with_client(
         },
         headers=_write_headers(etag),
         retry_ambiguous=False,
+        deadline=deadline,
+        cancel_check=cancel_check,
     )
     return {
         "id": _bounded_text(raw.get("id"), "item id", 1024),
@@ -813,16 +903,27 @@ async def create_folder_with_client(
 
 
 async def move_item_with_client(
-    client, *, source_url, destination_url=None, name=None, etag=None
+    client,
+    *,
+    source_url,
+    destination_url=None,
+    name=None,
+    etag=None,
+    deadline=None,
+    cancel_check=None,
 ):
-    source = await client.get_item(url=source_url)
-    if source["item"].get("kind") == "folder" and not source["item"].get("id"):
+    source = await client.get_item(
+        url=source_url, deadline=deadline, cancel_check=cancel_check
+    )
+    if source["item"].get("is_drive_root") is True:
         raise SharePointWriteError("source root cannot be moved")
     body = {}
     if name is not None:
         body["name"] = _write_name(name)
     if destination_url is not None:
-        destination = await client.get_item(url=destination_url)
+        destination = await client.get_item(
+            url=destination_url, deadline=deadline, cancel_check=cancel_check
+        )
         if source["tenant_host"] != destination["tenant_host"]:
             raise SharePointWriteError("source and destination tenants differ")
         if destination["item"].get("kind") != "folder":
@@ -838,6 +939,8 @@ async def move_item_with_client(
         json_body=body,
         headers=_write_headers(etag),
         retry_ambiguous=False,
+        deadline=deadline,
+        cancel_check=cancel_check,
     )
 
 
@@ -851,8 +954,14 @@ async def copy_item_with_client(
     deadline=None,
     cancel_check=None,
 ):
-    source = await client.get_item(url=source_url)
-    destination = await client.get_item(url=destination_url)
+    source = await client.get_item(
+        url=source_url, deadline=deadline, cancel_check=cancel_check
+    )
+    if source["item"].get("is_drive_root") is True:
+        raise SharePointWriteError("source root cannot be copied")
+    destination = await client.get_item(
+        url=destination_url, deadline=deadline, cancel_check=cancel_check
+    )
     if source["tenant_host"] != destination["tenant_host"]:
         raise SharePointWriteError("source and destination tenants differ")
     if destination["item"].get("kind") != "folder":
@@ -871,17 +980,26 @@ async def copy_item_with_client(
         max_polls=max_polls,
         deadline=deadline,
         cancel_check=cancel_check,
+        monitor_url_validator=lambda location: _validate_copy_monitor_url(
+            location, source["tenant_host"]
+        ),
     )
 
 
-async def recycle_item_with_client(client, *, url, etag=None):
-    source = await client.get_item(url=url)
-    if source["item"].get("id") in {"", None}:
+async def recycle_item_with_client(
+    client, *, url, etag=None, deadline=None, cancel_check=None
+):
+    source = await client.get_item(
+        url=url, deadline=deadline, cancel_check=cancel_check
+    )
+    if source["item"].get("is_drive_root") is True:
         raise SharePointWriteError("library root cannot be recycled")
     await client.graph.delete(
         f"/drives/{source['drive']['id']}/items/{source['item']['id']}",
         headers=_write_headers(etag),
         retry_ambiguous=False,
+        deadline=deadline,
+        cancel_check=cancel_check,
     )
     return {
         "recycled": True,
@@ -992,7 +1110,9 @@ async def upload_with_client(
     with _staged_upload_source(
         config, source, deadline=deadline, cancel_check=cancel_check
     ) as (local, size, source_name):
-        destination = await client.get_item(url=folder_url)
+        destination = await client.get_item(
+            url=folder_url, deadline=deadline, cancel_check=cancel_check
+        )
         if destination["item"].get("kind") != "folder":
             raise SharePointWriteError("upload destination must be a folder")
         remote_name = _write_name(name or source_name)
@@ -1003,6 +1123,8 @@ async def upload_with_client(
                 f"{base}/content?@microsoft.graph.conflictBehavior={conflict_behavior}",
                 local.read_bytes(),
                 max_bytes=4 * 1024 * 1024,
+                deadline=deadline,
+                cancel_check=cancel_check,
             )
         else:
             raw = await client.graph.upload_via_session(
@@ -1046,6 +1168,8 @@ async def _write_operation(name, configuration, arguments, *, cancel_check=None)
             name=arguments.get("name"),
             exist_ok=arguments.get("exist_ok") is True,
             etag=arguments.get("etag"),
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
     if name == "sharepoint_move_item":
         return await move_item_with_client(
@@ -1054,6 +1178,8 @@ async def _write_operation(name, configuration, arguments, *, cancel_check=None)
             destination_url=arguments.get("destination_url"),
             name=arguments.get("name"),
             etag=arguments.get("etag"),
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
     if name == "sharepoint_copy_item":
         return await copy_item_with_client(
@@ -1067,7 +1193,11 @@ async def _write_operation(name, configuration, arguments, *, cancel_check=None)
         )
     if name == "sharepoint_recycle_item":
         return await recycle_item_with_client(
-            client, url=arguments.get("url"), etag=arguments.get("etag")
+            client,
+            url=arguments.get("url"),
+            etag=arguments.get("etag"),
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
     raise SharePointWriteError("unknown write operation")
 

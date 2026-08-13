@@ -246,7 +246,9 @@ async def invoke(
 ) -> dict[str, Any]:
     if name == "sharepoint_resolve_url":
         return await operations.resolve_url(
-            configuration, str(arguments.get("url") or "")
+            configuration,
+            str(arguments.get("url") or ""),
+            cancel_check=cancel_check,
         )
     if name == "sharepoint_get_item":
         return await operations.get_item(
@@ -254,6 +256,7 @@ async def invoke(
             url=arguments.get("url"),
             drive_id=arguments.get("drive_id"),
             item_id=arguments.get("item_id"),
+            cancel_check=cancel_check,
         )
     if name == "sharepoint_list_items":
         return await operations.list_items(
