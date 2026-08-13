@@ -56,6 +56,7 @@ def test_auto_selects_only_complete_modes_without_exposing_secret(tmp_path):
         client_secret="must-not-leak",
         scopes=("https://graph.microsoft.com/.default",),
     )
+    assert "must-not-leak" not in repr(app_only)
     assert identity.select_auth_mode(app_only) is identity.GraphAuthMode.APP_ONLY
 
     incomplete = identity.GraphIdentityConfig(

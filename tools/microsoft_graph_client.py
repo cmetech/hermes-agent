@@ -239,51 +239,53 @@ class MicrosoftGraphClient:
                             url,
                             headers=request_headers,
                         ) as response:
-                            if response.status_code >= 400:
-                                await response.aread()
-                                api_error = self._build_api_error("GET", url, response)
-                                last_error = api_error
-
-                                if (
-                                    response.status_code == 401
-                                    and attempt < self.max_retries
-                                ):
-                                    self.token_provider.clear_cache()
-                                    await self._sleep(
-                                        self._retry_delay(response, attempt)
-                                    )
-                                    attempt += 1
-                                    continue
-
-                                if (
-                                    self._should_retry(response)
-                                    and attempt < self.max_retries
-                                ):
-                                    await self._sleep(
-                                        self._retry_delay(response, attempt)
-                                    )
-                                    attempt += 1
-                                    continue
-
-                                raise api_error
-
-                            content_type = response.headers.get("content-type")
-                            total = 0
-                            with tmp_target.open("wb") as handle:
-                                async for chunk in response.aiter_bytes(
-                                    chunk_size=chunk_size
-                                ):
-                                    self._check_control(
+                            if response.is_redirect:
+                                redirect_url = self._download_redirect_url(response)
+                                async with client.stream(
+                                    "GET",
+                                    redirect_url,
+                                    headers={
+                                        "Accept": "application/octet-stream",
+                                        "User-Agent": self.user_agent,
+                                    },
+                                ) as redirected:
+                                    content_type, total = await self._write_download_body(
+                                        redirected,
+                                        tmp_target,
+                                        chunk_size=chunk_size,
+                                        max_bytes=max_bytes,
                                         deadline=deadline,
                                         cancel_check=cancel_check,
                                     )
-                                    if chunk:
-                                        total += len(chunk)
-                                        if max_bytes is not None and total > max_bytes:
-                                            raise MicrosoftGraphLimitError(
-                                                "Microsoft Graph download exceeded its byte limit."
-                                            )
-                                        handle.write(chunk)
+                            else:
+                                content_type, total = await self._write_download_body(
+                                    response,
+                                    tmp_target,
+                                    chunk_size=chunk_size,
+                                    max_bytes=max_bytes,
+                                    deadline=deadline,
+                                    cancel_check=cancel_check,
+                                )
+                except MicrosoftGraphAPIError as api_error:
+                    last_error = api_error
+                    tmp_target.unlink(missing_ok=True)
+                    retryable = (
+                        api_error.status_code == 401
+                        or api_error.status_code == 429
+                        or 500 <= api_error.status_code < 600
+                    )
+                    if not retryable or attempt >= self.max_retries:
+                        raise
+                    if api_error.status_code == 401:
+                        self.token_provider.clear_cache()
+                    delay = api_error.retry_after_seconds
+                    await self._sleep(
+                        delay
+                        if delay is not None
+                        else min(8.0, 0.5 * (2**attempt))
+                    )
+                    attempt += 1
+                    continue
                 except httpx.HTTPError:
                     last_error = MicrosoftGraphClientError(
                         "Microsoft Graph download transport failed."
@@ -304,6 +306,62 @@ class MicrosoftGraphClient:
                 }
         finally:
             tmp_target.unlink(missing_ok=True)
+
+    async def _write_download_body(
+        self,
+        response: httpx.Response,
+        target: Path,
+        *,
+        chunk_size: int,
+        max_bytes: int | None,
+        deadline: float | None,
+        cancel_check: Callable[[], bool] | None,
+    ) -> tuple[str | None, int]:
+        if response.is_redirect:
+            raise MicrosoftGraphClientError(
+                "Microsoft Graph download returned an unsafe redirect chain."
+            )
+        if response.status_code >= 400:
+            await response.aread()
+            raise self._build_api_error(
+                "GET", self._safe_url(str(response.request.url)), response
+            )
+        content_type = response.headers.get("content-type")
+        total = 0
+        with target.open("wb") as handle:
+            async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                self._check_control(deadline=deadline, cancel_check=cancel_check)
+                if chunk:
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise MicrosoftGraphLimitError(
+                            "Microsoft Graph download exceeded its byte limit."
+                        )
+                    handle.write(chunk)
+        return content_type, total
+
+    @staticmethod
+    def _download_redirect_url(response: httpx.Response) -> str:
+        location = response.headers.get("Location")
+        try:
+            parsed = httpx.URL(location) if location else None
+            port = parsed.port if parsed is not None else None
+        except (TypeError, ValueError):
+            parsed = None
+            port = None
+        if (
+            parsed is None
+            or parsed.scheme != "https"
+            or not parsed.host
+            or parsed.username
+            or parsed.password
+            or port not in {None, 443}
+            or parsed.fragment
+        ):
+            raise MicrosoftGraphClientError(
+                "Microsoft Graph download returned an unsafe redirect."
+            )
+        return str(parsed)
 
     async def upload_small(
         self,

@@ -89,6 +89,66 @@ async def test_download_deadline_stops_before_network_and_cleans_partial(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_download_follows_one_preauthorized_https_redirect_without_bearer(
+    tmp_path,
+):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "https://tenant.sharepoint.com/download?sig=private"
+                },
+            )
+        assert request.url.host == "tenant.sharepoint.com"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=b"redirected content")
+
+    destination = tmp_path / "artifact.bin"
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    result = await client.download_to_file(
+        "/drives/d/items/i/content", destination, max_bytes=1024
+    )
+
+    assert destination.read_bytes() == b"redirected content"
+    assert result["size_bytes"] == len(b"redirected content")
+    assert requests[0].headers["authorization"] == "Bearer cached-token"
+    assert "sig=private" not in repr(result)
+
+
+@pytest.mark.anyio
+async def test_download_rejects_unsafe_preauthorized_redirect_before_following(
+    tmp_path,
+):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            302,
+            headers={"Location": "http://tenant.sharepoint.com/download?sig=private"},
+        )
+
+    destination = tmp_path / "artifact.bin"
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(graph.MicrosoftGraphClientError, match="redirect"):
+        await client.download_to_file("/content", destination, max_bytes=1024)
+
+    assert len(requests) == 1
+    assert not destination.exists()
+    assert not Path(f"{destination}.part").exists()
+
+
+@pytest.mark.anyio
 async def test_small_upload_uses_bounded_binary_put():
     requests = []
 

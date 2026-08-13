@@ -11,7 +11,7 @@ import asyncio
 import os
 import secrets
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -68,7 +68,7 @@ class GraphIdentityConfig:
     mode: GraphAuthMode | str = GraphAuthMode.AUTO
     tenant_id: str = ""
     client_id: str = ""
-    client_secret: str = ""
+    client_secret: str = field(default="", repr=False)
     scopes: tuple[str, ...] = ()
     authority_url: str = "https://login.microsoftonline.com"
     account_id: str = ""
