@@ -52,7 +52,7 @@ merge requests, and Jira comments each remain behind visible approval boundaries
 
 ## Readiness
 
-`available`: enable and configure the GitLab plugin, verify Jira readiness, and use
+`available`: enable and configure both standalone plugins, verify Jira/GitLab readiness, and use
 the reviewed `jira-to-gitlab` workflow with its exact tool and approval contracts.
 
 ## Demonstration

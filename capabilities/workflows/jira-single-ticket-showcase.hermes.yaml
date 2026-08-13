@@ -1,0 +1,10 @@
+language_compatibility: archon-2026-07
+delivery_defaults:
+  inputs:
+    arguments:
+      kind: text
+      required: true
+      max_bytes: 128
+overlap_policy: forbid
+outward_action_nodes: [post-comment]
+outward_action_policy: approval_required

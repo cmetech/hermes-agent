@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "base_url",
+      "label": "Jira base URL",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Exact HTTP(S) Jira origin, without a REST API path.",
+      "documentation_url": "https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/",
+      "validation": {
+        "format": "url",
+        "min_length": 8,
+        "max_length": 2048
+      },
+      "readiness": true
+    },
+    {
+      "id": "auth_mode",
+      "label": "Authentication mode",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "bearer",
+      "help": "Use a bearer PAT or an email plus Jira API token.",
+      "validation": {
+        "enum": ["bearer", "basic"]
+      },
+      "readiness": true
+    },
+    {
+      "id": "pat",
+      "label": "Personal access token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "help": "Write-only Jira bearer personal access token.",
+      "validation": {
+        "min_length": 1,
+        "max_length": 4096
+      },
+      "visible_when": {
+        "field": "auth_mode",
+        "equals": "bearer"
+      },
+      "readiness": true
+    },
+    {
+      "id": "email",
+      "label": "Jira account email",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Account email used only with basic API-token authentication.",
+      "validation": {
+        "min_length": 3,
+        "max_length": 320
+      },
+      "visible_when": {
+        "field": "auth_mode",
+        "equals": "basic"
+      },
+      "readiness": true
+    },
+    {
+      "id": "api_token",
+      "label": "Jira API token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "help": "Write-only Jira API token used with the configured email.",
+      "validation": {
+        "min_length": 1,
+        "max_length": 4096
+      },
+      "visible_when": {
+        "field": "auth_mode",
+        "equals": "basic"
+      },
+      "readiness": true
+    },
+    {
+      "id": "rest_api_version",
+      "label": "REST API preference",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "auto",
+      "help": "Prefer REST v3 with classified v2 fallback, or pin one version.",
+      "advanced": true,
+      "validation": {
+        "enum": ["auto", "3", "2"]
+      }
+    },
+    {
+      "id": "transport",
+      "label": "HTTP transport",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "auto",
+      "help": "Use native HTTP, curl, or bounded automatic Cloudflare-1010 fallback.",
+      "advanced": true,
+      "validation": {
+        "enum": ["auto", "native", "curl"]
+      }
+    },
+    {
+      "id": "curl_executable",
+      "label": "curl executable",
+      "type": "string",
+      "storage": "setting",
+      "default": "/usr/bin/curl",
+      "help": "Exact executable used by the private curl compatibility transport.",
+      "advanced": true,
+      "validation": {
+        "format": "path",
+        "max_length": 4096
+      },
+      "visible_when": {
+        "field": "transport",
+        "equals": "curl"
+      }
+    },
+    {
+      "id": "request_timeout_seconds",
+      "label": "Request timeout (seconds)",
+      "type": "integer",
+      "storage": "setting",
+      "default": 30,
+      "help": "Hard deadline for each bounded Jira request.",
+      "advanced": true,
+      "validation": {
+        "minimum": 1,
+        "maximum": 120
+      }
+    },
+    {
+      "id": "default_max_results",
+      "label": "Default maximum results",
+      "type": "integer",
+      "storage": "setting",
+      "default": 25,
+      "help": "Finite default result limit used when a tool omits its own bound.",
+      "advanced": true,
+      "validation": {
+        "minimum": 1,
+        "maximum": 100
+      }
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+name: jira-single-ticket-showcase
+description: Read, triage, preview, and optionally comment on exactly one Jira ticket
+tags: [ericsson, jira, showcase]
+requires: [ericsson-jira]
+nodes:
+  - id: read-ticket
+    prompt: >
+      Require $ARGUMENTS to contain exactly one Jira issue key and no surrounding
+      prose. If it does, use jira_get_issue for that exact key and return bounded
+      ticket facts with status success. Otherwise call no tool and return
+      invalid_input. Preserve not_found, permission, incomplete, and failed
+      results without inventing issue facts.
+    allowed_tools: [jira_get_issue]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, summary, description, status, warnings]
+      properties:
+        ticket_key: {type: [string, "null"], maxLength: 128}
+        summary: {type: [string, "null"], maxLength: 4096}
+        description: {type: [string, "null"], maxLength: 100000}
+        status: {type: string}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}
+
+  - id: triage-ticket
+    depends_on: [read-ticket]
+    when: "$read-ticket.output.status == 'success'"
+    prompt: >
+      Triage only ticket $read-ticket.output.ticket_key using its exact summary
+      $read-ticket.output.summary and description $read-ticket.output.description;
+      Return one of auto-fix, needs-info, manual-review, or not-a-code-fix with
+      confidence, reasoning, missing information, and a concise proposed Jira
+      comment that truthfully describes the triage. Confidence does not authorize
+      a write. Preserve warnings $read-ticket.output.warnings;
+    allowed_tools: []
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, category, confidence, reasoning, missing_info, proposed_comment, status, warnings]
+      properties:
+        ticket_key: {type: string, minLength: 3, maxLength: 128}
+        category: {type: string, enum: [auto-fix, needs-info, manual-review, not-a-code-fix]}
+        confidence: {type: integer, minimum: 0, maximum: 100}
+        reasoning: {type: string, maxLength: 4096}
+        missing_info: {type: array, maxItems: 20, items: {type: string, maxLength: 1024}}
+        proposed_comment: {type: string, minLength: 1, maxLength: 32000}
+        status: {type: string, const: success}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}
+
+  - id: approve-comment
+    depends_on: [triage-ticket]
+    when: "$triage-ticket.output.status == 'success'"
+    approval:
+      message: >
+        Review the exact Jira target $triage-ticket.output.ticket_key and comment
+        $triage-ticket.output.proposed_comment; approve only this current write.
+      capture_response: true
+
+  - id: post-comment
+    depends_on: [approve-comment, triage-ticket]
+    when: "$triage-ticket.output.status == 'success'"
+    prompt: >
+      Use jira_add_comment once for exact issue $triage-ticket.output.ticket_key
+      and exact approved body $triage-ticket.output.proposed_comment; the workflow
+      admission and plugin host approval must both authorize this invocation.
+      Never retry an ambiguous result; reconcile read-only and report uncertainty.
+    allowed_tools: [jira_add_comment]
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, comment_id, status, warnings]
+      properties:
+        ticket_key: {type: string, minLength: 3, maxLength: 128}
+        comment_id: {type: [string, "null"], maxLength: 128}
+        status: {type: string, enum: [created, duplicate, permission, ambiguous, failed]}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}
+
+  - id: report-status
+    depends_on: [post-comment, triage-ticket]
+    prompt: >
+      Report the one-ticket triage and comment outcome using only
+      $triage-ticket.output and $post-comment.output; preserve every warning and
+      never describe a skipped or ambiguous comment as created.
+    allowed_tools: []
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [ticket_key, category, comment_status, warnings]
+      properties:
+        ticket_key: {type: string, minLength: 3, maxLength: 128}
+        category: {type: string}
+        comment_status: {type: string}
+        warnings: {type: array, maxItems: 100, items: {type: string, maxLength: 4096}}
