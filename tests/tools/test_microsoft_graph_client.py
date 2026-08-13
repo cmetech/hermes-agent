@@ -72,6 +72,43 @@ class TestMicrosoftGraphClient:
         assert payload == {"ok": True}
         assert captured_auth == ["Bearer cached-token"]
 
+    async def test_401_clears_provider_and_forces_refresh(self):
+        class RefreshingProvider:
+            def __init__(self):
+                self.force_refresh = []
+                self.clears = 0
+
+            async def get_access_token(self, *, force_refresh=False):
+                self.force_refresh.append(force_refresh)
+                return "fresh" if force_refresh else "stale"
+
+            def clear_cache(self):
+                self.clears += 1
+
+        provider = RefreshingProvider()
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.headers["authorization"])
+            if len(calls) == 1:
+                return httpx.Response(401, json={"error": {"code": "InvalidToken"}})
+            return httpx.Response(200, json={"ok": True})
+
+        async def no_sleep(delay):
+            return None
+
+        client = MicrosoftGraphClient(
+            provider,
+            transport=httpx.MockTransport(handler),
+            sleep=no_sleep,
+            max_retries=1,
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert provider.clears == 1
+        assert provider.force_refresh == [False, True]
+        assert calls == ["Bearer stale", "Bearer fresh"]
+
     async def test_retries_on_rate_limit_and_uses_retry_after(self):
         calls: list[int] = []
         sleeps: list[float] = []
