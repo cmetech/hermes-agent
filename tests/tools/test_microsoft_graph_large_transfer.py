@@ -546,6 +546,73 @@ async def test_start_async_operation_posts_once_then_polls_trusted_location():
 
 
 @pytest.mark.anyio
+async def test_start_async_operation_polls_validated_external_monitor_without_bearer():
+    calls = []
+    monitor_url = (
+        "https://tenant.sharepoint.com/sites/Governance/"
+        "_api/v2.1/monitor/copy-1?token=private"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": monitor_url})
+        assert str(request.url) == monitor_url
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json={"status": "completed", "resourceId": "copy"})
+
+    validated = []
+
+    def validate_monitor(location: str) -> None:
+        validated.append(location)
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    result = await client.start_async_operation(
+        "/drives/d/items/i/copy",
+        json_body={"parentReference": {"driveId": "d", "id": "parent"}},
+        max_polls=2,
+        monitor_url_validator=validate_monitor,
+    )
+
+    assert result == {"status": "completed", "resourceId": "copy"}
+    assert validated == [monitor_url]
+    assert calls[0].headers["authorization"] == "Bearer cached-token"
+    assert "authorization" not in calls[1].headers
+
+
+@pytest.mark.anyio
+async def test_external_monitor_redirect_is_ambiguous_and_never_followed_or_restarted():
+    calls = []
+    monitor_url = "https://tenant.sharepoint.com/_api/v2.0/monitor/copy-1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": monitor_url})
+        return httpx.Response(302, headers={"Location": "https://attacker.example/steal"})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler), max_retries=0
+    )
+
+    with pytest.raises(graph.MicrosoftGraphAmbiguousWriteError):
+        await client.start_async_operation(
+            "/drives/d/items/i/copy",
+            json_body={"parentReference": {"driveId": "d", "id": "parent"}},
+            max_polls=2,
+            monitor_url_validator=lambda _location: None,
+        )
+
+    assert [(call.method, str(call.url)) for call in calls] == [
+        ("POST", "https://graph.microsoft.com/v1.0/drives/d/items/i/copy"),
+        ("GET", monitor_url),
+    ]
+
+
+@pytest.mark.anyio
 async def test_async_operation_terminal_failure_is_bounded_and_redacted():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

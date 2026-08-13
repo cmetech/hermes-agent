@@ -588,18 +588,38 @@ class MicrosoftGraphClient:
         deadline: float | None = None,
         cancel_check: Callable[[], bool] | None = None,
         poll_interval: float = 1.0,
+        monitor_url_validator: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Poll a trusted Graph monitor URL until a terminal bounded result."""
-        self._validate_graph_origin(location)
+        graph_origin = self._is_graph_origin(location)
+        if not graph_origin:
+            if monitor_url_validator is None:
+                self._validate_graph_origin(location)
+            try:
+                monitor_url_validator(location)
+            except MicrosoftGraphClientError:
+                raise
+            except Exception:
+                raise MicrosoftGraphClientError(
+                    "Microsoft Graph monitor URL was rejected by its authority policy."
+                ) from None
         if max_polls <= 0:
             raise MicrosoftGraphLimitError("Async operation poll count must be positive.")
         for poll_number in range(max_polls):
             self._check_control(deadline=deadline, cancel_check=cancel_check)
-            response = await self._request(
-                "GET",
-                location,
-                deadline=deadline,
-                cancel_check=cancel_check,
+            response = await (
+                self._request(
+                    "GET",
+                    location,
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
+                if graph_origin
+                else self._request_external_monitor(
+                    location,
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
             )
             payload = self._decode_json(response)
             if not isinstance(payload, dict):
@@ -633,6 +653,7 @@ class MicrosoftGraphClient:
         deadline: float | None = None,
         cancel_check: Callable[[], bool] | None = None,
         poll_interval: float = 1.0,
+        monitor_url_validator: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Submit one async write, then poll its trusted monitor exactly once.
 
@@ -669,17 +690,26 @@ class MicrosoftGraphClient:
             raise self._build_api_error("POST", url, response)
         location = response.headers.get("Location")
         if not location:
-            raise MicrosoftGraphAsyncOperationError(
-                "Microsoft Graph async operation returned no monitor location."
+            raise MicrosoftGraphAmbiguousWriteError(
+                "Microsoft Graph accepted the async write without a monitor location; reconcile before retrying."
             )
-        self._validate_graph_origin(location)
-        return await self.poll_async_operation(
-            location,
-            max_polls=max_polls,
-            deadline=deadline,
-            cancel_check=cancel_check,
-            poll_interval=poll_interval,
-        )
+        try:
+            return await self.poll_async_operation(
+                location,
+                max_polls=max_polls,
+                deadline=deadline,
+                cancel_check=cancel_check,
+                poll_interval=poll_interval,
+                monitor_url_validator=monitor_url_validator,
+            )
+        except MicrosoftGraphAsyncOperationError:
+            raise
+        except MicrosoftGraphAmbiguousWriteError:
+            raise
+        except MicrosoftGraphClientError:
+            raise MicrosoftGraphAmbiguousWriteError(
+                "Microsoft Graph accepted the async write but monitoring became uncertain; reconcile before retrying."
+            ) from None
 
     async def _request(
         self,
@@ -786,6 +816,60 @@ class MicrosoftGraphClient:
             f"Microsoft Graph request exhausted retries for {method} {url}."
         )
 
+    async def _request_external_monitor(
+        self,
+        url: str,
+        *,
+        deadline: float | None,
+        cancel_check: Callable[[], bool] | None,
+    ) -> httpx.Response:
+        """Poll one prevalidated external monitor without Graph credentials."""
+        for attempt in range(self.max_retries + 1):
+            self._check_control(deadline=deadline, cancel_check=cancel_check)
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self._request_timeout(deadline)),
+                    transport=self._transport,
+                ) as client:
+                    response = await client.get(
+                        url,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": self.user_agent,
+                        },
+                    )
+                self._check_control(deadline=deadline, cancel_check=cancel_check)
+            except httpx.HTTPError:
+                if attempt >= self.max_retries:
+                    raise MicrosoftGraphClientError(
+                        "Microsoft Graph external monitor transport failed."
+                    ) from None
+                await self._controlled_sleep(
+                    self._retry_delay(None, attempt),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
+                continue
+
+            if response.is_redirect:
+                raise MicrosoftGraphClientError(
+                    "Microsoft Graph external monitor returned an unsafe redirect."
+                )
+            if response.status_code < 400:
+                return response
+            if self._should_retry(response) and attempt < self.max_retries:
+                await self._controlled_sleep(
+                    self._retry_delay(response, attempt),
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
+                continue
+            raise self._build_api_error("GET", url, response)
+
+        raise MicrosoftGraphClientError(
+            "Microsoft Graph external monitor exhausted retries."
+        )
+
     def _resolve_url(self, path_or_url: str) -> str:
         if path_or_url.startswith(("http://", "https://")):
             self._validate_graph_origin(path_or_url)
@@ -794,20 +878,23 @@ class MicrosoftGraphClient:
         return f"{self.base_url}{path}"
 
     def _validate_graph_origin(self, url: str) -> None:
-        candidate = httpx.URL(url)
-        base = httpx.URL(self.base_url)
-        if (
-            candidate.scheme.casefold(),
-            candidate.host.casefold() if candidate.host else None,
-            candidate.port,
-        ) != (
-            base.scheme.casefold(),
-            base.host.casefold() if base.host else None,
-            base.port,
-        ):
+        if not self._is_graph_origin(url):
             raise MicrosoftGraphClientError(
                 "Microsoft Graph URL is outside the configured Graph origin."
             )
+
+    def _is_graph_origin(self, url: str) -> bool:
+        candidate = httpx.URL(url)
+        base = httpx.URL(self.base_url)
+        return (
+            candidate.scheme.casefold(),
+            candidate.host.casefold() if candidate.host else None,
+            candidate.port,
+        ) == (
+            base.scheme.casefold(),
+            base.host.casefold() if base.host else None,
+            base.port,
+        )
 
     def _check_control(
         self,
