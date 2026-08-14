@@ -10,8 +10,10 @@ import pytest
 from tools.microsoft_graph_auth import GraphCredentials, MicrosoftGraphTokenProvider
 from tools.microsoft_graph_client import (
     MicrosoftGraphAPIError,
+    MicrosoftGraphCancelledError,
     MicrosoftGraphClient,
     MicrosoftGraphClientError,
+    MicrosoftGraphDeadlineError,
 )
 
 
@@ -138,6 +140,81 @@ class TestMicrosoftGraphClient:
         assert payload == {"ok": True}
         assert len(calls) == 2
         assert sleeps == [3.0]
+
+    async def test_retry_after_is_capped_by_graph_client_policy(self):
+        calls = []
+        sleeps = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"Retry-After": "3600"})
+            return httpx.Response(200, json={"ok": True})
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=1,
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert sleeps == [60.0]
+
+    async def test_deadline_rejects_retry_delay_that_exceeds_remaining_budget(self):
+        calls = []
+        sleeps = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            clock=lambda: 10.0,
+            max_retries=1,
+        )
+
+        with pytest.raises(MicrosoftGraphDeadlineError):
+            await client.get_json("/me", deadline=15.0)
+
+        assert len(calls) == 1
+        assert sleeps == []
+
+    async def test_cancellation_interrupts_request_retry_sleep(self):
+        calls = []
+        sleeps = []
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+
+        async def fake_sleep(delay: float) -> None:
+            nonlocal cancelled
+            sleeps.append(delay)
+            cancelled = True
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=1,
+        )
+
+        with pytest.raises(MicrosoftGraphCancelledError):
+            await client.get_json("/me", cancel_check=lambda: cancelled)
+
+        assert len(calls) == 1
+        assert sleeps and max(sleeps) <= 0.25
 
 
     async def test_invalid_json_response_raises_client_error(self):

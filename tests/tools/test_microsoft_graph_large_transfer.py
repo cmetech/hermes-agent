@@ -312,6 +312,37 @@ async def test_upload_session_honors_server_resume_offset(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_upload_session_rejects_misaligned_server_resume_offset(tmp_path):
+    source = tmp_path / "upload.bin"
+    source.write_bytes(b"a" * 700_000)
+    ranges = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(
+                200,
+                json={"uploadUrl": "https://upload.example/misaligned"},
+            )
+        ranges.append(request.headers["content-range"])
+        return httpx.Response(202, json={"nextExpectedRanges": ["327681-"]})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(graph.MicrosoftGraphClientError, match="unsafe resume offset"):
+        await client.upload_via_session(
+            "/session",
+            source,
+            max_bytes=800_000,
+            chunk_size=327_680,
+            max_chunks=3,
+        )
+
+    assert ranges == ["bytes 0-327679/700000"]
+
+
+@pytest.mark.anyio
 async def test_upload_session_retries_same_range_after_rate_limit(tmp_path):
     source = tmp_path / "upload.bin"
     source.write_bytes(b"a" * 10)
@@ -482,6 +513,40 @@ async def test_async_operation_honors_retry_after_and_completes():
 
 
 @pytest.mark.anyio
+async def test_async_operation_retry_delay_cannot_outlive_deadline():
+    calls = []
+    sleeps = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            202,
+            json={"status": "inProgress"},
+            headers={"Retry-After": "86400"},
+        )
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    client = graph.MicrosoftGraphClient(
+        _provider(),
+        transport=httpx.MockTransport(handler),
+        sleep=sleep,
+        clock=lambda: 10.0,
+    )
+
+    with pytest.raises(graph.MicrosoftGraphDeadlineError):
+        await client.poll_async_operation(
+            "https://graph.microsoft.com/v1.0/monitor/1",
+            max_polls=2,
+            deadline=15.0,
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+@pytest.mark.anyio
 async def test_start_async_operation_posts_once_then_polls_trusted_location():
     calls = []
 
@@ -508,6 +573,73 @@ async def test_start_async_operation_posts_once_then_polls_trusted_location():
     assert [(call.method, str(call.url)) for call in calls] == [
         ("POST", "https://graph.microsoft.com/v1.0/drives/d/items/i/copy"),
         ("GET", "https://graph.microsoft.com/v1.0/monitor/copy-1"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_start_async_operation_polls_validated_external_monitor_without_bearer():
+    calls = []
+    monitor_url = (
+        "https://tenant.sharepoint.com/sites/Governance/"
+        "_api/v2.1/monitor/copy-1?token=private"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": monitor_url})
+        assert str(request.url) == monitor_url
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json={"status": "completed", "resourceId": "copy"})
+
+    validated = []
+
+    def validate_monitor(location: str) -> None:
+        validated.append(location)
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler)
+    )
+
+    result = await client.start_async_operation(
+        "/drives/d/items/i/copy",
+        json_body={"parentReference": {"driveId": "d", "id": "parent"}},
+        max_polls=2,
+        monitor_url_validator=validate_monitor,
+    )
+
+    assert result == {"status": "completed", "resourceId": "copy"}
+    assert validated == [monitor_url]
+    assert calls[0].headers["authorization"] == "Bearer cached-token"
+    assert "authorization" not in calls[1].headers
+
+
+@pytest.mark.anyio
+async def test_external_monitor_redirect_is_ambiguous_and_never_followed_or_restarted():
+    calls = []
+    monitor_url = "https://tenant.sharepoint.com/_api/v2.0/monitor/copy-1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": monitor_url})
+        return httpx.Response(302, headers={"Location": "https://attacker.example/steal"})
+
+    client = graph.MicrosoftGraphClient(
+        _provider(), transport=httpx.MockTransport(handler), max_retries=0
+    )
+
+    with pytest.raises(graph.MicrosoftGraphAmbiguousWriteError):
+        await client.start_async_operation(
+            "/drives/d/items/i/copy",
+            json_body={"parentReference": {"driveId": "d", "id": "parent"}},
+            max_polls=2,
+            monitor_url_validator=lambda _location: None,
+        )
+
+    assert [(call.method, str(call.url)) for call in calls] == [
+        ("POST", "https://graph.microsoft.com/v1.0/drives/d/items/i/copy"),
+        ("GET", monitor_url),
     ]
 
 

@@ -71,6 +71,8 @@ upstream_changes:
   - tests/tools/test_microsoft_graph_large_transfer.py
   owned_symbols:
   - GRAPH_UPLOAD_FRAGMENT_BYTES
+  - MAX_GRAPH_RETRY_DELAY_SECONDS
+  - CONTROL_SLEEP_SLICE_SECONDS
   - MicrosoftGraphLimitError
   - MicrosoftGraphCancelledError
   - MicrosoftGraphDeadlineError
@@ -80,12 +82,14 @@ upstream_changes:
   - MicrosoftGraphClient
   owned_invariants:
   - existing JSON request, pagination, retry, and streaming-download behavior remains compatible for Teams callers
-  - Graph pagination and async monitor URLs remain on the configured Graph origin and error URLs omit queries and fragments
+  - Graph pagination URLs remain on the configured Graph origin and error URLs omit queries and fragments
+  - retry delays have a hard client cap, cannot exceed the remaining deadline, and observe cooperative cancellation while sleeping
   - download redirects require absolute credential-free HTTPS targets and never receive a Microsoft Graph bearer token
   - downloads and uploads use atomic file boundaries plus explicit byte, chunk, poll, deadline, and cooperative-cancellation limits
   - upload session fragments are aligned to the Graph fragment size and resume only from validated server offsets
   - writes with an ambiguous transport or server outcome are not replayed automatically and require caller reconciliation
-  - asynchronous writes validate one same-origin monitor and stop at explicit terminal states or bounded failure
+  - asynchronous writes accept same-origin monitors by default and external monitors only through an exact caller-supplied authority validator
+  - external async monitors never receive a Graph bearer, never follow redirects, and any uncertainty after the initiating write is accepted requires reconciliation without replay
   tests:
   - tests/tools/test_microsoft_graph_client.py
   - tests/tools/test_microsoft_graph_large_transfer.py
@@ -97,15 +101,18 @@ upstream_changes:
     UNION on merge. Retain the old MicrosoftGraphClient call signatures and
     default retry behavior for existing reads while preserving explicit
     retry_ambiguous controls for mutations. Never forward Authorization to a
-    download redirect or upload-session URL. Keep origin validation, safe URL
-    rendering, temporary-file cleanup, Graph-aligned resume validation, and all
-    caller-supplied operation bounds. Transport-ambiguous mutations must remain
-    non-replayed. Run both Graph client suites and Teams pipeline regression
-    after changes to request, pagination, retry, or transfer behavior.
+    download redirect, upload-session URL, or externally hosted async monitor.
+    Keep origin validation, safe URL rendering, temporary-file cleanup,
+    Graph-aligned resume validation, interruptible/capped retry waits, and all
+    caller-supplied operation bounds. An external monitor must be explicitly
+    validated by its connector and must not follow redirects. Transport-
+    ambiguous mutations and accepted writes with uncertain monitoring must
+    remain non-replayed. Run both Graph client suites and Teams pipeline
+    regression after changes to request, pagination, retry, or transfer behavior.
   removal_condition: >-
     Remove when upstream provides equivalent bounded Graph transfers and async
-    operations with same-origin monitor validation, bearer-safe redirects,
-    atomic file handling, cancellation and deadline controls, validated upload
-    resume offsets, and non-replay of ambiguous mutations while preserving the
-    existing Teams client contract.
+    operations with connector-validated external monitor support, bearer-safe
+    redirects and monitors, atomic file handling, cancellation/deadline-aware
+    capped retry waits, validated upload resume offsets, and non-replay of
+    ambiguous mutations while preserving the existing Teams client contract.
   last_verified_upstream: da59906aaad8f9cb023fb66426c6f60ff5afa04a
