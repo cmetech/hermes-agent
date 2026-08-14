@@ -231,6 +231,26 @@ describe('WorkflowsView', () => {
     expect(boardShell.querySelector('[data-lane-scroll]')?.className).toContain('overflow-y-auto')
   })
 
+  it.each([
+    ['board', 'Active board'],
+    ['history', 'History'],
+    ['archive', 'Archive']
+  ] as const)('defaults every lane in the empty %s view to collapsed', async (view, label) => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [], schema_version: 1 })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    fireEvent.click(screen.getByRole('tab', { name: label }))
+
+    expect(await screen.findByLabelText('0 loaded workflow runs')).toBeTruthy()
+    const board = await screen.findByLabelText('Workflows activity board')
+
+    expect(within(board).getAllByRole('button', { name: /^Expand / })).toHaveLength(5)
+    expect(within(board).queryByText('No runs')).toBeNull()
+    expect(listWorkflowRuns).toHaveBeenCalledWith(undefined, view)
+  })
+
   it('keeps the catalog free of run-only toolbar controls', async () => {
     $workflowSelectedRunId.set(null)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
