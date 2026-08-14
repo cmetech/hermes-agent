@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "tenant_host",
+      "label": "SharePoint tenant host",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Exact SharePoint tenant host, such as tenant.sharepoint.com, without a scheme or path.",
+      "validation": {"min_length": 5, "max_length": 253},
+      "readiness": true
+    },
+    {
+      "id": "auth_mode",
+      "label": "Microsoft Graph authentication mode",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "auto",
+      "validation": {"enum": ["auto", "delegated_msal", "app_only", "azure_cli"]},
+      "readiness": true
+    },
+    {
+      "id": "tenant_id",
+      "label": "Microsoft Entra tenant ID",
+      "type": "string",
+      "storage": "setting",
+      "help": "Tenant identifier used by delegated MSAL and app-only authentication.",
+      "validation": {"max_length": 256}
+    },
+    {
+      "id": "client_id",
+      "label": "Microsoft Entra client ID",
+      "type": "string",
+      "storage": "setting",
+      "help": "Public or confidential application client identifier.",
+      "validation": {"max_length": 256}
+    },
+    {
+      "id": "client_secret",
+      "label": "Microsoft Entra client secret",
+      "type": "string",
+      "storage": "secret",
+      "help": "Write-only secret used only by app-only authentication.",
+      "validation": {"min_length": 1, "max_length": 4096}
+    },
+    {
+      "id": "scopes",
+      "label": "Microsoft Graph scopes",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "Sites.Read.All User.Read Group.Read.All",
+      "help": "Space- or comma-separated delegated scopes, or one .default scope for app-only/Azure CLI.",
+      "validation": {"min_length": 1, "max_length": 2048},
+      "readiness": true
+    },
+    {
+      "id": "authority_url",
+      "label": "Microsoft identity authority",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "https://login.microsoftonline.com",
+      "advanced": true,
+      "validation": {"format": "url", "max_length": 2048},
+      "readiness": true
+    },
+    {
+      "id": "account_id",
+      "label": "Delegated account",
+      "type": "string",
+      "storage": "setting",
+      "help": "Optional account ID or username when the delegated cache contains multiple accounts.",
+      "advanced": true,
+      "validation": {"max_length": 512}
+    },
+    {
+      "id": "azure_cli_enabled",
+      "label": "Allow existing Azure CLI identity",
+      "type": "boolean",
+      "storage": "setting",
+      "default": false,
+      "advanced": true
+    },
+    {
+      "id": "max_pages",
+      "label": "Maximum Graph pages per operation",
+      "type": "integer",
+      "storage": "setting",
+      "default": 25,
+      "advanced": true,
+      "validation": {"minimum": 1, "maximum": 1000}
+    },
+    {
+      "id": "max_items",
+      "label": "Maximum items per operation",
+      "type": "integer",
+      "storage": "setting",
+      "default": 1000,
+      "advanced": true,
+      "validation": {"minimum": 1, "maximum": 100000}
+    },
+    {
+      "id": "max_bytes",
+      "label": "Maximum aggregate bytes per operation",
+      "type": "integer",
+      "storage": "setting",
+      "default": 536870912,
+      "advanced": true,
+      "validation": {"minimum": 1, "maximum": 1099511627776}
+    },
+    {
+      "id": "timeout_seconds",
+      "label": "Operation timeout in seconds",
+      "type": "number",
+      "storage": "setting",
+      "default": 60,
+      "advanced": true,
+      "validation": {"minimum": 1, "maximum": 3600}
+    },
+    {
+      "id": "download_root",
+      "label": "Authorized download root",
+      "type": "string",
+      "storage": "setting",
+      "default": "artifacts/sharepoint/downloads",
+      "help": "Profile-relative or absolute directory authorized for SharePoint downloads.",
+      "validation": {"format": "path", "max_length": 4096}
+    },
+    {
+      "id": "upload_root",
+      "label": "Authorized upload root",
+      "type": "string",
+      "storage": "setting",
+      "default": "artifacts/sharepoint/uploads",
+      "help": "Profile-relative or absolute directory from which SharePoint uploads may read.",
+      "validation": {"format": "path", "max_length": 4096}
+    },
+    {
+      "id": "browser_profile",
+      "label": "Enrolled browser profile",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "ericsson-sharepoint",
+      "help": "Name of a Hermes-owned enrolled browser profile trusted for the SharePoint tenant origin.",
+      "validation": {"min_length": 1, "max_length": 128}
+    }
+  ],
+  "setup_actions": [
+    {
+      "id": "authenticate",
+      "label": "Authenticate Microsoft Graph",
+      "help": "Open the explicit delegated sign-in flow and persist only the protected profile cache.",
+      "interactive": true
+    },
+    {
+      "id": "test_connection",
+      "label": "Test Microsoft Graph connection",
+      "help": "Use the configured identity silently to verify access to the tenant site."
+    },
+    {
+      "id": "enroll_browser",
+      "label": "Enroll SharePoint browser",
+      "help": "Open the named Hermes enrolled browser profile for SharePoint sign-in.",
+      "interactive": true
+    },
+    {
+      "id": "clear_session",
+      "label": "Release SharePoint browser session",
+      "help": "Release only the browser session acquired by this connector."
+    }
+  ]
+}
+

@@ -184,7 +184,10 @@ class MicrosoftGraphTokenProvider:
             )
 
         if response.status_code >= 400:
-            detail = _extract_error_detail(response)
+            detail = _redact_value(
+                _extract_error_detail(response),
+                self.credentials.client_secret,
+            )
             raise MicrosoftGraphTokenError(
                 "Microsoft Graph token request failed with HTTP "
                 f"{response.status_code}: {detail}"
@@ -243,3 +246,10 @@ def _extract_error_detail(response: httpx.Response) -> str:
         if isinstance(error, str):
             return error
     return str(payload)
+
+
+def _redact_value(message: str, sensitive_value: str) -> str:
+    """Remove an exact configured credential echoed by an upstream error."""
+    if not sensitive_value:
+        return message
+    return message.replace(sensitive_value, "[REDACTED]")

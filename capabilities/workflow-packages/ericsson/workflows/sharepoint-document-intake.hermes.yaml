@@ -1,0 +1,8 @@
+language_compatibility: archon-2026-07
+delivery_defaults:
+  inputs:
+    arguments:
+      kind: text
+      required: true
+      max_bytes: 8192
+overlap_policy: forbid

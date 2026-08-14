@@ -8,13 +8,17 @@
   "capabilities/workflows/jira-to-gitlab.yml",
   "capabilities/workflows/my-tickets-summary.hermes.yaml",
   "capabilities/workflows/my-tickets-summary.yml",
+  "capabilities/workflows/sharepoint-document-intake.hermes.yaml",
+  "capabilities/workflows/sharepoint-document-intake.yml",
   "plugins/ericsson-gitlab",
   "plugins/ericsson-jira",
+  "plugins/ericsson-sharepoint",
   "plugins/ericsson-teams",
   "plugins/outlook-mcp",
   "skills/ericsson/gitlab",
   "skills/ericsson/jira",
   "skills/ericsson/jira-to-gitlab",
   "skills/ericsson/onboard-ericsson-capabilities",
-  "skills/ericsson/opportunity-visuals"
+  "skills/ericsson/opportunity-visuals",
+  "skills/ericsson/sharepoint"
 ]
