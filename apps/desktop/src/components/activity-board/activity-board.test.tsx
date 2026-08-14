@@ -121,7 +121,7 @@ describe('ActivityBoard', () => {
     expect(screen.getByRole('button', { name: 'Run one, running' }).style.borderLeftColor).toBe('var(--ui-green)')
   })
 
-  it('expands every lane when the entire board is empty', () => {
+  it('collapses every lane when the entire board is empty and lets users expand one', () => {
     const empty = {
       ...collapsibleModel,
       columns: collapsibleModel.columns.map(column => ({ ...column, cards: [], count: 0 }))
@@ -138,8 +138,12 @@ describe('ActivityBoard', () => {
       />
     )
 
-    expect(screen.queryByRole('button', { name: /^Expand / })).toBeNull()
-    expect(screen.getAllByText('No runs')).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: /^Expand / })).toHaveLength(2)
+    expect(screen.queryByText('No runs')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand Queued' }))
+    expect(within(screen.getByRole('region', { name: 'Queued, 0' })).getByText('No runs')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Collapse Queued' }).getAttribute('aria-expanded')).toBe('true')
   })
 
   it('resets lane overrides when the collapse scope changes', () => {

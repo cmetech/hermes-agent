@@ -42,7 +42,6 @@ function CollapsibleLaneStrip({
 }: CollapsibleLaneStripProps) {
   const [laneState, setLaneState] = useState(() => reconcileLaneCollapseState(null, collapseScope, model.columns))
   const reconciled = reconcileLaneCollapseState(laneState, collapseScope, model.columns)
-  const boardHasCards = model.columns.some(column => column.cards.length > 0)
   const stripRef = useRef<HTMLDivElement>(null)
   const { grabbing, onMouseDown } = useGrabScroll(stripRef)
 
@@ -61,7 +60,7 @@ function CollapsibleLaneStrip({
       ref={stripRef}
     >
       {model.columns.map(column => {
-        const collapsed = laneIsCollapsed(reconciled, column, boardHasCards)
+        const collapsed = laneIsCollapsed(reconciled, column)
 
         return (
           <VirtualCardColumn
@@ -75,7 +74,7 @@ function CollapsibleLaneStrip({
             loadMoreLabel={loadMoreLabel}
             onLoadMore={onLoadMore}
             onOpenCard={onOpenCard}
-            onToggleCollapsed={() => setLaneState(toggleLaneCollapse(reconciled, column, boardHasCards))}
+            onToggleCollapsed={() => setLaneState(toggleLaneCollapse(reconciled, column))}
             selectedCardId={selectedCardId}
           />
         )
