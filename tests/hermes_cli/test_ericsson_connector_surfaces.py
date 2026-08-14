@@ -52,6 +52,27 @@ JIRA_PLUGIN_SKILLS = {
     "ericsson-jira:ticket-research",
     "ericsson-jira:defect-triage",
 }
+SHAREPOINT_TOOL_NAMES = {
+    "sharepoint_resolve_url",
+    "sharepoint_get_item",
+    "sharepoint_list_items",
+    "sharepoint_download",
+    "sharepoint_list_owned_sites",
+    "sharepoint_audit_permissions",
+    "sharepoint_upload",
+    "sharepoint_create_folder",
+    "sharepoint_move_item",
+    "sharepoint_copy_item",
+    "sharepoint_recycle_item",
+}
+SHAREPOINT_GRAPH_TOOL_NAMES = SHAREPOINT_TOOL_NAMES - {
+    "sharepoint_audit_permissions"
+}
+SHAREPOINT_PLUGIN_SKILLS = {
+    "ericsson-sharepoint:sharepoint-navigation",
+    "ericsson-sharepoint:sharepoint-file-operations",
+    "ericsson-sharepoint:sharepoint-permission-audit",
+}
 
 
 def _vendor_source(home: Path) -> None:
@@ -166,6 +187,24 @@ def test_source_resolver_prefers_complete_manifest_pinned_vendor(tmp_path, monke
         pytest.fail("complete vendor with an invalid revision was accepted")
 
 
+def test_source_resolver_accepts_actual_vendored_workflow_package(monkeypatch):
+    monkeypatch.delenv(SOURCE_DIR_ENV, raising=False)
+    monkeypatch.delenv(SOURCE_SHA_ENV, raising=False)
+    repo_root = Path(__file__).resolve().parents[2]
+
+    try:
+        resolved = resolve_ericsson_connector_source(repo_root=repo_root)
+    except BaseException as exc:
+        pytest.fail(f"committed vendor was not accepted: {exc}")
+
+    manifest = json.loads(
+        (repo_root / "capabilities" / "ericsson.json").read_text(encoding="utf-8")
+    )
+    assert resolved.vendored is True
+    assert resolved.revision == manifest["vendoredFrom"]
+    assert resolved.workflow.name == "jira-to-gitlab.yaml"
+
+
 def test_source_resolver_rejects_explicit_nonrepository(tmp_path, monkeypatch):
     source = tmp_path / "not-a-repository"
     source.mkdir()
@@ -183,6 +222,109 @@ def _reachable_tool_names(definitions: list[dict]) -> set[str]:
 def _reachable_jira_tool_names(definitions: list[dict]) -> set[str]:
     serialized = json.dumps(definitions, sort_keys=True)
     return {name for name in JIRA_TOOL_NAMES if name in serialized}
+
+
+def _reachable_sharepoint_tool_names(definitions: list[dict]) -> set[str]:
+    serialized = json.dumps(definitions, sort_keys=True)
+    return {name for name in SHAREPOINT_TOOL_NAMES if name in serialized}
+
+
+def test_sharepoint_router_actions_and_tools_follow_fresh_profile_boundary(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+    from hermes_cli.plugin_configuration import PluginConfigurationService
+    from hermes_cli.plugins import PluginManager
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+    from tools.skills_tool import skill_view, skills_list
+
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "sharepoint-profile"
+    home.mkdir()
+    shutil.copytree(
+        repo_root / "plugins" / "ericsson-sharepoint",
+        home / "plugins" / "ericsson-sharepoint",
+    )
+    shutil.copytree(
+        repo_root / "skills" / "ericsson" / "sharepoint",
+        home / "skills" / "ericsson" / "sharepoint",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": [], "disabled": ["ericsson-sharepoint"]}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+
+    disabled_manager = PluginManager()
+    disabled_manager.discover_and_load()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", disabled_manager)
+    disabled_surface = get_tool_definitions(
+        enabled_toolsets=["skills", "ericsson-sharepoint"], quiet_mode=True
+    )
+    assert _reachable_sharepoint_tool_names(disabled_surface) == set()
+    assert disabled_manager.list_plugin_skills("ericsson-sharepoint") == []
+    assert "sharepoint" in json.dumps(json.loads(skills_list())).lower()
+    router = json.loads(skill_view("ericsson/sharepoint", preprocess=False))
+    assert router["success"] is True
+    assert "fresh conversation" in router["content"].lower()
+    assert "ericsson-sharepoint:sharepoint-navigation" in router["content"]
+    disabled_detail = PluginConfigurationService(disabled_manager).detail(
+        "ericsson-sharepoint"
+    )
+    assert {action["id"] for action in disabled_detail["setup_actions"]} == {
+        "authenticate",
+        "test_connection",
+        "enroll_browser",
+        "clear_session",
+    }
+    assert not any(action["available"] for action in disabled_detail["setup_actions"])
+
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"plugins": {"enabled": ["ericsson-sharepoint"], "disabled": []}}
+        ),
+        encoding="utf-8",
+    )
+    enabled_manager = PluginManager()
+    enabled_manager.discover_and_load()
+    service = PluginConfigurationService(enabled_manager)
+    service.update(
+        "ericsson-sharepoint",
+        settings={
+            "tenant_host": "tenant.sharepoint.com",
+            "auth_mode": "azure_cli",
+            "scopes": "https://graph.microsoft.com/.default",
+            "authority_url": "https://login.microsoftonline.com",
+            "browser_profile": "corp-sharepoint",
+        },
+    )
+    monkeypatch.setattr(plugins_module, "_plugin_manager", enabled_manager)
+    fresh_surface = get_tool_definitions(
+        enabled_toolsets=["skills", "ericsson-sharepoint"], quiet_mode=True
+    )
+
+    assert _reachable_sharepoint_tool_names(disabled_surface) == set()
+    assert _reachable_sharepoint_tool_names(fresh_surface) == SHAREPOINT_GRAPH_TOOL_NAMES
+    assert {
+        f"ericsson-sharepoint:{name}"
+        for name in enabled_manager.list_plugin_skills("ericsson-sharepoint")
+    } == SHAREPOINT_PLUGIN_SKILLS
+    assert all(
+        action["available"]
+        for action in service.detail("ericsson-sharepoint")["setup_actions"]
+    )
+    loaded = json.loads(
+        skill_view("ericsson-sharepoint:sharepoint-navigation", preprocess=False)
+    )
+    assert loaded["success"] is True
+    assert "tenant.sharepoint.com" not in json.dumps(loaded)
+
+    for name in SHAREPOINT_TOOL_NAMES:
+        registry.deregister(name)
 
 
 def test_jira_router_and_tools_follow_fresh_enabled_session_boundary(

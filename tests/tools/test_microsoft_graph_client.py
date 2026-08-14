@@ -10,8 +10,10 @@ import pytest
 from tools.microsoft_graph_auth import GraphCredentials, MicrosoftGraphTokenProvider
 from tools.microsoft_graph_client import (
     MicrosoftGraphAPIError,
+    MicrosoftGraphCancelledError,
     MicrosoftGraphClient,
     MicrosoftGraphClientError,
+    MicrosoftGraphDeadlineError,
 )
 
 
@@ -31,6 +33,32 @@ def _make_provider() -> MicrosoftGraphTokenProvider:
 
 @pytest.mark.anyio
 class TestMicrosoftGraphClient:
+    async def test_accepts_generic_provider_without_app_only_credentials(self):
+        class DelegatedProvider:
+            def __init__(self):
+                self.calls = []
+
+            async def get_access_token(self, *, force_refresh=False):
+                self.calls.append(force_refresh)
+                return "delegated-token"
+
+            def clear_cache(self):
+                return None
+
+        provider = DelegatedProvider()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == "Bearer delegated-token"
+            return httpx.Response(200, json={"ok": True})
+
+        client = MicrosoftGraphClient(
+            provider,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert provider.calls == [False]
+
     async def test_attaches_bearer_token_header(self):
         captured_auth: list[str] = []
 
@@ -45,6 +73,43 @@ class TestMicrosoftGraphClient:
         payload = await client.get_json("/me")
         assert payload == {"ok": True}
         assert captured_auth == ["Bearer cached-token"]
+
+    async def test_401_clears_provider_and_forces_refresh(self):
+        class RefreshingProvider:
+            def __init__(self):
+                self.force_refresh = []
+                self.clears = 0
+
+            async def get_access_token(self, *, force_refresh=False):
+                self.force_refresh.append(force_refresh)
+                return "fresh" if force_refresh else "stale"
+
+            def clear_cache(self):
+                self.clears += 1
+
+        provider = RefreshingProvider()
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.headers["authorization"])
+            if len(calls) == 1:
+                return httpx.Response(401, json={"error": {"code": "InvalidToken"}})
+            return httpx.Response(200, json={"ok": True})
+
+        async def no_sleep(delay):
+            return None
+
+        client = MicrosoftGraphClient(
+            provider,
+            transport=httpx.MockTransport(handler),
+            sleep=no_sleep,
+            max_retries=1,
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert provider.clears == 1
+        assert provider.force_refresh == [False, True]
+        assert calls == ["Bearer stale", "Bearer fresh"]
 
     async def test_retries_on_rate_limit_and_uses_retry_after(self):
         calls: list[int] = []
@@ -75,6 +140,81 @@ class TestMicrosoftGraphClient:
         assert payload == {"ok": True}
         assert len(calls) == 2
         assert sleeps == [3.0]
+
+    async def test_retry_after_is_capped_by_graph_client_policy(self):
+        calls = []
+        sleeps = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"Retry-After": "3600"})
+            return httpx.Response(200, json={"ok": True})
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=1,
+        )
+
+        assert await client.get_json("/me") == {"ok": True}
+        assert sleeps == [60.0]
+
+    async def test_deadline_rejects_retry_delay_that_exceeds_remaining_budget(self):
+        calls = []
+        sleeps = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            clock=lambda: 10.0,
+            max_retries=1,
+        )
+
+        with pytest.raises(MicrosoftGraphDeadlineError):
+            await client.get_json("/me", deadline=15.0)
+
+        assert len(calls) == 1
+        assert sleeps == []
+
+    async def test_cancellation_interrupts_request_retry_sleep(self):
+        calls = []
+        sleeps = []
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+
+        async def fake_sleep(delay: float) -> None:
+            nonlocal cancelled
+            sleeps.append(delay)
+            cancelled = True
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=1,
+        )
+
+        with pytest.raises(MicrosoftGraphCancelledError):
+            await client.get_json("/me", cancel_check=lambda: cancelled)
+
+        assert len(calls) == 1
+        assert sleeps and max(sleeps) <= 0.25
 
 
     async def test_invalid_json_response_raises_client_error(self):

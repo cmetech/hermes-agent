@@ -58,7 +58,7 @@ class TestMicrosoftGraphTokenProvider:
             )
 
         provider = MicrosoftGraphTokenProvider(
-            GraphCredentials("tenant", "client", "secret"),
+            GraphCredentials("tenant", "client", "client-value-not-in-message"),
             transport=httpx.MockTransport(handler),
         )
 
@@ -105,10 +105,31 @@ class TestMicrosoftGraphTokenProvider:
             )
 
         provider = MicrosoftGraphTokenProvider(
-            GraphCredentials("tenant", "client", "secret"),
+            GraphCredentials("tenant", "client", "client-value-not-in-message"),
             transport=httpx.MockTransport(handler),
         )
 
         with pytest.raises(MicrosoftGraphTokenError) as exc:
             await provider.get_access_token()
         assert "bad secret" in str(exc.value)
+
+    async def test_http_error_redacts_configured_client_secret(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                401,
+                json={
+                    "error": "invalid_client",
+                    "error_description": "credential super-secret-value rejected",
+                },
+            )
+
+        provider = MicrosoftGraphTokenProvider(
+            GraphCredentials("tenant", "client", "super-secret-value"),
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(MicrosoftGraphTokenError) as caught:
+            await provider.get_access_token()
+
+        assert "super-secret-value" not in str(caught.value)
+        assert "[REDACTED]" in str(caught.value)

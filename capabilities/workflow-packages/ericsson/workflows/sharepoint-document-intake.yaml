@@ -1,0 +1,20 @@
+name: sharepoint-document-intake
+description: Acquire a bounded SharePoint document set for a separate processing capability
+tags: [ericsson, sharepoint, documents]
+requires: [ericsson-sharepoint]
+nodes:
+  - id: acquire
+    allowed_tools:
+      - sharepoint_resolve_url
+      - sharepoint_list_items
+      - sharepoint_download
+    prompt: >
+      Require $ARGUMENTS to identify one permitted SharePoint URL, the requested
+      bounded file or folder scope, and an authorized relative destination.
+      Acquire only that requested bounded artifact set. Use
+      sharepoint_resolve_url to establish normalized identity, use
+      sharepoint_list_items only when folder discovery is requested, and use
+      sharepoint_download only for the selected files and authorized
+      destination. Record relative artifact paths, sizes, digests, warnings,
+      truncation, and the normalized remote identities in
+      sharepoint-intake-manifest.json.

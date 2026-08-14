@@ -41,13 +41,21 @@ def _required_source(
         if vendored
         else root / "workflows"
     )
+    workflow = next(
+        (
+            workflow_root / f"jira-to-gitlab{suffix}"
+            for suffix in (".yml", ".yaml")
+            if (workflow_root / f"jira-to-gitlab{suffix}").is_file()
+        ),
+        workflow_root / "jira-to-gitlab.yml",
+    )
     source = EricssonConnectorSource(
         root=root,
         revision=revision,
         plugin=root / "plugins" / "ericsson-gitlab",
         router_skill=root / "skills" / "ericsson" / "gitlab" / "SKILL.md",
-        workflow=workflow_root / "jira-to-gitlab.yml",
-        workflow_sidecar=workflow_root / "jira-to-gitlab.hermes.yaml",
+        workflow=workflow,
+        workflow_sidecar=workflow.with_name("jira-to-gitlab.hermes.yaml"),
         capability_manifest=manifest,
         vendored=vendored,
     )
