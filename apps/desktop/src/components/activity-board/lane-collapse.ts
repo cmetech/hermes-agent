@@ -43,21 +43,13 @@ export function reconcileLaneCollapseState(
   return samePhases && sameOverrides ? current : { overrides, phases, scope }
 }
 
-export function laneIsCollapsed(
-  state: LaneCollapseState,
-  column: ActivityBoardColumn,
-  boardHasCards: boolean
-): boolean {
-  return state.overrides[column.id] ?? (boardHasCards && column.cards.length === 0)
+export function laneIsCollapsed(state: LaneCollapseState, column: ActivityBoardColumn): boolean {
+  return state.overrides[column.id] ?? column.cards.length === 0
 }
 
-export function toggleLaneCollapse(
-  state: LaneCollapseState,
-  column: ActivityBoardColumn,
-  boardHasCards: boolean
-): LaneCollapseState {
-  const automatic = boardHasCards && column.cards.length === 0
-  const next = !laneIsCollapsed(state, column, boardHasCards)
+export function toggleLaneCollapse(state: LaneCollapseState, column: ActivityBoardColumn): LaneCollapseState {
+  const automatic = column.cards.length === 0
+  const next = !laneIsCollapsed(state, column)
   const overrides = { ...state.overrides }
 
   if (next === automatic) {

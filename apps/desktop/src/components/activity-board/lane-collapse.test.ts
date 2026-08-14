@@ -24,32 +24,32 @@ describe('collapsible lane state', () => {
     const columns = [column('queued', 0), column('active', 1)]
     const state = reconcileLaneCollapseState(null, 'board', columns)
 
-    expect(laneIsCollapsed(state, columns[0]!, true)).toBe(true)
-    expect(laneIsCollapsed(state, columns[1]!, true)).toBe(false)
+    expect(laneIsCollapsed(state, columns[0]!)).toBe(true)
+    expect(laneIsCollapsed(state, columns[1]!)).toBe(false)
   })
 
-  it('keeps every lane expanded when the whole board is empty', () => {
+  it('auto-collapses every empty lane when the whole board is empty', () => {
     const columns = [column('queued', 0), column('active', 0)]
     const state = reconcileLaneCollapseState(null, 'board', columns)
 
-    expect(columns.map(item => laneIsCollapsed(state, item, false))).toEqual([false, false])
+    expect(columns.map(item => laneIsCollapsed(state, item))).toEqual([true, true])
   })
 
   it('stores only deviations from automatic state', () => {
     const columns = [column('queued', 0), column('active', 1)]
     const initial = reconcileLaneCollapseState(null, 'board', columns)
-    const expandedEmpty = toggleLaneCollapse(initial, columns[0]!, true)
-    const collapsedOccupied = toggleLaneCollapse(expandedEmpty, columns[1]!, true)
+    const expandedEmpty = toggleLaneCollapse(initial, columns[0]!)
+    const collapsedOccupied = toggleLaneCollapse(expandedEmpty, columns[1]!)
 
     expect(expandedEmpty.overrides).toEqual({ queued: false })
     expect(collapsedOccupied.overrides).toEqual({ active: true, queued: false })
-    expect(toggleLaneCollapse(collapsedOccupied, columns[1]!, true).overrides).toEqual({ queued: false })
+    expect(toggleLaneCollapse(collapsedOccupied, columns[1]!).overrides).toEqual({ queued: false })
   })
 
   it('drops stale overrides when occupancy or scope changes', () => {
     const before = [column('queued', 0), column('active', 1)]
     let state = reconcileLaneCollapseState(null, 'board', before)
-    state = toggleLaneCollapse(state, before[0]!, true)
+    state = toggleLaneCollapse(state, before[0]!)
     state = reconcileLaneCollapseState(state, 'board', [column('queued', 1), column('active', 1)])
 
     expect(state.overrides).toEqual({})
