@@ -930,6 +930,7 @@ describe('usePromptActions exec fallback error reporting', () => {
 
   it('routes tool choice through its dedicated RPC and renders the confirmation', async () => {
     const seeds: Record<string, unknown>[] = []
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'tool_choice.configure') {
         return { output: 'Next turn tool choice: required with OTTO v1.' } as never
@@ -964,6 +965,7 @@ describe('usePromptActions exec fallback error reporting', () => {
 
   it('falls back to slash.exec for tool choice when an older gateway lacks the RPC', async () => {
     const seeds: Record<string, unknown>[] = []
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'tool_choice.configure') {
         throw new Error('method not found: tool_choice.configure')
