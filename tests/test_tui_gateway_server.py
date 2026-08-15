@@ -14853,6 +14853,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
         model_override={"model": "openai/gpt-5.4"},
         create_reasoning_override={"enabled": True, "effort": "high"},
         create_service_tier_override="",
+        tool_choice_control={"tool_choice": "required", "otto_v1": True},
     )
 
     def make_agent(*_args, **kwargs):
@@ -14879,6 +14880,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
     assert "model_override" not in session
     assert "create_reasoning_override" not in session
     assert "create_service_tier_override" not in session
+    assert "tool_choice_control" not in session
     assert session["agent"] is new_agent
 
 

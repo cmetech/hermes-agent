@@ -6114,6 +6114,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("tool_choice_control", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
