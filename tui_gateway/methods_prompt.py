@@ -334,13 +334,16 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(
-            rid,
-            sid,
-            session,
-            text,
-            tool_operation_context=tool_operation_context,
-        )
+        if tool_operation_context is None:
+            _run_prompt_submit(rid, sid, session, text)
+        else:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                tool_operation_context=tool_operation_context,
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -945,6 +948,7 @@ def _(rid, params: dict) -> dict:
 
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    server._consume_session_tool_choice = _consume_session_tool_choice
     _registry.install(server)
     # Module-level helpers aren't @method handlers, so install() doesn't see
     # them — but server.py's run path calls this one (run_message enrichment,

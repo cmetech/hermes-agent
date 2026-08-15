@@ -25,3 +25,9 @@ def test_tui_auto_clears_a_pending_named_choice():
 
     assert "automatic" in output
     assert _consume_session_tool_choice(session) is None
+
+
+def test_tui_prompt_handler_installs_tool_choice_consumer_in_server_namespace():
+    from tui_gateway import server
+
+    assert server._consume_session_tool_choice({}) is None
