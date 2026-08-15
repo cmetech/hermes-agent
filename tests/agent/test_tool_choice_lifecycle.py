@@ -407,8 +407,12 @@ def test_prompt_cache_key_ignores_operation_policy_and_identity():
     assert required_kwargs["prompt_cache_key"] == post_tool_kwargs["prompt_cache_key"]
 
 
-def test_gateway_protocol_error_is_terminal_without_fallback(lifecycle_agent):
+def test_gateway_protocol_error_is_terminal_without_fallback(
+    lifecycle_agent, monkeypatch, caplog
+):
     agent, _gateway = lifecycle_agent
+    events = []
+    monkeypatch.setattr("agent.monitoring.emitter.emit", events.append)
 
     class GatewayProtocolError(Exception):
         status_code = 502
@@ -423,17 +427,34 @@ def test_gateway_protocol_error_is_terminal_without_fallback(lifecycle_agent):
         GatewayProtocolError("sanitized fixture")
     )
     fallback_attempts = []
+    request_dumps = []
     agent._has_pending_fallback = lambda: True
     agent._try_activate_fallback = lambda *_args, **_kwargs: fallback_attempts.append(1)
+    agent._dump_api_request_debug = (
+        lambda *_args, **_kwargs: request_dumps.append(1)
+    )
+    context = ToolOperationContext.create(
+        ToolChoicePolicy(mode="required"),
+        operation_id="operation-fixture-protocol",
+        otto_contract_version="v1",
+    )
 
     result = agent.run_conversation(
         "protocol fixture",
         conversation_history=[],
         task_id="task-fixture-protocol",
+        tool_operation_context=context,
     )
 
     assert fallback_attempts == []
+    assert request_dumps == []
     assert result["failed"] is True
     assert result["error_code"] == "selected_model_tool_protocol_failed"
     assert result["final_response"] == ""
     assert "private upstream detail" not in result["error"]
+    assert "private upstream detail" not in caplog.text
+    terminal = [event for event in events if event["event"] == "tool_contract"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_code"] == "selected_model_tool_protocol_failed"
+    assert terminal[0]["retry_decision"] == "terminal"
+    assert terminal[0]["fallback_decision"] == "blocked"

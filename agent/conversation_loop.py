@@ -4288,29 +4288,37 @@ def run_conversation(
                     if _is_tool_contract_error
                     else agent._summarize_api_error(api_error)
                 )
-                logger.warning(
-                    "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
-                    retry_count,
-                    max_retries,
-                    error_type,
-                    agent._client_log_context(),
-                    _error_summary,
-                )
-
                 _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")
-                _status_code_str = f" [HTTP {status_code}]" if status_code else ""
-                agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
-                agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
-                agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
-                agent._buffer_vprint(f"   📝 Error: {_error_summary}")
-                if status_code and status_code < 500 and not _is_tool_contract_error:
-                    _err_body = getattr(api_error, "body", None)
-                    _err_body_str = str(_err_body)[:300] if _err_body else None
-                    if _err_body_str:
-                        agent._buffer_vprint(f"   📋 Details: {_err_body_str}")
-                agent._buffer_vprint(f"   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
+                if _is_tool_contract_error:
+                    logger.warning(
+                        "Tool contract failure code=%s retry=terminal fallback=blocked",
+                        _tool_contract_code,
+                    )
+                    agent._buffer_vprint(
+                        f"⚠️  Tool contract failure: {_error_summary}"
+                    )
+                else:
+                    logger.warning(
+                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                        retry_count,
+                        max_retries,
+                        error_type,
+                        agent._client_log_context(),
+                        _error_summary,
+                    )
+                    _status_code_str = f" [HTTP {status_code}]" if status_code else ""
+                    agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
+                    agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
+                    agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
+                    agent._buffer_vprint(f"   📝 Error: {_error_summary}")
+                    if status_code and status_code < 500:
+                        _err_body = getattr(api_error, "body", None)
+                        _err_body_str = str(_err_body)[:300] if _err_body else None
+                        if _err_body_str:
+                            agent._buffer_vprint(f"   📋 Details: {_err_body_str}")
+                    agent._buffer_vprint(f"   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
 
                 # Actionable hint for OpenRouter "no tool endpoints" error.
                 # Buffered like the rest of the retry trace — surfaced only
@@ -5222,7 +5230,7 @@ def run_conversation(
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
-                    if api_kwargs is not None:
+                    if api_kwargs is not None and not _is_tool_contract_error:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
@@ -5240,7 +5248,11 @@ def run_conversation(
                         if _is_tool_contract_error
                         else agent._summarize_api_error(api_error)
                     )
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                    if _is_tool_contract_error:
+                        agent._emit_status(
+                            f"❌ Tool contract failure: {_nonretryable_summary}"
+                        )
+                    elif classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
@@ -5256,8 +5268,9 @@ def run_conversation(
                             f"{_nonretryable_summary}"
                         )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
-                    agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
-                    agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
+                    if not _is_tool_contract_error:
+                        agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
+                        agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
                         if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
@@ -5360,7 +5373,14 @@ def run_conversation(
                             f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
-                    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+                    if _is_tool_contract_error:
+                        logger.error(
+                            "%sTool contract failure code=%s",
+                            agent.log_prefix,
+                            _tool_contract_code,
+                        )
+                    else:
+                        logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5413,6 +5433,24 @@ def run_conversation(
                             "billing_block": _ce_block,
                         }
                     if _is_tool_contract_error:
+                        from agent.tool_contract_telemetry import (
+                            emit_tool_contract_event,
+                        )
+
+                        emit_tool_contract_event(
+                            current_attempt_context,
+                            requested_model=agent.model,
+                            model_selection="explicit" if agent.model else "auto",
+                            transport=agent.api_mode,
+                            echo=(
+                                _tool_contract_code
+                                != "otto_tool_contract_unavailable"
+                            ),
+                            structured_call=False,
+                            terminal_code=_tool_contract_code,
+                            retry_decision="terminal",
+                            fallback_decision="blocked",
+                        )
                         return {
                             "final_response": "",
                             "messages": messages,
@@ -5805,6 +5843,29 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            if current_attempt_context is not None:
+                from agent.tool_contract_telemetry import emit_tool_contract_event
+
+                emit_tool_contract_event(
+                    current_attempt_context,
+                    requested_model=agent.model,
+                    model_selection="explicit" if agent.model else "auto",
+                    transport=agent.api_mode,
+                    echo=(
+                        current_attempt_context.otto_contract_version == "v1"
+                    ),
+                    structured_call=bool(normalized.tool_calls),
+                    retry_decision=(
+                        "reuse_attempt" if retry_count > 0 else "none"
+                    ),
+                    fallback_decision=(
+                        "blocked"
+                        if not _tool_policy_allows_fallback(
+                            current_attempt_context
+                        )
+                        else "not_considered"
+                    ),
+                )
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead

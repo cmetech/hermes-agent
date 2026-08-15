@@ -677,6 +677,19 @@ def classify_api_error(
         status_code = 429
     body = _extract_error_body(error)
     error_code = _extract_error_code(body)
+    if not error_code:
+        current = error
+        for _ in range(5):
+            candidate = getattr(current, "code", None)
+            if candidate in TOOL_CONTRACT_ERROR_MESSAGES:
+                error_code = candidate
+                break
+            cause = getattr(current, "__cause__", None) or getattr(
+                current, "__context__", None
+            )
+            if cause is None or cause is current:
+                break
+            current = cause
 
     # Build a comprehensive error message string for pattern matching.
     # str(error) alone may not include the body message (e.g. OpenAI SDK's

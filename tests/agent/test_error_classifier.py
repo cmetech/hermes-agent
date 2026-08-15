@@ -216,6 +216,20 @@ class TestClassifyApiError:
         assert result.error_context["code"] == code
         assert "private upstream detail" not in result.message
 
+    def test_local_echo_error_code_is_extracted_from_typed_exception(self):
+        from agent.otto_tool_contract import OttoToolContractError
+
+        result = classify_api_error(
+            OttoToolContractError(),
+            provider="otto",
+            model="model-fixture",
+        )
+
+        assert result.reason == FailoverReason.tool_contract
+        assert result.retryable is False
+        assert result.should_fallback is False
+        assert result.error_context["code"] == "otto_tool_contract_unavailable"
+
     # ── Auth errors ──
 
     def test_401_classified_as_auth(self):
@@ -1115,4 +1129,3 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
