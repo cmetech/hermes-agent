@@ -3202,6 +3202,16 @@ def create_anthropic_message(
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
+    from agent.otto_tool_contract import (
+        OttoToolContractError,
+        contract_required,
+        parse_verified_raw_response,
+        verify_exception_echo,
+        verify_stream_echo,
+    )
+
+    requires_otto_echo = contract_required(api_kwargs)
+
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
     if prefer_stream and callable(stream_fn):
@@ -3211,6 +3221,10 @@ def create_anthropic_message(
             if before_transport is not None:
                 before_transport()
             with stream_fn(**stream_kwargs) as stream:
+                verify_stream_echo(
+                    stream,
+                    contract_required=requires_otto_echo,
+                )
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
@@ -3233,6 +3247,10 @@ def create_anthropic_message(
                             )
                 return stream.get_final_message()
         except Exception as exc:
+            verify_exception_echo(
+                exc,
+                contract_required=requires_otto_echo,
+            )
             if not _is_stream_unavailable_error(exc):
                 raise
             logger.debug(
@@ -3244,6 +3262,22 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    raw_create = None
+    if requires_otto_echo:
+        raw_api = getattr(messages_api, "with_raw_response", None)
+        raw_create = getattr(raw_api, "create", None)
+        if not callable(raw_create):
+            raise OttoToolContractError()
     if before_transport is not None:
         before_transport()
+    if requires_otto_echo:
+        try:
+            raw_response = raw_create(**create_kwargs)
+        except Exception as exc:
+            verify_exception_echo(exc, contract_required=True)
+            raise
+        return parse_verified_raw_response(
+            raw_response,
+            contract_required=True,
+        )
     return messages_api.create(**create_kwargs)

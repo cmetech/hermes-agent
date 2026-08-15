@@ -519,7 +519,26 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
     reserve_provider_transport_attempt(agent, request_client)
-    return request_client.chat.completions.create(**api_kwargs)
+    from agent.otto_tool_contract import (
+        OttoToolContractError,
+        contract_required,
+        parse_verified_raw_response,
+        verify_exception_echo,
+    )
+
+    requires_echo = contract_required(api_kwargs)
+    if not requires_echo:
+        return request_client.chat.completions.create(**api_kwargs)
+    raw_api = getattr(request_client.chat.completions, "with_raw_response", None)
+    raw_create = getattr(raw_api, "create", None)
+    if not callable(raw_create):
+        raise OttoToolContractError()
+    try:
+        raw_response = raw_create(**api_kwargs)
+    except Exception as exc:
+        verify_exception_echo(exc, contract_required=True)
+        raise
+    return parse_verified_raw_response(raw_response, contract_required=True)
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -1139,6 +1158,16 @@ def build_api_kwargs(
     attempt_context: ToolOperationContext | None = None,
 ) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    from agent.otto_tool_contract import add_otto_request_headers
+
+    def _finalize(kwargs: dict) -> dict:
+        return add_otto_request_headers(
+            kwargs,
+            attempt_context,
+            provider=getattr(agent, "provider", None),
+            api_mode=getattr(agent, "api_mode", None),
+        )
+
     if tools_for_api is None:
         tools_for_api = agent.tools
 
@@ -1171,7 +1200,9 @@ def build_api_kwargs(
         # the profile hook that produces them is only consulted by the
         # OpenAI-wire transport. Merge them here so Messages traffic keeps
         # product attribution and sticky routing.
-        return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+        return _finalize(
+            _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+        )
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
@@ -1179,7 +1210,7 @@ def build_api_kwargs(
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
-        return _bt.build_kwargs(
+        return _finalize(_bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1187,7 +1218,7 @@ def build_api_kwargs(
             region=region,
             guardrail_config=guardrail,
             attempt_context=attempt_context,
-        )
+        ))
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -1237,7 +1268,7 @@ def build_api_kwargs(
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
-        return _ct.build_kwargs(
+        return _finalize(_ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
@@ -1257,7 +1288,7 @@ def build_api_kwargs(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
             attempt_context=attempt_context,
-        )
+        ))
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
@@ -1341,7 +1372,7 @@ def build_api_kwargs(
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return _finalize(_ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1364,7 +1395,7 @@ def build_api_kwargs(
             provider_name=getattr(agent, "provider", ""),
             structured_output=getattr(agent, "structured_output", None),
             attempt_context=attempt_context,
-        )
+        ))
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -1376,7 +1407,7 @@ def build_api_kwargs(
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    return _finalize(_ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -1413,7 +1444,7 @@ def build_api_kwargs(
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
         structured_output=getattr(agent, "structured_output", None),
-    )
+    ))
 
 
 
@@ -3155,7 +3186,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
             reserve_provider_transport_attempt(agent, request_client)
-            return request_client.chat.completions.create(**stream_kwargs)
+            from agent.otto_tool_contract import (
+                contract_required,
+                verify_exception_echo,
+                verify_stream_echo,
+            )
+
+            requires_echo = contract_required(stream_kwargs)
+            try:
+                raw_stream = request_client.chat.completions.create(**stream_kwargs)
+            except Exception as exc:
+                verify_exception_echo(exc, contract_required=requires_echo)
+                raise
+            verify_stream_echo(raw_stream, contract_required=requires_echo)
+            return raw_stream
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)

@@ -59,3 +59,27 @@ def test_build_api_kwargs_has_no_tool_policy_when_attempt_context_is_omitted():
     build_api_kwargs(agent, [{"role": "user", "content": "fixture"}])
 
     assert transport.params.get("attempt_context") is None
+
+
+def test_raw_response_tool_contract_builder_emits_exact_otto_headers():
+    from agent.chat_completion_helpers import build_api_kwargs
+    from agent.tool_choice_policy import ToolChoicePolicy, ToolOperationContext
+
+    transport = _CapturingTransport()
+    agent = _anthropic_agent(transport, [])
+    agent.provider = "otto"
+    context = ToolOperationContext.create(
+        ToolChoicePolicy(mode="none"),
+        otto_contract_version="v1",
+    )
+
+    kwargs = build_api_kwargs(
+        agent,
+        [{"role": "user", "content": "fixture"}],
+        attempt_context=context,
+    )
+
+    assert kwargs["extra_headers"] == {
+        "X-Otto-Tool-Contract": "v1",
+        "X-Otto-Call-Role": "primary",
+    }

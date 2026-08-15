@@ -1278,7 +1278,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
             reserve_provider_transport_attempt(agent, active_client)
-            return active_client.responses.create(**stream_kwargs)
+            from agent.otto_tool_contract import (
+                contract_required,
+                verify_exception_echo,
+                verify_stream_echo,
+            )
+
+            requires_echo = contract_required(stream_kwargs)
+            try:
+                raw_stream = active_client.responses.create(**stream_kwargs)
+            except Exception as exc:
+                verify_exception_echo(exc, contract_required=requires_echo)
+                raise
+            verify_stream_echo(raw_stream, contract_required=requires_echo)
+            return raw_stream
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
