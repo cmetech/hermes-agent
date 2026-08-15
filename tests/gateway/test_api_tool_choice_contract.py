@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server
 from gateway.platforms.api_server import APIServerAdapter
 
 
@@ -488,3 +489,119 @@ async def test_streaming_responses_policy_error_preserves_typed_code(adapter):
 
     assert response.status == 400
     assert payload["error"]["code"] == "mandatory_tool_choice_not_supported"
+
+
+@pytest.mark.asyncio
+async def test_stream_policy_preflight_timeout_does_not_cancel_validation(monkeypatch):
+    monkeypatch.setattr(api_server, "TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS", 0)
+    release_agent = asyncio.Event()
+    agent_task = asyncio.create_task(release_agent.wait())
+    preflight = asyncio.get_running_loop().create_future()
+
+    try:
+        result = await asyncio.wait_for(
+            api_server._await_stream_tool_policy_preflight(agent_task, preflight),
+            timeout=0.05,
+        )
+
+        assert result is None
+        assert not agent_task.done()
+        assert not preflight.done()
+    finally:
+        agent_task.cancel()
+        preflight.cancel()
+        await asyncio.gather(agent_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_streaming_chat_policy_preflight_timeout_uses_typed_sse_error(
+    adapter, monkeypatch
+):
+    from agent.tool_choice_policy import ToolChoicePolicyError
+
+    monkeypatch.setattr(api_server, "TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS", 0)
+    policy_error = ToolChoicePolicyError(
+        "mandatory_tool_choice_not_supported",
+        "The selected tool is unavailable for this request.",
+    )
+
+    async def _delayed_policy_error(**_kwargs):
+        await asyncio.sleep(0.01)
+        raise policy_error
+
+    body = _chat_body({
+        "type": "function",
+        "function": {"name": "unavailable_tool_fixture"},
+    })
+    body["stream"] = True
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new=_delayed_policy_error):
+            response = await client.post("/v1/chat/completions", json=body)
+            wire = await response.text()
+
+    assert response.status == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in wire.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    terminal = chunks[-1]
+    assert terminal["error"] == {
+        "message": "The selected tool is unavailable for this request.",
+        "type": "invalid_request_error",
+        "code": "mandatory_tool_choice_not_supported",
+    }
+    assert terminal["hermes"]["completed"] is False
+    assert terminal["hermes"]["failed"] is True
+    assert not any(
+        "content" in choice["delta"]
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_responses_policy_preflight_timeout_uses_typed_failure(
+    adapter, monkeypatch
+):
+    from agent.tool_choice_policy import ToolChoicePolicyError
+
+    monkeypatch.setattr(api_server, "TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS", 0)
+    policy_error = ToolChoicePolicyError(
+        "mandatory_tool_choice_not_supported",
+        "The selected tool is unavailable for this request.",
+    )
+
+    async def _delayed_policy_error(**_kwargs):
+        await asyncio.sleep(0.01)
+        raise policy_error
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new=_delayed_policy_error):
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "explicit-model-fixture",
+                    "input": "fixture request",
+                    "tool_choice": {
+                        "type": "function",
+                        "name": "unavailable_tool_fixture",
+                    },
+                    "stream": True,
+                },
+            )
+            wire = await response.text()
+
+    assert response.status == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in wire.splitlines()
+        if line.startswith("data: ")
+    ]
+    failed = next(event for event in events if event["type"] == "response.failed")
+    assert failed["response"]["error"]["code"] == (
+        "mandatory_tool_choice_not_supported"
+    )
+    assert not any(event["type"] == "response.output_text.delta" for event in events)

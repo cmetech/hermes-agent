@@ -159,6 +159,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1179,12 +1180,15 @@ async def _await_stream_tool_policy_preflight(
     agent_task: "asyncio.Task[Any]",
     preflight: "asyncio.Future[ToolChoicePolicyError | None]",
 ) -> ToolChoicePolicyError | None:
-    """Wait until request-scoped policy validation finishes before SSE starts."""
+    """Wait briefly for request-scoped policy validation before SSE starts."""
 
     done, _pending = await asyncio.wait(
         {agent_task, preflight},
+        timeout=TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS,
         return_when=asyncio.FIRST_COMPLETED,
     )
+    if not done:
+        return None
     if preflight in done:
         return preflight.result()
     try:
