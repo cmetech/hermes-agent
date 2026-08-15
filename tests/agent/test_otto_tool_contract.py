@@ -212,7 +212,10 @@ def test_raw_response_tool_contract_typed_error_requires_exact_echo(headers):
 
 
 def test_raw_response_tool_contract_typed_error_with_echo_remains_native():
-    from agent.otto_tool_contract import verify_exception_echo
+    from agent.otto_tool_contract import (
+        response_echo_present,
+        verify_exception_echo,
+    )
 
     typed_error = RuntimeError("sanitized typed gateway error")
     typed_error.response = SimpleNamespace(
@@ -220,6 +223,7 @@ def test_raw_response_tool_contract_typed_error_with_echo_remains_native():
     )
 
     assert verify_exception_echo(typed_error, contract_required=True) is None
+    assert response_echo_present(typed_error) is True
 
 
 def test_echo_before_first_stream_callback_or_iteration():

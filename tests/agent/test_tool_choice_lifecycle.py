@@ -456,5 +456,6 @@ def test_gateway_protocol_error_is_terminal_without_fallback(
     terminal = [event for event in events if event["event"] == "tool_contract"]
     assert len(terminal) == 1
     assert terminal[0]["terminal_code"] == "selected_model_tool_protocol_failed"
+    assert terminal[0]["echo"] is False
     assert terminal[0]["retry_decision"] == "terminal"
     assert terminal[0]["fallback_decision"] == "blocked"

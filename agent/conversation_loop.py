@@ -5436,16 +5436,14 @@ def run_conversation(
                         from agent.tool_contract_telemetry import (
                             emit_tool_contract_event,
                         )
+                        from agent.otto_tool_contract import response_echo_present
 
                         emit_tool_contract_event(
                             current_attempt_context,
                             requested_model=agent.model,
                             model_selection="explicit" if agent.model else "auto",
                             transport=agent.api_mode,
-                            echo=(
-                                _tool_contract_code
-                                != "otto_tool_contract_unavailable"
-                            ),
+                            echo=response_echo_present(api_error),
                             structured_call=False,
                             terminal_code=_tool_contract_code,
                             retry_decision="terminal",

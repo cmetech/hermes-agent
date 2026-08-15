@@ -117,6 +117,12 @@ def verify_exception_echo(exc: BaseException, *, contract_required: bool) -> Non
     )
 
 
+def response_echo_present(value: Any) -> bool:
+    """Report only an exact echo observed on this response or exception."""
+    response = getattr(value, "response", value)
+    return _header_value(_response_headers(response), CONTRACT_HEADER) == CONTRACT_VERSION
+
+
 def _response_headers(response: Any) -> Any:
     if response is None:
         return None
