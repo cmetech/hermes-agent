@@ -1240,6 +1240,15 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _tool_policy_allows_fallback(attempt_context) -> bool:
+    """Whether existing fallback routing may serve this logical operation."""
+    if attempt_context is None:
+        return True
+    if attempt_context.otto_contract_version == "v1":
+        return False
+    return attempt_context.policy.mode in {"auto", "none"}
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1253,6 +1262,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
     credential_recovery_state=None,
+    tool_operation_context=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1282,6 +1292,26 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    from agent.tool_choice_policy import ToolOperationContext
+
+    if (
+        tool_operation_context is not None
+        and not isinstance(tool_operation_context, ToolOperationContext)
+    ):
+        raise TypeError("tool_operation_context must be immutable operation context")
+    current_attempt_context = tool_operation_context
+
+    def _try_activate_fallback(*args, **kwargs) -> bool:
+        if not _tool_policy_allows_fallback(current_attempt_context):
+            return False
+        return agent._try_activate_fallback(*args, **kwargs)
+
+    def _has_pending_fallback() -> bool:
+        return (
+            _tool_policy_allows_fallback(current_attempt_context)
+            and agent._has_pending_fallback()
+        )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2167,7 +2197,7 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if _try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2220,11 +2250,15 @@ def run_conversation(
                     )
                 )
                 if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                    api_kwargs = agent._build_api_kwargs(
+                        api_messages,
+                        attempt_context=current_attempt_context,
+                    )
                 else:
                     api_kwargs = agent._build_api_kwargs(
                         api_messages,
                         tools_for_api=tools_for_api,
+                        attempt_context=current_attempt_context,
                     )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
@@ -2613,7 +2647,7 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if _try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2684,9 +2718,9 @@ def run_conversation(
                     
                     if retry_count >= max_retries:
                         # Try fallback before giving up
-                        if agent._has_pending_fallback():
+                        if _has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if _try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2859,11 +2893,11 @@ def run_conversation(
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
                     # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
+                    if _has_pending_fallback():
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if _try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3032,7 +3066,7 @@ def run_conversation(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if _try_activate_fallback():
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -4529,7 +4563,7 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if _try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -4562,7 +4596,7 @@ def run_conversation(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if _try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5162,14 +5196,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if _has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if _try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5390,9 +5424,9 @@ def run_conversation(
                         agent._fallback_activated = False
                         continue
                     # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
+                    if _has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if _try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6362,6 +6396,14 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                if (
+                    current_attempt_context is not None
+                    and assistant_message.tool_calls
+                ):
+                    current_attempt_context = (
+                        current_attempt_context.after_structured_tool_call()
+                    )
+
                 _tool_turn_persisted = None
                 try:
                     # Persist the assistant tool-call turn before any tool
@@ -6867,7 +6909,7 @@ def run_conversation(
                             "⚠️ Model returning empty responses — "
                             "switching to fallback provider..."
                         )
-                        if agent._try_activate_fallback():
+                        if _try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
