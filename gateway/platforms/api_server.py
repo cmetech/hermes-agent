@@ -1166,6 +1166,27 @@ def _effective_agent_tool_names(agent: Any) -> frozenset[str]:
     return frozenset(resolved)
 
 
+async def _await_stream_tool_policy_preflight(
+    agent_task: "asyncio.Task[Any]",
+    preflight: "asyncio.Future[ToolChoicePolicyError | None]",
+) -> ToolChoicePolicyError | None:
+    """Wait until request-scoped policy validation finishes before SSE starts."""
+
+    done, _pending = await asyncio.wait(
+        {agent_task, preflight},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if preflight in done:
+        return preflight.result()
+    try:
+        agent_task.result()
+    except ToolChoicePolicyError as exc:
+        return exc
+    except Exception:
+        return None
+    return None
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -4177,6 +4198,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            tool_policy_preflight = (
+                asyncio.get_running_loop().create_future()
+                if tool_operation_context is not None
+                else None
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -4188,12 +4214,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 tool_operation_context=tool_operation_context,
+                tool_policy_preflight=tool_policy_preflight,
                 **agent_overrides,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+
+            if tool_policy_preflight is not None:
+                policy_error = await _await_stream_tool_policy_preflight(
+                    agent_task,
+                    tool_policy_preflight,
+                )
+                if policy_error is not None:
+                    return web.json_response(
+                        _openai_error(
+                            str(policy_error),
+                            code=policy_error.code,
+                        ),
+                        status=400,
+                    )
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -4467,14 +4508,17 @@ class APIServerAdapter(BasePlatformAdapter):
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
             err_msg = result.get("error") if isinstance(result, dict) else None
             contract_failure = _tool_contract_result_error(result)
-            contract_error_code = None
+            terminal_error_code = None
             if contract_failure is not None:
-                contract_error_code, err_msg, _status = contract_failure
+                terminal_error_code, err_msg, _status = contract_failure
                 is_failed = True
                 completed = False
             if agent_error is not None:
                 is_failed = True
-                err_msg = err_msg or str(agent_error)
+                err_msg = err_msg or _redact_api_error_text(agent_error)
+                if isinstance(agent_error, ToolChoicePolicyError):
+                    terminal_error_code = agent_error.code
+                    completed = False
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -4501,10 +4545,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 if err_msg:
                     error_payload = {
                         "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
+                        "type": (
+                            "invalid_request_error"
+                            if isinstance(agent_error, ToolChoicePolicyError)
+                            else type(agent_error).__name__
+                            if agent_error
+                            else "agent_error"
+                        ),
                     }
-                    if contract_error_code is not None:
-                        error_payload["code"] = contract_error_code
+                    if terminal_error_code is not None:
+                        error_payload["code"] = terminal_error_code
                     finish_chunk["error"] = error_payload
                 finish_chunk["hermes"] = {
                     "completed": completed,
@@ -4514,7 +4564,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error_code": (
                         "output_truncated"
                         if finish_reason == "length"
-                        else contract_error_code or "agent_error"
+                        else terminal_error_code or "agent_error"
                     ),
                 }
             await response.write(_sse_frame(finish_chunk))
@@ -4980,6 +5030,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
+                if isinstance(e, ToolChoicePolicyError):
+                    agent_error_code = e.code
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -5349,6 +5401,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
 
             agent_ref = [None]
+            tool_policy_preflight = (
+                asyncio.get_running_loop().create_future()
+                if tool_operation_context is not None
+                else None
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -5361,12 +5418,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 tool_operation_context=tool_operation_context,
+                tool_policy_preflight=tool_policy_preflight,
                 **agent_overrides,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+
+            if tool_policy_preflight is not None:
+                policy_error = await _await_stream_tool_policy_preflight(
+                    agent_task,
+                    tool_policy_preflight,
+                )
+                if policy_error is not None:
+                    return web.json_response(
+                        _openai_error(
+                            str(policy_error),
+                            code=policy_error.code,
+                        ),
+                        status=400,
+                    )
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
@@ -6136,6 +6208,9 @@ class APIServerAdapter(BasePlatformAdapter):
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
         tool_operation_context: Optional[ToolOperationContext] = None,
+        tool_policy_preflight: Optional[
+            "asyncio.Future[ToolChoicePolicyError | None]"
+        ] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6167,6 +6242,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+
+        def _publish_tool_policy_preflight(
+            error: ToolChoicePolicyError | None,
+        ) -> None:
+            if tool_policy_preflight is None:
+                return
+
+            def _resolve() -> None:
+                if not tool_policy_preflight.done():
+                    tool_policy_preflight.set_result(error)
+
+            loop.call_soon_threadsafe(_resolve)
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -6201,6 +6288,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             tool_operation_context.policy,
                             _effective_agent_tool_names(agent),
                         )
+                    _publish_tool_policy_preflight(None)
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6307,6 +6395,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
                     return result, usage
+                except ToolChoicePolicyError as exc:
+                    _publish_tool_policy_preflight(exc)
+                    raise
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
                     # where _resolve_runtime_agent_kwargs() is called inside
@@ -6335,6 +6426,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    _publish_tool_policy_preflight(None)
                     # Turn finished (success, auth failure, or crash) — clear
                     # ownership markers so a disconnect landing after this
                     # point can't reap background work this turn left

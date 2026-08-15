@@ -382,3 +382,64 @@ async def test_streaming_responses_contract_failure_is_protocol_native(adapter):
         "selected_model_tool_protocol_failed"
     )
     assert 'event: response.output_text.delta' not in wire
+
+
+@pytest.mark.asyncio
+async def test_streaming_chat_policy_error_preserves_typed_code(adapter):
+    from agent.tool_choice_policy import ToolChoicePolicyError
+
+    body = _chat_body(
+        {
+            "type": "function",
+            "function": {"name": "unavailable_tool_fixture"},
+        }
+    )
+    body["stream"] = True
+    policy_error = ToolChoicePolicyError(
+        "invalid_tool_choice",
+        "Invalid tool choice.",
+    )
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(side_effect=policy_error),
+        ):
+            response = await client.post("/v1/chat/completions", json=body)
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_tool_choice"
+
+
+@pytest.mark.asyncio
+async def test_streaming_responses_policy_error_preserves_typed_code(adapter):
+    from agent.tool_choice_policy import ToolChoicePolicyError
+
+    policy_error = ToolChoicePolicyError(
+        "invalid_tool_choice",
+        "Invalid tool choice.",
+    )
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(side_effect=policy_error),
+        ):
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "explicit-model-fixture",
+                    "input": "fixture request",
+                    "tool_choice": {
+                        "type": "function",
+                        "name": "unavailable_tool_fixture",
+                    },
+                    "stream": True,
+                },
+            )
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_tool_choice"
