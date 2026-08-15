@@ -16,6 +16,7 @@ test('renderProvider(otto) declares provider-owned no-auth gateway capabilities'
   const source = rendered['__init__.py']
   assert.match(source, /supports_unauthenticated=True,/)
   assert.match(source, /model_capabilities_path="model-capabilities",/)
+  assert.match(source, /otto_tool_contract_version="v1",/)
   assert.doesNotMatch(source, /auth\.py substitutes/)
   assert.doesNotMatch(source, /hardcoded tuple/)
 })
@@ -35,6 +36,7 @@ test('renderProvider(loop24) swaps identity but keeps the OTTO gateway', () => {
   assert.match(out, /display_name="LOOP24 Gateway"/)
   assert.match(out, /OTTO_API_KEY/)              // gateway creds unchanged
   assert.match(out, /http:\/\/127\.0\.0\.1:18080\/v1/)
+  assert.match(out, /otto_tool_contract_version="v1",/)
 })
 
 test('neutralize removes plugins/model-providers/otto/ entirely', () => {

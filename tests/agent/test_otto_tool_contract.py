@@ -72,6 +72,62 @@ def test_raw_response_tool_contract_merges_owned_headers_without_body_changes():
     }
 
 
+def test_branded_gateway_profile_declares_exact_v1_contract_support():
+    from agent.otto_tool_contract import add_otto_request_headers
+    from providers import register_provider
+    from providers.base import ProviderProfile
+
+    provider = "brand-contract-v1-fixture"
+    register_provider(
+        ProviderProfile(
+            name=provider,
+            otto_tool_contract_version="v1",
+        )
+    )
+
+    result = add_otto_request_headers(
+        {"model": "model-fixture"},
+        _context(),
+        provider=provider,
+        api_mode="chat_completions",
+    )
+
+    assert result["extra_headers"] == {
+        "X-Otto-Tool-Contract": "v1",
+        "X-Otto-Call-Role": "primary",
+    }
+
+
+@pytest.mark.parametrize("declared_version", ["", "v2"])
+def test_branded_gateway_profile_rejects_missing_or_wrong_contract_declaration(
+    declared_version,
+):
+    from agent.otto_tool_contract import (
+        OttoToolContractError,
+        add_otto_request_headers,
+    )
+    from providers import register_provider
+    from providers.base import ProviderProfile
+
+    provider = f"brand-contract-{declared_version or 'missing'}-fixture"
+    register_provider(
+        ProviderProfile(
+            name=provider,
+            otto_tool_contract_version=declared_version,
+        )
+    )
+
+    with pytest.raises(OttoToolContractError) as raised:
+        add_otto_request_headers(
+            {"model": "model-fixture"},
+            _context(),
+            provider=provider,
+            api_mode="chat_completions",
+        )
+
+    assert raised.value.code == "otto_tool_contract_unavailable"
+
+
 def test_raw_response_tool_contract_direct_provider_has_no_otto_headers():
     from agent.otto_tool_contract import add_otto_request_headers
 
