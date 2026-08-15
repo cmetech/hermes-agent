@@ -2296,7 +2296,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
+            codex_kwargs = agent._build_api_kwargs(
+                api_messages,
+                attempt_context=None,
+            )
             codex_kwargs.pop("tools", None)
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
@@ -2413,7 +2416,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
+                codex_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    attempt_context=None,
+                )
                 codex_kwargs.pop("tools", None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -62,9 +64,16 @@ def _text_response():
 
 class _GatewayHandler(BaseHTTPRequestHandler):
     requests = []
+    probes = []
     queued_responses = []
 
     def do_GET(self):  # noqa: N802
+        type(self).probes.append(
+            {
+                "contract": self.headers.get("X-Otto-Tool-Contract"),
+                "role": self.headers.get("X-Otto-Call-Role"),
+            }
+        )
         body = json.dumps({"data": [{"id": "model-fixture"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -100,6 +109,7 @@ def lifecycle_agent(tmp_path, monkeypatch):
     from run_agent import AIAgent
 
     _GatewayHandler.requests = []
+    _GatewayHandler.probes = []
     _GatewayHandler.queued_responses = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GatewayHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -179,6 +189,9 @@ def test_conversation_loop_tool_policy_initial_and_post_tool_lifecycle(
     assert (post_tool["contract"], post_tool["role"]) == ("v1", "post_tool")
     assert initial["payload"]["messages"][0] == post_tool["payload"]["messages"][0]
     assert initial["payload"]["tools"] == post_tool["payload"]["tools"]
+    assert all(
+        probe == {"contract": None, "role": None} for probe in gateway.probes
+    )
     assert "tool_operation_context" not in agent.__dict__
 
 
@@ -326,3 +339,69 @@ def test_conversation_loop_tool_policy_concurrent_builds_are_isolated(lifecycle_
         "named": {"type": "function", "function": {"name": "tool_fixture"}},
     }
     assert "tool_operation_context" not in agent.__dict__
+
+
+def test_iteration_summary_explicitly_uses_fresh_automatic_context(lifecycle_agent):
+    agent, _gateway = lifecycle_agent
+    captured_contexts = []
+
+    def build_summary(_messages, *, attempt_context):
+        captured_contexts.append(attempt_context)
+        return {"model": "model-fixture", "input": []}
+
+    agent.api_mode = "codex_responses"
+    agent._build_api_kwargs = build_summary
+    agent._run_codex_stream = lambda _kwargs: object()
+    agent._get_transport = lambda: SimpleNamespace(
+        normalize_response=lambda _response: SimpleNamespace(content="summary fixture")
+    )
+
+    with patch(
+        "agent.relay_llm.execute_current",
+        side_effect=lambda request, callback, **_kwargs: callback(request),
+    ):
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "fixture"}],
+            4,
+        )
+
+    assert result == "summary fixture"
+    assert captured_contexts == [None]
+
+
+def test_prompt_cache_key_ignores_operation_policy_and_identity():
+    from agent.transports import get_transport
+    import agent.transports.codex  # noqa: F401
+
+    transport = get_transport("codex_responses")
+    messages = [
+        {"role": "system", "content": "Stable fixture prompt."},
+        {"role": "user", "content": "fixture"},
+    ]
+    required = ToolOperationContext.create(
+        ToolChoicePolicy(mode="required"),
+        operation_id="operation-fixture-required",
+    )
+    post_tool = ToolOperationContext.create(
+        ToolChoicePolicy(),
+        operation_id="operation-fixture-post-tool",
+        call_role="post_tool",
+        otto_contract_version="v1",
+    )
+
+    required_kwargs = transport.build_kwargs(
+        model="model-fixture",
+        messages=messages,
+        tools=[TOOL],
+        attempt_context=required,
+    )
+    post_tool_kwargs = transport.build_kwargs(
+        model="model-fixture",
+        messages=messages,
+        tools=[TOOL],
+        attempt_context=post_tool,
+    )
+
+    assert required_kwargs["tool_choice"] == "required"
+    assert post_tool_kwargs["tool_choice"] == "auto"
+    assert required_kwargs["prompt_cache_key"] == post_tool_kwargs["prompt_cache_key"]

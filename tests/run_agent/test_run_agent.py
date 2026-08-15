@@ -3823,7 +3823,8 @@ class TestRunConversation:
         agent.max_tokens = None
         requested_caps = []
 
-        def _fake_build_api_kwargs(api_messages):
+        def _fake_build_api_kwargs(api_messages, *, attempt_context=None):
+            assert attempt_context is None
             ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
             if ephemeral is not None:
                 agent._ephemeral_max_output_tokens = None
