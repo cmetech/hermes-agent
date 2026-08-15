@@ -3022,6 +3022,17 @@ def build_anthropic_kwargs(
                 kwargs["temperature"] = 1
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
 
+    if (
+        "thinking" in kwargs
+        and kwargs.get("tool_choice", {}).get("type") in {"any", "tool"}
+    ):
+        from agent.tool_choice_policy import ToolChoicePolicyError
+
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "Mandatory tool choice is incompatible with extended thinking.",
+        )
+
     # ── Strip sampling params on 4.7+ ─────────────────────────────────
     # Opus 4.7 rejects any non-default temperature/top_p/top_k with a 400.
     # Callers (auxiliary_client, etc.) may set these for older models;

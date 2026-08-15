@@ -1539,6 +1539,22 @@ class TestToolChoice:
         )
         assert kwargs["tool_choice"] == {"type": "tool", "name": "search"}
 
+    @pytest.mark.parametrize("tool_choice", ["required", "test"])
+    def test_mandatory_tool_choice_rejects_extended_thinking(self, tool_choice):
+        from agent.tool_choice_policy import ToolChoicePolicyError
+
+        with pytest.raises(ToolChoicePolicyError) as raised:
+            build_anthropic_kwargs(
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "Use the tool"}],
+                tools=self._DUMMY_TOOL,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "medium"},
+                tool_choice=tool_choice,
+            )
+
+        assert raised.value.code == "mandatory_tool_choice_not_supported"
+
 
 
 # ---------------------------------------------------------------------------
