@@ -61,6 +61,13 @@ class AnthropicTransport(ProviderTransport):
             drop_context_1m_beta: bool
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
+        from agent.transports.base import resolve_tool_choice
+
+        tool_choice = resolve_tool_choice(
+            params.get("attempt_context"), tools, dialect="anthropic"
+        )
+        if tool_choice is None:
+            tool_choice = params.get("tool_choice")
 
         return build_anthropic_kwargs(
             model=model,
@@ -68,7 +75,7 @@ class AnthropicTransport(ProviderTransport):
             tools=tools,
             max_tokens=params.get("max_tokens", 16384),
             reasoning_config=params.get("reasoning_config"),
-            tool_choice=params.get("tool_choice"),
+            tool_choice=tool_choice,
             is_oauth=params.get("is_oauth", False),
             preserve_dots=params.get("preserve_dots", False),
             context_length=params.get("context_length"),

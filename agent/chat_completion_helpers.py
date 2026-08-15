@@ -41,6 +41,7 @@ from agent.message_sanitization import (
 )
 from agent.provider_attempts import reserve_provider_transport_attempt
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.tool_choice_policy import ToolOperationContext
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -1130,7 +1131,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    tools_for_api: list | None = None,
+    *,
+    attempt_context: ToolOperationContext | None = None,
+) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -1157,6 +1164,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
             provider_name=getattr(agent, "provider", ""),
             structured_output=getattr(agent, "structured_output", None),
+            attempt_context=attempt_context,
         )
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
         # on its Messages route the same way it does on /chat/completions, but
@@ -1178,6 +1186,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens=agent.max_tokens or 4096,
             region=region,
             guardrail_config=guardrail,
+            attempt_context=attempt_context,
         )
 
     if agent.api_mode == "codex_responses":
@@ -1247,6 +1256,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            attempt_context=attempt_context,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -1353,6 +1363,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             qwen_session_metadata=_qwen_meta,
             provider_name=getattr(agent, "provider", ""),
             structured_output=getattr(agent, "structured_output", None),
+            attempt_context=attempt_context,
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -1387,6 +1398,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_tokenhub=_is_tokenhub,
         is_lmstudio=_is_lmstudio,
         is_custom_provider=agent.provider == "custom",
+        attempt_context=attempt_context,
         ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None,
         openrouter_min_coding_score=agent.openrouter_min_coding_score,

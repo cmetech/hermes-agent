@@ -1505,6 +1505,28 @@ class TestToolChoice:
         )
         assert kwargs["tool_choice"] == {"type": "auto"}
 
+    def test_tool_policy_required_and_none(self):
+        required = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config=None,
+            tool_choice="required",
+        )
+        none = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config=None,
+            tool_choice="none",
+        )
+
+        assert required["tool_choice"] == {"type": "any"}
+        assert "tools" not in none
+        assert "tool_choice" not in none
+
 
     def test_specific_tool_choice(self):
         kwargs = build_anthropic_kwargs(

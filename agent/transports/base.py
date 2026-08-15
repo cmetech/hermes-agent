@@ -13,6 +13,56 @@ from typing import Any, Dict, List, Optional
 from agent.transports.types import NormalizedResponse
 
 
+
+def _tool_names(tools: Optional[List[Dict[str, Any]]]) -> frozenset[str]:
+    names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+        else:
+            name = tool.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return frozenset(names)
+
+
+def resolve_tool_choice(
+    attempt_context,
+    tools: Optional[List[Dict[str, Any]]],
+    *,
+    dialect: str,
+):
+    """Validate and map an immutable attempt policy to one provider dialect."""
+    if attempt_context is None:
+        return None
+
+    from agent.tool_choice_policy import ToolChoicePolicyError
+
+    policy = attempt_context.policy
+    names = _tool_names(tools)
+    if policy.mode == "required" and not names:
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "Mandatory tool choice requires an available tool.",
+        )
+    if policy.mode == "named" and policy.name not in names:
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "The selected tool is unavailable for this request.",
+        )
+
+    if policy.mode in {"auto", "required", "none"}:
+        return policy.mode
+    if dialect == "chat_completions":
+        return {"type": "function", "function": {"name": policy.name}}
+    if dialect == "responses":
+        return {"type": "function", "name": policy.name}
+    return policy.name
+
+
 class ProviderTransport(ABC):
     """Base class for provider-specific format conversion and normalization."""
 

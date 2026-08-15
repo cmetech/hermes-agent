@@ -773,6 +773,33 @@ class TestBuildConverseKwargsToolStripping:
         )
         assert "toolConfig" in kwargs
 
+    def test_tool_choice_required_named_and_none(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
+        required = build_converse_kwargs(
+            model="us.anthropic.claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            tool_choice="required",
+        )
+        named = build_converse_kwargs(
+            model="us.anthropic.claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            tool_choice="test",
+        )
+        none = build_converse_kwargs(
+            model="us.anthropic.claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            tool_choice="none",
+        )
+
+        assert required["toolConfig"]["toolChoice"] == {"any": {}}
+        assert named["toolConfig"]["toolChoice"] == {"tool": {"name": "test"}}
+        assert "toolConfig" not in none
+
     def test_tools_stripped_for_deepseek_r1(self):
         from agent.bedrock_adapter import build_converse_kwargs
         tools = [{"type": "function", "function": {"name": "test", "description": "t", "parameters": {}}}]
