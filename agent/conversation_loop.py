@@ -4275,7 +4275,19 @@ def run_conversation(
                 
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
-                _error_summary = agent._summarize_api_error(api_error)
+                _is_tool_contract_error = (
+                    classified.reason == FailoverReason.tool_contract
+                )
+                _tool_contract_code = (
+                    classified.error_context.get("code")
+                    if _is_tool_contract_error
+                    else None
+                )
+                _error_summary = (
+                    classified.message
+                    if _is_tool_contract_error
+                    else agent._summarize_api_error(api_error)
+                )
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                     retry_count,
@@ -4293,7 +4305,7 @@ def run_conversation(
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
                 agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
                 agent._buffer_vprint(f"   📝 Error: {_error_summary}")
-                if status_code and status_code < 500:
+                if status_code and status_code < 500 and not _is_tool_contract_error:
                     _err_body = getattr(api_error, "body", None)
                     _err_body_str = str(_err_body)[:300] if _err_body else None
                     if _err_body_str:
@@ -5196,14 +5208,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if _has_pending_fallback():
+                    if not _is_tool_contract_error and _has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if _try_activate_fallback():
+                    if not _is_tool_contract_error and _try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5223,7 +5235,11 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
+                    _nonretryable_summary = (
+                        classified.message
+                        if _is_tool_contract_error
+                        else agent._summarize_api_error(api_error)
+                    )
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
@@ -5395,6 +5411,17 @@ def run_conversation(
                             "error": _nonretryable_summary,
                             "failure_reason": classified.reason.value,
                             "billing_block": _ce_block,
+                        }
+                    if _is_tool_contract_error:
+                        return {
+                            "final_response": "",
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _nonretryable_summary,
+                            "error_code": _tool_contract_code,
+                            "failure_reason": classified.reason.value,
                         }
                     return {
                         "final_response": _nonretryable_summary,

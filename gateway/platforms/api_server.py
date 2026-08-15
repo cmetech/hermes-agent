@@ -93,6 +93,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
+from agent.error_classifier import TOOL_CONTRACT_ERROR_MESSAGES
 from agent.tool_choice_policy import (
     ToolChoicePolicyError,
     ToolOperationContext,
@@ -1103,6 +1104,21 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _tool_contract_result_error(result: Any) -> tuple[str, str, int] | None:
+    """Return an allowlisted protocol-native failure from an agent result."""
+    if not isinstance(result, dict):
+        return None
+    code = result.get("error_code")
+    message = TOOL_CONTRACT_ERROR_MESSAGES.get(code)
+    if message is None:
+        return None
+    status = 400 if code in {
+        "unsupported_tool_contract_version",
+        "mandatory_tool_choice_not_supported",
+    } else 502
+    return code, message, status
 
 
 def _parse_api_tool_operation(
@@ -4243,6 +4259,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        contract_failure = _tool_contract_result_error(result)
+        if contract_failure is not None:
+            code, message, status = contract_failure
+            return web.json_response(
+                _openai_error(message, err_type="server_error", code=code),
+                status=status,
+            )
+
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
@@ -4440,6 +4464,12 @@ class APIServerAdapter(BasePlatformAdapter):
             is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
             err_msg = result.get("error") if isinstance(result, dict) else None
+            contract_failure = _tool_contract_result_error(result)
+            contract_error_code = None
+            if contract_failure is not None:
+                contract_error_code, err_msg, _status = contract_failure
+                is_failed = True
+                completed = False
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
@@ -4467,16 +4497,23 @@ class APIServerAdapter(BasePlatformAdapter):
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 if err_msg:
-                    finish_chunk["error"] = {
+                    error_payload = {
                         "message": err_msg,
                         "type": type(agent_error).__name__ if agent_error else "agent_error",
                     }
+                    if contract_error_code is not None:
+                        error_payload["code"] = contract_error_code
+                    finish_chunk["error"] = error_payload
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": (
+                        "output_truncated"
+                        if finish_reason == "length"
+                        else contract_error_code or "agent_error"
+                    ),
                 }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
@@ -4919,9 +4956,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _flush_batch()
 
             # Pick up agent result + usage from the completed task
+            agent_error_code = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                contract_failure = _tool_contract_result_error(result)
+                if contract_failure is not None:
+                    agent_error_code, agent_error, _status = contract_failure
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
@@ -4932,7 +4973,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
-                    agent_error = _redact_api_error_text(result["error"])
+                    if agent_error_code is None:
+                        agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
@@ -5004,7 +5046,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error),
+                    "type": "server_error",
+                }
+                if agent_error_code is not None:
+                    failed_env["error"]["code"] = agent_error_code
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -5400,6 +5447,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
                 )
+
+        contract_failure = _tool_contract_result_error(result)
+        if contract_failure is not None:
+            code, message, status = contract_failure
+            return web.json_response(
+                _openai_error(message, err_type="server_error", code=code),
+                status=status,
+            )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
         if not final_response:

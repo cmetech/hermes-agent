@@ -65,6 +65,7 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            "tool_contract",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -180,6 +181,40 @@ class TestClassify402:
 
 class TestClassifyApiError:
     """End-to-end classification tests."""
+
+    @pytest.mark.parametrize("status_code", [400, 502])
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "unsupported_tool_contract_version",
+            "mandatory_tool_choice_not_supported",
+            "otto_tool_contract_unavailable",
+            "selected_model_tool_protocol_failed",
+            "selected_model_tool_result_provenance_failed",
+        ],
+    )
+    def test_tool_contract_codes_are_terminal_before_generic_status_handling(
+        self, status_code, code
+    ):
+        error = MockAPIError(
+            "sanitized fixture",
+            status_code=status_code,
+            body={
+                "error": {
+                    "code": code,
+                    "message": "private upstream detail must not survive",
+                }
+            },
+        )
+
+        result = classify_api_error(error, provider="otto", model="model-fixture")
+
+        assert result.reason.value == "tool_contract"
+        assert result.retryable is False
+        assert result.should_fallback is False
+        assert result.should_rotate_credential is False
+        assert result.error_context["code"] == code
+        assert "private upstream detail" not in result.message
 
     # ── Auth errors ──
 
@@ -1080,6 +1115,4 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
-
 

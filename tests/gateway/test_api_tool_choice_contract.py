@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,21 @@ def _agent_result():
     return (
         {"final_response": "ok", "messages": [], "api_calls": 1},
         {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+
+
+def _agent_contract_failure(code="selected_model_tool_protocol_failed"):
+    return (
+        {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 1,
+            "completed": False,
+            "failed": True,
+            "error": "The selected model did not complete the required tool protocol.",
+            "error_code": code,
+        },
+        {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
     )
 
 
@@ -268,3 +284,102 @@ async def test_runs_executor_passes_context_to_conversation(adapter):
     context = captured["tool_operation_context"]
     assert context.policy.mode == "required"
     assert context.otto_contract_version == "v1"
+
+
+@pytest.mark.asyncio
+async def test_chat_contract_failure_preserves_native_error_code(adapter):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(return_value=_agent_contract_failure()),
+        ):
+            response = await client.post(
+                "/v1/chat/completions",
+                json=_chat_body("required"),
+                headers={"X-Otto-Tool-Contract": "v1"},
+            )
+            payload = await response.json()
+
+    assert response.status == 502
+    assert payload["error"]["code"] == "selected_model_tool_protocol_failed"
+    assert payload["error"]["message"] == (
+        "The selected model did not complete the required tool protocol."
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_contract_failure_preserves_native_error_code(adapter):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(return_value=_agent_contract_failure()),
+        ):
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "explicit-model-fixture",
+                    "input": "fixture request",
+                    "tool_choice": "required",
+                },
+                headers={"X-Otto-Tool-Contract": "v1"},
+            )
+            payload = await response.json()
+
+    assert response.status == 502
+    assert payload["error"]["code"] == "selected_model_tool_protocol_failed"
+
+
+@pytest.mark.asyncio
+async def test_streaming_contract_failure_emits_error_before_assistant_delta(adapter):
+    body = _chat_body("required")
+    body["stream"] = True
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(return_value=_agent_contract_failure()),
+        ):
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"X-Otto-Tool-Contract": "v1"},
+            )
+            wire = await response.text()
+
+    assert '"code": "selected_model_tool_protocol_failed"' in wire
+    assert '"content"' not in wire
+
+
+@pytest.mark.asyncio
+async def test_streaming_responses_contract_failure_is_protocol_native(adapter):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(return_value=_agent_contract_failure()),
+        ):
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "explicit-model-fixture",
+                    "input": "fixture request",
+                    "tool_choice": "required",
+                    "stream": True,
+                },
+                headers={"X-Otto-Tool-Contract": "v1"},
+            )
+            wire = await response.text()
+
+    assert 'event: response.failed' in wire
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in wire.splitlines()
+        if line.startswith("data: ")
+    ]
+    failed = next(event for event in events if event["type"] == "response.failed")
+    assert failed["response"]["error"]["code"] == (
+        "selected_model_tool_protocol_failed"
+    )
+    assert 'event: response.output_text.delta' not in wire
