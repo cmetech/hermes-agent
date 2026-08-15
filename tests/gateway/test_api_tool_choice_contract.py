@@ -167,7 +167,7 @@ async def test_unknown_named_tool_fails_after_effective_catalog_is_known(adapter
             payload = await response.json()
 
     assert response.status == 400
-    assert payload["error"]["code"] == "invalid_tool_choice"
+    assert payload["error"]["code"] == "mandatory_tool_choice_not_supported"
     fake_agent.run_conversation.assert_not_called()
 
 
@@ -179,6 +179,25 @@ async def test_nonempty_unknown_contract_version_fails_closed(adapter):
                 "/v1/chat/completions",
                 json=_chat_body("required"),
                 headers={"X-Otto-Tool-Contract": "v2"},
+            )
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "unsupported_tool_contract_version"
+    run_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_contract_headers_fail_before_agent_dispatch(adapter):
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new=AsyncMock()) as run_agent:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=_chat_body("required"),
+                headers=[
+                    ("X-Otto-Tool-Contract", "v1"),
+                    ("X-Otto-Tool-Contract", "v2"),
+                ],
             )
             payload = await response.json()
 
@@ -396,8 +415,8 @@ async def test_streaming_chat_policy_error_preserves_typed_code(adapter):
     )
     body["stream"] = True
     policy_error = ToolChoicePolicyError(
-        "invalid_tool_choice",
-        "Invalid tool choice.",
+        "mandatory_tool_choice_not_supported",
+        "The selected tool is unavailable for this request.",
     )
 
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -410,7 +429,7 @@ async def test_streaming_chat_policy_error_preserves_typed_code(adapter):
             payload = await response.json()
 
     assert response.status == 400
-    assert payload["error"]["code"] == "invalid_tool_choice"
+    assert payload["error"]["code"] == "mandatory_tool_choice_not_supported"
 
 
 @pytest.mark.asyncio
@@ -418,8 +437,8 @@ async def test_streaming_responses_policy_error_preserves_typed_code(adapter):
     from agent.tool_choice_policy import ToolChoicePolicyError
 
     policy_error = ToolChoicePolicyError(
-        "invalid_tool_choice",
-        "Invalid tool choice.",
+        "mandatory_tool_choice_not_supported",
+        "The selected tool is unavailable for this request.",
     )
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(
@@ -442,4 +461,4 @@ async def test_streaming_responses_policy_error_preserves_typed_code(adapter):
             payload = await response.json()
 
     assert response.status == 400
-    assert payload["error"]["code"] == "invalid_tool_choice"
+    assert payload["error"]["code"] == "mandatory_tool_choice_not_supported"

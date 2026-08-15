@@ -2827,6 +2827,7 @@ def build_anthropic_kwargs(
     drop_context_1m_beta: bool = False,
     provider_name: str | None = None,
     structured_output: Any = None,
+    use_native_none: bool = False,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2975,8 +2976,13 @@ def build_anthropic_kwargs(
         elif tool_choice == "required":
             kwargs["tool_choice"] = {"type": "any"}
         elif tool_choice == "none":
-            # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
-            kwargs.pop("tools", None)
+            if use_native_none:
+                # OTTO v1 needs the canonical policy to remain visible to the
+                # Gateway. Current Anthropic Messages supports native none.
+                kwargs["tool_choice"] = {"type": "none"}
+            else:
+                # Preserve legacy compatible-endpoint behavior outside v1.
+                kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}

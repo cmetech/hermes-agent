@@ -66,6 +66,7 @@ class AnthropicTransport(ProviderTransport):
         tool_choice = resolve_tool_choice(
             params.get("attempt_context"), tools, dialect="anthropic"
         )
+        attempt_context = params.get("attempt_context")
         if tool_choice is None:
             tool_choice = params.get("tool_choice")
 
@@ -84,6 +85,10 @@ class AnthropicTransport(ProviderTransport):
             drop_context_1m_beta=params.get("drop_context_1m_beta", False),
             provider_name=params.get("provider_name"),
             structured_output=params.get("structured_output"),
+            use_native_none=bool(
+                attempt_context is not None
+                and attempt_context.otto_contract_version == "v1"
+            ),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

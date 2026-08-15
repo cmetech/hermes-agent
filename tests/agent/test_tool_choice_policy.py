@@ -61,7 +61,7 @@ def test_named_anthropic_tool_choice_is_accepted_at_internal_boundary():
     assert parsed == policy.ToolChoicePolicy(mode="named", name="tool_call")
 
 
-def test_unknown_named_choice_fails_with_stable_invalid_category():
+def test_unknown_named_choice_fails_as_unsupported_mandatory_choice():
     policy = _policy_module()
 
     with pytest.raises(policy.ToolChoicePolicyError) as exc_info:
@@ -73,7 +73,7 @@ def test_unknown_named_choice_fails_with_stable_invalid_category():
             effective_tool_names={"tool_call"},
         )
 
-    assert exc_info.value.code == "invalid_tool_choice"
+    assert exc_info.value.code == "mandatory_tool_choice_not_supported"
 
 
 def test_malformed_choice_fails_with_stable_invalid_category():

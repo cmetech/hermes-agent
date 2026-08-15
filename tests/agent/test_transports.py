@@ -93,6 +93,24 @@ def test_anthropic_tool_policy_mapping():
     assert "tool_choice" not in none
 
 
+def test_anthropic_v1_none_uses_gateway_canonical_native_choice():
+    from agent.transports.anthropic import AnthropicTransport
+
+    context = ToolOperationContext.create(
+        ToolChoicePolicy(mode="none"),
+        otto_contract_version="v1",
+    )
+    kwargs = AnthropicTransport().build_kwargs(
+        "claude-sonnet-4-20250514",
+        MESSAGES,
+        TOOLS,
+        attempt_context=context,
+    )
+
+    assert kwargs["tools"]
+    assert kwargs["tool_choice"] == {"type": "none"}
+
+
 def test_responses_tool_policy_mapping_replaces_hard_coded_auto():
     from agent.transports.codex import ResponsesApiTransport
 

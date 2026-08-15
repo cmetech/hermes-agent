@@ -138,7 +138,10 @@ def validate_tool_choice_policy(
             "Mandatory tool choice requires an available tool.",
         )
     if policy.mode == "named" and policy.name not in names:
-        raise _invalid()
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "The selected tool is unavailable for this request.",
+        )
     return policy
 
 

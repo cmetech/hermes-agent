@@ -1127,7 +1127,16 @@ def _parse_api_tool_operation(
 ) -> tuple[Optional[ToolOperationContext], Optional["web.Response"]]:
     """Create trusted request context from standard choice plus exact v1 opt-in."""
 
-    contract_value = request.headers.get("X-Otto-Tool-Contract", "").strip()
+    contract_values = request.headers.getall("X-Otto-Tool-Contract", [])
+    if len(contract_values) > 1:
+        return None, web.json_response(
+            _openai_error(
+                "Unsupported OTTO tool contract version.",
+                code="unsupported_tool_contract_version",
+            ),
+            status=400,
+        )
+    contract_value = contract_values[0].strip() if contract_values else ""
     if contract_value not in {"", "v1"}:
         return None, web.json_response(
             _openai_error(
