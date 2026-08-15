@@ -3689,10 +3689,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            from agent.otto_tool_contract import (
+                contract_required,
+                verify_exception_echo,
+                verify_stream_echo,
+            )
+
+            requires_echo = contract_required(final_kwargs)
             reserve_provider_transport_attempt(agent, request_client)
-            manager = request_client.messages.stream(**final_kwargs)
+            try:
+                manager = request_client.messages.stream(**final_kwargs)
+            except Exception as exc:
+                verify_exception_echo(exc, contract_required=requires_echo)
+                raise
             _stream_context["manager"] = manager
-            return manager.__enter__()
+            try:
+                raw_stream = manager.__enter__()
+            except Exception as exc:
+                verify_exception_echo(exc, contract_required=requires_echo)
+                raise
+            try:
+                verify_stream_echo(raw_stream, contract_required=requires_echo)
+            except Exception:
+                manager.__exit__(None, None, None)
+                _stream_context["manager"] = None
+                raise
+            return raw_stream
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream

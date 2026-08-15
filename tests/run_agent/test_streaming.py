@@ -679,6 +679,75 @@ class TestCodexStreamCallbacks:
 class TestAnthropicStreamCallbacks:
     """Verify Anthropic streaming refreshes activity on every event."""
 
+    def test_anthropic_stream_rejects_missing_v1_echo_before_delivery(self):
+        from agent.otto_tool_contract import OttoToolContractError
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://gateway.invalid/v1",
+            provider="otto",
+            model="model-fixture",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+
+        delivered = []
+        cleanup = []
+        agent._fire_stream_delta = delivered.append
+
+        class _Stream:
+            response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                return iter(
+                    [
+                        SimpleNamespace(
+                            type="content_block_delta",
+                            delta=SimpleNamespace(
+                                type="text_delta",
+                                text="must not be delivered",
+                            ),
+                        )
+                    ]
+                )
+
+            def close(self):
+                cleanup.append("stream")
+
+            def get_final_message(self):
+                return SimpleNamespace(content=[], stop_reason="end_turn")
+
+        stream = _Stream()
+
+        class _Manager:
+            def __enter__(self):
+                return stream
+
+            def __exit__(self, *_args):
+                cleanup.append("manager")
+                return False
+
+        request_client = MagicMock()
+        request_client.messages.stream.return_value = _Manager()
+        agent._create_request_anthropic_client = lambda *a, **k: request_client
+
+        with pytest.raises(OttoToolContractError) as raised:
+            agent._interruptible_streaming_api_call(
+                {
+                    "extra_headers": {
+                        "X-Otto-Tool-Contract": "v1",
+                    }
+                }
+            )
+
+        assert raised.value.code == "otto_tool_contract_unavailable"
+        assert delivered == []
+        assert cleanup == ["stream", "manager"]
+
     def test_anthropic_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
@@ -1634,4 +1703,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-
