@@ -119,6 +119,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
     CommandDef("prompt", "Compose your next prompt in $EDITOR (markdown), then send it", "Session",
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
+    CommandDef(
+        "tool-choice",
+        "Set explicit tool policy for the next turn",
+        "Session",
+        aliases=("tool_choice",),
+        args_hint="[auto|required|named <tool>|none|off] [--otto-v1]",
+        busy_policy="dispatch",
+    ),
     CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
                args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
@@ -1261,7 +1269,17 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup",
+    "moa",
+    "debug",
+    "egress",
+    "init",
+    "version",
+    "diff",
+    "update",
+    "tool-choice",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

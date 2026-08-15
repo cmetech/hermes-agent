@@ -537,6 +537,27 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_tool_choice_command(self, event: MessageEvent) -> str:
+        """Configure an explicit policy for this conversation's next turn."""
+        from agent.tool_choice_control import (
+            OneShotToolChoice,
+            configure_tool_choice,
+        )
+
+        session_key = self._session_key_for_source(event.source)
+        controls = getattr(self, "_tool_choice_controls", None)
+        if not isinstance(controls, dict):
+            controls = {}
+            self._tool_choice_controls = controls
+        control = controls.get(session_key)
+        if not isinstance(control, OneShotToolChoice):
+            control = OneShotToolChoice()
+            controls[session_key] = control
+        try:
+            return configure_tool_choice(control, event.get_command_args().strip())
+        except ValueError as exc:
+            return f"✗ {exc}"
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

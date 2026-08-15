@@ -4672,6 +4672,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # that wants its output run as the next agent turn. Consumed and cleared
         # by the interactive loop immediately after process_command() returns.
         self._pending_agent_seed = None
+        from agent.tool_choice_control import OneShotToolChoice
+
+        self._tool_choice_control = OneShotToolChoice()
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
@@ -8117,6 +8120,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
+        tool_choice_control = getattr(self, "_tool_choice_control", None)
+        if tool_choice_control is not None:
+            tool_choice_control.clear()
         old_session_id = self.session_id
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
@@ -10018,6 +10024,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "handoff":
             if not self._handle_handoff_command(cmd_original):
                 return False
+        elif canonical == "tool-choice":
+            from agent.tool_choice_control import configure_tool_choice
+
+            args = cmd_original.split(maxsplit=1)
+            try:
+                _cprint(
+                    "  "
+                    + configure_tool_choice(
+                        self._tool_choice_control,
+                        args[1] if len(args) > 1 else "",
+                    )
+                )
+            except ValueError as exc:
+                _cprint(f"  ✗ {exc}")
         elif canonical == "new":
             # Strip inline-skip tokens (now/--yes/-y) before deriving the title
             # so "/new now My Session" yields title="My Session" instead of
@@ -13972,6 +13992,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
+                    _tool_operation_context = (
+                        self._tool_choice_control.consume_context()
+                    )
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -13979,6 +14002,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        tool_operation_context=_tool_operation_context,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
