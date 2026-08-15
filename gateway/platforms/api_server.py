@@ -93,6 +93,12 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
+from agent.tool_choice_policy import (
+    ToolChoicePolicyError,
+    ToolOperationContext,
+    parse_tool_choice_request,
+    validate_tool_choice_policy,
+)
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -1097,6 +1103,49 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _parse_api_tool_operation(
+    request: "web.Request",
+    body: Dict[str, Any],
+) -> tuple[Optional[ToolOperationContext], Optional["web.Response"]]:
+    """Create trusted request context from standard choice plus exact v1 opt-in."""
+
+    contract_value = request.headers.get("X-Otto-Tool-Contract", "").strip()
+    if contract_value not in {"", "v1"}:
+        return None, web.json_response(
+            _openai_error(
+                "Unsupported OTTO tool contract version.",
+                code="unsupported_tool_contract_version",
+            ),
+            status=400,
+        )
+    try:
+        policy = parse_tool_choice_request(body.get("tool_choice"))
+    except ToolChoicePolicyError as exc:
+        return None, web.json_response(
+            _openai_error(str(exc), code=exc.code),
+            status=400,
+        )
+    return ToolOperationContext.create(
+        policy,
+        call_role="primary",
+        otto_contract_version="v1" if contract_value == "v1" else None,
+    ), None
+
+
+def _effective_agent_tool_names(agent: Any) -> frozenset[str]:
+    names = getattr(agent, "valid_tool_names", None)
+    if isinstance(names, (set, frozenset, list, tuple)):
+        return frozenset(name for name in names if isinstance(name, str))
+    resolved = set()
+    for tool in getattr(agent, "tools", None) or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            resolved.add(function["name"])
+    return frozenset(resolved)
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -3896,6 +3945,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -4114,6 +4169,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             ))
@@ -4135,18 +4191,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_otto_tool_contract_version"] = (
+                tool_operation_context.otto_contract_version
+                if tool_operation_context is not None
+                else None
+            )
             fp = _make_request_fingerprint(
-                body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                fingerprint_body,
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "_otto_tool_contract_version",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4156,6 +4232,10 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -5066,6 +5146,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
+
         raw_input = body.get("input")
         if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -5225,6 +5311,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             ))
@@ -5260,14 +5347,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_otto_tool_contract_version"] = (
+                tool_operation_context.otto_contract_version
+                if tool_operation_context is not None
+                else None
+            )
             fp = _make_request_fingerprint(
-                body,
+                fingerprint_body,
                 keys=[
                     "input",
                     "instructions",
@@ -5277,10 +5371,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "tools",
+                    "tool_choice",
+                    "_otto_tool_contract_version",
                 ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -5290,6 +5390,10 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_response()
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -5974,6 +6078,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        tool_operation_context: Optional[ToolOperationContext] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6034,6 +6139,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if tool_operation_context is not None:
+                        validate_tool_choice_policy(
+                            tool_operation_context.policy,
+                            _effective_agent_tool_names(agent),
+                        )
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6041,11 +6151,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if tool_operation_context is not None:
+                        conversation_kwargs["tool_operation_context"] = (
+                            tool_operation_context
+                        )
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -6313,6 +6428,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -6527,10 +6648,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            if tool_operation_context is not None:
+                                validate_tool_choice_policy(
+                                    tool_operation_context.policy,
+                                    _effective_agent_tool_names(agent),
+                                )
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                tool_operation_context=tool_operation_context,
                             )
                         finally:
                             # Worker finished (interrupted or complete) —

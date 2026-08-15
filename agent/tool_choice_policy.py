@@ -105,23 +105,41 @@ def parse_tool_choice(
 ) -> ToolChoicePolicy:
     """Normalize a supported native choice against the effective tool catalog."""
 
-    names = frozenset(effective_tool_names)
+    policy = parse_tool_choice_request(value)
+    return validate_tool_choice_policy(policy, effective_tool_names)
+
+
+def parse_tool_choice_request(value: object) -> ToolChoicePolicy:
+    """Parse a native request shape before the agent catalog exists."""
+
     if value is None or value == "auto":
         return ToolChoicePolicy()
     if value == "none":
         return ToolChoicePolicy(mode="none")
     if value == "required":
-        if not names:
-            raise ToolChoicePolicyError(
-                "mandatory_tool_choice_not_supported",
-                "Mandatory tool choice requires an available tool.",
-            )
         return ToolChoicePolicy(mode="required")
 
     name = _named_choice_name(value)
-    if name is None or name not in names:
+    if name is None:
         raise _invalid()
     return ToolChoicePolicy(mode="named", name=name)
+
+
+def validate_tool_choice_policy(
+    policy: ToolChoicePolicy,
+    effective_tool_names: Iterable[str],
+) -> ToolChoicePolicy:
+    """Validate mandatory policy after the effective catalog is known."""
+
+    names = frozenset(effective_tool_names)
+    if policy.mode == "required" and not names:
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "Mandatory tool choice requires an available tool.",
+        )
+    if policy.mode == "named" and policy.name not in names:
+        raise _invalid()
+    return policy
 
 
 def _named_choice_name(value: object) -> str | None:
