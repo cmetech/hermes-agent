@@ -928,7 +928,83 @@ describe('usePromptActions exec fallback error reporting', () => {
     vi.restoreAllMocks()
   })
 
-  it('surfaces the slash.exec failure when command.dispatch only adds "not a quick/plugin/skill command"', async () => {
+  it('routes tool choice through its dedicated RPC and renders the confirmation', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'tool_choice.configure') {
+        return { output: 'Next turn tool choice: required with OTTO v1.' } as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/tool-choice required --otto-v1')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'tool_choice.configure',
+      { arguments: 'required --otto-v1', session_id: RUNTIME_SESSION_ID },
+      undefined
+    )
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+    expect(
+      renderedSeedTexts(seeds).some(text => text.includes('Next turn tool choice: required with OTTO v1.'))
+    ).toBe(true)
+  })
+
+  it('falls back to slash.exec for tool choice when an older gateway lacks the RPC', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'tool_choice.configure') {
+        throw new Error('method not found: tool_choice.configure')
+      }
+
+      if (method === 'slash.exec') {
+        return { output: 'Next turn tool choice: required with OTTO v1.' } as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/tool-choice required --otto-v1')
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual(['tool_choice.configure', 'slash.exec'])
+    expect(requestGateway).toHaveBeenCalledWith(
+      'slash.exec',
+      expect.objectContaining({
+        command: 'tool-choice required --otto-v1',
+        session_id: RUNTIME_SESSION_ID
+      })
+    )
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+    expect(
+      renderedSeedTexts(seeds).some(text => text.includes('Next turn tool choice: required with OTTO v1.'))
+    ).toBe(true)
+  })
+
+  it('surfaces the slash.exec failure when command.dispatch only adds current routing noise', async () => {
     const seeds: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -937,7 +1013,7 @@ describe('usePromptActions exec fallback error reporting', () => {
       }
 
       if (method === 'command.dispatch') {
-        throw new Error('not a quick/plugin/skill command: debug')
+        throw new Error('not a quick/plugin/bundle/skill command: debug')
       }
 
       return {} as never
@@ -961,7 +1037,7 @@ describe('usePromptActions exec fallback error reporting', () => {
     // the worker timeout is what actually went wrong (#44456).
     const texts = renderedSeedTexts(seeds)
     expect(texts.some(text => text.includes('slash worker timed out'))).toBe(true)
-    expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
+    expect(texts.some(text => text.includes('not a quick/plugin/bundle/skill command'))).toBe(false)
   })
 
   it('falls back to slash.exec when an older gateway lacks a dedicated RPC', async () => {

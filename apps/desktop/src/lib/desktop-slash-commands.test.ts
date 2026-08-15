@@ -129,6 +129,30 @@ describe('desktop slash command curation', () => {
     }
   })
 
+  it('routes tool choice through its dedicated one-shot RPC', () => {
+    const surface = resolveDesktopCommand('/tool-choice')?.surface
+
+    expect(surface?.kind).toBe('rpc')
+    expect(resolveDesktopCommand('/tool_choice')?.name).toBe('/tool-choice')
+    expect(desktopSlashCommandArgumentMode('/tool-choice')).toBe('mixed')
+    expect(isDesktopSlashSuggestion('/tool-choice')).toBe(true)
+    expect(isDesktopSlashSuggestion('/tool_choice')).toBe(false)
+
+    if (surface?.kind !== 'rpc') {
+      return
+    }
+
+    expect(surface.rpc).toBe('tool_choice.configure')
+    expect(
+      surface.buildParams({
+        arg: 'required --otto-v1',
+        command: '/tool-choice required --otto-v1',
+        name: 'tool-choice',
+        sessionId: 's-1'
+      })
+    ).toEqual({ arguments: 'required --otto-v1', session_id: 's-1' })
+  })
+
   it('keeps commands with richer CLI semantics on the slash worker', () => {
     for (const name of ['/agents', '/steer', '/stop', '/usage']) {
       expect(resolveDesktopCommand(name)?.surface).toEqual({ kind: 'exec' })

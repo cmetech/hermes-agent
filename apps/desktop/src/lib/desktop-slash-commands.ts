@@ -294,6 +294,13 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/retry', description: 'Retry the last user message', surface: exec() },
   { name: '/rollback', description: 'List or restore filesystem checkpoints', surface: exec() },
   {
+    name: '/tool-choice',
+    description: 'Set one-shot tool policy for the next turn',
+    aliases: ['/tool_choice'],
+    surface: rpc('tool_choice.configure', ctx => ({ arguments: ctx.arg, session_id: ctx.sessionId })),
+    argumentMode: 'mixed'
+  },
+  {
     name: '/save',
     description: 'Save the current transcript to JSON',
     surface: rpc('session.save', ctx => ({ session_id: ctx.sessionId }))

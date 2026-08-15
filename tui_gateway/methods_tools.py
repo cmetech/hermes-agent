@@ -22,6 +22,23 @@ def _handle_tool_choice_control(session: dict, arguments: str) -> str:
     return configure_tool_choice(control, arguments)
 
 
+@method("tool_choice.configure")
+def _(rid, params: dict) -> dict:
+    """Configure the one-shot tool policy for an existing session."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+
+    arguments = params.get("arguments", "")
+    if not isinstance(arguments, str):
+        return _err(rid, 4004, "tool choice arguments must be a string")
+    try:
+        output = _handle_tool_choice_control(session, arguments)
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    return _ok(rid, {"output": output})
+
+
 @method("system.battery")
 def _(rid, params: dict) -> dict:
     """Return the host battery status for the status-bar read-out.
@@ -1929,4 +1946,5 @@ def _(rid, params: dict) -> dict:
 
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    server._handle_tool_choice_control = _handle_tool_choice_control
     _registry.install(server)
