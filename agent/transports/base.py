@@ -43,6 +43,8 @@ def resolve_tool_choice(
 
     policy = attempt_context.policy
     names = _tool_names(tools)
+    if policy.mode == "auto" and not names:
+        return None
     if policy.mode == "required" and not names:
         raise ToolChoicePolicyError(
             "mandatory_tool_choice_not_supported",

@@ -188,7 +188,7 @@ async def test_nonempty_unknown_contract_version_fails_closed(adapter):
 
 
 @pytest.mark.asyncio
-async def test_next_chat_request_gets_fresh_auto_no_v1_context(adapter):
+async def test_next_chat_request_without_policy_preserves_legacy_context(adapter):
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(
             adapter, "_run_agent", new=AsyncMock(return_value=_agent_result())
@@ -205,9 +205,8 @@ async def test_next_chat_request_gets_fresh_auto_no_v1_context(adapter):
     assert first.status == second.status == 200
     first_context = run_agent.await_args_list[0].kwargs["tool_operation_context"]
     second_context = run_agent.await_args_list[1].kwargs["tool_operation_context"]
-    assert first_context.operation_id != second_context.operation_id
-    assert second_context.policy.mode == "auto"
-    assert second_context.otto_contract_version is None
+    assert first_context.policy.mode == "required"
+    assert second_context is None
 
 
 @pytest.mark.asyncio

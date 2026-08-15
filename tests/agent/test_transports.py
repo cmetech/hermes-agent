@@ -49,6 +49,20 @@ def test_chat_completions_tool_policy_mapping(mode, name, expected):
     assert kwargs["tool_choice"] == expected
 
 
+def test_chat_completions_auto_without_tools_omits_tool_choice():
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    kwargs = ChatCompletionsTransport().build_kwargs(
+        "model-fixture",
+        MESSAGES,
+        [],
+        attempt_context=_context("auto"),
+    )
+
+    assert "tools" not in kwargs
+    assert "tool_choice" not in kwargs
+
+
 def test_anthropic_tool_policy_mapping():
     from agent.transports.anthropic import AnthropicTransport
 
