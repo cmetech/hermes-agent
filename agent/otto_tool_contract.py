@@ -49,7 +49,7 @@ def add_otto_request_headers(
     owned = otto_headers(ctx)
     if not owned:
         return kwargs
-    if (provider or "").strip().lower() not in _OTTO_PROVIDERS:
+    if not _provider_supports_contract(provider):
         raise OttoToolContractError()
     if api_mode not in _HEADER_CAPABLE_MODES:
         raise OttoToolContractError()
@@ -65,6 +65,21 @@ def add_otto_request_headers(
     merged.update(owned)
     result["extra_headers"] = merged
     return result
+
+
+def _provider_supports_contract(provider: str | None) -> bool:
+    normalized = (provider or "").strip().lower()
+    if normalized in _OTTO_PROVIDERS:
+        return True
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+    except Exception:
+        return False
+    return (
+        getattr(profile, "otto_tool_contract_version", "") == CONTRACT_VERSION
+    )
 
 
 def contract_required(api_kwargs: Mapping[str, Any]) -> bool:

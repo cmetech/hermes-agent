@@ -60,6 +60,9 @@ class ProviderProfile:
     # Relative to the effective inference base URL; empty disables the
     # verified-capability contract.
     model_capabilities_path: str = ""
+    # Exact OTTO tool-contract version implemented by this provider. Empty by
+    # default so direct and undeclared providers remain outside that protocol.
+    otto_tool_contract_version: str = ""
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
     # Explicit provider-owned structured-output declaration. ``None`` means
