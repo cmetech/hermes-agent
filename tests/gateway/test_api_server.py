@@ -385,13 +385,20 @@ def test_adapter_fixtures_close_response_store_between_uses(request, fixture_nam
 class TestAgentExecution:
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
+        from agent.tool_choice_policy import ToolChoicePolicy, ToolOperationContext
+
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent.session_prompt_tokens = 1
         mock_agent.session_completion_tokens = 2
         mock_agent.session_total_tokens = 3
+        mock_agent.valid_tool_names = {"tool_call"}
 
         model_options = {"reasoning": {"enabled": False}, "fast": False}
+        tool_operation_context = ToolOperationContext.create(
+            ToolChoicePolicy(mode="required"),
+            operation_id="operation-fixture",
+        )
         with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create_agent:
             result, usage = await adapter._run_agent(
                 user_message="hello",
@@ -400,6 +407,7 @@ class TestAgentExecution:
                 requested_model="MiniMax-M3",
                 requested_provider="minimax",
                 model_options=model_options,
+                tool_operation_context=tool_operation_context,
             )
 
         # _run_agent annotates result with the effective agent.session_id
@@ -417,6 +425,7 @@ class TestAgentExecution:
             user_message="hello",
             conversation_history=[],
             task_id="session-123",
+            tool_operation_context=tool_operation_context,
         )
 
     @pytest.mark.asyncio
@@ -2886,4 +2895,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

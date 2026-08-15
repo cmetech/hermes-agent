@@ -1037,6 +1037,7 @@ def build_converse_kwargs(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    tool_choice: Any = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
@@ -1070,7 +1071,7 @@ def build_converse_kwargs(
     if stop_sequences:
         kwargs["inferenceConfig"]["stopSequences"] = stop_sequences
 
-    if tools:
+    if tools and tool_choice != "none":
         converse_tools = convert_tools_to_converse(tools)
         if converse_tools:
             # Some Bedrock models don't support tool/function calling (e.g.
@@ -1082,7 +1083,26 @@ def build_converse_kwargs(
                 if cache_enabled:
                     converse_tools = converse_tools + [{"cachePoint": {"type": "default"}}]
                 kwargs["toolConfig"] = {"tools": converse_tools}
+                if tool_choice == "required":
+                    kwargs["toolConfig"]["toolChoice"] = {"any": {}}
+                elif isinstance(tool_choice, str) and tool_choice not in {
+                    "auto",
+                    "none",
+                }:
+                    kwargs["toolConfig"]["toolChoice"] = {
+                        "tool": {"name": tool_choice}
+                    }
             else:
+                if tool_choice == "required" or (
+                    isinstance(tool_choice, str)
+                    and tool_choice not in {"auto", "none"}
+                ):
+                    from agent.tool_choice_policy import ToolChoicePolicyError
+
+                    raise ToolChoicePolicyError(
+                        "mandatory_tool_choice_not_supported",
+                        "The selected Bedrock model does not support tool choice.",
+                    )
                 logger.warning(
                     "Model %s does not support tool calling — tools stripped. "
                     "The agent will operate in text-only mode.", model

@@ -1025,6 +1025,40 @@ class TestBuildAnthropicKwargs:
             "format": {"type": "json_schema", "schema": _STRUCTURED_SCHEMA}
         }
 
+    def test_verified_v1_stream_preserves_midstream_transport_error(self):
+        failure = ConnectionError("sanitized midstream transport failure")
+
+        class Stream:
+            response = SimpleNamespace(
+                headers={"X-Otto-Tool-Contract": "v1"}
+            )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                raise failure
+
+        class Messages:
+            def stream(self, **_kwargs):
+                return Stream()
+
+        with pytest.raises(ConnectionError) as raised:
+            create_anthropic_message(
+                SimpleNamespace(messages=Messages()),
+                {
+                    "extra_headers": {
+                        "X-Otto-Tool-Contract": "v1",
+                    }
+                },
+                on_stream_event=lambda _event: None,
+            )
+
+        assert raised.value is failure
+
     @pytest.mark.parametrize(
         "strategy",
         [
@@ -1505,6 +1539,28 @@ class TestToolChoice:
         )
         assert kwargs["tool_choice"] == {"type": "auto"}
 
+    def test_tool_policy_required_and_none(self):
+        required = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config=None,
+            tool_choice="required",
+        )
+        none = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config=None,
+            tool_choice="none",
+        )
+
+        assert required["tool_choice"] == {"type": "any"}
+        assert "tools" not in none
+        assert "tool_choice" not in none
+
 
     def test_specific_tool_choice(self):
         kwargs = build_anthropic_kwargs(
@@ -1516,6 +1572,47 @@ class TestToolChoice:
             tool_choice="search",
         )
         assert kwargs["tool_choice"] == {"type": "tool", "name": "search"}
+
+    @pytest.mark.parametrize("tool_choice", ["required", "test"])
+    def test_mandatory_tool_choice_rejects_extended_thinking(self, tool_choice):
+        from agent.tool_choice_policy import ToolChoicePolicyError
+
+        with pytest.raises(ToolChoicePolicyError) as raised:
+            build_anthropic_kwargs(
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "Use the tool"}],
+                tools=self._DUMMY_TOOL,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "medium"},
+                tool_choice=tool_choice,
+            )
+
+        assert raised.value.code == "mandatory_tool_choice_not_supported"
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected_choice"),
+        [
+            ("required", {"type": "any"}),
+            ("search", {"type": "tool", "name": "search"}),
+        ],
+    )
+    def test_mandatory_tool_choice_allows_adaptive_thinking(
+        self, tool_choice, expected_choice
+    ):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "Use the tool"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            tool_choice=tool_choice,
+        )
+
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+        }
+        assert kwargs["tool_choice"] == expected_choice
 
 
 

@@ -81,6 +81,17 @@ def test_consecutive_user_messages_merge_for_gemini_alternation():
     assert roles == ["user", "model"], roles
 
 
+def test_tool_policy_modes_translate_to_native_gemini_config():
+    from agent.gemini_native_adapter import _translate_tool_choice_to_gemini
+
+    assert _translate_tool_choice_to_gemini("required") == {
+        "functionCallingConfig": {"mode": "ANY"}
+    }
+    assert _translate_tool_choice_to_gemini("none") == {
+        "functionCallingConfig": {"mode": "NONE"}
+    }
+
+
 
 
 def test_translate_native_response_surfaces_reasoning_and_tool_calls():
@@ -251,7 +262,6 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
 
 
 

@@ -2827,6 +2827,7 @@ def build_anthropic_kwargs(
     drop_context_1m_beta: bool = False,
     provider_name: str | None = None,
     structured_output: Any = None,
+    use_native_none: bool = False,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2975,8 +2976,13 @@ def build_anthropic_kwargs(
         elif tool_choice == "required":
             kwargs["tool_choice"] = {"type": "any"}
         elif tool_choice == "none":
-            # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
-            kwargs.pop("tools", None)
+            if use_native_none:
+                # OTTO v1 needs the canonical policy to remain visible to the
+                # Gateway. Current Anthropic Messages supports native none.
+                kwargs["tool_choice"] = {"type": "none"}
+            else:
+                # Preserve legacy compatible-endpoint behavior outside v1.
+                kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
@@ -3021,6 +3027,17 @@ def build_anthropic_kwargs(
                 # Anthropic requires temperature=1 when thinking is enabled on older models
                 kwargs["temperature"] = 1
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
+
+    if (
+        kwargs.get("thinking", {}).get("type") == "enabled"
+        and kwargs.get("tool_choice", {}).get("type") in {"any", "tool"}
+    ):
+        from agent.tool_choice_policy import ToolChoicePolicyError
+
+        raise ToolChoicePolicyError(
+            "mandatory_tool_choice_not_supported",
+            "Mandatory tool choice is incompatible with extended thinking.",
+        )
 
     # ── Strip sampling params on 4.7+ ─────────────────────────────────
     # Opus 4.7 rejects any non-default temperature/top_p/top_k with a 400.
@@ -3202,15 +3219,31 @@ def create_anthropic_message(
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
+    from agent.otto_tool_contract import (
+        OttoToolContractError,
+        contract_required,
+        parse_verified_raw_response,
+        verify_exception_echo,
+        verify_stream_echo,
+    )
+
+    requires_otto_echo = contract_required(api_kwargs)
+
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
     if prefer_stream and callable(stream_fn):
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
+        stream_echo_verified = False
         try:
             if before_transport is not None:
                 before_transport()
             with stream_fn(**stream_kwargs) as stream:
+                verify_stream_echo(
+                    stream,
+                    contract_required=requires_otto_echo,
+                )
+                stream_echo_verified = requires_otto_echo
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
@@ -3233,6 +3266,11 @@ def create_anthropic_message(
                             )
                 return stream.get_final_message()
         except Exception as exc:
+            if not stream_echo_verified:
+                verify_exception_echo(
+                    exc,
+                    contract_required=requires_otto_echo,
+                )
             if not _is_stream_unavailable_error(exc):
                 raise
             logger.debug(
@@ -3244,6 +3282,22 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    raw_create = None
+    if requires_otto_echo:
+        raw_api = getattr(messages_api, "with_raw_response", None)
+        raw_create = getattr(raw_api, "create", None)
+        if not callable(raw_create):
+            raise OttoToolContractError()
     if before_transport is not None:
         before_transport()
+    if requires_otto_echo:
+        try:
+            raw_response = raw_create(**create_kwargs)
+        except Exception as exc:
+            verify_exception_echo(exc, contract_required=True)
+            raise
+        return parse_verified_raw_response(
+            raw_response,
+            contract_required=True,
+        )
     return messages_api.create(**create_kwargs)

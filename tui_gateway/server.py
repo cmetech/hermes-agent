@@ -6114,6 +6114,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("tool_choice_control", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -9348,6 +9349,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    tool_operation_context=None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9648,6 +9650,11 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                tool_operation_context is not None
+                and "tool_operation_context" in _run_params
+            ):
+                run_kwargs["tool_operation_context"] = tool_operation_context
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)

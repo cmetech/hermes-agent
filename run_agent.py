@@ -8248,10 +8248,21 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    def _build_api_kwargs(
+        self,
+        api_messages: list,
+        tools_for_api: Optional[list] = None,
+        *,
+        attempt_context=None,
+    ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return build_api_kwargs(
+            self,
+            api_messages,
+            tools_for_api=tools_for_api,
+            attempt_context=attempt_context,
+        )
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -9028,6 +9039,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        tool_operation_context=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -9124,6 +9136,7 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                     credential_recovery_state=recovery_state,
+                    tool_operation_context=tool_operation_context,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:

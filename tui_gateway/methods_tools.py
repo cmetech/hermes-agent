@@ -11,6 +11,17 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _handle_tool_choice_control(session: dict, arguments: str) -> str:
+    """Configure a session-local policy consumed by the next accepted prompt."""
+    from agent.tool_choice_control import OneShotToolChoice, configure_tool_choice
+
+    control = session.get("tool_choice_control")
+    if not isinstance(control, OneShotToolChoice):
+        control = OneShotToolChoice()
+        session["tool_choice_control"] = control
+    return configure_tool_choice(control, arguments)
+
+
 @method("system.battery")
 def _(rid, params: dict) -> dict:
     """Return the host battery status for the status-bar read-out.
@@ -1089,6 +1100,13 @@ def _(rid, params: dict) -> dict:
     _cmd_parts = _cmd_text.split(maxsplit=1)
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
+
+    if _cmd_base in {"tool-choice", "tool_choice"}:
+        try:
+            output = _handle_tool_choice_control(session, _cmd_arg)
+        except ValueError as exc:
+            return _err(rid, 4004, str(exc))
+        return _ok(rid, {"output": output})
 
     live_output = _live_slash_command_output(
         params.get("session_id", ""), session, _cmd_base, _cmd_arg

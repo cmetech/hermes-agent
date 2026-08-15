@@ -13,6 +13,16 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _consume_session_tool_choice(session: dict):
+    """Consume the one-shot tool policy for one accepted prompt, if present."""
+    from agent.tool_choice_control import OneShotToolChoice
+
+    control = session.get("tool_choice_control")
+    if not isinstance(control, OneShotToolChoice):
+        return None
+    return control.consume_context()
+
+
 def _pending_reaction_notes(session: dict) -> str:
     """Note block describing reactions the user added since the last turn, or "".
 
@@ -281,6 +291,7 @@ def _(rid, params: dict) -> dict:
             f"session storage could not be written: {exc}",
         )
     _start_agent_build(sid, session)
+    tool_operation_context = _consume_session_tool_choice(session)
 
     def run_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted
@@ -323,7 +334,16 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if tool_operation_context is None:
+            _run_prompt_submit(rid, sid, session, text)
+        else:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                tool_operation_context=tool_operation_context,
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -928,6 +948,7 @@ def _(rid, params: dict) -> dict:
 
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    server._consume_session_tool_choice = _consume_session_tool_choice
     _registry.install(server)
     # Module-level helpers aren't @method handlers, so install() doesn't see
     # them — but server.py's run path calls this one (run_message enrichment,
