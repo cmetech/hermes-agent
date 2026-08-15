@@ -45,6 +45,7 @@ ${d.slug} = ProviderProfile(
     auth_type="api_key",
     supports_unauthenticated=True,
     model_capabilities_path="model-capabilities",
+    otto_tool_contract_version="v1",
     # Safe default; the picker also shows live ids from GET /v1/models.
     fallback_models=("auto",),
     # The gateway reports honest-zero usage and does not cap output itself;
