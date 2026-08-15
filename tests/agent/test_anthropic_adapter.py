@@ -1589,6 +1589,31 @@ class TestToolChoice:
 
         assert raised.value.code == "mandatory_tool_choice_not_supported"
 
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected_choice"),
+        [
+            ("required", {"type": "any"}),
+            ("search", {"type": "tool", "name": "search"}),
+        ],
+    )
+    def test_mandatory_tool_choice_allows_adaptive_thinking(
+        self, tool_choice, expected_choice
+    ):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "Use the tool"}],
+            tools=self._DUMMY_TOOL,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            tool_choice=tool_choice,
+        )
+
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+        }
+        assert kwargs["tool_choice"] == expected_choice
+
 
 
 # ---------------------------------------------------------------------------

@@ -1145,7 +1145,7 @@ def _parse_api_tool_operation(
             ),
             status=400,
         )
-    if "tool_choice" not in body and contract_value == "":
+    if body.get("tool_choice") is None and contract_value == "":
         return None, None
     try:
         policy = parse_tool_choice_request(body.get("tool_choice"))

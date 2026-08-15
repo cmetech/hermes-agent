@@ -229,6 +229,32 @@ async def test_next_chat_request_without_policy_preserves_legacy_context(adapter
 
 
 @pytest.mark.asyncio
+async def test_chat_null_tool_choice_is_legacy_unless_v1_is_requested(adapter):
+    body = {
+        "model": "explicit-model-fixture",
+        "messages": [{"role": "user", "content": "fixture request"}],
+        "tool_choice": None,
+    }
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(
+            adapter, "_run_agent", new=AsyncMock(return_value=_agent_result())
+        ) as run_agent:
+            legacy = await client.post("/v1/chat/completions", json=body)
+            coordinated = await client.post(
+                "/v1/chat/completions",
+                json=body,
+                headers={"X-Otto-Tool-Contract": "v1"},
+            )
+
+    assert legacy.status == coordinated.status == 200
+    legacy_context = run_agent.await_args_list[0].kwargs["tool_operation_context"]
+    coordinated_context = run_agent.await_args_list[1].kwargs["tool_operation_context"]
+    assert legacy_context is None
+    assert coordinated_context.policy.mode == "auto"
+    assert coordinated_context.otto_contract_version == "v1"
+
+
+@pytest.mark.asyncio
 async def test_responses_required_v1_threads_operation_context(adapter):
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(

@@ -194,6 +194,39 @@ def test_conversation_loop_tool_policy_initial_and_post_tool_lifecycle(
     )
 
 
+def test_cached_agent_next_operation_does_not_reuse_tool_policy(lifecycle_agent):
+    agent, gateway = lifecycle_agent
+    gateway.queued_responses = [
+        _tool_response(),
+        _text_response(),
+        _text_response(),
+    ]
+    context = ToolOperationContext.create(
+        ToolChoicePolicy(mode="required"),
+        operation_id="operation-fixture",
+        otto_contract_version="v1",
+    )
+
+    first = agent.run_conversation(
+        "use the fixture tool",
+        conversation_history=[],
+        task_id="task-fixture-first",
+        tool_operation_context=context,
+    )
+    second = agent.run_conversation(
+        "fresh fixture turn",
+        conversation_history=[],
+        task_id="task-fixture-second",
+    )
+
+    assert first["final_response"] == second["final_response"] == "done"
+    assert len(gateway.requests) == 3
+    fresh_request = gateway.requests[2]
+    assert "tool_choice" not in fresh_request["payload"]
+    assert fresh_request["contract"] is None
+    assert fresh_request["role"] is None
+
+
 def test_conversation_loop_tool_policy_network_retry_reuses_same_context(
     lifecycle_agent, monkeypatch
 ):

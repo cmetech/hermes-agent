@@ -3029,7 +3029,7 @@ def build_anthropic_kwargs(
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
 
     if (
-        "thinking" in kwargs
+        kwargs.get("thinking", {}).get("type") == "enabled"
         and kwargs.get("tool_choice", {}).get("type") in {"any", "tool"}
     ):
         from agent.tool_choice_policy import ToolChoicePolicyError
