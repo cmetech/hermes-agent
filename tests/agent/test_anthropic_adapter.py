@@ -1025,6 +1025,40 @@ class TestBuildAnthropicKwargs:
             "format": {"type": "json_schema", "schema": _STRUCTURED_SCHEMA}
         }
 
+    def test_verified_v1_stream_preserves_midstream_transport_error(self):
+        failure = ConnectionError("sanitized midstream transport failure")
+
+        class Stream:
+            response = SimpleNamespace(
+                headers={"X-Otto-Tool-Contract": "v1"}
+            )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                raise failure
+
+        class Messages:
+            def stream(self, **_kwargs):
+                return Stream()
+
+        with pytest.raises(ConnectionError) as raised:
+            create_anthropic_message(
+                SimpleNamespace(messages=Messages()),
+                {
+                    "extra_headers": {
+                        "X-Otto-Tool-Contract": "v1",
+                    }
+                },
+                on_stream_event=lambda _event: None,
+            )
+
+        assert raised.value is failure
+
     @pytest.mark.parametrize(
         "strategy",
         [

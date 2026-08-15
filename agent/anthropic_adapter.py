@@ -3228,6 +3228,7 @@ def create_anthropic_message(
     if prefer_stream and callable(stream_fn):
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
+        stream_echo_verified = False
         try:
             if before_transport is not None:
                 before_transport()
@@ -3236,6 +3237,7 @@ def create_anthropic_message(
                     stream,
                     contract_required=requires_otto_echo,
                 )
+                stream_echo_verified = requires_otto_echo
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
@@ -3258,10 +3260,11 @@ def create_anthropic_message(
                             )
                 return stream.get_final_message()
         except Exception as exc:
-            verify_exception_echo(
-                exc,
-                contract_required=requires_otto_echo,
-            )
+            if not stream_echo_verified:
+                verify_exception_echo(
+                    exc,
+                    contract_required=requires_otto_echo,
+                )
             if not _is_stream_unavailable_error(exc):
                 raise
             logger.debug(
