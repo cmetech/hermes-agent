@@ -10,8 +10,13 @@ Hermes v5.8.0 added an explicit, request-scoped tool-choice control and a
 `slash.exec` handler for `/tool-choice`. The Desktop renderer did not register
 the command as a built-in Desktop surface. It therefore treated the command as
 an extension command and routed it through the generic
-`slash.exec`/`command.dispatch` fallback chain. In an installed Desktop session
-this produced:
+`slash.exec`/`command.dispatch` fallback chain. That chain succeeds on a
+current v5.8.0 backend because `/tool-choice` has a pre-worker fast path, but it
+is fragile: when `slash.exec` fails, Desktop falls through to
+`command.dispatch`, which does not own built-in tool-choice configuration.
+
+The installed failure combined that registry gap with a second cause on the
+active backend path and produced:
 
 ```text
 /tool-choice error: not a quick/plugin/bundle/skill command: tool-choice
@@ -21,6 +26,13 @@ The command did not arm the one-shot policy, so submitting the following prompt
 would run with ordinary automatic tool choice rather than the coordinated OTTO
 v1 contract.
 
+Desktop also has an adjacent error-unmasking defect. Its fallback recognizes
+the old `not a quick/plugin/skill command` text, while the backend now emits
+`not a quick/plugin/bundle/skill command`. The mismatch replaces the original
+`slash.exec` failure with misleading `command.dispatch` routing noise. v5.8.1
+will update that matcher and preserve the original failure for every affected
+exec-surface command.
+
 ## Decision
 
 Desktop will expose `/tool-choice` as a first-class command backed by a
@@ -28,6 +40,10 @@ dedicated `tool_choice.configure` JSON-RPC method. The RPC will reuse the
 existing backend-owned `OneShotToolChoice` state and `configure_tool_choice`
 parser. Desktop will not duplicate policy parsing or store mutable policy in
 React.
+
+The snake-case `tool_choice` namespace is intentional: it names the existing
+session-scoped policy concept without overloading the unrelated
+`tools.configure` toolset endpoint.
 
 The underscore spelling `/tool_choice` remains an alias. The command accepts
 the existing forms:
@@ -74,6 +90,9 @@ does not call `slash.exec` or `command.dispatch` on a current backend.
 - Desktop's established missing-RPC compatibility behavior may fall back to
   `slash.exec` for an older backend. A current v5.8.1 shell and managed backend
   use the dedicated RPC.
+- If that `slash.exec` compatibility path fails and `command.dispatch` only
+  reports that the command is not a quick/plugin/bundle/skill command, Desktop
+  renders the original `slash.exec` error rather than the routing noise.
 - The command does not append a message, alter the system prompt, modify prior
   history, change the selected model, or grant connector authorization.
 - A successful confirmation is required before the user submits a contract
@@ -89,10 +108,15 @@ Implementation follows strict RED/GREEN TDD:
    `/tool-choice required --otto-v1` calls only `tool_choice.configure` with
    the correct session and arguments, renders the confirmation, and does not
    call `slash.exec` or `command.dispatch`.
-3. Backend RPC tests prove configuration is scoped to the requested session,
+3. A Desktop compatibility test proves a missing dedicated RPC falls back to
+   `slash.exec` and renders its successful confirmation.
+4. A Desktop error-unmasking test proves the current
+   `not a quick/plugin/bundle/skill command` fallback preserves the original
+   `slash.exec` failure.
+5. Backend RPC tests prove configuration is scoped to the requested session,
    returns the existing confirmation, is consumed exactly once by the prompt
    lifecycle, and preserves validation errors.
-4. Focused Desktop tests, adjacent TUI gateway tests, Desktop type-check/build,
+6. Focused Desktop tests, adjacent TUI gateway tests, Desktop type-check/build,
    Python compilation, merge gates, and brand-generation gates must pass before
    release.
 
