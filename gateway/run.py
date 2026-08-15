@@ -2383,7 +2383,19 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    "_tool_choice_controls",
 )
+
+
+def _consume_gateway_tool_choice(runner, session_key: str):
+    """Consume one conversation-local tool policy at the accepted-turn boundary."""
+    controls = getattr(runner, "_tool_choice_controls", None)
+    if not isinstance(controls, dict):
+        return None
+    control = controls.pop(session_key, None)
+    if control is None:
+        return None
+    return control.consume_context()
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
@@ -5313,6 +5325,13 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            _tool_operation_context = _consume_gateway_tool_choice(
+                self._runner, ctx.session_key
+            )
+            if _tool_operation_context is not None:
+                _conversation_kwargs["tool_operation_context"] = (
+                    _tool_operation_context
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -14199,6 +14218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                "tool-choice": self._handle_tool_choice_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -15120,6 +15140,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "tool-choice":
+            return await self._handle_tool_choice_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)

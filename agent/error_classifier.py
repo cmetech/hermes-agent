@@ -67,6 +67,7 @@ class FailoverReason(enum.Enum):
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
+    tool_contract = "tool_contract"          # OTTO v1 protocol failure — terminal
 
     # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
@@ -141,6 +142,22 @@ _BILLING_ERROR_CODES = frozenset({
     "model_not_supported_on_free_tier",
     _XAI_SPENDING_LIMIT_ERROR_CODE,
 })
+
+TOOL_CONTRACT_ERROR_MESSAGES = {
+    "unsupported_tool_contract_version": "Unsupported OTTO tool contract version.",
+    "mandatory_tool_choice_not_supported": (
+        "The selected model or transport does not support mandatory tool choice."
+    ),
+    "otto_tool_contract_unavailable": (
+        "The selected gateway does not support the requested tool contract."
+    ),
+    "selected_model_tool_protocol_failed": (
+        "The selected model did not complete the required tool protocol."
+    ),
+    "selected_model_tool_result_provenance_failed": (
+        "The selected model did not complete tool-result provenance recovery."
+    ),
+}
 
 # Patterns that indicate rate limiting (transient, will resolve)
 _RATE_LIMIT_PATTERNS = [
@@ -660,6 +677,19 @@ def classify_api_error(
         status_code = 429
     body = _extract_error_body(error)
     error_code = _extract_error_code(body)
+    if not error_code:
+        current = error
+        for _ in range(5):
+            candidate = getattr(current, "code", None)
+            if candidate in TOOL_CONTRACT_ERROR_MESSAGES:
+                error_code = candidate
+                break
+            cause = getattr(current, "__cause__", None) or getattr(
+                current, "__context__", None
+            )
+            if cause is None or cause is current:
+                break
+            current = cause
 
     # Build a comprehensive error message string for pattern matching.
     # str(error) alone may not include the body message (e.g. OpenAI SDK's
@@ -714,6 +744,19 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # OTTO v1 codes are an allowlisted protocol boundary. Classify them before
+    # generic 400/500/502 handling and replace arbitrary upstream detail with
+    # a static message so model text and private Gateway state cannot escape.
+    if error_code in TOOL_CONTRACT_ERROR_MESSAGES:
+        return _result(
+            FailoverReason.tool_contract,
+            message=TOOL_CONTRACT_ERROR_MESSAGES[error_code],
+            retryable=False,
+            should_fallback=False,
+            should_rotate_credential=False,
+            error_context={"code": error_code},
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

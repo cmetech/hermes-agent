@@ -93,6 +93,13 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
+from agent.error_classifier import TOOL_CONTRACT_ERROR_MESSAGES
+from agent.tool_choice_policy import (
+    ToolChoicePolicyError,
+    ToolOperationContext,
+    parse_tool_choice_request,
+    validate_tool_choice_policy,
+)
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -152,6 +159,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1097,6 +1105,99 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _tool_contract_result_error(result: Any) -> tuple[str, str, int] | None:
+    """Return an allowlisted protocol-native failure from an agent result."""
+    if not isinstance(result, dict):
+        return None
+    code = result.get("error_code")
+    message = TOOL_CONTRACT_ERROR_MESSAGES.get(code)
+    if message is None:
+        return None
+    status = 400 if code in {
+        "unsupported_tool_contract_version",
+        "mandatory_tool_choice_not_supported",
+    } else 502
+    return code, message, status
+
+
+def _parse_api_tool_operation(
+    request: "web.Request",
+    body: Dict[str, Any],
+) -> tuple[Optional[ToolOperationContext], Optional["web.Response"]]:
+    """Create trusted request context from standard choice plus exact v1 opt-in."""
+
+    contract_values = request.headers.getall("X-Otto-Tool-Contract", [])
+    if len(contract_values) > 1:
+        return None, web.json_response(
+            _openai_error(
+                "Unsupported OTTO tool contract version.",
+                code="unsupported_tool_contract_version",
+            ),
+            status=400,
+        )
+    contract_value = contract_values[0].strip() if contract_values else ""
+    if contract_value not in {"", "v1"}:
+        return None, web.json_response(
+            _openai_error(
+                "Unsupported OTTO tool contract version.",
+                code="unsupported_tool_contract_version",
+            ),
+            status=400,
+        )
+    if body.get("tool_choice") is None and contract_value == "":
+        return None, None
+    try:
+        policy = parse_tool_choice_request(body.get("tool_choice"))
+    except ToolChoicePolicyError as exc:
+        return None, web.json_response(
+            _openai_error(str(exc), code=exc.code),
+            status=400,
+        )
+    return ToolOperationContext.create(
+        policy,
+        call_role="primary",
+        otto_contract_version="v1" if contract_value == "v1" else None,
+    ), None
+
+
+def _effective_agent_tool_names(agent: Any) -> frozenset[str]:
+    names = getattr(agent, "valid_tool_names", None)
+    if isinstance(names, (set, frozenset, list, tuple)):
+        return frozenset(name for name in names if isinstance(name, str))
+    resolved = set()
+    for tool in getattr(agent, "tools", None) or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            resolved.add(function["name"])
+    return frozenset(resolved)
+
+
+async def _await_stream_tool_policy_preflight(
+    agent_task: "asyncio.Task[Any]",
+    preflight: "asyncio.Future[ToolChoicePolicyError | None]",
+) -> ToolChoicePolicyError | None:
+    """Wait briefly for request-scoped policy validation before SSE starts."""
+
+    done, _pending = await asyncio.wait(
+        {agent_task, preflight},
+        timeout=TOOL_POLICY_PREFLIGHT_TIMEOUT_SECONDS,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not done:
+        return None
+    if preflight in done:
+        return preflight.result()
+    try:
+        agent_task.result()
+    except ToolChoicePolicyError as exc:
+        return exc
+    except Exception:
+        return None
+    return None
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -3896,6 +3997,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -4104,6 +4211,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            tool_policy_preflight = (
+                asyncio.get_running_loop().create_future()
+                if tool_operation_context is not None
+                else None
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -4114,12 +4226,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
+                tool_policy_preflight=tool_policy_preflight,
                 **agent_overrides,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+
+            if tool_policy_preflight is not None:
+                policy_error = await _await_stream_tool_policy_preflight(
+                    agent_task,
+                    tool_policy_preflight,
+                )
+                if policy_error is not None:
+                    return web.json_response(
+                        _openai_error(
+                            str(policy_error),
+                            code=policy_error.code,
+                        ),
+                        status=400,
+                    )
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -4135,18 +4263,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_otto_tool_contract_version"] = (
+                tool_operation_context.otto_contract_version
+                if tool_operation_context is not None
+                else None
+            )
             fp = _make_request_fingerprint(
-                body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                fingerprint_body,
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "_otto_tool_contract_version",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4156,12 +4304,24 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
                 )
+
+        contract_failure = _tool_contract_result_error(result)
+        if contract_failure is not None:
+            code, message, status = contract_failure
+            return web.json_response(
+                _openai_error(message, err_type="server_error", code=code),
+                status=status,
+            )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
@@ -4360,9 +4520,18 @@ class APIServerAdapter(BasePlatformAdapter):
             is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
             err_msg = result.get("error") if isinstance(result, dict) else None
+            contract_failure = _tool_contract_result_error(result)
+            terminal_error_code = None
+            if contract_failure is not None:
+                terminal_error_code, err_msg, _status = contract_failure
+                is_failed = True
+                completed = False
             if agent_error is not None:
                 is_failed = True
-                err_msg = err_msg or str(agent_error)
+                err_msg = err_msg or _redact_api_error_text(agent_error)
+                if isinstance(agent_error, ToolChoicePolicyError):
+                    terminal_error_code = agent_error.code
+                    completed = False
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -4387,16 +4556,29 @@ class APIServerAdapter(BasePlatformAdapter):
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 if err_msg:
-                    finish_chunk["error"] = {
+                    error_payload = {
                         "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
+                        "type": (
+                            "invalid_request_error"
+                            if isinstance(agent_error, ToolChoicePolicyError)
+                            else type(agent_error).__name__
+                            if agent_error
+                            else "agent_error"
+                        ),
                     }
+                    if terminal_error_code is not None:
+                        error_payload["code"] = terminal_error_code
+                    finish_chunk["error"] = error_payload
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": (
+                        "output_truncated"
+                        if finish_reason == "length"
+                        else terminal_error_code or "agent_error"
+                    ),
                 }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
@@ -4839,9 +5021,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _flush_batch()
 
             # Pick up agent result + usage from the completed task
+            agent_error_code = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                contract_failure = _tool_contract_result_error(result)
+                if contract_failure is not None:
+                    agent_error_code, agent_error, _status = contract_failure
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
@@ -4852,10 +5038,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
-                    agent_error = _redact_api_error_text(result["error"])
+                    if agent_error_code is None:
+                        agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
+                if isinstance(e, ToolChoicePolicyError):
+                    agent_error_code = e.code
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -4924,7 +5113,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error),
+                    "type": "server_error",
+                }
+                if agent_error_code is not None:
+                    failed_env["error"]["code"] = agent_error_code
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -5065,6 +5259,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
             )
+
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -5214,6 +5414,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
 
             agent_ref = [None]
+            tool_policy_preflight = (
+                asyncio.get_running_loop().create_future()
+                if tool_operation_context is not None
+                else None
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -5225,12 +5430,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
+                tool_policy_preflight=tool_policy_preflight,
                 **agent_overrides,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+
+            if tool_policy_preflight is not None:
+                policy_error = await _await_stream_tool_policy_preflight(
+                    agent_task,
+                    tool_policy_preflight,
+                )
+                if policy_error is not None:
+                    return web.json_response(
+                        _openai_error(
+                            str(policy_error),
+                            code=policy_error.code,
+                        ),
+                        status=400,
+                    )
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
@@ -5260,14 +5481,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_operation_context=tool_operation_context,
                 **agent_overrides,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_otto_tool_contract_version"] = (
+                tool_operation_context.otto_contract_version
+                if tool_operation_context is not None
+                else None
+            )
             fp = _make_request_fingerprint(
-                body,
+                fingerprint_body,
                 keys=[
                     "input",
                     "instructions",
@@ -5277,10 +5505,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "tools",
+                    "tool_choice",
+                    "_otto_tool_contract_version",
                 ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -5290,12 +5524,24 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_response()
+            except ToolChoicePolicyError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code), status=400
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
                 )
+
+        contract_failure = _tool_contract_result_error(result)
+        if contract_failure is not None:
+            code, message, status = contract_failure
+            return web.json_response(
+                _openai_error(message, err_type="server_error", code=code),
+                status=status,
+            )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
         if not final_response:
@@ -5974,6 +6220,10 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        tool_operation_context: Optional[ToolOperationContext] = None,
+        tool_policy_preflight: Optional[
+            "asyncio.Future[ToolChoicePolicyError | None]"
+        ] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6006,6 +6256,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
 
+        def _publish_tool_policy_preflight(
+            error: ToolChoicePolicyError | None,
+        ) -> None:
+            if tool_policy_preflight is None:
+                return
+
+            def _resolve() -> None:
+                if not tool_policy_preflight.done():
+                    tool_policy_preflight.set_result(error)
+
+            loop.call_soon_threadsafe(_resolve)
+
         def _run():
             from gateway.session_context import clear_session_vars
 
@@ -6034,6 +6296,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if tool_operation_context is not None:
+                        validate_tool_choice_policy(
+                            tool_operation_context.policy,
+                            _effective_agent_tool_names(agent),
+                        )
+                    _publish_tool_policy_preflight(None)
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6041,11 +6309,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if tool_operation_context is not None:
+                        conversation_kwargs["tool_operation_context"] = (
+                            tool_operation_context
+                        )
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -6135,6 +6408,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
                     return result, usage
+                except ToolChoicePolicyError as exc:
+                    _publish_tool_policy_preflight(exc)
+                    raise
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
                     # where _resolve_runtime_agent_kwargs() is called inside
@@ -6163,6 +6439,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    _publish_tool_policy_preflight(None)
                     # Turn finished (success, auth failure, or crash) — clear
                     # ownership markers so a disconnect landing after this
                     # point can't reap background work this turn left
@@ -6312,6 +6589,12 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        tool_operation_context, tool_context_error = _parse_api_tool_operation(
+            request, body
+        )
+        if tool_context_error is not None:
+            return tool_context_error
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6527,10 +6810,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            if tool_operation_context is not None:
+                                validate_tool_choice_policy(
+                                    tool_operation_context.policy,
+                                    _effective_agent_tool_names(agent),
+                                )
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                tool_operation_context=tool_operation_context,
                             )
                         finally:
                             # Worker finished (interrupted or complete) —

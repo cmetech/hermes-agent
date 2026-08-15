@@ -427,9 +427,15 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             "store": False,
         }
+
+        from agent.transports.base import resolve_tool_choice
+
+        resolved_tool_choice = resolve_tool_choice(
+            params.get("attempt_context"), tools, dialect="responses"
+        )
         if response_tools:
             kwargs["tools"] = response_tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = resolved_tool_choice or "auto"
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
@@ -485,6 +491,8 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+        if resolved_tool_choice is not None and response_tools:
+            kwargs["tool_choice"] = resolved_tool_choice
 
         _reserve_structured_text_format(
             kwargs, params.get("structured_output")

@@ -472,6 +472,13 @@ class ChatCompletionsTransport(ProviderTransport):
             supports_prompt_cache_key: bool — explicit endpoint capability for
                 the top-level Chat Completions request field; defaults off.
         """
+        from agent.transports.base import resolve_tool_choice
+
+        resolved_tool_choice = resolve_tool_choice(
+            params.get("attempt_context"),
+            tools,
+            dialect="chat_completions",
+        )
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
@@ -483,6 +490,8 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
             )
+            if resolved_tool_choice is not None:
+                api_kwargs["tool_choice"] = resolved_tool_choice
             _reserve_structured_response_format(
                 api_kwargs, params.get("structured_output")
             )
@@ -682,6 +691,9 @@ class ChatCompletionsTransport(ProviderTransport):
         )
         if response_format is not None:
             api_kwargs["response_format"] = response_format
+
+        if resolved_tool_choice is not None:
+            api_kwargs["tool_choice"] = resolved_tool_choice
 
         return api_kwargs
 

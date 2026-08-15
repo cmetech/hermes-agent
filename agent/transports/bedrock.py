@@ -47,9 +47,13 @@ class BedrockTransport(ProviderTransport):
             region: str — AWS region (default 'us-east-1')
         """
         from agent.bedrock_adapter import build_converse_kwargs
+        from agent.transports.base import resolve_tool_choice
 
         region = params.get("region", "us-east-1")
         guardrail = params.get("guardrail_config")
+        tool_choice = resolve_tool_choice(
+            params.get("attempt_context"), tools, dialect="bedrock"
+        )
 
         kwargs = build_converse_kwargs(
             model=model,
@@ -58,6 +62,7 @@ class BedrockTransport(ProviderTransport):
             max_tokens=params.get("max_tokens", 4096),
             temperature=params.get("temperature"),
             guardrail_config=guardrail,
+            tool_choice=tool_choice,
         )
         # Sentinel keys for dispatch — agent pops these before the boto3 call
         kwargs["__bedrock_converse__"] = True
