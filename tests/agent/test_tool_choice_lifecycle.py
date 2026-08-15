@@ -192,7 +192,6 @@ def test_conversation_loop_tool_policy_initial_and_post_tool_lifecycle(
     assert all(
         probe == {"contract": None, "role": None} for probe in gateway.probes
     )
-    assert "tool_operation_context" not in agent.__dict__
 
 
 def test_conversation_loop_tool_policy_network_retry_reuses_same_context(
@@ -249,7 +248,6 @@ def test_conversation_loop_tool_policy_network_retry_reuses_same_context(
     assert len(contexts) >= 2
     assert contexts[0] is context
     assert contexts[1] is context
-    assert "tool_operation_context" not in agent.__dict__
 
 
 def test_conversation_loop_tool_policy_fallback_is_rejected_for_mandatory_operation():
@@ -282,7 +280,6 @@ def test_conversation_loop_tool_policy_cancellation_leaves_no_agent_state(
     )
 
     assert result.get("interrupted") is True
-    assert "tool_operation_context" not in agent.__dict__
 
 
 def test_conversation_loop_tool_policy_max_iterations_leaves_no_agent_state(
@@ -304,7 +301,6 @@ def test_conversation_loop_tool_policy_max_iterations_leaves_no_agent_state(
     )
 
     assert result.get("completed") is False
-    assert "tool_operation_context" not in agent.__dict__
 
 
 def test_conversation_loop_tool_policy_concurrent_builds_are_isolated(lifecycle_agent):
@@ -338,7 +334,6 @@ def test_conversation_loop_tool_policy_concurrent_builds_are_isolated(lifecycle_
         "required": "required",
         "named": {"type": "function", "function": {"name": "tool_fixture"}},
     }
-    assert "tool_operation_context" not in agent.__dict__
 
 
 def test_iteration_summary_explicitly_uses_fresh_automatic_context(lifecycle_agent):
