@@ -16,6 +16,7 @@ Two properties are load-bearing and must not be relaxed:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import secrets as _secrets
@@ -23,6 +24,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
+from typing import Mapping
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -81,6 +83,22 @@ class KeystoreError(RuntimeError):
     """A keystore operation failed in a way the caller must not ignore."""
 
 
+def _active_profile_identity() -> str:
+    """Return the active profile's stable, canonical storage identity."""
+    from hermes_constants import get_hermes_home
+
+    return str(Path(get_hermes_home()).expanduser().resolve())
+
+
+def _os_account_name(logical_key: str, profile_identity: str | None = None) -> str:
+    """Return an opaque keyring account for one profile-local logical key."""
+    profile_identity = profile_identity or _active_profile_identity()
+    digest = hashlib.sha256(
+        f"{profile_identity}\0{logical_key}".encode("utf-8")
+    ).hexdigest()
+    return f"hermes-profile-{digest}"
+
+
 def _mark_os_unhealthy() -> None:
     """Latch future bounded OS reads off for the life of this process."""
     global _OS_HEALTHY
@@ -96,6 +114,12 @@ class OSKeystore:
     """
 
     name = "os"
+
+    def __init__(self, profile_identity: str | None = None) -> None:
+        self._profile_identity = profile_identity or _active_profile_identity()
+
+    def _account_name(self, logical_key: str) -> str:
+        return _os_account_name(logical_key, self._profile_identity)
 
     def _guard(self) -> None:
         """Refuse if this backend is unavailable or already hung.
@@ -135,7 +159,9 @@ class OSKeystore:
         probe, so the same bound applies here. A timeout raises KeystoreError,
         which get_secret turns into "not configured" rather than a hang.
         """
-        return self._bounded_read(lambda: keyring.get_password(SERVICE_NAME, key))
+        return self._bounded_read(
+            lambda: keyring.get_password(SERVICE_NAME, self._account_name(key))
+        )
 
     def set(self, key: str, value: str) -> None:
         """Write one secret synchronously, with failures propagated.
@@ -150,7 +176,7 @@ class OSKeystore:
         """
         self._guard()
         try:
-            keyring.set_password(SERVICE_NAME, key, value)
+            keyring.set_password(SERVICE_NAME, self._account_name(key), value)
         except Exception as exc:
             raise KeystoreError("keystore write failed") from exc
 
@@ -168,7 +194,7 @@ class OSKeystore:
 
         def _delete():
             try:
-                keyring.delete_password(SERVICE_NAME, key)
+                keyring.delete_password(SERVICE_NAME, self._account_name(key))
             except _PasswordDeleteError:
                 return None  # already absent -- the desired end state
             return None
@@ -177,6 +203,33 @@ class OSKeystore:
             _delete()
         except Exception as exc:
             raise KeystoreError("keystore delete failed") from exc
+
+    def set_many(self, values: Mapping[str, str]) -> None:
+        """Synchronously write a batch, compensating prior writes on failure."""
+        previous = {key: self.get(key) for key in values}
+        completed: list[str] = []
+        try:
+            for key, value in values.items():
+                self.set(key, value)
+                completed.append(key)
+        except KeystoreError as write_error:
+            rollback_errors: list[Exception] = []
+            for key in reversed(completed):
+                try:
+                    if previous[key] is None:
+                        self.delete(key)
+                    else:
+                        self.set(key, previous[key])
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                raise KeystoreError(
+                    "keystore batch write failed and rollback failed; "
+                    "credential outcome is uncertain"
+                ) from write_error
+            raise KeystoreError(
+                "keystore batch write failed; earlier changes rolled back"
+            ) from write_error
 
 
 def _call_bounded(operation, timeout_seconds: float, default):
@@ -219,17 +272,18 @@ def _call_bounded(operation, timeout_seconds: float, default):
     return result
 
 
-def _probe_round_trip() -> bool:
+def _probe_round_trip(profile_identity: str | None = None) -> bool:
     """One set/get/delete cycle. Runs on a worker thread — see below."""
+    account_name = _os_account_name(_PROBE_KEY, profile_identity)
     cleanup_succeeded = True
     try:
-        keyring.set_password(SERVICE_NAME, _PROBE_KEY, _PROBE_VALUE)
-        observed = keyring.get_password(SERVICE_NAME, _PROBE_KEY)
+        keyring.set_password(SERVICE_NAME, account_name, _PROBE_VALUE)
+        observed = keyring.get_password(SERVICE_NAME, account_name)
     except Exception:
         return False
     finally:
         try:
-            keyring.delete_password(SERVICE_NAME, _PROBE_KEY)
+            keyring.delete_password(SERVICE_NAME, account_name)
         except _PasswordDeleteError:
             pass
         except Exception:
@@ -237,7 +291,11 @@ def _probe_round_trip() -> bool:
     return cleanup_succeeded and observed == _PROBE_VALUE
 
 
-def probe_os_keystore(timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> bool:
+def probe_os_keystore(
+    timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+    *,
+    profile_identity: str | None = None,
+) -> bool:
     """Return True only when a full set/get/delete round trip succeeds in time.
 
     Mirrors super-cli's ``NewStore``, which writes a ``probe`` entry before
@@ -266,7 +324,9 @@ def probe_os_keystore(timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> bool:
     if keyring is None:
         return False
     # Timeout -> False -> fall through to the file tier.
-    return _call_bounded(_probe_round_trip, timeout_seconds, False)
+    return _call_bounded(
+        lambda: _probe_round_trip(profile_identity), timeout_seconds, False
+    )
 
 
 class FileKeystore:
@@ -383,10 +443,16 @@ class FileKeystore:
         # The lock covers the complete read-modify-write transaction. Locking
         # only _write_all still loses one writer's update when two Hermes
         # processes read the same previous dictionary.
+        self.set_many({key: value})
+
+    def set_many(self, values: Mapping[str, str]) -> None:
+        """Persist every value in one locked encrypted-file transaction."""
+        if not values:
+            return
         self._initialize_root()
         with _store_lock(self._root):
             data = self._read_all()
-            data[key] = value
+            data.update(values)
             self._write_all(data)
 
     def delete(self, key: str) -> None:
@@ -520,6 +586,7 @@ __all__ += [
     "get_backend",
     "get_secret",
     "set_secret",
+    "set_secrets",
     "delete_secret",
     "reset_backend_cache",
 ]
@@ -527,6 +594,7 @@ __all__ += [
 _BACKEND = None
 _BACKEND_RESOLVED = False
 _BACKEND_MODE = None
+_BACKEND_PROFILE = None
 _BACKEND_LOCK = threading.Lock()
 # _OS_HEALTHY, _OS_CALL_LOCK and the base _mark_os_unhealthy() are introduced
 # in Task 3 because OSKeystore already consumes them there. This task extends
@@ -566,20 +634,19 @@ def _resolve_mode() -> str:
 
 def reset_backend_cache() -> None:
     """Clear the cached backend. For tests and for post-migration re-probe."""
-    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _OS_HEALTHY
+    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _BACKEND_PROFILE, _OS_HEALTHY
     # Match the read-time lock order: OS call lock, then backend lock.
     with _OS_CALL_LOCK:
         with _BACKEND_LOCK:
             _BACKEND = None
             _BACKEND_RESOLVED = False
             _BACKEND_MODE = None
+            _BACKEND_PROFILE = None
             _OS_HEALTHY = True
 
 
-def _secrets_root():
-    from hermes_constants import get_hermes_home
-
-    return Path(get_hermes_home()) / "secrets"
+def _secrets_root(profile_identity: str) -> Path:
+    return Path(profile_identity) / "secrets"
 
 
 def get_backend():
@@ -588,26 +655,36 @@ def get_backend():
     Resolved once per process: the probe can involve IPC to a keychain
     daemon and this is called on every secret resolution.
     """
-    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE
-    if _BACKEND_RESOLVED:
-        return _BACKEND
-    with _BACKEND_LOCK:
-        if _BACKEND_RESOLVED:
-            return _BACKEND
-        mode = _resolve_mode()
-        if mode == "off":
+    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _BACKEND_PROFILE, _OS_HEALTHY
+    profile_identity = _active_profile_identity()
+    # Keep cache rebinding in the same lock order as bounded reads and health
+    # demotion. A profile transition resets the entire selection lifecycle so
+    # a timed-out OS read in one profile cannot poison another profile.
+    with _OS_CALL_LOCK:
+        with _BACKEND_LOCK:
+            if _BACKEND_RESOLVED and _BACKEND_PROFILE == profile_identity:
+                return _BACKEND
             _BACKEND = None
-        elif mode == "file":
-            _BACKEND = FileKeystore(_secrets_root())
-        elif mode == "os":
-            _BACKEND = OSKeystore()
-        else:  # auto
-            _BACKEND = OSKeystore() if probe_os_keystore() else FileKeystore(
-                _secrets_root()
-            )
-        _BACKEND_MODE = mode
-        _BACKEND_RESOLVED = True
-        return _BACKEND
+            _BACKEND_RESOLVED = False
+            _BACKEND_MODE = None
+            _BACKEND_PROFILE = profile_identity
+            _OS_HEALTHY = True
+            mode = _resolve_mode()
+            if mode == "off":
+                _BACKEND = None
+            elif mode == "file":
+                _BACKEND = FileKeystore(_secrets_root(profile_identity))
+            elif mode == "os":
+                _BACKEND = OSKeystore(profile_identity)
+            else:  # auto
+                _BACKEND = (
+                    OSKeystore(profile_identity)
+                    if probe_os_keystore(profile_identity=profile_identity)
+                    else FileKeystore(_secrets_root(profile_identity))
+                )
+            _BACKEND_MODE = mode
+            _BACKEND_RESOLVED = True
+            return _BACKEND
 
 
 def _mark_os_unhealthy() -> None:
@@ -637,7 +714,7 @@ def _mark_os_unhealthy() -> None:
         if _BACKEND_MODE == "os":
             return
         if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
-            _BACKEND = FileKeystore(_secrets_root())
+            _BACKEND = FileKeystore(_secrets_root(_BACKEND_PROFILE))
             _BACKEND_RESOLVED = True
 
 
@@ -671,13 +748,36 @@ def set_secret(key: str, value: str) -> None:
     Deliberately never falls back to plaintext .env — that would silently
     undo the entire point of this module.
     """
-    backend = get_backend()
-    if backend is None:
-        raise KeystoreError(
-            f"secret keystore is disabled (secret_keystore: off in config.yaml); "
-            f"cannot store {key}"
-        )
-    backend.set(key, value)
+    try:
+        backend = get_backend()
+        if backend is None:
+            raise KeystoreError(
+                "secret keystore is disabled (secret_keystore: off in "
+                f"config.yaml); cannot store {key}"
+            )
+        backend.set(key, value)
+    except KeystoreError:
+        raise
+    except Exception as exc:
+        raise KeystoreError("keystore write failed") from exc
+
+
+def set_secrets(values: Mapping[str, str]) -> None:
+    """Atomically persist one service-level mapping where the tier supports it."""
+    if not values:
+        return
+    try:
+        backend = get_backend()
+        if backend is None:
+            raise KeystoreError(
+                "secret keystore is disabled (secret_keystore: off in config.yaml); "
+                "cannot store plugin secrets"
+            )
+        backend.set_many(values)
+    except KeystoreError:
+        raise
+    except Exception as exc:
+        raise KeystoreError("keystore batch write failed") from exc
 
 
 def delete_secret(key: str) -> None:
@@ -688,7 +788,12 @@ def delete_secret(key: str) -> None:
     the caller must be able to tell the operator the credential is still live
     rather than showing them a cleared field.
     """
-    backend = get_backend()
-    if backend is None:
-        return
-    backend.delete(key)
+    try:
+        backend = get_backend()
+        if backend is None:
+            return
+        backend.delete(key)
+    except KeystoreError:
+        raise
+    except Exception as exc:
+        raise KeystoreError("keystore delete failed") from exc

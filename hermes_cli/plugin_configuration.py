@@ -1188,14 +1188,15 @@ class PluginConfigurationService:
 
         if secrets:
             try:
-                for field_id, value in secrets.items():
-                    # Store in the OS keystore (or its encrypted-file
-                    # fallback), never in .env: load_dotenv exports the whole
-                    # .env into os.environ at startup, which would hand a copy
-                    # of every PAT to every child process Hermes spawns.
-                    secret_keystore.set_secret(
-                        _secret_storage_key(canonical_id, field_id), value
-                    )
+                # Store in the OS keystore (or its encrypted-file fallback),
+                # never in .env. Batch persistence avoids a partially saved
+                # multi-field connector when one later secret is refused.
+                secret_keystore.set_secrets(
+                    {
+                        _secret_storage_key(canonical_id, field_id): value
+                        for field_id, value in secrets.items()
+                    }
+                )
             except secret_keystore.KeystoreError as exc:
                 raise PluginConfigurationError(
                     "plugin configuration could not be persisted"

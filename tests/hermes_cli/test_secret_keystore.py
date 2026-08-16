@@ -293,7 +293,10 @@ class TestOSKeystore:
         fake = _FakeKeyring()
         with mock.patch("hermes_cli.secret_keystore.keyring", fake):
             OSKeystore().set("K", "v")
-        assert (SERVICE_NAME, "K") in fake.store
+        assert len(fake.store) == 1
+        service, account_name = next(iter(fake.store))
+        assert service == SERVICE_NAME
+        assert account_name != "K"
 
     def test_backend_failure_raises_keystore_error(self):
         with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring(fail=True)):
@@ -439,7 +442,9 @@ class TestBackendSelection:
         calls = []
         with mock.patch.object(sk, "keyring", _FakeKeyring()):
             with mock.patch.object(
-                sk, "probe_os_keystore", side_effect=lambda: calls.append(1) or True
+                sk,
+                "probe_os_keystore",
+                side_effect=lambda **_kwargs: calls.append(1) or True,
             ):
                 sk.get_backend()
                 sk.get_backend()
@@ -485,6 +490,145 @@ class TestModuleLevelAPI:
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
         with pytest.raises(KeystoreError):
             sk.set_secret("K", "v")
+
+    def test_set_secret_normalizes_an_ordinary_backend_exception(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.set.side_effect = PermissionError("refused")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(KeystoreError, match="write failed"):
+                sk.set_secret("K", "v")
+
+    def test_delete_secret_normalizes_an_ordinary_backend_exception(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.delete.side_effect = OSError("unavailable")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(KeystoreError, match="delete failed"):
+                sk.delete_secret("K")
+
+
+class TestProfileIsolation:
+    def test_os_accounts_are_isolated_by_canonical_profile(self, tmp_path, monkeypatch):
+        fake = _FakeKeyring()
+        first = tmp_path / "profiles" / "one" / ".." / "one"
+        second = tmp_path / "profiles" / "two"
+        with mock.patch.object(sk, "keyring", fake):
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            OSKeystore().set("HERMES_PLUGIN_SHARED_TOKEN", "one")
+
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") is None
+            OSKeystore().set("HERMES_PLUGIN_SHARED_TOKEN", "two")
+
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") == "one"
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            OSKeystore().delete("HERMES_PLUGIN_SHARED_TOKEN")
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") == "one"
+
+        assert len(fake.store) == 1
+        assert all(
+            name != "HERMES_PLUGIN_SHARED_TOKEN" for _service, name in fake.store
+        )
+
+    def test_file_backend_rebinds_when_profile_changes_without_manual_reset(
+        self, tmp_path, monkeypatch
+    ):
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        sk.set_secret("K", "one")
+        first_backend = sk.get_backend()
+        assert sk.get_backend() is first_backend
+
+        monkeypatch.setenv("HERMES_HOME", str(second))
+        assert sk.get_secret("K") is None
+        assert sk.get_backend() is not first_backend
+        sk.set_secret("K", "two")
+
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        assert sk.get_secret("K") == "one"
+
+    def test_os_backend_rebinds_when_profile_changes_without_manual_reset(
+        self, tmp_path, monkeypatch
+    ):
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            sk.set_secret("K", "one")
+            first_backend = sk.get_backend()
+            assert sk.get_backend() is first_backend
+
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            assert sk.get_secret("K") is None
+            assert sk.get_backend() is not first_backend
+            sk.set_secret("K", "two")
+
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert sk.get_secret("K") == "one"
+
+
+class TestBatchWrites:
+    def test_file_batch_persists_all_values(self, tmp_path):
+        store = FileKeystore(tmp_path)
+
+        store.set_many({"first": "one", "second": "two"})
+
+        assert store.get("first") == "one"
+        assert store.get("second") == "two"
+
+    def test_os_batch_failure_rolls_back_earlier_successes(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_second_set(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("write refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_second_set
+            with pytest.raises(KeystoreError, match="rolled back"):
+                store.set_many({"first": "new-first", "second": "new-second"})
+
+            assert store.get("first") == "old-first"
+            assert store.get("second") == "old-second"
+
+    def test_os_batch_rollback_failure_reports_outcome_uncertainty(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_write_and_rollback(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls in {2, 3}:
+                    raise OSError("write refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_write_and_rollback
+            with pytest.raises(KeystoreError, match="rollback failed.*uncertain"):
+                store.set_many({"first": "new-first", "second": "new-second"})
 
 
 class TestBoundedReads:
