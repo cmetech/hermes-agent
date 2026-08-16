@@ -83,9 +83,14 @@ class TestWindowsAcl:
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(
-                config.subprocess, "run", side_effect=OSError("no powershell")
+                config,
+                "_current_windows_sid",
+                return_value="S-1-5-21-1-2-3-1001",
             ):
-                config._secure_file(target)
+                with mock.patch.object(
+                    config.subprocess, "run", side_effect=OSError("no powershell")
+                ):
+                    config._secure_file(target)
 
     def test_acl_failure_warns_once(self, tmp_path, capsys):
         """Silently passing is exactly what produced this gap. A failure the
@@ -95,12 +100,33 @@ class TestWindowsAcl:
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(
-                config.subprocess, "run", side_effect=OSError("no powershell")
+                config,
+                "_current_windows_sid",
+                return_value="S-1-5-21-1-2-3-1001",
             ):
-                config._secure_file(target)
-                config._secure_file(target)
+                with mock.patch.object(
+                    config.subprocess, "run", side_effect=OSError("no powershell")
+                ):
+                    config._secure_file(target)
+                    config._secure_file(target)
         warnings = capsys.readouterr().err
         assert warnings.count("could not restrict") == 1
+
+    def test_nonzero_powershell_exit_warns_without_raising(self, tmp_path, capsys):
+        config._WARNED_ACL_PATHS.clear()
+        target = tmp_path / ".env"
+        target.write_text("SECRET=x", encoding="utf-8")
+        with mock.patch.object(config.sys, "platform", "win32"):
+            with mock.patch.object(
+                config,
+                "_current_windows_sid",
+                return_value="S-1-5-21-1-2-3-1001",
+            ):
+                with mock.patch.object(config.subprocess, "run") as run:
+                    run.return_value = mock.Mock(returncode=1)
+                    config._secure_file(target)
+        assert run.call_args[0][0][0] == "powershell"
+        assert capsys.readouterr().err.count("could not restrict") == 1
 
     def test_managed_mode_still_skips(self, tmp_path):
         target = tmp_path / ".env"

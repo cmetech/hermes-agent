@@ -19,6 +19,21 @@ from hermes_cli.plugins import LoadedPlugin, PluginManager, PluginManifest
 PLUGIN_ID = "sample-connector"
 
 
+@pytest.fixture(autouse=True)
+def _file_keystore(monkeypatch):
+    """Keep every API-module test away from the developer's OS keychain."""
+    from hermes_cli import secret_keystore
+
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    secret_keystore.reset_backend_cache()
+    try:
+        yield
+    finally:
+        # This runs before monkeypatch restores the environment, so no cached
+        # backend can survive with a mode or profile from this test.
+        secret_keystore.reset_backend_cache()
+
+
 def _schema(*, setup_actions: bool = True) -> dict:
     descriptor = {
         "version": 1,
@@ -133,7 +148,7 @@ def _service(
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    from hermes_cli import secret_keystore, web_server
+    from hermes_cli import web_server
 
     home = tmp_path / ".hermes"
     profile = home / "profiles" / "work"
@@ -145,8 +160,6 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
-    secret_keystore.reset_backend_cache()
     monkeypatch.setattr(
         "hermes_cli.web_routers.plugin_configuration.get_plugin_configuration_service",
         lambda: service,
@@ -163,7 +176,6 @@ def api(tmp_path, monkeypatch):
             delattr(web_server.app.state, "auth_required")
         else:
             web_server.app.state.auth_required = previous
-        secret_keystore.reset_backend_cache()
 
 
 def test_catalog_lists_disabled_descriptor_without_importing_plugin_code(
