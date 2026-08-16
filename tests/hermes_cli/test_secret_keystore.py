@@ -1116,6 +1116,32 @@ class TestRevocationFailuresPropagate:
 
 
 class TestConfigSetting:
+    def test_default_mode_missing_read_does_not_bootstrap_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing read must not create the standard Hermes profile tree."""
+        home = tmp_path / "profile"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+
     def test_mode_is_a_settable_config_key(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG
 

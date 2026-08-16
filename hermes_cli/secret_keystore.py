@@ -651,9 +651,9 @@ def _resolve_mode() -> str:
     raw = os.environ.get(_MODE_ENV)
     if raw is None:
         try:
-            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config import get_config_path, load_config_readonly
 
-            config = load_config_readonly()
+            config = load_config_readonly(config_path=get_config_path())
             raw = config.get(_MODE_KEY) if isinstance(config, dict) else None
         except Exception:
             raw = None
