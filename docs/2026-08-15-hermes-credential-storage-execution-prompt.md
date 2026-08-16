@@ -11,7 +11,7 @@
 
 Execute an implementation plan, task by task.
 
-**Repository:** `/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent`
+**Repository:** `hermes-agent` (this repo)
 
 **Plan file:** `docs/plans/2026-08-15-hermes-credential-storage-parity.md`
 
@@ -22,7 +22,7 @@ Execute an implementation plan, task by task.
 Verify the starting point and stop if any check fails:
 
 ```bash
-cd /Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
+# run from the hermes-agent repo root
 git rev-parse --abbrev-ref HEAD          # expect: base
 git status --porcelain --untracked-files=no | wc -l   # expect: 0
 git rev-list --count origin/base..base   # expect: 0
