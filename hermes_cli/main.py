@@ -11530,6 +11530,21 @@ def main() -> int:
     )
     secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command")
 
+    # Lazy import: only the full parser setup pays for the migration module;
+    # importing hermes_cli.main itself does not load the keystore stack.
+    from hermes_cli.secrets_migrate import _handle_secrets_migrate
+
+    migrate_parser = secrets_subparsers.add_parser(
+        "migrate",
+        help="Move plugin secrets from .env into the OS keystore",
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would move without changing anything",
+    )
+    migrate_parser.set_defaults(func=_handle_secrets_migrate)
+
     secrets_bw = secrets_subparsers.add_parser(
         "bitwarden",
         aliases=["bw"],

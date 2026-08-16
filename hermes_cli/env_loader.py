@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
+from hermes_cli.plugin_secret_keys import is_plugin_secret_key
 from utils import atomic_replace, fast_safe_load
 
 
@@ -516,6 +517,7 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    _scrub_plugin_secrets_from_process_env()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -532,6 +534,17 @@ def load_hermes_dotenv(
     _reapply_terminal_config_bridge(home_path)
 
     return loaded
+
+
+def _scrub_plugin_secrets_from_process_env() -> None:
+    """Remove legacy plugin PATs after every startup source has loaded.
+
+    This intentionally does not rewrite ``.env``. ``config.load_env()`` must
+    keep returning the value until the operator runs ``hermes secrets migrate``.
+    """
+    for key in tuple(os.environ):
+        if is_plugin_secret_key(key):
+            del os.environ[key]
 
 
 def _reapply_terminal_config_bridge(home_path: Path) -> None:

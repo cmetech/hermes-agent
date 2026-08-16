@@ -6,6 +6,32 @@ import sys
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
+def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
+    tmp_path, monkeypatch
+):
+    """Startup hides legacy PATs while compatibility reads keep working."""
+    from hermes_cli import config
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    (home / ".env").write_text(
+        f"{key}=legacy-pat\nANTHROPIC_API_KEY=normal-provider-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(key, "stale-parent-value")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config.invalidate_env_cache()
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert key not in os.environ
+    assert os.environ["ANTHROPIC_API_KEY"] == "normal-provider-key"
+    assert config.load_env()[key] == "legacy-pat"
+
+
 
 
 
