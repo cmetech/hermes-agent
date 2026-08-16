@@ -7,6 +7,8 @@ share its atomic write and strict platform-permission boundary.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -81,17 +83,39 @@ def encode_authority_registry(registry: AuthorityRegistry) -> bytes:
 def load_authority_registry(root: Path) -> AuthorityRegistry | None:
     """Read and strictly validate authority metadata without creating paths."""
     path = Path(root) / AUTHORITY_FILE
-    if not path.exists():
-        return None
     try:
+        expected = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AuthorityRegistryError("cannot inspect authority registry") from exc
+    if stat.S_ISLNK(expected.st_mode) or not stat.S_ISREG(expected.st_mode):
+        raise AuthorityRegistryError("authority registry is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(str(path), flags)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise AuthorityRegistryError("authority registry changed while reading")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            payload = handle.read()
         raw = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload,
             object_pairs_hook=_reject_duplicate_keys,
         )
     except AuthorityRegistryError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AuthorityRegistryError("cannot read authority registry") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(raw, dict) or set(raw) != {"version", "authorities"}:
         raise AuthorityRegistryError("invalid authority registry fields")
     entries = _validated_entries(raw["version"], raw["authorities"])

@@ -55,15 +55,17 @@ def test_deepest_enclosing_mount_controls_classification(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("mount_line", "expected_reason_fragment"),
+    ("runtime", "mount_line", "expected_reason_fragment"),
     [
         (
+            "docker",
             _mountinfo_line(
                 "/opt/data", fs_type="ext4", source="/dev/nvme0n1p1"
             ),
             "volume",
         ),
         (
+            "podman",
             _mountinfo_line(
                 "/opt/data",
                 fs_type="xfs",
@@ -76,8 +78,13 @@ def test_deepest_enclosing_mount_controls_classification(tmp_path):
     ],
 )
 def test_distinct_volume_and_bind_mounts_are_persistent(
-    tmp_path, mount_line, expected_reason_fragment
+    tmp_path, monkeypatch, runtime, mount_line, expected_reason_fragment
 ):
+    from hermes_cli import container_storage
+
+    monkeypatch.setattr(
+        container_storage, "_container_runtime_kind", lambda: runtime
+    )
     mountinfo = _write_mountinfo(
         tmp_path / "mountinfo",
         _mountinfo_line("/", fs_type="overlay", source="overlay") + mount_line,
@@ -90,6 +97,81 @@ def test_distinct_volume_and_bind_mounts_are_persistent(
     assert result.state is PersistenceState.PERSISTENT
     assert result.mount_point == Path("/opt/data")
     assert expected_reason_fragment in result.reason
+
+
+def test_kubernetes_disk_backed_emptydir_is_unknown_without_acknowledgement(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    mountinfo = _write_mountinfo(
+        tmp_path / "mountinfo",
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line(
+            "/opt/data",
+            fs_type="ext4",
+            source=(
+                "/var/lib/kubelet/pods/pod-id/volumes/"
+                "kubernetes.io~empty-dir/hermes"
+            ),
+        ),
+    )
+
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+
+    assert result.state is PersistenceState.UNKNOWN
+    assert "Kubernetes" in result.reason
+    assert "security.container_persistence_acknowledged" in result.reason
+
+
+def test_kubernetes_pvc_acknowledgement_is_read_fresh_each_time(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    mountinfo = _write_mountinfo(
+        tmp_path / "mountinfo",
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line(
+            "/opt/data",
+            fs_type="ext4",
+            source="/dev/disk/by-id/scsi-pvc-volume-id",
+        ),
+    )
+
+    config_path.write_text(
+        "security:\n  container_persistence_acknowledged: false\n",
+        encoding="utf-8",
+    )
+    first = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+    config_path.write_text(
+        "security:\n  container_persistence_acknowledged: true\n",
+        encoding="utf-8",
+    )
+    second = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+    config_path.write_text(
+        "security:\n  container_persistence_acknowledged: false\n",
+        encoding="utf-8",
+    )
+    third = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+
+    assert first.state is PersistenceState.UNKNOWN
+    assert second.state is PersistenceState.PERSISTENT
+    assert "operator acknowledgement" in second.reason
+    assert third.state is PersistenceState.UNKNOWN
 
 
 def test_mountinfo_escapes_are_decoded_for_nonexistent_children(tmp_path):

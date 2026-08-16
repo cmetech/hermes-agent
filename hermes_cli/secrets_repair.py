@@ -293,7 +293,10 @@ def _container_storage_finding(root: Path) -> SecretFinding | None:
         "error",
         None,
         f"encrypted file storage at {root} is {evidence.state.value}: "
-        f"{evidence.reason}",
+        f"{evidence.reason}. Mount HERMES_HOME on durable storage; in "
+        f"Kubernetes or another ambiguous runtime, verify the storage class "
+        f"and retention policy, then set "
+        f"security.container_persistence_acknowledged: true in config.yaml",
     )
 
 
@@ -647,6 +650,24 @@ def _build_plan(
             actions.append(
                 RepairAction("REBUILD_AUTHORITY", None, "corrupt", preferred)
             )
+            nonselected = "file" if preferred == "os" else "os"
+            for key in snapshot.keys:
+                file_value = (
+                    None
+                    if snapshot.file_values is None
+                    else snapshot.file_values.get(key)
+                )
+                os_value = snapshot.os_values.get(key)
+                if (
+                    file_value is not None
+                    and os_value is not None
+                    and file_value == os_value
+                ):
+                    actions.append(
+                        RepairAction(
+                            "DELETE_STALE_COPY", key, nonselected, None
+                        )
+                    )
 
     if not snapshot.registry_corrupt and not snapshot.file_corrupt:
         for key in snapshot.keys:

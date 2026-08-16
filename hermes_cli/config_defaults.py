@@ -2136,6 +2136,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Kubernetes and runtimes without Docker/Podman volume evidence cannot
+        # prove durability from mountinfo alone. Operators may explicitly
+        # acknowledge durable backing after verifying their deployment.
+        "container_persistence_acknowledged": False,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

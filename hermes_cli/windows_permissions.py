@@ -62,6 +62,7 @@ _DIRECTORY_INHERITANCE = (
     "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit;"
 )
 _APPLY_SUFFIX = (
+    "$acl.SetOwner($id);"
     "$propagation=[System.Security.AccessControl.PropagationFlags]::None;"
     "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
     "$id,$rights,$inheritance,$propagation,"
@@ -70,10 +71,14 @@ _APPLY_SUFFIX = (
     "Set-Acl -LiteralPath $p -AclObject $acl;"
 )
 _INSPECT_SUFFIX = (
+    "$owner=$acl.GetOwner("
+    "[System.Security.Principal.SecurityIdentifier]);"
     "$access=@($acl.Access);"
-    "$secure=$acl.AreAccessRulesProtected -and $access.Count -eq 1;"
+    "$secure=$owner.Value -eq $id.Value -and "
+    "$acl.AreAccessRulesProtected -and $access.Count -eq 1;"
     "$detail=$null;"
-    "if(-not $acl.AreAccessRulesProtected){$detail='ACL inheritance is enabled'}"
+    "if($owner.Value -ne $id.Value){$detail='ACL owner does not match the current user'}"
+    "elseif(-not $acl.AreAccessRulesProtected){$detail='ACL inheritance is enabled'}"
     "elseif($access.Count -ne 1){$detail='expected exactly one explicit ACE'}"
     "else{"
     "$r=$access[0];"
@@ -88,7 +93,8 @@ _INSPECT_SUFFIX = (
     "[System.Security.AccessControl.PropagationFlags]::None;"
     "if(-not $secure){$detail='the explicit ACE does not match the current-user rule'}"
     "};"
-    "[pscustomobject]@{secure=$secure;detail=$detail}|ConvertTo-Json -Compress;"
+    "[pscustomobject]@{secure=$secure;detail=$detail;owner_sid=$owner.Value}"
+    "|ConvertTo-Json -Compress;"
 )
 
 _APPLY_FILE_SCRIPT = (
@@ -167,8 +173,13 @@ def _validated_sid() -> str:
     return sid
 
 
-def _run_powershell(script: str, path: Path) -> subprocess.CompletedProcess[str]:
-    sid = _validated_sid()
+def _run_powershell(
+    script: str,
+    path: Path,
+    *,
+    sid: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    sid = sid or _validated_sid()
     child_env = _filtered_environment()
     child_env["HERMES_ACL_PATH"] = str(Path(path))
     child_env["HERMES_ACL_SID"] = sid
@@ -208,7 +219,8 @@ def restrict_directory_to_current_user(path: Path) -> None:
 
 
 def _inspect(path: Path, script: str) -> WindowsAclInspection:
-    completed = _run_powershell(script, Path(path))
+    sid = _validated_sid()
+    completed = _run_powershell(script, Path(path), sid=sid)
 
     def reject_duplicate_fields(pairs):
         result = {}
@@ -227,13 +239,25 @@ def _inspect(path: Path, script: str) -> WindowsAclInspection:
         raise WindowsAclError("PowerShell ACL inspection returned invalid data") from exc
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"secure", "detail"}
+        or set(payload) != {"secure", "detail", "owner_sid"}
         or type(payload.get("secure")) is not bool
     ):
         raise WindowsAclError("PowerShell ACL inspection returned invalid data")
     detail = payload.get("detail")
     if detail is not None and not isinstance(detail, str):
         raise WindowsAclError("PowerShell ACL inspection returned invalid data")
+    owner_sid = payload.get("owner_sid")
+    if (
+        not isinstance(owner_sid, str)
+        or len(owner_sid) > 184
+        or _SID_RE.fullmatch(owner_sid) is None
+    ):
+        raise WindowsAclError("PowerShell ACL inspection returned invalid data")
+    if owner_sid != sid:
+        return WindowsAclInspection(
+            secure=False,
+            detail="ACL owner does not match the current user",
+        )
     return WindowsAclInspection(secure=payload["secure"], detail=detail)
 
 

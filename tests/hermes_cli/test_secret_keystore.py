@@ -1682,6 +1682,84 @@ class TestDurableAuthority:
 
         assert fake.store == {}
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+    def test_registered_os_read_does_not_repair_stale_file_permissions(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "os-value")
+            key_path = root / "keystore.key"
+            data_path = root / "keystore.enc"
+            key_path.write_bytes(b"stale-key")
+            data_path.write_bytes(b"stale-data")
+            os.chmod(key_path, 0o644)
+            os.chmod(data_path, 0o644)
+
+            assert sk.resolve_secret(self.KEY) == "os-value"
+
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o644
+        assert stat.S_IMODE(data_path.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_registered_os_read_ignores_non_authoritative_file_symlink(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "os-value")
+            stale_target = tmp_path / "stale-file-tier"
+            stale_target.write_bytes(b"not-a-keystore")
+            (root / "keystore.enc").symlink_to(stale_target)
+
+            assert sk.resolve_secret(self.KEY) == "os-value"
+
+        assert (root / "keystore.enc").is_symlink()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+    def test_registered_file_read_does_not_repair_permission_drift(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+        key_path = root / "keystore.key"
+        data_path = root / "keystore.enc"
+        os.chmod(key_path, 0o644)
+        os.chmod(data_path, 0o644)
+
+        assert sk.resolve_secret(self.KEY) == "file-value"
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o644
+        assert stat.S_IMODE(data_path.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_legacy_value_ignores_hostile_stale_file_artifacts(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        root.mkdir(parents=True)
+        stale_target = tmp_path / "stale-file-tier"
+        stale_target.write_bytes(b"not-a-keystore")
+        (root / "keystore.enc").symlink_to(stale_target)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert (
+            sk.resolve_secret(self.KEY, legacy_value="legacy-value")
+            == "legacy-value"
+        )
+        assert (root / "keystore.enc").is_symlink()
+
     def test_registered_authority_ignores_mode_for_reads_but_not_mutations(
         self, tmp_path, monkeypatch
     ):
@@ -1791,6 +1869,41 @@ class TestDurableAuthority:
         with pytest.raises(KeystoreError, match="lock"):
             sk.get_authority(self.KEY)
         assert not lock_path.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    @pytest.mark.parametrize("artifact", ["authority.json", "keystore.key", "keystore.enc"])
+    @pytest.mark.parametrize("target_exists", [True, False], ids=["live", "dangling"])
+    def test_ordinary_write_refuses_linked_live_artifacts(
+        self, tmp_path, monkeypatch, artifact, target_exists
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        root.mkdir(parents=True)
+        (root / "keystore.lock").write_bytes(b"")
+        target = tmp_path / f"outside-{artifact}"
+        if target_exists:
+            if artifact == "authority.json":
+                target.write_bytes(
+                    b'{"version":1,"authorities":{"OLD":"cleared"}}\n'
+                )
+            elif artifact == "keystore.key":
+                target.write_bytes(b"x" * 32)
+            else:
+                target.write_bytes(b"outside-ciphertext")
+        link = root / artifact
+        link.symlink_to(target)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            with pytest.raises(KeystoreError, match="artifact|authority|regular"):
+                sk.set_secret(self.KEY, "new-value")
+
+        assert link.is_symlink()
+        if target_exists and artifact == "authority.json":
+            assert target.read_bytes() == (
+                b'{"version":1,"authorities":{"OLD":"cleared"}}\n'
+            )
 
     def test_equal_pre_registry_copies_resolve_by_configured_preference_read_only(
         self, tmp_path, monkeypatch

@@ -57,6 +57,24 @@ def test_file_acl_uses_constant_script_and_filtered_environment(tmp_path, monkey
     assert PLUGIN_KEY not in child_env
 
 
+def test_acl_apply_sets_validated_current_user_as_owner(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    run = mock.Mock(return_value=_completed())
+    monkeypatch.setattr(permissions.subprocess, "run", run)
+
+    permissions.restrict_file_to_current_user(target)
+
+    argv = run.call_args.args[0]
+    script = argv[argv.index("-Command") + 1]
+    assert "$acl.SetOwner($id)" in script
+    assert SID not in script
+    assert run.call_args.kwargs["env"]["HERMES_ACL_SID"] == SID
+
+
 def test_directory_acl_grants_inheritance_and_required_child_rights(
     tmp_path, monkeypatch
 ):
@@ -151,7 +169,9 @@ def test_acl_inspection_is_read_only_and_returns_structured_result(
     monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
     run = mock.Mock(
         return_value=_completed(
-            stdout=json.dumps({"secure": False, "detail": "unexpected ACE"})
+            stdout=json.dumps(
+                {"secure": False, "detail": "unexpected ACE", "owner_sid": SID}
+            )
         )
     )
     monkeypatch.setattr(permissions.subprocess, "run", run)
@@ -164,9 +184,79 @@ def test_acl_inspection_is_read_only_and_returns_structured_result(
     script = run.call_args.args[0][run.call_args.args[0].index("-Command") + 1]
     assert "Set-Acl" not in script
     assert "Get-Acl" in script
+    assert "GetOwner" in script
     assert str(target) not in script
     assert SID not in script
     assert run.call_args.kwargs["env"]["HERMES_ACL_PATH"] == str(target)
+
+
+def test_acl_inspection_requires_exact_owner_sid(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    monkeypatch.setattr(
+        permissions.subprocess,
+        "run",
+        mock.Mock(
+            return_value=_completed(
+                stdout=json.dumps(
+                    {
+                        "secure": True,
+                        "detail": None,
+                        "owner_sid": "S-1-5-21-1-2-3-2002",
+                    }
+                )
+            )
+        ),
+    )
+
+    assert permissions.inspect_file_acl(target) == permissions.WindowsAclInspection(
+        secure=False,
+        detail="ACL owner does not match the current user",
+    )
+
+
+@pytest.mark.parametrize("owner_sid", [None, 7, "", "not-a-sid"])
+def test_acl_inspection_rejects_malformed_owner(
+    tmp_path, monkeypatch, owner_sid
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    monkeypatch.setattr(
+        permissions.subprocess,
+        "run",
+        mock.Mock(
+            return_value=_completed(
+                stdout=json.dumps(
+                    {"secure": True, "detail": None, "owner_sid": owner_sid}
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(permissions.WindowsAclError, match="inspection"):
+        permissions.inspect_file_acl(target)
+
+
+def test_acl_owner_inspection_error_fails_closed(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    monkeypatch.setattr(
+        permissions.subprocess,
+        "run",
+        mock.Mock(return_value=_completed(returncode=1, stderr="owner denied")),
+    )
+
+    with pytest.raises(permissions.WindowsAclError, match="owner denied"):
+        permissions.inspect_file_acl(target)
 
 
 def test_invalid_inspection_output_raises_typed_error(tmp_path, monkeypatch):
@@ -267,9 +357,9 @@ def test_whoami_sid_accepts_canonical_escaped_quote_in_account(
 @pytest.mark.parametrize(
     "stdout",
     [
-        '{"secure":true,"detail":null,"unexpected":false}',
-        '{"secure":true,"secure":false,"detail":null}',
-        '{"detail":null,"detail":"changed","secure":true}',
+        f'{{"secure":true,"detail":null,"owner_sid":"{SID}","unexpected":false}}',
+        f'{{"secure":true,"secure":false,"detail":null,"owner_sid":"{SID}"}}',
+        f'{{"detail":null,"detail":"changed","secure":true,"owner_sid":"{SID}"}}',
     ],
     ids=["extra-field", "duplicate-secure", "duplicate-detail"],
 )
@@ -315,6 +405,7 @@ def test_file_inspection_rejects_full_control_as_broader_than_required_rights(
                 {
                     "secure": rights_match,
                     "detail": None if rights_match else "unexpected rights",
+                    "owner_sid": SID,
                 }
             )
         )

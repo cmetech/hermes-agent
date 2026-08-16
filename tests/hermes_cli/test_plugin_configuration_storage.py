@@ -1053,6 +1053,48 @@ class TestKeystoreReadPath:
 
         assert resolved["token"] == live_value
 
+    @pytest.mark.parametrize("authority", ["file", "os", "cleared"])
+    @pytest.mark.parametrize("override", ["external", "scope", "managed"])
+    def test_explicit_empty_live_authority_never_falls_through(
+        self, tmp_path, monkeypatch, authority, override
+    ):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_cli.plugin_configuration import PluginConfigurationService
+
+        _home, service, manager, key = _registered_service_secret(
+            tmp_path, monkeypatch, authority
+        )
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.get_secret_source_values",
+            lambda selected_home: {key: ""} if override == "external" else {},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.load_managed_env",
+            lambda: {key: ""} if override == "managed" else {},
+        )
+        scope_token = set_secret_scope({key: ""} if override == "scope" else {})
+
+        try:
+            with (
+                mock.patch.object(
+                    PluginConfigurationService,
+                    "_profile_secret_values",
+                    side_effect=AssertionError("plaintext fallback consulted"),
+                ),
+                mock.patch.object(
+                    sk,
+                    "resolve_secret",
+                    side_effect=AssertionError("durable fallback consulted"),
+                ),
+            ):
+                resolved, _invalid = service._resolved(
+                    "sample-connector", manager._plugins["sample-connector"]
+                )
+        finally:
+            reset_secret_scope(scope_token)
+
+        assert "token" not in resolved
+
     @pytest.mark.parametrize(
         ("authority", "expected"),
         [

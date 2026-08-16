@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import yaml
+
+from hermes_constants import get_hermes_home
+
 
 class PersistenceState(Enum):
     PERSISTENT = "persistent"
@@ -64,6 +68,7 @@ _CONTAINER_CGROUP_ROOT_MARKERS = (
     "/crio",
     "/cri-o/",
 )
+_PERSISTENCE_ACK_CONFIG_KEY = "security.container_persistence_acknowledged"
 
 
 def _decode_mount_field(value: str) -> str:
@@ -122,6 +127,53 @@ def _parse_mountinfo_line(line: str) -> _MountInfo:
 
 def _unknown(reason: str) -> MountPersistence:
     return MountPersistence(PersistenceState.UNKNOWN, None, None, None, reason)
+
+
+def _container_runtime_kind() -> str:
+    """Classify only the runtime evidence relevant to mount durability."""
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return "kubernetes"
+    if Path("/.dockerenv").exists():
+        return "docker"
+    if Path("/run/.containerenv").exists():
+        return "podman"
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        ).lower()
+    except OSError:
+        cgroup = ""
+    if "kubepods" in cgroup:
+        return "kubernetes"
+    if "docker" in cgroup:
+        return "docker"
+    if "podman" in cgroup or "libpod" in cgroup:
+        return "podman"
+    if os.environ.get("HERMES_CONTAINER") or any(
+        marker in cgroup
+        for marker in ("containerd", "crio", "cri-o", "/lxc/")
+    ):
+        return "ambiguous"
+    return "host"
+
+
+def _operator_acknowledges_container_persistence() -> bool:
+    """Read the active profile acknowledgement directly, without caching."""
+    try:
+        raw = yaml.safe_load(
+            (get_hermes_home() / "config.yaml").read_text(
+                encoding="utf-8", errors="strict"
+            )
+        )
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    security = raw.get("security")
+    return (
+        isinstance(security, dict)
+        and security.get("container_persistence_acknowledged") is True
+    )
 
 
 def inspect_mount_persistence(
@@ -183,6 +235,30 @@ def inspect_mount_persistence(
             f"distinct {mount.fs_type} mount is ephemeral",
         )
     kind = "bind" if mount.root != "/" else "volume"
+    runtime_kind = _container_runtime_kind()
+    if runtime_kind in {"kubernetes", "ambiguous"}:
+        if _operator_acknowledges_container_persistence():
+            return MountPersistence(
+                PersistenceState.PERSISTENT,
+                mount.mount_point,
+                mount.fs_type,
+                mount.source,
+                f"distinct {kind} mount accepted by explicit operator "
+                f"acknowledgement in config.yaml "
+                f"({_PERSISTENCE_ACK_CONFIG_KEY}: true)",
+            )
+        runtime_label = (
+            "Kubernetes" if runtime_kind == "kubernetes" else "ambiguous container"
+        )
+        return MountPersistence(
+            PersistenceState.UNKNOWN,
+            mount.mount_point,
+            mount.fs_type,
+            mount.source,
+            f"{runtime_label} mountinfo cannot distinguish durable storage "
+            f"from runtime-scoped storage; after verifying durable backing, "
+            f"set {_PERSISTENCE_ACK_CONFIG_KEY}: true in config.yaml",
+        )
     return MountPersistence(
         PersistenceState.PERSISTENT,
         mount.mount_point,

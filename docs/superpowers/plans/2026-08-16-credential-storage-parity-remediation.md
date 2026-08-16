@@ -269,12 +269,20 @@ with compensation and an “outcome uncertain” error if rollback fails. Batch
 writes snapshot all affected values and authority states before changing any
 key and restore both on failure.
 
-Route plugin secret resolution through
-`resolve_secret(storage_key, legacy_value=aggregate.get(storage_key))`.
-Registered `os`/`file` authority ignores a legacy value, `cleared` returns
-absent without consulting it, and only an unregistered key preserves legacy
-compatibility. Replace existing “legacy always wins” tests with separate
-unregistered-compatibility and registered/tombstone-authority contracts.
+Use a presence-aware live lookup before calling
+`resolve_secret(storage_key, legacy_value=plaintext.get(storage_key))`.
+Treat live and durable authority as separate precedence layers: managed env >
+installed secret scope > external secret source > durable `os`/`file`/`cleared`
+authority > legacy plaintext compatibility. Mapping presence, not truthiness,
+establishes live authority. Therefore an explicitly present empty string from
+managed env, secret scope, or an external source suppresses every lower layer;
+it never consults durable storage or legacy plaintext. An empty legacy
+plaintext value is not authority and remains equivalent to absent compatibility
+data. Registered `os`/`file` authority ignores a legacy value, `cleared`
+returns absent without consulting it, and only an unregistered key preserves
+legacy compatibility. Replace existing “legacy always wins” tests with
+separate live-override, unregistered-compatibility, and
+registered/tombstone-authority contracts.
 
 - [ ] **Step 6: Make service clear retryable and normalize every ordinary failure**
 
@@ -654,8 +662,17 @@ class MountPersistence:
 ```
 
 Parse `/proc/self/mountinfo` without importing test-runner code. Select the
-deepest enclosing mount. A distinct non-ephemeral mount is persistent evidence;
-container root alone is insufficient. Missing evidence fails closed.
+deepest enclosing mount. A distinct non-ephemeral bind mount or named volume is
+persistent evidence for Docker and Podman; container root alone is
+insufficient. Kubernetes and otherwise ambiguous runtimes cannot distinguish a
+disk-backed `emptyDir`, PVC-like mount, or genuinely durable generic mount from
+mountinfo alone, so all such distinct non-memory mounts are `UNKNOWN` unless
+the operator has verified the storage class and retention policy and explicitly
+set `security.container_persistence_acknowledged: true` in the active profile's
+`config.yaml`. Read that narrow setting directly and afresh without importing
+the full config loader, adding a `HERMES_*` variable, or caching evidence. The
+acknowledgement cannot override known `overlay`, `tmpfs`, `ramfs`, or `aufs`
+evidence. Missing evidence fails closed.
 `hermes_constants.is_container()` becomes a compatibility delegate and config
 retains its `HERMES_SKIP_CHMOD` permission-policy override.
 
@@ -665,6 +682,8 @@ the doctor/repair command. Do not cache mount evidence.
 
 Wire the same inspection into doctor and unrecoverable reset. Reset cannot
 initialize a clean file store on `UNKNOWN` or `EPHEMERAL` evidence.
+Doctor tells Kubernetes/ambiguous-runtime operators to verify durable backing
+before setting the acknowledgement in `config.yaml`.
 
 - [ ] **Step 5: Run container and keystore suites GREEN**
 

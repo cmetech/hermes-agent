@@ -238,13 +238,23 @@ and file-keystore replacement paths all invoke this shared boundary.
 
 Container and mount detection move into a small shared module with no config or
 keystore dependency cycle. A missing file-keystore master key may be created in
-a container only when the effective secrets path is on a proven persistent
-bind mount, Docker volume, or equivalent non-overlay mount.
+a container only when the effective secrets path is on proven persistent
+storage. A distinct bind mount or named volume is affirmative evidence in
+Docker and Podman. In Kubernetes and runtimes that cannot distinguish durable
+storage from runtime-scoped storage, a generic distinct non-memory filesystem
+is `UNKNOWN`: disk-backed `emptyDir` and PVC-like mountinfo are not durable
+proof. Operators may promote that evidence only by verifying the deployment's
+storage class and retention policy and explicitly setting
+`security.container_persistence_acknowledged: true` in the active profile's
+`config.yaml`. The acknowledgement is read afresh for each inspection and is
+never exposed as a `HERMES_*` environment variable.
 
 Overlay, tmpfs, aufs, and unresolved ephemeral roots continue to fail closed.
 If mount information cannot establish persistence, the error points to a
-persistent mount or the explicit recovery/init workflow. A fresh documented
-`/opt/data` volume must initialize successfully and survive restart.
+persistent mount, the operator acknowledgement where applicable, or the
+explicit recovery/init workflow. An acknowledgement never overrides a known
+memory or union filesystem. A fresh documented Docker/Podman `/opt/data`
+volume must initialize successfully and survive restart.
 
 ## Strict Dry-run and Stable Errors
 

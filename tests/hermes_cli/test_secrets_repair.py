@@ -174,6 +174,12 @@ def test_container_storage_evidence_is_fresh_and_doctor_is_read_only(
     assert "CONTAINER_STORAGE_UNPROVEN" in {
         finding.code for finding in first.findings
     }
+    finding = next(
+        item
+        for item in first.findings
+        if item.code == "CONTAINER_STORAGE_UNPROVEN"
+    )
+    assert "security.container_persistence_acknowledged" in finding.message
     assert "CONTAINER_STORAGE_UNPROVEN" not in {
         finding.code for finding in second.findings
     }
@@ -519,6 +525,37 @@ def test_repair_quarantines_and_reconstructs_corrupt_authority(
     assert stat.S_IMODE(
         (report.quarantine_paths[0] / "manifest.json").stat().st_mode
     ) == 0o600
+
+
+def test_corrupt_authority_equal_duplicates_converge_in_one_apply(
+    profile, fake_keyring
+):
+    write_file_secret(profile)
+    fake_keyring.put(KEY, SECRET, profile)
+    (profile / "secrets" / "authority.json").write_text(
+        "{broken-authority", encoding="utf-8"
+    )
+    os.chmod(profile / "secrets" / "authority.json", 0o600)
+
+    plan = plan_secret_repair()
+
+    assert [action.code for action in plan.actions] == [
+        "DELETE_STALE_COPY",
+        "REBUILD_AUTHORITY",
+    ]
+    stale = next(
+        action for action in plan.actions if action.code == "DELETE_STALE_COPY"
+    )
+    assert (stale.key, stale.source) == (KEY, "file")
+
+    report = apply_secret_repair(plan)
+    after = diagnose_secrets()
+
+    assert report.failed == ()
+    assert sk.get_authority(KEY) == "os"
+    assert fake_keyring.value(KEY, profile) == SECRET
+    assert sk._read_file_store_readonly(profile / "secrets").get(KEY) is None
+    assert after.findings == ()
 
 
 def test_repair_rolls_back_interrupted_move_by_deleting_stale_copy(

@@ -1039,8 +1039,8 @@ class PluginConfigurationService:
 
     def _resolved(self, plugin_id: str, loaded) -> tuple[dict[str, Any], set[str]]:
         stored = self._settings(plugin_id)
-        legacy_secret_values = self._profile_secret_values()
         live_secret_overrides = self._live_secret_overrides()
+        legacy_secret_values: dict[str, str] | None = None
         resolved: dict[str, Any] = {}
         invalid: set[str] = set()
         for field in loaded.manifest.configuration.fields:
@@ -1048,20 +1048,17 @@ class PluginConfigurationService:
             value = None
             if field.storage is FieldStorage.SECRET:
                 storage_key = _secret_storage_key(plugin_id, field.id)
-                value = live_secret_overrides.get(storage_key)
-                if value in {None, ""}:
-                    # An explicit empty live authority still suppresses the
-                    # lower-precedence plaintext profile value, matching the
-                    # previous merged-ladder behavior before consulting the
-                    # durable authority.
-                    legacy_value = (
-                        None
-                        if storage_key in live_secret_overrides
-                        else legacy_secret_values.get(storage_key)
-                    )
+                if storage_key in live_secret_overrides:
+                    # Mapping presence is authoritative even when its value is
+                    # empty. An explicit live clear must not revive durable or
+                    # legacy plaintext state from a lower precedence tier.
+                    value = live_secret_overrides[storage_key]
+                else:
+                    if legacy_secret_values is None:
+                        legacy_secret_values = self._profile_secret_values()
                     value = secret_keystore.resolve_secret(
                         storage_key,
-                        legacy_value=legacy_value,
+                        legacy_value=legacy_secret_values.get(storage_key),
                     )
                 if value not in {None, ""}:
                     present = True

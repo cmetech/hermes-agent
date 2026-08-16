@@ -33,6 +33,7 @@ from hermes_cli.secret_authority import (
     AUTHORITY_FILE,
     AUTHORITY_VERSION,
     AuthorityRegistry,
+    AuthorityRegistryError,
     SecretAuthority,
     encode_authority_registry,
     load_authority_registry,
@@ -393,14 +394,26 @@ class FileKeystore:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
-        if self._root.exists():
+        try:
+            root_info = self._root.lstat()
+        except FileNotFoundError:
+            root_info = None
+        except OSError as exc:
+            raise KeystoreError(
+                f"cannot inspect secret-store root {self._root}"
+            ) from exc
+        if root_info is not None:
+            if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+                raise KeystoreError(
+                    f"secret-store root is not a direct directory: {self._root}"
+                )
             self._secure_existing_store()
 
     def _secure_existing_store(self) -> None:
         _ensure_private_permissions(self._root, 0o700)
         for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE, AUTHORITY_FILE):
             path = self._root / filename
-            if path.exists():
+            if _lstat_regular_artifact(path) is not None:
                 _ensure_private_permissions(path, 0o600)
 
     def _initialize_root(self) -> None:
@@ -412,7 +425,10 @@ class FileKeystore:
 
     def _require_persistent_storage_for_new_key(self) -> None:
         """Fail before initialization unless a container mount is proven durable."""
-        if (self._root / _KEY_FILE).exists() or not _in_container():
+        if (
+            _lstat_regular_artifact(self._root / _KEY_FILE) is not None
+            or not _in_container()
+        ):
             return
         evidence = container_storage.inspect_mount_persistence(self._root)
         if evidence.state is container_storage.PersistenceState.PERSISTENT:
@@ -429,9 +445,10 @@ class FileKeystore:
 
     def _load_or_create_key(self) -> bytes:
         path = self._root / _KEY_FILE
-        if path.exists():
+        key_info = _lstat_regular_artifact(path)
+        if key_info is not None:
             _ensure_private_permissions(path, 0o600)
-            raw = path.read_bytes()
+            raw = _read_regular_file_nofollow(path, expected=key_info)
             if len(raw) != _KEY_BYTES:
                 raise KeystoreError(
                     f"corrupt key file {path}: expected {_KEY_BYTES} bytes, "
@@ -452,12 +469,13 @@ class FileKeystore:
 
     def _read_all(self) -> dict[str, str]:
         path = self._root / _DATA_FILE
-        if not path.exists():
+        data_info = _lstat_regular_artifact(path)
+        if data_info is None:
             return {}
         _ensure_private_permissions(path, 0o600)
-        if not (self._root / _KEY_FILE).exists():
+        if _lstat_regular_artifact(self._root / _KEY_FILE) is None:
             raise KeystoreError("cannot decrypt secrets: missing encryption key")
-        blob = path.read_bytes()
+        blob = _read_regular_file_nofollow(path, expected=data_info)
         if len(blob) <= _NONCE_BYTES:
             raise KeystoreError("corrupt secret file")
         key = self._load_or_create_key()
@@ -489,7 +507,7 @@ class FileKeystore:
 
     def _get_unlocked(self, key: str) -> str | None:
         """Read one value while the caller owns the profile transaction lock."""
-        if not (self._root / _DATA_FILE).exists():
+        if _lstat_regular_artifact(self._root / _DATA_FILE) is None:
             return None
         return self._read_all().get(key)
 
@@ -508,14 +526,14 @@ class FileKeystore:
 
     def _delete_unlocked(self, key: str) -> None:
         """Delete one value while the caller owns the profile transaction lock."""
-        if not (self._root / _DATA_FILE).exists():
+        if _lstat_regular_artifact(self._root / _DATA_FILE) is None:
             return
         data = self._read_all()
         if data.pop(key, None) is not None:
             self._write_all(data)
 
     def get(self, key: str) -> str | None:
-        if not (self._root / _DATA_FILE).exists():
+        if _lstat_regular_artifact(self._root / _DATA_FILE) is None:
             return None
         with _store_lock(self._root, create=False):
             return self._get_unlocked(key)
@@ -536,13 +554,13 @@ class FileKeystore:
             self._set_many_unlocked(values)
 
     def delete(self, key: str) -> None:
-        if not (self._root / _DATA_FILE).exists():
+        if _lstat_regular_artifact(self._root / _DATA_FILE) is None:
             return
         with _store_lock(self._root, create=False):
             self._delete_unlocked(key)
 
     def keys(self) -> list[str]:
-        if not (self._root / _DATA_FILE).exists():
+        if _lstat_regular_artifact(self._root / _DATA_FILE) is None:
             return []
         with _store_lock(self._root, create=False):
             return list(self._read_all())
@@ -720,21 +738,21 @@ def _write_private(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            existing = None
+        except OSError as exc:
+            raise KeystoreError(
+                f"cannot inspect private replacement path {path}"
+            ) from exc
+        if existing is not None and (
+            stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+        ):
+            raise KeystoreError(
+                f"private replacement target is not a regular file: {path}"
+            )
         if _is_windows():
-            try:
-                existing = path.lstat()
-            except FileNotFoundError:
-                existing = None
-            except OSError as exc:
-                raise KeystoreError(
-                    f"cannot inspect private replacement path {path}"
-                ) from exc
-            if existing is not None and (
-                stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
-            ):
-                raise KeystoreError(
-                    f"private replacement target is not a regular file: {path}"
-                )
             replaced_path = Path(atomic_replace(tmp_name, path))
         else:
             os.replace(tmp_name, path)
@@ -835,6 +853,17 @@ def _lstat_regular_artifact(path: Path) -> os.stat_result | None:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise KeystoreError(f"secret-store artifact is not a regular file: {path}")
     return info
+
+
+def _artifact_present_nofollow(path: Path) -> bool:
+    """Return whether a directory entry exists, including a dangling link."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect secret-store artifact {path}") from exc
+    return True
 
 
 def _read_regular_file_nofollow(
@@ -1127,12 +1156,22 @@ def _assert_mutation_mode(mode: str, authority: SecretAuthority) -> None:
 
 def _registry_bytes(root: Path) -> bytes | None:
     path = root / AUTHORITY_FILE
-    return path.read_bytes() if path.exists() else None
+    info = _lstat_regular_artifact(path)
+    return (
+        _read_regular_file_nofollow(path, expected=info)
+        if info is not None
+        else None
+    )
 
 
 def _restore_registry_bytes(root: Path, previous: bytes | None) -> None:
     path = root / AUTHORITY_FILE
-    current = path.read_bytes() if path.exists() else None
+    info = _lstat_regular_artifact(path)
+    current = (
+        _read_regular_file_nofollow(path, expected=info)
+        if info is not None
+        else None
+    )
     if current == previous:
         return
     if previous is None:
@@ -1261,79 +1300,73 @@ def get_authority(key: str) -> SecretAuthority | None:
     """Return durable authority without creating the profile store or lock."""
     root = _secrets_root(_active_profile_identity())
     path = root / AUTHORITY_FILE
-    if not path.exists():
+    if not _artifact_present_nofollow(path):
         return None
-    with _store_lock(root, create=False):
+    with _store_lock(root, create=False, secure=False):
         registry = load_authority_registry(root)
         return registry.entries.get(key) if registry is not None else None
 
 
 def resolve_secret(key: str, *, legacy_value: str | None = None) -> str | None:
     """Resolve one secret through its durable authority, never creating state."""
-    if _resolve_mode() == "off":
-        return None
-    profile_identity = _active_profile_identity()
-    root = _secrets_root(profile_identity)
-    file_store = FileKeystore(root)
-    os_store = OSKeystore(profile_identity)
-
-    def _resolve_current(*, file_state_locked: bool) -> str | None:
-        registry = load_authority_registry(root)
-        authority = registry.entries.get(key) if registry is not None else None
-        if authority is SecretAuthority.CLEARED:
+    try:
+        mode = _resolve_mode()
+        if mode == "off":
             return None
-        if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
-            return _read_tier(
-                authority,
-                key,
-                file_store=file_store,
-                os_store=os_store,
-            )
-        if legacy_value not in {None, ""}:
-            return legacy_value
-        if file_state_locked:
-            file_value, os_known, os_value = _pre_registry_copies(
-                key,
-                file_store=file_store,
-                os_store=os_store,
-            )
-        else:
-            # With no lock file, do not race a newly-created encrypted store
-            # by reading it unlocked. A post-read check below retries under
-            # the lock if a writer created transaction state concurrently.
-            file_value = None
+        profile_identity = _active_profile_identity()
+        root = _secrets_root(profile_identity)
+
+        def _resolve_current(*, file_state_locked: bool) -> str | None:
+            registry = load_authority_registry(root)
+            authority = registry.entries.get(key) if registry is not None else None
+            if authority is SecretAuthority.CLEARED:
+                return None
+            if authority is SecretAuthority.OS:
+                return OSKeystore(profile_identity).get(key)
+            if authority is SecretAuthority.FILE:
+                return _read_file_store_readonly(root).get(key)
+            if legacy_value not in {None, ""}:
+                return legacy_value
+
+            # Pre-registry inference uses the same no-create, no-permission-
+            # repair reader as doctor. Reads must never mutate drifted file
+            # artifacts merely because they are being considered as a tier.
+            if file_state_locked:
+                file_value = _read_file_store_readonly(root).get(key)
+            else:
+                # With no lock file, do not race a newly-created encrypted
+                # store by reading it unlocked. A post-read check below retries
+                # under the lock if a writer creates transaction state.
+                file_value = None
             try:
-                os_value = os_store.get(key)
+                os_value = OSKeystore(profile_identity).get(key)
                 os_known = True
             except Exception:
                 os_value = None
                 os_known = False
-        value, _tiers = _infer_pre_registry_tiers(
-            file_value,
-            os_known,
-            os_value,
-            mode=_resolve_mode(),
-        )
-        return value
+            value, _tiers = _infer_pre_registry_tiers(
+                file_value,
+                os_known,
+                os_value,
+                mode=mode,
+            )
+            return value
 
-    try:
         lock_path = root / _LOCK_FILE
-        needs_lock = (
-            lock_path.exists()
-            or (root / AUTHORITY_FILE).exists()
-            or (root / _DATA_FILE).exists()
-        )
-        if needs_lock:
-            with _store_lock(root, create=False):
+        if _artifact_present_nofollow(lock_path):
+            with _store_lock(root, create=False, secure=False):
                 return _resolve_current(file_state_locked=True)
+        # Durable authority without its transaction lock is an inconsistent
+        # live store and must fail closed. Pre-registry file debris alone does
+        # not block a higher-precedence legacy value.
+        if _artifact_present_nofollow(root / AUTHORITY_FILE):
+            return None
         result = _resolve_current(file_state_locked=False)
-        if (
-            lock_path.exists()
-            or (root / AUTHORITY_FILE).exists()
-            or (root / _DATA_FILE).exists()
-        ):
-            with _store_lock(root, create=False):
+        if _artifact_present_nofollow(lock_path):
+            with _store_lock(root, create=False, secure=False):
                 return _resolve_current(file_state_locked=True)
+        if _artifact_present_nofollow(root / AUTHORITY_FILE):
+            return None
         return result
     except Exception:
         # Credential reads remain non-throwing. Corruption and unavailable
@@ -1367,6 +1400,15 @@ def set_secrets(values: Mapping[str, str]) -> None:
             preselected = _selected_new_authority(mode)
             if preselected is SecretAuthority.FILE:
                 FileKeystore(root)._require_persistent_storage_for_new_key()
+        else:
+            # Reject linked or special live artifacts before even repairing
+            # root permissions or creating a transaction lock. Corruption is
+            # exclusively doctor/repair territory.
+            authority_info = _lstat_regular_artifact(root / AUTHORITY_FILE)
+            for filename in (_KEY_FILE, _DATA_FILE):
+                _lstat_regular_artifact(root / filename)
+            if authority_info is not None:
+                load_authority_registry(root)
         _ensure_transaction_root(root)
         with _store_lock(root):
             registry = load_authority_registry(root)
@@ -1417,6 +1459,11 @@ def set_secrets(values: Mapping[str, str]) -> None:
             )
     except KeystoreError:
         raise
+    except AuthorityRegistryError as exc:
+        raise KeystoreError(
+            "authority registry is corrupt; run `hermes secrets doctor` and "
+            "`hermes secrets repair --apply`"
+        ) from exc
     except Exception as exc:
         raise KeystoreError("keystore batch write failed") from exc
 
