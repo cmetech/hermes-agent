@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 
 from hermes_cli import secret_keystore
 from hermes_cli.config import (
-    ConfigurationPersistenceError,
     load_env,
     remove_env_value,
 )
@@ -66,7 +65,7 @@ def migrate_secrets(dry_run: bool = False) -> MigrationReport:
                 mirror_process_env=False,
                 strict=True,
             )
-        except ConfigurationPersistenceError:
+        except Exception:
             removed = False
         if not removed:
             report.failed.append(key)
@@ -80,12 +79,15 @@ def _handle_secrets_migrate(args) -> int:
     from hermes_cli.secrets_migrate import migrate_secrets
 
     report = migrate_secrets(dry_run=args.dry_run)
-    backend = secret_keystore.get_backend()
-    backend_name = backend.name if backend is not None else "disabled"
-
     if not report.migrated and not report.failed:
         print("No plugin secrets found in .env — nothing to migrate.")
         return 0
+
+    try:
+        backend = secret_keystore.get_backend()
+        backend_name = backend.name if backend is not None else "disabled"
+    except Exception:
+        backend_name = "unavailable"
 
     verb = "Would migrate" if report.dry_run else "Migrated"
     print(f"{verb} {len(report.migrated)} secret(s) to the {backend_name} keystore.")

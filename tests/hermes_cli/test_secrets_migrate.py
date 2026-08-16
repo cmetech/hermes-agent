@@ -17,6 +17,7 @@ from hermes_cli.secrets_migrate import (
 # plugin_configuration.py. A shorter digest would not match
 # _PLUGIN_SECRET_KEY and every test using it would silently find nothing.
 KEY = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+SECOND_KEY = "HERMES_PLUGIN_E5F60718E5F60718E5F60718E5F60718_API_TOKEN"
 
 
 @pytest.fixture(autouse=True)
@@ -169,6 +170,67 @@ class TestMigrate:
         assert report.migrated == []
         assert report.failed == [KEY]
 
+    @pytest.mark.parametrize(
+        ("target", "error"),
+        [
+            ("builtins.open", PermissionError("open denied")),
+            (
+                "hermes_cli.config.tempfile.mkstemp",
+                PermissionError("mkstemp denied"),
+            ),
+            ("hermes_cli.config.os.fsync", OSError("fsync failed")),
+            ("hermes_cli.config.atomic_replace", OSError("replace failed")),
+        ],
+    )
+    def test_ordinary_removal_error_keeps_plaintext_and_continues(
+        self, tmp_path, target, error
+    ):
+        """A real file-operation failure must not abort later migrations."""
+        import builtins
+
+        from hermes_cli import config
+
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            f"{KEY}=legacy-one\n{SECOND_KEY}=legacy-two\n",
+            encoding="utf-8",
+        )
+        config.invalidate_env_cache()
+        assert config.load_env() == {
+            KEY: "legacy-one",
+            SECOND_KEY: "legacy-two",
+        }
+
+        originals = {
+            "builtins.open": builtins.open,
+            "hermes_cli.config.tempfile.mkstemp": config.tempfile.mkstemp,
+            "hermes_cli.config.os.fsync": config.os.fsync,
+            "hermes_cli.config.atomic_replace": config.atomic_replace,
+        }
+        original = originals[target]
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise error
+            return original(*args, **kwargs)
+
+        values = {KEY: "legacy-one", SECOND_KEY: "legacy-two"}
+        with mock.patch.object(sk, "set_secret"):
+            with mock.patch.object(
+                sk, "get_secret", side_effect=lambda key: values[key]
+            ):
+                with mock.patch(target, side_effect=fail_once):
+                    report = migrate_secrets()
+
+        assert report.failed == [KEY]
+        assert report.migrated == [SECOND_KEY]
+        remaining = env_path.read_text(encoding="utf-8")
+        assert f"{KEY}=legacy-one" in remaining
+        assert SECOND_KEY not in remaining
+
     def test_removal_is_strict_and_does_not_touch_process_env(self):
         """Removal must fail loudly and never mirror a plugin PAT to env."""
         env = {KEY: "tok"}
@@ -182,6 +244,19 @@ class TestMigrate:
 
 
 class TestCommandHandler:
+    def test_clean_noop_does_not_resolve_backend(self, capsys):
+        args = mock.Mock(dry_run=False)
+        report = MigrationReport(migrated=[], failed=[], dry_run=False)
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ):
+            with mock.patch.object(sk, "get_backend") as get_backend:
+                exit_code = _handle_secrets_migrate(args)
+
+        assert exit_code == 0
+        assert "No plugin secrets found in .env" in capsys.readouterr().out
+        get_backend.assert_not_called()
+
     def test_dry_run_reports_backend_and_returns_success(self, capsys):
         args = mock.Mock(dry_run=True)
         report = MigrationReport(migrated=[KEY], failed=[], dry_run=True)
@@ -207,6 +282,24 @@ class TestCommandHandler:
             "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
         ):
             with mock.patch.object(sk, "get_backend", return_value=backend):
+                exit_code = _handle_secrets_migrate(args)
+
+        output = capsys.readouterr().out
+        assert exit_code == 1
+        assert "could NOT be migrated and remain in .env" in output
+        assert f"failed: {KEY}" in output
+
+    def test_backend_display_failure_does_not_discard_migration_failure(
+        self, capsys
+    ):
+        args = mock.Mock(dry_run=False)
+        report = MigrationReport(migrated=[], failed=[KEY], dry_run=False)
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ):
+            with mock.patch.object(
+                sk, "get_backend", side_effect=PermissionError("keychain denied")
+            ):
                 exit_code = _handle_secrets_migrate(args)
 
         output = capsys.readouterr().out
