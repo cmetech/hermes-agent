@@ -24,7 +24,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Literal, Mapping, cast
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -751,6 +751,7 @@ def _write_private(path: Path, payload: bytes) -> None:
 __all__ += [
     "SecretAuthority",
     "get_backend",
+    "get_configured_mode",
     "get_authority",
     "get_secret",
     "resolve_secret",
@@ -795,6 +796,11 @@ def _resolve_mode() -> str:
             raw = None
     mode = str(raw or "auto").strip().lower()
     return mode if mode in _VALID_MODES else "auto"
+
+
+def get_configured_mode() -> Literal["auto", "os", "file", "off"]:
+    """Return configured policy without resolving or probing a backend."""
+    return cast(Literal["auto", "os", "file", "off"], _resolve_mode())
 
 
 def reset_backend_cache() -> None:

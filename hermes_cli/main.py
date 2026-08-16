@@ -180,11 +180,53 @@ def _early_readonly_startup_target(argv: list[str]) -> str | None:
     """Classify startup owned by a dependency-light, non-mutating command.
 
     This runs before recovery, dotenv, logging, and the normal parser graph,
-    so it intentionally uses only token inspection. The selected command is
-    parsed by its real narrow parser before execution later in startup.
+    so it intentionally uses only token inspection. Selected commands are
+    either exact token forms or parsed by their narrow command-owned parser
+    before execution later in startup.
     """
     if _workflow_schema_owns_early_startup(argv):
         return "workflow-schema"
+
+    # Migration dry-run is safe to dispatch before normal startup only when
+    # the complete argv is exact after removing one supported profile override.
+    # In particular, do not inherit argparse's abbreviation behavior here:
+    # lookalikes must stay on the ordinary parser path.
+    def _valid_profile_id(value: str) -> bool:
+        leading = "abcdefghijklmnopqrstuvwxyz0123456789"
+        allowed = leading + "_-"
+        return (
+            1 <= len(value) <= 64
+            and value[0] in leading
+            and all(character in allowed for character in value)
+        )
+
+    migrate_argv: list[str] = []
+    profile_override_seen = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--profile", "-p"}:
+            if (
+                profile_override_seen
+                or i + 1 >= len(argv)
+                or not _valid_profile_id(argv[i + 1])
+            ):
+                break
+            profile_override_seen = True
+            i += 2
+            continue
+        if arg.startswith("--profile="):
+            profile_id = arg.partition("=")[2].lower()
+            if profile_override_seen or not _valid_profile_id(profile_id):
+                break
+            profile_override_seen = True
+            i += 1
+            continue
+        migrate_argv.append(arg)
+        i += 1
+    else:
+        if migrate_argv == ["secrets", "migrate", "--dry-run"]:
+            return "secrets-migrate-dry-run"
 
     command_index = None
     i = 0
@@ -914,7 +956,12 @@ _WORKFLOW_SCHEMA_READONLY_STARTUP = (
 _SECRET_READONLY_EARLY_TARGET = _early_readonly_startup_target(sys.argv[1:])
 _EARLY_READONLY_STARTUP = (
     _WORKFLOW_SCHEMA_READONLY_STARTUP
-    or _SECRET_READONLY_EARLY_TARGET in {"secrets-doctor", "secrets-repair"}
+    or _SECRET_READONLY_EARLY_TARGET
+    in {
+        "secrets-doctor",
+        "secrets-repair",
+        "secrets-migrate-dry-run",
+    }
 )
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
@@ -11479,6 +11526,13 @@ def _try_early_readonly() -> int | None:
         return 0
     current_argv = list(sys.argv[1:])
     target = _early_readonly_startup_target(current_argv)
+    if target == "secrets-migrate-dry-run":
+        from hermes_cli.secrets_migrate import _handle_secrets_migrate
+
+        class _DryRunArgs:
+            dry_run = True
+
+        return int(_handle_secrets_migrate(_DryRunArgs()) or 0)
     if target not in {"secrets-doctor", "secrets-repair"}:
         return None
     from hermes_cli.secrets_repair import parse_readonly_cli

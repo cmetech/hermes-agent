@@ -83,14 +83,23 @@ def _handle_secrets_migrate(args) -> int:
         print("No plugin secrets found in .env — nothing to migrate.")
         return 0
 
-    try:
-        backend = secret_keystore.get_backend()
-        backend_name = backend.name if backend is not None else "disabled"
-    except Exception:
-        backend_name = "unavailable"
-
     verb = "Would migrate" if report.dry_run else "Migrated"
-    print(f"{verb} {len(report.migrated)} secret(s) to the {backend_name} keystore.")
+    if report.dry_run:
+        mode = secret_keystore.get_configured_mode()
+        print(
+            f"{verb} {len(report.migrated)} secret(s) "
+            f"(configured {mode} mode; backend not probed)."
+        )
+    else:
+        try:
+            backend = secret_keystore.get_backend()
+            backend_name = backend.name if backend is not None else "disabled"
+        except Exception:
+            backend_name = "unavailable"
+        print(
+            f"{verb} {len(report.migrated)} secret(s) "
+            f"to the {backend_name} keystore."
+        )
     for key in report.migrated:
         print(f"  {verb.lower()}: {key}")
     if report.failed:

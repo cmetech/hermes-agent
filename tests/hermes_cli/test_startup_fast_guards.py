@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Modules that must NEVER be imported by the fast path. Each one either
@@ -104,3 +106,41 @@ def test_fast_version_reports_install_method_stamp(tmp_path):
     result = _run_version({"HERMES_HOME": str(home), "TERMUX_VERSION": ""})
     assert result.returncode == 0, result.stderr
     assert "Install method: git" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["secrets", "migrate", "--dry-run"],
+        ["-p", "work", "secrets", "migrate", "--dry-run"],
+        ["secrets", "--profile", "work", "migrate", "--dry-run"],
+        ["secrets", "migrate", "--dry-run", "--profile=work"],
+    ],
+)
+def test_exact_migration_dry_run_owns_readonly_startup(argv):
+    from hermes_cli.main import _early_readonly_startup_target
+
+    assert _early_readonly_startup_target(argv) == "secrets-migrate-dry-run"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["secrets", "migrate"],
+        ["secrets", "migrate", "--dry"],
+        ["secrets", "migrate", "--dry-run=true"],
+        ["secrets", "migrate", "--dry-run", "--dry-run"],
+        ["secrets", "migrate", "--dry-run", "extra"],
+        ["secrets", "migr", "--dry-run"],
+        ["secret", "migrate", "--dry-run"],
+        ["--profile", "--dry-run", "secrets", "migrate", "--dry-run"],
+        ["--profile", "bad:name", "secrets", "migrate", "--dry-run"],
+        ["--profile=bad:name", "secrets", "migrate", "--dry-run"],
+        ["--version", "secrets", "migrate", "--dry-run"],
+        ["--oneshot", "prompt", "secrets", "migrate", "--dry-run"],
+    ],
+)
+def test_migration_dry_run_lookalikes_use_normal_startup(argv):
+    from hermes_cli.main import _early_readonly_startup_target
+
+    assert _early_readonly_startup_target(argv) is None

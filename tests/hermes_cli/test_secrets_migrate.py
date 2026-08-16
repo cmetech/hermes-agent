@@ -1,5 +1,9 @@
 """Tests for hermes_cli.secrets_migrate."""
 
+import os
+import stat
+import subprocess
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -18,6 +22,21 @@ from hermes_cli.secrets_migrate import (
 # _PLUGIN_SECRET_KEY and every test using it would silently find nothing.
 KEY = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
 SECOND_KEY = "HERMES_PLUGIN_E5F60718E5F60718E5F60718E5F60718_API_TOKEN"
+
+
+def snapshot_tree(root: Path) -> dict[str, tuple[str, int, bytes]]:
+    """Capture profile contents and modes for exact read-only assertions."""
+    if not root.exists():
+        return {}
+    snapshot: dict[str, tuple[str, int, bytes]] = {}
+    for path in sorted((root, *root.rglob("*"))):
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if path.is_dir():
+            snapshot[relative] = ("dir", mode, b"")
+        elif path.is_file():
+            snapshot[relative] = ("file", mode, path.read_bytes())
+    return snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -257,21 +276,73 @@ class TestCommandHandler:
         assert "No plugin secrets found in .env" in capsys.readouterr().out
         get_backend.assert_not_called()
 
-    def test_dry_run_reports_backend_and_returns_success(self, capsys):
+    def test_dry_run_never_resolves_or_probes_backend(self, capsys):
         args = mock.Mock(dry_run=True)
         report = MigrationReport(migrated=[KEY], failed=[], dry_run=True)
-        backend = mock.Mock()
-        backend.name = "file"
         with mock.patch(
             "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved")
+        ), mock.patch.object(
+            sk, "probe_os_keystore", side_effect=AssertionError("probed")
+        ), mock.patch.object(
+            sk,
+            "get_configured_mode",
+            return_value="auto",
         ):
-            with mock.patch.object(sk, "get_backend", return_value=backend):
-                exit_code = _handle_secrets_migrate(args)
+            exit_code = _handle_secrets_migrate(args)
 
         output = capsys.readouterr().out
         assert exit_code == 0
-        assert "Would migrate 1 secret(s) to the file keystore." in output
+        assert "configured auto mode; backend not probed" in output
         assert f"would migrate: {KEY}" in output
+
+    def test_dry_run_handler_does_not_create_an_absent_profile(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        profile = tmp_path / "profiles" / "absent"
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        report = MigrationReport(migrated=[KEY], failed=[], dry_run=True)
+        before = snapshot_tree(profile)
+
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved")
+        ), mock.patch.object(
+            sk, "probe_os_keystore", side_effect=AssertionError("probed")
+        ):
+            exit_code = _handle_secrets_migrate(mock.Mock(dry_run=True))
+
+        assert exit_code == 0
+        assert snapshot_tree(profile) == before == {}
+        assert "configured auto mode; backend not probed" in capsys.readouterr().out
+
+    def test_real_migration_reports_committed_backend_after_writes(self, capsys):
+        events = []
+        backend = mock.Mock(name="backend")
+        backend.name = "file"
+
+        def migrate_after_writes(*, dry_run):
+            events.append(("migrate", dry_run))
+            return MigrationReport(migrated=[KEY], failed=[], dry_run=False)
+
+        def resolve_committed_backend():
+            events.append(("backend", None))
+            return backend
+
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets",
+            side_effect=migrate_after_writes,
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=resolve_committed_backend
+        ):
+            exit_code = _handle_secrets_migrate(mock.Mock(dry_run=False))
+
+        assert exit_code == 0
+        assert events == [("migrate", False), ("backend", None)]
+        assert "Migrated 1 secret(s) to the file keystore." in capsys.readouterr().out
 
     def test_failure_reports_plaintext_is_retained_and_returns_error(self, capsys):
         args = mock.Mock(dry_run=False)
@@ -306,3 +377,66 @@ class TestCommandHandler:
         assert exit_code == 1
         assert "could NOT be migrated and remain in .env" in output
         assert f"failed: {KEY}" in output
+
+
+def test_real_console_dry_run_is_byte_read_only_and_never_touches_keyring(
+    tmp_path,
+):
+    repo = Path(__file__).resolve().parents[2]
+    hermes = repo / ".venv" / "bin" / "hermes"
+    assert hermes.is_file(), "the real .venv/bin/hermes entrypoint is required"
+
+    hermes_root = tmp_path / "hermes-root"
+    profile = hermes_root / "profiles" / "dry-run"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text(f"{KEY}=legacy-secret\n", encoding="utf-8")
+    marker = profile / "profile-marker.bin"
+    marker.write_bytes(b"unchanged-profile-bytes")
+
+    fake_modules = tmp_path / "fake-modules"
+    package = fake_modules / "keyring"
+    package.mkdir(parents=True)
+    keyring_marker = tmp_path / "keyring-touched"
+    (package / "__init__.py").write_text(
+        "from . import errors\n"
+        "def _touch(operation):\n"
+        f"    open({str(keyring_marker)!r}, 'wb').write(operation.encode())\n"
+        "    raise AssertionError('keyring operation invoked during dry-run')\n"
+        "def get_password(service, account): return _touch('get')\n"
+        "def set_password(service, account, value): return _touch('set')\n"
+        "def delete_password(service, account): return _touch('delete')\n",
+        encoding="utf-8",
+    )
+    (package / "errors.py").write_text(
+        "class PasswordDeleteError(Exception): pass\n", encoding="utf-8"
+    )
+
+    before = snapshot_tree(profile)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_root)
+    env.pop("HERMES_SECRET_KEYSTORE", None)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(fake_modules), str(repo), env.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run(
+        [
+            str(hermes),
+            "--profile",
+            "dry-run",
+            "secrets",
+            "migrate",
+            "--dry-run",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "configured auto mode; backend not probed" in result.stdout
+    assert KEY in result.stdout
+    assert "legacy-secret" not in result.stdout
+    assert snapshot_tree(profile) == before
+    assert not keyring_marker.exists()
