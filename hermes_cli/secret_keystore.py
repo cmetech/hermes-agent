@@ -511,6 +511,7 @@ __all__ += [
 
 _BACKEND = None
 _BACKEND_RESOLVED = False
+_BACKEND_MODE = None
 _BACKEND_LOCK = threading.Lock()
 # _OS_HEALTHY, _OS_CALL_LOCK and the base _mark_os_unhealthy() are introduced
 # in Task 3 because OSKeystore already consumes them there. This task extends
@@ -550,12 +551,13 @@ def _resolve_mode() -> str:
 
 def reset_backend_cache() -> None:
     """Clear the cached backend. For tests and for post-migration re-probe."""
-    global _BACKEND, _BACKEND_RESOLVED, _OS_HEALTHY
+    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _OS_HEALTHY
     # Match the read-time lock order: OS call lock, then backend lock.
     with _OS_CALL_LOCK:
         with _BACKEND_LOCK:
             _BACKEND = None
             _BACKEND_RESOLVED = False
+            _BACKEND_MODE = None
             _OS_HEALTHY = True
 
 
@@ -571,7 +573,7 @@ def get_backend():
     Resolved once per process: the probe can involve IPC to a keychain
     daemon and this is called on every secret resolution.
     """
-    global _BACKEND, _BACKEND_RESOLVED
+    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE
     if _BACKEND_RESOLVED:
         return _BACKEND
     with _BACKEND_LOCK:
@@ -588,6 +590,7 @@ def get_backend():
             _BACKEND = OSKeystore() if probe_os_keystore() else FileKeystore(
                 _secrets_root()
             )
+        _BACKEND_MODE = mode
         _BACKEND_RESOLVED = True
         return _BACKEND
 
@@ -612,9 +615,12 @@ def _mark_os_unhealthy() -> None:
     """
     global _OS_HEALTHY, _BACKEND, _BACKEND_RESOLVED
     _OS_HEALTHY = False
-    if _resolve_mode() == "os":
-        return
     with _BACKEND_LOCK:
+        # Backend and selection mode are one process-cached decision. Reading
+        # mutable config here would let an unrelated post-startup change swap
+        # the tier under a running process.
+        if _BACKEND_MODE == "os":
+            return
         if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
             _BACKEND = FileKeystore(_secrets_root())
             _BACKEND_RESOLVED = True
@@ -636,7 +642,11 @@ def get_secret(key: str) -> str | None:
         if backend is None:
             return None
         return backend.get(key)
-    except (KeystoreError, OSError):
+    # This is the read facade's final fault boundary. Backend integrations can
+    # raise ordinary exceptions outside our typed wrappers; reads still need
+    # to fall through as "not configured". Process-control exceptions remain
+    # visible because BaseException is deliberately not caught.
+    except Exception:
         return None
 
 

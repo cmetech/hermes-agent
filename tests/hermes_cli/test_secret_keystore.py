@@ -429,6 +429,16 @@ class TestModuleLevelAPI:
         with mock.patch.object(sk, "get_backend", return_value=broken):
             assert sk.get_secret("K") is None
 
+    def test_get_secret_never_raises_on_unexpected_backend_failure(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.get.side_effect = RuntimeError("unexpected backend failure")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            assert sk.get_secret("K") is None
+
     def test_set_secret_raises_on_backend_failure(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         broken = mock.Mock()
@@ -557,18 +567,95 @@ class TestBoundedReads:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
         released = threading.Event()
+        finished = threading.Event()
 
         class _HangingKeyring:
             def get_password(self, service, name):
                 released.wait(timeout=10)
+                finished.set()
 
         sk.reset_backend_cache()
         with mock.patch.object(sk, "keyring", _HangingKeyring()):
-            with mock.patch.object(sk, "probe_os_keystore", return_value=True):
-                assert sk.get_backend().name == "os"
-                assert sk.get_secret("K") is None       # timed out, swallowed
-                assert sk.get_backend().name == "file"  # demoted
-            released.set()
+            try:
+                with mock.patch.object(sk, "probe_os_keystore", return_value=True):
+                    assert sk.get_backend().name == "os"
+                    assert sk.get_secret("K") is None       # timed out, swallowed
+                    assert sk.get_backend().name == "file"  # demoted
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
+
+    def test_auto_selection_demotes_after_current_mode_changes_to_os(
+        self, tmp_path, monkeypatch
+    ):
+        """The process-cached selection mode, not mutable current config,
+        controls whether a timed-out OS read demotes the backend."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            try:
+                with (
+                    mock.patch.object(sk, "probe_os_keystore", return_value=True),
+                    mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2),
+                ):
+                    assert sk.get_backend().name == "os"
+                    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+                    assert sk.get_secret("K") is None
+                    assert sk.get_backend().name == "file"
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
+
+    def test_forced_os_selection_stays_pinned_after_current_mode_changes_to_auto(
+        self, tmp_path, monkeypatch
+    ):
+        """A forced OS selection stays pinned for the process even if the
+        config source changes before a later read times out."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            try:
+                with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                    assert sk.get_backend().name == "os"
+                    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+                    assert sk.get_secret("K") is None
+                    assert sk.get_backend().name == "os"
+                    assert sk._OS_HEALTHY is False
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
 
 
 class TestRevocationFailuresPropagate:
