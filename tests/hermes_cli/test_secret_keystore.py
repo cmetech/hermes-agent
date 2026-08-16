@@ -408,7 +408,8 @@ import hermes_cli.secret_keystore as sk
 
 
 @pytest.fixture(autouse=True)
-def _reset_backend_cache():
+def _reset_backend_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     sk.reset_backend_cache()
     yield
     sk.reset_backend_cache()
@@ -604,7 +605,7 @@ class TestBatchWrites:
                 original_set(service, name, value)
 
             fake.set_password = fail_second_set
-            with pytest.raises(KeystoreError, match="rolled back"):
+            with pytest.raises(KeystoreError, match="state restored"):
                 store.set_many({"first": "new-first", "second": "new-second"})
 
             assert store.get("first") == "old-first"
@@ -630,8 +631,165 @@ class TestBatchWrites:
             with pytest.raises(KeystoreError, match="rollback failed.*uncertain"):
                 store.set_many({"first": "new-first", "second": "new-second"})
 
+    def test_os_batch_restores_the_current_key_when_its_write_commits_then_raises(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def commit_then_raise(service, name, value):
+                nonlocal calls
+                calls += 1
+                original_set(service, name, value)
+                if calls == 2:
+                    raise OSError("reply lost after commit")
+
+            fake.set_password = commit_then_raise
+            with pytest.raises(KeystoreError, match="state restored"):
+                store.set_many({"first": "new-first", "second": "new-second"})
+
+            assert store.get("first") == "old-first"
+            assert store.get("second") == "old-second"
+
+    def test_os_batch_rollback_cannot_overwrite_a_concurrent_successful_batch(self):
+        import threading
+
+        fake = _FakeKeyring()
+        entered_failure = threading.Event()
+        release_failure = threading.Event()
+        second_started = threading.Event()
+        second_done = threading.Event()
+        results = []
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("shared", "old")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_after_first_mutation(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    entered_failure.set()
+                    assert release_failure.wait(timeout=5)
+                    raise OSError("second field refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_after_first_mutation
+
+            def failing_batch():
+                with pytest.raises(KeystoreError, match="batch write failed"):
+                    store.set_many({"shared": "first", "reject": "value"})
+
+            def successful_batch():
+                second_started.set()
+                store.set_many({"shared": "second"})
+                results.append(store.get("shared"))
+                second_done.set()
+
+            first = threading.Thread(target=failing_batch)
+            second = threading.Thread(target=successful_batch)
+            first.start()
+            assert entered_failure.wait(timeout=5)
+            second.start()
+            assert second_started.wait(timeout=5)
+            release_failure.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            assert not first.is_alive()
+            assert not second.is_alive()
+            assert store.get("shared") == "second"
+
+        assert second_done.is_set()
+        assert results == ["second"]
+
+
+class TestProbeConcurrency:
+    def test_concurrent_probes_use_distinct_accounts_and_clean_up_exactly(self):
+        import threading
+
+        class ProbeKeyring(_FakeKeyring):
+            def __init__(self):
+                super().__init__()
+                self.accounts = []
+                self.deleted = []
+                self.barrier = threading.Barrier(2)
+
+            def set_password(self, service, name, value):
+                self.accounts.append(name)
+                super().set_password(service, name, value)
+                self.barrier.wait(timeout=5)
+
+            def delete_password(self, service, name):
+                self.deleted.append(name)
+                super().delete_password(service, name)
+
+        fake = ProbeKeyring()
+        results = []
+        with mock.patch.object(sk, "keyring", fake):
+            threads = [
+                threading.Thread(target=lambda: results.append(probe_os_keystore()))
+                for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+        assert results == [True, True]
+        assert len(set(fake.accounts)) == 2
+        assert sorted(fake.deleted) == sorted(fake.accounts)
+        assert fake.store == {}
+
 
 class TestBoundedReads:
+    def test_profile_b_selection_does_not_reset_profile_a_timeout_health(
+        self, tmp_path
+    ):
+        import threading
+
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        release_a = threading.Event()
+        finished_a = threading.Event()
+        token_a = set_hermes_home_override(tmp_path / "a")
+        try:
+            store_a = OSKeystore()
+        finally:
+            reset_hermes_home_override(token_a)
+        token_b = set_hermes_home_override(tmp_path / "b")
+        try:
+            store_b = OSKeystore()
+        finally:
+            reset_hermes_home_override(token_b)
+
+        account_a = store_a._account_name("K")
+
+        class ProfileKeyring:
+            def get_password(self, _service, name):
+                if name == account_a:
+                    release_a.wait(timeout=5)
+                    finished_a.set()
+                    return "late"
+                return "profile-b"
+
+        with mock.patch.object(sk, "keyring", ProfileKeyring()):
+            with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                with pytest.raises(KeystoreError, match="timed out"):
+                    store_a.get("K")
+                assert store_b.get("K") == "profile-b"
+                with pytest.raises(KeystoreError, match="stopped responding"):
+                    store_a.get("K")
+            release_a.set()
+            assert finished_a.wait(timeout=5)
+
     def test_a_blocking_read_times_out_rather_than_hanging(self):
         """The probe passing does not make later reads safe: a keychain can
         be unlocked at startup and re-locked by screen-lock mid-process."""
@@ -729,7 +887,7 @@ class TestBoundedReads:
             assert sk.get_backend().name == "os"
             assert sk.get_secret("K") is None       # timed out, swallowed
             assert sk.get_backend().name == "os"    # tier NOT swapped
-            assert sk._OS_HEALTHY is False          # but latched unusable
+            assert sk._profile_state(sk._active_profile_identity()).healthy is False
             released.set()
             assert finished.wait(timeout=5), "abandoned worker never completed"
 
@@ -826,7 +984,10 @@ class TestBoundedReads:
                     monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
                     assert sk.get_secret("K") is None
                     assert sk.get_backend().name == "os"
-                    assert sk._OS_HEALTHY is False
+                    assert (
+                        sk._profile_state(sk._active_profile_identity()).healthy
+                        is False
+                    )
             finally:
                 released.set()
                 assert finished.wait(timeout=5), (

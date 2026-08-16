@@ -72,15 +72,34 @@ _PROBE_VALUE = "ok"
 # use. A locked Linux keyring or an unresponsive D-Bus Secret Service blocks
 # rather than raising, so the bound has to be a timeout, not an except.
 PROBE_TIMEOUT_SECONDS = 3.0
-# Task 3 owns the health primitives because OSKeystore uses them immediately.
-# Task 4 replaces _mark_os_unhealthy's body to add auto-tier demotion, but the
-# Task 3 commit is independently runnable and green.
-_OS_HEALTHY = True
-_OS_CALL_LOCK = threading.Lock()
-
-
 class KeystoreError(RuntimeError):
     """A keystore operation failed in a way the caller must not ignore."""
+
+
+class _ProfileState:
+    """Cached backend and bounded-read state for one canonical profile."""
+
+    def __init__(self, profile_identity: str) -> None:
+        self.profile_identity = profile_identity
+        self.backend = None
+        self.resolved = False
+        self.mode = None
+        self.healthy = True
+        self.backend_lock = threading.Lock()
+        self.call_lock = threading.Lock()
+
+
+_PROFILE_STATES: dict[str, _ProfileState] = {}
+_PROFILE_STATES_LOCK = threading.Lock()
+
+
+def _profile_state(profile_identity: str) -> _ProfileState:
+    with _PROFILE_STATES_LOCK:
+        state = _PROFILE_STATES.get(profile_identity)
+        if state is None:
+            state = _ProfileState(profile_identity)
+            _PROFILE_STATES[profile_identity] = state
+        return state
 
 
 def _active_profile_identity() -> str:
@@ -99,12 +118,6 @@ def _os_account_name(logical_key: str, profile_identity: str | None = None) -> s
     return f"hermes-profile-{digest}"
 
 
-def _mark_os_unhealthy() -> None:
-    """Latch future bounded OS reads off for the life of this process."""
-    global _OS_HEALTHY
-    _OS_HEALTHY = False
-
-
 class OSKeystore:
     """The OS-native credential store, via the ``keyring`` package.
 
@@ -117,20 +130,30 @@ class OSKeystore:
 
     def __init__(self, profile_identity: str | None = None) -> None:
         self._profile_identity = profile_identity or _active_profile_identity()
+        self._state = _profile_state(self._profile_identity)
 
     def _account_name(self, logical_key: str) -> str:
         return _os_account_name(logical_key, self._profile_identity)
 
+    @contextlib.contextmanager
+    def _mutation_lock(self):
+        """Serialize every OS mutation for this profile across processes."""
+        root = Path(self._profile_identity) / "secrets"
+        root.mkdir(parents=True, exist_ok=True)
+        _ensure_private_permissions(root, 0o700)
+        with _store_lock(root):
+            yield
+
     def _guard(self) -> None:
         """Refuse if this backend is unavailable or already hung.
 
-        Bounded reads call this while holding _OS_CALL_LOCK. That makes the
+        Bounded reads call this while holding the profile call lock. That makes the
         check-and-spawn transition atomic: concurrent callers cannot all see a
         healthy latch and each abandon a worker before the first timeout.
         """
         if keyring is None:
             raise KeystoreError("keyring is not available")
-        if not _OS_HEALTHY:
+        if not self._state.healthy:
             raise KeystoreError(
                 "os keystore stopped responding earlier in this process"
             )
@@ -138,7 +161,7 @@ class OSKeystore:
     def _bounded_read(self, operation):
         # Hold the lock through the timeout decision. Waiting callers then see
         # the false latch and fail without starting another worker.
-        with _OS_CALL_LOCK:
+        with self._state.call_lock:
             self._guard()
             sentinel = object()
             try:
@@ -146,7 +169,7 @@ class OSKeystore:
             except Exception as exc:
                 raise KeystoreError("keystore read failed") from exc
             if value is sentinel:
-                _mark_os_unhealthy()
+                _mark_os_unhealthy(self._profile_identity)
                 raise KeystoreError("keystore read timed out")
             return value
 
@@ -163,7 +186,7 @@ class OSKeystore:
             lambda: keyring.get_password(SERVICE_NAME, self._account_name(key))
         )
 
-    def set(self, key: str, value: str) -> None:
+    def _set_unlocked(self, key: str, value: str) -> None:
         """Write one secret synchronously, with failures propagated.
 
         keyring exposes no cancellation primitive. Putting a mutation on the
@@ -180,7 +203,11 @@ class OSKeystore:
         except Exception as exc:
             raise KeystoreError("keystore write failed") from exc
 
-    def delete(self, key: str) -> None:
+    def set(self, key: str, value: str) -> None:
+        with self._mutation_lock():
+            self._set_unlocked(key, value)
+
+    def _delete_unlocked(self, key: str) -> None:
         """Remove one secret. Absent is success; anything else raises.
 
         The distinction matters because this is the revocation path. keyring
@@ -204,32 +231,39 @@ class OSKeystore:
         except Exception as exc:
             raise KeystoreError("keystore delete failed") from exc
 
+    def delete(self, key: str) -> None:
+        with self._mutation_lock():
+            self._delete_unlocked(key)
+
     def set_many(self, values: Mapping[str, str]) -> None:
         """Synchronously write a batch, compensating prior writes on failure."""
-        previous = {key: self.get(key) for key in values}
-        completed: list[str] = []
-        try:
-            for key, value in values.items():
-                self.set(key, value)
-                completed.append(key)
-        except KeystoreError as write_error:
-            rollback_errors: list[Exception] = []
-            for key in reversed(completed):
-                try:
-                    if previous[key] is None:
-                        self.delete(key)
-                    else:
-                        self.set(key, previous[key])
-                except Exception as rollback_error:
-                    rollback_errors.append(rollback_error)
-            if rollback_errors:
+        with self._mutation_lock():
+            previous = {key: self.get(key) for key in values}
+            changed: list[str] = []
+            try:
+                for key, value in values.items():
+                    # A backend can commit before its transport reports an
+                    # error, so include the current key before mutating it.
+                    changed.append(key)
+                    self._set_unlocked(key, value)
+            except KeystoreError as write_error:
+                rollback_errors: list[Exception] = []
+                for key in reversed(changed):
+                    try:
+                        if previous[key] is None:
+                            self._delete_unlocked(key)
+                        else:
+                            self._set_unlocked(key, previous[key])
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise KeystoreError(
+                        "keystore batch write failed and rollback failed; "
+                        "credential outcome is uncertain"
+                    ) from write_error
                 raise KeystoreError(
-                    "keystore batch write failed and rollback failed; "
-                    "credential outcome is uncertain"
+                    "keystore batch write failed; state restored"
                 ) from write_error
-            raise KeystoreError(
-                "keystore batch write failed; earlier changes rolled back"
-            ) from write_error
 
 
 def _call_bounded(operation, timeout_seconds: float, default):
@@ -274,7 +308,10 @@ def _call_bounded(operation, timeout_seconds: float, default):
 
 def _probe_round_trip(profile_identity: str | None = None) -> bool:
     """One set/get/delete cycle. Runs on a worker thread — see below."""
-    account_name = _os_account_name(_PROBE_KEY, profile_identity)
+    # A unique probe account prevents concurrent probes for the same profile
+    # from deleting one another's in-flight round-trip entry.
+    probe_key = f"{_PROBE_KEY}\0{_secrets.token_hex(16)}"
+    account_name = _os_account_name(probe_key, profile_identity)
     cleanup_succeeded = True
     try:
         keyring.set_password(SERVICE_NAME, account_name, _PROBE_VALUE)
@@ -591,14 +628,6 @@ __all__ += [
     "reset_backend_cache",
 ]
 
-_BACKEND = None
-_BACKEND_RESOLVED = False
-_BACKEND_MODE = None
-_BACKEND_PROFILE = None
-_BACKEND_LOCK = threading.Lock()
-# _OS_HEALTHY, _OS_CALL_LOCK and the base _mark_os_unhealthy() are introduced
-# in Task 3 because OSKeystore already consumes them there. This task extends
-# the marker with automatic-tier demotion.
 # AGENTS.md:124 rejects new HERMES_* env vars for non-secret config: ".env is
 # for secrets only ... All behavioral settings -- timeouts, thresholds, feature
 # flags, display prefs -- go in config.yaml." The keystore mode is a feature
@@ -634,15 +663,19 @@ def _resolve_mode() -> str:
 
 def reset_backend_cache() -> None:
     """Clear the cached backend. For tests and for post-migration re-probe."""
-    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _BACKEND_PROFILE, _OS_HEALTHY
-    # Match the read-time lock order: OS call lock, then backend lock.
-    with _OS_CALL_LOCK:
-        with _BACKEND_LOCK:
-            _BACKEND = None
-            _BACKEND_RESOLVED = False
-            _BACKEND_MODE = None
-            _BACKEND_PROFILE = None
-            _OS_HEALTHY = True
+    # Detach the registry before acquiring any profile locks. Operations that
+    # already hold a state keep their own object; future lookups get a fresh
+    # lifecycle without ever reversing call-lock -> backend-lock ordering.
+    with _PROFILE_STATES_LOCK:
+        states = list(_PROFILE_STATES.values())
+        _PROFILE_STATES.clear()
+    for state in states:
+        with state.call_lock:
+            with state.backend_lock:
+                state.backend = None
+                state.resolved = False
+                state.mode = None
+                state.healthy = True
 
 
 def _secrets_root(profile_identity: str) -> Path:
@@ -655,46 +688,45 @@ def get_backend():
     Resolved once per process: the probe can involve IPC to a keychain
     daemon and this is called on every secret resolution.
     """
-    global _BACKEND, _BACKEND_RESOLVED, _BACKEND_MODE, _BACKEND_PROFILE, _OS_HEALTHY
     profile_identity = _active_profile_identity()
+    state = _profile_state(profile_identity)
     # Keep cache rebinding in the same lock order as bounded reads and health
     # demotion. A profile transition resets the entire selection lifecycle so
     # a timed-out OS read in one profile cannot poison another profile.
-    with _OS_CALL_LOCK:
-        with _BACKEND_LOCK:
-            if _BACKEND_RESOLVED and _BACKEND_PROFILE == profile_identity:
-                return _BACKEND
-            _BACKEND = None
-            _BACKEND_RESOLVED = False
-            _BACKEND_MODE = None
-            _BACKEND_PROFILE = profile_identity
-            _OS_HEALTHY = True
+    with state.call_lock:
+        with state.backend_lock:
+            if state.resolved:
+                return state.backend
+            state.backend = None
+            state.resolved = False
+            state.mode = None
+            state.healthy = True
             mode = _resolve_mode()
             if mode == "off":
-                _BACKEND = None
+                state.backend = None
             elif mode == "file":
-                _BACKEND = FileKeystore(_secrets_root(profile_identity))
+                state.backend = FileKeystore(_secrets_root(profile_identity))
             elif mode == "os":
-                _BACKEND = OSKeystore(profile_identity)
+                state.backend = OSKeystore(profile_identity)
             else:  # auto
-                _BACKEND = (
+                state.backend = (
                     OSKeystore(profile_identity)
                     if probe_os_keystore(profile_identity=profile_identity)
                     else FileKeystore(_secrets_root(profile_identity))
                 )
-            _BACKEND_MODE = mode
-            _BACKEND_RESOLVED = True
-            return _BACKEND
+            state.mode = mode
+            state.resolved = True
+            return state.backend
 
 
-def _mark_os_unhealthy() -> None:
+def _mark_os_unhealthy(profile_identity: str) -> None:
     """Latch the OS keystore as unusable, and in "auto" fall back to file.
 
     Two separable things happen here, and conflating them was a real defect:
 
-    * The **latch** (`_OS_HEALTHY = False`) always applies. `_OS_CALL_LOCK`
-      makes the check-and-spawn transition atomic, so even concurrent readers
-      can abandon at most one worker per process.
+    * The **latch** always applies to this profile. Its call lock makes the
+      check-and-spawn transition atomic, so even concurrent readers can
+      abandon at most one worker per profile selection lifecycle.
     * The **demotion** applies only in "auto" mode. "os" pins the tier
       deliberately; swapping under the operator would move reads to a store
       that does not hold their secrets, which presents as data loss rather
@@ -705,17 +737,17 @@ def _mark_os_unhealthy() -> None:
     unlocked, and re-probing on a timer would reintroduce the stall on a
     schedule.
     """
-    global _OS_HEALTHY, _BACKEND, _BACKEND_RESOLVED
-    _OS_HEALTHY = False
-    with _BACKEND_LOCK:
+    state = _profile_state(profile_identity)
+    state.healthy = False
+    with state.backend_lock:
         # Backend and selection mode are one process-cached decision. Reading
         # mutable config here would let an unrelated post-startup change swap
         # the tier under a running process.
-        if _BACKEND_MODE == "os":
+        if state.mode == "os":
             return
-        if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
-            _BACKEND = FileKeystore(_secrets_root(_BACKEND_PROFILE))
-            _BACKEND_RESOLVED = True
+        if state.backend is not None and getattr(state.backend, "name", None) == "os":
+            state.backend = FileKeystore(_secrets_root(profile_identity))
+            state.resolved = True
 
 
 def get_secret(key: str) -> str | None:
