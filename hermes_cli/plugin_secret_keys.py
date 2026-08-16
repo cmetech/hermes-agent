@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+from typing import Mapping
 
-__all__ = ["is_plugin_secret_key"]
+__all__ = ["is_plugin_secret_key", "without_plugin_secret_keys"]
 
 # Keys minted by plugin_configuration._secret_storage_key:
 # HERMES_PLUGIN_<sha256 prefix: 32 uppercase hex>_<field slug>.
@@ -14,3 +15,13 @@ _PLUGIN_SECRET_KEY = re.compile(r"^HERMES_PLUGIN_[0-9A-F]{32}_[A-Z0-9_]+$")
 def is_plugin_secret_key(name: str) -> bool:
     """True only for the persisted per-plugin secret-key namespace."""
     return _PLUGIN_SECRET_KEY.fullmatch(name) is not None
+
+
+def without_plugin_secret_keys(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in environment.items()
+        if not is_plugin_secret_key(key)
+    }

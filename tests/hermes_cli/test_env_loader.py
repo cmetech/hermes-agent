@@ -20,6 +20,14 @@ def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
         f"{key}=legacy-pat\nANTHROPIC_API_KEY=normal-provider-key\n",
         encoding="utf-8",
     )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  command:\n"
+        "    enabled: true\n"
+        "    command: >-\n"
+        f"      if [ -n \"${{{key}+present}}\" ]; then printf STARTUP_HELPER=present; else printf STARTUP_HELPER=absent; fi\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv(key, "stale-parent-value")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -27,6 +35,7 @@ def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
 
     load_hermes_dotenv(hermes_home=home)
 
+    assert os.environ["STARTUP_HELPER"] == "absent"
     assert key not in os.environ
     assert os.environ["ANTHROPIC_API_KEY"] == "normal-provider-key"
     assert config.load_env()[key] == "legacy-pat"

@@ -78,6 +78,18 @@ def test_profile_helper_does_not_inherit_process_secret(monkeypatch):
     assert output == "unset|profile-value"
 
 
+def test_real_helper_never_inherits_plugin_secret(monkeypatch):
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    monkeypatch.setenv(key, "legacy-pat")
+    observed = _run_helper(
+        f'if [ -n "${{{key}+present}}" ]; then printf present; else printf absent; fi',
+        "REQUESTED_KEY",
+        1.0,
+        64,
+    )
+    assert observed == "absent"
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Each test starts with a clean source map, applied-home guard, and no

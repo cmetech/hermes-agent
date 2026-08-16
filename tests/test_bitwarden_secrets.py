@@ -86,6 +86,27 @@ def test_platform_asset_name(system, machine, libc_text, expected):
         assert bw._platform_asset_name() == expected
 
 
+def test_platform_asset_name_filters_plugin_secrets_from_ldd(monkeypatch):
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    monkeypatch.setenv(key, "legacy-pat")
+    monkeypatch.setenv("ORDINARY_ENV", "keep-me")
+    monkeypatch.setenv("HERMES_HOME", "/profile-home")
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs.get("env", os.environ))
+        return mock.Mock(stdout="glibc", stderr="glibc")
+
+    with mock.patch.object(bw.platform, "system", return_value="Linux"), \
+         mock.patch.object(bw.platform, "machine", return_value="x86_64"), \
+         mock.patch.object(bw.subprocess, "run", side_effect=fake_run):
+        assert bw._platform_asset_name().endswith("unknown-linux-gnu-2.0.0.zip")
+
+    assert key not in captured_env
+    assert captured_env["ORDINARY_ENV"] == "keep-me"
+    assert captured_env["HERMES_HOME"] == "/profile-home"
+
+
 # ---------------------------------------------------------------------------
 # install_bws — fully mocked HTTP
 # ---------------------------------------------------------------------------
@@ -208,6 +229,37 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
         server_url="https://vault.bitwarden.eu",
     )
     assert captured_env.get("BWS_SERVER_URL") == "https://vault.bitwarden.eu"
+
+
+def test_bws_list_filters_plugin_secrets_but_keeps_its_required_environment(
+    monkeypatch, tmp_path
+):
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    monkeypatch.setenv(key, "legacy-pat")
+    monkeypatch.setenv("ORDINARY_ENV", "keep-me")
+    monkeypatch.setenv("HERMES_HOME", "/profile-home")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs["env"])
+        return mock.Mock(
+            returncode=0,
+            stdout=_fake_bws_payload([{"key": "K", "value": "v"}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    secrets, warnings = bw._run_bws_list(fake_binary, "0.t", "project")
+
+    assert secrets == {"K": "v"}
+    assert warnings == []
+    assert key not in captured_env
+    assert captured_env["BWS_ACCESS_TOKEN"] == "0.t"
+    assert captured_env["ORDINARY_ENV"] == "keep-me"
+    assert captured_env["HERMES_HOME"] == "/profile-home"
 
 
 
@@ -517,7 +569,6 @@ def test_stale_fallback_skipped_on_auth_failure(monkeypatch, tmp_path):
             access_token="0.t", project_id="proj-1", binary=fake_binary,
             cache_ttl_seconds=300, home_path=home,
         )
-
 
 
 
