@@ -76,6 +76,30 @@ class TestWindowsCredentialAclBoundaries:
         restrict.assert_called_once_with(env_path)
         assert env_path.read_text(encoding="utf-8") == "KEEP=present\n"
 
+    def test_remove_env_value_acl_failure_retry_cannot_bypass_acl(self, tmp_path):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("KEEP=present\nDROP=gone\n", encoding="utf-8")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                side_effect=windows_permissions.WindowsAclError("access denied"),
+            ),
+        ):
+            with pytest.raises(ConfigurationPersistenceError, match="ACL"):
+                remove_env_value("DROP", mirror_process_env=False)
+
+            assert env_path.read_text(encoding="utf-8") == "KEEP=present\n"
+
+            with pytest.raises(ConfigurationPersistenceError, match="ACL"):
+                remove_env_value("DROP", mirror_process_env=False)
+
     def test_sanitize_env_file_acls_replacement(self, tmp_path):
         from hermes_cli import config as config_module
         from hermes_cli import windows_permissions
@@ -94,6 +118,24 @@ class TestWindowsCredentialAclBoundaries:
 
         restrict.assert_called_once_with(env_path)
         assert env_path.read_bytes() == b"TOKEN=value\n"
+
+    def test_sanitize_env_file_acls_an_already_normalized_file(self, tmp_path):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        env_path = tmp_path / ".env"
+        env_path.write_bytes(b"TOKEN=value\n")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(
+                windows_permissions, "restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            assert sanitize_env_file() == 0
+
+        restrict.assert_called_once_with(env_path)
 
     @pytest.mark.parametrize("operation", ["save", "remove", "sanitize"])
     def test_credential_acl_failure_is_a_configuration_persistence_error(

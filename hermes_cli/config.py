@@ -3948,6 +3948,8 @@ def sanitize_env_file() -> int:
     sanitized = _sanitize_env_lines(original_lines)
 
     if sanitized == original_lines:
+        if sys.platform == "win32":
+            _secure_credential_file(Path(os.path.realpath(env_path)))
         return 0
 
     # Count lines whose normalized representation differs.
@@ -4296,6 +4298,8 @@ def _remove_env_value_locked(
             except OSError:
                 pass
             raise
+    elif sys.platform == "win32":
+        _secure_credential_file(Path(os.path.realpath(env_path)))
 
     if mirror_process_env:
         os.environ.pop(key, None)

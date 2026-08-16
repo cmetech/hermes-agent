@@ -438,6 +438,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         # BOM-less UTF-16 (NUL-padded ASCII) into clean UTF-8.
         stripped = [line.replace("\x00", "") for line in original]
         sanitized = _sanitize_env_lines(stripped)
+        acl_path = Path(os.path.realpath(path))
         if sanitized != original or force_utf8_rewrite:
             import tempfile
             fd, tmp = tempfile.mkstemp(
@@ -448,27 +449,27 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
                     f.writelines(sanitized)
                     f.flush()
                     os.fsync(f.fileno())
-                replaced_path = Path(atomic_replace(tmp, path))
-                if sys.platform == "win32":
-                    from hermes_cli.windows_permissions import (
-                        WindowsAclError,
-                        restrict_file_to_current_user,
-                    )
-
-                    try:
-                        restrict_file_to_current_user(replaced_path)
-                    except WindowsAclError as exc:
-                        logging.getLogger(__name__).warning(
-                            "Windows ACL drift remains on startup-sanitized %s: %s",
-                            replaced_path,
-                            exc,
-                        )
+                acl_path = Path(atomic_replace(tmp, path))
             except BaseException:
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
                 raise
+        if sys.platform == "win32":
+            from hermes_cli.windows_permissions import (
+                WindowsAclError,
+                restrict_file_to_current_user,
+            )
+
+            try:
+                restrict_file_to_current_user(acl_path)
+            except WindowsAclError as exc:
+                logging.getLogger(__name__).warning(
+                    "Windows ACL drift remains on startup-sanitized %s: %s",
+                    acl_path,
+                    exc,
+                )
     except Exception:
         pass  # best-effort — don't block gateway startup
 

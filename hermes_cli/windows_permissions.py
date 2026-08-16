@@ -41,14 +41,16 @@ _PURGE_ACL = (
 )
 _FILE_RIGHTS = (
     "$rights=[System.Security.AccessControl.FileSystemRights]::Read -bor "
-    "[System.Security.AccessControl.FileSystemRights]::Write;"
+    "[System.Security.AccessControl.FileSystemRights]::Write -bor "
+    "[System.Security.AccessControl.FileSystemRights]::Synchronize;"
 )
 _DIRECTORY_RIGHTS = (
     "$rights=[System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor "
     "[System.Security.AccessControl.FileSystemRights]::Write -bor "
     "[System.Security.AccessControl.FileSystemRights]::CreateFiles -bor "
     "[System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor "
-    "[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles;"
+    "[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles "
+    "-bor [System.Security.AccessControl.FileSystemRights]::Synchronize;"
 )
 _FILE_INHERITANCE = (
     "$inheritance=[System.Security.AccessControl.InheritanceFlags]::None;"
@@ -79,7 +81,7 @@ _INSPECT_SUFFIX = (
     "$secure=$secure -and $ruleSid.Value -eq $id.Value -and "
     "$r.AccessControlType -eq "
     "[System.Security.AccessControl.AccessControlType]::Allow -and "
-    "($r.FileSystemRights -band $rights) -eq $rights -and "
+    "$r.FileSystemRights -eq $rights -and "
     "$r.InheritanceFlags -eq $inheritance -and "
     "$r.PropagationFlags -eq "
     "[System.Security.AccessControl.PropagationFlags]::None;"
@@ -129,15 +131,13 @@ def _current_windows_sid() -> str:
     if completed.returncode != 0:
         return ""
     try:
-        rows = csv.reader(completed.stdout.splitlines())
-        fields = next(rows, ())
-    except (csv.Error, StopIteration):
+        rows = list(csv.reader(completed.stdout.splitlines()))
+    except csv.Error:
         return ""
-    for field in fields:
-        candidate = field.strip()
-        if candidate.startswith("S-1-"):
-            return candidate
-    return ""
+    if len(rows) != 1 or len(rows[0]) != 2:
+        return ""
+    candidate = rows[0][1].strip()
+    return candidate if candidate.startswith("S-1-") else ""
 
 
 def _validated_sid() -> str:
@@ -191,11 +191,27 @@ def restrict_directory_to_current_user(path: Path) -> None:
 
 def _inspect(path: Path, script: str) -> WindowsAclInspection:
     completed = _run_powershell(script, Path(path))
+
+    def reject_duplicate_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate ACL inspection field")
+            result[key] = value
+        return result
+
     try:
-        payload = json.loads(completed.stdout)
-    except (TypeError, json.JSONDecodeError) as exc:
+        payload = json.loads(
+            completed.stdout,
+            object_pairs_hook=reject_duplicate_fields,
+        )
+    except (TypeError, ValueError) as exc:
         raise WindowsAclError("PowerShell ACL inspection returned invalid data") from exc
-    if not isinstance(payload, dict) or type(payload.get("secure")) is not bool:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"secure", "detail"}
+        or type(payload.get("secure")) is not bool
+    ):
         raise WindowsAclError("PowerShell ACL inspection returned invalid data")
     detail = payload.get("detail")
     if detail is not None and not isinstance(detail, str):

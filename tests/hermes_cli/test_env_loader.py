@@ -52,6 +52,33 @@ def test_startup_sanitize_acl_failure_is_best_effort_and_diagnosable(
     )
 
 
+def test_startup_sanitize_no_rewrite_still_retries_acl_and_warns(
+    tmp_path, monkeypatch, caplog
+):
+    from hermes_cli import env_loader, windows_permissions
+
+    env_file = tmp_path / ".env"
+    original = b"TOKEN=value\n"
+    env_file.write_bytes(original)
+    monkeypatch.setattr(env_loader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_permissions,
+        "restrict_file_to_current_user",
+        lambda _path: (_ for _ in ()).throw(
+            windows_permissions.WindowsAclError("access denied")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
+        env_loader._sanitize_env_file_if_needed(env_file)
+
+    assert env_file.read_bytes() == original
+    assert any(
+        "ACL drift" in record.message and str(env_file) in record.message
+        for record in caplog.records
+    )
+
+
 def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
     tmp_path, monkeypatch
 ):

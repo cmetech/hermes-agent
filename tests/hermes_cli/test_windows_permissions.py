@@ -195,3 +195,92 @@ def test_sid_lookup_filters_plugin_secrets_from_its_child(tmp_path, monkeypatch)
     assert permissions._current_windows_sid() == SID
     assert PLUGIN_KEY not in run.call_args.kwargs["env"]
     assert run.call_args.kwargs["env"] is not os.environ
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        f'"DOMAIN\\user","{SID}","unexpected"\n',
+        f'"{SID}","DOMAIN\\user"\n',
+        f'"DOMAIN\\user","{SID}"\n"OTHER\\user","{SID}"\n',
+        f'"DOMAIN\\user","{SID}"\n\n',
+    ],
+    ids=["extra-field", "sid-in-wrong-field", "extra-row", "trailing-blank-row"],
+)
+def test_whoami_sid_requires_exactly_one_two_field_csv_row(
+    tmp_path, monkeypatch, stdout
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    run = mock.Mock(return_value=_completed(stdout=stdout))
+    monkeypatch.setattr(permissions.subprocess, "run", run)
+
+    with pytest.raises(permissions.WindowsAclError, match="SID"):
+        permissions.restrict_file_to_current_user(target)
+
+    assert run.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"secure":true,"detail":null,"unexpected":false}',
+        '{"secure":true,"secure":false,"detail":null}',
+        '{"detail":null,"detail":"changed","secure":true}',
+    ],
+    ids=["extra-field", "duplicate-secure", "duplicate-detail"],
+)
+def test_inspection_json_rejects_extra_or_duplicate_fields(
+    tmp_path, monkeypatch, stdout
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    monkeypatch.setattr(
+        permissions.subprocess,
+        "run",
+        mock.Mock(return_value=_completed(stdout=stdout)),
+    )
+
+    with pytest.raises(permissions.WindowsAclError, match="inspection"):
+        permissions.inspect_file_acl(target)
+
+
+def test_file_inspection_rejects_full_control_as_broader_than_required_rights(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+
+    def emulate_powershell(argv, **_kwargs):
+        script = argv[argv.index("-Command") + 1]
+        required_rights = 0x00000116
+        full_control = 0x001F01FF
+        if "($r.FileSystemRights -band $rights) -eq $rights" in script:
+            rights_match = full_control & required_rights == required_rights
+        elif "$r.FileSystemRights -eq $rights" in script:
+            rights_match = full_control == required_rights
+        else:
+            raise AssertionError("inspection script did not compare ACL rights")
+        return _completed(
+            stdout=json.dumps(
+                {
+                    "secure": rights_match,
+                    "detail": None if rights_match else "unexpected rights",
+                }
+            )
+        )
+
+    monkeypatch.setattr(permissions.subprocess, "run", emulate_powershell)
+
+    assert permissions.inspect_file_acl(target) == permissions.WindowsAclInspection(
+        secure=False,
+        detail="unexpected rights",
+    )
