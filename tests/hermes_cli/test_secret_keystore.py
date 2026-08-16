@@ -436,16 +436,58 @@ class TestContainerKeyPersistence:
     ("my credentials vanished") gives no hint of the cause.
     """
 
-    def test_new_key_in_a_container_is_refused(self, tmp_path):
-        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
-            with pytest.raises(KeystoreError, match="persistent volume"):
-                FileKeystore(tmp_path).set("K", "v")
+    def test_fresh_persistent_container_store_initializes(self, tmp_path, monkeypatch):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
 
-    def test_refusal_leaves_no_key_file_behind(self, tmp_path):
-        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
-            with pytest.raises(KeystoreError):
-                FileKeystore(tmp_path).set("K", "v")
-        assert not (tmp_path / "keystore.key").exists()
+        root = tmp_path / "secrets"
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                PersistenceState.PERSISTENT,
+                tmp_path,
+                "ext4",
+                "/dev/x",
+                "volume mount",
+            ),
+        )
+
+        FileKeystore(root).set("K", "v")
+
+        assert FileKeystore(root).get("K") == "v"
+
+    @pytest.mark.parametrize("state", ["ephemeral", "unknown"])
+    def test_unproven_container_storage_refuses_new_key(
+        self, tmp_path, monkeypatch, state
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        root = tmp_path / "secrets"
+        persistence_state = PersistenceState(state)
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                persistence_state,
+                tmp_path if state == "ephemeral" else None,
+                "tmpfs" if state == "ephemeral" else None,
+                "tmpfs" if state == "ephemeral" else None,
+                f"{state} test evidence",
+            ),
+        )
+
+        with pytest.raises(KeystoreError) as exc_info:
+            FileKeystore(root).set("K", "v")
+
+        message = str(exc_info.value)
+        assert str(root) in message
+        assert "hermes secrets doctor" in message
+        assert "hermes secrets repair" in message
+        assert not (root / "keystore.key").exists()
 
     def test_an_existing_key_in_a_container_is_fine(self, tmp_path):
         """A mounted volume with a key already on it is the supported setup —

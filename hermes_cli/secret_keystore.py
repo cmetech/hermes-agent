@@ -28,6 +28,7 @@ from typing import Literal, Mapping
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from hermes_cli import container_storage
 from hermes_cli.secret_authority import (
     AUTHORITY_FILE,
     AUTHORITY_VERSION,
@@ -52,14 +53,9 @@ except Exception:  # keyring absent, or an older layout
     class _PasswordDeleteError(Exception):
         """Never raised; keeps the except clause below well-typed."""
 
-# The one Hermes import this module allows itself beyond get_hermes_home.
-# _is_container already exists at hermes_cli/config.py:836 and honours the
-# HERMES_CONTAINER / HERMES_SKIP_CHMOD opt-outs plus the /.dockerenv marker,
-# so container detection stays one implementation rather than two.
-#
-# D4's container check is _in_container() below rather than
-# config._is_container(): that helper also returns True for HERMES_SKIP_CHMOD,
-# a permission opt-out used on NFS and SMB mounts that are not containers.
+# Container durability uses the shared detector directly.  In particular it
+# must not reuse config._is_container(), whose HERMES_SKIP_CHMOD behavior is a
+# permission-policy override for NFS/SMB hosts rather than container evidence.
 
 __all__ = [
     "KeystoreError",
@@ -426,22 +422,21 @@ class FileKeystore:
                 )
             return raw
 
-        # D4: in a container, minting a fresh key is usually a silent
-        # data-loss bug rather than first-run setup. If HERMES_HOME is not a
-        # persisted volume, the key dies with the container and every secret
-        # encrypted under it becomes permanently unreadable -- and the symptom
-        # ("all my credentials vanished after a restart") points nowhere near
-        # the cause. Refuse loudly instead, and name the fix.
+        # Minting a key on a container root or memory/union filesystem is a
+        # silent data-loss bug. Only fresh, positive evidence for a distinct
+        # persistent mount authorizes first-run initialization.
         if _in_container():
-            raise KeystoreError(
-                f"refusing to generate a new encryption key at {path} inside a "
-                f"container. The key would not survive a restart and every "
-                f"secret written under it would become unreadable. Mount "
-                f"HERMES_HOME on a persistent volume. Setting "
-                f"secret_keystore: off in config.yaml disables the keystore "
-                f"entirely -- it does NOT resume .env writes, which the write "
-                f"path refuses by design."
-            )
+            evidence = container_storage.inspect_mount_persistence(self._root)
+            if evidence.state is not container_storage.PersistenceState.PERSISTENT:
+                raise KeystoreError(
+                    f"refusing to generate a new encryption key for {self._root} "
+                    f"inside a container because storage persistence is "
+                    f"{evidence.state.value}: {evidence.reason}. Mount "
+                    f"HERMES_HOME on a persistent volume, then run "
+                    f"`hermes secrets doctor` and `hermes secrets repair`. "
+                    f"Setting secret_keystore: off in config.yaml disables the "
+                    f"keystore entirely -- it does NOT resume .env writes."
+                )
 
         raw = _secrets.token_bytes(_KEY_BYTES)
         _write_private(path, raw)
@@ -691,26 +686,8 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
 
 
 def _in_container() -> bool:
-    """Container detection for D4, narrower than config._is_container.
-
-    config._is_container() also returns True for HERMES_SKIP_CHMOD, which is
-    a *permission* opt-out people set on NFS and SMB mounts where 0600 breaks
-    multi-UID access -- ordinary hosts, not containers. Reusing it here would
-    refuse key creation on an NFS box and give the operator a message about
-    persistent volumes that makes no sense on their machine.
-
-    HERMES_CONTAINER stays honoured: that one does mean "container".
-    """
-    if os.environ.get("HERMES_CONTAINER"):
-        return True
-    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
-        return True
-    try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
-            cgroup = handle.read()
-    except OSError:
-        return False
-    return any(marker in cgroup for marker in ("docker", "lxc", "kubepods"))
+    """Compatibility wrapper around shared container-runtime detection."""
+    return container_storage.is_container()
 
 
 def _write_private(path: Path, payload: bytes) -> None:

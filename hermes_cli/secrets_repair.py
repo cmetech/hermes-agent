@@ -18,6 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping
 
+from hermes_cli import container_storage
 from hermes_cli import secret_keystore as sk
 from hermes_cli.plugin_configuration import PluginConfigurationService
 from hermes_cli.secret_authority import (
@@ -281,11 +282,29 @@ def _abandoned_temp_findings(root: Path) -> list[SecretFinding]:
     ]
 
 
+def _container_storage_finding(root: Path) -> SecretFinding | None:
+    if not container_storage.is_container():
+        return None
+    evidence = container_storage.inspect_mount_persistence(root)
+    if evidence.state is container_storage.PersistenceState.PERSISTENT:
+        return None
+    return _finding(
+        "CONTAINER_STORAGE_UNPROVEN",
+        "error",
+        None,
+        f"encrypted file storage at {root} is {evidence.state.value}: "
+        f"{evidence.reason}",
+    )
+
+
 def _inspect_secrets() -> _SecretSnapshot:
     profile_identity = sk._active_profile_identity()
     root = sk._secrets_root(profile_identity)
     mode = sk._resolve_mode()
     findings: list[SecretFinding] = []
+    storage_finding = _container_storage_finding(root)
+    if storage_finding is not None:
+        findings.append(storage_finding)
 
     registry: AuthorityRegistry | None = None
     registry_corrupt = False
@@ -577,20 +596,36 @@ def _build_plan(
         for key, authority in snapshot.authorities.items()
         if authority is SecretAuthority.FILE
     )
+    storage_unproven = next(
+        (
+            finding
+            for finding in snapshot.findings
+            if finding.code == "CONTAINER_STORAGE_UNPROVEN"
+        ),
+        None,
+    )
     if snapshot.file_corrupt:
         recoverable = bool(file_authority_keys) and snapshot.os_available and all(
             snapshot.os_values.get(key) is not None for key in file_authority_keys
         )
         if recoverable and not snapshot.registry_corrupt:
-            actions.append(RepairAction("REBUILD_FILE_STORE", None, "os", "file"))
+            if storage_unproven is not None:
+                blocked.append(storage_unproven)
+            else:
+                actions.append(
+                    RepairAction("REBUILD_FILE_STORE", None, "os", "file")
+                )
         elif (
             reset_unrecoverable
             and not snapshot.registry_corrupt
             and snapshot.os_available
         ):
-            actions.append(
-                RepairAction("RESET_UNRECOVERABLE", None, "file", "cleared")
-            )
+            if storage_unproven is not None:
+                blocked.append(storage_unproven)
+            else:
+                actions.append(
+                    RepairAction("RESET_UNRECOVERABLE", None, "file", "cleared")
+                )
         else:
             blocked.append(_blocked(snapshot, "FILE_STORE_CORRUPT"))
             if not snapshot.os_available:
@@ -652,11 +687,14 @@ def _build_plan(
                     actions.append(RepairAction("RESUME_MOVE", key, source, other))
                 elif authoritative is None and alternate_known:
                     if reset_unrecoverable and source == "file":
-                        actions.append(
-                            RepairAction(
-                                "RESET_UNRECOVERABLE", None, "file", "cleared"
+                        if storage_unproven is not None:
+                            blocked.append(storage_unproven)
+                        else:
+                            actions.append(
+                                RepairAction(
+                                    "RESET_UNRECOVERABLE", None, "file", "cleared"
+                                )
                             )
-                        )
                     else:
                         blocked.append(
                             _blocked(snapshot, "AUTHORITY_MODE_MISMATCH", key)
@@ -905,6 +943,13 @@ def _initialize_clean_file_store(root: Path) -> None:
     store._write_all({})
     if store._read_all() != {}:
         raise sk.KeystoreError("clean file-store verification failed")
+
+
+def _require_persistent_container_storage(root: Path) -> None:
+    """Recheck durability immediately before destructive file-store repair."""
+    finding = _container_storage_finding(root)
+    if finding is not None:
+        raise RepairRefusedError(finding.message)
 
 
 def _registry_with(
@@ -1192,6 +1237,7 @@ def apply_secret_repair(
                         failure_label="keystore repair move",
                     )
                 elif action.code in {"REBUILD_FILE_STORE", "RESET_UNRECOVERABLE"}:
+                    _require_persistent_container_storage(root)
                     for artifact in (root / sk._KEY_FILE, root / sk._DATA_FILE):
                         _assert_path_unchanged(snapshot, artifact)
                     for key, authority in snapshot.authorities.items():

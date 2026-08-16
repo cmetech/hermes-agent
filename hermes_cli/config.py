@@ -838,28 +838,21 @@ def _secure_dir(path):
 
 
 def _is_container() -> bool:
-    """Detect if we're running inside a Docker/Podman/LXC container.
+    """Apply the container-aware permission policy.
 
     When Hermes runs in a container with volume-mounted config files, forcing
     0o600 permissions breaks multi-process setups where the gateway and
     dashboard run as different UIDs or the volume mount requires broader
     permissions.
     """
-    # Explicit opt-out
-    if os.environ.get("HERMES_CONTAINER") or os.environ.get("HERMES_SKIP_CHMOD"):
+    # This is a permission-policy override, not container evidence. Keep it
+    # local so storage durability checks never mistake NFS/SMB deployments for
+    # containers.
+    if os.environ.get("HERMES_SKIP_CHMOD"):
         return True
-    # Docker / Podman marker file
-    if os.path.exists("/.dockerenv"):
-        return True
-    # LXC / cgroup-based detection
-    try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
-            cgroup_content = f.read()
-        if "docker" in cgroup_content or "lxc" in cgroup_content or "kubepods" in cgroup_content:
-            return True
-    except (OSError, IOError):
-        pass
-    return False
+    from hermes_cli.container_storage import is_container
+
+    return is_container()
 
 
 def _secure_file(path):

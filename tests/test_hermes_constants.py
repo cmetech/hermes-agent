@@ -283,35 +283,16 @@ class TestNodeToolRunnable:
 class TestIsContainer:
     """Tests for is_container() — Docker/Podman detection."""
 
-    def _reset_cache(self, monkeypatch):
-        """Reset the cached detection result before each test."""
-        monkeypatch.setattr(hermes_constants, "_container_detected", None)
+    def test_compatibility_helper_delegates_without_caching(self, monkeypatch):
+        from hermes_cli import container_storage
 
-    def test_detects_dockerenv(self, monkeypatch, tmp_path):
-        """/.dockerenv triggers container detection."""
-        self._reset_cache(monkeypatch)
-        monkeypatch.setattr(os.path, "exists", lambda p: p == "/.dockerenv")
+        observed = iter((True, False))
+        monkeypatch.setattr(
+            container_storage, "is_container", lambda: next(observed)
+        )
+
         assert is_container() is True
-
-
-
-
-    def test_detects_kubernetes_env(self, monkeypatch):
-        """KUBERNETES_SERVICE_HOST env var triggers detection (k8s/k3s pod)."""
-        self._reset_cache(monkeypatch)
-        monkeypatch.setattr(os.path, "exists", lambda p: False)
-        monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
-        assert is_container() is True
-
-
-
-    def test_caches_result(self, monkeypatch):
-        """Second call uses cached value without re-probing."""
-        monkeypatch.setattr(hermes_constants, "_container_detected", True)
-        assert is_container() is True
-        # Even if we make os.path.exists return False, cached value wins
-        monkeypatch.setattr(os.path, "exists", lambda p: False)
-        assert is_container() is True
+        assert is_container() is False
 
 
 class TestParseReasoningEffort:

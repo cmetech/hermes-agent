@@ -137,6 +137,88 @@ def finding_codes() -> set[str]:
     return {finding.code for finding in diagnose_secrets().findings}
 
 
+def test_container_storage_evidence_is_fresh_and_doctor_is_read_only(
+    profile, fake_keyring, monkeypatch
+):
+    from hermes_cli import container_storage
+    from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+    root = profile / "secrets"
+    evidence = iter(
+        (
+            MountPersistence(
+                PersistenceState.UNKNOWN, None, None, None, "missing mountinfo"
+            ),
+            MountPersistence(
+                PersistenceState.PERSISTENT,
+                profile,
+                "ext4",
+                "/dev/x",
+                "volume mount",
+            ),
+        )
+    )
+    inspected_paths: list[Path] = []
+    monkeypatch.setattr(container_storage, "is_container", lambda: True)
+
+    def inspect(path: Path) -> MountPersistence:
+        inspected_paths.append(path)
+        return next(evidence)
+
+    monkeypatch.setattr(container_storage, "inspect_mount_persistence", inspect)
+    before = snapshot_tree(profile)
+
+    first = diagnose_secrets()
+    second = diagnose_secrets()
+
+    assert "CONTAINER_STORAGE_UNPROVEN" in {
+        finding.code for finding in first.findings
+    }
+    assert "CONTAINER_STORAGE_UNPROVEN" not in {
+        finding.code for finding in second.findings
+    }
+    assert inspected_paths == [root, root]
+    assert snapshot_tree(profile) == before
+    assert fake_keyring.set_calls == []
+    assert fake_keyring.delete_calls == []
+
+
+@pytest.mark.parametrize("state", ["ephemeral", "unknown"])
+def test_unrecoverable_reset_refuses_unproven_container_storage_before_quarantine(
+    profile, fake_keyring, monkeypatch, state
+):
+    from hermes_cli import container_storage
+    from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+    write_file_secret(profile)
+    write_registry(profile, {KEY: SecretAuthority.FILE})
+    (profile / "secrets" / "keystore.key").unlink()
+    persistence_state = PersistenceState(state)
+    monkeypatch.setattr(container_storage, "is_container", lambda: True)
+    monkeypatch.setattr(
+        container_storage,
+        "inspect_mount_persistence",
+        lambda path: MountPersistence(
+            persistence_state,
+            profile if state == "ephemeral" else None,
+            "tmpfs" if state == "ephemeral" else None,
+            "tmpfs" if state == "ephemeral" else None,
+            f"{state} test evidence",
+        ),
+    )
+    before = snapshot_tree(profile)
+
+    plan = plan_secret_repair(reset_unrecoverable=True)
+
+    assert "CONTAINER_STORAGE_UNPROVEN" in {
+        finding.code for finding in plan.blocked_findings
+    }
+    assert all(action.code != "RESET_UNRECOVERABLE" for action in plan.actions)
+    with pytest.raises(RepairRefusedError, match="blocked"):
+        apply_secret_repair(plan, confirm_reset=True)
+    assert snapshot_tree(profile) == before
+
+
 def test_windows_doctor_reports_acl_drift_without_mutating(
     profile, fake_keyring, monkeypatch
 ):

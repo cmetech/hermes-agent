@@ -32,6 +32,59 @@ def _reset_audit_sentinel():
 
 
 
+@pytest.mark.parametrize("state", ["ephemeral", "unknown"])
+def test_container_storage_without_persistent_evidence_warns(
+    monkeypatch, tmp_path, state
+):
+    from hermes_cli import container_storage
+    from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+    monkeypatch.setattr(container_storage, "is_container", lambda: True)
+    monkeypatch.setattr(
+        container_storage,
+        "inspect_mount_persistence",
+        lambda path: MountPersistence(
+            PersistenceState(state),
+            tmp_path if state == "ephemeral" else None,
+            "tmpfs" if state == "ephemeral" else None,
+            "tmpfs" if state == "ephemeral" else None,
+            f"{state} test evidence",
+        ),
+    )
+
+    finding = audit._container_no_volume_mount(tmp_path / "profile")
+
+    assert finding is not None
+    assert str(tmp_path / "profile") in finding
+    assert "persistent volume" in finding
+
+
+def test_container_storage_on_distinct_persistent_mount_is_clean(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import container_storage
+    from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+    inspected: list[Path] = []
+    monkeypatch.setattr(container_storage, "is_container", lambda: True)
+
+    def inspect(path: Path) -> MountPersistence:
+        inspected.append(path)
+        return MountPersistence(
+            PersistenceState.PERSISTENT,
+            tmp_path,
+            "ext4",
+            "/dev/x",
+            "volume mount",
+        )
+
+    monkeypatch.setattr(container_storage, "inspect_mount_persistence", inspect)
+    home = tmp_path / "profile"
+
+    assert audit._container_no_volume_mount(home) is None
+    assert inspected == [home]
+
+
 # ── network listener without auth ──────────────────────────────────────────
 
 
@@ -72,5 +125,4 @@ def test_log_startup_security_warnings_emits_and_is_idempotent(monkeypatch, tmp_
     assert second == []
     forced = audit.log_startup_security_warnings(hermes_home=tmp_path, config={}, force=True)
     assert len(forced) == 1
-
 
