@@ -142,6 +142,11 @@ After evidence capture, only gate-owned artifacts were removed:
 - generated desktop build changes were restored and the generated untracked
   `plugins/model-providers/otto` directory was removed.
 
+An initial `cron remove 3af069346051` accidentally omitted the disposable
+`HERMES_HOME`, returned `job not found`, and only listed default-profile jobs
+without mutation; the corrected exact-scoped command then removed only the
+disposable job and confirmed its registry empty.
+
 Negative verification confirmed the original disposable profile path absent,
 the exact Keychain account absent, zero exact-profile processes, no generated
 provider directory, and a tracked-clean checkout. Pre-existing unrelated
