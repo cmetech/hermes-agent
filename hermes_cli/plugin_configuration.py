@@ -957,6 +957,25 @@ class PluginConfigurationService:
         )
         return [self.detail(plugin_id, platform=platform) for plugin_id in plugin_ids]
 
+    def secret_storage_keys(self) -> list[str]:
+        """Return the static manifest-derived secret-key inventory.
+
+        This intentionally does not call ``detail()``, ``_resolved()``, or any
+        secret source.  Doctor can enumerate the logical keys that keyring
+        itself cannot list without importing plugin code or reading a value.
+        """
+        keys = {
+            _secret_storage_key(
+                loaded.manifest.key or loaded.manifest.name,
+                field.id,
+            )
+            for loaded in self._inventory()
+            if loaded.manifest.configuration is not None
+            for field in loaded.manifest.configuration.fields
+            if field.storage is FieldStorage.SECRET
+        }
+        return sorted(keys)
+
     def _registrations(self, plugin_id: str) -> dict[str, dict[str, Any]]:
         if self._manager is not None:
             # Explicitly injected managers are a test/embedding seam and do

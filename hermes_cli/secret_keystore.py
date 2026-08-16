@@ -540,7 +540,7 @@ class FileKeystore:
 
 
 @contextlib.contextmanager
-def _store_lock(root: Path, *, create: bool = True):
+def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
     """Serialize one whole file-store transaction across threads/processes.
 
     The separate lock file remains stable while key/ciphertext files are
@@ -558,7 +558,8 @@ def _store_lock(root: Path, *, create: bool = True):
                 f"secret transaction lock is missing at {lock_path}"
             ) from exc
         with os.fdopen(fd, "r+b") as handle:
-            _ensure_private_permissions(lock_path, 0o600)
+            if secure:
+                _ensure_private_permissions(lock_path, 0o600)
             if os.name == "nt":
                 import msvcrt
 
@@ -725,6 +726,58 @@ def reset_backend_cache() -> None:
 
 def _secrets_root(profile_identity: str) -> Path:
     return Path(profile_identity) / "secrets"
+
+
+def _read_file_store_readonly(root: Path) -> dict[str, str]:
+    """Validate and decrypt the file tier without creating or chmodding paths.
+
+    ``FileKeystore`` deliberately repairs permissions when it opens an existing
+    store. Doctor cannot use that constructor: even a helpful chmod would
+    violate its byte-for-byte read-only contract. This repair-only primitive
+    therefore mirrors the strict read path using only filesystem reads; it is
+    private so ordinary resolution remains lazy and per-key.
+    """
+    root = Path(root)
+    key_path = root / _KEY_FILE
+    data_path = root / _DATA_FILE
+    key_exists = key_path.exists()
+    data_exists = data_path.exists()
+    if not data_exists:
+        if key_exists:
+            raw_key = key_path.read_bytes()
+            if len(raw_key) != _KEY_BYTES:
+                raise KeystoreError(
+                    f"corrupt key file {key_path}: expected {_KEY_BYTES} bytes, "
+                    f"got {len(raw_key)}"
+                )
+        return {}
+    if not key_exists:
+        raise KeystoreError("cannot decrypt secrets: missing encryption key")
+    key = key_path.read_bytes()
+    if len(key) != _KEY_BYTES:
+        raise KeystoreError(
+            f"corrupt key file {key_path}: expected {_KEY_BYTES} bytes, "
+            f"got {len(key)}"
+        )
+    blob = data_path.read_bytes()
+    if len(blob) <= _NONCE_BYTES:
+        raise KeystoreError("corrupt secret file")
+    try:
+        plaintext = AESGCM(key).decrypt(
+            blob[:_NONCE_BYTES], blob[_NONCE_BYTES:], None
+        )
+    except Exception as exc:
+        raise KeystoreError("cannot decrypt secrets (key may have changed)") from exc
+    try:
+        data = json.loads(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise KeystoreError("corrupt secret file") from exc
+    if not isinstance(data, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in data.items()
+    ):
+        raise KeystoreError("corrupt secret file")
+    return dict(data)
 
 
 def get_backend():
@@ -1210,6 +1263,65 @@ def set_secrets(values: Mapping[str, str]) -> None:
         raise KeystoreError("keystore batch write failed") from exc
 
 
+def _move_secret_locked(
+    key: str,
+    target: SecretAuthority,
+    *,
+    profile_identity: str,
+    root: Path,
+    mode: str,
+    failure_label: str = "keystore move",
+) -> None:
+    """Run the move protocol while the caller holds the profile lock."""
+    registry = load_authority_registry(root)
+    authority = registry.entries.get(key) if registry is not None else None
+    file_store = FileKeystore(root)
+    os_store = OSKeystore(profile_identity)
+    source_tiers: tuple[SecretAuthority, ...]
+    if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
+        source_tiers = (authority,)
+        value = _read_tier(
+            authority,
+            key,
+            file_store=file_store,
+            os_store=os_store,
+        )
+    elif authority is SecretAuthority.CLEARED:
+        raise KeystoreError("cannot move a cleared secret")
+    else:
+        file_value, os_known, os_value = _pre_registry_copies(
+            key,
+            file_store=file_store,
+            os_store=os_store,
+        )
+        value, source_tiers = _infer_pre_registry_tiers(
+            file_value,
+            os_known,
+            os_value,
+            mode=mode,
+        )
+    if value is None:
+        raise KeystoreError("cannot move an absent secret")
+    if authority is target:
+        return
+
+    operations: list[tuple[str, SecretAuthority, str, str | None]] = [
+        ("set", target, key, value)
+    ]
+    for source in source_tiers:
+        if source is not target:
+            operations.append(("delete", source, key, None))
+    _apply_value_transaction(
+        root=root,
+        registry=registry,
+        operations=operations,
+        authority_updates={key: target},
+        file_store=file_store,
+        os_store=os_store,
+        failure_label=failure_label,
+    )
+
+
 def move_secret(
     key: str,
     destination: Literal["os", "file"],
@@ -1217,7 +1329,8 @@ def move_secret(
     """Transactionally move one key between durable authority tiers."""
     if destination not in {"os", "file"}:
         raise KeystoreError("destination must be 'os' or 'file'")
-    if _resolve_mode() == "off":
+    mode = _resolve_mode()
+    if mode == "off":
         raise KeystoreError(
             "secret keystore is disabled (secret_keystore: off in config.yaml)"
         )
@@ -1227,52 +1340,12 @@ def move_secret(
     try:
         _ensure_transaction_root(root)
         with _store_lock(root):
-            registry = load_authority_registry(root)
-            authority = registry.entries.get(key) if registry is not None else None
-            file_store = FileKeystore(root)
-            os_store = OSKeystore(profile_identity)
-            source_tiers: tuple[SecretAuthority, ...]
-            if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
-                source_tiers = (authority,)
-                value = _read_tier(
-                    authority,
-                    key,
-                    file_store=file_store,
-                    os_store=os_store,
-                )
-            elif authority is SecretAuthority.CLEARED:
-                raise KeystoreError("cannot move a cleared secret")
-            else:
-                file_value, os_known, os_value = _pre_registry_copies(
-                    key,
-                    file_store=file_store,
-                    os_store=os_store,
-                )
-                value, source_tiers = _infer_pre_registry_tiers(
-                    file_value,
-                    os_known,
-                    os_value,
-                    mode=_resolve_mode(),
-                )
-            if value is None:
-                raise KeystoreError("cannot move an absent secret")
-            if authority is target:
-                return
-
-            operations: list[tuple[str, SecretAuthority, str, str | None]] = [
-                ("set", target, key, value)
-            ]
-            for source in source_tiers:
-                if source is not target:
-                    operations.append(("delete", source, key, None))
-            _apply_value_transaction(
+            _move_secret_locked(
+                key,
+                target,
+                profile_identity=profile_identity,
                 root=root,
-                registry=registry,
-                operations=operations,
-                authority_updates={key: target},
-                file_store=file_store,
-                os_store=os_store,
-                failure_label="keystore move",
+                mode=mode,
             )
     except KeystoreError:
         raise

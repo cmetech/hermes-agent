@@ -271,3 +271,47 @@ class TestChatSubparserInheritedValueFlags:
             + "\n  ".join(f"{opts} dest={dest} default={d!r}"
                           for opts, dest, d in offenders)
         )
+
+
+class TestEarlyReadOnlySecretRouting:
+    """Read-only secret commands must own startup before mutating seams."""
+
+    @pytest.mark.parametrize(
+        ("argv", "target"),
+        [
+            (["secrets", "doctor"], "secrets-doctor"),
+            (["-p", "work", "secrets", "doctor"], "secrets-doctor"),
+            (["secrets", "--profile", "work", "doctor"], "secrets-doctor"),
+            (["secrets", "repair"], "secrets-repair"),
+            (["secrets", "repair", "--move-to", "file"], "secrets-repair"),
+            (["secrets", "repair", "--reset-unrecoverable"], "secrets-repair"),
+            (["--profile=work", "secrets", "repair"], "secrets-repair"),
+        ],
+    )
+    def test_dependency_light_classifier_accepts_only_readonly_forms(
+        self, argv, target
+    ):
+        from hermes_cli.main import _early_readonly_startup_target
+
+        assert _early_readonly_startup_target(argv) == target
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["secrets", "repair", "--apply"],
+            ["secrets", "repair", "--move-to", "os", "--apply"],
+            [
+                "secrets",
+                "repair",
+                "--reset-unrecoverable",
+                "--apply",
+                "--yes",
+            ],
+            ["--version", "secrets", "doctor"],
+            ["--oneshot", "prompt", "secrets", "doctor"],
+        ],
+    )
+    def test_mutating_or_higher_precedence_forms_use_normal_startup(self, argv):
+        from hermes_cli.main import _early_readonly_startup_target
+
+        assert _early_readonly_startup_target(argv) is None
