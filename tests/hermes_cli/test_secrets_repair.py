@@ -15,6 +15,7 @@ import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -134,6 +135,101 @@ def write_file_secret(profile: Path, key: str = KEY, value: str = SECRET) -> Non
 
 def finding_codes() -> set[str]:
     return {finding.code for finding in diagnose_secrets().findings}
+
+
+def test_windows_doctor_reports_acl_drift_without_mutating(
+    profile, fake_keyring, monkeypatch
+):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    write_file_secret(profile)
+    write_registry(profile, {KEY: SecretAuthority.FILE})
+    before = snapshot_tree(profile)
+    monkeypatch.setattr(sk, "_is_windows", lambda: True)
+    inspect_directory = mock.Mock(
+        return_value=windows_permissions.WindowsAclInspection(
+            secure=False, detail="unexpected directory ACE"
+        )
+    )
+    inspect_file = mock.Mock(
+        return_value=windows_permissions.WindowsAclInspection(
+            secure=True, detail=None
+        )
+    )
+    monkeypatch.setattr(
+        windows_permissions, "inspect_directory_acl", inspect_directory
+    )
+    monkeypatch.setattr(windows_permissions, "inspect_file_acl", inspect_file)
+
+    report = diagnose_secrets()
+
+    assert snapshot_tree(profile) == before
+    drift = [finding for finding in report.findings if finding.code == "PERMISSION_DRIFT"]
+    assert len(drift) == 1
+    assert "unexpected directory ACE" in drift[0].message
+    inspect_directory.assert_called_once_with(profile / "secrets")
+    assert inspect_file.call_count >= 4
+
+
+def test_windows_quarantine_acls_created_directories_manifest_and_renamed_file(
+    profile, monkeypatch
+):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    root = profile / "secrets"
+    root.mkdir(parents=True)
+    artifact = root / "authority.json"
+    artifact.write_text("corrupt", encoding="utf-8")
+    restrict_file = mock.Mock()
+    restrict_directory = mock.Mock()
+    monkeypatch.setattr(sk, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        windows_permissions, "restrict_file_to_current_user", restrict_file
+    )
+    monkeypatch.setattr(
+        windows_permissions,
+        "restrict_directory_to_current_user",
+        restrict_directory,
+    )
+
+    destination = repair._quarantine_artifacts(
+        root, [artifact], finding_codes=("AUTHORITY_CORRUPT",)
+    )
+
+    assert destination is not None
+    assert not artifact.exists()
+    assert (destination / "authority.json").read_text(encoding="utf-8") == "corrupt"
+    secured_directories = [call.args[0] for call in restrict_directory.call_args_list]
+    assert root / "quarantine" in secured_directories
+    assert destination in secured_directories
+    secured_files = [call.args[0] for call in restrict_file.call_args_list]
+    assert destination / "manifest.json" in secured_files
+    assert destination / "authority.json" in secured_files
+
+
+def test_windows_quarantine_acl_failure_raises_keystore_error(profile, monkeypatch):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    root = profile / "secrets"
+    root.mkdir(parents=True)
+    artifact = root / "authority.json"
+    artifact.write_text("corrupt", encoding="utf-8")
+    monkeypatch.setattr(sk, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        windows_permissions,
+        "restrict_directory_to_current_user",
+        lambda _path: (_ for _ in ()).throw(
+            windows_permissions.WindowsAclError("access denied")
+        ),
+    )
+
+    with pytest.raises(sk.KeystoreError, match="ACL"):
+        repair._quarantine_artifacts(
+            root, [artifact], finding_codes=("AUTHORITY_CORRUPT",)
+        )
 
 
 def test_secret_storage_keys_is_static_manifest_inventory(monkeypatch):

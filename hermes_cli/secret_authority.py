@@ -1,4 +1,8 @@
-"""Pure schema and read-only parsing for secret authority metadata."""
+"""Pure schema and read-only parsing for secret authority metadata.
+
+Persistence remains centralized in ``secret_keystore`` so authority replacements
+share its atomic write and strict platform-permission boundary.
+"""
 
 from __future__ import annotations
 

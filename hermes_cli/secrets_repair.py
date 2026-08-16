@@ -173,8 +173,7 @@ def _inventory_keys() -> list[str]:
 def _inspect_permissions(root: Path) -> list[SecretFinding]:
     root_info = _lstat(root)
     if (
-        os.name == "nt"
-        or root_info is None
+        root_info is None
         or stat.S_ISLNK(root_info.st_mode)
         or not stat.S_ISDIR(root_info.st_mode)
     ):
@@ -199,6 +198,37 @@ def _inspect_permissions(root: Path) -> list[SecretFinding]:
             and path.name.endswith(".tmp")
         ):
             candidates.append((path, 0o600))
+    if sk._is_windows():
+        from hermes_cli.windows_permissions import (
+            WindowsAclError,
+            inspect_directory_acl,
+            inspect_file_acl,
+        )
+
+        for path, _expected in candidates:
+            try:
+                inspection = (
+                    inspect_directory_acl(path)
+                    if path == root
+                    else inspect_file_acl(path)
+                )
+            except WindowsAclError as exc:
+                inspection_detail = f"inspection failed ({type(exc).__name__})"
+            else:
+                if inspection.secure:
+                    continue
+                inspection_detail = inspection.detail or "ACL does not match policy"
+            findings.append(
+                _finding(
+                    "PERMISSION_DRIFT",
+                    "warning",
+                    None,
+                    f"{path} has mode Windows ACL drift ({inspection_detail}); "
+                    "expected current-user-only",
+                )
+            )
+        return findings
+
     for path, expected in candidates:
         try:
             info = path.lstat()
@@ -991,6 +1021,8 @@ def apply_secret_repair(
     ):
         raise RepairRefusedError("secret storage root is not a direct directory")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root_info is None:
+        sk._ensure_private_permissions(root, 0o700)
     applied: list[RepairAction] = []
     quarantine_paths: list[Path] = []
 

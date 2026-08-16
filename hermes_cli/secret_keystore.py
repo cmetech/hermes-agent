@@ -36,6 +36,7 @@ from hermes_cli.secret_authority import (
     encode_authority_registry,
     load_authority_registry,
 )
+from utils import atomic_replace
 
 try:  # pragma: no cover - import guard exercised via mock.patch
     import keyring
@@ -81,6 +82,12 @@ _PROBE_VALUE = "ok"
 # use. A locked Linux keyring or an unresponsive D-Bus Secret Service blocks
 # rather than raising, so the bound has to be a timeout, not an except.
 PROBE_TIMEOUT_SECONDS = 3.0
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 class KeystoreError(RuntimeError):
     """A keystore operation failed in a way the caller must not ignore."""
 
@@ -555,6 +562,15 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
     if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
         raise KeystoreError(f"secret transaction root is not a direct directory: {root}")
     lock_path = root / _LOCK_FILE
+    try:
+        lock_path.lstat()
+        lock_existed = True
+    except FileNotFoundError:
+        lock_existed = False
+    except OSError as exc:
+        raise KeystoreError(
+            f"secret transaction lock is unavailable at {lock_path}"
+        ) from exc
     with _FILE_THREAD_LOCK:
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -571,7 +587,7 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
                 f"secret transaction lock is not a regular file: {lock_path}"
             )
         with os.fdopen(fd, "r+b") as handle:
-            if secure:
+            if secure or (_is_windows() and not lock_existed):
                 _ensure_private_permissions(lock_path, 0o600)
             if os.name == "nt":
                 import msvcrt
@@ -598,8 +614,30 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
 
 
 def _ensure_private_permissions(path: Path, mode: int) -> None:
-    """Establish and verify the required POSIX mode for a private path."""
-    if os.name == "nt":
+    """Establish and verify the required private permissions for a path."""
+    if _is_windows():
+        from hermes_cli.windows_permissions import (
+            WindowsAclError,
+            restrict_directory_to_current_user,
+            restrict_file_to_current_user,
+        )
+
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise KeystoreError(f"refusing to ACL linked path {path}")
+            if stat.S_ISDIR(info.st_mode):
+                restrict_directory_to_current_user(path)
+            elif stat.S_ISREG(info.st_mode):
+                restrict_file_to_current_user(path)
+            else:
+                raise KeystoreError(f"refusing to ACL non-regular path {path}")
+        except KeystoreError:
+            raise
+        except WindowsAclError as exc:
+            raise KeystoreError(f"cannot enforce Windows ACL on {path}") from exc
+        except OSError as exc:
+            raise KeystoreError(f"cannot inspect path for Windows ACL: {path}") from exc
         return
     fd: int | None = None
     try:
@@ -686,7 +724,7 @@ def _write_private(path: Path, payload: bytes) -> None:
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        if os.name != "nt":
+        if not _is_windows():
             try:
                 os.fchmod(fd, 0o600)
             except (AttributeError, OSError, NotImplementedError) as exc:
@@ -698,8 +736,26 @@ def _write_private(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-        _ensure_private_permissions(path, 0o600)
+        if _is_windows():
+            try:
+                existing = path.lstat()
+            except FileNotFoundError:
+                existing = None
+            except OSError as exc:
+                raise KeystoreError(
+                    f"cannot inspect private replacement path {path}"
+                ) from exc
+            if existing is not None and (
+                stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+            ):
+                raise KeystoreError(
+                    f"private replacement target is not a regular file: {path}"
+                )
+            replaced_path = Path(atomic_replace(tmp_name, path))
+        else:
+            os.replace(tmp_name, path)
+            replaced_path = path
+        _ensure_private_permissions(replaced_path, 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

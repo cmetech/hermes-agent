@@ -25,6 +25,119 @@ from hermes_cli.secret_keystore import (
 )
 
 
+class TestWindowsCredentialAclBoundaries:
+    def test_file_store_acls_directory_lock_key_ciphertext_and_second_write(
+        self, tmp_path
+    ):
+        from hermes_cli import windows_permissions
+
+        root = tmp_path / "secrets"
+        restrict_file = mock.Mock()
+        restrict_directory = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                restrict_directory,
+            ),
+        ):
+            store = FileKeystore(root)
+            store.set("K", "first")
+            store.set("K", "second")
+
+        assert restrict_directory.call_args_list.count(mock.call(root)) >= 2
+        secured_files = [call.args[0] for call in restrict_file.call_args_list]
+        assert root / "keystore.lock" in secured_files
+        assert root / "keystore.key" in secured_files
+        assert secured_files.count(root / "keystore.enc") >= 2
+        assert store.get("K") == "second"
+
+    def test_authority_replacement_is_acled_after_real_file_write(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import windows_permissions
+
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        secret_keystore.reset_backend_cache()
+        restrict_file = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions, "restrict_directory_to_current_user"
+            ),
+        ):
+            secret_keystore.set_secret("K", "value")
+
+        secured_files = [call.args[0] for call in restrict_file.call_args_list]
+        assert home / "secrets" / "authority.json" in secured_files
+        assert secret_keystore.get_authority("K") is secret_keystore.SecretAuthority.FILE
+
+    def test_os_mutation_root_and_lock_creation_are_acled(self, tmp_path):
+        from hermes_cli import windows_permissions
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        store = OSKeystore(str(profile.resolve()))
+        restrict_file = mock.Mock()
+        restrict_directory = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                restrict_directory,
+            ),
+        ):
+            with store._mutation_lock():
+                pass
+
+        root = profile / "secrets"
+        restrict_directory.assert_called_with(root)
+        restrict_file.assert_called_with(root / "keystore.lock")
+
+    @pytest.mark.parametrize("kind", ["file", "directory"])
+    def test_windows_acl_failures_raise_keystore_error(self, tmp_path, kind):
+        from hermes_cli import windows_permissions
+
+        failure = windows_permissions.WindowsAclError("access denied")
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                side_effect=failure if kind == "file" else None,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                side_effect=failure if kind == "directory" else None,
+            ),
+            pytest.raises(KeystoreError, match="ACL"),
+        ):
+            FileKeystore(tmp_path / "secrets").set("K", "value")
+
+
 def _concurrent_file_writer(root, prefix, start, count):
     """Spawn-safe worker used by the real cross-process transaction test."""
     store = FileKeystore(Path(root))
@@ -277,9 +390,42 @@ class TestFileKeystore:
         with (
             mock.patch("hermes_cli.secret_keystore.os.name", "nt"),
             mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
         ):
             with secret_keystore._store_lock(tmp_path):
                 assert lock_path.read_bytes() == b"\0"
+        restrict.assert_called_once_with(lock_path)
+
+    def test_windows_secure_false_still_acls_a_new_repair_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+
+        with (
+            mock.patch("hermes_cli.secret_keystore._is_windows", return_value=True),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            with secret_keystore._store_lock(tmp_path, secure=False):
+                pass
+
+        restrict.assert_called_once_with(lock_path)
+
+    def test_windows_secure_false_preserves_an_existing_repair_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+        lock_path.touch()
+
+        with (
+            mock.patch("hermes_cli.secret_keystore._is_windows", return_value=True),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            with secret_keystore._store_lock(tmp_path, secure=False):
+                pass
+
+        restrict.assert_not_called()
 
 
 class TestContainerKeyPersistence:

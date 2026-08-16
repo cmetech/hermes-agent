@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import io
+import logging
 import os
 import sys
 import threading
@@ -392,8 +393,6 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         path_key = str(path.resolve())
         if path_key not in _WARNED_UTF32_PATHS:
             _WARNED_UTF32_PATHS.add(path_key)
-            import logging
-
             logging.getLogger(__name__).warning(
                 "Skipping .env sanitize for %s: UTF-32 BOM detected; "
                 "leaving file untouched to avoid corruption",
@@ -449,7 +448,21 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
                     f.writelines(sanitized)
                     f.flush()
                     os.fsync(f.fileno())
-                atomic_replace(tmp, path)
+                replaced_path = Path(atomic_replace(tmp, path))
+                if sys.platform == "win32":
+                    from hermes_cli.windows_permissions import (
+                        WindowsAclError,
+                        restrict_file_to_current_user,
+                    )
+
+                    try:
+                        restrict_file_to_current_user(replaced_path)
+                    except WindowsAclError as exc:
+                        logging.getLogger(__name__).warning(
+                            "Windows ACL drift remains on startup-sanitized %s: %s",
+                            replaced_path,
+                            exc,
+                        )
             except BaseException:
                 try:
                     os.unlink(tmp)

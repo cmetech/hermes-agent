@@ -1,0 +1,221 @@
+"""Strict, stdlib-only Windows ACL boundaries for credential artifacts."""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from hermes_cli.plugin_secret_keys import without_plugin_secret_keys
+
+
+class WindowsAclError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class WindowsAclInspection:
+    secure: bool
+    detail: str | None
+
+
+_SID_RE = re.compile(r"^S-1-[0-9]+(?:-[0-9]+)+$")
+_TIMEOUT_SECONDS = 15
+_POWERSHELL = "powershell"
+
+_SCRIPT_PREFIX = (
+    "$ErrorActionPreference='Stop';"
+    "$p=$env:HERMES_ACL_PATH;"
+    "$id=New-Object System.Security.Principal.SecurityIdentifier("
+    "$env:HERMES_ACL_SID);"
+    "$acl=Get-Acl -LiteralPath $p;"
+)
+_PURGE_ACL = (
+    "$acl.SetAccessRuleProtection($true,$false);"
+    "foreach($r in @($acl.Access)){"
+    "[void]$acl.PurgeAccessRules($r.IdentityReference)};"
+)
+_FILE_RIGHTS = (
+    "$rights=[System.Security.AccessControl.FileSystemRights]::Read -bor "
+    "[System.Security.AccessControl.FileSystemRights]::Write;"
+)
+_DIRECTORY_RIGHTS = (
+    "$rights=[System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor "
+    "[System.Security.AccessControl.FileSystemRights]::Write -bor "
+    "[System.Security.AccessControl.FileSystemRights]::CreateFiles -bor "
+    "[System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor "
+    "[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles;"
+)
+_FILE_INHERITANCE = (
+    "$inheritance=[System.Security.AccessControl.InheritanceFlags]::None;"
+)
+_DIRECTORY_INHERITANCE = (
+    "$inheritance="
+    "[System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor "
+    "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit;"
+)
+_APPLY_SUFFIX = (
+    "$propagation=[System.Security.AccessControl.PropagationFlags]::None;"
+    "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
+    "$id,$rights,$inheritance,$propagation,"
+    "[System.Security.AccessControl.AccessControlType]::Allow);"
+    "$acl.AddAccessRule($rule);"
+    "Set-Acl -LiteralPath $p -AclObject $acl;"
+)
+_INSPECT_SUFFIX = (
+    "$access=@($acl.Access);"
+    "$secure=$acl.AreAccessRulesProtected -and $access.Count -eq 1;"
+    "$detail=$null;"
+    "if(-not $acl.AreAccessRulesProtected){$detail='ACL inheritance is enabled'}"
+    "elseif($access.Count -ne 1){$detail='expected exactly one explicit ACE'}"
+    "else{"
+    "$r=$access[0];"
+    "$ruleSid=$r.IdentityReference.Translate("
+    "[System.Security.Principal.SecurityIdentifier]);"
+    "$secure=$secure -and $ruleSid.Value -eq $id.Value -and "
+    "$r.AccessControlType -eq "
+    "[System.Security.AccessControl.AccessControlType]::Allow -and "
+    "($r.FileSystemRights -band $rights) -eq $rights -and "
+    "$r.InheritanceFlags -eq $inheritance -and "
+    "$r.PropagationFlags -eq "
+    "[System.Security.AccessControl.PropagationFlags]::None;"
+    "if(-not $secure){$detail='the explicit ACE does not match the current-user rule'}"
+    "};"
+    "[pscustomobject]@{secure=$secure;detail=$detail}|ConvertTo-Json -Compress;"
+)
+
+_APPLY_FILE_SCRIPT = (
+    _SCRIPT_PREFIX + _PURGE_ACL + _FILE_RIGHTS + _FILE_INHERITANCE + _APPLY_SUFFIX
+)
+_APPLY_DIRECTORY_SCRIPT = (
+    _SCRIPT_PREFIX
+    + _PURGE_ACL
+    + _DIRECTORY_RIGHTS
+    + _DIRECTORY_INHERITANCE
+    + _APPLY_SUFFIX
+)
+_INSPECT_FILE_SCRIPT = (
+    _SCRIPT_PREFIX + _FILE_RIGHTS + _FILE_INHERITANCE + _INSPECT_SUFFIX
+)
+_INSPECT_DIRECTORY_SCRIPT = (
+    _SCRIPT_PREFIX
+    + _DIRECTORY_RIGHTS
+    + _DIRECTORY_INHERITANCE
+    + _INSPECT_SUFFIX
+)
+
+
+def _filtered_environment() -> dict[str, str]:
+    return without_plugin_secret_keys(os.environ)
+
+
+def _current_windows_sid() -> str:
+    """Resolve the current account by SID without localized account names."""
+    try:
+        completed = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_SECONDS,
+            check=False,
+            env=_filtered_environment(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    try:
+        rows = csv.reader(completed.stdout.splitlines())
+        fields = next(rows, ())
+    except (csv.Error, StopIteration):
+        return ""
+    for field in fields:
+        candidate = field.strip()
+        if candidate.startswith("S-1-"):
+            return candidate
+    return ""
+
+
+def _validated_sid() -> str:
+    sid = _current_windows_sid()
+    if not sid:
+        raise WindowsAclError("current-user SID is unavailable")
+    if len(sid) > 184 or _SID_RE.fullmatch(sid) is None:
+        raise WindowsAclError("current-user SID is invalid")
+    return sid
+
+
+def _run_powershell(script: str, path: Path) -> subprocess.CompletedProcess[str]:
+    sid = _validated_sid()
+    child_env = _filtered_environment()
+    child_env["HERMES_ACL_PATH"] = str(Path(path))
+    child_env["HERMES_ACL_SID"] = sid
+    try:
+        completed = subprocess.run(
+            [
+                _POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_SECONDS,
+            check=False,
+            env=child_env,
+        )
+    except FileNotFoundError as exc:
+        raise WindowsAclError("PowerShell is unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WindowsAclError("PowerShell ACL operation timed out") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WindowsAclError("PowerShell ACL operation could not start") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown failure").strip()
+        raise WindowsAclError(f"PowerShell ACL operation failed: {detail}")
+    return completed
+
+
+def restrict_file_to_current_user(path: Path) -> None:
+    _run_powershell(_APPLY_FILE_SCRIPT, Path(path))
+
+
+def restrict_directory_to_current_user(path: Path) -> None:
+    _run_powershell(_APPLY_DIRECTORY_SCRIPT, Path(path))
+
+
+def _inspect(path: Path, script: str) -> WindowsAclInspection:
+    completed = _run_powershell(script, Path(path))
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise WindowsAclError("PowerShell ACL inspection returned invalid data") from exc
+    if not isinstance(payload, dict) or type(payload.get("secure")) is not bool:
+        raise WindowsAclError("PowerShell ACL inspection returned invalid data")
+    detail = payload.get("detail")
+    if detail is not None and not isinstance(detail, str):
+        raise WindowsAclError("PowerShell ACL inspection returned invalid data")
+    return WindowsAclInspection(secure=payload["secure"], detail=detail)
+
+
+def inspect_file_acl(path: Path) -> WindowsAclInspection:
+    return _inspect(Path(path), _INSPECT_FILE_SCRIPT)
+
+
+def inspect_directory_acl(path: Path) -> WindowsAclInspection:
+    return _inspect(Path(path), _INSPECT_DIRECTORY_SCRIPT)
+
+
+__all__ = [
+    "WindowsAclError",
+    "WindowsAclInspection",
+    "inspect_directory_acl",
+    "inspect_file_acl",
+    "restrict_directory_to_current_user",
+    "restrict_file_to_current_user",
+]

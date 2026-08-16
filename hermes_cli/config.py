@@ -862,110 +862,6 @@ def _is_container() -> bool:
     return False
 
 
-# Belt and braces: the SID comes from `whoami /user`, but it is checked
-# against this before reaching PowerShell so a surprising whoami cannot
-# widen the surface.
-_SID_RE = re.compile(r"^S-1-[0-9-]{1,60}$")
-
-
-def _current_windows_sid() -> str:
-    """Return the current account's SID as a string, or "" if unavailable.
-
-    A SID rather than DOMAIN\\user because the DACL is built by SID: names
-    are localised ("Administratoren"), ambiguous between the local SAM and
-    the domain, and a name that fails to resolve turns a permission tightening
-    into an error. The SID is stable and unambiguous.
-
-    whoami is present on every supported Windows and needs no pywin32.
-    """
-    try:
-        completed = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if completed.returncode != 0:
-        return ""
-    # Output: "DOMAIN\user","S-1-5-21-..."
-    fields = [f.strip().strip('"') for f in completed.stdout.strip().split(",")]
-    for field in fields:
-        if field.startswith("S-1-"):
-            return field
-    return ""
-
-
-def _windows_restrict_acl(path) -> bool:
-    """Leave exactly one ACE: the current user. True if applied.
-
-    icacls cannot express "replace the whole DACL" -- ``/inheritance:r``
-    drops only *inherited* ACEs, and ``/remove:g`` drops only the SIDs you
-    name, so neither reaches an explicit ACE left by an older Hermes, a
-    restore from backup, or a copy from another profile. Enumerating them
-    first is possible but means parsing localised icacls output.
-
-    PowerShell can express it directly. ``SetAccessRuleProtection($true,
-    $false)`` detaches inheritance and discards the inherited copies;
-    ``PurgeAccessRules`` removes every explicit rule for an identity; the
-    single ``AddAccessRule`` then leaves exactly one ACE. Identities are
-    well-known SIDs, not names: "Administrators" is "Administratoren" on a
-    German install and "Administrateurs" on a French one, and a name that
-    does not resolve makes icacls fail rather than skip.
-    """
-    sid = _current_windows_sid()
-    if not sid:
-        # Without a SID the DACL cannot be built correctly. Returning False
-        # lets the caller warn; doing nothing and reporting success would be
-        # the one outcome worse than the gap being fixed.
-        return False
-
-    if not _SID_RE.fullmatch(sid):
-        return False
-
-    # The path is user-controlled and must never be interpolated into the
-    # script body: Windows permits single quotes in file names, so a
-    # directory called  it's ok'; <code>; $x='  would execute as code.
-    #
-    # It is passed through the ENVIRONMENT instead. powershell.exe's
-    # `-Command <string>` form does not populate $args -- that only works for
-    # `-File script.ps1 a b` or an explicit script block -- so an earlier
-    # draft's `-Command ... -args path sid` silently passed nothing and the
-    # script would have operated on $null. Environment variables need no
-    # quoting, are never parsed as source, and work with -Command.
-    script = (
-        "$ErrorActionPreference='Stop';"
-        "$p=$env:HERMES_ACL_PATH;"
-        "$id=New-Object System.Security.Principal.SecurityIdentifier("
-        "$env:HERMES_ACL_SID);"
-        "$acl=Get-Acl -LiteralPath $p;"
-        # $true = protect from inheritance, $false = do not copy inherited ACEs
-        "$acl.SetAccessRuleProtection($true,$false);"
-        # Drop every explicit rule, including ones for identities we cannot name
-        "foreach($r in @($acl.Access)){[void]$acl.PurgeAccessRules($r.IdentityReference)};"
-        "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
-        "$id,'Read,Write','Allow');"
-        "$acl.AddAccessRule($rule);"
-        "Set-Acl -LiteralPath $p -AclObject $acl;"
-    )
-    child_env = dict(os.environ)
-    child_env["HERMES_ACL_PATH"] = str(path)
-    child_env["HERMES_ACL_SID"] = sid
-    try:
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            timeout=15,
-            check=False,
-            env=child_env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
-
-
 def _secure_file(path):
     """Restrict a file to its owner.
 
@@ -989,8 +885,16 @@ def _secure_file(path):
         return
 
     if sys.platform == "win32":
-        if _windows_restrict_acl(path):
+        from hermes_cli.windows_permissions import (
+            WindowsAclError,
+            restrict_file_to_current_user,
+        )
+
+        try:
+            restrict_file_to_current_user(Path(path))
             return
+        except WindowsAclError:
+            pass
         key = str(path)
         if key not in _WARNED_ACL_PATHS:
             _WARNED_ACL_PATHS.add(key)
@@ -1006,6 +910,23 @@ def _secure_file(path):
         os.chmod(path, 0o600)
     except (OSError, NotImplementedError):
         pass
+
+
+def _secure_credential_file(path: Path) -> None:
+    """Apply the strict credential boundary after a Windows replacement."""
+    if sys.platform != "win32":
+        return
+    from hermes_cli.windows_permissions import (
+        WindowsAclError,
+        restrict_file_to_current_user,
+    )
+
+    try:
+        restrict_file_to_current_user(Path(path))
+    except WindowsAclError as exc:
+        raise ConfigurationPersistenceError(
+            f"could not enforce credential ACL on {path}"
+        ) from exc
 
 
 def _ensure_default_soul_md(home: Path) -> None:
@@ -4041,14 +3962,17 @@ def sanitize_env_file() -> int:
             f.writelines(sanitized)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
+        replaced_path = Path(atomic_replace(tmp_path, env_path))
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
-    _secure_file(env_path)
+    if sys.platform == "win32":
+        _secure_credential_file(replaced_path)
+    else:
+        _secure_file(env_path)
     invalidate_env_cache()
     return fixes
 
@@ -4235,16 +4159,17 @@ def _save_env_value_locked(
             f.writelines(lines)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
+        replaced_path = Path(atomic_replace(tmp_path, env_path))
         # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
         # instead of letting _secure_file unconditionally tighten to 0600.
-        if original_mode is not None:
+        if original_mode is not None and sys.platform != "win32":
             try:
                 os.chmod(env_path, original_mode)
             except OSError:
                 pass
-        else:
+        elif sys.platform != "win32":
             _secure_file(env_path)
+        _secure_credential_file(replaced_path)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -4353,17 +4278,18 @@ def _remove_env_value_locked(
                 f.writelines(new_lines)
                 f.flush()
                 os.fsync(f.fileno())
-            atomic_replace(tmp_path, env_path)
+            replaced_path = Path(atomic_replace(tmp_path, env_path))
             # Preserve the original file mode (e.g. 0640 for Docker volume
             # mounts) instead of letting _secure_file unconditionally tighten
             # to 0600. Mirrors save_env_value().
-            if original_mode is not None:
+            if original_mode is not None and sys.platform != "win32":
                 try:
                     os.chmod(env_path, original_mode)
                 except OSError:
                     pass
-            else:
+            elif sys.platform != "win32":
                 _secure_file(env_path)
+            _secure_credential_file(replaced_path)
         except BaseException:
             try:
                 os.unlink(tmp_path)

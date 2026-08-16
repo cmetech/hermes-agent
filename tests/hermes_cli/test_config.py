@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from hermes_cli.config import (
+    ConfigurationPersistenceError,
     DEFAULT_CONFIG,
     check_config_version,
     get_hermes_home,
@@ -29,6 +30,101 @@ from hermes_cli.config import (
     write_platform_config_field,
     _sanitize_env_lines,
 )
+
+
+class TestWindowsCredentialAclBoundaries:
+    def test_save_env_value_acls_resolved_target_after_existing_file_replacement(
+        self, tmp_path
+    ):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        real_env = tmp_path / "credentials.env"
+        real_env.write_text("KEEP=present\nTOKEN=old\n", encoding="utf-8")
+        (tmp_path / ".env").symlink_to(real_env.name)
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(config_module, "ensure_hermes_home", return_value=None),
+            patch.object(
+                windows_permissions, "restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            save_env_value("TOKEN", "new", mirror_process_env=False)
+
+        restrict.assert_called_once_with(real_env)
+        assert real_env.read_text(encoding="utf-8") == "KEEP=present\nTOKEN=new\n"
+        assert (tmp_path / ".env").is_symlink()
+
+    def test_remove_env_value_acls_existing_env_after_replacement(self, tmp_path):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("KEEP=present\nDROP=gone\n", encoding="utf-8")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(
+                windows_permissions, "restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            assert remove_env_value("DROP", mirror_process_env=False)
+
+        restrict.assert_called_once_with(env_path)
+        assert env_path.read_text(encoding="utf-8") == "KEEP=present\n"
+
+    def test_sanitize_env_file_acls_replacement(self, tmp_path):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        env_path = tmp_path / ".env"
+        env_path.write_bytes(b" TOKEN=value\n")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(
+                windows_permissions, "restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            assert sanitize_env_file() == 1
+
+        restrict.assert_called_once_with(env_path)
+        assert env_path.read_bytes() == b"TOKEN=value\n"
+
+    @pytest.mark.parametrize("operation", ["save", "remove", "sanitize"])
+    def test_credential_acl_failure_is_a_configuration_persistence_error(
+        self, tmp_path, operation
+    ):
+        from hermes_cli import config as config_module
+        from hermes_cli import windows_permissions
+
+        env_path = tmp_path / ".env"
+        if operation == "sanitize":
+            env_path.write_bytes(b" TOKEN=value\n")
+        else:
+            env_path.write_text("TOKEN=old\nDROP=gone\n", encoding="utf-8")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False),
+            patch.object(config_module.sys, "platform", "win32"),
+            patch.object(config_module, "_is_container", return_value=False),
+            patch.object(config_module, "ensure_hermes_home", return_value=None),
+            patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                side_effect=windows_permissions.WindowsAclError("access denied"),
+            ),
+            pytest.raises(ConfigurationPersistenceError, match="ACL"),
+        ):
+            if operation == "save":
+                save_env_value("TOKEN", "new", mirror_process_env=False)
+            elif operation == "remove":
+                remove_env_value("DROP", mirror_process_env=False)
+            else:
+                sanitize_env_file()
 
 
 class TestGetHermesHome:
