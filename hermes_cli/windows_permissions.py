@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import re
@@ -131,13 +132,22 @@ def _current_windows_sid() -> str:
     if completed.returncode != 0:
         return ""
     try:
-        rows = list(csv.reader(completed.stdout.splitlines()))
+        rows = list(
+            csv.reader(
+                io.StringIO(completed.stdout, newline=""),
+                strict=True,
+            )
+        )
     except csv.Error:
         return ""
     if len(rows) != 1 or len(rows[0]) != 2:
         return ""
-    candidate = rows[0][1].strip()
-    return candidate if candidate.startswith("S-1-") else ""
+    account, candidate = rows[0]
+    if not account.strip():
+        return ""
+    if len(candidate) > 184 or _SID_RE.fullmatch(candidate) is None:
+        return ""
+    return candidate
 
 
 def _validated_sid() -> str:

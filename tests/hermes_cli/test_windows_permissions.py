@@ -204,8 +204,25 @@ def test_sid_lookup_filters_plugin_secrets_from_its_child(tmp_path, monkeypatch)
         f'"{SID}","DOMAIN\\user"\n',
         f'"DOMAIN\\user","{SID}"\n"OTHER\\user","{SID}"\n',
         f'"DOMAIN\\user","{SID}"\n\n',
+        f'"DOMAIN\\user","{SID}\n',
+        f'"DOMAIN\\user","{SID}"  \n',
+        f'"","{SID}"\n',
+        f'"   ","{SID}"\n',
+        f'"DOMAIN\\user"," {SID}"\n',
+        f'"DOMAIN\\user","{SID} "\n',
     ],
-    ids=["extra-field", "sid-in-wrong-field", "extra-row", "trailing-blank-row"],
+    ids=[
+        "extra-field",
+        "sid-in-wrong-field",
+        "extra-row",
+        "trailing-blank-row",
+        "unterminated-quote",
+        "spaces-after-closing-sid-quote",
+        "empty-account",
+        "blank-account",
+        "leading-sid-whitespace",
+        "trailing-sid-whitespace",
+    ],
 )
 def test_whoami_sid_requires_exactly_one_two_field_csv_row(
     tmp_path, monkeypatch, stdout
