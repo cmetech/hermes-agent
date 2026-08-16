@@ -1298,6 +1298,7 @@ def delete_secret(key: str) -> None:
             os_store = OSKeystore(profile_identity)
 
             tiers: tuple[SecretAuthority, ...] = ()
+            pre_registry_os_unknown = False
             if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
                 _assert_mutation_mode(mode, authority)
                 tiers = (authority,)
@@ -1307,12 +1308,15 @@ def delete_secret(key: str) -> None:
                     file_store=file_store,
                     os_store=os_store,
                 )
-                _value, tiers = _infer_pre_registry_tiers(
-                    file_value,
-                    os_known,
-                    os_value,
-                    mode=mode,
-                )
+                if os_known:
+                    _value, tiers = _infer_pre_registry_tiers(
+                        file_value,
+                        os_known,
+                        os_value,
+                        mode=mode,
+                    )
+                else:
+                    pre_registry_os_unknown = True
 
             # Plaintext removal is deliberately first and is never compensated.
             # A retry therefore cannot resurrect a legacy value after a later
@@ -1324,6 +1328,10 @@ def delete_secret(key: str) -> None:
                 strict=True,
                 mirror_process_env=False,
             )
+            if pre_registry_os_unknown:
+                raise KeystoreError(
+                    "cannot determine OS keystore state for unregistered secret"
+                )
             for tier in tiers:
                 _delete_tier(
                     tier,

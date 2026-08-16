@@ -1555,6 +1555,35 @@ class TestDurableAuthority:
 
         assert sk.get_authority(self.KEY) is None
 
+    def test_delete_unregistered_secret_fails_after_plaintext_removal_when_os_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        profile_identity = str(home.resolve())
+        fake = _FakeKeyring(fail=True)
+        account = sk._os_account_name(self.KEY, profile_identity)
+        fake.store[(SERVICE_NAME, account)] = "pre-registry-os-value"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        home.mkdir(parents=True)
+        env_path = home / ".env"
+        env_path.write_text(f"{self.KEY}=legacy-plaintext\n", encoding="utf-8")
+
+        with mock.patch.object(sk, "keyring", fake):
+            with pytest.raises(KeystoreError, match="OS.*unknown|determine OS"):
+                sk.delete_secret(self.KEY)
+
+            assert self.KEY not in env_path.read_text(encoding="utf-8")
+            assert sk.get_authority(self.KEY) is None
+
+            fake.fail = False
+            assert OSKeystore(profile_identity).get(self.KEY) == "pre-registry-os-value"
+
+            sk.delete_secret(self.KEY)
+
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.CLEARED
+            assert OSKeystore(profile_identity).get(self.KEY) is None
+
     def test_unregistered_legacy_value_remains_compatible(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
 
