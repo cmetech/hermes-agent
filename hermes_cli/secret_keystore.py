@@ -548,15 +548,28 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
     a process crashes. The thread lock is also required because POSIX flock
     ownership semantics alone do not provide a portable same-process mutex.
     """
+    try:
+        root_info = root.lstat()
+    except OSError as exc:
+        raise KeystoreError(f"secret transaction root is unavailable at {root}") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise KeystoreError(f"secret transaction root is not a direct directory: {root}")
     lock_path = root / _LOCK_FILE
     with _FILE_THREAD_LOCK:
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(str(lock_path), flags, 0o600)
-        except FileNotFoundError as exc:
+        except OSError as exc:
             raise KeystoreError(
-                f"secret transaction lock is missing at {lock_path}"
+                f"secret transaction lock is unavailable at {lock_path}"
             ) from exc
+        lock_info = os.fstat(fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            os.close(fd)
+            raise KeystoreError(
+                f"secret transaction lock is not a regular file: {lock_path}"
+            )
         with os.fdopen(fd, "r+b") as handle:
             if secure:
                 _ensure_private_permissions(lock_path, 0o600)
@@ -588,13 +601,37 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
     """Establish and verify the required POSIX mode for a private path."""
     if os.name == "nt":
         return
+    fd: int | None = None
     try:
-        os.chmod(path, mode)
-        actual_mode = stat.S_IMODE(path.stat().st_mode)
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not (
+            stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)
+        ):
+            raise KeystoreError(f"refusing to chmod non-regular path {path}")
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise KeystoreError(f"path changed while securing permissions: {path}")
+        # Keep the established chmod failure seam while explicitly refusing
+        # link traversal. The already-open no-follow descriptor anchors and
+        # verifies the intended inode across this pathname operation.
+        os.chmod(path, mode, follow_symlinks=False)
+        after = path.lstat()
+        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+            raise KeystoreError(f"path changed while securing permissions: {path}")
+        os.fchmod(fd, mode)
+        actual_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    except KeystoreError:
+        raise
     except (OSError, NotImplementedError) as exc:
         raise KeystoreError(
             f"cannot secure permissions on {path} to {mode:o}"
         ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
     if actual_mode != mode:
         raise KeystoreError(
             f"cannot secure permissions on {path} to {mode:o}; "
@@ -728,6 +765,51 @@ def _secrets_root(profile_identity: str) -> Path:
     return Path(profile_identity) / "secrets"
 
 
+def _lstat_regular_artifact(path: Path) -> os.stat_result | None:
+    """Return no-follow metadata or reject a non-regular store artifact."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect secret-store artifact {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise KeystoreError(f"secret-store artifact is not a regular file: {path}")
+    return info
+
+
+def _read_regular_file_nofollow(
+    path: Path,
+    *,
+    expected: os.stat_result | None = None,
+) -> bytes:
+    """Read one direct regular file without traversing a symbolic link."""
+    expected = expected or _lstat_regular_artifact(path)
+    if expected is None:
+        raise KeystoreError(f"secret-store artifact is missing: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(str(path), flags)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise KeystoreError(f"secret-store artifact changed while reading: {path}")
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            return handle.read()
+    except KeystoreError:
+        raise
+    except OSError as exc:
+        raise KeystoreError(f"cannot read secret-store artifact {path}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _read_file_store_readonly(root: Path) -> dict[str, str]:
     """Validate and decrypt the file tier without creating or chmodding paths.
 
@@ -738,13 +820,25 @@ def _read_file_store_readonly(root: Path) -> dict[str, str]:
     private so ordinary resolution remains lazy and per-key.
     """
     root = Path(root)
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        root_info = None
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect secret-store root {root}") from exc
+    if root_info is not None and (
+        stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode)
+    ):
+        raise KeystoreError(f"secret-store root is not a direct directory: {root}")
     key_path = root / _KEY_FILE
     data_path = root / _DATA_FILE
-    key_exists = key_path.exists()
-    data_exists = data_path.exists()
+    key_info = _lstat_regular_artifact(key_path)
+    data_info = _lstat_regular_artifact(data_path)
+    key_exists = key_info is not None
+    data_exists = data_info is not None
     if not data_exists:
         if key_exists:
-            raw_key = key_path.read_bytes()
+            raw_key = _read_regular_file_nofollow(key_path, expected=key_info)
             if len(raw_key) != _KEY_BYTES:
                 raise KeystoreError(
                     f"corrupt key file {key_path}: expected {_KEY_BYTES} bytes, "
@@ -753,13 +847,13 @@ def _read_file_store_readonly(root: Path) -> dict[str, str]:
         return {}
     if not key_exists:
         raise KeystoreError("cannot decrypt secrets: missing encryption key")
-    key = key_path.read_bytes()
+    key = _read_regular_file_nofollow(key_path, expected=key_info)
     if len(key) != _KEY_BYTES:
         raise KeystoreError(
             f"corrupt key file {key_path}: expected {_KEY_BYTES} bytes, "
             f"got {len(key)}"
         )
-    blob = data_path.read_bytes()
+    blob = _read_regular_file_nofollow(data_path, expected=data_info)
     if len(blob) <= _NONCE_BYTES:
         raise KeystoreError("corrupt secret file")
     try:

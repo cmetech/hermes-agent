@@ -315,3 +315,12 @@ class TestEarlyReadOnlySecretRouting:
         from hermes_cli.main import _early_readonly_startup_target
 
         assert _early_readonly_startup_target(argv) is None
+
+    @pytest.mark.parametrize("prefix", ["--a", "--ap", "--app", "--appl"])
+    def test_apply_abbreviations_are_not_treated_as_apply(self, prefix):
+        from hermes_cli.main import _early_readonly_startup_target
+
+        assert (
+            _early_readonly_startup_target(["secrets", "repair", prefix])
+            == "secrets-repair"
+        )

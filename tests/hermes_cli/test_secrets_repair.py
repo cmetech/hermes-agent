@@ -8,6 +8,7 @@ never fall through to the developer's real keychain.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -506,6 +507,163 @@ def test_apply_rejects_a_stale_plan(profile, fake_keyring):
         apply_secret_repair(plan)
 
 
+def test_apply_rejects_changed_source_with_same_action_shape(
+    profile, fake_keyring, capsys
+):
+    import hermes_cli.secrets_repair as repair
+
+    original = "original-private-value"
+    replacement = "replacement-private-value"
+    write_file_secret(profile, value=original)
+    write_registry(profile, {KEY: SecretAuthority.FILE})
+    plan = plan_secret_repair(move_to="os")
+    assert [action.code for action in plan.actions] == ["MOVE_SECRET"]
+
+    write_file_secret(profile, value=replacement)
+    before = snapshot_tree(profile)
+    with pytest.raises(RepairRefusedError, match="state changed"):
+        apply_secret_repair(plan)
+
+    assert snapshot_tree(profile) == before
+    assert sk.get_authority(KEY) == "file"
+    assert sk.FileKeystore(profile / "secrets").get(KEY) == replacement
+    assert fake_keyring.value(KEY, profile) is None
+    args = build_secrets_parser().parse_args(
+        ["secrets", "repair", "--move-to", "os"]
+    )
+    assert args.func(args) == 0
+    public_text = (
+        repr(plan)
+        + repr(diagnose_secrets())
+        + repr(repair._PLAN_BINDINGS)
+        + capsys.readouterr().out
+    )
+    for sensitive in (original, replacement):
+        assert sensitive not in public_text
+        assert hashlib.sha256(sensitive.encode()).hexdigest() not in public_text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_absolute_authority_symlink_is_quarantined_without_following_target(
+    profile, fake_keyring, tmp_path
+):
+    root = profile / "secrets"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside-authority.json"
+    outside.write_bytes(b"outside-bytes-must-stay")
+    os.chmod(outside, 0o644)
+    (root / "authority.json").symlink_to(outside)
+    before_mode = stat.S_IMODE(outside.stat().st_mode)
+    before_bytes = outside.read_bytes()
+
+    report = diagnose_secrets()
+    assert "AUTHORITY_CORRUPT" in {finding.code for finding in report.findings}
+    plan = plan_secret_repair()
+    applied = apply_secret_repair(plan)
+
+    assert applied.failed == ()
+    assert outside.read_bytes() == before_bytes
+    assert stat.S_IMODE(outside.stat().st_mode) == before_mode
+    quarantined = applied.quarantine_paths[0] / "authority.json"
+    assert quarantined.is_symlink()
+    assert os.readlink(quarantined) == str(outside)
+    assert not (root / "authority.json").is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_dangling_authority_symlink_is_detected_and_quarantined(
+    profile, fake_keyring, tmp_path
+):
+    root = profile / "secrets"
+    root.mkdir(parents=True)
+    missing_target = tmp_path / "missing-outside-authority.json"
+    (root / "authority.json").symlink_to(missing_target)
+
+    assert "AUTHORITY_CORRUPT" in finding_codes()
+    applied = apply_secret_repair(plan_secret_repair())
+
+    assert applied.failed == ()
+    quarantined = applied.quarantine_paths[0] / "authority.json"
+    assert quarantined.is_symlink()
+    assert os.readlink(quarantined) == str(missing_target)
+    assert not missing_target.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+@pytest.mark.parametrize("dangling", [False, True])
+def test_file_key_symlink_is_quarantined_without_following_target(
+    profile, fake_keyring, tmp_path, dangling
+):
+    write_registry(profile, {KEY: SecretAuthority.FILE})
+    root = profile / "secrets"
+    outside = tmp_path / "outside-file-key"
+    if not dangling:
+        outside.write_bytes(b"x" * 32)
+        os.chmod(outside, 0o644)
+    (root / "keystore.key").symlink_to(outside)
+    (root / "keystore.enc").write_bytes(b"x" * 13)
+    before_bytes = None if dangling else outside.read_bytes()
+    before_mode = None if dangling else stat.S_IMODE(outside.stat().st_mode)
+
+    assert "FILE_STORE_CORRUPT" in finding_codes()
+    plan = plan_secret_repair(reset_unrecoverable=True)
+    applied = apply_secret_repair(plan, confirm_reset=True)
+
+    assert applied.failed == ()
+    quarantined = applied.quarantine_paths[0] / "keystore.key"
+    assert quarantined.is_symlink()
+    assert os.readlink(quarantined) == str(outside)
+    if dangling:
+        assert not outside.exists()
+    else:
+        assert outside.read_bytes() == before_bytes
+        assert stat.S_IMODE(outside.stat().st_mode) == before_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_permission_repair_refuses_a_replaced_symlink(
+    profile, fake_keyring, tmp_path
+):
+    write_registry(profile, {})
+    authority = profile / "secrets" / "authority.json"
+    os.chmod(profile / "secrets", 0o700)
+    os.chmod(profile / "secrets" / "keystore.lock", 0o600)
+    os.chmod(authority, 0o644)
+    plan = plan_secret_repair()
+    assert [action.code for action in plan.actions] == ["REPAIR_PERMISSIONS"]
+    valid_authority_bytes = authority.read_bytes()
+    authority.unlink()
+    outside = tmp_path / "outside-permission-target"
+    outside.write_bytes(valid_authority_bytes)
+    os.chmod(outside, 0o644)
+    authority.symlink_to(outside)
+    before_mode = stat.S_IMODE(outside.stat().st_mode)
+
+    with pytest.raises(RepairRefusedError, match="state changed"):
+        apply_secret_repair(plan)
+
+    assert outside.read_bytes() == valid_authority_bytes
+    assert stat.S_IMODE(outside.stat().st_mode) == before_mode
+
+
+def test_quarantine_refuses_paths_outside_direct_child(profile, fake_keyring, tmp_path):
+    import hermes_cli.secrets_repair as repair
+
+    root = profile / "secrets"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside-artifact"
+    outside.write_bytes(b"outside-bytes-must-stay")
+
+    with pytest.raises(RepairRefusedError, match="direct child"):
+        repair._quarantine_artifacts(
+            root,
+            [outside],
+            finding_codes=("AUTHORITY_CORRUPT",),
+        )
+
+    assert outside.read_bytes() == b"outside-bytes-must-stay"
+
+
 def build_secrets_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes")
     commands = parser.add_subparsers(dest="command")
@@ -537,6 +695,13 @@ def test_required_cli_forms_parse(argv, expected):
     args = build_secrets_parser().parse_args(argv)
     assert args.secrets_command == expected
     assert callable(args.func)
+
+
+@pytest.mark.parametrize("prefix", ["--a", "--ap", "--app", "--appl"])
+def test_repair_parser_rejects_apply_abbreviations(prefix):
+    with pytest.raises(SystemExit) as exc_info:
+        build_secrets_parser().parse_args(["secrets", "repair", prefix])
+    assert exc_info.value.code == 2
 
 
 def test_default_repair_cli_is_nonmutating_and_redacts_values(
@@ -633,3 +798,48 @@ def test_real_console_doctor_and_default_repair_are_byte_read_only(tmp_path):
         assert "unchanged-profile-bytes" not in result.stdout
         assert snapshot_tree(profile) == before
         assert not mutation_marker.exists()
+
+
+@pytest.mark.parametrize("prefix", ["--app", "--appl"])
+def test_real_console_apply_prefix_cannot_mutate_from_readonly_path(tmp_path, prefix):
+    repo = Path(__file__).resolve().parents[2]
+    hermes = repo / ".venv" / "bin" / "hermes"
+    profile = tmp_path / "profiles" / "prefix"
+    temp = profile / "secrets" / ".authority.json.prefix.tmp"
+    temp.parent.mkdir(parents=True)
+    temp.write_bytes(b"must-not-be-removed")
+    fake_modules = tmp_path / "fake-modules"
+    package = fake_modules / "keyring"
+    package.mkdir(parents=True)
+    mutation_marker = tmp_path / "keyring-mutated"
+    (package / "__init__.py").write_text(
+        "from . import errors\n"
+        "def get_password(service, account): return None\n"
+        "def set_password(service, account, value):\n"
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'set')\n"
+        "def delete_password(service, account):\n"
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'delete')\n",
+        encoding="utf-8",
+    )
+    (package / "errors.py").write_text(
+        "class PasswordDeleteError(Exception): pass\n", encoding="utf-8"
+    )
+    before = snapshot_tree(profile)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(profile)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(fake_modules), str(repo), env.get("PYTHONPATH", "")]
+    )
+
+    result = subprocess.run(
+        [str(hermes), "secrets", "repair", prefix],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 2
+    assert snapshot_tree(profile) == before
+    assert not mutation_marker.exists()

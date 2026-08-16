@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import secrets
 import stat
 import sys
+import threading
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +26,8 @@ from hermes_cli.secret_authority import (
     AuthorityRegistry,
     AuthorityRegistryError,
     SecretAuthority,
-    load_authority_registry,
+    _reject_duplicate_keys,
+    _validated_entries,
 )
 
 
@@ -83,12 +88,27 @@ class _SecretSnapshot:
     findings: tuple[SecretFinding, ...]
 
 
+@dataclass(frozen=True)
+class _PlanBinding:
+    fingerprint: bytes = field(repr=False)
+    move_to: Literal["os", "file"] | None
+    reset_unrecoverable: bool
+    actions: tuple[RepairAction, ...]
+    blocked_findings: tuple[SecretFinding, ...]
+
+
 _LIVE_FILE_MODES = {
     "keystore.key": 0o600,
     "keystore.enc": 0o600,
     "keystore.lock": 0o600,
     AUTHORITY_FILE: 0o600,
 }
+_PLAN_FINGERPRINT_KEY = secrets.token_bytes(32)
+_PLAN_BINDINGS: dict[
+    int,
+    tuple[weakref.ReferenceType[RepairPlan], _PlanBinding],
+] = {}
+_PLAN_BINDINGS_LOCK = threading.Lock()
 
 
 def _path_state(path: Path) -> tuple[int, int, int, int] | None:
@@ -97,6 +117,39 @@ def _path_state(path: Path) -> tuple[int, int, int, int] | None:
     except OSError:
         return None
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _load_authority_registry_readonly(root: Path) -> AuthorityRegistry | None:
+    """Read authority metadata without following a filesystem link."""
+    path = root / AUTHORITY_FILE
+    info = sk._lstat_regular_artifact(path)
+    if info is None:
+        return None
+    try:
+        raw = json.loads(
+            sk._read_regular_file_nofollow(path, expected=info).decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except AuthorityRegistryError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, sk.KeystoreError) as exc:
+        raise AuthorityRegistryError("cannot read authority registry") from exc
+    if not isinstance(raw, dict) or set(raw) != {"version", "authorities"}:
+        raise AuthorityRegistryError("invalid authority registry fields")
+    entries = _validated_entries(raw["version"], raw["authorities"])
+    return AuthorityRegistry(
+        version=AUTHORITY_VERSION,
+        entries=MappingProxyType(entries),
+    )
 
 
 def _finding(
@@ -118,27 +171,42 @@ def _inventory_keys() -> list[str]:
 
 
 def _inspect_permissions(root: Path) -> list[SecretFinding]:
-    if os.name == "nt" or not root.exists():
+    root_info = _lstat(root)
+    if (
+        os.name == "nt"
+        or root_info is None
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+    ):
         return []
     findings: list[SecretFinding] = []
     candidates = [(root, 0o700)]
-    candidates.extend(
-        (root / filename, mode)
-        for filename, mode in _LIVE_FILE_MODES.items()
-        if (root / filename).exists()
-    )
+    for filename, mode in _LIVE_FILE_MODES.items():
+        path = root / filename
+        info = _lstat(path)
+        if info is not None and stat.S_ISREG(info.st_mode):
+            candidates.append((path, mode))
     try:
         children = tuple(root.iterdir())
     except OSError:
         children = ()
-    candidates.extend(
-        (path, 0o600)
-        for path in children
-        if path.is_file() and path.name.startswith(".") and path.name.endswith(".tmp")
-    )
+    for path in children:
+        info = _lstat(path)
+        if (
+            info is not None
+            and stat.S_ISREG(info.st_mode)
+            and path.name.startswith(".")
+            and path.name.endswith(".tmp")
+        ):
+            candidates.append((path, 0o600))
     for path, expected in candidates:
         try:
-            actual = stat.S_IMODE(path.stat().st_mode)
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not (
+                stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+            ):
+                continue
+            actual = stat.S_IMODE(info.st_mode)
         except OSError:
             continue
         if actual != expected:
@@ -154,15 +222,21 @@ def _inspect_permissions(root: Path) -> list[SecretFinding]:
 
 
 def _abandoned_temp_findings(root: Path) -> list[SecretFinding]:
-    if not root.exists():
+    root_info = _lstat(root)
+    if (
+        root_info is None
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+    ):
         return []
     try:
         paths = sorted(
             path
             for path in root.iterdir()
-            if path.is_file()
-            and path.name.startswith(".")
+            if path.name.startswith(".")
             and path.name.endswith(".tmp")
+            and (info := _lstat(path)) is not None
+            and (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode))
         )
     except OSError:
         return []
@@ -185,19 +259,24 @@ def _inspect_secrets() -> _SecretSnapshot:
 
     registry: AuthorityRegistry | None = None
     registry_corrupt = False
-    if (root / AUTHORITY_FILE).exists():
-        try:
-            registry = load_authority_registry(root)
-        except (AuthorityRegistryError, OSError):
-            registry_corrupt = True
-            findings.append(
-                _finding(
-                    "AUTHORITY_CORRUPT",
-                    "error",
-                    None,
-                    "the authority registry is unreadable or invalid",
-                )
+    root_info = _lstat(root)
+    root_unsafe = root_info is not None and (
+        stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode)
+    )
+    try:
+        if root_unsafe:
+            raise AuthorityRegistryError("unsafe secret-store root")
+        registry = _load_authority_registry_readonly(root)
+    except (AuthorityRegistryError, OSError, sk.KeystoreError):
+        registry_corrupt = True
+        findings.append(
+            _finding(
+                "AUTHORITY_CORRUPT",
+                "error",
+                None,
+                "the authority registry is unreadable or invalid",
             )
+        )
     authorities = dict(registry.entries) if registry is not None else {}
 
     file_corrupt = False
@@ -611,6 +690,104 @@ def _build_plan(
     return RepairPlan(actions=ordered_actions, blocked_findings=ordered_blocked)
 
 
+def _keyed_value_digest(tier: str, key: str, value: str | None) -> str:
+    marker = b"absent" if value is None else b"present\0" + value.encode("utf-8")
+    message = b"value\0" + tier.encode() + b"\0" + key.encode() + b"\0" + marker
+    return hmac.new(_PLAN_FINGERPRINT_KEY, message, hashlib.sha256).hexdigest()
+
+
+def _snapshot_fingerprint(snapshot: _SecretSnapshot) -> bytes:
+    value_digests: list[tuple[str, str, str]] = []
+    if snapshot.file_values is not None:
+        value_digests.extend(
+            ("file", key, _keyed_value_digest("file", key, snapshot.file_values.get(key)))
+            for key in snapshot.keys
+        )
+    if snapshot.os_available:
+        value_digests.extend(
+            ("os", key, _keyed_value_digest("os", key, snapshot.os_values.get(key)))
+            for key in snapshot.keys
+        )
+    artifact_states = sorted(
+        (path, state, snapshot.path_modes[path])
+        for path, state in snapshot.path_states.items()
+        if Path(path) != snapshot.root and Path(path).name != sk._LOCK_FILE
+    )
+    payload = {
+        "mode": snapshot.configured_mode,
+        "registry_corrupt": snapshot.registry_corrupt,
+        "authorities": sorted(
+            (key, authority.value) for key, authority in snapshot.authorities.items()
+        ),
+        "keys": snapshot.keys,
+        "file_corrupt": snapshot.file_corrupt,
+        "os_available": snapshot.os_available,
+        "value_digests": value_digests,
+        "artifact_states": artifact_states,
+        "findings": [
+            (finding.code, finding.severity, finding.key, finding.message)
+            for finding in snapshot.findings
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        _PLAN_FINGERPRINT_KEY,
+        b"snapshot\0" + encoded,
+        hashlib.sha256,
+    ).digest()
+
+
+def _bind_plan(
+    plan: RepairPlan,
+    snapshot: _SecretSnapshot,
+    *,
+    move_to: Literal["os", "file"] | None,
+    reset_unrecoverable: bool,
+) -> RepairPlan:
+    binding = _PlanBinding(
+        fingerprint=_snapshot_fingerprint(snapshot),
+        move_to=move_to,
+        reset_unrecoverable=reset_unrecoverable,
+        actions=plan.actions,
+        blocked_findings=plan.blocked_findings,
+    )
+    plan_id = id(plan)
+
+    def _discard(reference: weakref.ReferenceType[RepairPlan]) -> None:
+        with _PLAN_BINDINGS_LOCK:
+            current = _PLAN_BINDINGS.get(plan_id)
+            if current is not None and current[0] is reference:
+                _PLAN_BINDINGS.pop(plan_id, None)
+
+    reference = weakref.ref(plan, _discard)
+    with _PLAN_BINDINGS_LOCK:
+        _PLAN_BINDINGS[plan_id] = (reference, binding)
+    return plan
+
+
+def _plan_binding(plan: RepairPlan) -> _PlanBinding:
+    with _PLAN_BINDINGS_LOCK:
+        current = _PLAN_BINDINGS.get(id(plan))
+    if current is None or current[0]() is not plan:
+        raise RepairRefusedError("secret storage state changed after planning")
+    binding = current[1]
+    if (
+        plan.actions != binding.actions
+        or plan.blocked_findings != binding.blocked_findings
+    ):
+        raise RepairRefusedError("secret storage state changed after planning")
+    return binding
+
+
+def _assert_snapshot_bound(snapshot: _SecretSnapshot, binding: _PlanBinding) -> None:
+    if not hmac.compare_digest(_snapshot_fingerprint(snapshot), binding.fingerprint):
+        raise RepairRefusedError("secret storage state changed after planning")
+
+
 def plan_secret_repair(
     *,
     move_to: Literal["os", "file"] | None = None,
@@ -619,34 +796,18 @@ def plan_secret_repair(
     """Build a deterministic, side-effect-free repair plan."""
     if move_to not in {None, "os", "file"}:
         raise ValueError("move_to must be 'os', 'file', or None")
-    return _build_plan(
-        _inspect_secrets(),
+    snapshot = _inspect_secrets()
+    plan = _build_plan(
+        snapshot,
         move_to=move_to,
         reset_unrecoverable=reset_unrecoverable,
     )
-
-
-def _matching_plan_options(
-    snapshot: _SecretSnapshot,
-    plan: RepairPlan,
-) -> tuple[str | None, bool]:
-    """Recover non-public planning options by exact locked re-planning.
-
-    The approved public ``RepairPlan`` shape intentionally contains actions
-    and blockers only. Several option sets can produce the same safe actions;
-    trying the three bounded candidates preserves that public contract without
-    hiding an unverifiable mutable token in the plan.
-    """
-    reset = any(action.code == "RESET_UNRECOVERABLE" for action in plan.actions)
-    for move_to in (None, "os", "file"):
-        current = _build_plan(
-            snapshot,
-            move_to=move_to,
-            reset_unrecoverable=reset,
-        )
-        if current == plan:
-            return move_to, reset
-    raise RepairRefusedError("secret storage state changed after planning")
+    return _bind_plan(
+        plan,
+        snapshot,
+        move_to=move_to,
+        reset_unrecoverable=reset_unrecoverable,
+    )
 
 
 def _quarantine_artifacts(
@@ -655,8 +816,28 @@ def _quarantine_artifacts(
     *,
     finding_codes: tuple[str, ...],
 ) -> Path | None:
-    paths = [path for path in paths if path.exists()]
-    if not paths:
+    root = Path(os.path.abspath(root))
+    root_info = _lstat(root)
+    if root_info is None or stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(
+        root_info.st_mode
+    ):
+        raise RepairRefusedError("quarantine root is not a direct directory")
+    quarantinable: list[Path] = []
+    names: set[str] = set()
+    for candidate in paths:
+        path = Path(os.path.abspath(candidate))
+        if path.parent != root:
+            raise RepairRefusedError("quarantine artifact must be a direct child")
+        if path.name in names or path.name == "manifest.json":
+            raise RepairRefusedError("quarantine artifact name is not unique")
+        info = _lstat(path)
+        if info is None:
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            raise RepairRefusedError("quarantine artifact has unsupported file type")
+        names.add(path.name)
+        quarantinable.append(path)
+    if not quarantinable:
         return None
     quarantine_root = root / "quarantine"
     quarantine_root.mkdir(parents=True, exist_ok=True)
@@ -668,7 +849,7 @@ def _quarantine_artifacts(
     manifest = {
         "version": 1,
         "finding_codes": sorted(set(finding_codes)),
-        "paths": [path.name for path in paths],
+        "paths": [path.name for path in quarantinable],
     }
     sk._write_private(
         destination / "manifest.json",
@@ -676,9 +857,14 @@ def _quarantine_artifacts(
             "utf-8"
         ),
     )
-    for path in paths:
-        os.replace(path, destination / path.name)
-        sk._ensure_private_permissions(destination / path.name, 0o600)
+    for path in quarantinable:
+        quarantined_path = destination / path.name
+        os.replace(path, quarantined_path)
+        moved_info = quarantined_path.lstat()
+        if stat.S_ISREG(moved_info.st_mode):
+            sk._ensure_private_permissions(quarantined_path, 0o600)
+        elif not stat.S_ISLNK(moved_info.st_mode):
+            raise RepairRefusedError("quarantined artifact changed file type")
     return destination
 
 
@@ -751,6 +937,32 @@ def _assert_path_unchanged(snapshot: _SecretSnapshot, path: Path) -> None:
         raise RepairRefusedError("secret storage state changed after planning")
 
 
+def _assert_direct_repair_path(
+    root: Path,
+    path: Path,
+    *,
+    allow_root: bool = False,
+    allow_symlink: bool = False,
+) -> Path:
+    root = Path(os.path.abspath(root))
+    path = Path(os.path.abspath(path))
+    if not ((allow_root and path == root) or path.parent == root):
+        raise RepairRefusedError("repair target must be a direct child")
+    info = _lstat(path)
+    if info is None:
+        raise RepairRefusedError("secret storage state changed after planning")
+    if stat.S_ISLNK(info.st_mode):
+        if allow_symlink:
+            return path
+        raise RepairRefusedError("refusing to repair permissions through a symlink")
+    if not (
+        stat.S_ISREG(info.st_mode)
+        or (allow_root and path == root and stat.S_ISDIR(info.st_mode))
+    ):
+        raise RepairRefusedError("repair target has unsupported file type")
+    return path
+
+
 def apply_secret_repair(
     plan: RepairPlan,
     *,
@@ -759,6 +971,7 @@ def apply_secret_repair(
     """Apply a previously generated plan after locked state revalidation."""
     if not isinstance(plan, RepairPlan):
         raise TypeError("plan must be a RepairPlan")
+    binding = _plan_binding(plan)
     if plan.blocked_findings:
         raise RepairRefusedError("repair plan contains blocked findings")
     reset_requested = any(
@@ -771,6 +984,12 @@ def apply_secret_repair(
 
     profile_identity = sk._active_profile_identity()
     root = sk._secrets_root(profile_identity)
+    _assert_snapshot_bound(_inspect_secrets(), binding)
+    root_info = _lstat(root)
+    if root_info is not None and (
+        stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode)
+    ):
+        raise RepairRefusedError("secret storage root is not a direct directory")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     applied: list[RepairAction] = []
     quarantine_paths: list[Path] = []
@@ -781,7 +1000,8 @@ def apply_secret_repair(
     # visible to the comparison below.
     with sk._store_lock(root, secure=False):
         snapshot = _inspect_secrets()
-        move_to, _reset_unrecoverable = _matching_plan_options(snapshot, plan)
+        _assert_snapshot_bound(snapshot, binding)
+        move_to = binding.move_to
 
         priorities = {
             "REPAIR_PERMISSIONS": 0,
@@ -807,7 +1027,11 @@ def apply_secret_repair(
             try:
                 if action.code == "REPAIR_PERMISSIONS":
                     assert action.source is not None and action.destination is not None
-                    path = Path(action.source)
+                    path = _assert_direct_repair_path(
+                        root,
+                        Path(action.source),
+                        allow_root=True,
+                    )
                     _assert_path_unchanged(snapshot, path)
                     try:
                         current_mode = stat.S_IMODE(path.lstat().st_mode)
@@ -824,7 +1048,11 @@ def apply_secret_repair(
                     )
                 elif action.code == "CLEAN_ABANDONED_TEMP":
                     assert action.source is not None
-                    path = Path(action.source)
+                    path = _assert_direct_repair_path(
+                        root,
+                        Path(action.source),
+                        allow_symlink=True,
+                    )
                     _assert_path_unchanged(snapshot, path)
                     path.unlink()
                 elif action.code == "REBUILD_AUTHORITY":
@@ -866,7 +1094,7 @@ def apply_secret_repair(
                             action.source,
                             os_store=os_store,
                         )
-                        registry = load_authority_registry(root)
+                        registry = _load_authority_registry_readonly(root)
                         sk._write_authority_registry(
                             root,
                             _registry_with(
@@ -906,7 +1134,7 @@ def apply_secret_repair(
                         action.destination,
                         os_store=os_store,
                     )
-                    registry = load_authority_registry(root)
+                    registry = _load_authority_registry_readonly(root)
                     sk._write_authority_registry(
                         root,
                         _registry_with(
@@ -951,7 +1179,7 @@ def apply_secret_repair(
                         quarantine_paths.append(quarantine)
                     _initialize_clean_file_store(root)
                     file_store = sk.FileKeystore(root)
-                    registry = load_authority_registry(root)
+                    registry = _load_authority_registry_readonly(root)
                     file_keys = tuple(
                         key
                         for key, authority in (registry.entries if registry else {}).items()
@@ -1095,7 +1323,9 @@ def register_cli(subparsers) -> None:
     )
     doctor.set_defaults(func=_handle_secrets_doctor)
     repair = subparsers.add_parser(
-        "repair", help="Plan or explicitly apply secret-storage repairs"
+        "repair",
+        help="Plan or explicitly apply secret-storage repairs",
+        allow_abbrev=False,
     )
     repair.add_argument("--apply", action="store_true", help="Apply the printed plan")
     repair.add_argument("--move-to", choices=("os", "file"))
