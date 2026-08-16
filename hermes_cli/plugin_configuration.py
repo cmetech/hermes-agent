@@ -1039,7 +1039,8 @@ class PluginConfigurationService:
 
     def _resolved(self, plugin_id: str, loaded) -> tuple[dict[str, Any], set[str]]:
         stored = self._settings(plugin_id)
-        secret_values = self._profile_secret_values()
+        legacy_secret_values = self._profile_secret_values()
+        live_secret_overrides = self._live_secret_overrides()
         resolved: dict[str, Any] = {}
         invalid: set[str] = set()
         for field in loaded.manifest.configuration.fields:
@@ -1047,10 +1048,21 @@ class PluginConfigurationService:
             value = None
             if field.storage is FieldStorage.SECRET:
                 storage_key = _secret_storage_key(plugin_id, field.id)
-                value = secret_keystore.resolve_secret(
-                    storage_key,
-                    legacy_value=secret_values.get(storage_key),
-                )
+                value = live_secret_overrides.get(storage_key)
+                if value in {None, ""}:
+                    # An explicit empty live authority still suppresses the
+                    # lower-precedence plaintext profile value, matching the
+                    # previous merged-ladder behavior before consulting the
+                    # durable authority.
+                    legacy_value = (
+                        None
+                        if storage_key in live_secret_overrides
+                        else legacy_secret_values.get(storage_key)
+                    )
+                    value = secret_keystore.resolve_secret(
+                        storage_key,
+                        legacy_value=legacy_value,
+                    )
                 if value not in {None, ""}:
                     present = True
             elif field.id in stored:
@@ -1068,21 +1080,30 @@ class PluginConfigurationService:
 
     @staticmethod
     def _profile_secret_values() -> dict[str, str]:
-        """Merge credential authorities without consulting process-global env.
+        """Read only the current profile's legacy plaintext secret values."""
+        from hermes_cli.config import load_env
 
-        Lowest to highest precedence is the current profile file, its hydrated
-        external-secret snapshot, the installed context-local secret scope,
-        then administrator-managed env. A scope miss therefore observes a
-        newly persisted profile value, while an explicit scoped/external or
-        managed authority continues to override plaintext profile storage.
+        return {
+            key: value
+            for key, value in load_env().items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+
+    @staticmethod
+    def _live_secret_overrides() -> dict[str, str]:
+        """Merge live credential authorities without process-global env.
+
+        Lowest to highest precedence is the hydrated external-secret snapshot,
+        the installed context-local secret scope, then administrator-managed
+        env. These live authorities override both durable registered state and
+        the separately read legacy plaintext profile value.
         """
         from agent.secret_scope import current_secret_scope
         from hermes_cli import env_loader, managed_scope
-        from hermes_cli.config import load_env
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        values = load_env()
+        values: dict[str, str] = {}
         try:
             values.update(env_loader.get_secret_source_values(home))
         except Exception:

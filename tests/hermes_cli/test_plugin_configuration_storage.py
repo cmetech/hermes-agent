@@ -18,6 +18,23 @@ from hermes_cli.plugin_configuration import (
 from hermes_cli.plugins import LoadedPlugin, PluginManager, PluginManifest
 
 
+class _MemoryKeyring:
+    def __init__(self):
+        self.values = {}
+
+    def get_password(self, service, name):
+        return self.values.get((service, name))
+
+    def set_password(self, service, name, value):
+        self.values[(service, name)] = value
+
+    def delete_password(self, service, name):
+        try:
+            del self.values[(service, name)]
+        except KeyError as exc:
+            raise sk._PasswordDeleteError("already absent") from exc
+
+
 @pytest.fixture(autouse=True)
 def _isolate_real_keyring(monkeypatch):
     """No plugin-storage test may touch the developer's actual keychain."""
@@ -852,7 +869,7 @@ def test_plugin_context_lookup_is_storage_authorized_and_cross_plugin_isolated(
         assert str(unavailable.value) == "plugin configuration value unavailable"
 
 
-def test_plugin_context_registered_secret_ignores_legacy_aggregate_overrides(
+def test_plugin_context_live_overrides_registered_file_secret(
     tmp_path, monkeypatch
 ):
     from agent.secret_scope import reset_secret_scope, set_secret_scope
@@ -881,14 +898,14 @@ def test_plugin_context_registered_secret_ignores_legacy_aggregate_overrides(
     )
     assert (
         modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-        == "profile-file-secret"
+        == "external-secret"
     )
 
     scope_token = set_secret_scope({key: "installed-scope-secret"})
     try:
         assert (
             modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-            == "profile-file-secret"
+            == "installed-scope-secret"
         )
         monkeypatch.setattr(
             "hermes_cli.managed_scope.load_managed_env",
@@ -896,7 +913,7 @@ def test_plugin_context_registered_secret_ignores_legacy_aggregate_overrides(
         )
         assert (
             modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-            == "profile-file-secret"
+            == "managed-secret"
         )
     finally:
         reset_secret_scope(scope_token)
@@ -909,6 +926,32 @@ def _token_field(service):
         for field in service.detail("sample-connector")["fields"]
         if field["id"] == "token"
     )
+
+
+def _registered_service_secret(tmp_path, monkeypatch, authority):
+    from hermes_cli.plugin_configuration import _secret_storage_key
+
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(
+        "HERMES_SECRET_KEYSTORE", "os" if authority == "os" else "file"
+    )
+    if authority == "os":
+        monkeypatch.setattr(sk, "keyring", _MemoryKeyring())
+    sk.reset_backend_cache()
+    service, manager = _service(tmp_path)
+    key = _secret_storage_key("sample-connector", "token")
+    service.update("sample-connector", secrets={"token": "durable-secret"})
+    if authority == "cleared":
+        service.clear_secret("sample-connector", "token")
+    return home, service, manager, key
+
+
+def _write_stale_profile_secret(home, key):
+    from hermes_cli.config import invalidate_env_cache
+
+    (home / ".env").write_text(f"{key}=stale-plaintext\n", encoding="utf-8")
+    invalidate_env_cache()
 
 
 class TestKeystoreReadPath:
@@ -977,6 +1020,65 @@ class TestKeystoreReadPath:
             )
 
         assert resolved["token"] == "from-keystore"
+
+    @pytest.mark.parametrize("authority", ["file", "os", "cleared"])
+    @pytest.mark.parametrize("override", ["external", "scope", "managed"])
+    def test_registered_authority_yields_to_live_override(
+        self, tmp_path, monkeypatch, authority, override
+    ):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        home, service, manager, key = _registered_service_secret(
+            tmp_path, monkeypatch, authority
+        )
+        _write_stale_profile_secret(home, key)
+        live_value = f"{override}-live-secret"
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.get_secret_source_values",
+            lambda selected_home: {key: live_value} if override == "external" else {},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.load_managed_env",
+            lambda: {key: live_value} if override == "managed" else {},
+        )
+        scope_token = set_secret_scope(
+            {key: live_value} if override == "scope" else {}
+        )
+        try:
+            resolved, _invalid = service._resolved(
+                "sample-connector", manager._plugins["sample-connector"]
+            )
+        finally:
+            reset_secret_scope(scope_token)
+
+        assert resolved["token"] == live_value
+
+    @pytest.mark.parametrize(
+        ("authority", "expected"),
+        [
+            ("file", "durable-secret"),
+            ("os", "durable-secret"),
+            ("cleared", None),
+        ],
+    )
+    def test_registered_authority_suppresses_stale_plaintext_env(
+        self, tmp_path, monkeypatch, authority, expected
+    ):
+        home, service, manager, key = _registered_service_secret(
+            tmp_path, monkeypatch, authority
+        )
+        _write_stale_profile_secret(home, key)
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.get_secret_source_values",
+            lambda selected_home: {},
+        )
+        monkeypatch.setattr("hermes_cli.managed_scope.load_managed_env", lambda: {})
+
+        resolved, _invalid = service._resolved(
+            "sample-connector", manager._plugins["sample-connector"]
+        )
+
+        assert resolved.get("token") == expected
 
     def test_cleared_tombstone_ignores_restored_legacy_after_restart(
         self, tmp_path, monkeypatch
