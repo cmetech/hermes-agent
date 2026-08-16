@@ -296,6 +296,17 @@ _WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = (
 )
 _EARLY_READONLY_OWNS_STARTUP = _EARLY_READONLY_STARTUP_TARGET is not None
 
+
+def _authorized_early_readonly_startup_target(argv: list[str]) -> str | None:
+    """Classify current argv without upgrading a rejected startup candidate."""
+    target = _early_readonly_startup_target(argv)
+    if (
+        target == "secrets-migrate-dry-run"
+        and _EARLY_READONLY_STARTUP_TARGET != target
+    ):
+        return None
+    return target
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
@@ -953,7 +964,9 @@ _WORKFLOW_SCHEMA_EARLY_ARGS = _parse_workflow_schema_candidate(sys.argv[1:])
 _WORKFLOW_SCHEMA_READONLY_STARTUP = (
     _normal_dispatch_target(_WORKFLOW_SCHEMA_EARLY_ARGS) == "workflow-schema"
 )
-_SECRET_READONLY_EARLY_TARGET = _early_readonly_startup_target(sys.argv[1:])
+_SECRET_READONLY_EARLY_TARGET = _authorized_early_readonly_startup_target(
+    sys.argv[1:]
+)
 _EARLY_READONLY_STARTUP = (
     _WORKFLOW_SCHEMA_READONLY_STARTUP
     or _SECRET_READONLY_EARLY_TARGET
@@ -11525,7 +11538,7 @@ def _try_early_readonly() -> int | None:
     if _try_workflow_schema_readonly():
         return 0
     current_argv = list(sys.argv[1:])
-    target = _early_readonly_startup_target(current_argv)
+    target = _authorized_early_readonly_startup_target(current_argv)
     if target == "secrets-migrate-dry-run":
         from hermes_cli.secrets_migrate import _handle_secrets_migrate
 

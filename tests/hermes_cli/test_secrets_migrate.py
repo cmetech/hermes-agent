@@ -9,6 +9,12 @@ from unittest import mock
 import pytest
 
 import hermes_cli.secret_keystore as sk
+from hermes_cli.secret_authority import (
+    AUTHORITY_VERSION,
+    AuthorityRegistry,
+    SecretAuthority,
+    encode_authority_registry,
+)
 from hermes_cli.secrets_migrate import (
     MigrationReport,
     _handle_secrets_migrate,
@@ -72,6 +78,20 @@ class TestFindLegacySecrets:
             },
         ):
             assert find_legacy_secrets() == {}
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("os", "os"), (" FILE ", "file"), ("bogus", "auto")],
+)
+def test_dependency_light_mode_reader_matches_public_contract(
+    monkeypatch, configured, expected
+):
+    from hermes_cli.secrets_migrate import _get_configured_mode_readonly
+
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", configured)
+    assert _get_configured_mode_readonly() == expected
+    assert sk.get_configured_mode() == expected
 
 
 class TestMigrate:
@@ -276,7 +296,10 @@ class TestCommandHandler:
         assert "No plugin secrets found in .env" in capsys.readouterr().out
         get_backend.assert_not_called()
 
-    def test_dry_run_never_resolves_or_probes_backend(self, capsys):
+    def test_dry_run_never_resolves_or_probes_backend(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
         args = mock.Mock(dry_run=True)
         report = MigrationReport(migrated=[KEY], failed=[], dry_run=True)
         with mock.patch(
@@ -285,17 +308,36 @@ class TestCommandHandler:
             sk, "get_backend", side_effect=AssertionError("resolved")
         ), mock.patch.object(
             sk, "probe_os_keystore", side_effect=AssertionError("probed")
-        ), mock.patch.object(
-            sk,
-            "get_configured_mode",
-            return_value="auto",
         ):
             exit_code = _handle_secrets_migrate(args)
 
         output = capsys.readouterr().out
         assert exit_code == 0
-        assert "configured auto mode; backend not probed" in output
-        assert f"would migrate: {KEY}" in output
+        assert output == (
+            "Would migrate 1 secret(s) "
+            "(configured auto mode; backend not probed).\n"
+            f"  would migrate: {KEY}\n"
+        )
+
+    def test_candidate_free_dry_run_still_reports_non_probing_mode(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        report = MigrationReport(migrated=[], failed=[], dry_run=True)
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved")
+        ), mock.patch.object(
+            sk, "probe_os_keystore", side_effect=AssertionError("probed")
+        ):
+            exit_code = _handle_secrets_migrate(mock.Mock(dry_run=True))
+
+        assert exit_code == 0
+        assert capsys.readouterr().out == (
+            "Would migrate 0 secret(s) "
+            "(configured auto mode; backend not probed).\n"
+        )
 
     def test_dry_run_handler_does_not_create_an_absent_profile(
         self, tmp_path, monkeypatch, capsys
@@ -319,62 +361,84 @@ class TestCommandHandler:
         assert snapshot_tree(profile) == before == {}
         assert "configured auto mode; backend not probed" in capsys.readouterr().out
 
-    def test_real_migration_reports_committed_backend_after_writes(self, capsys):
-        events = []
-        backend = mock.Mock(name="backend")
-        backend.name = "file"
+    def test_real_file_migration_reports_backend_neutral_success(
+        self, tmp_path, capsys
+    ):
+        from hermes_cli import config
 
-        def migrate_after_writes(*, dry_run):
-            events.append(("migrate", dry_run))
-            return MigrationReport(migrated=[KEY], failed=[], dry_run=False)
+        env_path = tmp_path / ".env"
+        env_path.write_text(f"{KEY}=legacy-value\n", encoding="utf-8")
+        config.invalidate_env_cache()
 
-        def resolve_committed_backend():
-            events.append(("backend", None))
-            return backend
-
-        with mock.patch(
-            "hermes_cli.secrets_migrate.migrate_secrets",
-            side_effect=migrate_after_writes,
-        ), mock.patch.object(
-            sk, "get_backend", side_effect=resolve_committed_backend
+        with mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved after writes")
         ):
             exit_code = _handle_secrets_migrate(mock.Mock(dry_run=False))
 
         assert exit_code == 0
-        assert events == [("migrate", False), ("backend", None)]
-        assert "Migrated 1 secret(s) to the file keystore." in capsys.readouterr().out
+        assert sk.get_secret(KEY) == "legacy-value"
+        assert sk.get_authority(KEY) is SecretAuthority.FILE
+        assert KEY not in config.load_env()
+        assert capsys.readouterr().out == (
+            "Migrated 1 secret(s) to protected credential storage.\n"
+            f"  migrated: {KEY}\n"
+        )
+
+    @pytest.mark.parametrize(
+        "authorities",
+        [
+            {KEY: SecretAuthority.OS},
+            {KEY: SecretAuthority.FILE},
+            {KEY: SecretAuthority.OS, SECOND_KEY: SecretAuthority.FILE},
+        ],
+        ids=("os", "file", "mixed"),
+    )
+    def test_success_reporting_is_neutral_for_durable_authority_layouts(
+        self, tmp_path, authorities, capsys
+    ):
+        root = tmp_path / "secrets"
+        root.mkdir(mode=0o700)
+        (root / "keystore.lock").touch(mode=0o600)
+        authority_path = root / "authority.json"
+        authority_path.write_bytes(
+            encode_authority_registry(
+                AuthorityRegistry(version=AUTHORITY_VERSION, entries=authorities)
+            )
+        )
+        os.chmod(authority_path, 0o600)
+        assert {key: sk.get_authority(key) for key in authorities} == authorities
+
+        migrated = list(authorities)
+        report = MigrationReport(migrated=migrated, failed=[], dry_run=False)
+        with mock.patch(
+            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved after writes")
+        ):
+            exit_code = _handle_secrets_migrate(mock.Mock(dry_run=False))
+
+        expected_lines = [
+            f"Migrated {len(migrated)} secret(s) to protected credential storage."
+        ]
+        expected_lines.extend(f"  migrated: {key}" for key in migrated)
+        assert exit_code == 0
+        assert capsys.readouterr().out == "\n".join(expected_lines) + "\n"
 
     def test_failure_reports_plaintext_is_retained_and_returns_error(self, capsys):
         args = mock.Mock(dry_run=False)
         report = MigrationReport(migrated=[], failed=[KEY], dry_run=False)
-        backend = mock.Mock()
-        backend.name = "file"
         with mock.patch(
             "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
+        ), mock.patch.object(
+            sk, "get_backend", side_effect=AssertionError("resolved after writes")
         ):
-            with mock.patch.object(sk, "get_backend", return_value=backend):
-                exit_code = _handle_secrets_migrate(args)
+            exit_code = _handle_secrets_migrate(args)
 
         output = capsys.readouterr().out
         assert exit_code == 1
-        assert "could NOT be migrated and remain in .env" in output
-        assert f"failed: {KEY}" in output
-
-    def test_backend_display_failure_does_not_discard_migration_failure(
-        self, capsys
-    ):
-        args = mock.Mock(dry_run=False)
-        report = MigrationReport(migrated=[], failed=[KEY], dry_run=False)
-        with mock.patch(
-            "hermes_cli.secrets_migrate.migrate_secrets", return_value=report
-        ):
-            with mock.patch.object(
-                sk, "get_backend", side_effect=PermissionError("keychain denied")
-            ):
-                exit_code = _handle_secrets_migrate(args)
-
-        output = capsys.readouterr().out
-        assert exit_code == 1
+        assert output.startswith(
+            "Migrated 0 secret(s) to protected credential storage.\n"
+        )
         assert "could NOT be migrated and remain in .env" in output
         assert f"failed: {KEY}" in output
 
@@ -398,13 +462,8 @@ def test_real_console_dry_run_is_byte_read_only_and_never_touches_keyring(
     package.mkdir(parents=True)
     keyring_marker = tmp_path / "keyring-touched"
     (package / "__init__.py").write_text(
-        "from . import errors\n"
-        "def _touch(operation):\n"
-        f"    open({str(keyring_marker)!r}, 'wb').write(operation.encode())\n"
-        "    raise AssertionError('keyring operation invoked during dry-run')\n"
-        "def get_password(service, account): return _touch('get')\n"
-        "def set_password(service, account, value): return _touch('set')\n"
-        "def delete_password(service, account): return _touch('delete')\n",
+        f"open({str(keyring_marker)!r}, 'wb').write(b'import')\n"
+        "raise AssertionError('keyring imported during dry-run')\n",
         encoding="utf-8",
     )
     (package / "errors.py").write_text(

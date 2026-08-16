@@ -144,3 +144,48 @@ def test_migration_dry_run_lookalikes_use_normal_startup(argv):
     from hermes_cli.main import _early_readonly_startup_target
 
     assert _early_readonly_startup_target(argv) is None
+
+
+@pytest.mark.parametrize(
+    ("profile_args", "parser_error"),
+    [
+        (
+            ["--profile", "first", "--profile=second"],
+            "unrecognized arguments: --profile=second",
+        ),
+        (
+            ["--profile=first", "--profile", "second"],
+            "argument command: invalid choice: 'second'",
+        ),
+    ],
+    ids=("split-then-equals", "equals-then-split"),
+)
+def test_real_console_duplicate_profiles_use_normal_parser(
+    tmp_path, profile_args, parser_error
+):
+    hermes = REPO_ROOT / ".venv" / "bin" / "hermes"
+    assert hermes.is_file(), "the real .venv/bin/hermes entrypoint is required"
+    hermes_root = tmp_path / "hermes-root"
+    (hermes_root / "profiles" / "first").mkdir(parents=True)
+    (hermes_root / "profiles" / "second").mkdir(parents=True)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_root)
+
+    result = subprocess.run(
+        [
+            str(hermes),
+            *profile_args,
+            "secrets",
+            "migrate",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 2
+    assert parser_error in result.stderr
+    assert "backend not probed" not in result.stdout
