@@ -161,6 +161,42 @@ class TestFileKeystore:
         assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
         assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "chmod() got an unexpected keyword argument 'follow_symlinks'",
+            "chmod() takes no keyword arguments",
+        ],
+        ids=["named-follow-symlinks", "legacy-no-keywords"],
+    )
+    def test_unsupported_nofollow_chmod_typeerror_falls_back_to_descriptor(
+        self, tmp_path, message
+    ):
+        root = tmp_path / "store"
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=TypeError(message)
+        ):
+            store = FileKeystore(root)
+            store.set("K", "v")
+
+        assert store.get("K") == "v"
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / "keystore.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_unrelated_keyword_typeerror_fails_closed(self, tmp_path):
+        message = "internal keyword dispatch failure"
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=TypeError(message)
+        ):
+            with pytest.raises(TypeError, match=message):
+                FileKeystore(tmp_path / "store").set("K", "v")
+
     def test_corrupt_key_file_raises(self, tmp_path):
         FileKeystore(tmp_path).set("K", "v")
         (tmp_path / "keystore.key").write_bytes(b"too-short")

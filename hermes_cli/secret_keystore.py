@@ -626,7 +626,10 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
             pass
         except TypeError as exc:
             message = str(exc)
-            if "follow_symlinks" not in message and "keyword" not in message:
+            if (
+                "follow_symlinks" not in message
+                and "takes no keyword arguments" not in message
+            ):
                 raise
         after = path.lstat()
         if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
