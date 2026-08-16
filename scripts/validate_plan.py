@@ -71,6 +71,7 @@ def main(path):
             textwrap.dedent(body),
             "class _Frag:\n" + body,
             "class _Frag:\n" + textwrap.indent(textwrap.dedent(body), "    "),
+            "{\n" + textwrap.dedent(body) + "\n}",
         ):
             try:
                 return ast.parse(candidate)
@@ -104,22 +105,28 @@ def main(path):
                         f"{child.name} is nested inside {node.name}() - it will never run"
                     )
 
+    def names_defined(tree):
+        """Names made available by one parsed block."""
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                found.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    found.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.arg):
+                found.add(node.arg)
+        return found
+
     # 4. names used in tests that are never defined or imported anywhere
     defined = set()
     for body, _ in py:
         tree = parse(body)
         if tree is None:
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                defined.add(node.name)
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                defined.add(node.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for a in node.names:
-                    defined.add((a.asname or a.name).split(".")[0])
-            elif isinstance(node, ast.arg):
-                defined.add(node.arg)
+        defined.update(names_defined(tree))
     BUILTINS = set(dir(__builtins__)) | {
         "self", "mock", "pytest", "os", "sys", "re", "json", "Path", "time",
         "threading", "hashlib", "stat", "subprocess", "config", "sk", "keyring",
@@ -138,7 +145,40 @@ def main(path):
                         f"constant {n} is used but never assigned in any block"
                     )
 
-    # 5. stated PASS counts vs actual test defs, per test file, cumulative
+    # 5. a task may depend on earlier tasks or on definitions in its own task,
+    # but not on a symbol first introduced by a later task. Collecting all
+    # definitions globally hid exactly that sequencing defect in round five.
+    definitions_by_task = defaultdict(set)
+    uses_by_task = defaultdict(set)
+    task_order = []
+    for body, start in py:
+        task = task_of(text, start)
+        if task not in task_order:
+            task_order.append(task)
+        tree = parse(body)
+        if tree is None:
+            continue
+        block_defined = names_defined(tree)
+        definitions_by_task[task].update(block_defined)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                name = node.id
+                if (name.startswith("_") or name.isupper()) and name not in block_defined:
+                    uses_by_task[task].add(name)
+
+    first_definition = {}
+    for index, task in enumerate(task_order):
+        for name in definitions_by_task[task]:
+            first_definition.setdefault(name, index)
+    for index, task in enumerate(task_order):
+        for name in sorted(uses_by_task[task]):
+            if first_definition.get(name, index) > index:
+                later_task = task_order[first_definition[name]]
+                problems.append(
+                    f"TASK-ORDER: {task} uses {name}, first defined by {later_task}"
+                )
+
+    # 6. stated PASS counts vs actual test defs, per test file, cumulative
     per_file = defaultdict(int)
     tasks = [(m.group(1), m.start()) for m in re.finditer(r"^### (Task \d+):", text, re.M)]
     tasks.append(("END", len(text)))
@@ -158,7 +198,7 @@ def main(path):
                     f"cumulatively has {per_file[f]}"
                 )
 
-    # 6. symbols the plan says it implements vs symbols the tests reference
+    # 7. symbols the plan says it implements vs symbols the tests reference
     impl = set(re.findall(r"^def (\w+)|^    def (\w+)", text, re.M))
     impl = {a or b for a, b in impl}
     for body, start in py:
@@ -170,7 +210,40 @@ def main(path):
                     f"which no block defines"
                 )
 
-    # 7. step numbering contiguous per task
+    # 8. known semantic seams that AST syntax alone cannot validate.
+    for i, (name, start_offset) in enumerate(tasks[:-1]):
+        task_body = text[start_offset : tasks[i + 1][1]]
+        if (
+            'patch.object(config, "_is_container"' in task_body
+            and "def _in_container" in task_body
+            and "if _in_container()" in task_body
+        ):
+            problems.append(
+                f"PATCH-SEAM: {name} patches config._is_container but production "
+                "calls the task-local _in_container"
+            )
+
+    for body, start in py:
+        tree = parse(body)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if "startup" not in node.name.lower():
+                continue
+            calls = {
+                call.func.id
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            }
+            if "load_env" in calls and "load_hermes_dotenv" not in calls:
+                problems.append(
+                    f"STARTUP-LOADER: {task_of(text, start)} calls config.load_env; "
+                    "startup uses env_loader.load_hermes_dotenv"
+                )
+
+    # 9. step numbering contiguous per task
     cur, steps = None, []
     for line in text.splitlines():
         m = re.match(r"^### (Task \d+):", line)
@@ -184,7 +257,7 @@ def main(path):
     if cur and steps and steps != list(range(1, len(steps) + 1)):
         problems.append(f"STEPS: {cur} numbered {steps}")
 
-    # 8. developer home paths
+    # 10. developer home paths
     for m in re.finditer(r"/Users/|/home/[^/\s]+/", text):
         problems.append(f"HOME-PATH: line {text[:m.start()].count(chr(10))+1}")
 
