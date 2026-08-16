@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from hermes_cli import secret_keystore
 from hermes_cli.secret_keystore import FileKeystore, KeystoreError
 
 
@@ -63,6 +64,42 @@ class TestFileKeystore:
         assert stat.S_IMODE(os.stat(tmp_path / "keystore.key").st_mode) == 0o600
         assert stat.S_IMODE(os.stat(tmp_path / "keystore.enc").st_mode) == 0o600
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_existing_store_files_are_resecured(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        with secret_keystore._store_lock(tmp_path):
+            pass
+
+        os.chmod(tmp_path, 0o755)
+        os.chmod(tmp_path / "keystore.key", 0o644)
+        os.chmod(tmp_path / "keystore.enc", 0o644)
+        os.chmod(tmp_path / "keystore.lock", 0o644)
+
+        reopened = FileKeystore(tmp_path)
+        assert reopened.get("K") == "v"
+        assert stat.S_IMODE(os.stat(tmp_path).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.key").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.enc").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.lock").st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_existing_key_is_resecured_without_ciphertext(self, tmp_path):
+        key_path = tmp_path / "keystore.key"
+        key_path.write_bytes(b"\0" * 32)
+        os.chmod(key_path, 0o644)
+
+        assert FileKeystore(tmp_path).get("missing") is None
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_raises_when_private_permissions_cannot_be_established(self, tmp_path):
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=OSError("read-only")
+        ):
+            with pytest.raises(KeystoreError, match="cannot secure permissions"):
+                FileKeystore(tmp_path)
+
     def test_corrupt_key_file_raises(self, tmp_path):
         FileKeystore(tmp_path).set("K", "v")
         (tmp_path / "keystore.key").write_bytes(b"too-short")
@@ -74,6 +111,16 @@ class TestFileKeystore:
         (tmp_path / "keystore.key").write_bytes(b"\x00" * 32)
         with pytest.raises(KeystoreError, match="cannot decrypt"):
             FileKeystore(tmp_path).get("K")
+
+    def test_ciphertext_without_key_raises_without_creating_a_new_key(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        key_path = tmp_path / "keystore.key"
+        key_path.unlink()
+
+        with pytest.raises(KeystoreError, match="missing encryption key"):
+            store.get("K")
+        assert not key_path.exists()
 
     def test_interrupted_atomic_replace_preserves_previous_ciphertext(self, tmp_path):
         """Direct truncation destroys the last good store when a write fails."""
@@ -120,6 +167,22 @@ class TestFileKeystore:
         for worker in range(4):
             for index in range(12):
                 assert store.get(f"p{worker}-{index}") == f"value-p{worker}-{index}"
+
+    def test_windows_initializes_lock_sentinel_only_after_acquiring_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+        fake_msvcrt = mock.Mock(LK_LOCK=1, LK_UNLCK=2)
+
+        def assert_lock_precedes_initialization(_fd, mode, _count):
+            if mode == fake_msvcrt.LK_LOCK:
+                assert lock_path.read_bytes() == b""
+
+        fake_msvcrt.locking.side_effect = assert_lock_precedes_initialization
+        with (
+            mock.patch("hermes_cli.secret_keystore.os.name", "nt"),
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+        ):
+            with secret_keystore._store_lock(tmp_path):
+                assert lock_path.read_bytes() == b"\0"
 
 
 class TestContainerKeyPersistence:

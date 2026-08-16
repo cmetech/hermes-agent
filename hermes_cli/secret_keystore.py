@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import secrets as _secrets
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -64,13 +65,18 @@ class FileKeystore:
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
-        _chmod(self._root, 0o700)
+        _ensure_private_permissions(self._root, 0o700)
+        for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE):
+            path = self._root / filename
+            if path.exists():
+                _ensure_private_permissions(path, 0o600)
 
     # -- key management -------------------------------------------------
 
     def _load_or_create_key(self) -> bytes:
         path = self._root / _KEY_FILE
         if path.exists():
+            _ensure_private_permissions(path, 0o600)
             raw = path.read_bytes()
             if len(raw) != _KEY_BYTES:
                 raise KeystoreError(
@@ -106,6 +112,9 @@ class FileKeystore:
         path = self._root / _DATA_FILE
         if not path.exists():
             return {}
+        _ensure_private_permissions(path, 0o600)
+        if not (self._root / _KEY_FILE).exists():
+            raise KeystoreError("cannot decrypt secrets: missing encryption key")
         blob = path.read_bytes()
         if len(blob) <= _NONCE_BYTES:
             raise KeystoreError("corrupt secret file")
@@ -173,16 +182,17 @@ def _store_lock(root: Path):
     with _FILE_THREAD_LOCK:
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
         with os.fdopen(fd, "r+b") as handle:
-            _chmod(lock_path, 0o600)
+            _ensure_private_permissions(lock_path, 0o600)
             if os.name == "nt":
                 import msvcrt
 
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.seek(0)
+                    handle.write(b"\0")
+                    handle.flush()
             else:
                 import fcntl
 
@@ -197,12 +207,22 @@ def _store_lock(root: Path):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _chmod(path: Path, mode: int) -> None:
-    """chmod, tolerating platforms and filesystems that do not support it."""
+def _ensure_private_permissions(path: Path, mode: int) -> None:
+    """Establish and verify the required POSIX mode for a private path."""
+    if os.name == "nt":
+        return
     try:
         os.chmod(path, mode)
-    except (OSError, NotImplementedError):
-        pass
+        actual_mode = stat.S_IMODE(path.stat().st_mode)
+    except (OSError, NotImplementedError) as exc:
+        raise KeystoreError(
+            f"cannot secure permissions on {path} to {mode:o}"
+        ) from exc
+    if actual_mode != mode:
+        raise KeystoreError(
+            f"cannot secure permissions on {path} to {mode:o}; "
+            f"found {actual_mode:o}"
+        )
 
 
 def _in_container() -> bool:
@@ -239,15 +259,20 @@ def _write_private(path: Path, payload: bytes) -> None:
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            try:
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError, NotImplementedError) as exc:
+                raise KeystoreError(
+                    f"cannot secure permissions on {path} to 600"
+                ) from exc
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
-        _chmod(path, 0o600)
+        _ensure_private_permissions(path, 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)
