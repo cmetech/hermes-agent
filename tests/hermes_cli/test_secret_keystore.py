@@ -367,3 +367,295 @@ class TestProbe:
 
         signature = inspect.signature(probe_os_keystore)
         assert signature.parameters["timeout_seconds"].default == PROBE_TIMEOUT_SECONDS
+
+
+import hermes_cli.secret_keystore as sk
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend_cache():
+    sk.reset_backend_cache()
+    yield
+    sk.reset_backend_cache()
+
+
+class TestBackendSelection:
+    def test_prefers_os_when_probe_succeeds(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            assert sk.get_backend().name == "os"
+
+    def test_falls_back_to_file_when_probe_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with mock.patch.object(sk, "keyring", _FakeKeyring(fail=True)):
+            assert sk.get_backend().name == "file"
+
+    def test_env_override_forces_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            assert sk.get_backend().name == "file"
+
+    def test_env_override_off_disables_keystore(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        assert sk.get_backend() is None
+        assert sk.get_secret("K") is None
+
+    def test_probe_runs_once_per_process(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            with mock.patch.object(
+                sk, "probe_os_keystore", side_effect=lambda: calls.append(1) or True
+            ):
+                sk.get_backend()
+                sk.get_backend()
+        assert len(calls) == 1
+
+
+class TestModuleLevelAPI:
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret("HERMES_PLUGIN_X_PAT", "tok")
+        assert sk.get_secret("HERMES_PLUGIN_X_PAT") == "tok"
+
+    def test_get_secret_never_raises_on_backend_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.get.side_effect = KeystoreError("boom")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            assert sk.get_secret("K") is None
+
+    def test_set_secret_raises_on_backend_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.set.side_effect = KeystoreError("boom")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(KeystoreError):
+                sk.set_secret("K", "v")
+
+    def test_set_secret_raises_when_keystore_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        with pytest.raises(KeystoreError):
+            sk.set_secret("K", "v")
+
+
+class TestBoundedReads:
+    def test_a_blocking_read_times_out_rather_than_hanging(self):
+        """The probe passing does not make later reads safe: a keychain can
+        be unlocked at startup and re-locked by screen-lock mid-process."""
+        import threading
+        import time as _time
+
+        import hermes_cli.secret_keystore as sk
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+                return "late"
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            store = sk.OSKeystore()
+            start = _time.monotonic()
+            with pytest.raises(sk.KeystoreError, match="timed out"):
+                store.get("K")
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, f"read blocked for {elapsed:.1f}s"
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_concurrent_reads_spawn_at_most_one_worker(self, tmp_path, monkeypatch):
+        """The latch must cover concurrent callers, not only a serial loop."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+        callers_ready = threading.Barrier(6)
+        calls = []
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                calls.append(name)
+                released.wait(timeout=10)
+                finished.set()
+
+        results = []
+
+        def _resolve(index):
+            callers_ready.wait(timeout=5)
+            results.append(sk.get_secret(f"K{index}"))
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                assert sk.get_backend().name == "os"
+                callers = [
+                    threading.Thread(target=_resolve, args=(index,))
+                    for index in range(5)
+                ]
+                for caller in callers:
+                    caller.start()
+                callers_ready.wait(timeout=5)
+                for caller in callers:
+                    caller.join(timeout=5)
+                    assert not caller.is_alive()
+
+            # Exactly one call reached keyring. The other four waited for the
+            # atomic check/spawn transition, then saw the false latch.
+            assert len(calls) == 1
+            assert results == [None] * 5
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_forced_os_mode_is_not_demoted(self, tmp_path, monkeypatch):
+        """"os" pins the tier. Demoting would move reads to a store that does
+        not hold the operator's secrets, which looks like data loss."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            assert sk.get_backend().name == "os"
+            assert sk.get_secret("K") is None       # timed out, swallowed
+            assert sk.get_backend().name == "os"    # tier NOT swapped
+            assert sk._OS_HEALTHY is False          # but latched unusable
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_timed_out_read_demotes_the_backend(self, tmp_path, monkeypatch):
+        """One hang is enough evidence. Without demotion, resolving N secrets
+        against a wedged keychain abandons N threads and burns N timeouts."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        released = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            with mock.patch.object(sk, "probe_os_keystore", return_value=True):
+                assert sk.get_backend().name == "os"
+                assert sk.get_secret("K") is None       # timed out, swallowed
+                assert sk.get_backend().name == "file"  # demoted
+            released.set()
+
+
+class TestRevocationFailuresPropagate:
+    """Already repaired once. Untested, it regresses silently -- and its
+    symptom is a credential the dashboard says is gone that still works."""
+
+    def test_os_delete_raises_when_the_backend_refuses(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = RuntimeError("dbus refused")
+        with mock.patch.object(sk, "keyring", broken):
+            with pytest.raises(sk.KeystoreError):
+                sk.OSKeystore().delete("K")
+
+    def test_os_delete_treats_absent_as_success(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = sk._PasswordDeleteError("no such item")
+        with mock.patch.object(sk, "keyring", broken):
+            sk.OSKeystore().delete("K")   # must not raise
+
+    def test_module_delete_secret_propagates(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.delete.side_effect = sk.KeystoreError("refused")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(sk.KeystoreError):
+                sk.delete_secret("K")
+
+
+class TestConfigSetting:
+    def test_mode_is_a_settable_config_key(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG.get("secret_keystore") == "auto"
+
+    def test_config_key_passes_validation(self):
+        from hermes_cli.config import _validate_config_key
+
+        assert _validate_config_key("secret_keystore")[0] is True
+
+    def test_config_yaml_value_is_honoured(self, tmp_path, monkeypatch):
+        """The documented path. Earlier tests only exercised the env bridge,
+        so a mode read that ignored config.yaml would have passed them all."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend().name == "file"
+
+    def test_env_bridge_overrides_config(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend() is None
+
+    def test_a_typo_in_config_falls_back_to_auto(self, monkeypatch):
+        """This runs on the credential-resolution path; a typo must not make
+        every plugin unreadable."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "fille"},
+        )
+        sk.reset_backend_cache()
+        # A typo resolves to "auto", and "auto" probes the OS keystore -- so
+        # without this patch the test would write a probe entry into the
+        # developer's real Keychain, or raise an authorisation prompt in CI.
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            assert sk.get_backend() is not None
+            assert sk.get_backend().name == "file"

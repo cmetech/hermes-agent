@@ -10,6 +10,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Where plugin secrets live: "auto" probes the OS keystore and falls back
+    # to an encrypted file; "os" / "file" pin one tier; "off" disables the
+    # keystore entirely -- it does NOT resume .env writes, which the write
+    # path refuses by design.
+    "secret_keystore": "auto",
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).

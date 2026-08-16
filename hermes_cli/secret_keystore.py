@@ -499,3 +499,171 @@ def _write_private(path: Path, payload: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+__all__ += [
+    "get_backend",
+    "get_secret",
+    "set_secret",
+    "delete_secret",
+    "reset_backend_cache",
+]
+
+_BACKEND = None
+_BACKEND_RESOLVED = False
+_BACKEND_LOCK = threading.Lock()
+# _OS_HEALTHY, _OS_CALL_LOCK and the base _mark_os_unhealthy() are introduced
+# in Task 3 because OSKeystore already consumes them there. This task extends
+# the marker with automatic-tier demotion.
+# AGENTS.md:124 rejects new HERMES_* env vars for non-secret config: ".env is
+# for secrets only ... All behavioral settings -- timeouts, thresholds, feature
+# flags, display prefs -- go in config.yaml." The keystore mode is a feature
+# flag, so config.yaml is its home. AGENTS.md does permit an internal bridge
+# env var, which _MODE_ENV remains -- undocumented, for tests and emergency
+# override only. User-facing docs must point at config.yaml.
+_MODE_KEY = "secret_keystore"
+_MODE_ENV = "HERMES_SECRET_KEYSTORE"  # internal bridge; not user-facing
+_VALID_MODES = frozenset({"auto", "os", "file", "off"})
+
+
+def _resolve_mode() -> str:
+    """config.yaml `secret_keystore`, with an internal env bridge.
+
+    Precedence is env-then-config so a test or an operator unpicking a broken
+    keychain can override without editing config.yaml. An unrecognised value
+    falls back to "auto" rather than raising: this runs on the credential
+    resolution path, and a typo in config.yaml must not make every plugin
+    unreadable.
+    """
+    raw = os.environ.get(_MODE_ENV)
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            raw = config.get(_MODE_KEY) if isinstance(config, dict) else None
+        except Exception:
+            raw = None
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in _VALID_MODES else "auto"
+
+
+def reset_backend_cache() -> None:
+    """Clear the cached backend. For tests and for post-migration re-probe."""
+    global _BACKEND, _BACKEND_RESOLVED, _OS_HEALTHY
+    # Match the read-time lock order: OS call lock, then backend lock.
+    with _OS_CALL_LOCK:
+        with _BACKEND_LOCK:
+            _BACKEND = None
+            _BACKEND_RESOLVED = False
+            _OS_HEALTHY = True
+
+
+def _secrets_root():
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "secrets"
+
+
+def get_backend():
+    """Return the active backend, or None when the keystore is disabled.
+
+    Resolved once per process: the probe can involve IPC to a keychain
+    daemon and this is called on every secret resolution.
+    """
+    global _BACKEND, _BACKEND_RESOLVED
+    if _BACKEND_RESOLVED:
+        return _BACKEND
+    with _BACKEND_LOCK:
+        if _BACKEND_RESOLVED:
+            return _BACKEND
+        mode = _resolve_mode()
+        if mode == "off":
+            _BACKEND = None
+        elif mode == "file":
+            _BACKEND = FileKeystore(_secrets_root())
+        elif mode == "os":
+            _BACKEND = OSKeystore()
+        else:  # auto
+            _BACKEND = OSKeystore() if probe_os_keystore() else FileKeystore(
+                _secrets_root()
+            )
+        _BACKEND_RESOLVED = True
+        return _BACKEND
+
+
+def _mark_os_unhealthy() -> None:
+    """Latch the OS keystore as unusable, and in "auto" fall back to file.
+
+    Two separable things happen here, and conflating them was a real defect:
+
+    * The **latch** (`_OS_HEALTHY = False`) always applies. `_OS_CALL_LOCK`
+      makes the check-and-spawn transition atomic, so even concurrent readers
+      can abandon at most one worker per process.
+    * The **demotion** applies only in "auto" mode. "os" pins the tier
+      deliberately; swapping under the operator would move reads to a store
+      that does not hold their secrets, which presents as data loss rather
+      than as the keychain problem it actually is.
+
+    Deliberately not a circuit breaker with a recovery window: a keychain
+    that stops answering mid-process stays that way until the session is
+    unlocked, and re-probing on a timer would reintroduce the stall on a
+    schedule.
+    """
+    global _OS_HEALTHY, _BACKEND, _BACKEND_RESOLVED
+    _OS_HEALTHY = False
+    if _resolve_mode() == "os":
+        return
+    with _BACKEND_LOCK:
+        if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
+            _BACKEND = FileKeystore(_secrets_root())
+            _BACKEND_RESOLVED = True
+
+
+def get_secret(key: str) -> str | None:
+    """Return one secret, or None.
+
+    Never raises.  A read failure must look like "not configured" so the
+    caller reports a missing credential instead of crashing an agent turn.
+    """
+    # get_backend() is inside the try on purpose. It constructs FileKeystore,
+    # which creates $HERMES_HOME/secrets and can raise OSError, and it runs
+    # D4's container check, which raises KeystoreError. Leaving it outside
+    # would break the "never raises" contract on the exact paths most likely
+    # to fail -- a read-only home, a full disk, a container without a volume.
+    try:
+        backend = get_backend()
+        if backend is None:
+            return None
+        return backend.get(key)
+    except (KeystoreError, OSError):
+        return None
+
+
+def set_secret(key: str, value: str) -> None:
+    """Store one secret. Raises KeystoreError rather than losing the value.
+
+    Deliberately never falls back to plaintext .env — that would silently
+    undo the entire point of this module.
+    """
+    backend = get_backend()
+    if backend is None:
+        raise KeystoreError(
+            f"secret keystore is disabled (secret_keystore: off in config.yaml); "
+            f"cannot store {key}"
+        )
+    backend.set(key, value)
+
+
+def delete_secret(key: str) -> None:
+    """Remove one secret. Raises KeystoreError if the backend refused.
+
+    Deliberately NOT symmetric with get_secret, which swallows failures so a
+    read looks like "not configured". A failed delete is a failed revocation:
+    the caller must be able to tell the operator the credential is still live
+    rather than showing them a cleared field.
+    """
+    backend = get_backend()
+    if backend is None:
+        return
+    backend.delete(key)
