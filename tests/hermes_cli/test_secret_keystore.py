@@ -717,6 +717,9 @@ class TestProbeConcurrency:
                 self.accounts = []
                 self.deleted = []
                 self.barrier = threading.Barrier(2)
+                self.finished = threading.Event()
+                self._completed = 0
+                self._lock = threading.Lock()
 
             def set_password(self, service, name, value):
                 self.accounts.append(name)
@@ -726,19 +729,31 @@ class TestProbeConcurrency:
             def delete_password(self, service, name):
                 self.deleted.append(name)
                 super().delete_password(service, name)
+                with self._lock:
+                    self._completed += 1
+                    if self._completed == 2:
+                        self.finished.set()
 
         fake = ProbeKeyring()
         results = []
         with mock.patch.object(sk, "keyring", fake):
-            threads = [
-                threading.Thread(target=lambda: results.append(probe_os_keystore()))
-                for _ in range(2)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=5)
-                assert not thread.is_alive()
+            try:
+                threads = [
+                    threading.Thread(
+                        target=lambda: results.append(probe_os_keystore())
+                    )
+                    for _ in range(2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+                    assert not thread.is_alive()
+            finally:
+                fake.barrier.abort()
+                assert fake.finished.wait(timeout=5), (
+                    "probe workers outlived the fake-keyring patch"
+                )
 
         assert results == [True, True]
         assert len(set(fake.accounts)) == 2
@@ -747,6 +762,75 @@ class TestProbeConcurrency:
 
 
 class TestBoundedReads:
+    def test_late_timeout_from_detached_state_cannot_poison_new_lifecycle(
+        self, tmp_path
+    ):
+        import threading
+
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        profile_token = set_hermes_home_override(tmp_path / "profile")
+        try:
+            old_store = OSKeystore()
+        finally:
+            reset_hermes_home_override(profile_token)
+        profile_identity = old_store._profile_identity
+        old_account = old_store._account_name("K")
+        reads = 0
+
+        class LateKeyring:
+            def get_password(self, _service, name):
+                nonlocal reads
+                if name == old_account:
+                    reads += 1
+                    if reads == 1:
+                        entered.set()
+                        release.wait(timeout=5)
+                        finished.set()
+                        return "late"
+                return "fresh"
+
+        reader_errors = []
+        with mock.patch.object(sk, "keyring", LateKeyring()):
+            try:
+                with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                    def read_old():
+                        try:
+                            old_store.get("K")
+                        except KeystoreError as exc:
+                            reader_errors.append(exc)
+
+                    reader = threading.Thread(target=read_old)
+                    reader.start()
+                    assert entered.wait(timeout=5)
+
+                    resetter = threading.Thread(target=sk.reset_backend_cache)
+                    resetter.start()
+                    for _ in range(100):
+                        if profile_identity not in sk._PROFILE_STATES:
+                            break
+                        threading.Event().wait(0.01)
+                    assert profile_identity not in sk._PROFILE_STATES
+                    new_store = OSKeystore(profile_identity)
+
+                    reader.join(timeout=5)
+                    resetter.join(timeout=5)
+                    assert not reader.is_alive()
+                    assert not resetter.is_alive()
+                    assert len(reader_errors) == 1
+                    assert "timed out" in str(reader_errors[0])
+                    assert new_store._state.healthy is True
+                    assert new_store.get("K") == "fresh"
+            finally:
+                release.set()
+                assert finished.wait(timeout=5)
+
     def test_profile_b_selection_does_not_reset_profile_a_timeout_health(
         self, tmp_path
     ):

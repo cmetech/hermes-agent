@@ -169,7 +169,7 @@ class OSKeystore:
             except Exception as exc:
                 raise KeystoreError("keystore read failed") from exc
             if value is sentinel:
-                _mark_os_unhealthy(self._profile_identity)
+                _mark_os_unhealthy(self._state)
                 raise KeystoreError("keystore read timed out")
             return value
 
@@ -719,7 +719,7 @@ def get_backend():
             return state.backend
 
 
-def _mark_os_unhealthy(profile_identity: str) -> None:
+def _mark_os_unhealthy(state: _ProfileState) -> None:
     """Latch the OS keystore as unusable, and in "auto" fall back to file.
 
     Two separable things happen here, and conflating them was a real defect:
@@ -737,7 +737,6 @@ def _mark_os_unhealthy(profile_identity: str) -> None:
     unlocked, and re-probing on a timer would reintroduce the stall on a
     schedule.
     """
-    state = _profile_state(profile_identity)
     state.healthy = False
     with state.backend_lock:
         # Backend and selection mode are one process-cached decision. Reading
@@ -746,7 +745,7 @@ def _mark_os_unhealthy(profile_identity: str) -> None:
         if state.mode == "os":
             return
         if state.backend is not None and getattr(state.backend, "name", None) == "os":
-            state.backend = FileKeystore(_secrets_root(profile_identity))
+            state.backend = FileKeystore(_secrets_root(state.profile_identity))
             state.resolved = True
 
 
