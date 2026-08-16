@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # every time. Cleared automatically when the file changes (different mtime).
 _CONFIG_PARSE_WARNED: set = set()
 
+# Paths we have already warned about failing to ACL, so repeated
+# save_env_value() calls do not spam one message per write.
+_WARNED_ACL_PATHS: set[str] = set()
+
 
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
@@ -858,8 +862,117 @@ def _is_container() -> bool:
     return False
 
 
+# Belt and braces: the SID comes from `whoami /user`, but it is checked
+# against this before reaching PowerShell so a surprising whoami cannot
+# widen the surface.
+_SID_RE = re.compile(r"^S-1-[0-9-]{1,60}$")
+
+
+def _current_windows_sid() -> str:
+    """Return the current account's SID as a string, or "" if unavailable.
+
+    A SID rather than DOMAIN\\user because the DACL is built by SID: names
+    are localised ("Administratoren"), ambiguous between the local SAM and
+    the domain, and a name that fails to resolve turns a permission tightening
+    into an error. The SID is stable and unambiguous.
+
+    whoami is present on every supported Windows and needs no pywin32.
+    """
+    try:
+        completed = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    # Output: "DOMAIN\user","S-1-5-21-..."
+    fields = [f.strip().strip('"') for f in completed.stdout.strip().split(",")]
+    for field in fields:
+        if field.startswith("S-1-"):
+            return field
+    return ""
+
+
+def _windows_restrict_acl(path) -> bool:
+    """Leave exactly one ACE: the current user. True if applied.
+
+    icacls cannot express "replace the whole DACL" -- ``/inheritance:r``
+    drops only *inherited* ACEs, and ``/remove:g`` drops only the SIDs you
+    name, so neither reaches an explicit ACE left by an older Hermes, a
+    restore from backup, or a copy from another profile. Enumerating them
+    first is possible but means parsing localised icacls output.
+
+    PowerShell can express it directly. ``SetAccessRuleProtection($true,
+    $false)`` detaches inheritance and discards the inherited copies;
+    ``PurgeAccessRules`` removes every explicit rule for an identity; the
+    single ``AddAccessRule`` then leaves exactly one ACE. Identities are
+    well-known SIDs, not names: "Administrators" is "Administratoren" on a
+    German install and "Administrateurs" on a French one, and a name that
+    does not resolve makes icacls fail rather than skip.
+    """
+    sid = _current_windows_sid()
+    if not sid:
+        # Without a SID the DACL cannot be built correctly. Returning False
+        # lets the caller warn; doing nothing and reporting success would be
+        # the one outcome worse than the gap being fixed.
+        return False
+
+    if not _SID_RE.fullmatch(sid):
+        return False
+
+    # The path is user-controlled and must never be interpolated into the
+    # script body: Windows permits single quotes in file names, so a
+    # directory called  it's ok'; <code>; $x='  would execute as code.
+    #
+    # It is passed through the ENVIRONMENT instead. powershell.exe's
+    # `-Command <string>` form does not populate $args -- that only works for
+    # `-File script.ps1 a b` or an explicit script block -- so an earlier
+    # draft's `-Command ... -args path sid` silently passed nothing and the
+    # script would have operated on $null. Environment variables need no
+    # quoting, are never parsed as source, and work with -Command.
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$p=$env:HERMES_ACL_PATH;"
+        "$id=New-Object System.Security.Principal.SecurityIdentifier("
+        "$env:HERMES_ACL_SID);"
+        "$acl=Get-Acl -LiteralPath $p;"
+        # $true = protect from inheritance, $false = do not copy inherited ACEs
+        "$acl.SetAccessRuleProtection($true,$false);"
+        # Drop every explicit rule, including ones for identities we cannot name
+        "foreach($r in @($acl.Access)){[void]$acl.PurgeAccessRules($r.IdentityReference)};"
+        "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
+        "$id,'Read,Write','Allow');"
+        "$acl.AddAccessRule($rule);"
+        "Set-Acl -LiteralPath $p -AclObject $acl;"
+    )
+    child_env = dict(os.environ)
+    child_env["HERMES_ACL_PATH"] = str(path)
+    child_env["HERMES_ACL_SID"] = sid
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            timeout=15,
+            check=False,
+            env=child_env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def _secure_file(path):
-    """Set file to owner-only read/write (0600). No-op on Windows.
+    """Restrict a file to its owner.
+
+    POSIX: chmod 0600. Windows: a rebuilt single-ACE DACL -- the mode
+    argument to os.chmod is close to meaningless there, which is why this
+    used to be documented as a no-op and left credentials with whatever the
+    user profile directory happened to allow.
 
     Skipped in managed mode — the NixOS activation script sets
     group-readable permissions (0640) on config files.
@@ -870,8 +983,27 @@ def _secure_file(path):
     if is_managed() or _is_container():
         return
     try:
-        if os.path.exists(str(path)):
-            os.chmod(path, 0o600)
+        if not os.path.exists(str(path)):
+            return
+    except OSError:
+        return
+
+    if sys.platform == "win32":
+        if _windows_restrict_acl(path):
+            return
+        key = str(path)
+        if key not in _WARNED_ACL_PATHS:
+            _WARNED_ACL_PATHS.add(key)
+            print(
+                f"  Warning: could not restrict access to {path}. It may be "
+                f"readable by other accounts on this machine. Check that "
+                f"powershell.exe is available on PATH.",
+                file=sys.stderr,
+            )
+        return
+
+    try:
+        os.chmod(path, 0o600)
     except (OSError, NotImplementedError):
         pass
 
