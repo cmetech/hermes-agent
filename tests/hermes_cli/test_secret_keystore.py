@@ -31,6 +31,38 @@ def _concurrent_file_writer(root, prefix, start, count):
 
 
 class TestFileKeystore:
+    def test_absent_store_get_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        assert FileKeystore(root).get("missing") is None
+
+        assert not root.exists()
+
+    def test_absent_store_keys_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        assert FileKeystore(root).keys() == []
+
+        assert not root.exists()
+
+    def test_absent_store_delete_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        FileKeystore(root).delete("missing")
+
+        assert not root.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_set_securely_initializes_an_absent_store(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        FileKeystore(root).set("K", "v")
+
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / "keystore.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
+
     def test_round_trip(self, tmp_path):
         store = FileKeystore(tmp_path)
         store.set("HERMES_PLUGIN_ABC_PAT", "s3cret-value")

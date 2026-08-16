@@ -554,11 +554,16 @@ def test_configuration_reads_preserve_an_existing_profile_tree(tmp_path, monkeyp
     descriptor_root.mkdir()
     service, _ = _service(descriptor_root)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    sk.reset_backend_cache()
     before = sorted(
         path.relative_to(home).as_posix() for path in home.rglob("*")
     )
 
-    detail = service.detail("sample-connector", platform="cli")
+    try:
+        detail = service.detail("sample-connector", platform="cli")
+    finally:
+        sk.reset_backend_cache()
 
     assert detail["enabled"] is True
     endpoint = next(field for field in detail["fields"] if field["id"] == "endpoint")

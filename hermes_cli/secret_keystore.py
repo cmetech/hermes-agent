@@ -284,12 +284,20 @@ class FileKeystore:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
-        self._root.mkdir(parents=True, exist_ok=True)
+        if self._root.exists():
+            self._secure_existing_store()
+
+    def _secure_existing_store(self) -> None:
         _ensure_private_permissions(self._root, 0o700)
         for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE):
             path = self._root / filename
             if path.exists():
                 _ensure_private_permissions(path, 0o600)
+
+    def _initialize_root(self) -> None:
+        """Create and secure the store root before a write transaction."""
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._secure_existing_store()
 
     # -- key management -------------------------------------------------
 
@@ -366,6 +374,8 @@ class FileKeystore:
     # -- public API -----------------------------------------------------
 
     def get(self, key: str) -> str | None:
+        if not self._root.exists():
+            return None
         with _store_lock(self._root):
             return self._read_all().get(key)
 
@@ -373,18 +383,23 @@ class FileKeystore:
         # The lock covers the complete read-modify-write transaction. Locking
         # only _write_all still loses one writer's update when two Hermes
         # processes read the same previous dictionary.
+        self._initialize_root()
         with _store_lock(self._root):
             data = self._read_all()
             data[key] = value
             self._write_all(data)
 
     def delete(self, key: str) -> None:
+        if not self._root.exists():
+            return
         with _store_lock(self._root):
             data = self._read_all()
             if data.pop(key, None) is not None:
                 self._write_all(data)
 
     def keys(self) -> list[str]:
+        if not self._root.exists():
+            return []
         with _store_lock(self._root):
             return list(self._read_all())
 
