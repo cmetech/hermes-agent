@@ -133,7 +133,7 @@ def _service(
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    from hermes_cli import web_server
+    from hermes_cli import secret_keystore, web_server
 
     home = tmp_path / ".hermes"
     profile = home / "profiles" / "work"
@@ -145,6 +145,8 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    secret_keystore.reset_backend_cache()
     monkeypatch.setattr(
         "hermes_cli.web_routers.plugin_configuration.get_plugin_configuration_service",
         lambda: service,
@@ -161,6 +163,7 @@ def api(tmp_path, monkeypatch):
             delattr(web_server.app.state, "auth_required")
         else:
             web_server.app.state.auth_required = previous
+        secret_keystore.reset_backend_cache()
 
 
 def test_catalog_lists_disabled_descriptor_without_importing_plugin_code(
@@ -229,7 +232,12 @@ def test_detail_update_secret_clear_and_readiness_are_profile_scoped(api):
     }
     assert "profile-secret" not in updated.text
     assert not (home / ".env").exists()
-    assert "profile-secret" in (profile / ".env").read_text(encoding="utf-8")
+    assert not (profile / ".env").exists()
+    assert all(
+        b"profile-secret" not in path.read_bytes()
+        for path in profile.rglob("*")
+        if path.is_file()
+    )
 
     readiness = client.post(
         f"/api/plugin-configurations/{PLUGIN_ID}/readiness",
