@@ -1187,17 +1187,16 @@ class PluginConfigurationService:
                 ) from exc
 
         if secrets:
-            from hermes_cli.config import ConfigurationPersistenceError, save_env_value
-
             try:
                 for field_id, value in secrets.items():
-                    save_env_value(
-                        _secret_storage_key(canonical_id, field_id),
-                        value,
-                        mirror_process_env=False,
-                        strict=True,
+                    # Store in the OS keystore (or its encrypted-file
+                    # fallback), never in .env: load_dotenv exports the whole
+                    # .env into os.environ at startup, which would hand a copy
+                    # of every PAT to every child process Hermes spawns.
+                    secret_keystore.set_secret(
+                        _secret_storage_key(canonical_id, field_id), value
                     )
-            except ConfigurationPersistenceError as exc:
+            except secret_keystore.KeystoreError as exc:
                 raise PluginConfigurationError(
                     "plugin configuration could not be persisted"
                 ) from exc
@@ -1217,9 +1216,21 @@ class PluginConfigurationService:
             )
         from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
 
+        storage_key = _secret_storage_key(canonical_id, field_id)
+        # Clear BOTH tiers. The keystore holds anything written since this
+        # feature landed; .env still holds anything from a profile that has
+        # not run `hermes secrets migrate`. Removing only one leaves a
+        # credential that the dashboard reports as cleared and that still
+        # authenticates -- worse than never having moved it.
+        try:
+            secret_keystore.delete_secret(storage_key)
+        except secret_keystore.KeystoreError as exc:
+            raise PluginConfigurationError(
+                "plugin configuration could not be persisted"
+            ) from exc
         try:
             remove_env_value(
-                _secret_storage_key(canonical_id, field_id),
+                storage_key,
                 mirror_process_env=False,
                 strict=True,
             )

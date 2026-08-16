@@ -185,6 +185,8 @@ def test_settings_and_write_only_secrets_use_active_profile_stores(
 ):
     home = tmp_path / "profile-a"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    sk.reset_backend_cache()
     service, _ = _service(tmp_path)
 
     detail = service.update(
@@ -198,8 +200,7 @@ def test_settings_and_write_only_secrets_use_active_profile_stores(
     assert "settings:" in raw
     assert "endpoint: https://git.example.test" in raw
     assert "top-secret" not in raw
-    env_text = (home / ".env").read_text(encoding="utf-8")
-    assert "top-secret" in env_text
+    assert not (home / ".env").exists()
     token = next(field for field in detail["fields"] if field["id"] == "token")
     assert token["is_set"] is True
     assert "value" not in token
@@ -225,6 +226,8 @@ def test_profile_switch_isolates_reads_writes_and_secret_clear(tmp_path, monkeyp
     profile_a = tmp_path / "a"
     profile_b = tmp_path / "b"
     monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    sk.reset_backend_cache()
     service, _ = _service(tmp_path)
     service.update(
         "sample-connector",
@@ -233,6 +236,7 @@ def test_profile_switch_isolates_reads_writes_and_secret_clear(tmp_path, monkeyp
     )
 
     monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    sk.reset_backend_cache()
     unconfigured_b = service.detail("sample-connector")
     assert (
         next(f for f in unconfigured_b["fields"] if f["id"] == "token")["is_set"]
@@ -251,8 +255,9 @@ def test_profile_switch_isolates_reads_writes_and_secret_clear(tmp_path, monkeyp
         == "https://b.test"
     )
     assert next(f for f in detail_b["fields"] if f["id"] == "token")["is_set"] is False
-    assert "token-a" in (profile_a / ".env").read_text(encoding="utf-8")
-    assert "token-b" not in (profile_b / ".env").read_text(encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    sk.reset_backend_cache()
+    assert _token_field(service)["is_set"] is True
 
 
 def test_readiness_is_backend_authored_from_all_required_facts(tmp_path, monkeypatch):
@@ -577,17 +582,21 @@ def test_managed_persistence_noop_raises_stable_service_error(tmp_path, monkeypa
     for subdir in ("cron", "sessions", "logs", "memories"):
         (home / subdir).mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    sk.reset_backend_cache()
     service, _ = _service(tmp_path)
     monkeypatch.setattr("hermes_cli.config.is_managed", lambda: True)
 
     with pytest.raises(PluginConfigurationError, match="could not be persisted"):
         service.update("sample-connector", settings={"endpoint": "https://valid.test"})
-    with pytest.raises(PluginConfigurationError, match="could not be persisted"):
-        service.update("sample-connector", secrets={"token": "valid-token"})
+    service.update("sample-connector", secrets={"token": "valid-token"})
+    assert _token_field(service)["is_set"] is True
 
 
 def test_managed_scope_targeted_noop_raises_stable_service_error(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    sk.reset_backend_cache()
     service, _ = _service(tmp_path)
     monkeypatch.setattr(
         "hermes_cli.managed_scope.managed_config_keys",
@@ -599,8 +608,8 @@ def test_managed_scope_targeted_noop_raises_stable_service_error(tmp_path, monke
 
     monkeypatch.setattr("hermes_cli.managed_scope.managed_config_keys", lambda: set())
     monkeypatch.setattr("hermes_cli.managed_scope.is_env_managed", lambda key: True)
-    with pytest.raises(PluginConfigurationError, match="could not be persisted"):
-        service.update("sample-connector", secrets={"token": "valid-token"})
+    service.update("sample-connector", secrets={"token": "valid-token"})
+    assert _token_field(service)["is_set"] is True
 
 
 def test_plugin_context_reads_its_current_profile_configuration_without_projection(
@@ -966,3 +975,141 @@ class TestKeystoreReadPath:
 
         with mock.patch.object(sk, "get_backend", return_value=broken):
             assert _token_field(service)["is_set"] is False
+
+
+class TestKeystoreWritePath:
+    def test_saved_secret_does_not_reach_the_env_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        service.update("sample-connector", secrets={"token": "should-not-be-in-env"})
+
+        env_path = tmp_path / "profile" / ".env"
+        contents = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        assert "should-not-be-in-env" not in contents
+
+    def test_saved_secret_is_readable_back_through_detail(self, tmp_path, monkeypatch):
+        """Round trip through the production paths, not the keystore API."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        service.update("sample-connector", secrets={"token": "valid-token"})
+
+        assert _token_field(service)["is_set"] is True
+
+    def test_unrelated_env_entries_are_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        env_path = tmp_path / "profile" / ".env"
+        env_path.write_text("EXISTING=keepme\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+
+        service.update("sample-connector", secrets={"token": "valid-token"})
+
+        assert "EXISTING=keepme" in env_path.read_text(encoding="utf-8")
+
+    def test_keystore_write_failure_raises_rather_than_writing_plaintext(
+        self, tmp_path, monkeypatch
+    ):
+        """Global Constraint: never silently write plaintext. If both tiers
+        are unavailable the save must fail loudly."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        with pytest.raises(PluginConfigurationError):
+            service.update("sample-connector", secrets={"token": "valid-token"})
+
+        env_path = tmp_path / "profile" / ".env"
+        contents = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        assert "valid-token" not in contents
+
+
+class TestKeystoreClearPath:
+    def test_clearing_removes_the_keystore_copy(self, tmp_path, monkeypatch):
+        """The revocation bug this task exists to prevent: writes go to the
+        keystore, so a clear that only touches .env leaves the credential
+        live while the UI reports it gone."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+        service.update("sample-connector", secrets={"token": "live-credential"})
+        assert _token_field(service)["is_set"] is True
+
+        service.clear_secret("sample-connector", "token")
+
+        assert _token_field(service)["is_set"] is False
+
+    def test_clearing_an_absent_secret_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        service.clear_secret("sample-connector", "token")
+
+        assert _token_field(service)["is_set"] is False
+
+    def test_a_refused_revocation_raises_and_keeps_the_env_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """If the keystore refuses, the operator must be told -- and the .env
+        entry must survive, because removing it while the keystore copy still
+        authenticates would leave a live credential with nothing pointing at
+        it. Fail with both copies intact rather than half-revoked."""
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationError,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        key = _secret_storage_key("sample-connector", "token")
+        (tmp_path / "profile" / ".env").write_text(
+            f"{key}=legacy-plaintext\n", encoding="utf-8"
+        )
+        service, _ = _service(tmp_path)
+
+        broken = mock.Mock()
+        broken.name = "file"
+        broken.delete.side_effect = sk.KeystoreError("refused")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(PluginConfigurationError):
+                service.clear_secret("sample-connector", "token")
+
+        contents = (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
+        assert "legacy-plaintext" in contents, (
+            "env entry removed despite a failed revocation"
+        )
+
+    def test_clearing_still_removes_an_unmigrated_env_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """Profiles that have not run `hermes secrets migrate` keep a .env
+        entry. Clearing must remove both tiers, not swap which one it forgets."""
+        from hermes_cli.plugin_configuration import _secret_storage_key
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        key = _secret_storage_key("sample-connector", "token")
+        (tmp_path / "profile" / ".env").write_text(
+            f"{key}=legacy-plaintext\n", encoding="utf-8"
+        )
+        service, _ = _service(tmp_path)
+
+        service.clear_secret("sample-connector", "token")
+
+        contents = (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
+        assert "legacy-plaintext" not in contents
