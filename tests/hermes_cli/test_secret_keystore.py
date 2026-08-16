@@ -4,13 +4,22 @@ import multiprocessing
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from hermes_cli import secret_keystore
-from hermes_cli.secret_keystore import FileKeystore, KeystoreError
+from hermes_cli.secret_keystore import (
+    OSKeystore,
+    PROBE_TIMEOUT_SECONDS,
+    SERVICE_NAME,
+    _PROBE_VALUE,
+    FileKeystore,
+    KeystoreError,
+    probe_os_keystore,
+)
 
 
 def _concurrent_file_writer(root, prefix, start, count):
@@ -215,3 +224,124 @@ class TestContainerKeyPersistence:
         with mock.patch("hermes_cli.secret_keystore._in_container", return_value=False):
             FileKeystore(tmp_path).set("K", "v")
         assert (tmp_path / "keystore.key").exists()
+
+
+class _FakeKeyring:
+    """In-memory stand-in for the keyring module."""
+
+    def __init__(self, fail=False):
+        self.store = {}
+        self.fail = fail
+
+    def get_password(self, service, name):
+        if self.fail:
+            raise RuntimeError("no backend")
+        return self.store.get((service, name))
+
+    def set_password(self, service, name, value):
+        if self.fail:
+            raise RuntimeError("no backend")
+        self.store[(service, name)] = value
+
+    def delete_password(self, service, name):
+        if self.fail:
+            raise RuntimeError("no backend")
+        self.store.pop((service, name), None)
+
+
+class TestOSKeystore:
+    def test_round_trip(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            store = OSKeystore()
+            store.set("K", "v")
+            assert store.get("K") == "v"
+
+    def test_uses_namespaced_service_name(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            OSKeystore().set("K", "v")
+        assert (SERVICE_NAME, "K") in fake.store
+
+    def test_backend_failure_raises_keystore_error(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring(fail=True)):
+            with pytest.raises(KeystoreError):
+                OSKeystore().set("K", "v")
+
+
+class TestProbe:
+    def test_probe_true_when_round_trip_works(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring()):
+            assert probe_os_keystore() is True
+
+    def test_probe_false_when_backend_unavailable(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring(fail=True)):
+            assert probe_os_keystore() is False
+
+    def test_probe_false_when_keyring_not_installed(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", None):
+            assert probe_os_keystore() is False
+
+    def test_probe_leaves_no_residue(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            probe_os_keystore()
+        assert fake.store == {}
+
+    def test_probe_false_when_round_trip_value_mismatches(self):
+        fake = _FakeKeyring()
+        fake.get_password = lambda service, name: "wrong-value"
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is False
+
+    def test_probe_gives_up_on_a_hanging_backend(self):
+        """The failure mode that a try/except cannot catch.
+
+        A locked Linux keyring or a D-Bus Secret Service that never answers
+        blocks inside keyring rather than raising. The Global Constraints
+        require probing to "fail fast to the fallback rather than hang", and
+        an exception handler does not deliver that.
+
+        The worker is released and joined INSIDE the patch. An earlier draft
+        exited the `with` block first, which restored the real keyring module
+        while the abandoned worker was still mid-round-trip -- so its next
+        call resolved the real backend and touched the developer's actual
+        keychain. Releasing first keeps the fake in place for the whole life
+        of the thread.
+        """
+        import threading
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def set_password(self, service, name, value):
+                released.wait(timeout=10)   # unblocked by the test, not the probe
+
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                return _PROBE_VALUE
+
+            def delete_password(self, service, name):
+                finished.set()
+
+        with mock.patch("hermes_cli.secret_keystore.keyring", _HangingKeyring()):
+            start = time.monotonic()
+            result = probe_os_keystore(timeout_seconds=0.25)
+            elapsed = time.monotonic() - start
+
+            assert result is False
+            assert elapsed < 5.0, (
+                f"probe blocked for {elapsed:.1f}s instead of failing fast"
+            )
+
+            # Let the abandoned worker finish against the fake, then wait for
+            # it, so no thread outlives the patch.
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_probe_timeout_is_configurable_and_defaulted(self):
+        import inspect
+
+        signature = inspect.signature(probe_os_keystore)
+        assert signature.parameters["timeout_seconds"].default == PROBE_TIMEOUT_SECONDS

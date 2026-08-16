@@ -26,6 +26,20 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+try:  # pragma: no cover - import guard exercised via mock.patch
+    import keyring
+except Exception:  # ImportError, or a backend that explodes at import time
+    keyring = None
+
+# Imported by class rather than matched on type(exc).__name__: a string
+# comparison silently stops working if keyring renames or re-homes the
+# exception, and the failure mode is a swallowed revocation error.
+try:  # pragma: no cover - exercised via mock.patch
+    from keyring.errors import PasswordDeleteError as _PasswordDeleteError
+except Exception:  # keyring absent, or an older layout
+    class _PasswordDeleteError(Exception):
+        """Never raised; keeps the except clause below well-typed."""
+
 # The one Hermes import this module allows itself beyond get_hermes_home.
 # _is_container already exists at hermes_cli/config.py:836 and honours the
 # HERMES_CONTAINER / HERMES_SKIP_CHMOD opt-outs plus the /.dockerenv marker,
@@ -35,7 +49,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # config._is_container(): that helper also returns True for HERMES_SKIP_CHMOD,
 # a permission opt-out used on NFS and SMB mounts that are not containers.
 
-__all__ = ["KeystoreError", "FileKeystore"]
+__all__ = [
+    "KeystoreError",
+    "FileKeystore",
+    "OSKeystore",
+    "SERVICE_NAME",
+    "probe_os_keystore",
+]
 
 _KEY_BYTES = 32
 _NONCE_BYTES = 12
@@ -43,10 +63,207 @@ _KEY_FILE = "keystore.key"
 _DATA_FILE = "keystore.enc"
 _LOCK_FILE = "keystore.lock"
 _FILE_THREAD_LOCK = threading.RLock()
+SERVICE_NAME = "hermes.plugin-secrets"
+_PROBE_KEY = "__hermes_probe__"
+_PROBE_VALUE = "ok"
+# The probe runs once per process, on the path that decides which tier to
+# use. A locked Linux keyring or an unresponsive D-Bus Secret Service blocks
+# rather than raising, so the bound has to be a timeout, not an except.
+PROBE_TIMEOUT_SECONDS = 3.0
+# Task 3 owns the health primitives because OSKeystore uses them immediately.
+# Task 4 replaces _mark_os_unhealthy's body to add auto-tier demotion, but the
+# Task 3 commit is independently runnable and green.
+_OS_HEALTHY = True
+_OS_CALL_LOCK = threading.Lock()
 
 
 class KeystoreError(RuntimeError):
     """A keystore operation failed in a way the caller must not ignore."""
+
+
+def _mark_os_unhealthy() -> None:
+    """Latch future bounded OS reads off for the life of this process."""
+    global _OS_HEALTHY
+    _OS_HEALTHY = False
+
+
+class OSKeystore:
+    """The OS-native credential store, via the ``keyring`` package.
+
+    Backends: macOS Keychain, Windows Credential Manager (DPAPI), Linux
+    Secret Service.  Reached only after ``probe_os_keystore()`` confirms a
+    working round trip, so callers can treat failures here as exceptional.
+    """
+
+    name = "os"
+
+    def _guard(self) -> None:
+        """Refuse if this backend is unavailable or already hung.
+
+        Bounded reads call this while holding _OS_CALL_LOCK. That makes the
+        check-and-spawn transition atomic: concurrent callers cannot all see a
+        healthy latch and each abandon a worker before the first timeout.
+        """
+        if keyring is None:
+            raise KeystoreError("keyring is not available")
+        if not _OS_HEALTHY:
+            raise KeystoreError(
+                "os keystore stopped responding earlier in this process"
+            )
+
+    def _bounded_read(self, operation):
+        # Hold the lock through the timeout decision. Waiting callers then see
+        # the false latch and fail without starting another worker.
+        with _OS_CALL_LOCK:
+            self._guard()
+            sentinel = object()
+            try:
+                value = _call_bounded(operation, PROBE_TIMEOUT_SECONDS, sentinel)
+            except Exception as exc:
+                raise KeystoreError("keystore read failed") from exc
+            if value is sentinel:
+                _mark_os_unhealthy()
+                raise KeystoreError("keystore read timed out")
+            return value
+
+    def get(self, key: str) -> str | None:
+        """Read one secret, bounded.
+
+        A successful probe does not make later reads safe: a keychain can be
+        unlocked at startup and locked again by screen-lock or policy while
+        the process runs. The Global Constraint covers reads as well as the
+        probe, so the same bound applies here. A timeout raises KeystoreError,
+        which get_secret turns into "not configured" rather than a hang.
+        """
+        return self._bounded_read(lambda: keyring.get_password(SERVICE_NAME, key))
+
+    def set(self, key: str, value: str) -> None:
+        """Write one secret synchronously, with failures propagated.
+
+        keyring exposes no cancellation primitive. Putting a mutation on the
+        daemon timeout worker is unsafe: a timed-out set_password can commit
+        later, after the caller was told it failed and after auto mode moved to
+        the file tier. A later restart would then resurrect that credential.
+        Probe/read are bounded because their user-secret operation is
+        side-effect free; mutations remain synchronous until the backend can
+        offer a cancellable or reconcilable API.
+        """
+        self._guard()
+        try:
+            keyring.set_password(SERVICE_NAME, key, value)
+        except Exception as exc:
+            raise KeystoreError("keystore write failed") from exc
+
+    def delete(self, key: str) -> None:
+        """Remove one secret. Absent is success; anything else raises.
+
+        The distinction matters because this is the revocation path. keyring
+        raises PasswordDeleteError specifically for "no such item", so an
+        absent key is separable from a backend that refused -- and a refusal
+        must reach the caller. Swallowing every exception here would make
+        clear_secret report success while the credential kept working, which
+        is the failure this whole feature exists to prevent.
+        """
+        self._guard()
+
+        def _delete():
+            try:
+                keyring.delete_password(SERVICE_NAME, key)
+            except _PasswordDeleteError:
+                return None  # already absent -- the desired end state
+            return None
+
+        try:
+            _delete()
+        except Exception as exc:
+            raise KeystoreError("keystore delete failed") from exc
+
+
+def _call_bounded(operation, timeout_seconds: float, default):
+    """Run `operation` on a daemon worker, returning `default` on timeout.
+
+    Two failure modes exist and only one is an exception. A missing backend
+    RAISES and is handled by the caller's except. A locked keyring or an
+    unresponsive D-Bus Secret Service HANGS, and no except clause will ever
+    see it -- while the Global Constraints require probing *and reads* to
+    fail fast to the fallback rather than block. The backend runs headless
+    under the desktop app, the workflow scheduler and cron, where a hang is
+    indistinguishable from a crash.
+
+    signal.alarm is not an option: it only works on the main thread of the
+    main interpreter and this runs inside a spawned backend. This helper is
+    deliberately limited to probes and reads. A read has no side effect; the
+    probe touches only its namespaced, self-cleaning key. It must never wrap
+    set_secret/delete_secret: Python cannot cancel the worker, so a timed-out
+    credential mutation could commit after failure was reported. Tests faking
+    the probe backend must keep the fake in place until the worker is done.
+    """
+    import threading
+
+    outcome: list = []
+
+    def _run() -> None:
+        try:
+            outcome.append(operation())
+        except BaseException as exc:   # noqa: BLE001 - relayed to the caller
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_run, name="hermes-keystore-io", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive() or not outcome:
+        return default
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _probe_round_trip() -> bool:
+    """One set/get/delete cycle. Runs on a worker thread — see below."""
+    try:
+        keyring.set_password(SERVICE_NAME, _PROBE_KEY, _PROBE_VALUE)
+        observed = keyring.get_password(SERVICE_NAME, _PROBE_KEY)
+    except Exception:
+        return False
+    finally:
+        try:
+            keyring.delete_password(SERVICE_NAME, _PROBE_KEY)
+        except Exception:
+            pass
+    return observed == _PROBE_VALUE
+
+
+def probe_os_keystore(timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> bool:
+    """Return True only when a full set/get/delete round trip succeeds in time.
+
+    Mirrors super-cli's ``NewStore``, which writes a ``probe`` entry before
+    committing to the OS keyring.  Two distinct failure modes have to be
+    handled, and only one of them is an exception:
+
+    * **Raises** — no backend installed, permission denied, keyring absent.
+      Caught by ``_probe_round_trip``.
+    * **Hangs** — a locked Linux keyring, or a D-Bus Secret Service that
+      accepts the call and never answers.  No ``except`` clause will ever
+      see this, and the Global Constraints require failing fast to the
+      fallback rather than blocking: the backend runs headless under the
+      desktop app, the workflow scheduler and cron, where a hang is
+      indistinguishable from a crash.
+
+    A daemon worker thread bounds the second case.  ``signal.alarm`` is not
+    an option — it only works on the main thread of the main interpreter,
+    and this runs inside a spawned backend.  The thread is abandoned rather
+    than killed, which is safe: it holds no lock this process needs, and
+    daemon threads do not block interpreter shutdown. It DOES still complete
+    its call afterwards -- for the probe that means writing and then deleting
+    a namespaced probe key, idempotent and self-cleaning, but a real write.
+    Any test faking the backend must keep the fake in place until the worker
+    has finished, or the abandoned thread will reach the real keyring.
+    """
+    if keyring is None:
+        return False
+    # Timeout -> False -> fall through to the file tier.
+    return _call_bounded(_probe_round_trip, timeout_seconds, False)
 
 
 class FileKeystore:
