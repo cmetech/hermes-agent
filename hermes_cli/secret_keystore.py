@@ -221,6 +221,7 @@ def _call_bounded(operation, timeout_seconds: float, default):
 
 def _probe_round_trip() -> bool:
     """One set/get/delete cycle. Runs on a worker thread — see below."""
+    cleanup_succeeded = True
     try:
         keyring.set_password(SERVICE_NAME, _PROBE_KEY, _PROBE_VALUE)
         observed = keyring.get_password(SERVICE_NAME, _PROBE_KEY)
@@ -229,9 +230,11 @@ def _probe_round_trip() -> bool:
     finally:
         try:
             keyring.delete_password(SERVICE_NAME, _PROBE_KEY)
-        except Exception:
+        except _PasswordDeleteError:
             pass
-    return observed == _PROBE_VALUE
+        except Exception:
+            cleanup_succeeded = False
+    return cleanup_succeeded and observed == _PROBE_VALUE
 
 
 def probe_os_keystore(timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> bool:

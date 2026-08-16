@@ -288,6 +288,28 @@ class TestProbe:
             probe_os_keystore()
         assert fake.store == {}
 
+    def test_probe_false_when_cleanup_is_refused(self):
+        fake = _FakeKeyring()
+
+        def refuse_delete(service, name):
+            raise RuntimeError("delete refused")
+
+        fake.delete_password = refuse_delete
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is False
+
+    def test_probe_stays_true_when_cleanup_reports_already_absent(self):
+        fake = _FakeKeyring()
+
+        def report_already_absent(service, name):
+            fake.store.pop((service, name), None)
+            raise secret_keystore._PasswordDeleteError("already absent")
+
+        fake.delete_password = report_already_absent
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is True
+        assert fake.store == {}
+
     def test_probe_false_when_round_trip_value_mismatches(self):
         fake = _FakeKeyring()
         fake.get_password = lambda service, name: "wrong-value"
