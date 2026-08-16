@@ -160,6 +160,54 @@ def test_missing_mountinfo_is_unknown(tmp_path):
     assert result.mount_point is None
 
 
+@pytest.mark.parametrize(
+    "mount_line",
+    [
+        _mountinfo_line(
+            "/opt/data",
+            fs_type="ext4",
+            source=r"/dev/mapper/hermes\999data",
+        ),
+        _mountinfo_line(
+            "/opt/data",
+            fs_type="ext4",
+            source="/dev/xvda",
+        ).rstrip("\n")
+        + " unexpected\n",
+    ],
+    ids=["invalid-escape", "trailing-field"],
+)
+def test_invalid_escape_and_trailing_fields_are_unknown(tmp_path, mount_line):
+    mountinfo = _write_mountinfo(
+        tmp_path / "mountinfo",
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + mount_line,
+    )
+
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+
+    assert result.state is PersistenceState.UNKNOWN
+    assert "malformed" in result.reason
+
+
+def test_same_depth_stacked_mounts_are_unknown(tmp_path):
+    mountinfo = _write_mountinfo(
+        tmp_path / "mountinfo",
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line("/opt/data", fs_type="ext4", source="/dev/xvda")
+        + _mountinfo_line("/opt/data", fs_type="tmpfs", source="tmpfs"),
+    )
+
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+
+    assert result.state is PersistenceState.UNKNOWN
+    assert "ambiguous" in result.reason
+
+
 def _patch_container_inputs(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -225,6 +273,21 @@ def test_containerd_mountinfo_detects_cgroup_v2_container(monkeypatch):
     )
 
     assert is_container() is True
+
+
+@pytest.mark.parametrize("runtime_name", ["docker", "containerd", "podman"])
+def test_unrelated_runtime_named_host_mount_is_not_container(
+    monkeypatch, runtime_name
+):
+    _patch_container_inputs(
+        monkeypatch,
+        mountinfo=(
+            "42 31 8:1 / /var/lib/"
+            f"{runtime_name} rw,relatime - ext4 /dev/{runtime_name}-data rw\n"
+        ),
+    )
+
+    assert is_container() is False
 
 
 def test_desktop_child_is_not_misclassified_from_parent_cgroup(monkeypatch):

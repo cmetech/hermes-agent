@@ -219,6 +219,47 @@ def test_unrecoverable_reset_refuses_unproven_container_storage_before_quarantin
     assert snapshot_tree(profile) == before
 
 
+def test_reset_rechecks_persistence_after_all_reads_before_quarantine(
+    profile, fake_keyring, monkeypatch
+):
+    from hermes_cli import container_storage
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+    write_file_secret(profile)
+    write_registry(profile, {KEY: SecretAuthority.FILE})
+    (profile / "secrets" / "keystore.key").unlink()
+    current_state = PersistenceState.PERSISTENT
+    monkeypatch.setattr(container_storage, "is_container", lambda: True)
+
+    def inspect(path):
+        return MountPersistence(
+            current_state,
+            profile if current_state is PersistenceState.PERSISTENT else None,
+            "ext4" if current_state is PersistenceState.PERSISTENT else None,
+            "/dev/x" if current_state is PersistenceState.PERSISTENT else None,
+            f"{current_state.value} evidence",
+        )
+
+    monkeypatch.setattr(container_storage, "inspect_mount_persistence", inspect)
+    plan = plan_secret_repair(reset_unrecoverable=True)
+    assert any(action.code == "RESET_UNRECOVERABLE" for action in plan.actions)
+    original_assert = repair._assert_tier_unchanged
+
+    def change_storage_after_read(*args, **kwargs):
+        nonlocal current_state
+        original_assert(*args, **kwargs)
+        current_state = PersistenceState.UNKNOWN
+
+    monkeypatch.setattr(repair, "_assert_tier_unchanged", change_storage_after_read)
+    before = snapshot_tree(profile)
+
+    with pytest.raises(RepairRefusedError, match="storage.*unknown"):
+        apply_secret_repair(plan, confirm_reset=True)
+
+    assert snapshot_tree(profile) == before
+
+
 def test_windows_doctor_reports_acl_drift_without_mutating(
     profile, fake_keyring, monkeypatch
 ):

@@ -487,7 +487,66 @@ class TestContainerKeyPersistence:
         assert str(root) in message
         assert "hermes secrets doctor" in message
         assert "hermes secrets repair" in message
+        assert not root.exists()
+
+    @pytest.mark.parametrize("mode", ["file", "auto"])
+    def test_public_write_refusal_does_not_create_transaction_state(
+        self, tmp_path, monkeypatch, mode
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        profile = tmp_path / "profile"
+        root = profile / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", mode)
+        monkeypatch.setattr(secret_keystore, "probe_os_keystore", lambda **kwargs: False)
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                PersistenceState.UNKNOWN,
+                None,
+                None,
+                None,
+                "missing mountinfo",
+            ),
+        )
+        secret_keystore.reset_backend_cache()
+
+        with pytest.raises(KeystoreError, match="persistence is unknown"):
+            secret_keystore.set_secret("K", "v")
+
+        assert not root.exists()
+
+    def test_persistence_is_rechecked_inside_new_store_transaction(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        root = tmp_path / "secrets"
+        states = iter((PersistenceState.PERSISTENT, PersistenceState.UNKNOWN))
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+
+        def inspect(path):
+            state = next(states)
+            return MountPersistence(
+                state,
+                tmp_path if state is PersistenceState.PERSISTENT else None,
+                "ext4" if state is PersistenceState.PERSISTENT else None,
+                "/dev/x" if state is PersistenceState.PERSISTENT else None,
+                f"{state.value} evidence",
+            )
+
+        monkeypatch.setattr(container_storage, "inspect_mount_persistence", inspect)
+
+        with pytest.raises(KeystoreError, match="persistence is unknown"):
+            FileKeystore(root).set("K", "v")
+
         assert not (root / "keystore.key").exists()
+        assert not (root / "keystore.enc").exists()
 
     def test_an_existing_key_in_a_container_is_fine(self, tmp_path):
         """A mounted volume with a key already on it is the supported setup —

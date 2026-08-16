@@ -8,7 +8,6 @@ must never authorize creation of an encryption key on ephemeral storage.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -37,8 +36,6 @@ class _MountInfo:
     source: str
 
 
-_MOUNT_ESCAPE_RE = re.compile(r"\\(040|011|012|134)")
-_UNDECODED_OCTAL_RE = re.compile(r"\\[0-7]{3}")
 _MOUNT_ESCAPES = {
     "040": " ",
     "011": "\t",
@@ -46,7 +43,7 @@ _MOUNT_ESCAPES = {
     "134": "\\",
 }
 _EPHEMERAL_FILESYSTEMS = frozenset({"overlay", "tmpfs", "ramfs", "aufs"})
-_CONTAINER_MARKERS = (
+_CGROUP_MARKERS = (
     "docker",
     "podman",
     "libpod",
@@ -56,24 +53,47 @@ _CONTAINER_MARKERS = (
     "crio",
     "cri-o",
 )
+_CGROUP_FILESYSTEMS = frozenset({"cgroup", "cgroup2"})
+_CONTAINER_ROOT_FILESYSTEMS = frozenset({"aufs", "fuse-overlayfs", "overlay"})
+_CONTAINER_CGROUP_ROOT_MARKERS = (
+    "/docker/",
+    "/libpod",
+    "/lxc/",
+    "/kubepods/",
+    "/containerd/",
+    "/crio",
+    "/cri-o/",
+)
 
 
 def _decode_mount_field(value: str) -> str:
-    decoded = _MOUNT_ESCAPE_RE.sub(
-        lambda match: _MOUNT_ESCAPES[match.group(1)], value
-    )
-    if _UNDECODED_OCTAL_RE.search(decoded):
-        raise ValueError("unsupported mountinfo escape")
-    return decoded
+    """Decode exactly the four escape sequences emitted by mountinfo.
+
+    This is deliberately a single pass: a literal ``\\040`` is encoded as
+    ``\\134040`` and must decode to a backslash followed by three digits, not
+    be interpreted a second time as a space.
+    """
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            decoded.append(value[index])
+            index += 1
+            continue
+        code = value[index + 1 : index + 4]
+        if len(code) != 3 or code not in _MOUNT_ESCAPES:
+            raise ValueError("unsupported mountinfo escape")
+        decoded.append(_MOUNT_ESCAPES[code])
+        index += 4
+    return "".join(decoded)
 
 
 def _parse_mountinfo_line(line: str) -> _MountInfo:
     fields = line.split()
-    try:
-        separator = fields.index("-")
-    except ValueError as exc:
-        raise ValueError("missing mountinfo separator") from exc
-    if separator < 6 or len(fields) < separator + 4:
+    if fields.count("-") != 1:
+        raise ValueError("invalid mountinfo separator")
+    separator = fields.index("-")
+    if separator < 6 or len(fields) != separator + 4:
         raise ValueError("incomplete mountinfo record")
     if not fields[0].isdigit() or not fields[1].isdigit():
         raise ValueError("invalid mount identifiers")
@@ -82,8 +102,12 @@ def _parse_mountinfo_line(line: str) -> _MountInfo:
         raise ValueError("invalid mount device")
     root = _decode_mount_field(fields[3])
     mount_point_text = _decode_mount_field(fields[4])
+    _decode_mount_field(fields[5])
+    for optional_field in fields[6:separator]:
+        _decode_mount_field(optional_field)
     fs_type = fields[separator + 1].strip().lower()
     source = _decode_mount_field(fields[separator + 2])
+    _decode_mount_field(fields[separator + 3])
     if not root.startswith("/") or not mount_point_text.startswith("/"):
         raise ValueError("mount paths must be absolute")
     if not fs_type or not source:
@@ -118,12 +142,11 @@ def inspect_mount_persistence(
         return _unknown(f"mountinfo unavailable ({type(exc).__name__})")
     if not text.strip():
         return _unknown("mountinfo is empty")
+    lines = text.splitlines()
+    if any(not line.strip() for line in lines):
+        return _unknown("mountinfo is malformed (blank record)")
     try:
-        mounts = tuple(
-            _parse_mountinfo_line(line)
-            for line in text.splitlines()
-            if line.strip()
-        )
+        mounts = tuple(_parse_mountinfo_line(line) for line in lines)
     except ValueError as exc:
         return _unknown(f"mountinfo is malformed ({exc})")
     if not mounts:
@@ -136,10 +159,13 @@ def inspect_mount_persistence(
     )
     if not enclosing:
         return _unknown(f"no mount entry encloses {target}")
-    mount = max(
-        enclosing,
-        key=lambda item: len(item.mount_point.parts),
+    deepest_depth = max(len(item.mount_point.parts) for item in enclosing)
+    deepest = tuple(
+        item for item in enclosing if len(item.mount_point.parts) == deepest_depth
     )
+    if len(deepest) != 1:
+        return _unknown(f"deepest mount evidence for {target} is ambiguous")
+    mount = deepest[0]
     if mount.mount_point == Path("/"):
         return MountPersistence(
             PersistenceState.UNKNOWN,
@@ -176,12 +202,39 @@ def is_container() -> bool:
         return True
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         return True
-    for path in (Path("/proc/1/cgroup"), Path("/proc/self/mountinfo")):
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        ).lower()
+    except OSError:
+        cgroup = ""
+    if any(marker in cgroup for marker in _CGROUP_MARKERS):
+        return True
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        mountinfo = ""
+    for line in mountinfo.splitlines():
         try:
-            evidence = path.read_text(encoding="utf-8", errors="replace").lower()
-        except OSError:
+            mount = _parse_mountinfo_line(line)
+        except ValueError:
             continue
-        if any(marker in evidence for marker in _CONTAINER_MARKERS):
+        if (
+            mount.mount_point == Path("/")
+            and mount.fs_type in _CONTAINER_ROOT_FILESYSTEMS
+        ):
+            return True
+        root = mount.root.lower()
+        if (
+            mount.fs_type in _CGROUP_FILESYSTEMS
+            and (
+                mount.mount_point == Path("/sys/fs/cgroup")
+                or Path("/sys/fs/cgroup") in mount.mount_point.parents
+            )
+            and any(marker in root for marker in _CONTAINER_CGROUP_ROOT_MARKERS)
+        ):
             return True
     return False
 

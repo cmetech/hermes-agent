@@ -1237,7 +1237,6 @@ def apply_secret_repair(
                         failure_label="keystore repair move",
                     )
                 elif action.code in {"REBUILD_FILE_STORE", "RESET_UNRECOVERABLE"}:
-                    _require_persistent_container_storage(root)
                     for artifact in (root / sk._KEY_FILE, root / sk._DATA_FILE):
                         _assert_path_unchanged(snapshot, artifact)
                     for key, authority in snapshot.authorities.items():
@@ -1248,6 +1247,7 @@ def apply_secret_repair(
                                 "os",
                                 os_store=os_store,
                             )
+                    _require_persistent_container_storage(root)
                     quarantine = _quarantine_artifacts(
                         root,
                         [root / sk._KEY_FILE, root / sk._DATA_FILE],

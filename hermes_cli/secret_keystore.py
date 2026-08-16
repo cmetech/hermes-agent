@@ -410,6 +410,23 @@ class FileKeystore:
 
     # -- key management -------------------------------------------------
 
+    def _require_persistent_storage_for_new_key(self) -> None:
+        """Fail before initialization unless a container mount is proven durable."""
+        if (self._root / _KEY_FILE).exists() or not _in_container():
+            return
+        evidence = container_storage.inspect_mount_persistence(self._root)
+        if evidence.state is container_storage.PersistenceState.PERSISTENT:
+            return
+        raise KeystoreError(
+            f"refusing to generate a new encryption key for {self._root} "
+            f"inside a container because storage persistence is "
+            f"{evidence.state.value}: {evidence.reason}. Mount "
+            f"HERMES_HOME on a persistent volume, then run "
+            f"`hermes secrets doctor` and `hermes secrets repair`. "
+            f"Setting secret_keystore: off in config.yaml disables the "
+            f"keystore entirely -- it does NOT resume .env writes."
+        )
+
     def _load_or_create_key(self) -> bytes:
         path = self._root / _KEY_FILE
         if path.exists():
@@ -425,18 +442,7 @@ class FileKeystore:
         # Minting a key on a container root or memory/union filesystem is a
         # silent data-loss bug. Only fresh, positive evidence for a distinct
         # persistent mount authorizes first-run initialization.
-        if _in_container():
-            evidence = container_storage.inspect_mount_persistence(self._root)
-            if evidence.state is not container_storage.PersistenceState.PERSISTENT:
-                raise KeystoreError(
-                    f"refusing to generate a new encryption key for {self._root} "
-                    f"inside a container because storage persistence is "
-                    f"{evidence.state.value}: {evidence.reason}. Mount "
-                    f"HERMES_HOME on a persistent volume, then run "
-                    f"`hermes secrets doctor` and `hermes secrets repair`. "
-                    f"Setting secret_keystore: off in config.yaml disables the "
-                    f"keystore entirely -- it does NOT resume .env writes."
-                )
+        self._require_persistent_storage_for_new_key()
 
         raw = _secrets.token_bytes(_KEY_BYTES)
         _write_private(path, raw)
@@ -524,6 +530,7 @@ class FileKeystore:
         """Persist every value in one locked encrypted-file transaction."""
         if not values:
             return
+        self._require_persistent_storage_for_new_key()
         self._initialize_root()
         with _store_lock(self._root):
             self._set_many_unlocked(values)
@@ -1349,6 +1356,11 @@ def set_secrets(values: Mapping[str, str]) -> None:
     profile_identity = _active_profile_identity()
     root = _secrets_root(profile_identity)
     try:
+        preselected: SecretAuthority | None = None
+        if not root.exists():
+            preselected = _selected_new_authority(mode)
+            if preselected is SecretAuthority.FILE:
+                FileKeystore(root)._require_persistent_storage_for_new_key()
         _ensure_transaction_root(root)
         with _store_lock(root):
             registry = load_authority_registry(root)
@@ -1357,7 +1369,7 @@ def set_secrets(values: Mapping[str, str]) -> None:
             os_store = OSKeystore(profile_identity)
             operations: list[tuple[str, SecretAuthority, str, str | None]] = []
             updates: dict[str, SecretAuthority] = {}
-            selected: SecretAuthority | None = None
+            selected = preselected
 
             for key, value in values.items():
                 authority = entries.get(key)
@@ -1478,6 +1490,8 @@ def move_secret(
     root = _secrets_root(profile_identity)
     target = SecretAuthority(destination)
     try:
+        if target is SecretAuthority.FILE and not root.exists():
+            FileKeystore(root)._require_persistent_storage_for_new_key()
         _ensure_transaction_root(root)
         with _store_lock(root):
             _move_secret_locked(
