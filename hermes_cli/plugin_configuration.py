@@ -28,6 +28,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from hermes_cli import secret_keystore
+
 
 _MAX_DESCRIPTOR_BYTES = 64 * 1024
 _MAX_FIELDS = 64
@@ -1025,7 +1027,15 @@ class PluginConfigurationService:
             present = False
             value = None
             if field.storage is FieldStorage.SECRET:
-                value = secret_values.get(_secret_storage_key(plugin_id, field.id))
+                storage_key = _secret_storage_key(plugin_id, field.id)
+                value = secret_values.get(storage_key)
+                if value in {None, ""}:
+                    # Legacy authorities missed -> consult the OS keystore.
+                    # Deliberately last: managed env, the secret scope and
+                    # external sources must keep overriding, and a profile
+                    # that has not run `hermes secrets migrate` yet still
+                    # resolves from its plaintext .env entry.
+                    value = secret_keystore.get_secret(storage_key)
                 if value not in {None, ""}:
                     present = True
             elif field.id in stored:

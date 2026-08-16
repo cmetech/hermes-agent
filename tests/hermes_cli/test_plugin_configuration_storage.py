@@ -5,9 +5,11 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+import hermes_cli.secret_keystore as sk
 from hermes_cli.plugin_configuration import (
     PluginConfigurationError,
     PluginConfigurationService,
@@ -857,3 +859,105 @@ def test_plugin_context_secret_resolution_preserves_host_authority_precedence(
         )
     finally:
         reset_secret_scope(scope_token)
+
+
+def _token_field(service):
+    """Resolved state of the sample connector's secret field, via detail()."""
+    return next(
+        field
+        for field in service.detail("sample-connector")["fields"]
+        if field["id"] == "token"
+    )
+
+
+class TestKeystoreReadPath:
+    def test_keystore_value_is_resolved_when_env_has_no_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """RED before Task 5: .env has no entry, so detail() reports the
+        field unset no matter what the keystore holds."""
+        from hermes_cli.plugin_configuration import _secret_storage_key
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+        sk.set_secret(_secret_storage_key("sample-connector", "token"), "from-keystore")
+
+        assert _token_field(service)["is_set"] is True
+
+    def test_legacy_env_value_wins_over_keystore(self, tmp_path, monkeypatch):
+        """Un-migrated .env entries must keep working, and managed/scoped
+        overrides ride the same path — so legacy authorities take precedence.
+
+        Asserted through the real resolution order rather than a reimplementation
+        of it: the point is that `_resolved` consults the keystore *after* the
+        profile store, and only a test that runs `_resolved` can show that.
+        """
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationService,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, manager = _service(tmp_path)
+        key = _secret_storage_key("sample-connector", "token")
+        sk.set_secret(key, "from-keystore")
+
+        with mock.patch.object(
+            PluginConfigurationService,
+            "_profile_secret_values",
+            staticmethod(lambda: {key: "from-env"}),
+        ):
+            resolved, _invalid = service._resolved(
+                "sample-connector", manager._plugins["sample-connector"]
+            )
+
+        assert resolved["token"] == "from-env"
+
+    def test_keystore_is_consulted_only_after_the_profile_store_misses(
+        self, tmp_path, monkeypatch
+    ):
+        """Precedence is an ordering property, so assert on the call itself.
+
+        Without this, a read path that consulted the keystore *first* and then
+        let .env overwrite the result would still satisfy the test above.
+        """
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationService,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        sk.reset_backend_cache()
+        service, manager = _service(tmp_path)
+        key = _secret_storage_key("sample-connector", "token")
+
+        with mock.patch.object(
+            PluginConfigurationService,
+            "_profile_secret_values",
+            staticmethod(lambda: {key: "from-env"}),
+        ):
+            with mock.patch.object(sk, "get_secret") as get_secret:
+                service._resolved(
+                    "sample-connector", manager._plugins["sample-connector"]
+                )
+
+        get_secret.assert_not_called()
+
+    def test_keystore_read_failure_leaves_the_field_unconfigured(
+        self, tmp_path, monkeypatch
+    ):
+        """A broken keystore must not raise out of a read path the dashboard
+        calls on every page load — it degrades to 'not configured'."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.get.side_effect = sk.KeystoreError("boom")
+
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            assert _token_field(service)["is_set"] is False
