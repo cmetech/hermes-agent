@@ -617,7 +617,17 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
         # Keep the established chmod failure seam while explicitly refusing
         # link traversal. The already-open no-follow descriptor anchors and
         # verifies the intended inode across this pathname operation.
-        os.chmod(path, mode, follow_symlinks=False)
+        try:
+            os.chmod(path, mode, follow_symlinks=False)
+        except NotImplementedError:
+            # Linux commonly exposes chmod but not its no-follow variant.
+            # The descriptor above was opened with O_NOFOLLOW and remains the
+            # authority for both mutation and verification below.
+            pass
+        except TypeError as exc:
+            message = str(exc)
+            if "follow_symlinks" not in message and "keyword" not in message:
+                raise
         after = path.lstat()
         if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
             raise KeystoreError(f"path changed while securing permissions: {path}")
