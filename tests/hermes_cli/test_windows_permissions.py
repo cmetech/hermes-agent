@@ -210,6 +210,8 @@ def test_sid_lookup_filters_plugin_secrets_from_its_child(tmp_path, monkeypatch)
         f'"   ","{SID}"\n',
         f'"DOMAIN\\user"," {SID}"\n',
         f'"DOMAIN\\user","{SID} "\n',
+        f'DOMAIN"user,"{SID}"\n',
+        f'DOMAIN\\user","{SID}"\n',
     ],
     ids=[
         "extra-field",
@@ -222,6 +224,8 @@ def test_sid_lookup_filters_plugin_secrets_from_its_child(tmp_path, monkeypatch)
         "blank-account",
         "leading-sid-whitespace",
         "trailing-sid-whitespace",
+        "quote-embedded-in-unquoted-account",
+        "unterminated-unquoted-account-quote",
     ],
 )
 def test_whoami_sid_requires_exactly_one_two_field_csv_row(
@@ -238,6 +242,26 @@ def test_whoami_sid_requires_exactly_one_two_field_csv_row(
         permissions.restrict_file_to_current_user(target)
 
     assert run.call_count == 1
+
+
+def test_whoami_sid_accepts_canonical_escaped_quote_in_account(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "secret"
+    target.write_text("credential", encoding="utf-8")
+    run = mock.Mock(
+        side_effect=[
+            _completed(stdout=f'"DOMAIN""user","{SID}"\n'),
+            _completed(),
+        ]
+    )
+    monkeypatch.setattr(permissions.subprocess, "run", run)
+
+    permissions.restrict_file_to_current_user(target)
+
+    assert run.call_count == 2
 
 
 @pytest.mark.parametrize(

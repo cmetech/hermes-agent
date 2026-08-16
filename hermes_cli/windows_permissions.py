@@ -142,6 +142,14 @@ def _current_windows_sid() -> str:
         return ""
     if len(rows) != 1 or len(rows[0]) != 2:
         return ""
+    canonical = io.StringIO(newline="")
+    csv.writer(
+        canonical,
+        lineterminator="\n",
+        quoting=csv.QUOTE_ALL,
+    ).writerow(rows[0])
+    if completed.stdout != canonical.getvalue():
+        return ""
     account, candidate = rows[0]
     if not account.strip():
         return ""
