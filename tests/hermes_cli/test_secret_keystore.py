@@ -1,5 +1,6 @@
 """Tests for hermes_cli.secret_keystore — two-tier plugin secret storage."""
 
+import logging
 import multiprocessing
 import os
 import stat
@@ -1141,6 +1142,50 @@ class TestConfigSetting:
                 sk.reset_backend_cache()
 
         assert snapshot() == before
+
+    def test_malformed_config_read_leaves_recovery_for_the_ordinary_loader(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        """A keystore mode probe must not consume corrupt-config recovery."""
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        broken = b"secret_keystore: [unterminated\n"
+        config_path.write_bytes(broken)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+        with (
+            caplog.at_level(logging.WARNING, logger="hermes_cli.config"),
+            mock.patch.object(sk, "probe_os_keystore", return_value=False),
+        ):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+        assert caplog.records == []
+        assert capsys.readouterr().err == ""
+
+        loaded = config_module.load_config(config_path=config_path)
+
+        backups = list(home.glob("config.yaml.corrupt.*.bak"))
+        assert loaded["secret_keystore"] == "auto"
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == broken
+        assert "Failed to parse" in capsys.readouterr().err
+        assert any("Failed to parse" in record.message for record in caplog.records)
 
     def test_mode_is_a_settable_config_key(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG

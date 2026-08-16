@@ -653,7 +653,10 @@ def _resolve_mode() -> str:
         try:
             from hermes_cli.config import get_config_path, load_config_readonly
 
-            config = load_config_readonly(config_path=get_config_path())
+            config = load_config_readonly(
+                config_path=get_config_path(),
+                suppress_parse_failure_side_effects=True,
+            )
             raw = config.get(_MODE_KEY) if isinstance(config, dict) else None
         except Exception:
             raw = None

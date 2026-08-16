@@ -3329,7 +3329,11 @@ def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True, config_path=config_path)
 
 
-def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def load_config_readonly(
+    config_path: Optional[Path] = None,
+    *,
+    suppress_parse_failure_side_effects: bool = False,
+) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3350,8 +3354,16 @@ def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     ``config_path`` has the same explicit-profile semantics as
     :func:`load_config` and does not mutate process-global profile state.
+    ``suppress_parse_failure_side_effects`` is for speculative behavioral
+    reads that must not consume corrupt-config recovery: parse failures return
+    the normal fallback without warning, backup, or corrupt-signature cache
+    writes, leaving a later ordinary load to surface and preserve the file.
     """
-    return _load_config_impl(want_deepcopy=False, config_path=config_path)
+    return _load_config_impl(
+        want_deepcopy=False,
+        config_path=config_path,
+        suppress_parse_failure_side_effects=suppress_parse_failure_side_effects,
+    )
 
 
 def write_platform_config_field(
@@ -3486,6 +3498,7 @@ def _load_config_impl(
     *,
     want_deepcopy: bool,
     config_path: Optional[Path] = None,
+    suppress_parse_failure_side_effects: bool = False,
 ) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         if config_path is None:
@@ -3540,6 +3553,7 @@ def _load_config_impl(
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        parse_failed = False
 
         if user_sig is not None:
             try:
@@ -3555,6 +3569,7 @@ def _load_config_impl(
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                parse_failed = True
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3568,11 +3583,14 @@ def _load_config_impl(
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
                 lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
-                _warn_config_parse_failure(
-                    config_path,
-                    e,
-                    fallback="last-known-good" if lkg is not None else "defaults",
-                )
+                if not suppress_parse_failure_side_effects:
+                    _warn_config_parse_failure(
+                        config_path,
+                        e,
+                        fallback=(
+                            "last-known-good" if lkg is not None else "defaults"
+                        ),
+                    )
                 if lkg is not None:
                     # save_config() stores the pre-expansion normalized dict
                     # (env-ref templates preserved); the load path stores the
@@ -3582,7 +3600,10 @@ def _load_config_impl(
                     lkg_copy: Dict[str, Any] = _cast(
                         Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
                     )
-                    if cache_sig is not None:
+                    if (
+                        cache_sig is not None
+                        and not suppress_parse_failure_side_effects
+                    ):
                         # Cache under the corrupt file's signature (empty env
                         # snapshot: always valid) so repeated loads don't
                         # re-parse the broken file; fixing the file changes the
@@ -3606,6 +3627,9 @@ def _load_config_impl(
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        if suppress_parse_failure_side_effects and parse_failed:
+            return copy.deepcopy(expanded) if want_deepcopy else expanded
+
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
