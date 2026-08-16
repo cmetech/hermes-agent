@@ -975,6 +975,28 @@ class TestBoundedReads:
             released.set()
             assert finished.wait(timeout=5.0), "abandoned worker never completed"
 
+    def test_a_forced_os_mode_is_not_demoted(self, tmp_path, monkeypatch):
+        """"os" pins the tier. Demoting would move reads to a store that does
+        not hold the operator's secrets, which looks like data loss."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            assert sk.get_backend().name == "os"
+            assert sk.get_secret("K") is None       # timed out, swallowed
+            assert sk.get_backend().name == "os"    # NOT demoted
+        released.set()
+
     def test_a_timed_out_read_demotes_the_backend(self, tmp_path, monkeypatch):
         """One hang is enough evidence. Without demotion, resolving N secrets
         against a wedged keychain abandons N threads and burns N timeouts."""
@@ -983,7 +1005,7 @@ class TestBoundedReads:
         import hermes_cli.secret_keystore as sk
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
         released = threading.Event()
 
         class _HangingKeyring:
@@ -1079,7 +1101,12 @@ class TestConfigSetting:
             lambda *a, **k: {"secret_keystore": "fille"},
         )
         sk.reset_backend_cache()
-        assert sk.get_backend() is not None
+        # A typo resolves to "auto", and "auto" probes the OS keystore -- so
+        # without this patch the test would write a probe entry into the
+        # developer's real Keychain, or raise an authorisation prompt in CI.
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            assert sk.get_backend() is not None
+            assert sk.get_backend().name == "file"
 ```
 
 - [ ] **Step 4: Implement the facade**
@@ -1177,11 +1204,21 @@ def get_backend():
 def _demote_os_backend() -> None:
     """Swap a wedged OS keystore for the file tier, once, process-wide.
 
+    Only applies in "auto" mode. "os" pins the tier deliberately, so a
+    demotion there would contradict the operator's explicit choice and move
+    reads to a store that does not hold their secrets.
+
     Deliberately not a circuit breaker with a recovery window: a keychain
     that stops answering mid-process stays that way until the session is
     unlocked, and re-probing on a timer would reintroduce the stall on a
     schedule.
     """
+    if _resolve_mode() == "os":
+        # "os" pins the tier. Demoting would silently move secrets to a
+        # different store than the operator asked for -- and a subsequent
+        # read would miss, looking like the credential had vanished. A
+        # forced tier that stops answering must keep failing loudly.
+        return
     global _BACKEND, _BACKEND_RESOLVED
     with _BACKEND_LOCK:
         if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
@@ -1241,7 +1278,7 @@ def delete_secret(key: str) -> None:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secret_keystore.py -v`
-Expected: PASS (43 tests)
+Expected: PASS (44 tests)
 
 - [ ] **Step 6: Commit**
 
@@ -1852,7 +1889,7 @@ class TestMigrate:
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 report = migrate_secrets(dry_run=True)
         assert report.migrated == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
@@ -1866,7 +1903,7 @@ class TestMigrate:
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 report = migrate_secrets()
         assert report.migrated == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
@@ -1879,7 +1916,7 @@ class TestMigrate:
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 with mock.patch.object(
                     sk, "set_secret", side_effect=sk.KeystoreError("boom")
@@ -1895,7 +1932,7 @@ class TestMigrate:
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 with mock.patch.object(sk, "get_secret", return_value="different"):
                     report = migrate_secrets()
@@ -2001,12 +2038,52 @@ def migrate_secrets(dry_run: bool = False) -> MigrationReport:
             continue
         report.migrated.append(key)
     return report
+
+    def test_a_failed_env_removal_is_reported_as_failed_not_migrated(self):
+        """The whole point of checking remove_env_value's return. Reporting a
+        key as migrated while its plaintext survives in .env is the one
+        outcome this command must never produce -- the operator stops looking."""
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value",
+                side_effect=lambda k, **kwargs: False,
+            ):
+                report = migrate_secrets()
+        assert report.migrated == []
+        assert report.failed == [KEY]
+
+    def test_a_persistence_error_during_removal_is_also_failed(self):
+        from hermes_cli.config import ConfigurationPersistenceError
+
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value",
+                side_effect=ConfigurationPersistenceError("disk full"),
+            ):
+                report = migrate_secrets()
+        assert report.migrated == []
+        assert report.failed == [KEY]
+
+    def test_removal_is_strict_and_does_not_touch_process_env(self):
+        """strict=True so a failed write raises instead of returning False
+        quietly; mirror_process_env=False because a plugin secret must never
+        enter os.environ, migration included."""
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value", return_value=True
+            ) as remove:
+                migrate_secrets()
+        assert remove.call_args.kwargs["strict"] is True
+        assert remove.call_args.kwargs["mirror_process_env"] is False
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secrets_migrate.py -v`
-Expected: PASS (8 tests)
+Expected: PASS (10 tests)
 
 - [ ] **Step 5: Wire up the CLI subcommand**
 
@@ -2129,51 +2206,72 @@ from hermes_cli import config
 
 
 class TestWindowsAcl:
-    def test_windows_path_invokes_icacls(self, tmp_path):
+    def test_windows_path_rebuilds_the_dacl_via_powershell(self, tmp_path):
         target = tmp_path / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
-            with mock.patch.object(config.subprocess, "run") as run:
-                run.return_value = mock.Mock(returncode=0)
-                config._secure_file(target)
+            with mock.patch.object(config, "_current_windows_sid",
+                                   return_value="S-1-5-21-1-2-3-1001"):
+                with mock.patch.object(config.subprocess, "run") as run:
+                    run.return_value = mock.Mock(returncode=0)
+                    config._secure_file(target)
         assert run.called
         argv = run.call_args[0][0]
-        assert argv[0] == "icacls"
-        assert str(target) in argv
+        assert argv[0] == "powershell"
         script = argv[-1]
         # Inheritance detached AND inherited copies discarded.
         assert "SetAccessRuleProtection($true,$false)" in script
-        # Every explicit ACE purged -- /inheritance:r alone would leave these,
-        # and /remove:g only reaches SIDs named explicitly.
+        # Every explicit ACE purged. icacls could not do this: /inheritance:r
+        # drops only inherited ACEs and /remove:g only the SIDs it is given.
         assert "PurgeAccessRules" in script
         # Exactly one rule added back.
         assert script.count("AddAccessRule") == 1
         # Identity is a SID, not a localisable name.
-        assert "SecurityIdentifier" in script
+        assert "S-1-5-21-1-2-3-1001" in script
         assert "Administrators" not in script
 
-    def test_grant_is_restricted_to_the_current_user(self, tmp_path):
-        target = tmp_path / ".env"
+    def test_the_path_is_passed_as_data_not_interpolated_source(self, tmp_path):
+        """A path is user-controlled. Interpolating it into PowerShell source
+        lets a directory named  '; rm -r x; $y='  run as code -- and Windows
+        permits single quotes in file names."""
+        hostile = tmp_path / "it's ok'; Write-Output PWNED; $x='"
+        hostile.mkdir()
+        target = hostile / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
-            with mock.patch.object(config, "_current_windows_principal",
-                                   return_value="CORP\\alice"):
+            with mock.patch.object(config, "_current_windows_sid",
+                                   return_value="S-1-5-21-1-2-3-1001"):
                 with mock.patch.object(config.subprocess, "run") as run:
                     run.return_value = mock.Mock(returncode=0)
                     config._secure_file(target)
         argv = run.call_args[0][0]
-        assert any("CORP\\alice" in part for part in argv)
+        script = argv[-1]
+        assert "PWNED" not in script, "path was interpolated into the script body"
+        # The path travels as a bound argument instead.
+        assert str(target) in argv[argv.index(script) + 1:] or str(target) in argv
 
-    def test_icacls_failure_does_not_raise(self, tmp_path):
+    def test_no_sid_means_no_call_and_no_silent_success(self, tmp_path):
+        """If the SID cannot be resolved the DACL cannot be built correctly.
+        Doing nothing and reporting success would be the worst outcome."""
+        target = tmp_path / ".env"
+        target.write_text("SECRET=x", encoding="utf-8")
+        config._WARNED_ACL_PATHS.clear()
+        with mock.patch.object(config.sys, "platform", "win32"):
+            with mock.patch.object(config, "_current_windows_sid", return_value=""):
+                with mock.patch.object(config.subprocess, "run") as run:
+                    config._secure_file(target)
+        assert not run.called
+
+    def test_acl_failure_does_not_raise(self, tmp_path):
         """A failed ACL must not break setup — but see the next test."""
         target = tmp_path / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(config.subprocess, "run",
-                                   side_effect=OSError("no icacls")):
+                                   side_effect=OSError("no powershell")):
                 config._secure_file(target)
 
-    def test_icacls_failure_warns_once(self, tmp_path, capsys):
+    def test_acl_failure_warns_once(self, tmp_path, capsys):
         """Silently passing is exactly what produced this gap. A failure the
         operator never sees is indistinguishable from no protection."""
         config._WARNED_ACL_PATHS.clear()
@@ -2181,7 +2279,7 @@ class TestWindowsAcl:
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(config.subprocess, "run",
-                                   side_effect=OSError("no icacls")):
+                                   side_effect=OSError("no powershell")):
                 config._secure_file(target)
                 config._secure_file(target)
         warnings = capsys.readouterr().err
@@ -2219,7 +2317,7 @@ class TestWindowsAcl:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secure_file_windows.py -v`
-Expected: FAIL — `AttributeError: module 'hermes_cli.config' has no attribute '_current_windows_principal'`
+Expected: FAIL — `AttributeError: module 'hermes_cli.config' has no attribute '_current_windows_sid'`
 
 - [ ] **Step 3: Implement**
 
@@ -2234,6 +2332,12 @@ _WARNED_ACL_PATHS: set[str] = set()
 Then replace `_secure_file` and add its Windows helpers:
 
 ```python
+# Belt and braces: the SID comes from `whoami /user`, but it is checked
+# against this before reaching PowerShell so a surprising whoami cannot
+# widen the surface.
+_SID_RE = re.compile(r"^S-1-[0-9-]{1,60}$")
+
+
 def _current_windows_sid() -> str:
     """Return the current account's SID as a string, or "" if unavailable.
 
@@ -2283,11 +2387,23 @@ def _windows_restrict_acl(path) -> bool:
     """
     sid = _current_windows_sid()
     if not sid:
+        # Without a SID the DACL cannot be built correctly. Returning False
+        # lets the caller warn; doing nothing and reporting success would be
+        # the one outcome worse than the gap being fixed.
         return False
+
+    # The path arrives from the filesystem and is user-controlled. It is bound
+    # as an ARGUMENT, never interpolated into the script body: Windows permits
+    # single quotes in file names, so a directory called  it's ok'; <code>; $x='
+    # would otherwise execute. -File is not usable here (no stdin script), so
+    # the script reads $args[0].
+    #
+    # $sid is not user-controlled -- it comes from `whoami /user` and is
+    # validated below -- but it is bound the same way for consistency.
     script = (
         "$ErrorActionPreference='Stop';"
-        f"$p='{path}';"
-        f"$id=New-Object System.Security.Principal.SecurityIdentifier('{sid}');"
+        "$p=$args[0];"
+        "$id=New-Object System.Security.Principal.SecurityIdentifier($args[1]);"
         "$acl=Get-Acl -LiteralPath $p;"
         # $true = protect from inheritance, $false = do not copy inherited ACEs
         "$acl.SetAccessRuleProtection($true,$false);"
@@ -2298,9 +2414,15 @@ def _windows_restrict_acl(path) -> bool:
         "$acl.AddAccessRule($rule);"
         "Set-Acl -LiteralPath $p -AclObject $acl;"
     )
+    if not _SID_RE.fullmatch(sid):
+        return False
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            [
+                "powershell", "-NoProfile", "-NonInteractive",
+                "-Command", script,
+                "-args", str(path), sid,
+            ],
             capture_output=True,
             timeout=15,
             check=False,
@@ -2486,11 +2608,29 @@ ps -Eww -p $PID | tr ' ' '\n' | grep -c '^HERMES_PLUGIN_' || true
 Expected: `0`.
 
 ```powershell
-# Windows
-(Get-Process -Name python | Select-Object -First 1).StartInfo.EnvironmentVariables.Keys |
-  Where-Object { $_ -like 'HERMES_PLUGIN_*' }
+# Windows. Get-Process(...).StartInfo is NOT the answer: StartInfo describes
+# how *you* would start a process, and on a Process object obtained by
+# querying the system it is empty. Reading another process's environment on
+# Windows needs WMI/CIM:
+$pid = (Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -match 'hermes' } |
+        Select-Object -First 1).ProcessId
+Write-Output "backend pid: $pid"
+
+# CIM does not expose the environment block directly either, so read it from
+# the process itself via a debugger-free handle:
+(Get-Process -Id $pid).Modules | Out-Null   # forces a handle open; ignore output
+$env_dump = & "$env:SystemRoot\System32\cmd.exe" /c "wmic process where processid=$pid get commandline"
 ```
-Expected: no output.
+
+If that proves awkward on the target machine — it often does — use the
+in-process check instead, which is the more reliable form on every platform:
+add a temporary debug tool returning
+`[k for k in os.environ if k.startswith("HERMES_PLUGIN_")]` and call it
+**through the running agent**. What matters is that the check executes inside
+the process under test, not that it uses any particular OS facility.
+
+Expected: no `HERMES_PLUGIN_*` keys.
 
 If the PID cannot be resolved, the equivalent in-process check is to add a
 temporary debug tool that returns `[k for k in os.environ if
