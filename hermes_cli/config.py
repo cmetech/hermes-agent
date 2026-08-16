@@ -2678,7 +2678,7 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(m: re.Match, *, warn: bool = True) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
@@ -2705,22 +2705,24 @@ def _env_expand_match(m: re.Match) -> str:
         val = os.environ.get(name)
         if val is not None:
             return val
-        logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name,
-        )
+        if warn:
+            logger.warning(
+                "Config ref %r: %s is not set (check ~/.hermes/.env); "
+                "keeping the literal placeholder", raw, name,
+            )
         return raw
     if ":" in inner and re.match(r"^[a-z][a-z0-9_-]*:", inner):
         # Looks like a SecretRef with a non-env source.  Values from vault
         # backends arrive via the secrets: block as env vars — point there
         # instead of silently treating "bitwarden:FOO" as a var named
         # "bitwarden:FOO".
-        logger.warning(
-            "Config ref %r uses source %r which is not resolvable in "
-            "config.yaml — external secret sources inject env vars at "
-            "startup, so reference the variable as ${env:NAME} instead",
-            raw, inner.split(":", 1)[0],
-        )
+        if warn:
+            logger.warning(
+                "Config ref %r uses source %r which is not resolvable in "
+                "config.yaml — external secret sources inject env vars at "
+                "startup, so reference the variable as ${env:NAME} instead",
+                raw, inner.split(":", 1)[0],
+            )
         return raw
     # Legacy ``${VAR}`` — bare name.
     return os.environ.get(inner, raw)
@@ -2738,7 +2740,7 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(obj, *, warn: bool = True):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
     values.
 
@@ -2747,11 +2749,15 @@ def _expand_env_vars(obj):
     ``os.environ``) are kept verbatim so callers can detect them.
     """
     if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda match: _env_expand_match(match, warn=warn),
+            obj,
+        )
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {k: _expand_env_vars(v, warn=warn) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, warn=warn) for item in obj]
     return obj
 
 
@@ -3598,7 +3604,13 @@ def _load_config_impl(
                     # stored value is already expanded.
                     from typing import cast as _cast
                     lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                        Dict[str, Any],
+                        _expand_env_vars(
+                            copy.deepcopy(lkg),
+                            warn=not (
+                                suppress_parse_failure_side_effects and parse_failed
+                            ),
+                        ),
                     )
                     if (
                         cache_sig is not None
@@ -3617,7 +3629,10 @@ def _load_config_impl(
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
+        warn_on_unresolved_refs = not (
+            suppress_parse_failure_side_effects and parse_failed
+        )
+        expanded = _expand_env_vars(normalized, warn=warn_on_unresolved_refs)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.
@@ -3625,7 +3640,9 @@ def _load_config_impl(
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
         if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
+            managed_expanded = _expand_env_vars(
+                managed_config, warn=warn_on_unresolved_refs
+            )
             expanded = _deep_merge(expanded, managed_expanded)
         if suppress_parse_failure_side_effects and parse_failed:
             return copy.deepcopy(expanded) if want_deepcopy else expanded

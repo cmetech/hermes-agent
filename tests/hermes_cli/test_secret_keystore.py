@@ -1187,6 +1187,68 @@ class TestConfigSetting:
         assert "Failed to parse" in capsys.readouterr().err
         assert any("Failed to parse" in record.message for record in caplog.records)
 
+    def test_lkg_placeholder_warning_waits_for_the_ordinary_loader(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        """Silent LKG re-expansion must not consume config diagnostics."""
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        placeholder = "${env:ROUND3_UNSET_NAME}"
+        config_path.write_text(
+            f"secret_keystore: file\nround3_placeholder: {placeholder}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.delenv("ROUND3_UNSET_NAME", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            seeded = config_module.load_config(config_path=config_path)
+        assert seeded["round3_placeholder"] == placeholder
+        caplog.clear()
+        capsys.readouterr()
+
+        broken = b"secret_keystore: [unterminated\n"
+        config_path.write_bytes(broken)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+        with (
+            caplog.at_level(logging.WARNING, logger="hermes_cli.config"),
+            mock.patch.object(sk, "probe_os_keystore", return_value=False),
+        ):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+        assert caplog.records == []
+        assert capsys.readouterr().err == ""
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            recovered = config_module.load_config(config_path=config_path)
+
+        backups = list(home.glob("config.yaml.corrupt.*.bak"))
+        assert recovered["round3_placeholder"] == placeholder
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == broken
+        assert "Failed to parse" in capsys.readouterr().err
+        assert any("Failed to parse" in record.message for record in caplog.records)
+        assert any(
+            "ROUND3_UNSET_NAME is not set" in record.message
+            for record in caplog.records
+        )
+
     def test_mode_is_a_settable_config_key(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG
 
