@@ -24,9 +24,18 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from typing import Mapping
+from typing import Literal, Mapping
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from hermes_cli.secret_authority import (
+    AUTHORITY_FILE,
+    AUTHORITY_VERSION,
+    AuthorityRegistry,
+    SecretAuthority,
+    encode_authority_registry,
+    load_authority_registry,
+)
 
 try:  # pragma: no cover - import guard exercised via mock.patch
     import keyring
@@ -386,7 +395,7 @@ class FileKeystore:
 
     def _secure_existing_store(self) -> None:
         _ensure_private_permissions(self._root, 0o700)
-        for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE):
+        for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE, AUTHORITY_FILE):
             path = self._root / filename
             if path.exists():
                 _ensure_private_permissions(path, 0o600)
@@ -470,11 +479,38 @@ class FileKeystore:
 
     # -- public API -----------------------------------------------------
 
-    def get(self, key: str) -> str | None:
-        if not self._root.exists():
+    def _get_unlocked(self, key: str) -> str | None:
+        """Read one value while the caller owns the profile transaction lock."""
+        if not (self._root / _DATA_FILE).exists():
             return None
-        with _store_lock(self._root):
-            return self._read_all().get(key)
+        return self._read_all().get(key)
+
+    def _set_unlocked(self, key: str, value: str) -> None:
+        """Write one value while the caller owns the profile transaction lock."""
+        data = self._read_all()
+        data[key] = value
+        self._write_all(data)
+
+    def _set_many_unlocked(self, values: Mapping[str, str]) -> None:
+        if not values:
+            return
+        data = self._read_all()
+        data.update(values)
+        self._write_all(data)
+
+    def _delete_unlocked(self, key: str) -> None:
+        """Delete one value while the caller owns the profile transaction lock."""
+        if not (self._root / _DATA_FILE).exists():
+            return
+        data = self._read_all()
+        if data.pop(key, None) is not None:
+            self._write_all(data)
+
+    def get(self, key: str) -> str | None:
+        if not (self._root / _DATA_FILE).exists():
+            return None
+        with _store_lock(self._root, create=False):
+            return self._get_unlocked(key)
 
     def set(self, key: str, value: str) -> None:
         # The lock covers the complete read-modify-write transaction. Locking
@@ -488,27 +524,23 @@ class FileKeystore:
             return
         self._initialize_root()
         with _store_lock(self._root):
-            data = self._read_all()
-            data.update(values)
-            self._write_all(data)
+            self._set_many_unlocked(values)
 
     def delete(self, key: str) -> None:
-        if not self._root.exists():
+        if not (self._root / _DATA_FILE).exists():
             return
-        with _store_lock(self._root):
-            data = self._read_all()
-            if data.pop(key, None) is not None:
-                self._write_all(data)
+        with _store_lock(self._root, create=False):
+            self._delete_unlocked(key)
 
     def keys(self) -> list[str]:
-        if not self._root.exists():
+        if not (self._root / _DATA_FILE).exists():
             return []
-        with _store_lock(self._root):
+        with _store_lock(self._root, create=False):
             return list(self._read_all())
 
 
 @contextlib.contextmanager
-def _store_lock(root: Path):
+def _store_lock(root: Path, *, create: bool = True):
     """Serialize one whole file-store transaction across threads/processes.
 
     The separate lock file remains stable while key/ciphertext files are
@@ -518,7 +550,13 @@ def _store_lock(root: Path):
     """
     lock_path = root / _LOCK_FILE
     with _FILE_THREAD_LOCK:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        flags = os.O_RDWR | (os.O_CREAT if create else 0)
+        try:
+            fd = os.open(str(lock_path), flags, 0o600)
+        except FileNotFoundError as exc:
+            raise KeystoreError(
+                f"secret transaction lock is missing at {lock_path}"
+            ) from exc
         with os.fdopen(fd, "r+b") as handle:
             _ensure_private_permissions(lock_path, 0o600)
             if os.name == "nt":
@@ -620,11 +658,15 @@ def _write_private(path: Path, payload: bytes) -> None:
 
 
 __all__ += [
+    "SecretAuthority",
     "get_backend",
+    "get_authority",
     "get_secret",
+    "resolve_secret",
     "set_secret",
     "set_secrets",
     "delete_secret",
+    "move_secret",
     "reset_backend_cache",
 ]
 
@@ -703,7 +745,6 @@ def get_backend():
             state.backend = None
             state.resolved = False
             state.mode = None
-            state.healthy = True
             mode = _resolve_mode()
             if mode == "off":
                 state.backend = None
@@ -714,7 +755,8 @@ def get_backend():
             else:  # auto
                 state.backend = (
                     OSKeystore(profile_identity)
-                    if probe_os_keystore(profile_identity=profile_identity)
+                    if state.healthy
+                    and probe_os_keystore(profile_identity=profile_identity)
                     else FileKeystore(_secrets_root(profile_identity))
                 )
             state.mode = mode
@@ -723,111 +765,586 @@ def get_backend():
 
 
 def _mark_os_unhealthy(state: _ProfileState) -> None:
-    """Latch the OS keystore as unusable, and in "auto" fall back to file.
-
-    Two separable things happen here, and conflating them was a real defect:
-
-    * The **latch** always applies to this profile. Its call lock makes the
-      check-and-spawn transition atomic, so even concurrent readers can
-      abandon at most one worker per profile selection lifecycle.
-    * The **demotion** applies only in "auto" mode. "os" pins the tier
-      deliberately; swapping under the operator would move reads to a store
-      that does not hold their secrets, which presents as data loss rather
-      than as the keychain problem it actually is.
-
-    Deliberately not a circuit breaker with a recovery window: a keychain
-    that stops answering mid-process stays that way until the session is
-    unlocked, and re-probing on a timer would reintroduce the stall on a
-    schedule.
-    """
+    """Latch OS health without ever changing the selected or durable tier."""
     state.healthy = False
-    with state.backend_lock:
-        # Backend and selection mode are one process-cached decision. Reading
-        # mutable config here would let an unrelated post-startup change swap
-        # the tier under a running process.
-        if state.mode == "os":
-            return
-        if state.backend is not None and getattr(state.backend, "name", None) == "os":
-            state.backend = FileKeystore(_secrets_root(state.profile_identity))
-            state.resolved = True
 
 
-def get_secret(key: str) -> str | None:
-    """Return one secret, or None.
+def _ensure_transaction_root(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    _ensure_private_permissions(root, 0o700)
 
-    Never raises.  A read failure must look like "not configured" so the
-    caller reports a missing credential instead of crashing an agent turn.
-    """
-    # get_backend() is inside the try on purpose. It constructs FileKeystore,
-    # which creates $HERMES_HOME/secrets and can raise OSError, and it runs
-    # D4's container check, which raises KeystoreError. Leaving it outside
-    # would break the "never raises" contract on the exact paths most likely
-    # to fail -- a read-only home, a full disk, a container without a volume.
+
+def _write_authority_registry(root: Path, registry: AuthorityRegistry) -> None:
+    """Replace authority metadata atomically while the caller owns the lock."""
+    _write_private(root / AUTHORITY_FILE, encode_authority_registry(registry))
+
+
+def _registry_with_updates(
+    registry: AuthorityRegistry | None,
+    updates: Mapping[str, SecretAuthority],
+) -> AuthorityRegistry:
+    entries = dict(registry.entries) if registry is not None else {}
+    entries.update(updates)
+    return AuthorityRegistry(version=AUTHORITY_VERSION, entries=entries)
+
+
+def _read_tier(
+    tier: SecretAuthority,
+    key: str,
+    *,
+    file_store: FileKeystore,
+    os_store: OSKeystore,
+) -> str | None:
+    if tier is SecretAuthority.FILE:
+        return file_store._get_unlocked(key)
+    if tier is SecretAuthority.OS:
+        return os_store.get(key)
+    raise KeystoreError("cleared authority has no readable tier")
+
+
+def _set_tier(
+    tier: SecretAuthority,
+    key: str,
+    value: str,
+    *,
+    file_store: FileKeystore,
+    os_store: OSKeystore,
+) -> None:
+    if tier is SecretAuthority.FILE:
+        file_store._set_unlocked(key, value)
+        return
+    if tier is SecretAuthority.OS:
+        os_store._set_unlocked(key, value)
+        return
+    raise KeystoreError("cannot write cleared authority")
+
+
+def _delete_tier(
+    tier: SecretAuthority,
+    key: str,
+    *,
+    file_store: FileKeystore,
+    os_store: OSKeystore,
+) -> None:
+    if tier is SecretAuthority.FILE:
+        file_store._delete_unlocked(key)
+        return
+    if tier is SecretAuthority.OS:
+        os_store._delete_unlocked(key)
+        return
+    raise KeystoreError("cannot delete cleared authority")
+
+
+def _pre_registry_copies(
+    key: str,
+    *,
+    file_store: FileKeystore,
+    os_store: OSKeystore,
+) -> tuple[str | None, bool, str | None]:
+    """Return file value, whether OS state is known, and OS value."""
+    file_value = file_store._get_unlocked(key)
     try:
-        backend = get_backend()
-        if backend is None:
-            return None
-        return backend.get(key)
-    # This is the read facade's final fault boundary. Backend integrations can
-    # raise ordinary exceptions outside our typed wrappers; reads still need
-    # to fall through as "not configured". Process-control exceptions remain
-    # visible because BaseException is deliberately not caught.
+        os_value = os_store.get(key)
     except Exception:
+        return file_value, False, None
+    return file_value, True, os_value
+
+
+def _infer_pre_registry_tiers(
+    file_value: str | None,
+    os_known: bool,
+    os_value: str | None,
+    *,
+    mode: str,
+) -> tuple[str | None, tuple[SecretAuthority, ...]]:
+    """Fail closed on competing or incompletely observable legacy state."""
+    if not os_known:
+        if file_value is not None:
+            raise KeystoreError(
+                "cannot determine OS keystore state while file data exists"
+            )
+        return None, ()
+    if file_value is not None and os_value is not None:
+        if file_value != os_value:
+            raise KeystoreError("competing pre-registry secret values")
+        if mode == "file":
+            preferred = SecretAuthority.FILE
+        else:
+            preferred = SecretAuthority.OS
+        other = (
+            SecretAuthority.OS
+            if preferred is SecretAuthority.FILE
+            else SecretAuthority.FILE
+        )
+        return file_value, (preferred, other)
+    if file_value is not None:
+        return file_value, (SecretAuthority.FILE,)
+    if os_value is not None:
+        return os_value, (SecretAuthority.OS,)
+    return None, ()
+
+
+def _selected_new_authority(mode: str) -> SecretAuthority:
+    if mode == "os":
+        return SecretAuthority.OS
+    if mode == "file":
+        return SecretAuthority.FILE
+    state = _profile_state(_active_profile_identity())
+    if not state.healthy:
+        # This chooses only the destination for an unregistered new key. It
+        # deliberately does not mutate the process-cached backend, so existing
+        # OS authority cannot be redirected to a stale file copy.
+        return SecretAuthority.FILE
+    backend = get_backend()
+    if backend is None:
+        raise KeystoreError(
+            "secret keystore is disabled (secret_keystore: off in config.yaml)"
+        )
+    if getattr(backend, "name", None) == "os":
+        return SecretAuthority.OS
+    if getattr(backend, "name", None) == "file":
+        return SecretAuthority.FILE
+    raise KeystoreError("keystore selected an unknown backend")
+
+
+def _assert_mutation_mode(mode: str, authority: SecretAuthority) -> None:
+    if mode == "off":
+        raise KeystoreError(
+            "secret keystore is disabled (secret_keystore: off in config.yaml)"
+        )
+    if mode in {"os", "file"} and authority.value != mode:
+        raise KeystoreError(
+            f"registered {authority.value} authority conflicts with {mode} mode; "
+            f"use move_secret(..., destination='{mode}')"
+        )
+
+
+def _registry_bytes(root: Path) -> bytes | None:
+    path = root / AUTHORITY_FILE
+    return path.read_bytes() if path.exists() else None
+
+
+def _restore_registry_bytes(root: Path, previous: bytes | None) -> None:
+    path = root / AUTHORITY_FILE
+    current = path.read_bytes() if path.exists() else None
+    if current == previous:
+        return
+    if previous is None:
+        path.unlink(missing_ok=True)
+    else:
+        _write_private(path, previous)
+
+
+def _apply_value_transaction(
+    *,
+    root: Path,
+    registry: AuthorityRegistry | None,
+    operations: list[tuple[str, SecretAuthority, str, str | None]],
+    authority_updates: Mapping[str, SecretAuthority],
+    file_store: FileKeystore,
+    os_store: OSKeystore,
+    failure_label: str,
+) -> None:
+    """Apply value operations, then authority, compensating both on failure."""
+    locations = list(dict.fromkeys((tier, key) for _op, tier, key, _value in operations))
+    try:
+        snapshots = {
+            location: _read_tier(
+                location[0],
+                location[1],
+                file_store=file_store,
+                os_store=os_store,
+            )
+            for location in locations
+        }
+    except Exception as exc:
+        raise KeystoreError(f"{failure_label} failed before mutation") from exc
+
+    changed: list[tuple[SecretAuthority, str]] = []
+    previous_registry = _registry_bytes(root)
+    metadata_attempted = False
+    try:
+        for operation, tier, key, value in operations:
+            location = (tier, key)
+            if location not in changed:
+                # Include the current location before mutation because a
+                # backend may commit and then lose its reply.
+                changed.append(location)
+            if operation == "set":
+                assert value is not None
+                _set_tier(
+                    tier,
+                    key,
+                    value,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                observed = _read_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                if observed != value:
+                    raise KeystoreError("destination verification failed")
+            elif operation == "delete":
+                _delete_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                if _read_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                ) is not None:
+                    raise KeystoreError("source deletion verification failed")
+            else:  # pragma: no cover - internal invariant
+                raise AssertionError(f"unknown secret operation: {operation}")
+
+        updated_registry = _registry_with_updates(registry, authority_updates)
+        old_entries = dict(registry.entries) if registry is not None else {}
+        if dict(updated_registry.entries) != old_entries:
+            metadata_attempted = True
+            _write_authority_registry(root, updated_registry)
+    except Exception as operation_error:
+        rollback_errors: list[Exception] = []
+        for tier, key in reversed(changed):
+            try:
+                previous = snapshots[(tier, key)]
+                if previous is None:
+                    _delete_tier(
+                        tier,
+                        key,
+                        file_store=file_store,
+                        os_store=os_store,
+                    )
+                else:
+                    _set_tier(
+                        tier,
+                        key,
+                        previous,
+                        file_store=file_store,
+                        os_store=os_store,
+                    )
+                if _read_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                ) != previous:
+                    raise KeystoreError("rollback verification failed")
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if metadata_attempted:
+            try:
+                _restore_registry_bytes(root, previous_registry)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise KeystoreError(
+                f"{failure_label} failed and rollback failed; credential outcome "
+                "is uncertain"
+            ) from operation_error
+        raise KeystoreError(f"{failure_label} failed; state restored") from operation_error
+
+
+def get_authority(key: str) -> SecretAuthority | None:
+    """Return durable authority without creating the profile store or lock."""
+    root = _secrets_root(_active_profile_identity())
+    path = root / AUTHORITY_FILE
+    if not path.exists():
+        return None
+    with _store_lock(root, create=False):
+        registry = load_authority_registry(root)
+        return registry.entries.get(key) if registry is not None else None
+
+
+def resolve_secret(key: str, *, legacy_value: str | None = None) -> str | None:
+    """Resolve one secret through its durable authority, never creating state."""
+    if _resolve_mode() == "off":
+        return None
+    profile_identity = _active_profile_identity()
+    root = _secrets_root(profile_identity)
+    file_store = FileKeystore(root)
+    os_store = OSKeystore(profile_identity)
+
+    def _resolve_current(*, file_state_locked: bool) -> str | None:
+        registry = load_authority_registry(root)
+        authority = registry.entries.get(key) if registry is not None else None
+        if authority is SecretAuthority.CLEARED:
+            return None
+        if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
+            return _read_tier(
+                authority,
+                key,
+                file_store=file_store,
+                os_store=os_store,
+            )
+        if legacy_value not in {None, ""}:
+            return legacy_value
+        if file_state_locked:
+            file_value, os_known, os_value = _pre_registry_copies(
+                key,
+                file_store=file_store,
+                os_store=os_store,
+            )
+        else:
+            # With no lock file, do not race a newly-created encrypted store
+            # by reading it unlocked. A post-read check below retries under
+            # the lock if a writer created transaction state concurrently.
+            file_value = None
+            try:
+                os_value = os_store.get(key)
+                os_known = True
+            except Exception:
+                os_value = None
+                os_known = False
+        value, _tiers = _infer_pre_registry_tiers(
+            file_value,
+            os_known,
+            os_value,
+            mode=_resolve_mode(),
+        )
+        return value
+
+    try:
+        lock_path = root / _LOCK_FILE
+        needs_lock = (
+            lock_path.exists()
+            or (root / AUTHORITY_FILE).exists()
+            or (root / _DATA_FILE).exists()
+        )
+        if needs_lock:
+            with _store_lock(root, create=False):
+                return _resolve_current(file_state_locked=True)
+        result = _resolve_current(file_state_locked=False)
+        if (
+            lock_path.exists()
+            or (root / AUTHORITY_FILE).exists()
+            or (root / _DATA_FILE).exists()
+        ):
+            with _store_lock(root, create=False):
+                return _resolve_current(file_state_locked=True)
+        return result
+    except Exception:
+        # Credential reads remain non-throwing. Corruption and unavailable
+        # authority surface as unconfigured until doctor/repair is requested.
         return None
 
 
-def set_secret(key: str, value: str) -> None:
-    """Store one secret. Raises KeystoreError rather than losing the value.
+def get_secret(key: str) -> str | None:
+    """Compatibility wrapper for the authority-aware read facade."""
+    return resolve_secret(key)
 
-    Deliberately never falls back to plaintext .env — that would silently
-    undo the entire point of this module.
-    """
-    try:
-        backend = get_backend()
-        if backend is None:
-            raise KeystoreError(
-                "secret keystore is disabled (secret_keystore: off in "
-                f"config.yaml); cannot store {key}"
-            )
-        backend.set(key, value)
-    except KeystoreError:
-        raise
-    except Exception as exc:
-        raise KeystoreError("keystore write failed") from exc
+
+def set_secret(key: str, value: str) -> None:
+    set_secrets({key: value})
 
 
 def set_secrets(values: Mapping[str, str]) -> None:
-    """Atomically persist one service-level mapping where the tier supports it."""
+    """Write a service batch and commit all authority changes together."""
     if not values:
         return
+    mode = _resolve_mode()
+    if mode == "off":
+        raise KeystoreError(
+            "secret keystore is disabled (secret_keystore: off in config.yaml)"
+        )
+    profile_identity = _active_profile_identity()
+    root = _secrets_root(profile_identity)
     try:
-        backend = get_backend()
-        if backend is None:
-            raise KeystoreError(
-                "secret keystore is disabled (secret_keystore: off in config.yaml); "
-                "cannot store plugin secrets"
+        _ensure_transaction_root(root)
+        with _store_lock(root):
+            registry = load_authority_registry(root)
+            entries = dict(registry.entries) if registry is not None else {}
+            file_store = FileKeystore(root)
+            os_store = OSKeystore(profile_identity)
+            operations: list[tuple[str, SecretAuthority, str, str | None]] = []
+            updates: dict[str, SecretAuthority] = {}
+            selected: SecretAuthority | None = None
+
+            for key, value in values.items():
+                authority = entries.get(key)
+                if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
+                    _assert_mutation_mode(mode, authority)
+                    target = authority
+                    source_tiers: tuple[SecretAuthority, ...] = (authority,)
+                else:
+                    if selected is None:
+                        selected = _selected_new_authority(mode)
+                    target = selected
+                    source_tiers = ()
+                    if authority is None:
+                        file_value, os_known, os_value = _pre_registry_copies(
+                            key,
+                            file_store=file_store,
+                            os_store=os_store,
+                        )
+                        _old_value, source_tiers = _infer_pre_registry_tiers(
+                            file_value,
+                            os_known,
+                            os_value,
+                            mode=mode,
+                        )
+                operations.append(("set", target, key, value))
+                for source in source_tiers:
+                    if source is not target:
+                        operations.append(("delete", source, key, None))
+                updates[key] = target
+
+            _apply_value_transaction(
+                root=root,
+                registry=registry,
+                operations=operations,
+                authority_updates=updates,
+                file_store=file_store,
+                os_store=os_store,
+                failure_label="keystore batch write",
             )
-        backend.set_many(values)
     except KeystoreError:
         raise
     except Exception as exc:
         raise KeystoreError("keystore batch write failed") from exc
 
 
-def delete_secret(key: str) -> None:
-    """Remove one secret. Raises KeystoreError if the backend refused.
-
-    Deliberately NOT symmetric with get_secret, which swallows failures so a
-    read looks like "not configured". A failed delete is a failed revocation:
-    the caller must be able to tell the operator the credential is still live
-    rather than showing them a cleared field.
-    """
+def move_secret(
+    key: str,
+    destination: Literal["os", "file"],
+) -> None:
+    """Transactionally move one key between durable authority tiers."""
+    if destination not in {"os", "file"}:
+        raise KeystoreError("destination must be 'os' or 'file'")
+    if _resolve_mode() == "off":
+        raise KeystoreError(
+            "secret keystore is disabled (secret_keystore: off in config.yaml)"
+        )
+    profile_identity = _active_profile_identity()
+    root = _secrets_root(profile_identity)
+    target = SecretAuthority(destination)
     try:
-        backend = get_backend()
-        if backend is None:
-            return
-        backend.delete(key)
+        _ensure_transaction_root(root)
+        with _store_lock(root):
+            registry = load_authority_registry(root)
+            authority = registry.entries.get(key) if registry is not None else None
+            file_store = FileKeystore(root)
+            os_store = OSKeystore(profile_identity)
+            source_tiers: tuple[SecretAuthority, ...]
+            if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
+                source_tiers = (authority,)
+                value = _read_tier(
+                    authority,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+            elif authority is SecretAuthority.CLEARED:
+                raise KeystoreError("cannot move a cleared secret")
+            else:
+                file_value, os_known, os_value = _pre_registry_copies(
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                value, source_tiers = _infer_pre_registry_tiers(
+                    file_value,
+                    os_known,
+                    os_value,
+                    mode=_resolve_mode(),
+                )
+            if value is None:
+                raise KeystoreError("cannot move an absent secret")
+            if authority is target:
+                return
+
+            operations: list[tuple[str, SecretAuthority, str, str | None]] = [
+                ("set", target, key, value)
+            ]
+            for source in source_tiers:
+                if source is not target:
+                    operations.append(("delete", source, key, None))
+            _apply_value_transaction(
+                root=root,
+                registry=registry,
+                operations=operations,
+                authority_updates={key: target},
+                file_store=file_store,
+                os_store=os_store,
+                failure_label="keystore move",
+            )
     except KeystoreError:
         raise
     except Exception as exc:
+        raise KeystoreError("keystore move failed") from exc
+
+
+def delete_secret(key: str) -> None:
+    """Revoke a secret and record a tombstone without restoring plaintext."""
+    mode = _resolve_mode()
+    if mode == "off":
+        raise KeystoreError(
+            "secret keystore is disabled (secret_keystore: off in config.yaml)"
+        )
+    profile_identity = _active_profile_identity()
+    root = _secrets_root(profile_identity)
+    try:
+        _ensure_transaction_root(root)
+        with _store_lock(root):
+            registry = load_authority_registry(root)
+            authority = registry.entries.get(key) if registry is not None else None
+            file_store = FileKeystore(root)
+            os_store = OSKeystore(profile_identity)
+
+            tiers: tuple[SecretAuthority, ...] = ()
+            if authority in {SecretAuthority.OS, SecretAuthority.FILE}:
+                _assert_mutation_mode(mode, authority)
+                tiers = (authority,)
+            elif authority is None:
+                file_value, os_known, os_value = _pre_registry_copies(
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                _value, tiers = _infer_pre_registry_tiers(
+                    file_value,
+                    os_known,
+                    os_value,
+                    mode=mode,
+                )
+
+            # Plaintext removal is deliberately first and is never compensated.
+            # A retry therefore cannot resurrect a legacy value after a later
+            # backend refusal.
+            from hermes_cli.config import remove_env_value
+
+            remove_env_value(
+                key,
+                strict=True,
+                mirror_process_env=False,
+            )
+            for tier in tiers:
+                _delete_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                )
+                if _read_tier(
+                    tier,
+                    key,
+                    file_store=file_store,
+                    os_store=os_store,
+                ) is not None:
+                    raise KeystoreError("keystore delete verification failed")
+            updated = _registry_with_updates(
+                registry,
+                {key: SecretAuthority.CLEARED},
+            )
+            if registry is None or dict(updated.entries) != dict(registry.entries):
+                _write_authority_registry(root, updated)
+    except Exception as exc:
+        if isinstance(exc, KeystoreError):
+            raise
         raise KeystoreError("keystore delete failed") from exc

@@ -1028,14 +1028,10 @@ class PluginConfigurationService:
             value = None
             if field.storage is FieldStorage.SECRET:
                 storage_key = _secret_storage_key(plugin_id, field.id)
-                value = secret_values.get(storage_key)
-                if value in {None, ""}:
-                    # Legacy authorities missed -> consult the OS keystore.
-                    # Deliberately last: managed env, the secret scope and
-                    # external sources must keep overriding, and a profile
-                    # that has not run `hermes secrets migrate` yet still
-                    # resolves from its plaintext .env entry.
-                    value = secret_keystore.get_secret(storage_key)
+                value = secret_keystore.resolve_secret(
+                    storage_key,
+                    legacy_value=secret_values.get(storage_key),
+                )
                 if value not in {None, ""}:
                     present = True
             elif field.id in stored:
@@ -1215,27 +1211,10 @@ class PluginConfigurationService:
             raise PluginConfigurationError(
                 f"field '{field_id}' has incompatible storage"
             )
-        from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
-
         storage_key = _secret_storage_key(canonical_id, field_id)
-        # Clear BOTH tiers. The keystore holds anything written since this
-        # feature landed; .env still holds anything from a profile that has
-        # not run `hermes secrets migrate`. Removing only one leaves a
-        # credential that the dashboard reports as cleared and that still
-        # authenticates -- worse than never having moved it.
         try:
             secret_keystore.delete_secret(storage_key)
         except secret_keystore.KeystoreError as exc:
-            raise PluginConfigurationError(
-                "plugin configuration could not be persisted"
-            ) from exc
-        try:
-            remove_env_value(
-                storage_key,
-                mirror_process_env=False,
-                strict=True,
-            )
-        except ConfigurationPersistenceError as exc:
             raise PluginConfigurationError(
                 "plugin configuration could not be persisted"
             ) from exc

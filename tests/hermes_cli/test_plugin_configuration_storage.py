@@ -18,6 +18,25 @@ from hermes_cli.plugin_configuration import (
 from hermes_cli.plugins import LoadedPlugin, PluginManager, PluginManifest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_real_keyring(monkeypatch):
+    """No plugin-storage test may touch the developer's actual keychain."""
+    class _UnavailableProbeKnownEmptyReads:
+        def get_password(self, _service, _name):
+            return None
+
+        def set_password(self, _service, _name, _value):
+            raise RuntimeError("OS backend unavailable")
+
+        def delete_password(self, _service, _name):
+            raise sk._PasswordDeleteError("already absent")
+
+    monkeypatch.setattr(sk, "keyring", _UnavailableProbeKnownEmptyReads())
+    sk.reset_backend_cache()
+    yield
+    sk.reset_backend_cache()
+
+
 def _set_enabled(plugin_ids):
     from hermes_cli.config import load_config, save_config
 
@@ -833,7 +852,7 @@ def test_plugin_context_lookup_is_storage_authorized_and_cross_plugin_isolated(
         assert str(unavailable.value) == "plugin configuration value unavailable"
 
 
-def test_plugin_context_secret_resolution_preserves_host_authority_precedence(
+def test_plugin_context_registered_secret_ignores_legacy_aggregate_overrides(
     tmp_path, monkeypatch
 ):
     from agent.secret_scope import reset_secret_scope, set_secret_scope
@@ -862,14 +881,14 @@ def test_plugin_context_secret_resolution_preserves_host_authority_precedence(
     )
     assert (
         modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-        == "external-secret"
+        == "profile-file-secret"
     )
 
     scope_token = set_secret_scope({key: "installed-scope-secret"})
     try:
         assert (
             modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-            == "installed-scope-secret"
+            == "profile-file-secret"
         )
         monkeypatch.setattr(
             "hermes_cli.managed_scope.load_managed_env",
@@ -877,7 +896,7 @@ def test_plugin_context_secret_resolution_preserves_host_authority_precedence(
         )
         assert (
             modules["runtime-config-plugin"].runtime_configuration().secret("pat")
-            == "managed-secret"
+            == "profile-file-secret"
         )
     finally:
         reset_secret_scope(scope_token)
@@ -908,14 +927,34 @@ class TestKeystoreReadPath:
 
         assert _token_field(service)["is_set"] is True
 
-    def test_legacy_env_value_wins_over_keystore(self, tmp_path, monkeypatch):
-        """Un-migrated .env entries must keep working, and managed/scoped
-        overrides ride the same path — so legacy authorities take precedence.
+    def test_unregistered_legacy_value_remains_compatible(self, tmp_path, monkeypatch):
+        """Legacy plaintext remains readable until authority is registered."""
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationService,
+            _secret_storage_key,
+        )
 
-        Asserted through the real resolution order rather than a reimplementation
-        of it: the point is that `_resolved` consults the keystore *after* the
-        profile store, and only a test that runs `_resolved` can show that.
-        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, manager = _service(tmp_path)
+        key = _secret_storage_key("sample-connector", "token")
+        with mock.patch.object(
+            PluginConfigurationService,
+            "_profile_secret_values",
+            staticmethod(lambda: {key: "from-env"}),
+        ):
+            resolved, _invalid = service._resolved(
+                "sample-connector", manager._plugins["sample-connector"]
+            )
+
+        assert resolved["token"] == "from-env"
+        assert sk.get_authority(key) is None
+
+    def test_registered_authority_ignores_a_legacy_value(
+        self, tmp_path, monkeypatch
+    ):
+        """Once registered, restored plaintext cannot replace durable authority."""
         from hermes_cli.plugin_configuration import (
             PluginConfigurationService,
             _secret_storage_key,
@@ -937,37 +976,31 @@ class TestKeystoreReadPath:
                 "sample-connector", manager._plugins["sample-connector"]
             )
 
-        assert resolved["token"] == "from-env"
+        assert resolved["token"] == "from-keystore"
 
-    def test_keystore_is_consulted_only_after_the_profile_store_misses(
+    def test_cleared_tombstone_ignores_restored_legacy_after_restart(
         self, tmp_path, monkeypatch
     ):
-        """Precedence is an ordering property, so assert on the call itself.
+        from hermes_cli.config import invalidate_env_cache
+        from hermes_cli.plugin_configuration import _secret_storage_key
 
-        Without this, a read path that consulted the keystore *first* and then
-        let .env overwrite the result would still satisfy the test above.
-        """
-        from hermes_cli.plugin_configuration import (
-            PluginConfigurationService,
-            _secret_storage_key,
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
-        sk.reset_backend_cache()
-        service, manager = _service(tmp_path)
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        service, _manager = _service(tmp_path)
         key = _secret_storage_key("sample-connector", "token")
+        service.update("sample-connector", secrets={"token": "live-token"})
+        service.clear_secret("sample-connector", "token")
 
-        with mock.patch.object(
-            PluginConfigurationService,
-            "_profile_secret_values",
-            staticmethod(lambda: {key: "from-env"}),
-        ):
-            with mock.patch.object(sk, "get_secret") as get_secret:
-                service._resolved(
-                    "sample-connector", manager._plugins["sample-connector"]
-                )
+        (home / ".env").write_text(
+            f"{key}=restored-backup-token\n",
+            encoding="utf-8",
+        )
+        invalidate_env_cache()
+        sk.reset_backend_cache()
 
-        get_secret.assert_not_called()
+        assert _token_field(service)["is_set"] is False
+        assert sk.get_authority(key) is sk.SecretAuthority.CLEARED
 
     def test_keystore_read_failure_leaves_the_field_unconfigured(
         self, tmp_path, monkeypatch
@@ -1066,13 +1099,10 @@ class TestKeystoreClearPath:
 
         assert _token_field(service)["is_set"] is False
 
-    def test_a_refused_revocation_raises_and_keeps_the_env_entry(
+    def test_a_refused_revocation_removes_plaintext_then_retry_completes(
         self, tmp_path, monkeypatch
     ):
-        """If the keystore refuses, the operator must be told -- and the .env
-        entry must survive, because removing it while the keystore copy still
-        authenticates would leave a live credential with nothing pointing at
-        it. Fail with both copies intact rather than half-revoked."""
+        """A partial clear never restores plaintext and remains retryable."""
         from hermes_cli.plugin_configuration import (
             PluginConfigurationError,
             _secret_storage_key,
@@ -1083,22 +1113,29 @@ class TestKeystoreClearPath:
         sk.reset_backend_cache()
         (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
         key = _secret_storage_key("sample-connector", "token")
+        sk.set_secret(key, "keystore-token")
         (tmp_path / "profile" / ".env").write_text(
             f"{key}=legacy-plaintext\n", encoding="utf-8"
         )
         service, _ = _service(tmp_path)
 
-        broken = mock.Mock()
-        broken.name = "file"
-        broken.delete.side_effect = sk.KeystoreError("refused")
-        with mock.patch.object(sk, "get_backend", return_value=broken):
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_delete_unlocked",
+            side_effect=OSError("refused"),
+        ):
             with pytest.raises(PluginConfigurationError):
                 service.clear_secret("sample-connector", "token")
 
         contents = (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
-        assert "legacy-plaintext" in contents, (
-            "env entry removed despite a failed revocation"
-        )
+        assert "legacy-plaintext" not in contents
+        assert sk.get_authority(key) is sk.SecretAuthority.FILE
+        assert sk.resolve_secret(key) == "keystore-token"
+
+        service.clear_secret("sample-connector", "token")
+
+        assert sk.get_authority(key) is sk.SecretAuthority.CLEARED
+        assert sk.resolve_secret(key, legacy_value="restored-backup-token") is None
 
     def test_clearing_still_removes_an_unmigrated_env_entry(
         self, tmp_path, monkeypatch
@@ -1156,12 +1193,13 @@ class TestKeystoreBatchServicePath:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
         service, _ = _service(tmp_path)
-        broken = mock.Mock()
-        broken.name = "file"
-        broken.set_many.side_effect = PermissionError("read-only keychain")
-
-        with mock.patch.object(sk, "get_backend", return_value=broken):
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_set_unlocked",
+            side_effect=PermissionError("read-only keychain"),
+        ):
             with pytest.raises(
                 PluginConfigurationError, match="could not be persisted"
             ):
@@ -1172,11 +1210,13 @@ class TestKeystoreBatchServicePath:
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         service, _ = _service(tmp_path)
-        broken = mock.Mock()
-        broken.name = "file"
-        broken.delete.side_effect = OSError("keystore unavailable")
-
-        with mock.patch.object(sk, "get_backend", return_value=broken):
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        service.update("sample-connector", secrets={"token": "valid-token"})
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_delete_unlocked",
+            side_effect=OSError("keystore unavailable"),
+        ):
             with pytest.raises(
                 PluginConfigurationError, match="could not be persisted"
             ):
