@@ -145,20 +145,18 @@ def test_container_storage_evidence_is_fresh_and_doctor_is_read_only(
     from hermes_cli.container_storage import MountPersistence, PersistenceState
 
     root = profile / "secrets"
-    evidence = iter(
-        (
-            MountPersistence(
-                PersistenceState.UNKNOWN, None, None, None, "missing mountinfo"
-            ),
-            MountPersistence(
-                PersistenceState.PERSISTENT,
-                profile,
-                "ext4",
-                "/dev/x",
-                "volume mount",
-            ),
-        )
-    )
+    evidence = iter((
+        MountPersistence(
+            PersistenceState.UNKNOWN, None, None, None, "missing mountinfo"
+        ),
+        MountPersistence(
+            PersistenceState.PERSISTENT,
+            profile,
+            "ext4",
+            "/dev/x",
+            "volume mount",
+        ),
+    ))
     inspected_paths: list[Path] = []
     monkeypatch.setattr(container_storage, "is_container", lambda: True)
 
@@ -172,13 +170,9 @@ def test_container_storage_evidence_is_fresh_and_doctor_is_read_only(
     first = diagnose_secrets()
     second = diagnose_secrets()
 
-    assert "CONTAINER_STORAGE_UNPROVEN" in {
-        finding.code for finding in first.findings
-    }
+    assert "CONTAINER_STORAGE_UNPROVEN" in {finding.code for finding in first.findings}
     finding = next(
-        item
-        for item in first.findings
-        if item.code == "CONTAINER_STORAGE_UNPROVEN"
+        item for item in first.findings if item.code == "CONTAINER_STORAGE_UNPROVEN"
     )
     assert "security.container_persistence_acknowledged" in finding.message
     assert "CONTAINER_STORAGE_UNPROVEN" not in {
@@ -283,19 +277,17 @@ def test_windows_doctor_reports_acl_drift_without_mutating(
         )
     )
     inspect_file = mock.Mock(
-        return_value=windows_permissions.WindowsAclInspection(
-            secure=True, detail=None
-        )
+        return_value=windows_permissions.WindowsAclInspection(secure=True, detail=None)
     )
-    monkeypatch.setattr(
-        windows_permissions, "inspect_directory_acl", inspect_directory
-    )
+    monkeypatch.setattr(windows_permissions, "inspect_directory_acl", inspect_directory)
     monkeypatch.setattr(windows_permissions, "inspect_file_acl", inspect_file)
 
     report = diagnose_secrets()
 
     assert snapshot_tree(profile) == before
-    drift = [finding for finding in report.findings if finding.code == "PERMISSION_DRIFT"]
+    drift = [
+        finding for finding in report.findings if finding.code == "PERMISSION_DRIFT"
+    ]
     assert len(drift) == 1
     assert "unexpected directory ACE" in drift[0].message
     inspect_directory.assert_called_once_with(profile / "secrets")
@@ -503,9 +495,7 @@ def test_repair_reconstructs_unambiguous_registry(profile, fake_keyring):
     assert sk.FileKeystore(profile / "secrets").get(KEY) == SECRET
 
 
-def test_repair_quarantines_and_reconstructs_corrupt_authority(
-    profile, fake_keyring
-):
+def test_repair_quarantines_and_reconstructs_corrupt_authority(profile, fake_keyring):
     write_file_secret(profile)
     (profile / "secrets" / "authority.json").write_text(
         "{broken-authority", encoding="utf-8"
@@ -523,9 +513,10 @@ def test_repair_quarantines_and_reconstructs_corrupt_authority(
     assert len(report.quarantine_paths) == 1
     assert (report.quarantine_paths[0] / "authority.json").is_file()
     assert stat.S_IMODE(report.quarantine_paths[0].stat().st_mode) == 0o700
-    assert stat.S_IMODE(
-        (report.quarantine_paths[0] / "manifest.json").stat().st_mode
-    ) == 0o600
+    assert (
+        stat.S_IMODE((report.quarantine_paths[0] / "manifest.json").stat().st_mode)
+        == 0o600
+    )
 
 
 def test_corrupt_authority_with_absent_known_key_blocks_tombstone_erasure(
@@ -574,22 +565,23 @@ def test_confirmed_corrupt_authority_reset_clears_absent_known_keys_and_rebuilds
     before = snapshot_tree(profile)
     parser = build_secrets_parser()
 
-    without_yes = parser.parse_args(
-        ["secrets", "repair", "--reset-unrecoverable", "--apply"]
-    )
+    without_yes = parser.parse_args([
+        "secrets",
+        "repair",
+        "--reset-unrecoverable",
+        "--apply",
+    ])
     with mock.patch("sys.stdin.isatty", return_value=False):
         assert without_yes.func(without_yes) == 2
     assert snapshot_tree(profile) == before
 
-    with_yes = parser.parse_args(
-        [
-            "secrets",
-            "repair",
-            "--reset-unrecoverable",
-            "--apply",
-            "--yes",
-        ]
-    )
+    with_yes = parser.parse_args([
+        "secrets",
+        "repair",
+        "--reset-unrecoverable",
+        "--apply",
+        "--yes",
+    ])
     assert with_yes.func(with_yes) == 0
 
     assert sk.get_authority(KEY) is SecretAuthority.FILE
@@ -700,9 +692,7 @@ def test_explicit_file_policy_survives_revalidation_for_equal_legacy_copies(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission repair")
-def test_repair_restores_permissions_and_cleans_temporary_files(
-    profile, fake_keyring
-):
+def test_repair_restores_permissions_and_cleans_temporary_files(profile, fake_keyring):
     write_file_secret(profile)
     temp = profile / "secrets" / ".keystore.key.crash.tmp"
     temp.write_bytes(b"temporary")
@@ -717,9 +707,7 @@ def test_repair_restores_permissions_and_cleans_temporary_files(
     assert stat.S_IMODE((profile / "secrets" / "keystore.key").stat().st_mode) == 0o600
 
 
-def test_corrupt_file_store_rebuilds_from_healthy_os_copy(
-    profile, fake_keyring
-):
+def test_corrupt_file_store_rebuilds_from_healthy_os_copy(profile, fake_keyring):
     write_file_secret(profile)
     write_registry(profile, {KEY: SecretAuthority.FILE})
     fake_keyring.put(KEY, SECRET, profile)
@@ -733,7 +721,9 @@ def test_corrupt_file_store_rebuilds_from_healthy_os_copy(
     assert len(report.quarantine_paths) == 1
     assert sk.FileKeystore(profile / "secrets").get(KEY) == SECRET
     assert fake_keyring.value(KEY, profile) is None
-    manifest = (report.quarantine_paths[0] / "manifest.json").read_text()
+    manifest = (report.quarantine_paths[0] / "manifest.json").read_text(
+        encoding="utf-8"
+    )
     assert SECRET not in manifest
     assert "FILE_STORE_CORRUPT" in manifest
 
@@ -816,9 +806,7 @@ def test_reset_retries_after_clean_store_init_but_before_tombstone_commit(
     monkeypatch.setattr(sk, "_write_authority_registry", original_write)
 
     retry_plan = plan_secret_repair(reset_unrecoverable=True)
-    assert any(
-        action.code == "RESET_UNRECOVERABLE" for action in retry_plan.actions
-    )
+    assert any(action.code == "RESET_UNRECOVERABLE" for action in retry_plan.actions)
     retry = apply_secret_repair(retry_plan, confirm_reset=True)
 
     assert retry.failed == ()
@@ -857,9 +845,7 @@ def test_apply_rejects_changed_source_with_same_action_shape(
     assert sk.get_authority(KEY) == "file"
     assert sk.FileKeystore(profile / "secrets").get(KEY) == replacement
     assert fake_keyring.value(KEY, profile) is None
-    args = build_secrets_parser().parse_args(
-        ["secrets", "repair", "--move-to", "os"]
-    )
+    args = build_secrets_parser().parse_args(["secrets", "repair", "--move-to", "os"])
     assert args.func(args) == 0
     public_text = (
         repr(plan)
@@ -953,9 +939,7 @@ def test_file_key_symlink_is_quarantined_without_following_target(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
-def test_permission_repair_refuses_a_replaced_symlink(
-    profile, fake_keyring, tmp_path
-):
+def test_permission_repair_refuses_a_replaced_symlink(profile, fake_keyring, tmp_path):
     write_registry(profile, {})
     authority = profile / "secrets" / "authority.json"
     os.chmod(profile / "secrets", 0o700)
@@ -1008,6 +992,7 @@ def build_secrets_parser() -> argparse.ArgumentParser:
     ("argv", "expected"),
     [
         (["secrets", "doctor"], "doctor"),
+        (["secrets", "doctor", "--write-probe"], "doctor"),
         (["secrets", "repair"], "repair"),
         (["secrets", "repair", "--apply"], "repair"),
         (["secrets", "repair", "--move-to", "os", "--apply"], "repair"),
@@ -1027,6 +1012,236 @@ def test_required_cli_forms_parse(argv, expected):
     args = build_secrets_parser().parse_args(argv)
     assert args.secrets_command == expected
     assert callable(args.func)
+
+
+@pytest.mark.parametrize("prefix", ["--w", "--wr", "--wri", "--write-"])
+def test_doctor_parser_rejects_write_probe_abbreviations(prefix):
+    with pytest.raises(SystemExit) as exc_info:
+        build_secrets_parser().parse_args(["secrets", "doctor", prefix])
+    assert exc_info.value.code == 2
+
+
+def test_plain_doctor_never_invokes_write_probe_or_creates_absent_profile(
+    profile, fake_keyring, monkeypatch, capsys
+):
+    from hermes_cli import secrets_repair as repair
+
+    before = snapshot_tree(profile)
+    invoked = False
+
+    def unexpected_probe(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("plain doctor must not run the write probe")
+
+    monkeypatch.setattr(repair, "run_write_probe", unexpected_probe, raising=False)
+    args = build_secrets_parser().parse_args(["secrets", "doctor"])
+
+    assert args.func(args) == 0
+    assert snapshot_tree(profile) == before
+    assert not profile.exists()
+    assert not invoked
+    assert fake_keyring.set_calls == []
+    assert fake_keyring.delete_calls == []
+    assert "No secret storage findings." in capsys.readouterr().out
+
+
+def test_write_probe_creates_only_one_synthetic_artifact_and_cleans_it(
+    profile, fake_keyring, monkeypatch
+):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    monkeypatch.setattr(repair.sk, "_is_windows", lambda: True)
+    probe_calls = []
+
+    def successful_probe(root, *, directory_name, file_name, contents):
+        probe_calls.append((root, directory_name, file_name, contents))
+        root.mkdir(parents=True, exist_ok=False)
+        return windows_permissions.WindowsPrivateProbeResult(None, False)
+
+    monkeypatch.setattr(
+        windows_permissions, "run_private_acl_write_probe", successful_probe
+    )
+
+    def forbidden_secret_store_access(*_args, **_kwargs):
+        raise AssertionError("write probe must not access secret storage")
+
+    for name in (
+        "OSKeystore",
+        "FileKeystore",
+        "_read_file_store_readonly",
+        "_write_authority_registry",
+        "get_authority",
+        "resolve_secret",
+        "set_secret",
+    ):
+        monkeypatch.setattr(repair.sk, name, forbidden_secret_store_access)
+    monkeypatch.setattr(
+        repair, "_load_authority_registry_readonly", forbidden_secret_store_access
+    )
+
+    findings = repair.run_write_probe(profile)
+
+    assert [(item.code, item.severity) for item in findings] == [
+        ("WRITE_PROBE_OK", "info")
+    ]
+    assert profile.is_dir()
+    assert list(profile.glob(".secret-write-probe-*")) == []
+    assert len(probe_calls) == 1
+    root, directory_name, file_name, contents = probe_calls[0]
+    assert root == profile
+    assert directory_name.startswith(".secret-write-probe-")
+    assert file_name == "sentinel"
+    assert contents == b"hermes-secret-write-probe\n"
+    assert fake_keyring.set_calls == []
+    assert fake_keyring.delete_calls == []
+
+
+def test_write_probe_acl_failure_is_redacted_and_cleaned(profile, monkeypatch):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    monkeypatch.setattr(repair.sk, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        windows_permissions,
+        "run_private_acl_write_probe",
+        lambda *_args, **_kwargs: windows_permissions.WindowsPrivateProbeResult(
+            "RuntimeError", False
+        ),
+    )
+
+    findings = repair.run_write_probe(profile)
+
+    assert [(item.code, item.severity) for item in findings] == [
+        ("WRITE_PROBE_FAILED", "error")
+    ]
+    assert "RuntimeError" in findings[0].message
+    assert "private path: do not leak" not in findings[0].message
+    assert list(profile.glob(".secret-write-probe-*")) == []
+
+
+def test_write_probe_reports_manual_cleanup_path_without_exception_payload(
+    profile, monkeypatch
+):
+    from hermes_cli import secrets_repair as repair
+
+    original_unlink = os.unlink
+
+    def refuse_probe_unlink(path, *args, **kwargs):
+        if path == "sentinel" and kwargs.get("dir_fd") is not None:
+            raise OSError("private cleanup detail")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(repair.os, "unlink", refuse_probe_unlink)
+    findings = repair.run_write_probe(profile)
+    artifact = next(profile.glob(".secret-write-probe-*"))
+
+    assert [(item.code, item.severity) for item in findings] == [
+        ("WRITE_PROBE_CLEANUP_FAILED", "error")
+    ]
+    assert str(artifact) in findings[0].message
+    assert "private cleanup detail" not in findings[0].message
+    original_unlink(artifact / "sentinel")
+    artifact.rmdir()
+
+
+def test_write_probe_never_reuses_a_collision(profile, monkeypatch):
+    from hermes_cli import secrets_repair as repair
+
+    monkeypatch.setattr(repair.secrets, "token_hex", lambda _bytes: "collision")
+    collision = profile / ".secret-write-probe-collision"
+    collision.mkdir(parents=True)
+    marker = collision / "sentinel"
+    marker.write_bytes(b"pre-existing")
+
+    findings = repair.run_write_probe(profile)
+
+    assert [(item.code, item.severity) for item in findings] == [
+        ("WRITE_PROBE_FAILED", "error")
+    ]
+    assert marker.read_bytes() == b"pre-existing"
+
+
+def test_write_probe_never_deletes_a_sentinel_collision(profile, monkeypatch):
+    from hermes_cli import secrets_repair as repair
+
+    monkeypatch.setattr(repair.secrets, "token_hex", lambda _bytes: "collision")
+    original_open = os.open
+
+    def collide_sentinel(path, flags, mode=0o777, *, dir_fd=None):
+        if Path(path).name == "sentinel":
+            fd = original_open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            os.write(fd, b"pre-existing")
+            os.close(fd)
+            raise FileExistsError("private collision detail")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(repair.os, "open", collide_sentinel)
+
+    findings = repair.run_write_probe(profile)
+    collision = profile / ".secret-write-probe-collision" / "sentinel"
+
+    assert {item.code for item in findings} == {
+        "WRITE_PROBE_FAILED",
+        "WRITE_PROBE_CLEANUP_FAILED",
+    }
+    assert collision.read_bytes() == b"pre-existing"
+    collision.unlink()
+    collision.parent.rmdir()
+
+
+def test_write_probe_fails_closed_when_probe_directory_is_replaced(
+    profile, tmp_path, monkeypatch
+):
+    from hermes_cli import secrets_repair as repair
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_fchmod = os.fchmod
+    fchmod_calls = 0
+
+    def replace_probe_directory(fd, mode):
+        nonlocal fchmod_calls
+        fchmod_calls += 1
+        if fchmod_calls == 1:
+            probe = next(profile.glob(".secret-write-probe-*"))
+            probe.rmdir()
+            probe.symlink_to(outside, target_is_directory=True)
+        return original_fchmod(fd, mode)
+
+    monkeypatch.setattr(repair.os, "fchmod", replace_probe_directory)
+
+    findings = repair.run_write_probe(profile)
+    probe = next(profile.glob(".secret-write-probe-*"))
+
+    assert {item.code for item in findings} == {
+        "WRITE_PROBE_FAILED",
+        "WRITE_PROBE_CLEANUP_FAILED",
+    }
+    assert list(outside.iterdir()) == []
+    probe.unlink()
+
+
+def test_write_probe_rejects_a_symlink_profile_root(profile, tmp_path):
+    from hermes_cli import secrets_repair as repair
+
+    target = tmp_path / "target"
+    target.mkdir()
+    profile.parent.mkdir(parents=True)
+    profile.symlink_to(target, target_is_directory=True)
+
+    findings = repair.run_write_probe(profile)
+
+    assert [(item.code, item.severity) for item in findings] == [
+        ("WRITE_PROBE_FAILED", "error")
+    ]
+    assert list(target.iterdir()) == []
 
 
 @pytest.mark.parametrize("prefix", ["--a", "--ap", "--app", "--appl"])
@@ -1064,18 +1279,19 @@ def test_yes_is_refused_without_reset_and_apply(profile, fake_keyring, capsys):
     assert "--yes requires --reset-unrecoverable --apply" in capsys.readouterr().err
 
 
-def test_noninteractive_reset_requires_yes(
-    profile, fake_keyring, monkeypatch, capsys
-):
+def test_noninteractive_reset_requires_yes(profile, fake_keyring, monkeypatch, capsys):
     import io
 
     write_file_secret(profile)
     write_registry(profile, {KEY: SecretAuthority.FILE})
     (profile / "secrets" / "keystore.key").unlink()
     before = snapshot_tree(profile)
-    args = build_secrets_parser().parse_args(
-        ["secrets", "repair", "--reset-unrecoverable", "--apply"]
-    )
+    args = build_secrets_parser().parse_args([
+        "secrets",
+        "repair",
+        "--reset-unrecoverable",
+        "--apply",
+    ])
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
 
     assert args.func(args) != 0
@@ -1100,10 +1316,10 @@ def test_real_console_doctor_and_default_repair_are_byte_read_only(tmp_path):
         "from . import errors\n"
         "def get_password(service, account): return None\n"
         "def set_password(service, account, value):\n"
-        f"    open({str(mutation_marker)!r}, 'wb').write(b'set')\n"
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'set')\n"  # windows-footgun: ok — binary mode
         "    raise AssertionError('mutating OS probe invoked')\n"
         "def delete_password(service, account):\n"
-        f"    open({str(mutation_marker)!r}, 'wb').write(b'delete')\n"
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'delete')\n"  # windows-footgun: ok — binary mode
         "    raise AssertionError('mutating OS probe invoked')\n",
         encoding="utf-8",
     )
@@ -1113,9 +1329,11 @@ def test_real_console_doctor_and_default_repair_are_byte_read_only(tmp_path):
     before = snapshot_tree(profile)
     env = os.environ.copy()
     env["HERMES_HOME"] = str(profile)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(fake_modules), str(repo), env.get("PYTHONPATH", "")]
-    )
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(fake_modules),
+        str(repo),
+        env.get("PYTHONPATH", ""),
+    ])
 
     for argv in (("secrets", "doctor"), ("secrets", "repair")):
         result = subprocess.run(
@@ -1148,9 +1366,9 @@ def test_real_console_apply_prefix_cannot_mutate_from_readonly_path(tmp_path, pr
         "from . import errors\n"
         "def get_password(service, account): return None\n"
         "def set_password(service, account, value):\n"
-        f"    open({str(mutation_marker)!r}, 'wb').write(b'set')\n"
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'set')\n"  # windows-footgun: ok — binary mode
         "def delete_password(service, account):\n"
-        f"    open({str(mutation_marker)!r}, 'wb').write(b'delete')\n",
+        f"    open({str(mutation_marker)!r}, 'wb').write(b'delete')\n",  # windows-footgun: ok — binary mode
         encoding="utf-8",
     )
     (package / "errors.py").write_text(
@@ -1159,9 +1377,11 @@ def test_real_console_apply_prefix_cannot_mutate_from_readonly_path(tmp_path, pr
     before = snapshot_tree(profile)
     env = os.environ.copy()
     env["HERMES_HOME"] = str(profile)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(fake_modules), str(repo), env.get("PYTHONPATH", "")]
-    )
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(fake_modules),
+        str(repo),
+        env.get("PYTHONPATH", ""),
+    ])
 
     result = subprocess.run(
         [str(hermes), "secrets", "repair", prefix],

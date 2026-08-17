@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import inspect
+import os
 import stat
 from dataclasses import fields
 from pathlib import Path
@@ -34,6 +35,119 @@ ACCESS_ALLOWED_ACE_TYPE = 0x00
 ACCESS_DENIED_ACE_TYPE = 0x01
 FILE_PRIVATE_MASK = 0x0012019F
 DIRECTORY_PRIVATE_MASK = 0x001201FF
+FILE_ADD_FILE = 0x00000002
+
+
+class HandleBackedProbeApi:
+    """Portable handle model for the Windows probe's relative filesystem work."""
+
+    def __init__(self, permissions, *, swapped_root: Path | None = None) -> None:
+        self.permissions = permissions
+        self.swapped_root = swapped_root
+        self.expected_root_identity = (
+            swapped_root.stat().st_ino if swapped_root is not None else None
+        )
+        self.opened_root_identity: int | None = None
+        self.children: dict[int, tuple[int, str, bool]] = {}
+        self.delete_handles: set[int] = set()
+        self.closed: list[int] = []
+        self.flushed: list[int] = []
+        self.refuse_next_delete = False
+
+    def open_handle(self, path, *, access, flags):
+        candidate = Path(path)
+        if self.swapped_root is not None and candidate == self.swapped_root:
+            parked = candidate.with_name(f"{candidate.name}-parked")
+            attacker = candidate.with_name(f"{candidate.name}-attacker")
+            candidate.rename(parked)
+            attacker.rename(candidate)
+            try:
+                handle = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+                self.opened_root_identity = os.fstat(handle).st_ino
+            finally:
+                candidate.rename(attacker)
+                parked.rename(candidate)
+            return handle
+        return os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+
+    def open_relative_directory(self, parent, name, *, access):
+        try:
+            return os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent,
+            )
+        except FileNotFoundError:
+            raise self.permissions._WindowsCallError(
+                "open relative Windows probe object", 0xC0000034
+            ) from None
+
+    def create_relative_directory(self, parent, name, *, access):
+        os.mkdir(name, dir_fd=parent)
+        return self.open_relative_directory(parent, name, access=access)
+
+    def create_relative(self, parent, name, *, directory, access):
+        if directory:
+            os.mkdir(name, dir_fd=parent)
+            handle = self.open_relative_directory(parent, name, access=access)
+            if self.expected_root_identity is not None:
+                self.opened_root_identity = os.fstat(parent).st_ino
+        else:
+            handle = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent,
+            )
+        self.children[handle] = (parent, name, directory)
+        return handle
+
+    def handle_metadata(self, handle):
+        info = os.fstat(handle)
+        return self.permissions._HandleMetadata(
+            FILE_ATTRIBUTE_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0,
+            self.permissions._FileIdentity(info.st_dev, info.st_ino),
+        )
+
+    def current_user(self):
+        return self.permissions._CurrentUserSid(SID, 0x51D, None)
+
+    def read_acl(self, handle, current_user, security_information):
+        directory = stat.S_ISDIR(os.fstat(handle).st_mode)
+        return self.permissions._AclState(
+            True,
+            True,
+            True,
+            1,
+            ACCESS_ALLOWED_ACE_TYPE,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE if directory else 0,
+            DIRECTORY_PRIVATE_MASK if directory else FILE_PRIVATE_MASK,
+            True,
+        )
+
+    def set_dacl(self, *_args):
+        pass
+
+    def write_handle(self, handle, data):
+        os.write(handle, data)
+
+    def flush_handle(self, handle):
+        os.fsync(handle)
+        self.flushed.append(handle)
+
+    def delete_on_close(self, handle):
+        if self.refuse_next_delete:
+            self.refuse_next_delete = False
+            raise OSError("synthetic cleanup failure")
+        self.delete_handles.add(handle)
+
+    def close_handle(self, handle):
+        child = self.children.pop(handle, None)
+        os.close(handle)
+        self.closed.append(handle)
+        if child is not None and handle in self.delete_handles:
+            parent, name, directory = child
+            (os.rmdir if directory else os.unlink)(name, dir_fd=parent)
 
 
 class FakeNativeApi:
@@ -124,11 +238,246 @@ def _target(tmp_path: Path, *, directory: bool) -> Path:
     return path
 
 
-def _uninitialized_native_api(permissions, *, kernel32, advapi32):
+def _uninitialized_native_api(permissions, *, kernel32, advapi32, ntdll=None):
     api = object.__new__(permissions._WindowsAclApi)
     api.kernel32 = kernel32
     api.advapi32 = advapi32
+    api.ntdll = ntdll if ntdll is not None else SimpleNamespace()
     return api
+
+
+def test_private_write_probe_rejects_non_relative_artifact_names(tmp_path):
+    from hermes_cli import windows_permissions as permissions
+
+    with pytest.raises(permissions.WindowsAclError):
+        permissions.run_private_acl_write_probe(
+            tmp_path,
+            directory_name="../outside",
+            file_name="sentinel",
+            contents=b"synthetic",
+        )
+
+
+def test_private_write_probe_uses_only_relative_handles_and_deletes_them(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    class ProbeApi:
+        def __init__(self):
+            self.opens = []
+            self.walk = []
+            self.relative = []
+            self.writes = []
+            self.deletes = []
+            self.closed = []
+            self.flushed = []
+            self.next_handle = 2
+            self.directory_handles = {1}
+
+        def open_handle(self, path, *, access, flags):
+            self.opens.append((Path(path), access, flags))
+            return 1
+
+        def open_relative_directory(self, parent, name, *, access):
+            handle = self.next_handle
+            self.next_handle += 1
+            self.directory_handles.add(handle)
+            self.walk.append((parent, name, access, handle))
+            return handle
+
+        def create_relative_directory(self, parent, name, *, access):
+            raise AssertionError("the test root already exists")
+
+        def create_relative(self, parent, name, *, directory, access):
+            self.relative.append((parent, name, directory, access))
+            handle = self.next_handle
+            self.next_handle += 1
+            if directory:
+                self.directory_handles.add(handle)
+            return handle
+
+        def handle_metadata(self, handle):
+            return permissions._HandleMetadata(
+                FILE_ATTRIBUTE_DIRECTORY if handle in self.directory_handles else 0,
+                permissions._FileIdentity(7, handle),
+            )
+
+        def current_user(self):
+            return permissions._CurrentUserSid(SID, 0x51D, None)
+
+        def read_acl(self, handle, current_user, security_information):
+            return permissions._AclState(
+                True,
+                True,
+                True,
+                1,
+                ACCESS_ALLOWED_ACE_TYPE,
+                (
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                    if handle in self.directory_handles
+                    else 0
+                ),
+                (
+                    DIRECTORY_PRIVATE_MASK
+                    if handle in self.directory_handles
+                    else FILE_PRIVATE_MASK
+                ),
+                True,
+            )
+
+        def set_dacl(self, *_args):
+            pass
+
+        def write_handle(self, handle, data):
+            self.writes.append((handle, data))
+
+        def flush_handle(self, handle):
+            self.flushed.append(handle)
+
+        def delete_on_close(self, handle):
+            self.deletes.append(handle)
+
+        def close_handle(self, handle):
+            self.closed.append(handle)
+
+    api = ProbeApi()
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    result = permissions.run_private_acl_write_probe(
+        tmp_path,
+        directory_name=".secret-write-probe-token",
+        file_name="sentinel",
+        contents=b"synthetic",
+    )
+
+    assert result == permissions.WindowsPrivateProbeResult(None, False)
+    assert len(api.opens) == 1
+    assert api.opens[0][0] == Path(tmp_path.anchor)
+    assert [item[1] for item in api.walk] == list(tmp_path.parts[1:])
+    root_handle = api.walk[-1][3]
+    probe_handle = api.relative[0][0] + 1
+    file_handle = probe_handle + 1
+    assert [item[0:3] for item in api.relative] == [
+        (root_handle, ".secret-write-probe-token", True),
+        (probe_handle, "sentinel", False),
+    ]
+    assert api.relative[0][3] & FILE_ADD_FILE
+    assert api.writes == [(file_handle, b"synthetic")]
+    assert api.flushed == [file_handle]
+    assert api.deletes == [file_handle, probe_handle]
+    assert api.closed[:2] == [file_handle, probe_handle]
+    assert api.closed[-1] == 1
+
+
+def test_private_write_probe_closes_artifact_handles_when_cleanup_marking_fails(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    root = tmp_path / "profile"
+    root.mkdir()
+    api = HandleBackedProbeApi(permissions)
+    api.refuse_next_delete = True
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    result = permissions.run_private_acl_write_probe(
+        root,
+        directory_name=".secret-write-probe-token",
+        file_name="sentinel",
+        contents=b"synthetic",
+    )
+
+    try:
+        assert result == permissions.WindowsPrivateProbeResult(None, True)
+        assert api.children == {}
+    finally:
+        for handle in tuple(api.children):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+        sentinel = root / ".secret-write-probe-token" / "sentinel"
+        if sentinel.exists():
+            sentinel.unlink()
+        if sentinel.parent.exists():
+            sentinel.parent.rmdir()
+
+
+def test_private_write_probe_cannot_be_redirected_by_root_swap(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    root = tmp_path / "profile"
+    root.mkdir()
+    attacker = tmp_path / "profile-attacker"
+    attacker.mkdir()
+    api = HandleBackedProbeApi(permissions, swapped_root=root)
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    result = permissions.run_private_acl_write_probe(
+        root,
+        directory_name=".secret-write-probe-token",
+        file_name="sentinel",
+        contents=b"synthetic",
+    )
+
+    assert result == permissions.WindowsPrivateProbeResult(None, False)
+    assert api.opened_root_identity == api.expected_root_identity
+    assert list(root.iterdir()) == []
+    assert list(attacker.iterdir()) == []
+
+
+def test_private_write_probe_creates_absent_root_from_held_ancestor(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    root = tmp_path / "missing-parent" / "profile"
+    api = HandleBackedProbeApi(permissions)
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    result = permissions.run_private_acl_write_probe(
+        root,
+        directory_name=".secret-write-probe-token",
+        file_name="sentinel",
+        contents=b"synthetic",
+    )
+
+    assert result == permissions.WindowsPrivateProbeResult(None, False)
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
+
+
+def test_native_relative_root_open_disables_reparse_and_rename_sharing():
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+
+    def nt_create_file(*args):
+        calls.append(args)
+        args[0]._obj.value = 0xA11
+        return 0
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(),
+        advapi32=SimpleNamespace(),
+        ntdll=SimpleNamespace(NtCreateFile=nt_create_file),
+    )
+
+    handle = api.open_relative_directory(0x051D, "profile", access=0x00100001)
+
+    assert handle == 0xA11
+    assert len(calls) == 1
+    call = calls[0]
+    attributes = call[2]._obj
+    assert attributes.RootDirectory == 0x051D
+    assert attributes.Attributes & 0x00001000
+    assert call[6] == 0x00000001 | 0x00000002
+    assert not call[6] & 0x00000004
+    assert call[7] == 1
+    assert call[8] & 0x00200000
+    assert call[8] & 0x00000001
 
 
 def test_native_create_file_call_uses_win32_argument_order(tmp_path):
