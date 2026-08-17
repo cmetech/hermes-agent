@@ -64,7 +64,9 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
     assert "⚠ Last startup issue: telegram conflict" in lines
 
 
-def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
+def test_runtime_status_running_pid_falls_back_when_live_cmdline_unreadable(
+    monkeypatch,
+):
     from gateway import status as status_mod
 
     runtime = {
@@ -76,8 +78,7 @@ def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
     }
     monkeypatch.setattr(status_mod, "_pid_exists", lambda pid: pid == 12345)
     monkeypatch.setattr(status_mod, "_get_process_start_time", lambda pid: None)
-    monkeypatch.setattr(status_mod, "_looks_like_gateway_process", lambda pid: False)
+    monkeypatch.setattr(status_mod, "_read_process_cmdline", lambda pid: None)
 
     assert status_mod.get_runtime_status_running_pid(runtime) == 12345
-
 
