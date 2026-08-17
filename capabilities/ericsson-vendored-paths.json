@@ -10,6 +10,8 @@
   "capabilities/workflows/my-tickets-summary.yml",
   "capabilities/workflows/sharepoint-document-intake.hermes.yaml",
   "capabilities/workflows/sharepoint-document-intake.yml",
+  "plugins/ericsson-arm",
+  "plugins/ericsson-confluence",
   "plugins/ericsson-gitlab",
   "plugins/ericsson-jira",
   "plugins/ericsson-sharepoint",

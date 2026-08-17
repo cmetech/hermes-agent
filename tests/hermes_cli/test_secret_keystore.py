@@ -1,0 +1,2494 @@
+"""Tests for hermes_cli.secret_keystore — two-tier plugin secret storage."""
+
+import contextlib
+import logging
+import multiprocessing
+import os
+import stat
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from hermes_cli import secret_keystore
+from hermes_cli.secret_keystore import (
+    OSKeystore,
+    PROBE_TIMEOUT_SECONDS,
+    SERVICE_NAME,
+    _PROBE_VALUE,
+    FileKeystore,
+    KeystoreError,
+    probe_os_keystore,
+)
+
+
+def _with_reparse_attribute(info):
+    result = mock.Mock()
+    result.st_mode = info.st_mode
+    result.st_dev = info.st_dev
+    result.st_ino = info.st_ino
+    result.st_size = info.st_size
+    result.st_mtime_ns = info.st_mtime_ns
+    result.st_file_attributes = stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return result
+
+
+class TestWindowsCredentialAclBoundaries:
+    @pytest.mark.parametrize("kind", ["root", "artifact"])
+    def test_windows_reparse_store_paths_are_rejected(self, tmp_path, kind):
+        root = tmp_path / "secrets"
+        root.mkdir()
+        artifact = root / "keystore.key"
+        artifact.write_bytes(b"x" * 32)
+        target = root if kind == "root" else artifact
+        reparse_info = _with_reparse_attribute(target.lstat())
+        real_lstat = Path.lstat
+
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                autospec=True,
+                side_effect=lambda candidate: (
+                    reparse_info if candidate == target else real_lstat(candidate)
+                ),
+            ),
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_directory_to_current_user"
+            ),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ),
+            pytest.raises(KeystoreError, match="reparse|direct|regular"),
+        ):
+            FileKeystore(root)
+
+    def test_private_replace_rejects_destination_identity_swap_before_acl(
+        self, tmp_path
+    ):
+        from hermes_cli import windows_permissions
+
+        path = tmp_path / "keystore.enc"
+        path.write_bytes(b"previous")
+        real_replace = os.replace
+        restrict = mock.Mock()
+
+        def replace_then_swap(source, destination):
+            real_replace(source, destination)
+            Path(destination).unlink()
+            Path(destination).write_bytes(b"attacker-replacement")
+
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore.os, "replace", replace_then_swap),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict,
+            ),
+            pytest.raises(KeystoreError, match="changed|replacement"),
+        ):
+            secret_keystore._write_private(path, b"new-ciphertext")
+
+        restrict.assert_not_called()
+
+    def test_private_replace_rejects_parent_identity_swap_before_acl(
+        self, tmp_path
+    ):
+        from hermes_cli import windows_permissions
+
+        root = tmp_path / "secrets"
+        root.mkdir()
+        path = root / "keystore.enc"
+        path.write_bytes(b"previous")
+        displaced_root = tmp_path / "displaced-secrets"
+        real_replace = os.replace
+        restrict = mock.Mock()
+
+        def replace_then_swap_parent(source, destination):
+            real_replace(source, destination)
+            real_replace(root, displaced_root)
+            root.mkdir()
+            path.write_bytes(b"attacker-replacement")
+
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(
+                secret_keystore.os,
+                "replace",
+                replace_then_swap_parent,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict,
+            ),
+            pytest.raises(KeystoreError, match="parent|changed|replacement"),
+        ):
+            secret_keystore._write_private(path, b"new-ciphertext")
+
+        restrict.assert_not_called()
+
+    def test_private_replace_never_follows_a_late_destination_symlink(
+        self, tmp_path
+    ):
+        from hermes_cli import windows_permissions
+
+        path = tmp_path / "keystore.enc"
+        path.write_bytes(b"previous")
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"outside-unchanged")
+        real_islink = os.path.islink
+
+        def inject_symlink(candidate):
+            if Path(candidate) == path:
+                path.unlink()
+                path.symlink_to(outside)
+                return True
+            return real_islink(candidate)
+
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore.os.path, "islink", inject_symlink),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+            ),
+        ):
+            secret_keystore._write_private(path, b"new-ciphertext")
+
+        assert path.is_file()
+        assert not path.is_symlink()
+        assert path.read_bytes() == b"new-ciphertext"
+        assert outside.read_bytes() == b"outside-unchanged"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows junctions")
+    def test_windows_native_junction_store_root_is_rejected(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        junction = tmp_path / "junction"
+        created = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(junction), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip("current Windows account cannot create a junction")
+
+        with pytest.raises(KeystoreError, match="reparse|direct"):
+            FileKeystore(junction)
+
+    def test_file_store_acls_directory_lock_key_ciphertext_and_second_write(
+        self, tmp_path
+    ):
+        from hermes_cli import windows_permissions
+
+        root = tmp_path / "secrets"
+        restrict_file = mock.Mock()
+        restrict_directory = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                restrict_directory,
+            ),
+        ):
+            store = FileKeystore(root)
+            store.set("K", "first")
+            store.set("K", "second")
+
+        assert restrict_directory.call_args_list.count(mock.call(root)) >= 2
+        secured_files = [call.args[0] for call in restrict_file.call_args_list]
+        assert root / "keystore.lock" in secured_files
+        assert root / "keystore.key" in secured_files
+        assert secured_files.count(root / "keystore.enc") >= 2
+        assert store.get("K") == "second"
+
+    def test_authority_replacement_is_acled_after_real_file_write(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import windows_permissions
+
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        secret_keystore.reset_backend_cache()
+        restrict_file = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions, "restrict_directory_to_current_user"
+            ),
+        ):
+            secret_keystore.set_secret("K", "value")
+
+        secured_files = [call.args[0] for call in restrict_file.call_args_list]
+        assert home / "secrets" / "authority.json" in secured_files
+        assert secret_keystore.get_authority("K") is secret_keystore.SecretAuthority.FILE
+
+    def test_os_mutation_root_and_lock_creation_are_acled(self, tmp_path):
+        from hermes_cli import windows_permissions
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        store = OSKeystore(str(profile.resolve()))
+        restrict_file = mock.Mock()
+        restrict_directory = mock.Mock()
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                restrict_file,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                restrict_directory,
+            ),
+        ):
+            with store._mutation_lock():
+                pass
+
+        root = profile / "secrets"
+        restrict_directory.assert_called_with(root)
+        restrict_file.assert_called_with(root / "keystore.lock")
+
+    @pytest.mark.parametrize("kind", ["file", "directory"])
+    def test_windows_acl_failures_raise_keystore_error(self, tmp_path, kind):
+        from hermes_cli import windows_permissions
+
+        failure = windows_permissions.WindowsAclError("access denied")
+        with (
+            mock.patch.object(secret_keystore, "_is_windows", return_value=True),
+            mock.patch.object(secret_keystore, "_in_container", return_value=False),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_file_to_current_user",
+                side_effect=failure if kind == "file" else None,
+            ),
+            mock.patch.object(
+                windows_permissions,
+                "restrict_directory_to_current_user",
+                side_effect=failure if kind == "directory" else None,
+            ),
+            pytest.raises(KeystoreError, match="ACL"),
+        ):
+            FileKeystore(tmp_path / "secrets").set("K", "value")
+
+
+def _concurrent_file_writer(root, prefix, start, count):
+    """Spawn-safe worker used by the real cross-process transaction test."""
+    store = FileKeystore(Path(root))
+    start.wait(timeout=10)
+    for index in range(count):
+        store.set(f"{prefix}-{index}", f"value-{prefix}-{index}")
+
+
+class TestFileKeystore:
+    def test_absent_store_get_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        assert FileKeystore(root).get("missing") is None
+
+        assert not root.exists()
+
+    def test_absent_store_keys_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        assert FileKeystore(root).keys() == []
+
+        assert not root.exists()
+
+    def test_absent_store_delete_does_not_create_root(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        FileKeystore(root).delete("missing")
+
+        assert not root.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_set_securely_initializes_an_absent_store(self, tmp_path):
+        root = tmp_path / "secrets"
+
+        FileKeystore(root).set("K", "v")
+
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / "keystore.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
+
+    def test_round_trip(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("HERMES_PLUGIN_ABC_PAT", "s3cret-value")
+        assert store.get("HERMES_PLUGIN_ABC_PAT") == "s3cret-value"
+
+    def test_missing_key_returns_none(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        assert store.get("HERMES_PLUGIN_NOPE_PAT") is None
+
+    def test_delete_removes_value(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        store.delete("K")
+        assert store.get("K") is None
+
+    def test_delete_missing_key_is_silent(self, tmp_path):
+        FileKeystore(tmp_path).delete("ABSENT")
+
+    def test_ciphertext_does_not_contain_plaintext(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "distinctive-plaintext-marker")
+        blob = (tmp_path / "keystore.enc").read_bytes()
+        assert b"distinctive-plaintext-marker" not in blob
+
+    def test_survives_new_instance(self, tmp_path):
+        FileKeystore(tmp_path).set("K", "v")
+        assert FileKeystore(tmp_path).get("K") == "v"
+
+    def test_keys_lists_stored_names(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("A", "1")
+        store.set("B", "2")
+        assert sorted(store.keys()) == ["A", "B"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_file_modes_match_super_cli(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        assert stat.S_IMODE(os.stat(tmp_path).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.key").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.enc").st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_existing_store_files_are_resecured(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        with secret_keystore._store_lock(tmp_path):
+            pass
+
+        os.chmod(tmp_path, 0o755)
+        os.chmod(tmp_path / "keystore.key", 0o644)
+        os.chmod(tmp_path / "keystore.enc", 0o644)
+        os.chmod(tmp_path / "keystore.lock", 0o644)
+
+        reopened = FileKeystore(tmp_path)
+        assert reopened.get("K") == "v"
+        assert stat.S_IMODE(os.stat(tmp_path).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.key").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.enc").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "keystore.lock").st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_existing_key_is_resecured_without_ciphertext(self, tmp_path):
+        key_path = tmp_path / "keystore.key"
+        key_path.write_bytes(b"\0" * 32)
+        os.chmod(key_path, 0o644)
+
+        assert FileKeystore(tmp_path).get("missing") is None
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_raises_when_private_permissions_cannot_be_established(self, tmp_path):
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=OSError("read-only")
+        ):
+            with pytest.raises(KeystoreError, match="cannot secure permissions"):
+                FileKeystore(tmp_path)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_unsupported_nofollow_chmod_falls_back_to_descriptor(self, tmp_path):
+        root = tmp_path / "store"
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod",
+            side_effect=NotImplementedError("follow_symlinks unavailable"),
+        ):
+            store = FileKeystore(root)
+            store.set("K", "v")
+
+        assert store.get("K") == "v"
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / "keystore.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "chmod() got an unexpected keyword argument 'follow_symlinks'",
+            "chmod() takes no keyword arguments",
+        ],
+        ids=["named-follow-symlinks", "legacy-no-keywords"],
+    )
+    def test_unsupported_nofollow_chmod_typeerror_falls_back_to_descriptor(
+        self, tmp_path, message
+    ):
+        root = tmp_path / "store"
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=TypeError(message)
+        ):
+            store = FileKeystore(root)
+            store.set("K", "v")
+
+        assert store.get("K") == "v"
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / "keystore.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.enc").stat().st_mode) == 0o600
+        assert stat.S_IMODE((root / "keystore.lock").stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_unrelated_keyword_typeerror_fails_closed(self, tmp_path):
+        message = "internal keyword dispatch failure"
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.chmod", side_effect=TypeError(message)
+        ):
+            with pytest.raises(TypeError, match=message):
+                FileKeystore(tmp_path / "store").set("K", "v")
+
+    def test_corrupt_key_file_raises(self, tmp_path):
+        FileKeystore(tmp_path).set("K", "v")
+        (tmp_path / "keystore.key").write_bytes(b"too-short")
+        with pytest.raises(KeystoreError, match="expected 32 bytes"):
+            FileKeystore(tmp_path).get("K")
+
+    def test_wrong_key_raises_rather_than_returning_garbage(self, tmp_path):
+        FileKeystore(tmp_path).set("K", "v")
+        (tmp_path / "keystore.key").write_bytes(b"\x00" * 32)
+        with pytest.raises(KeystoreError, match="cannot decrypt"):
+            FileKeystore(tmp_path).get("K")
+
+    def test_ciphertext_without_key_raises_without_creating_a_new_key(self, tmp_path):
+        store = FileKeystore(tmp_path)
+        store.set("K", "v")
+        key_path = tmp_path / "keystore.key"
+        key_path.unlink()
+
+        with pytest.raises(KeystoreError, match="missing encryption key"):
+            store.get("K")
+        assert not key_path.exists()
+
+    def test_interrupted_atomic_replace_preserves_previous_ciphertext(self, tmp_path):
+        """Direct truncation destroys the last good store when a write fails."""
+        store = FileKeystore(tmp_path)
+        store.set("existing", "survives")
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.replace", side_effect=OSError("disk full")
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                store.set("new", "not-committed")
+
+        reopened = FileKeystore(tmp_path)
+        assert reopened.get("existing") == "survives"
+        assert reopened.get("new") is None
+
+    def test_concurrent_processes_do_not_lose_updates_or_split_the_key(self, tmp_path):
+        """Hermes CLI, gateway and desktop may write one profile concurrently."""
+        ctx = multiprocessing.get_context("spawn")
+        start = ctx.Event()
+        workers = [
+            ctx.Process(
+                target=_concurrent_file_writer,
+                args=(str(tmp_path), f"p{worker}", start, 12),
+            )
+            for worker in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            start.set()
+            for worker in workers:
+                worker.join(timeout=20)
+                assert not worker.is_alive(), "keystore transaction deadlocked"
+                assert worker.exitcode == 0
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        store = FileKeystore(tmp_path)
+        assert len(store.keys()) == 48
+        for worker in range(4):
+            for index in range(12):
+                assert store.get(f"p{worker}-{index}") == f"value-p{worker}-{index}"
+
+    def test_windows_initializes_lock_sentinel_only_after_acquiring_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+        fake_msvcrt = mock.Mock(LK_LOCK=1, LK_UNLCK=2)
+
+        def assert_lock_precedes_initialization(_fd, mode, _count):
+            if mode == fake_msvcrt.LK_LOCK:
+                assert lock_path.read_bytes() == b""
+
+        fake_msvcrt.locking.side_effect = assert_lock_precedes_initialization
+        with (
+            mock.patch("hermes_cli.secret_keystore.os.name", "nt"),
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            with secret_keystore._store_lock(tmp_path):
+                assert lock_path.read_bytes() == b"\0"
+        restrict.assert_called_once_with(lock_path)
+
+    def test_windows_secure_false_still_acls_a_new_repair_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+
+        with (
+            mock.patch("hermes_cli.secret_keystore._is_windows", return_value=True),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            with secret_keystore._store_lock(tmp_path, secure=False):
+                pass
+
+        restrict.assert_called_once_with(lock_path)
+
+    def test_windows_secure_false_preserves_an_existing_repair_lock(self, tmp_path):
+        lock_path = tmp_path / "keystore.lock"
+        lock_path.touch()
+
+        with (
+            mock.patch("hermes_cli.secret_keystore._is_windows", return_value=True),
+            mock.patch(
+                "hermes_cli.windows_permissions.restrict_file_to_current_user"
+            ) as restrict,
+        ):
+            with secret_keystore._store_lock(tmp_path, secure=False):
+                pass
+
+        restrict.assert_not_called()
+
+    def test_windows_noncreating_lock_rejects_empty_file_without_mutating_it(
+        self, tmp_path
+    ):
+        lock_path = tmp_path / "keystore.lock"
+        lock_path.touch()
+        fake_msvcrt = mock.Mock(LK_LOCK=1, LK_UNLCK=2)
+
+        with (
+            mock.patch("hermes_cli.secret_keystore.os.name", "nt"),
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+            pytest.raises(KeystoreError, match="empty|corrupt"),
+        ):
+            with secret_keystore._store_lock(
+                tmp_path,
+                create=False,
+                secure=False,
+            ):
+                pass
+
+        assert lock_path.read_bytes() == b""
+        fake_msvcrt.locking.assert_not_called()
+
+
+class TestContainerKeyPersistence:
+    """Decision D4: an ephemeral key in a container is refused loudly.
+
+    Generating one silently is the worst available outcome -- every secret
+    written under it becomes unreadable at the next restart, and the symptom
+    ("my credentials vanished") gives no hint of the cause.
+    """
+
+    def test_fresh_persistent_container_store_initializes(self, tmp_path, monkeypatch):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        root = tmp_path / "secrets"
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                PersistenceState.PERSISTENT,
+                tmp_path,
+                "ext4",
+                "/dev/x",
+                "volume mount",
+            ),
+        )
+
+        FileKeystore(root).set("K", "v")
+
+        assert FileKeystore(root).get("K") == "v"
+
+    @pytest.mark.parametrize("state", ["ephemeral", "unknown"])
+    def test_unproven_container_storage_refuses_new_key(
+        self, tmp_path, monkeypatch, state
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        root = tmp_path / "secrets"
+        persistence_state = PersistenceState(state)
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                persistence_state,
+                tmp_path if state == "ephemeral" else None,
+                "tmpfs" if state == "ephemeral" else None,
+                "tmpfs" if state == "ephemeral" else None,
+                f"{state} test evidence",
+            ),
+        )
+
+        with pytest.raises(KeystoreError) as exc_info:
+            FileKeystore(root).set("K", "v")
+
+        message = str(exc_info.value)
+        assert str(root) in message
+        assert "hermes secrets doctor" in message
+        assert "hermes secrets repair" in message
+        assert not root.exists()
+
+    @pytest.mark.parametrize("mode", ["file", "auto"])
+    def test_public_write_refusal_does_not_create_transaction_state(
+        self, tmp_path, monkeypatch, mode
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        profile = tmp_path / "profile"
+        root = profile / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", mode)
+        monkeypatch.setattr(secret_keystore, "probe_os_keystore", lambda **kwargs: False)
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+        monkeypatch.setattr(
+            container_storage,
+            "inspect_mount_persistence",
+            lambda path: MountPersistence(
+                PersistenceState.UNKNOWN,
+                None,
+                None,
+                None,
+                "missing mountinfo",
+            ),
+        )
+        secret_keystore.reset_backend_cache()
+
+        with pytest.raises(KeystoreError, match="persistence is unknown"):
+            secret_keystore.set_secret("K", "v")
+
+        assert not root.exists()
+
+    def test_persistence_is_rechecked_inside_new_store_transaction(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import container_storage
+        from hermes_cli.container_storage import MountPersistence, PersistenceState
+
+        root = tmp_path / "secrets"
+        states = iter((PersistenceState.PERSISTENT, PersistenceState.UNKNOWN))
+        monkeypatch.setattr(container_storage, "is_container", lambda: True)
+
+        def inspect(path):
+            state = next(states)
+            return MountPersistence(
+                state,
+                tmp_path if state is PersistenceState.PERSISTENT else None,
+                "ext4" if state is PersistenceState.PERSISTENT else None,
+                "/dev/x" if state is PersistenceState.PERSISTENT else None,
+                f"{state.value} evidence",
+            )
+
+        monkeypatch.setattr(container_storage, "inspect_mount_persistence", inspect)
+
+        with pytest.raises(KeystoreError, match="persistence is unknown"):
+            FileKeystore(root).set("K", "v")
+
+        assert not (root / "keystore.key").exists()
+        assert not (root / "keystore.enc").exists()
+
+    def test_an_existing_key_in_a_container_is_fine(self, tmp_path):
+        """A mounted volume with a key already on it is the supported setup —
+        the refusal is about *creating* a key, not about containers."""
+        FileKeystore(tmp_path).set("K", "v")           # key created outside the container
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
+            assert FileKeystore(tmp_path).get("K") == "v"
+
+    def test_outside_a_container_a_new_key_is_created(self, tmp_path):
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=False):
+            FileKeystore(tmp_path).set("K", "v")
+        assert (tmp_path / "keystore.key").exists()
+
+
+class _FakeKeyring:
+    """In-memory stand-in for the keyring module."""
+
+    def __init__(self, fail=False):
+        self.store = {}
+        self.fail = fail
+
+    def get_password(self, service, name):
+        if self.fail:
+            raise RuntimeError("no backend")
+        return self.store.get((service, name))
+
+    def set_password(self, service, name, value):
+        if self.fail:
+            raise RuntimeError("no backend")
+        self.store[(service, name)] = value
+
+    def delete_password(self, service, name):
+        if self.fail:
+            raise RuntimeError("no backend")
+        self.store.pop((service, name), None)
+
+
+class TestOSKeystore:
+    def test_round_trip(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            store = OSKeystore()
+            store.set("K", "v")
+            assert store.get("K") == "v"
+
+    def test_uses_namespaced_service_name(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            OSKeystore().set("K", "v")
+        assert len(fake.store) == 1
+        service, account_name = next(iter(fake.store))
+        assert service == SERVICE_NAME
+        assert account_name != "K"
+
+    def test_backend_failure_raises_keystore_error(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring(fail=True)):
+            with pytest.raises(KeystoreError):
+                OSKeystore().set("K", "v")
+
+
+class TestProbe:
+    def test_probe_true_when_round_trip_works(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring()):
+            assert probe_os_keystore() is True
+
+    def test_probe_false_when_backend_unavailable(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", _FakeKeyring(fail=True)):
+            assert probe_os_keystore() is False
+
+    def test_probe_false_when_keyring_not_installed(self):
+        with mock.patch("hermes_cli.secret_keystore.keyring", None):
+            assert probe_os_keystore() is False
+
+    def test_probe_leaves_no_residue(self):
+        fake = _FakeKeyring()
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            probe_os_keystore()
+        assert fake.store == {}
+
+    def test_probe_false_when_cleanup_is_refused(self):
+        fake = _FakeKeyring()
+
+        def refuse_delete(service, name):
+            raise RuntimeError("delete refused")
+
+        fake.delete_password = refuse_delete
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is False
+
+    def test_probe_stays_true_when_cleanup_reports_already_absent(self):
+        fake = _FakeKeyring()
+
+        def report_already_absent(service, name):
+            fake.store.pop((service, name), None)
+            raise secret_keystore._PasswordDeleteError("already absent")
+
+        fake.delete_password = report_already_absent
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is True
+        assert fake.store == {}
+
+    def test_probe_false_when_round_trip_value_mismatches(self):
+        fake = _FakeKeyring()
+        fake.get_password = lambda service, name: "wrong-value"
+        with mock.patch("hermes_cli.secret_keystore.keyring", fake):
+            assert probe_os_keystore() is False
+
+    def test_probe_gives_up_on_a_hanging_backend(self):
+        """The failure mode that a try/except cannot catch.
+
+        A locked Linux keyring or a D-Bus Secret Service that never answers
+        blocks inside keyring rather than raising. The Global Constraints
+        require probing to "fail fast to the fallback rather than hang", and
+        an exception handler does not deliver that.
+
+        The worker is released and joined INSIDE the patch. An earlier draft
+        exited the `with` block first, which restored the real keyring module
+        while the abandoned worker was still mid-round-trip -- so its next
+        call resolved the real backend and touched the developer's actual
+        keychain. Releasing first keeps the fake in place for the whole life
+        of the thread.
+        """
+        import threading
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def set_password(self, service, name, value):
+                released.wait(timeout=10)   # unblocked by the test, not the probe
+
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                return _PROBE_VALUE
+
+            def delete_password(self, service, name):
+                finished.set()
+
+        with mock.patch("hermes_cli.secret_keystore.keyring", _HangingKeyring()):
+            start = time.monotonic()
+            result = probe_os_keystore(timeout_seconds=0.25)
+            elapsed = time.monotonic() - start
+
+            assert result is False
+            assert elapsed < 5.0, (
+                f"probe blocked for {elapsed:.1f}s instead of failing fast"
+            )
+
+            # Let the abandoned worker finish against the fake, then wait for
+            # it, so no thread outlives the patch.
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_probe_timeout_is_configurable_and_defaulted(self):
+        import inspect
+
+        signature = inspect.signature(probe_os_keystore)
+        assert signature.parameters["timeout_seconds"].default == PROBE_TIMEOUT_SECONDS
+
+
+import hermes_cli.secret_keystore as sk
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    # Every test starts isolated from the developer's real OS keychain. Tests
+    # that exercise OS authority install a bounded-lifetime fake explicitly.
+    monkeypatch.setattr(sk, "keyring", _FakeKeyring(fail=True))
+    sk.reset_backend_cache()
+    yield
+    sk.reset_backend_cache()
+
+
+class TestBackendSelection:
+    def test_prefers_os_when_probe_succeeds(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            assert sk.get_backend().name == "os"
+
+    def test_falls_back_to_file_when_probe_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with mock.patch.object(sk, "keyring", _FakeKeyring(fail=True)):
+            assert sk.get_backend().name == "file"
+
+    def test_env_override_forces_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            assert sk.get_backend().name == "file"
+
+    def test_env_override_off_disables_keystore(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        assert sk.get_backend() is None
+        assert sk.get_secret("K") is None
+
+    def test_probe_runs_once_per_process(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            with mock.patch.object(
+                sk,
+                "probe_os_keystore",
+                side_effect=lambda **_kwargs: calls.append(1) or True,
+            ):
+                sk.get_backend()
+                sk.get_backend()
+        assert len(calls) == 1
+
+
+class TestModuleLevelAPI:
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret("HERMES_PLUGIN_X_PAT", "tok")
+        assert sk.get_secret("HERMES_PLUGIN_X_PAT") == "tok"
+
+    def test_get_secret_never_raises_on_backend_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.get.side_effect = KeystoreError("boom")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            assert sk.get_secret("K") is None
+
+    def test_get_secret_never_raises_on_unexpected_backend_failure(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.get.side_effect = RuntimeError("unexpected backend failure")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            assert sk.get_secret("K") is None
+
+    def test_set_secret_raises_on_backend_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.set.side_effect = KeystoreError("boom")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(KeystoreError):
+                sk.set_secret("K", "v")
+
+    def test_set_secret_raises_when_keystore_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        with pytest.raises(KeystoreError):
+            sk.set_secret("K", "v")
+
+    def test_set_secret_normalizes_an_ordinary_backend_exception(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_set_unlocked",
+            side_effect=PermissionError("refused"),
+        ):
+            with pytest.raises(KeystoreError, match="write failed"):
+                sk.set_secret("K", "v")
+
+    def test_delete_secret_normalizes_an_ordinary_backend_exception(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret("K", "v")
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_delete_unlocked",
+            side_effect=OSError("unavailable"),
+        ):
+            with pytest.raises(KeystoreError, match="delete failed"):
+                sk.delete_secret("K")
+
+
+class TestProfileIsolation:
+    def test_os_accounts_are_isolated_by_canonical_profile(self, tmp_path, monkeypatch):
+        fake = _FakeKeyring()
+        first = tmp_path / "profiles" / "one" / ".." / "one"
+        second = tmp_path / "profiles" / "two"
+        with mock.patch.object(sk, "keyring", fake):
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            OSKeystore().set("HERMES_PLUGIN_SHARED_TOKEN", "one")
+
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") is None
+            OSKeystore().set("HERMES_PLUGIN_SHARED_TOKEN", "two")
+
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") == "one"
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            OSKeystore().delete("HERMES_PLUGIN_SHARED_TOKEN")
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert OSKeystore().get("HERMES_PLUGIN_SHARED_TOKEN") == "one"
+
+        assert len(fake.store) == 1
+        assert all(
+            name != "HERMES_PLUGIN_SHARED_TOKEN" for _service, name in fake.store
+        )
+
+    def test_file_backend_rebinds_when_profile_changes_without_manual_reset(
+        self, tmp_path, monkeypatch
+    ):
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        sk.set_secret("K", "one")
+        first_backend = sk.get_backend()
+        assert sk.get_backend() is first_backend
+
+        monkeypatch.setenv("HERMES_HOME", str(second))
+        assert sk.get_secret("K") is None
+        assert sk.get_backend() is not first_backend
+        sk.set_secret("K", "two")
+
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        assert sk.get_secret("K") == "one"
+
+    def test_os_backend_rebinds_when_profile_changes_without_manual_reset(
+        self, tmp_path, monkeypatch
+    ):
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            sk.set_secret("K", "one")
+            first_backend = sk.get_backend()
+            assert sk.get_backend() is first_backend
+
+            monkeypatch.setenv("HERMES_HOME", str(second))
+            assert sk.get_secret("K") is None
+            assert sk.get_backend() is not first_backend
+            sk.set_secret("K", "two")
+
+            monkeypatch.setenv("HERMES_HOME", str(first))
+            assert sk.get_secret("K") == "one"
+
+
+class TestBatchWrites:
+    def test_file_batch_persists_all_values(self, tmp_path):
+        store = FileKeystore(tmp_path)
+
+        store.set_many({"first": "one", "second": "two"})
+
+        assert store.get("first") == "one"
+        assert store.get("second") == "two"
+
+    def test_os_batch_failure_rolls_back_earlier_successes(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_second_set(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("write refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_second_set
+            with pytest.raises(KeystoreError, match="state restored"):
+                store.set_many({"first": "new-first", "second": "new-second"})
+
+            assert store.get("first") == "old-first"
+            assert store.get("second") == "old-second"
+
+    def test_os_batch_rollback_failure_reports_outcome_uncertainty(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_write_and_rollback(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls in {2, 3}:
+                    raise OSError("write refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_write_and_rollback
+            with pytest.raises(KeystoreError, match="rollback failed.*uncertain"):
+                store.set_many({"first": "new-first", "second": "new-second"})
+
+    def test_os_batch_restores_the_current_key_when_its_write_commits_then_raises(self):
+        fake = _FakeKeyring()
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("first", "old-first")
+            store.set("second", "old-second")
+            original_set = fake.set_password
+            calls = 0
+
+            def commit_then_raise(service, name, value):
+                nonlocal calls
+                calls += 1
+                original_set(service, name, value)
+                if calls == 2:
+                    raise OSError("reply lost after commit")
+
+            fake.set_password = commit_then_raise
+            with pytest.raises(KeystoreError, match="state restored"):
+                store.set_many({"first": "new-first", "second": "new-second"})
+
+            assert store.get("first") == "old-first"
+            assert store.get("second") == "old-second"
+
+    def test_os_batch_rollback_cannot_overwrite_a_concurrent_successful_batch(self):
+        import threading
+
+        fake = _FakeKeyring()
+        entered_failure = threading.Event()
+        release_failure = threading.Event()
+        second_started = threading.Event()
+        second_done = threading.Event()
+        results = []
+        with mock.patch.object(sk, "keyring", fake):
+            store = OSKeystore()
+            store.set("shared", "old")
+            original_set = fake.set_password
+            calls = 0
+
+            def fail_after_first_mutation(service, name, value):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    entered_failure.set()
+                    assert release_failure.wait(timeout=5)
+                    raise OSError("second field refused")
+                original_set(service, name, value)
+
+            fake.set_password = fail_after_first_mutation
+
+            def failing_batch():
+                with pytest.raises(KeystoreError, match="batch write failed"):
+                    store.set_many({"shared": "first", "reject": "value"})
+
+            def successful_batch():
+                second_started.set()
+                store.set_many({"shared": "second"})
+                results.append(store.get("shared"))
+                second_done.set()
+
+            first = threading.Thread(target=failing_batch)
+            second = threading.Thread(target=successful_batch)
+            first.start()
+            assert entered_failure.wait(timeout=5)
+            second.start()
+            assert second_started.wait(timeout=5)
+            release_failure.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            assert not first.is_alive()
+            assert not second.is_alive()
+            assert store.get("shared") == "second"
+
+        assert second_done.is_set()
+        assert results == ["second"]
+
+
+class TestProbeConcurrency:
+    def test_concurrent_probes_use_distinct_accounts_and_clean_up_exactly(self):
+        import threading
+
+        class ProbeKeyring(_FakeKeyring):
+            def __init__(self):
+                super().__init__()
+                self.accounts = []
+                self.deleted = []
+                self.barrier = threading.Barrier(2)
+                self.finished = threading.Event()
+                self._completed = 0
+                self._lock = threading.Lock()
+
+            def set_password(self, service, name, value):
+                self.accounts.append(name)
+                super().set_password(service, name, value)
+                self.barrier.wait(timeout=5)
+
+            def delete_password(self, service, name):
+                self.deleted.append(name)
+                super().delete_password(service, name)
+                with self._lock:
+                    self._completed += 1
+                    if self._completed == 2:
+                        self.finished.set()
+
+        fake = ProbeKeyring()
+        results = []
+        with mock.patch.object(sk, "keyring", fake):
+            try:
+                threads = [
+                    threading.Thread(
+                        target=lambda: results.append(probe_os_keystore())
+                    )
+                    for _ in range(2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+                    assert not thread.is_alive()
+            finally:
+                fake.barrier.abort()
+                assert fake.finished.wait(timeout=5), (
+                    "probe workers outlived the fake-keyring patch"
+                )
+
+        assert results == [True, True]
+        assert len(set(fake.accounts)) == 2
+        assert sorted(fake.deleted) == sorted(fake.accounts)
+        assert fake.store == {}
+
+
+class TestBoundedReads:
+    def test_late_timeout_from_detached_state_cannot_poison_new_lifecycle(
+        self, tmp_path
+    ):
+        import threading
+
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        profile_token = set_hermes_home_override(tmp_path / "profile")
+        try:
+            old_store = OSKeystore()
+        finally:
+            reset_hermes_home_override(profile_token)
+        profile_identity = old_store._profile_identity
+        old_account = old_store._account_name("K")
+        reads = 0
+
+        class LateKeyring:
+            def get_password(self, _service, name):
+                nonlocal reads
+                if name == old_account:
+                    reads += 1
+                    if reads == 1:
+                        entered.set()
+                        release.wait(timeout=5)
+                        finished.set()
+                        return "late"
+                return "fresh"
+
+        reader_errors = []
+        with mock.patch.object(sk, "keyring", LateKeyring()):
+            try:
+                with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                    def read_old():
+                        try:
+                            old_store.get("K")
+                        except KeystoreError as exc:
+                            reader_errors.append(exc)
+
+                    reader = threading.Thread(target=read_old)
+                    reader.start()
+                    assert entered.wait(timeout=5)
+
+                    resetter = threading.Thread(target=sk.reset_backend_cache)
+                    resetter.start()
+                    for _ in range(100):
+                        if profile_identity not in sk._PROFILE_STATES:
+                            break
+                        threading.Event().wait(0.01)
+                    assert profile_identity not in sk._PROFILE_STATES
+                    new_store = OSKeystore(profile_identity)
+
+                    reader.join(timeout=5)
+                    resetter.join(timeout=5)
+                    assert not reader.is_alive()
+                    assert not resetter.is_alive()
+                    assert len(reader_errors) == 1
+                    assert "timed out" in str(reader_errors[0])
+                    assert new_store._state.healthy is True
+                    assert new_store.get("K") == "fresh"
+            finally:
+                release.set()
+                assert finished.wait(timeout=5)
+
+    def test_profile_b_selection_does_not_reset_profile_a_timeout_health(
+        self, tmp_path
+    ):
+        import threading
+
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        release_a = threading.Event()
+        finished_a = threading.Event()
+        token_a = set_hermes_home_override(tmp_path / "a")
+        try:
+            store_a = OSKeystore()
+        finally:
+            reset_hermes_home_override(token_a)
+        token_b = set_hermes_home_override(tmp_path / "b")
+        try:
+            store_b = OSKeystore()
+        finally:
+            reset_hermes_home_override(token_b)
+
+        account_a = store_a._account_name("K")
+
+        class ProfileKeyring:
+            def get_password(self, _service, name):
+                if name == account_a:
+                    release_a.wait(timeout=5)
+                    finished_a.set()
+                    return "late"
+                return "profile-b"
+
+        with mock.patch.object(sk, "keyring", ProfileKeyring()):
+            with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                with pytest.raises(KeystoreError, match="timed out"):
+                    store_a.get("K")
+                assert store_b.get("K") == "profile-b"
+                with pytest.raises(KeystoreError, match="stopped responding"):
+                    store_a.get("K")
+            release_a.set()
+            assert finished_a.wait(timeout=5)
+
+    def test_a_blocking_read_times_out_rather_than_hanging(self):
+        """The probe passing does not make later reads safe: a keychain can
+        be unlocked at startup and re-locked by screen-lock mid-process."""
+        import threading
+        import time as _time
+
+        import hermes_cli.secret_keystore as sk
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+                return "late"
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            store = sk.OSKeystore()
+            start = _time.monotonic()
+            with pytest.raises(sk.KeystoreError, match="timed out"):
+                store.get("K")
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, f"read blocked for {elapsed:.1f}s"
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_concurrent_reads_spawn_at_most_one_worker(self, tmp_path, monkeypatch):
+        """The latch must cover concurrent callers, not only a serial loop."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+        callers_ready = threading.Barrier(6)
+        calls = []
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                calls.append(name)
+                released.wait(timeout=10)
+                finished.set()
+
+        results = []
+
+        def _resolve(index):
+            callers_ready.wait(timeout=5)
+            results.append(sk.get_secret(f"K{index}"))
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                assert sk.get_backend().name == "os"
+                callers = [
+                    threading.Thread(target=_resolve, args=(index,))
+                    for index in range(5)
+                ]
+                for caller in callers:
+                    caller.start()
+                callers_ready.wait(timeout=5)
+                for caller in callers:
+                    caller.join(timeout=5)
+                    assert not caller.is_alive()
+
+            # Exactly one call reached keyring. The other four waited for the
+            # atomic check/spawn transition, then saw the false latch.
+            assert len(calls) == 1
+            assert results == [None] * 5
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_forced_os_mode_is_not_demoted(self, tmp_path, monkeypatch):
+        """"os" pins the tier. Demoting would move reads to a store that does
+        not hold the operator's secrets, which looks like data loss."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            assert sk.get_backend().name == "os"
+            assert sk.get_secret("K") is None       # timed out, swallowed
+            assert sk.get_backend().name == "os"    # tier NOT swapped
+            assert sk._profile_state(sk._active_profile_identity()).healthy is False
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_timed_out_read_latches_health_without_demoting_authority(
+        self, tmp_path, monkeypatch
+    ):
+        """A timeout makes OS unavailable, never makes a stale file copy win."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            try:
+                with mock.patch.object(sk, "probe_os_keystore", return_value=True):
+                    assert sk.get_backend().name == "os"
+                    assert sk.get_secret("K") is None       # timed out, swallowed
+                    assert sk.get_backend().name == "os"
+                    assert (
+                        sk._profile_state(sk._active_profile_identity()).healthy
+                        is False
+                    )
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
+
+    def test_auto_selection_does_not_demote_after_current_mode_changes_to_os(
+        self, tmp_path, monkeypatch
+    ):
+        """The process-cached selection mode, not mutable current config,
+        controls whether a timed-out OS read demotes the backend."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            try:
+                with (
+                    mock.patch.object(sk, "probe_os_keystore", return_value=True),
+                    mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2),
+                ):
+                    assert sk.get_backend().name == "os"
+                    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+                    assert sk.get_secret("K") is None
+                    assert sk.get_backend().name == "os"
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
+
+    def test_forced_os_selection_stays_pinned_after_current_mode_changes_to_auto(
+        self, tmp_path, monkeypatch
+    ):
+        """A forced OS selection stays pinned for the process even if the
+        config source changes before a later read times out."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            try:
+                with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                    assert sk.get_backend().name == "os"
+                    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+                    assert sk.get_secret("K") is None
+                    assert sk.get_backend().name == "os"
+                    assert (
+                        sk._profile_state(sk._active_profile_identity()).healthy
+                        is False
+                    )
+            finally:
+                released.set()
+                assert finished.wait(timeout=5), (
+                    "abandoned worker never completed"
+                )
+
+
+class TestRevocationFailuresPropagate:
+    """Already repaired once. Untested, it regresses silently -- and its
+    symptom is a credential the dashboard says is gone that still works."""
+
+    def test_os_delete_raises_when_the_backend_refuses(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = RuntimeError("dbus refused")
+        with mock.patch.object(sk, "keyring", broken):
+            with pytest.raises(sk.KeystoreError):
+                sk.OSKeystore().delete("K")
+
+    def test_os_delete_treats_absent_as_success(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = sk._PasswordDeleteError("no such item")
+        with mock.patch.object(sk, "keyring", broken):
+            sk.OSKeystore().delete("K")   # must not raise
+
+    def test_module_delete_secret_propagates(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        sk.set_secret("K", "v")
+        with mock.patch.object(
+            sk.FileKeystore,
+            "_delete_unlocked",
+            side_effect=sk.KeystoreError("refused"),
+        ):
+            with pytest.raises(sk.KeystoreError):
+                sk.delete_secret("K")
+
+
+class TestConfigSetting:
+    def test_default_mode_missing_read_does_not_bootstrap_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing read must not create the standard Hermes profile tree."""
+        home = tmp_path / "profile"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+
+    def test_malformed_config_read_leaves_recovery_for_the_ordinary_loader(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        """A keystore mode probe must not consume corrupt-config recovery."""
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        broken = b"secret_keystore: [unterminated\n"
+        config_path.write_bytes(broken)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+        with (
+            caplog.at_level(logging.WARNING, logger="hermes_cli.config"),
+            mock.patch.object(sk, "probe_os_keystore", return_value=False),
+        ):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+        assert caplog.records == []
+        assert capsys.readouterr().err == ""
+
+        loaded = config_module.load_config(config_path=config_path)
+
+        backups = list(home.glob("config.yaml.corrupt.*.bak"))
+        assert loaded["secret_keystore"] == "auto"
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == broken
+        assert "Failed to parse" in capsys.readouterr().err
+        assert any("Failed to parse" in record.message for record in caplog.records)
+
+    def test_lkg_placeholder_warning_waits_for_the_ordinary_loader(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        """Silent LKG re-expansion must not consume config diagnostics."""
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        placeholder = "${env:ROUND3_UNSET_NAME}"
+        config_path.write_text(
+            f"secret_keystore: file\nround3_placeholder: {placeholder}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.delenv("ROUND3_UNSET_NAME", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            seeded = config_module.load_config(config_path=config_path)
+        assert seeded["round3_placeholder"] == placeholder
+        caplog.clear()
+        capsys.readouterr()
+
+        broken = b"secret_keystore: [unterminated\n"
+        config_path.write_bytes(broken)
+
+        def snapshot():
+            return {
+                path.relative_to(home): path.read_bytes() if path.is_file() else None
+                for path in home.rglob("*")
+            }
+
+        before = snapshot()
+        with (
+            caplog.at_level(logging.WARNING, logger="hermes_cli.config"),
+            mock.patch.object(sk, "probe_os_keystore", return_value=False),
+        ):
+            sk.reset_backend_cache()
+            try:
+                assert sk.get_secret("missing") is None
+            finally:
+                sk.reset_backend_cache()
+
+        assert snapshot() == before
+        assert caplog.records == []
+        assert capsys.readouterr().err == ""
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            recovered = config_module.load_config(config_path=config_path)
+
+        backups = list(home.glob("config.yaml.corrupt.*.bak"))
+        assert recovered["round3_placeholder"] == placeholder
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == broken
+        assert "Failed to parse" in capsys.readouterr().err
+        assert any("Failed to parse" in record.message for record in caplog.records)
+        assert any(
+            "ROUND3_UNSET_NAME is not set" in record.message
+            for record in caplog.records
+        )
+
+    def test_mode_is_a_settable_config_key(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG.get("secret_keystore") == "auto"
+
+    def test_config_key_passes_validation(self):
+        from hermes_cli.config import _validate_config_key
+
+        assert _validate_config_key("secret_keystore")[0] is True
+
+    def test_config_yaml_value_is_honoured(self, tmp_path, monkeypatch):
+        """The documented path. Earlier tests only exercised the env bridge,
+        so a mode read that ignored config.yaml would have passed them all."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend().name == "file"
+
+    def test_env_bridge_overrides_config(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend() is None
+
+    def test_a_typo_in_config_falls_back_to_auto(self, monkeypatch):
+        """This runs on the credential-resolution path; a typo must not make
+        every plugin unreadable."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "fille"},
+        )
+        sk.reset_backend_cache()
+        # A typo resolves to "auto", and "auto" probes the OS keystore -- so
+        # without this patch the test would write a probe entry into the
+        # developer's real Keychain, or raise an authorisation prompt in CI.
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            assert sk.get_backend() is not None
+            assert sk.get_backend().name == "file"
+
+
+class TestDurableAuthority:
+    KEY = "HERMES_PLUGIN_AUTHORITY_TOKEN"
+
+    def test_authority_inspection_of_absent_store_is_non_creating(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert sk.get_authority(self.KEY) is None
+        assert sk.resolve_secret(self.KEY) is None
+        assert not home.exists()
+
+    def test_new_file_write_commits_authority_without_an_os_shadow(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "file-value")
+
+        assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+        assert FileKeystore(home / "secrets").get(self.KEY) == "file-value"
+        assert fake.store == {}
+
+    def test_new_os_write_commits_authority_without_a_file_shadow(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "os-value")
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.OS
+            assert OSKeystore(str(home.resolve())).get(self.KEY) == "os-value"
+
+        assert FileKeystore(home / "secrets").get(self.KEY) is None
+
+    def test_registered_file_authority_survives_os_recovery_and_restart(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", fake):
+            assert sk.resolve_secret(self.KEY) == "file-value"
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+
+        assert fake.store == {}
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+    def test_registered_os_read_does_not_repair_stale_file_permissions(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "os-value")
+            key_path = root / "keystore.key"
+            data_path = root / "keystore.enc"
+            key_path.write_bytes(b"stale-key")
+            data_path.write_bytes(b"stale-data")
+            os.chmod(key_path, 0o644)
+            os.chmod(data_path, 0o644)
+
+            assert sk.resolve_secret(self.KEY) == "os-value"
+
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o644
+        assert stat.S_IMODE(data_path.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_registered_os_read_ignores_non_authoritative_file_symlink(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "os-value")
+            stale_target = tmp_path / "stale-file-tier"
+            stale_target.write_bytes(b"not-a-keystore")
+            (root / "keystore.enc").symlink_to(stale_target)
+
+            assert sk.resolve_secret(self.KEY) == "os-value"
+
+        assert (root / "keystore.enc").is_symlink()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+    def test_registered_file_read_does_not_repair_permission_drift(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+        key_path = root / "keystore.key"
+        data_path = root / "keystore.enc"
+        os.chmod(key_path, 0o644)
+        os.chmod(data_path, 0o644)
+
+        assert sk.resolve_secret(self.KEY) == "file-value"
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o644
+        assert stat.S_IMODE(data_path.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_legacy_value_ignores_hostile_stale_file_artifacts(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        root.mkdir(parents=True)
+        stale_target = tmp_path / "stale-file-tier"
+        stale_target.write_bytes(b"not-a-keystore")
+        (root / "keystore.enc").symlink_to(stale_target)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert (
+            sk.resolve_secret(self.KEY, legacy_value="legacy-value")
+            == "legacy-value"
+        )
+        assert (root / "keystore.enc").is_symlink()
+
+    def test_registered_authority_ignores_mode_for_reads_but_not_mutations(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", fake):
+            assert sk.resolve_secret(self.KEY) == "file-value"
+            with pytest.raises(KeystoreError, match="move_secret"):
+                sk.set_secret(self.KEY, "wrong-tier-write")
+
+        assert FileKeystore(home / "secrets").get(self.KEY) == "file-value"
+        assert fake.store == {}
+
+    def test_forced_mode_selects_a_new_key_even_if_an_old_backend_is_cached(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        with (
+            mock.patch.object(sk, "keyring", fake),
+            mock.patch.object(sk, "probe_os_keystore", return_value=True),
+        ):
+            assert sk.get_backend().name == "os"
+            monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+            sk.set_secret(self.KEY, "forced-file-value")
+
+        assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+        assert FileKeystore(home / "secrets").get(self.KEY) == "forced-file-value"
+        assert fake.store == {}
+
+    def test_auto_selects_file_for_a_new_key_after_os_health_is_latched_false(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingReadKeyring:
+            def get_password(self, _service, _name):
+                released.wait(timeout=10)
+                finished.set()
+                return None
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        with mock.patch.object(sk, "keyring", _HangingReadKeyring()):
+            try:
+                with (
+                    mock.patch.object(sk, "probe_os_keystore", return_value=True),
+                    mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2),
+                ):
+                    selected = sk.get_backend()
+                    assert selected.name == "os"
+                    assert sk.resolve_secret("UNREGISTERED_READ") is None
+                    assert sk._profile_state(str(home.resolve())).healthy is False
+                    released.set()
+                    assert finished.wait(timeout=5)
+
+                    sk.set_secret(self.KEY, "file-after-timeout")
+                    assert sk.get_backend() is selected
+            finally:
+                released.set()
+                finished.wait(timeout=5)
+
+        assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+        assert FileKeystore(home / "secrets").get(self.KEY) == "file-after-timeout"
+
+    def test_off_mode_disables_reads_and_rejects_every_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        sk.reset_backend_cache()
+        assert sk.resolve_secret(self.KEY, legacy_value="legacy") is None
+        with pytest.raises(KeystoreError, match="disabled"):
+            sk.set_secret(self.KEY, "new")
+        with pytest.raises(KeystoreError, match="disabled"):
+            sk.set_secrets({self.KEY: "new"})
+        with pytest.raises(KeystoreError, match="disabled"):
+            sk.delete_secret(self.KEY)
+        with pytest.raises(KeystoreError, match="disabled"):
+            sk.move_secret(self.KEY, "os")
+
+    def test_missing_lock_beside_authority_fails_closed_without_recreating_it(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "file-value")
+        lock_path = home / "secrets" / "keystore.lock"
+        lock_path.unlink()
+
+        assert sk.resolve_secret(self.KEY) is None
+        with pytest.raises(KeystoreError, match="lock"):
+            sk.get_authority(self.KEY)
+        assert not lock_path.exists()
+
+    def test_missing_lock_with_differing_file_and_os_values_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        profile_identity = str(home.resolve())
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        FileKeystore(root).set(self.KEY, "file-value")
+        (root / "keystore.lock").unlink()
+        fake.set_password(
+            SERVICE_NAME,
+            sk._os_account_name(self.KEY, profile_identity),
+            "different-os-value",
+        )
+
+        with mock.patch.object(sk, "keyring", fake):
+            assert sk.resolve_secret(self.KEY) is None
+
+        assert not (root / "keystore.lock").exists()
+        assert sk._read_file_store_readonly(root)[self.KEY] == "file-value"
+
+    def test_unlocked_os_read_rechecks_file_artifacts_before_accepting_value(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        profile_identity = str(home.resolve())
+        account = sk._os_account_name(self.KEY, profile_identity)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+
+        class RacingKeyring(_FakeKeyring):
+            def get_password(self, service, name):
+                if (service, name) == (SERVICE_NAME, account):
+                    root.mkdir(parents=True, exist_ok=True)
+                    (root / "keystore.enc").write_bytes(b"racing-file-data")
+                    return "os-value"
+                return super().get_password(service, name)
+
+        with mock.patch.object(sk, "keyring", RacingKeyring()):
+            assert sk.resolve_secret(self.KEY) is None
+
+        assert (root / "keystore.enc").read_bytes() == b"racing-file-data"
+        assert not (root / "keystore.lock").exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    @pytest.mark.parametrize("artifact", ["authority.json", "keystore.key", "keystore.enc"])
+    @pytest.mark.parametrize("target_exists", [True, False], ids=["live", "dangling"])
+    def test_ordinary_write_refuses_linked_live_artifacts(
+        self, tmp_path, monkeypatch, artifact, target_exists
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        root.mkdir(parents=True)
+        (root / "keystore.lock").write_bytes(b"")
+        target = tmp_path / f"outside-{artifact}"
+        if target_exists:
+            if artifact == "authority.json":
+                target.write_bytes(
+                    b'{"version":1,"authorities":{"OLD":"cleared"}}\n'
+                )
+            elif artifact == "keystore.key":
+                target.write_bytes(b"x" * 32)
+            else:
+                target.write_bytes(b"outside-ciphertext")
+        link = root / artifact
+        link.symlink_to(target)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+
+        with mock.patch.object(sk, "keyring", _FakeKeyring()):
+            with pytest.raises(KeystoreError, match="artifact|authority|regular"):
+                sk.set_secret(self.KEY, "new-value")
+
+        assert link.is_symlink()
+        if target_exists and artifact == "authority.json":
+            assert target.read_bytes() == (
+                b'{"version":1,"authorities":{"OLD":"cleared"}}\n'
+            )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+    @pytest.mark.parametrize("mutation", ["set", "move", "delete"])
+    def test_corrupt_authority_preflight_refuses_without_mutating_store(
+        self, tmp_path, monkeypatch, mutation
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        root.mkdir(parents=True)
+        authority_path = root / "authority.json"
+        authority_path.write_bytes(b"{broken-authority")
+        os.chmod(root, 0o755)
+        os.chmod(authority_path, 0o644)
+        before = authority_path.read_bytes()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+
+        with pytest.raises(KeystoreError):
+            if mutation == "set":
+                sk.set_secret(self.KEY, "new-value")
+            elif mutation == "move":
+                sk.move_secret(self.KEY, "os")
+            else:
+                sk.delete_secret(self.KEY)
+
+        assert authority_path.read_bytes() == before
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+        assert stat.S_IMODE(authority_path.stat().st_mode) == 0o644
+        assert not (root / "keystore.lock").exists()
+
+    def test_equal_pre_registry_copies_resolve_by_configured_preference_read_only(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        profile_identity = str(home.resolve())
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        FileKeystore(root).set(self.KEY, "same-value")
+        fake.set_password(
+            SERVICE_NAME,
+            sk._os_account_name(self.KEY, profile_identity),
+            "same-value",
+        )
+
+        with mock.patch.object(sk, "keyring", fake):
+            assert sk.resolve_secret(self.KEY) == "same-value"
+            assert sk.get_authority(self.KEY) is None
+
+        assert not (root / "authority.json").exists()
+
+    def test_differing_pre_registry_copies_fail_closed(self, tmp_path, monkeypatch):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        profile_identity = str(home.resolve())
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        FileKeystore(root).set(self.KEY, "file-value")
+        fake.set_password(
+            SERVICE_NAME,
+            sk._os_account_name(self.KEY, profile_identity),
+            "os-value",
+        )
+
+        with (
+            mock.patch.object(sk, "keyring", fake),
+            mock.patch.object(sk, "probe_os_keystore", return_value=True),
+        ):
+            assert sk.resolve_secret(self.KEY) is None
+            with pytest.raises(KeystoreError, match="competing"):
+                sk.set_secret(self.KEY, "replacement")
+
+        assert sk.get_authority(self.KEY) is None
+        assert FileKeystore(root).get(self.KEY) == "file-value"
+
+    def test_unknown_os_state_with_file_data_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        FileKeystore(root).set(self.KEY, "file-value")
+
+        with mock.patch.object(sk, "keyring", _FakeKeyring(fail=True)):
+            assert sk.resolve_secret(self.KEY) is None
+            with pytest.raises(KeystoreError, match="OS.*unknown|determine OS"):
+                sk.set_secret(self.KEY, "replacement")
+
+        assert sk.get_authority(self.KEY) is None
+
+    def test_delete_unregistered_secret_fails_after_plaintext_removal_when_os_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        profile_identity = str(home.resolve())
+        fake = _FakeKeyring(fail=True)
+        account = sk._os_account_name(self.KEY, profile_identity)
+        fake.store[(SERVICE_NAME, account)] = "pre-registry-os-value"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        home.mkdir(parents=True)
+        env_path = home / ".env"
+        env_path.write_text(f"{self.KEY}=legacy-plaintext\n", encoding="utf-8")
+
+        with mock.patch.object(sk, "keyring", fake):
+            with pytest.raises(KeystoreError, match="OS.*unknown|determine OS"):
+                sk.delete_secret(self.KEY)
+
+            assert self.KEY not in env_path.read_text(encoding="utf-8")
+            assert sk.get_authority(self.KEY) is None
+
+            fake.fail = False
+            assert OSKeystore(profile_identity).get(self.KEY) == "pre-registry-os-value"
+
+            sk.delete_secret(self.KEY)
+
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.CLEARED
+            assert OSKeystore(profile_identity).get(self.KEY) is None
+
+    def test_unregistered_legacy_value_remains_compatible(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+
+        assert sk.resolve_secret(self.KEY, legacy_value="legacy-value") == "legacy-value"
+        assert sk.get_authority(self.KEY) is None
+
+
+class TestAuthorityMoves:
+    KEY = "HERMES_PLUGIN_MOVE_TOKEN"
+
+    def _os_source(self, home, monkeypatch, fake):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.set_secret(self.KEY, "move-value")
+
+    def _file_source(self, home, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret(self.KEY, "move-value")
+
+    def test_move_round_trip_has_exactly_one_authoritative_copy(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        self._os_source(home, monkeypatch, fake)
+
+        with mock.patch.object(sk, "keyring", fake):
+            sk.move_secret(self.KEY, "file")
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+            assert FileKeystore(home / "secrets").get(self.KEY) == "move-value"
+            assert OSKeystore(str(home.resolve())).get(self.KEY) is None
+
+            sk.move_secret(self.KEY, "os")
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.OS
+            assert OSKeystore(str(home.resolve())).get(self.KEY) == "move-value"
+            assert FileKeystore(home / "secrets").get(self.KEY) is None
+
+    @pytest.mark.parametrize("boundary", ["write", "verify", "delete", "metadata"])
+    def test_os_to_file_failure_restores_source_and_authority(
+        self, tmp_path, monkeypatch, boundary
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        self._os_source(home, monkeypatch, fake)
+        registry_path = home / "secrets" / "authority.json"
+        previous_registry = registry_path.read_bytes()
+
+        patches = []
+        if boundary == "write":
+            patches.append(
+                mock.patch.object(
+                    sk.FileKeystore,
+                    "_set_unlocked",
+                    side_effect=OSError("destination write refused"),
+                )
+            )
+        elif boundary == "verify":
+            original_get = sk.FileKeystore._get_unlocked
+
+            def fail_verify(store, key):
+                value = original_get(store, key)
+                return "wrong-value" if value == "move-value" else value
+
+            patches.append(mock.patch.object(sk.FileKeystore, "_get_unlocked", fail_verify))
+        elif boundary == "delete":
+            patches.append(
+                mock.patch.object(
+                    sk.OSKeystore,
+                    "_delete_unlocked",
+                    side_effect=OSError("source delete refused"),
+                )
+            )
+        else:
+            patches.append(
+                mock.patch.object(
+                    sk,
+                    "_write_authority_registry",
+                    side_effect=OSError("metadata replace refused"),
+                )
+            )
+
+        with mock.patch.object(sk, "keyring", fake), contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with pytest.raises(KeystoreError, match="state restored"):
+                sk.move_secret(self.KEY, "file")
+
+        with mock.patch.object(sk, "keyring", fake):
+            assert sk.get_authority(self.KEY) is sk.SecretAuthority.OS
+            assert OSKeystore(str(home.resolve())).get(self.KEY) == "move-value"
+        assert FileKeystore(home / "secrets").get(self.KEY) is None
+        assert registry_path.read_bytes() == previous_registry
+        assert b"move-value" not in previous_registry
+
+    @pytest.mark.parametrize("boundary", ["write", "verify", "delete", "metadata"])
+    def test_file_to_os_failure_restores_source_and_authority(
+        self, tmp_path, monkeypatch, boundary
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        self._file_source(home, monkeypatch)
+        registry_path = home / "secrets" / "authority.json"
+        previous_registry = registry_path.read_bytes()
+
+        patches = []
+        if boundary == "write":
+            patches.append(
+                mock.patch.object(
+                    sk.OSKeystore,
+                    "_set_unlocked",
+                    side_effect=OSError("destination write refused"),
+                )
+            )
+        elif boundary == "verify":
+            original_get = sk.OSKeystore.get
+
+            def fail_verify(store, key):
+                value = original_get(store, key)
+                return "wrong-value" if value == "move-value" else value
+
+            patches.append(mock.patch.object(sk.OSKeystore, "get", fail_verify))
+        elif boundary == "delete":
+            patches.append(
+                mock.patch.object(
+                    sk.FileKeystore,
+                    "_delete_unlocked",
+                    side_effect=OSError("source delete refused"),
+                )
+            )
+        else:
+            patches.append(
+                mock.patch.object(
+                    sk,
+                    "_write_authority_registry",
+                    side_effect=OSError("metadata replace refused"),
+                )
+            )
+
+        with mock.patch.object(sk, "keyring", fake), contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with pytest.raises(KeystoreError, match="state restored"):
+                sk.move_secret(self.KEY, "os")
+
+        assert sk.get_authority(self.KEY) is sk.SecretAuthority.FILE
+        assert FileKeystore(home / "secrets").get(self.KEY) == "move-value"
+        with mock.patch.object(sk, "keyring", fake):
+            assert OSKeystore(str(home.resolve())).get(self.KEY) is None
+        assert registry_path.read_bytes() == previous_registry
+
+    def test_move_rollback_failure_reports_uncertain_outcome(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        self._os_source(home, monkeypatch, fake)
+
+        with (
+            mock.patch.object(sk, "keyring", fake),
+            mock.patch.object(
+                sk.OSKeystore,
+                "_delete_unlocked",
+                side_effect=OSError("source delete refused"),
+            ),
+            mock.patch.object(
+                sk.FileKeystore,
+                "_delete_unlocked",
+                side_effect=OSError("rollback delete refused"),
+            ),
+            pytest.raises(KeystoreError, match="outcome is uncertain"),
+        ):
+            sk.move_secret(self.KEY, "file")
+
+        assert sk.get_authority(self.KEY) is sk.SecretAuthority.OS
+
+
+class TestAuthorityBatchCompensation:
+    def test_mixed_authority_batch_failure_restores_every_value(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        fake = _FakeKeyring()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret("A", "old-a")
+        sk.set_secret("B", "old-b")
+        with mock.patch.object(sk, "keyring", fake):
+            sk.move_secret("B", "os")
+
+        original_set = sk.OSKeystore._set_unlocked
+
+        def fail_b(store, key, value):
+            if key == "B" and value == "new-b":
+                raise OSError("second authority refused")
+            return original_set(store, key, value)
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        sk.reset_backend_cache()
+        with (
+            mock.patch.object(sk, "keyring", fake),
+            mock.patch.object(sk.OSKeystore, "_set_unlocked", fail_b),
+            pytest.raises(KeystoreError, match="state restored"),
+        ):
+            sk.set_secrets({"A": "new-a", "B": "new-b"})
+
+        assert FileKeystore(home / "secrets").get("A") == "old-a"
+        with mock.patch.object(sk, "keyring", fake):
+            assert OSKeystore(str(home.resolve())).get("B") == "old-b"
+        assert sk.get_authority("A") is sk.SecretAuthority.FILE
+        assert sk.get_authority("B") is sk.SecretAuthority.OS
+
+    def test_metadata_failure_restores_values_and_previous_complete_registry(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.set_secret("A", "old-a")
+        previous_registry = (root / "authority.json").read_bytes()
+
+        real_replace = sk.os.replace
+
+        def fail_authority_replace(source, destination):
+            if Path(destination).name == "authority.json":
+                raise OSError("metadata replace refused")
+            return real_replace(source, destination)
+
+        with mock.patch.object(sk.os, "replace", fail_authority_replace):
+            with pytest.raises(KeystoreError, match="state restored"):
+                sk.set_secrets({"A": "new-a", "B": "new-b"})
+
+        assert FileKeystore(root).get("A") == "old-a"
+        assert FileKeystore(root).get("B") is None
+        assert sk.get_authority("A") is sk.SecretAuthority.FILE
+        assert sk.get_authority("B") is None
+        assert (root / "authority.json").read_bytes() == previous_registry

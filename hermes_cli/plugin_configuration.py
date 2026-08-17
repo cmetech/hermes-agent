@@ -28,6 +28,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from hermes_cli import secret_keystore
+
 
 _MAX_DESCRIPTOR_BYTES = 64 * 1024
 _MAX_FIELDS = 64
@@ -955,6 +957,25 @@ class PluginConfigurationService:
         )
         return [self.detail(plugin_id, platform=platform) for plugin_id in plugin_ids]
 
+    def secret_storage_keys(self) -> list[str]:
+        """Return the static manifest-derived secret-key inventory.
+
+        This intentionally does not call ``detail()``, ``_resolved()``, or any
+        secret source.  Doctor can enumerate the logical keys that keyring
+        itself cannot list without importing plugin code or reading a value.
+        """
+        keys = {
+            _secret_storage_key(
+                loaded.manifest.key or loaded.manifest.name,
+                field.id,
+            )
+            for loaded in self._inventory()
+            if loaded.manifest.configuration is not None
+            for field in loaded.manifest.configuration.fields
+            if field.storage is FieldStorage.SECRET
+        }
+        return sorted(keys)
+
     def _registrations(self, plugin_id: str) -> dict[str, dict[str, Any]]:
         if self._manager is not None:
             # Explicitly injected managers are a test/embedding seam and do
@@ -1018,14 +1039,27 @@ class PluginConfigurationService:
 
     def _resolved(self, plugin_id: str, loaded) -> tuple[dict[str, Any], set[str]]:
         stored = self._settings(plugin_id)
-        secret_values = self._profile_secret_values()
+        live_secret_overrides = self._live_secret_overrides()
+        legacy_secret_values: dict[str, str] | None = None
         resolved: dict[str, Any] = {}
         invalid: set[str] = set()
         for field in loaded.manifest.configuration.fields:
             present = False
             value = None
             if field.storage is FieldStorage.SECRET:
-                value = secret_values.get(_secret_storage_key(plugin_id, field.id))
+                storage_key = _secret_storage_key(plugin_id, field.id)
+                if storage_key in live_secret_overrides:
+                    # Mapping presence is authoritative even when its value is
+                    # empty. An explicit live clear must not revive durable or
+                    # legacy plaintext state from a lower precedence tier.
+                    value = live_secret_overrides[storage_key]
+                else:
+                    if legacy_secret_values is None:
+                        legacy_secret_values = self._profile_secret_values()
+                    value = secret_keystore.resolve_secret(
+                        storage_key,
+                        legacy_value=legacy_secret_values.get(storage_key),
+                    )
                 if value not in {None, ""}:
                     present = True
             elif field.id in stored:
@@ -1043,21 +1077,30 @@ class PluginConfigurationService:
 
     @staticmethod
     def _profile_secret_values() -> dict[str, str]:
-        """Merge credential authorities without consulting process-global env.
+        """Read only the current profile's legacy plaintext secret values."""
+        from hermes_cli.config import load_env
 
-        Lowest to highest precedence is the current profile file, its hydrated
-        external-secret snapshot, the installed context-local secret scope,
-        then administrator-managed env. A scope miss therefore observes a
-        newly persisted profile value, while an explicit scoped/external or
-        managed authority continues to override plaintext profile storage.
+        return {
+            key: value
+            for key, value in load_env().items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+
+    @staticmethod
+    def _live_secret_overrides() -> dict[str, str]:
+        """Merge live credential authorities without process-global env.
+
+        Lowest to highest precedence is the hydrated external-secret snapshot,
+        the installed context-local secret scope, then administrator-managed
+        env. These live authorities override both durable registered state and
+        the separately read legacy plaintext profile value.
         """
         from agent.secret_scope import current_secret_scope
         from hermes_cli import env_loader, managed_scope
-        from hermes_cli.config import load_env
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        values = load_env()
+        values: dict[str, str] = {}
         try:
             values.update(env_loader.get_secret_source_values(home))
         except Exception:
@@ -1177,17 +1220,17 @@ class PluginConfigurationService:
                 ) from exc
 
         if secrets:
-            from hermes_cli.config import ConfigurationPersistenceError, save_env_value
-
             try:
-                for field_id, value in secrets.items():
-                    save_env_value(
-                        _secret_storage_key(canonical_id, field_id),
-                        value,
-                        mirror_process_env=False,
-                        strict=True,
-                    )
-            except ConfigurationPersistenceError as exc:
+                # Store in the OS keystore (or its encrypted-file fallback),
+                # never in .env. Batch persistence avoids a partially saved
+                # multi-field connector when one later secret is refused.
+                secret_keystore.set_secrets(
+                    {
+                        _secret_storage_key(canonical_id, field_id): value
+                        for field_id, value in secrets.items()
+                    }
+                )
+            except secret_keystore.KeystoreError as exc:
                 raise PluginConfigurationError(
                     "plugin configuration could not be persisted"
                 ) from exc
@@ -1205,15 +1248,10 @@ class PluginConfigurationService:
             raise PluginConfigurationError(
                 f"field '{field_id}' has incompatible storage"
             )
-        from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
-
+        storage_key = _secret_storage_key(canonical_id, field_id)
         try:
-            remove_env_value(
-                _secret_storage_key(canonical_id, field_id),
-                mirror_process_env=False,
-                strict=True,
-            )
-        except ConfigurationPersistenceError as exc:
+            secret_keystore.delete_secret(storage_key)
+        except secret_keystore.KeystoreError as exc:
             raise PluginConfigurationError(
                 "plugin configuration could not be persisted"
             ) from exc

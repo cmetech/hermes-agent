@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # every time. Cleared automatically when the file changes (different mtime).
 _CONFIG_PARSE_WARNED: set = set()
 
+# Paths we have already warned about failing to ACL, so repeated
+# save_env_value() calls do not spam one message per write.
+_WARNED_ACL_PATHS: set[str] = set()
+
 
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
@@ -834,32 +838,30 @@ def _secure_dir(path):
 
 
 def _is_container() -> bool:
-    """Detect if we're running inside a Docker/Podman/LXC container.
+    """Apply the container-aware permission policy.
 
     When Hermes runs in a container with volume-mounted config files, forcing
     0o600 permissions breaks multi-process setups where the gateway and
     dashboard run as different UIDs or the volume mount requires broader
     permissions.
     """
-    # Explicit opt-out
-    if os.environ.get("HERMES_CONTAINER") or os.environ.get("HERMES_SKIP_CHMOD"):
+    # This is a permission-policy override, not container evidence. Keep it
+    # local so storage durability checks never mistake NFS/SMB deployments for
+    # containers.
+    if os.environ.get("HERMES_SKIP_CHMOD"):
         return True
-    # Docker / Podman marker file
-    if os.path.exists("/.dockerenv"):
-        return True
-    # LXC / cgroup-based detection
-    try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
-            cgroup_content = f.read()
-        if "docker" in cgroup_content or "lxc" in cgroup_content or "kubepods" in cgroup_content:
-            return True
-    except (OSError, IOError):
-        pass
-    return False
+    from hermes_cli.container_storage import is_container
+
+    return is_container()
 
 
 def _secure_file(path):
-    """Set file to owner-only read/write (0600). No-op on Windows.
+    """Restrict a file to its owner.
+
+    POSIX: chmod 0600. Windows: a rebuilt single-ACE DACL -- the mode
+    argument to os.chmod is close to meaningless there, which is why this
+    used to be documented as a no-op and left credentials with whatever the
+    user profile directory happened to allow.
 
     Skipped in managed mode — the NixOS activation script sets
     group-readable permissions (0640) on config files.
@@ -870,10 +872,54 @@ def _secure_file(path):
     if is_managed() or _is_container():
         return
     try:
-        if os.path.exists(str(path)):
-            os.chmod(path, 0o600)
+        if not os.path.exists(str(path)):
+            return
+    except OSError:
+        return
+
+    if sys.platform == "win32":
+        from hermes_cli.windows_permissions import (
+            WindowsAclError,
+            restrict_file_to_current_user,
+        )
+
+        try:
+            restrict_file_to_current_user(Path(path))
+            return
+        except WindowsAclError:
+            pass
+        key = str(path)
+        if key not in _WARNED_ACL_PATHS:
+            _WARNED_ACL_PATHS.add(key)
+            print(
+                f"  Warning: could not restrict access to {path}. It may be "
+                f"readable by other accounts on this machine. Check that "
+                f"powershell.exe is available on PATH.",
+                file=sys.stderr,
+            )
+        return
+
+    try:
+        os.chmod(path, 0o600)
     except (OSError, NotImplementedError):
         pass
+
+
+def _secure_credential_file(path: Path) -> None:
+    """Apply the strict credential boundary after a Windows replacement."""
+    if sys.platform != "win32":
+        return
+    from hermes_cli.windows_permissions import (
+        WindowsAclError,
+        restrict_file_to_current_user,
+    )
+
+    try:
+        restrict_file_to_current_user(Path(path))
+    except WindowsAclError as exc:
+        raise ConfigurationPersistenceError(
+            f"could not enforce credential ACL on {path}"
+        ) from exc
 
 
 def _ensure_default_soul_md(home: Path) -> None:
@@ -2546,7 +2592,7 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(m: re.Match, *, warn: bool = True) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
@@ -2573,22 +2619,24 @@ def _env_expand_match(m: re.Match) -> str:
         val = os.environ.get(name)
         if val is not None:
             return val
-        logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name,
-        )
+        if warn:
+            logger.warning(
+                "Config ref %r: %s is not set (check ~/.hermes/.env); "
+                "keeping the literal placeholder", raw, name,
+            )
         return raw
     if ":" in inner and re.match(r"^[a-z][a-z0-9_-]*:", inner):
         # Looks like a SecretRef with a non-env source.  Values from vault
         # backends arrive via the secrets: block as env vars — point there
         # instead of silently treating "bitwarden:FOO" as a var named
         # "bitwarden:FOO".
-        logger.warning(
-            "Config ref %r uses source %r which is not resolvable in "
-            "config.yaml — external secret sources inject env vars at "
-            "startup, so reference the variable as ${env:NAME} instead",
-            raw, inner.split(":", 1)[0],
-        )
+        if warn:
+            logger.warning(
+                "Config ref %r uses source %r which is not resolvable in "
+                "config.yaml — external secret sources inject env vars at "
+                "startup, so reference the variable as ${env:NAME} instead",
+                raw, inner.split(":", 1)[0],
+            )
         return raw
     # Legacy ``${VAR}`` — bare name.
     return os.environ.get(inner, raw)
@@ -2606,7 +2654,7 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(obj, *, warn: bool = True):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
     values.
 
@@ -2615,11 +2663,15 @@ def _expand_env_vars(obj):
     ``os.environ``) are kept verbatim so callers can detect them.
     """
     if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda match: _env_expand_match(match, warn=warn),
+            obj,
+        )
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {k: _expand_env_vars(v, warn=warn) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, warn=warn) for item in obj]
     return obj
 
 
@@ -3197,7 +3249,11 @@ def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True, config_path=config_path)
 
 
-def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def load_config_readonly(
+    config_path: Optional[Path] = None,
+    *,
+    suppress_parse_failure_side_effects: bool = False,
+) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3218,8 +3274,16 @@ def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     ``config_path`` has the same explicit-profile semantics as
     :func:`load_config` and does not mutate process-global profile state.
+    ``suppress_parse_failure_side_effects`` is for speculative behavioral
+    reads that must not consume corrupt-config recovery: parse failures return
+    the normal fallback without warning, backup, or corrupt-signature cache
+    writes, leaving a later ordinary load to surface and preserve the file.
     """
-    return _load_config_impl(want_deepcopy=False, config_path=config_path)
+    return _load_config_impl(
+        want_deepcopy=False,
+        config_path=config_path,
+        suppress_parse_failure_side_effects=suppress_parse_failure_side_effects,
+    )
 
 
 def write_platform_config_field(
@@ -3354,6 +3418,7 @@ def _load_config_impl(
     *,
     want_deepcopy: bool,
     config_path: Optional[Path] = None,
+    suppress_parse_failure_side_effects: bool = False,
 ) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         if config_path is None:
@@ -3408,6 +3473,7 @@ def _load_config_impl(
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        parse_failed = False
 
         if user_sig is not None:
             try:
@@ -3423,6 +3489,7 @@ def _load_config_impl(
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                parse_failed = True
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3436,11 +3503,14 @@ def _load_config_impl(
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
                 lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
-                _warn_config_parse_failure(
-                    config_path,
-                    e,
-                    fallback="last-known-good" if lkg is not None else "defaults",
-                )
+                if not suppress_parse_failure_side_effects:
+                    _warn_config_parse_failure(
+                        config_path,
+                        e,
+                        fallback=(
+                            "last-known-good" if lkg is not None else "defaults"
+                        ),
+                    )
                 if lkg is not None:
                     # save_config() stores the pre-expansion normalized dict
                     # (env-ref templates preserved); the load path stores the
@@ -3448,9 +3518,18 @@ def _load_config_impl(
                     # stored value is already expanded.
                     from typing import cast as _cast
                     lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                        Dict[str, Any],
+                        _expand_env_vars(
+                            copy.deepcopy(lkg),
+                            warn=not (
+                                suppress_parse_failure_side_effects and parse_failed
+                            ),
+                        ),
                     )
-                    if cache_sig is not None:
+                    if (
+                        cache_sig is not None
+                        and not suppress_parse_failure_side_effects
+                    ):
                         # Cache under the corrupt file's signature (empty env
                         # snapshot: always valid) so repeated loads don't
                         # re-parse the broken file; fixing the file changes the
@@ -3464,7 +3543,10 @@ def _load_config_impl(
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
+        warn_on_unresolved_refs = not (
+            suppress_parse_failure_side_effects and parse_failed
+        )
+        expanded = _expand_env_vars(normalized, warn=warn_on_unresolved_refs)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.
@@ -3472,8 +3554,13 @@ def _load_config_impl(
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
         if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
+            managed_expanded = _expand_env_vars(
+                managed_config, warn=warn_on_unresolved_refs
+            )
             expanded = _deep_merge(expanded, managed_expanded)
+        if suppress_parse_failure_side_effects and parse_failed:
+            return copy.deepcopy(expanded) if want_deepcopy else expanded
+
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -3854,6 +3941,8 @@ def sanitize_env_file() -> int:
     sanitized = _sanitize_env_lines(original_lines)
 
     if sanitized == original_lines:
+        if sys.platform == "win32":
+            _secure_credential_file(Path(os.path.realpath(env_path)))
         return 0
 
     # Count lines whose normalized representation differs.
@@ -3868,14 +3957,17 @@ def sanitize_env_file() -> int:
             f.writelines(sanitized)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
+        replaced_path = Path(atomic_replace(tmp_path, env_path))
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
-    _secure_file(env_path)
+    if sys.platform == "win32":
+        _secure_credential_file(replaced_path)
+    else:
+        _secure_file(env_path)
     invalidate_env_cache()
     return fixes
 
@@ -4062,16 +4154,17 @@ def _save_env_value_locked(
             f.writelines(lines)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
+        replaced_path = Path(atomic_replace(tmp_path, env_path))
         # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
         # instead of letting _secure_file unconditionally tighten to 0600.
-        if original_mode is not None:
+        if original_mode is not None and sys.platform != "win32":
             try:
                 os.chmod(env_path, original_mode)
             except OSError:
                 pass
-        else:
+        elif sys.platform != "win32":
             _secure_file(env_path)
+        _secure_credential_file(replaced_path)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -4180,23 +4273,26 @@ def _remove_env_value_locked(
                 f.writelines(new_lines)
                 f.flush()
                 os.fsync(f.fileno())
-            atomic_replace(tmp_path, env_path)
+            replaced_path = Path(atomic_replace(tmp_path, env_path))
             # Preserve the original file mode (e.g. 0640 for Docker volume
             # mounts) instead of letting _secure_file unconditionally tighten
             # to 0600. Mirrors save_env_value().
-            if original_mode is not None:
+            if original_mode is not None and sys.platform != "win32":
                 try:
                     os.chmod(env_path, original_mode)
                 except OSError:
                     pass
-            else:
+            elif sys.platform != "win32":
                 _secure_file(env_path)
+            _secure_credential_file(replaced_path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             raise
+    elif sys.platform == "win32":
+        _secure_credential_file(Path(os.path.realpath(env_path)))
 
     if mirror_process_env:
         os.environ.pop(key, None)

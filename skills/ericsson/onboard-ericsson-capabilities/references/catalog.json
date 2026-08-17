@@ -2,6 +2,26 @@
   "capabilities": [
     {
       "aliases": [
+        "Ericsson ARM",
+        "Ericsson Artifactory",
+        "Artifactory connector",
+        "release artefact research"
+      ],
+      "displayName": "Ericsson Artifactory/ARM Tools",
+      "entry": "references/capabilities/artifactory-arm-tools.md",
+      "goals": [
+        "List visible Artifactory repositories and inspect bounded artefact or folder metadata.",
+        "Search for release artefacts with bounded AQL and preserve truncation warnings.",
+        "Trace an artefact through build properties to the GitLab pipeline and commit that produced it.",
+        "Preview and perform an explicitly approved checksum-first deployment of one local file.",
+        "Preview and perform an explicitly approved deletion of one Artifactory path."
+      ],
+      "id": "artifactory-arm-tools",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
         "GitLab CI audit",
         "pipeline policy audit",
         "CI security review"
@@ -16,6 +36,25 @@
       "id": "ci-file-auditor",
       "maturity": "partially-ported",
       "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Ericsson Confluence",
+        "Confluence connector",
+        "Confluence page research",
+        "Confluence tools"
+      ],
+      "displayName": "Ericsson Confluence Tools",
+      "entry": "references/capabilities/confluence-tools.md",
+      "goals": [
+        "Search Confluence with bounded CQL and navigate visible spaces and direct child pages.",
+        "Read one page, its Markdown body, or its comments while preserving untrusted-content warnings.",
+        "Research one explicit page with bounded and attributable page and comment evidence.",
+        "Preview and perform an explicitly approved page creation, page update, or comment."
+      ],
+      "id": "confluence-tools",
+      "maturity": "available",
+      "recommendationEligible": true
     },
     {
       "aliases": [
@@ -48,8 +87,9 @@
         "Inspect recent commits, commit details, comments, and discussions.",
         "Discover merge requests and inspect their commits and discussions.",
         "Research a GitLab repository or merge request with bounded evidence.",
-        "Inspect GitLab pipelines and CI configuration without reading variable values.",
-        "Preview and perform an explicitly approved GitLab branch, commit, or merge request write."
+        "Inspect GitLab pipelines, job logs, and CI configuration without reading variable values.",
+        "Reply to and resolve merge request discussions, inspect approvals, approve, and SHA-pin a merge.",
+        "Preview and perform explicitly approved GitLab repository, review, and CI recovery writes."
       ],
       "id": "gitlab-tools",
       "maturity": "available",
@@ -127,14 +167,14 @@
       "aliases": [
         "Jira issue tools",
         "Jira ticket lookup",
-        "Jira comment tool"
+        "Jira issue management"
       ],
       "displayName": "Ericsson Jira Tools",
       "entry": "references/capabilities/jira-tools.md",
       "goals": [
-        "Show the unresolved Jira tickets assigned to me.",
-        "Get the details of a Jira issue.",
-        "Prepare a Jira comment for my approval."
+        "Discover bounded Jira issues, fields, projects, transitions, assignable users, and link types.",
+        "Read assigned work, explicit searches, issue details, and recent comments.",
+        "Preview and perform an explicitly approved Jira comment, transition, assignment, field update, label change, issue creation, or issue link."
       ],
       "id": "jira-tools",
       "maturity": "available",

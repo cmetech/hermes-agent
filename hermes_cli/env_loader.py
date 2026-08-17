@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import codecs
 import io
+import logging
 import os
 import sys
 import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
+from hermes_cli.plugin_secret_keys import is_plugin_secret_key
 from utils import atomic_replace, fast_safe_load
 
 
@@ -391,8 +393,6 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         path_key = str(path.resolve())
         if path_key not in _WARNED_UTF32_PATHS:
             _WARNED_UTF32_PATHS.add(path_key)
-            import logging
-
             logging.getLogger(__name__).warning(
                 "Skipping .env sanitize for %s: UTF-32 BOM detected; "
                 "leaving file untouched to avoid corruption",
@@ -438,6 +438,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         # BOM-less UTF-16 (NUL-padded ASCII) into clean UTF-8.
         stripped = [line.replace("\x00", "") for line in original]
         sanitized = _sanitize_env_lines(stripped)
+        acl_path = Path(os.path.realpath(path))
         if sanitized != original or force_utf8_rewrite:
             import tempfile
             fd, tmp = tempfile.mkstemp(
@@ -448,13 +449,27 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
                     f.writelines(sanitized)
                     f.flush()
                     os.fsync(f.fileno())
-                atomic_replace(tmp, path)
+                acl_path = Path(atomic_replace(tmp, path))
             except BaseException:
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
                 raise
+        if sys.platform == "win32":
+            from hermes_cli.windows_permissions import (
+                WindowsAclError,
+                restrict_file_to_current_user,
+            )
+
+            try:
+                restrict_file_to_current_user(acl_path)
+            except WindowsAclError as exc:
+                logging.getLogger(__name__).warning(
+                    "Windows ACL drift remains on startup-sanitized %s: %s",
+                    acl_path,
+                    exc,
+                )
     except Exception:
         pass  # best-effort — don't block gateway startup
 
@@ -516,6 +531,7 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    _scrub_plugin_secrets_from_process_env()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -532,6 +548,17 @@ def load_hermes_dotenv(
     _reapply_terminal_config_bridge(home_path)
 
     return loaded
+
+
+def _scrub_plugin_secrets_from_process_env() -> None:
+    """Remove legacy plugin PATs after every startup source has loaded.
+
+    This intentionally does not rewrite ``.env``. ``config.load_env()`` must
+    keep returning the value until the operator runs ``hermes secrets migrate``.
+    """
+    for key in tuple(os.environ):
+        if is_plugin_secret_key(key):
+            del os.environ[key]
 
 
 def _reapply_terminal_config_bridge(home_path: Path) -> None:

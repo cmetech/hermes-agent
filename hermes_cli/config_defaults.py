@@ -10,6 +10,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Where plugin secrets live: "auto" probes the OS keystore and falls back
+    # to an encrypted file; "os" / "file" pin one tier; "off" disables the
+    # keystore entirely -- it does NOT resume .env writes, which the write
+    # path refuses by design.
+    "secret_keystore": "auto",
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
@@ -2131,6 +2136,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Kubernetes and runtimes without Docker/Podman volume evidence cannot
+        # prove durability from mountinfo alone. Operators may explicitly
+        # acknowledge durable backing after verifying their deployment.
+        "container_persistence_acknowledged": False,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

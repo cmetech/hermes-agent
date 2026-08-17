@@ -85,6 +85,11 @@ dependencies = [
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
   "cryptography==48.0.1",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf; ==48.0.1 (not 49.x): msal and alibabacloud-tea-openapi cap <49, hindsight-api-slim needs >=48.0.1
+  # OS-native credential storage for per-profile plugin secrets (Jira/GitLab/
+  # Confluence/ARM PATs). Backends: macOS Keychain, Windows Credential Manager,
+  # Linux Secret Service. Probed at runtime with an encrypted-file fallback, so
+  # a missing backend degrades rather than fails — see hermes_cli/secret_keystore.py.
+  "keyring==25.6.0",
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
