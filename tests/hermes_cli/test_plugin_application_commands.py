@@ -595,3 +595,125 @@ class TestPluginContextApplicationCommands:
         assert results.count({"ok": True}) == 1
         assert results.count("rejected") == 1
         assert entered == [shared]
+
+
+def _mint_real_tool_admission(monkeypatch):
+    from hermes_cli.plugins import resolve_pre_tool_admission
+    from tools.registry import registry
+
+    tool_name = "_application_command_cross_authority_tool"
+    registry.deregister(tool_name)
+    context = PluginContext(
+        PluginManifest(name="Tool Provider", key="tool-provider", source="user"),
+        PluginManager(),
+    )
+    context.register_tool(
+        tool_name,
+        "cross-authority",
+        {
+            "name": tool_name,
+            "description": "cross-authority test probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        lambda arguments, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **kwargs: [
+            {"action": "approve", "message": "confirm mutation"}
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: {"approved": True, "message": None},
+    )
+    decision = resolve_pre_tool_admission(
+        tool_name,
+        {"value": 1},
+        tool_call_id="tool-call-1",
+        turn_id="turn-1",
+    )
+    assert decision.admission is not None
+    return tool_name, decision.admission
+
+
+class TestAuthoritySeparation:
+    @pytest.mark.parametrize("placement", ["arguments", "mode"])
+    def test_model_tool_admission_cannot_enter_application_command(
+        self, monkeypatch, placement
+    ):
+        from tools.registry import registry
+
+        tool_name, admission = _mint_real_tool_admission(monkeypatch)
+        _manager, provider, caller, _outsider = _port_contexts()
+        called = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: called.append(invocation) or {},
+        )
+        _patch_snapshot(monkeypatch)
+        arguments = {"value": admission} if placement == "arguments" else {}
+        mode = admission if placement == "mode" else "read"
+        try:
+            with pytest.raises(PluginApplicationCommandInvalid):
+                caller.invoke_application_command(
+                    "records-provider",
+                    "records_get",
+                    arguments,
+                    mode=mode,
+                    invocation_id="invocation-1",
+                )
+        finally:
+            registry.deregister(tool_name)
+
+        assert called == []
+
+    def test_application_dispatch_skips_every_model_tool_path(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: {
+                "has_tool_admission": hasattr(invocation, "tool_admission")
+            },
+        )
+        _patch_snapshot(monkeypatch)
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("application commands must not enter model-tool machinery")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", unexpected)
+        monkeypatch.setattr("tools.approval.request_tool_approval", unexpected)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware", unexpected
+        )
+        monkeypatch.setattr("tools.registry.registry.dispatch", unexpected)
+
+        result = caller.invoke_application_command(
+            "records-provider",
+            "records_get",
+            {},
+            mode="read",
+            invocation_id="invocation-1",
+        )
+
+        assert result == {"has_tool_admission": False}
+
+    def test_application_invocation_cannot_escape_through_result(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: {"invocation": invocation},
+        )
+        _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandExecutionError):
+            caller.invoke_application_command(
+                "records-provider",
+                "records_get",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )

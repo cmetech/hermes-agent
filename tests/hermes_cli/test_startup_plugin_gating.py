@@ -20,6 +20,7 @@ Two invariants:
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import re
@@ -75,6 +76,84 @@ def _live_subcommand_names() -> set[str]:
 
 
 # ── _plugin_cli_discovery_needed ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "--help"],
+        ["hermes", "logs"],
+        ["hermes", "plugins", "list"],
+    ],
+)
+def test_help_and_known_builtins_keep_the_plugin_discovery_fast_path(
+    monkeypatch, argv
+):
+    monkeypatch.setattr(sys, "argv", argv)
+    assert _plugin_cli_discovery_needed() is False
+
+
+def test_help_surface_with_plugin_discovery_suppressed_matches_builtin_registry():
+    # ``help`` is a reserved fast-path token handled before argparse rather
+    # than a parser subcommand. Every actual parser command must otherwise
+    # match the discovery-suppressed help surface exactly.
+    assert _live_subcommand_names() | {"help"} == _BUILTIN_SUBCOMMANDS
+
+
+def test_unknown_plugin_command_slow_path_can_invoke_application_provider(
+    monkeypatch,
+):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "records"])
+    assert _plugin_cli_discovery_needed() is True
+
+    manager = PluginManager()
+    provider = PluginContext(
+        PluginManifest(name="Records Provider", key="records-provider"), manager
+    )
+    caller = PluginContext(
+        PluginManifest(name="Records CLI", key="records-cli"), manager
+    )
+    provider.register_application_commands(
+        operations={"records_get": "read"},
+        allowed_callers={"records-cli"},
+        handler=lambda invocation: {"record_id": invocation.arguments["record_id"]},
+    )
+
+    class Snapshot:
+        def scoped_fingerprint(self, required_services, required_tools):
+            return "profile-fingerprint"
+
+    monkeypatch.setattr(
+        "hermes_cli.plugin_configuration.connector_capability_snapshot",
+        lambda: Snapshot(),
+    )
+
+    def handle_records(args):
+        return caller.invoke_application_command(
+            "records-provider",
+            "records_get",
+            {"record_id": args.record_id},
+            mode="read",
+            invocation_id="startup-slow-path",
+        )
+
+    caller.register_cli_command(
+        "records",
+        "Read records",
+        lambda parser: parser.add_argument("record_id"),
+        handler_fn=handle_records,
+    )
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    for command in manager._cli_commands.values():
+        command_parser = subparsers.add_parser(command["name"])
+        command["setup_fn"](command_parser)
+        command_parser.set_defaults(func=command["handler_fn"])
+
+    parsed = parser.parse_args(["records", "123"])
+    assert parsed.func(parsed) == {"record_id": "123"}
 
 
 # ── _BUILTIN_SUBCOMMANDS ↔ argparse registration parity ────────────────────
