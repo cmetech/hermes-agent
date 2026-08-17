@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from hermes_cli.plugin_application_commands import (
+    PluginApplicationCommandDenied,
     PluginApplicationCommandExecutionError,
     PluginApplicationCommandInvalid,
     PluginApplicationCommandInvocation,
     PluginApplicationCommandMode,
     PluginApplicationCommandRegistrationError,
+    PluginApplicationCommandUnavailable,
     _build_registration,
+    _mint_invocation,
     _mint_invocation_for_test,
     _validate_result_mapping,
 )
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
 
 class TestCommandModel:
@@ -195,3 +201,397 @@ class TestCommandModel:
                 allowed_callers=allowed_callers,
                 handler=handler,
             )
+
+
+def _port_contexts():
+    manager = PluginManager()
+    provider = PluginContext(
+        PluginManifest(name="Records Provider", key="records-provider"), manager
+    )
+    caller = PluginContext(
+        PluginManifest(name="Records CLI", key="records-cli"), manager
+    )
+    outsider = PluginContext(
+        PluginManifest(name="Other Caller", key="other-caller"), manager
+    )
+    return manager, provider, caller, outsider
+
+
+class _FingerprintSnapshot:
+    def __init__(self, fingerprint="profile-fingerprint"):
+        self.fingerprint = fingerprint
+        self.calls = []
+
+    def scoped_fingerprint(self, required_services, required_tools):
+        self.calls.append((required_services, required_tools))
+        return self.fingerprint
+
+
+def _patch_snapshot(monkeypatch, snapshot=None):
+    snapshot = snapshot or _FingerprintSnapshot()
+    monkeypatch.setattr(
+        "hermes_cli.plugin_configuration.connector_capability_snapshot",
+        lambda: snapshot,
+    )
+    return snapshot
+
+
+class TestPluginContextApplicationCommands:
+    def test_provider_registration_uses_canonical_owner_and_is_immutable(self):
+        manager, provider, _caller, _outsider = _port_contexts()
+        handler = lambda invocation: {"ok": True}
+
+        provider.register_application_commands(
+            operations={"records_get": "read", "records_update": "write"},
+            allowed_callers={"records-cli"},
+            handler=handler,
+        )
+
+        registration = manager._application_command_providers["records-provider"]
+        assert registration.provider_id == "records-provider"
+        assert registration.handler is handler
+        assert dict(registration.operations) == {
+            "records_get": "read",
+            "records_update": "write",
+        }
+        assert registration.allowed_callers == frozenset({"records-cli"})
+        with pytest.raises(TypeError):
+            registration.operations["records_delete"] = "write"
+
+    def test_provider_cannot_register_for_a_different_identity(self):
+        _manager, provider, _caller, _outsider = _port_contexts()
+
+        with pytest.raises(TypeError):
+            provider.register_application_commands(
+                provider_id="other-provider",
+                operations={"records_get": "read"},
+                allowed_callers={"records-cli"},
+                handler=lambda invocation: {},
+            )
+
+    def test_duplicate_registration_preserves_the_first_provider(self):
+        manager, provider, _caller, _outsider = _port_contexts()
+        first = lambda invocation: {"first": True}
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=first,
+        )
+
+        with pytest.raises(PluginApplicationCommandRegistrationError):
+            provider.register_application_commands(
+                operations={"records_get": "read"},
+                allowed_callers={"records-cli"},
+                handler=lambda invocation: {"second": True},
+            )
+
+        assert manager._application_command_providers["records-provider"].handler is first
+
+    @pytest.mark.parametrize(
+        ("operation", "mode", "expected_mode"),
+        [
+            ("records_get", "read", PluginApplicationCommandMode.READ),
+            ("records_update", "dry_run", PluginApplicationCommandMode.DRY_RUN),
+            ("records_update", "confirm", PluginApplicationCommandMode.CONFIRM),
+        ],
+    )
+    def test_allowed_caller_invokes_with_exact_mode_and_scoped_fingerprint(
+        self, monkeypatch, operation, mode, expected_mode
+    ):
+        _manager, provider, caller, _outsider = _port_contexts()
+        seen = []
+        provider.register_application_commands(
+            operations={"records_get": "read", "records_update": "write"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: seen.append(invocation) or {"ok": True},
+        )
+        snapshot = _patch_snapshot(monkeypatch)
+
+        result = caller.invoke_application_command(
+            "records-provider",
+            operation,
+            {"record_id": "123"},
+            mode=mode,
+            invocation_id="invocation-1",
+        )
+
+        assert result == {"ok": True}
+        assert len(seen) == 1
+        invocation = seen[0]
+        assert invocation.provider_id == "records-provider"
+        assert invocation.caller_id == "records-cli"
+        assert invocation.operation == operation
+        assert invocation.mode is expected_mode
+        assert invocation.profile_fingerprint == "profile-fingerprint"
+        assert snapshot.calls == [
+            (frozenset({"records-provider"}), frozenset({operation}))
+        ]
+
+    @pytest.mark.parametrize("mode", ["dry_run", "confirm"])
+    def test_read_rejects_write_modes_before_handler_or_snapshot(
+        self, monkeypatch, mode
+    ):
+        _manager, provider, caller, _outsider = _port_contexts()
+        called = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: called.append(True) or {},
+        )
+        snapshot = _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandInvalid):
+            caller.invoke_application_command(
+                "records-provider",
+                "records_get",
+                {},
+                mode=mode,
+                invocation_id="invocation-1",
+            )
+
+        assert called == []
+        assert snapshot.calls == []
+
+    def test_write_rejects_read_mode_before_handler_or_snapshot(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        called = []
+        provider.register_application_commands(
+            operations={"records_update": "write"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: called.append(True) or {},
+        )
+        snapshot = _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandDenied):
+            caller.invoke_application_command(
+                "records-provider",
+                "records_update",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+        assert called == []
+        assert snapshot.calls == []
+
+    def test_unlisted_operation_is_invalid_before_handler_or_snapshot(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        called = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: called.append(True) or {},
+        )
+        snapshot = _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandInvalid):
+            caller.invoke_application_command(
+                "records-provider",
+                "records_delete",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+        assert called == []
+        assert snapshot.calls == []
+
+    def test_unlisted_caller_is_denied_before_handler_or_snapshot(self, monkeypatch):
+        _manager, provider, _caller, outsider = _port_contexts()
+        called = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: called.append(True) or {},
+        )
+        snapshot = _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandDenied):
+            outsider.invoke_application_command(
+                "records-provider",
+                "records_get",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+        assert called == []
+        assert snapshot.calls == []
+
+    def test_absent_provider_fails_before_configuration_snapshot(self, monkeypatch):
+        _manager, _provider, caller, _outsider = _port_contexts()
+        monkeypatch.setattr(
+            "hermes_cli.plugin_configuration.connector_capability_snapshot",
+            lambda: pytest.fail("snapshot must not run for an absent provider"),
+        )
+
+        with pytest.raises(PluginApplicationCommandUnavailable):
+            caller.invoke_application_command(
+                "missing-provider",
+                "records_get",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+    def test_arguments_are_copied_before_concurrent_caller_mutation(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        reached_snapshot = threading.Event()
+        allow_snapshot = threading.Event()
+        seen = []
+
+        class BlockingSnapshot(_FingerprintSnapshot):
+            def scoped_fingerprint(self, required_services, required_tools):
+                reached_snapshot.set()
+                assert allow_snapshot.wait(timeout=5)
+                return super().scoped_fingerprint(required_services, required_tools)
+
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: seen.append(invocation.arguments["record"]["status"])
+            or {"ok": True},
+        )
+        _patch_snapshot(monkeypatch, BlockingSnapshot())
+        arguments = {"record": {"status": "open"}}
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                caller.invoke_application_command,
+                "records-provider",
+                "records_get",
+                arguments,
+                mode="read",
+                invocation_id="invocation-1",
+            )
+            assert reached_snapshot.wait(timeout=5)
+            arguments["record"]["status"] = "closed"
+            allow_snapshot.set()
+            assert future.result(timeout=5) == {"ok": True}
+
+        assert seen == ["open"]
+
+    def test_handler_exception_is_stable_and_closes_invocation(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        seen = []
+
+        def handler(invocation):
+            seen.append(invocation)
+            assert invocation.active is True
+            raise RuntimeError("distinctive-secret-marker")
+
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=handler,
+        )
+        _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandExecutionError) as raised:
+            caller.invoke_application_command(
+                "records-provider",
+                "records_get",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+        assert "distinctive-secret-marker" not in str(raised.value)
+        assert len(seen) == 1
+        assert seen[0].active is False
+
+    @pytest.mark.parametrize(
+        "invalid_result",
+        [
+            ["not", "a", "mapping"],
+            {"value": object()},
+            {"value": math.nan},
+            {"value": "x" * 1_048_576},
+        ],
+    )
+    def test_invalid_handler_result_uses_stable_execution_error(
+        self, monkeypatch, invalid_result
+    ):
+        _manager, provider, caller, _outsider = _port_contexts()
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: invalid_result,
+        )
+        _patch_snapshot(monkeypatch)
+
+        with pytest.raises(PluginApplicationCommandExecutionError):
+            caller.invoke_application_command(
+                "records-provider",
+                "records_get",
+                {},
+                mode="read",
+                invocation_id="invocation-1",
+            )
+
+    def test_successful_handler_invocation_is_closed_after_return(self, monkeypatch):
+        _manager, provider, caller, _outsider = _port_contexts()
+        seen = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: seen.append((invocation, invocation.active))
+            or {"ok": True},
+        )
+        _patch_snapshot(monkeypatch)
+
+        assert caller.invoke_application_command(
+            "records-provider",
+            "records_get",
+            {},
+            mode="read",
+            invocation_id="invocation-1",
+        ) == {"ok": True}
+
+        assert seen[0][1] is True
+        assert seen[0][0].active is False
+
+    def test_same_internally_minted_invocation_enters_handler_only_once(
+        self, monkeypatch
+    ):
+        import hermes_cli.plugin_application_commands as application_commands
+
+        manager, provider, caller, _outsider = _port_contexts()
+        entered = []
+        provider.register_application_commands(
+            operations={"records_get": "read"},
+            allowed_callers={"records-cli"},
+            handler=lambda invocation: entered.append(invocation) or {"ok": True},
+        )
+        registration = manager._application_command_providers["records-provider"]
+        shared = _mint_invocation(
+            provider_id="records-provider",
+            caller_id="records-cli",
+            operation="records_get",
+            arguments={},
+            mode="read",
+            invocation_id="shared-invocation",
+            profile_fingerprint="profile-fingerprint",
+            registration_token=registration._registration_token,
+        )
+        monkeypatch.setattr(application_commands, "_mint_invocation", lambda **_: shared)
+        _patch_snapshot(monkeypatch)
+
+        def invoke():
+            try:
+                return caller.invoke_application_command(
+                    "records-provider",
+                    "records_get",
+                    {},
+                    mode="read",
+                    invocation_id="shared-invocation",
+                )
+            except PluginApplicationCommandExecutionError:
+                return "rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: invoke(), range(2)))
+
+        assert results.count({"ok": True}) == 1
+        assert results.count("rejected") == 1
+        assert entered == [shared]

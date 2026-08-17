@@ -161,6 +161,12 @@ def _validate_result_mapping(result: object) -> dict[str, Any]:
     return copied
 
 
+def _validate_invocation_id(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_ID_LENGTH:
+        raise PluginApplicationCommandInvalid()
+    return value
+
+
 class PluginApplicationCommandInvocation:
     """Immutable, single-use authority minted by the Hermes host."""
 
@@ -199,12 +205,7 @@ class PluginApplicationCommandInvocation:
         caller_id = _validate_identifier(caller_id)
         operation = _validate_identifier(operation)
         parsed_mode = _parse_mode(mode)
-        if (
-            not isinstance(invocation_id, str)
-            or not invocation_id
-            or len(invocation_id) > _MAX_ID_LENGTH
-        ):
-            raise PluginApplicationCommandInvalid()
+        invocation_id = _validate_invocation_id(invocation_id)
         if (
             not isinstance(profile_fingerprint, str)
             or not profile_fingerprint
@@ -353,3 +354,98 @@ def _mint_invocation(
 def _mint_invocation_for_test(**values: Any) -> PluginApplicationCommandInvocation:
     """Private seam for value-object tests; never used by plugin code."""
     return _mint_invocation(registration_token=object(), **values)
+
+
+def _register_application_commands(
+    registry: dict[str, Any],
+    *,
+    provider_id: object,
+    operations: object,
+    allowed_callers: object,
+    handler: object,
+) -> None:
+    registration = _build_registration(
+        provider_id=provider_id,
+        operations=operations,
+        allowed_callers=allowed_callers,
+        handler=handler,
+    )
+    if registration.provider_id in registry:
+        raise PluginApplicationCommandRegistrationError()
+    registry[registration.provider_id] = registration
+
+
+def _execute_invocation_once(
+    invocation: PluginApplicationCommandInvocation,
+    registration: _ApplicationCommandRegistration,
+) -> dict[str, Any]:
+    token = registration._registration_token
+    if not invocation._activate_once(token):
+        raise PluginApplicationCommandExecutionError()
+    try:
+        try:
+            result = registration.handler(invocation)
+        except Exception:
+            raise PluginApplicationCommandExecutionError() from None
+        return _validate_result_mapping(result)
+    finally:
+        invocation._close_once(token)
+
+
+def _invoke_application_command(
+    registry: Mapping[str, Any],
+    *,
+    caller_id: object,
+    provider_id: object,
+    operation: object,
+    arguments: object,
+    mode: object,
+    invocation_id: object,
+) -> dict[str, Any]:
+    validated_caller = _validate_identifier(caller_id)
+    validated_provider = _validate_identifier(provider_id)
+    validated_operation = _validate_identifier(operation)
+    parsed_mode = _parse_mode(mode)
+    validated_invocation_id = _validate_invocation_id(invocation_id)
+    copied_arguments, _arguments_sha256 = _canonical_arguments(arguments)
+
+    registration = registry.get(validated_provider)
+    if not isinstance(registration, _ApplicationCommandRegistration):
+        raise PluginApplicationCommandUnavailable()
+    if validated_caller not in registration.allowed_callers:
+        raise PluginApplicationCommandDenied()
+    classification = registration.operations.get(validated_operation)
+    if classification is None:
+        raise PluginApplicationCommandInvalid()
+    if classification == "read" and parsed_mode is not PluginApplicationCommandMode.READ:
+        raise PluginApplicationCommandInvalid()
+    if classification == "write" and parsed_mode is PluginApplicationCommandMode.READ:
+        raise PluginApplicationCommandDenied()
+
+    try:
+        from hermes_cli.plugin_configuration import connector_capability_snapshot
+
+        profile_fingerprint = connector_capability_snapshot().scoped_fingerprint(
+            frozenset({validated_provider}),
+            frozenset({validated_operation}),
+        )
+    except Exception:
+        raise PluginApplicationCommandUnavailable() from None
+    if (
+        not isinstance(profile_fingerprint, str)
+        or not profile_fingerprint
+        or len(profile_fingerprint) > _MAX_ID_LENGTH
+    ):
+        raise PluginApplicationCommandExecutionError()
+
+    invocation = _mint_invocation(
+        provider_id=validated_provider,
+        caller_id=validated_caller,
+        operation=validated_operation,
+        arguments=copied_arguments,
+        mode=parsed_mode,
+        invocation_id=validated_invocation_id,
+        profile_fingerprint=profile_fingerprint,
+        registration_token=registration._registration_token,
+    )
+    return _execute_invocation_once(invocation, registration)
