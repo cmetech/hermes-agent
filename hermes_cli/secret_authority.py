@@ -30,6 +30,15 @@ class AuthorityRegistryError(ValueError):
     pass
 
 
+def _is_reparse_point(info: os.stat_result) -> bool:
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and getattr(info, "st_file_attributes", 0) & flag)
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
 @dataclass(frozen=True)
 class AuthorityRegistry:
     version: int
@@ -82,13 +91,27 @@ def encode_authority_registry(registry: AuthorityRegistry) -> bytes:
 
 def load_authority_registry(root: Path) -> AuthorityRegistry | None:
     """Read and strictly validate authority metadata without creating paths."""
-    path = Path(root) / AUTHORITY_FILE
+    root = Path(root)
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AuthorityRegistryError("cannot inspect authority registry root") from exc
+    if _is_reparse_point(root_info):
+        raise AuthorityRegistryError("authority registry root is a reparse point")
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise AuthorityRegistryError("authority registry root is not a direct directory")
+
+    path = root / AUTHORITY_FILE
     try:
         expected = path.lstat()
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise AuthorityRegistryError("cannot inspect authority registry") from exc
+    if _is_reparse_point(expected):
+        raise AuthorityRegistryError("authority registry is a reparse point")
     if stat.S_ISLNK(expected.st_mode) or not stat.S_ISREG(expected.st_mode):
         raise AuthorityRegistryError("authority registry is not a regular file")
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
@@ -97,7 +120,7 @@ def load_authority_registry(root: Path) -> AuthorityRegistry | None:
     try:
         fd = os.open(str(path), flags)
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or (
+        if _is_reparse_point(opened) or not stat.S_ISREG(opened.st_mode) or (
             opened.st_dev,
             opened.st_ino,
         ) != (expected.st_dev, expected.st_ino):
@@ -105,6 +128,14 @@ def load_authority_registry(root: Path) -> AuthorityRegistry | None:
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = None
             payload = handle.read()
+        after_root = root.lstat()
+        if (
+            _is_reparse_point(after_root)
+            or stat.S_ISLNK(after_root.st_mode)
+            or not stat.S_ISDIR(after_root.st_mode)
+            or _identity(after_root) != _identity(root_info)
+        ):
+            raise AuthorityRegistryError("authority registry root changed while reading")
         raw = json.loads(
             payload,
             object_pairs_hook=_reject_duplicate_keys,

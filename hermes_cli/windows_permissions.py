@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,6 +174,37 @@ def _validated_sid() -> str:
     return sid
 
 
+def _is_reparse_point(info: os.stat_result) -> bool:
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and getattr(info, "st_file_attributes", 0) & flag)
+
+
+def _validated_direct_path(path: Path, *, directory: bool) -> tuple[int, int]:
+    kind = "directory" if directory else "file"
+    try:
+        info = Path(path).lstat()
+    except OSError as exc:
+        raise WindowsAclError(f"cannot inspect Windows ACL {kind} path") from exc
+    if _is_reparse_point(info):
+        raise WindowsAclError(f"Windows ACL {kind} path is a reparse point")
+    if stat.S_ISLNK(info.st_mode):
+        raise WindowsAclError(f"Windows ACL {kind} path is a symbolic link")
+    type_matches = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not type_matches:
+        raise WindowsAclError(f"Windows ACL {kind} path has the wrong type")
+    return (info.st_dev, info.st_ino)
+
+
+def _validate_path_unchanged(
+    path: Path,
+    *,
+    directory: bool,
+    expected_identity: tuple[int, int],
+) -> None:
+    if _validated_direct_path(path, directory=directory) != expected_identity:
+        raise WindowsAclError("Windows ACL path changed during operation")
+
+
 def _run_powershell(
     script: str,
     path: Path,
@@ -211,16 +243,28 @@ def _run_powershell(
 
 
 def restrict_file_to_current_user(path: Path) -> None:
-    _run_powershell(_APPLY_FILE_SCRIPT, Path(path))
+    path = Path(path)
+    identity = _validated_direct_path(path, directory=False)
+    _run_powershell(_APPLY_FILE_SCRIPT, path)
+    _validate_path_unchanged(path, directory=False, expected_identity=identity)
 
 
 def restrict_directory_to_current_user(path: Path) -> None:
-    _run_powershell(_APPLY_DIRECTORY_SCRIPT, Path(path))
+    path = Path(path)
+    identity = _validated_direct_path(path, directory=True)
+    _run_powershell(_APPLY_DIRECTORY_SCRIPT, path)
+    _validate_path_unchanged(path, directory=True, expected_identity=identity)
 
 
-def _inspect(path: Path, script: str) -> WindowsAclInspection:
+def _inspect(path: Path, script: str, *, directory: bool) -> WindowsAclInspection:
+    identity = _validated_direct_path(path, directory=directory)
     sid = _validated_sid()
     completed = _run_powershell(script, Path(path), sid=sid)
+    _validate_path_unchanged(
+        path,
+        directory=directory,
+        expected_identity=identity,
+    )
 
     def reject_duplicate_fields(pairs):
         result = {}
@@ -262,11 +306,11 @@ def _inspect(path: Path, script: str) -> WindowsAclInspection:
 
 
 def inspect_file_acl(path: Path) -> WindowsAclInspection:
-    return _inspect(Path(path), _INSPECT_FILE_SCRIPT)
+    return _inspect(Path(path), _INSPECT_FILE_SCRIPT, directory=False)
 
 
 def inspect_directory_acl(path: Path) -> WindowsAclInspection:
-    return _inspect(Path(path), _INSPECT_DIRECTORY_SCRIPT)
+    return _inspect(Path(path), _INSPECT_DIRECTORY_SCRIPT, directory=True)
 
 
 __all__ = [

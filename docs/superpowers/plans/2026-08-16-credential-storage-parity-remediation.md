@@ -358,6 +358,14 @@ stale-copy deletion, interrupted-move resume/rollback, temporary cleanup,
 permission repair, quarantine before replacement, healthy-tier reconstruction,
 and unrecoverable reset requiring both explicit flags:
 
+Also cover corrupt-registry tombstone loss. An absent known plugin key may have
+had a `cleared` entry in the damaged registry, so default repair must report a
+value-free `AUTHORITY_TOMBSTONE_AMBIGUOUS` finding and refuse reconstruction.
+`--reset-unrecoverable --apply` without `--yes` must change nothing;
+`--reset-unrecoverable --apply --yes` must quarantine the corrupt registry,
+reconstruct independently unambiguous tier entries, and durably record
+`cleared` for absent known keys so stale legacy plaintext cannot reactivate.
+
 ```python
 def test_unrecoverable_reset_requires_confirmation(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -438,8 +446,12 @@ class RepairReport:
 
 Diagnosis uses only bounded gets and filesystem reads. It never invokes the
 mutating OS round-trip probe. Plans sort actions by code and key for stable
-output. Application revalidates the finding under the transaction lock before
-each mutation; changed state aborts rather than applying a stale plan.
+output. Under corrupt authority, an inventory key absent from every healthy,
+fully observed tier is not inferred as unregistered because its lost state may
+have been a tombstone; default planning blocks on that ambiguity. Application
+revalidates the finding, inventory, tier values, and artifact identities under
+the transaction lock before each mutation; changed state aborts rather than
+applying a stale plan.
 
 - [ ] **Step 6: Implement quarantine, move, reset, and CLI registration**
 
@@ -448,6 +460,13 @@ private permissions, and a manifest containing paths and finding codes but no
 values. `--reset-unrecoverable` quarantines corrupt file artifacts, records
 affected registered file keys as `cleared`, and initializes a clean encrypted
 store only after confirmation and container-persistence checks.
+
+The same explicit reset flag governs corrupt-registry tombstone loss. With
+`--yes`, repair quarantines the corrupt authority file and writes one complete
+registry containing reconstructed authorities for surviving unambiguous values
+and `cleared` for absent known plugin keys. Without `--yes`, noninteractive
+apply refuses before mutation. Public findings, plans, reports, and manifests
+remain value-free.
 
 Register doctor and repair beneath the existing secrets parser. `repair`
 without `--apply` prints the plan only. `--yes` is accepted only with
@@ -606,10 +625,12 @@ git commit -m "fix: enforce credential ACLs after replacement"
 
 Use synthetic mountinfo for deepest enclosing mount selection, escaped
 mountpoints (`\\040`, `\\011`, `\\012`, `\\134`), nonexistent `secrets`
-children, persistent bind/volume mounts, and `overlay`, `tmpfs`, `ramfs`, and
-`aufs` refusal. Root-only, malformed, missing, or unrelated mountinfo is
-`UNKNOWN`, not success. Cover Docker, Podman, Kubernetes, cgroup, containerd,
-CRI-O, and desktop-child detection.
+children, persistent bind/volume mounts, and `overlay`, `fuse-overlayfs`,
+`tmpfs`, `ramfs`, and `aufs` refusal. Root-only, malformed, missing, or
+unrelated mountinfo is `UNKNOWN`, not success. Cover Docker, Podman,
+Kubernetes, cgroup, containerd, CRI-O, desktop-child detection, and a process
+detected only from a union root. Exercise `is_container()` and persistence
+inspection from the same inputs rather than patching the runtime classifier.
 
 Extend doctor tests with `CONTAINER_STORAGE_UNPROVEN` and assert mount evidence
 is read fresh on each diagnosis without writing profile state.
@@ -662,17 +683,20 @@ class MountPersistence:
 ```
 
 Parse `/proc/self/mountinfo` without importing test-runner code. Select the
-deepest enclosing mount. A distinct non-ephemeral bind mount or named volume is
-persistent evidence for Docker and Podman; container root alone is
-insufficient. Kubernetes and otherwise ambiguous runtimes cannot distinguish a
-disk-backed `emptyDir`, PVC-like mount, or genuinely durable generic mount from
-mountinfo alone, so all such distinct non-memory mounts are `UNKNOWN` unless
-the operator has verified the storage class and retention policy and explicitly
-set `security.container_persistence_acknowledged: true` in the active profile's
+deepest enclosing mount and derive runtime kind from that same parsed evidence.
+A distinct non-ephemeral bind mount or named volume is persistent evidence for
+positively identified Docker and Podman; container root alone is insufficient.
+A union-root-only container is ambiguous, as is every container not positively
+identified as Docker or Podman. Kubernetes and otherwise ambiguous runtimes
+cannot distinguish a disk-backed `emptyDir`, PVC-like mount, or genuinely
+durable generic mount from mountinfo alone, so all such distinct non-memory
+mounts are `UNKNOWN` unless the operator has verified the storage class and
+retention policy and explicitly set
+`security.container_persistence_acknowledged: true` in the active profile's
 `config.yaml`. Read that narrow setting directly and afresh without importing
 the full config loader, adding a `HERMES_*` variable, or caching evidence. The
-acknowledgement cannot override known `overlay`, `tmpfs`, `ramfs`, or `aufs`
-evidence. Missing evidence fails closed.
+acknowledgement cannot override known `overlay`, `fuse-overlayfs`, `tmpfs`,
+`ramfs`, or `aufs` evidence. Missing evidence fails closed.
 `hermes_constants.is_container()` becomes a compatibility delegate and config
 retains its `HERMES_SKIP_CHMOD` permission-policy override.
 

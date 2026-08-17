@@ -46,16 +46,8 @@ _MOUNT_ESCAPES = {
     "012": "\n",
     "134": "\\",
 }
-_EPHEMERAL_FILESYSTEMS = frozenset({"overlay", "tmpfs", "ramfs", "aufs"})
-_CGROUP_MARKERS = (
-    "docker",
-    "podman",
-    "libpod",
-    "/lxc/",
-    "kubepods",
-    "containerd",
-    "crio",
-    "cri-o",
+_EPHEMERAL_FILESYSTEMS = frozenset(
+    {"overlay", "fuse-overlayfs", "tmpfs", "ramfs", "aufs"}
 )
 _CGROUP_FILESYSTEMS = frozenset({"cgroup", "cgroup2"})
 _CONTAINER_ROOT_FILESYSTEMS = frozenset({"aufs", "fuse-overlayfs", "overlay"})
@@ -129,8 +121,12 @@ def _unknown(reason: str) -> MountPersistence:
     return MountPersistence(PersistenceState.UNKNOWN, None, None, None, reason)
 
 
-def _container_runtime_kind() -> str:
-    """Classify only the runtime evidence relevant to mount durability."""
+def _container_runtime_kind(mounts: tuple[_MountInfo, ...] = ()) -> str:
+    """Classify runtime markers plus the already-parsed mount evidence."""
+    if os.environ.get("HERMES_CONTAINER"):
+        return "ambiguous"
+    if os.environ.get("HERMES_DESKTOP_CHILD_PID"):
+        return "host"
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         return "kubernetes"
     if Path("/.dockerenv").exists():
@@ -149,11 +145,24 @@ def _container_runtime_kind() -> str:
         return "docker"
     if "podman" in cgroup or "libpod" in cgroup:
         return "podman"
-    if os.environ.get("HERMES_CONTAINER") or any(
-        marker in cgroup
-        for marker in ("containerd", "crio", "cri-o", "/lxc/")
-    ):
+    if any(marker in cgroup for marker in ("containerd", "crio", "cri-o", "/lxc/")):
         return "ambiguous"
+    for mount in mounts:
+        if (
+            mount.mount_point == Path("/")
+            and mount.fs_type in _CONTAINER_ROOT_FILESYSTEMS
+        ):
+            return "ambiguous"
+        root = mount.root.lower()
+        if (
+            mount.fs_type in _CGROUP_FILESYSTEMS
+            and (
+                mount.mount_point == Path("/sys/fs/cgroup")
+                or Path("/sys/fs/cgroup") in mount.mount_point.parents
+            )
+            and any(marker in root for marker in _CONTAINER_CGROUP_ROOT_MARKERS)
+        ):
+            return "ambiguous"
     return "host"
 
 
@@ -235,7 +244,7 @@ def inspect_mount_persistence(
             f"distinct {mount.fs_type} mount is ephemeral",
         )
     kind = "bind" if mount.root != "/" else "volume"
-    runtime_kind = _container_runtime_kind()
+    runtime_kind = _container_runtime_kind(mounts)
     if runtime_kind in {"kubernetes", "ambiguous"}:
         if _operator_acknowledges_container_persistence():
             return MountPersistence(
@@ -270,49 +279,19 @@ def inspect_mount_persistence(
 
 def is_container() -> bool:
     """Return whether runtime markers identify a container process."""
-    if os.environ.get("HERMES_CONTAINER"):
-        return True
-    if os.environ.get("HERMES_DESKTOP_CHILD_PID"):
-        return False
-    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
-        return True
-    if os.environ.get("KUBERNETES_SERVICE_HOST"):
-        return True
-    try:
-        cgroup = Path("/proc/1/cgroup").read_text(
-            encoding="utf-8", errors="replace"
-        ).lower()
-    except OSError:
-        cgroup = ""
-    if any(marker in cgroup for marker in _CGROUP_MARKERS):
-        return True
     try:
         mountinfo = Path("/proc/self/mountinfo").read_text(
             encoding="utf-8", errors="replace"
         )
     except OSError:
         mountinfo = ""
+    mounts: list[_MountInfo] = []
     for line in mountinfo.splitlines():
         try:
-            mount = _parse_mountinfo_line(line)
+            mounts.append(_parse_mountinfo_line(line))
         except ValueError:
             continue
-        if (
-            mount.mount_point == Path("/")
-            and mount.fs_type in _CONTAINER_ROOT_FILESYSTEMS
-        ):
-            return True
-        root = mount.root.lower()
-        if (
-            mount.fs_type in _CGROUP_FILESYSTEMS
-            and (
-                mount.mount_point == Path("/sys/fs/cgroup")
-                or Path("/sys/fs/cgroup") in mount.mount_point.parents
-            )
-            and any(marker in root for marker in _CONTAINER_CGROUP_ROOT_MARKERS)
-        ):
-            return True
-    return False
+    return _container_runtime_kind(tuple(mounts)) != "host"
 
 
 __all__ = [

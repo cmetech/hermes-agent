@@ -38,7 +38,6 @@ from hermes_cli.secret_authority import (
     encode_authority_registry,
     load_authority_registry,
 )
-from utils import atomic_replace
 
 try:  # pragma: no cover - import guard exercised via mock.patch
     import keyring
@@ -87,6 +86,28 @@ def _is_windows() -> bool:
 
 class KeystoreError(RuntimeError):
     """A keystore operation failed in a way the caller must not ignore."""
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    """Return whether Windows marked this direct entry as a reparse point."""
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and getattr(info, "st_file_attributes", 0) & flag)
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _lstat_direct_directory(path: Path, *, purpose: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect {purpose} {path}") from exc
+    if _is_reparse_point(info):
+        raise KeystoreError(f"{purpose} is a reparse point: {path}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise KeystoreError(f"{purpose} is not a direct directory: {path}")
+    return info
 
 
 class _ProfileState:
@@ -403,6 +424,10 @@ class FileKeystore:
                 f"cannot inspect secret-store root {self._root}"
             ) from exc
         if root_info is not None:
+            if _is_reparse_point(root_info):
+                raise KeystoreError(
+                    f"secret-store root is a reparse point: {self._root}"
+                )
             if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
                 raise KeystoreError(
                     f"secret-store root is not a direct directory: {self._root}"
@@ -575,22 +600,10 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
     a process crashes. The thread lock is also required because POSIX flock
     ownership semantics alone do not provide a portable same-process mutex.
     """
-    try:
-        root_info = root.lstat()
-    except OSError as exc:
-        raise KeystoreError(f"secret transaction root is unavailable at {root}") from exc
-    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
-        raise KeystoreError(f"secret transaction root is not a direct directory: {root}")
+    root_info = _lstat_direct_directory(root, purpose="secret transaction root")
     lock_path = root / _LOCK_FILE
-    try:
-        lock_path.lstat()
-        lock_existed = True
-    except FileNotFoundError:
-        lock_existed = False
-    except OSError as exc:
-        raise KeystoreError(
-            f"secret transaction lock is unavailable at {lock_path}"
-        ) from exc
+    expected_lock = _lstat_regular_artifact(lock_path)
+    lock_existed = expected_lock is not None
     with _FILE_THREAD_LOCK:
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -601,21 +614,48 @@ def _store_lock(root: Path, *, create: bool = True, secure: bool = True):
                 f"secret transaction lock is unavailable at {lock_path}"
             ) from exc
         lock_info = os.fstat(fd)
-        if not stat.S_ISREG(lock_info.st_mode):
+        if _is_reparse_point(lock_info) or not stat.S_ISREG(lock_info.st_mode):
             os.close(fd)
             raise KeystoreError(
                 f"secret transaction lock is not a regular file: {lock_path}"
             )
+        if expected_lock is not None and _identity(lock_info) != _identity(expected_lock):
+            os.close(fd)
+            raise KeystoreError(
+                f"secret transaction lock changed while opening: {lock_path}"
+            )
+        current_lock = _lstat_regular_artifact(lock_path)
+        current_root = _lstat_direct_directory(
+            root,
+            purpose="secret transaction root",
+        )
+        if (
+            current_lock is None
+            or _identity(current_lock) != _identity(lock_info)
+            or _identity(current_root) != _identity(root_info)
+        ):
+            os.close(fd)
+            raise KeystoreError("secret transaction paths changed while opening")
         with os.fdopen(fd, "r+b") as handle:
             if secure or (_is_windows() and not lock_existed):
                 _ensure_private_permissions(lock_path, 0o600)
+                secured_lock = _lstat_regular_artifact(lock_path)
+                if secured_lock is None or _identity(secured_lock) != _identity(lock_info):
+                    raise KeystoreError(
+                        f"secret transaction lock changed while securing: {lock_path}"
+                    )
             if os.name == "nt":
                 import msvcrt
 
+                handle.seek(0, os.SEEK_END)
+                lock_is_empty = handle.tell() == 0
+                if lock_is_empty and not create:
+                    raise KeystoreError(
+                        f"secret transaction lock is empty or corrupt: {lock_path}"
+                    )
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
+                if lock_is_empty:
                     handle.seek(0)
                     handle.write(b"\0")
                     handle.flush()
@@ -644,14 +684,24 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
 
         try:
             info = path.lstat()
+            if _is_reparse_point(info):
+                raise KeystoreError(f"refusing to ACL reparse point {path}")
             if stat.S_ISLNK(info.st_mode):
                 raise KeystoreError(f"refusing to ACL linked path {path}")
+            expected_identity = _identity(info)
             if stat.S_ISDIR(info.st_mode):
                 restrict_directory_to_current_user(path)
             elif stat.S_ISREG(info.st_mode):
                 restrict_file_to_current_user(path)
             else:
                 raise KeystoreError(f"refusing to ACL non-regular path {path}")
+            after = path.lstat()
+            if (
+                _is_reparse_point(after)
+                or stat.S_ISLNK(after.st_mode)
+                or _identity(after) != expected_identity
+            ):
+                raise KeystoreError(f"path changed while securing permissions: {path}")
         except KeystoreError:
             raise
         except WindowsAclError as exc:
@@ -662,7 +712,7 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
     fd: int | None = None
     try:
         before = path.lstat()
-        if stat.S_ISLNK(before.st_mode) or not (
+        if _is_reparse_point(before) or stat.S_ISLNK(before.st_mode) or not (
             stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)
         ):
             raise KeystoreError(f"refusing to chmod non-regular path {path}")
@@ -670,7 +720,7 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(str(path), flags)
         opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        if _is_reparse_point(opened) or _identity(opened) != _identity(before):
             raise KeystoreError(f"path changed while securing permissions: {path}")
         # Keep the established chmod failure seam while explicitly refusing
         # link traversal. The already-open no-follow descriptor anchors and
@@ -690,7 +740,7 @@ def _ensure_private_permissions(path: Path, mode: int) -> None:
             ):
                 raise
         after = path.lstat()
-        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        if _is_reparse_point(after) or _identity(after) != _identity(opened):
             raise KeystoreError(f"path changed while securing permissions: {path}")
         os.fchmod(fd, mode)
         actual_mode = stat.S_IMODE(os.fstat(fd).st_mode)
@@ -722,9 +772,16 @@ def _write_private(path: Path, payload: bytes) -> None:
     same filesystem. A crash or disk error before replace leaves the last good
     key/ciphertext intact rather than exposing a truncated live file.
     """
+    path = Path(path)
+    parent = path.parent
+    parent_before = _lstat_direct_directory(
+        parent,
+        purpose="private replacement parent",
+    )
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
+    temporary_identity: tuple[int, int] | None = None
     try:
         if not _is_windows():
             try:
@@ -738,6 +795,13 @@ def _write_private(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+            temporary_identity = _identity(os.fstat(handle.fileno()))
+        parent_pre_replace = _lstat_direct_directory(
+            parent,
+            purpose="private replacement parent",
+        )
+        if _identity(parent_pre_replace) != _identity(parent_before):
+            raise KeystoreError(f"private replacement parent changed: {parent}")
         try:
             existing = path.lstat()
         except FileNotFoundError:
@@ -746,18 +810,40 @@ def _write_private(path: Path, payload: bytes) -> None:
             raise KeystoreError(
                 f"cannot inspect private replacement path {path}"
             ) from exc
+        if existing is not None and _is_reparse_point(existing):
+            raise KeystoreError(f"private replacement target is a reparse point: {path}")
         if existing is not None and (
             stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
         ):
             raise KeystoreError(
                 f"private replacement target is not a regular file: {path}"
             )
-        if _is_windows():
-            replaced_path = Path(atomic_replace(tmp_name, path))
-        else:
-            os.replace(tmp_name, path)
-            replaced_path = path
-        _ensure_private_permissions(replaced_path, 0o600)
+        os.replace(tmp_name, path)
+        parent_after = _lstat_direct_directory(
+            parent,
+            purpose="private replacement parent",
+        )
+        if _identity(parent_after) != _identity(parent_before):
+            raise KeystoreError(f"private replacement parent changed: {parent}")
+        destination = _lstat_regular_artifact(path)
+        if (
+            destination is None
+            or temporary_identity is None
+            or _identity(destination) != temporary_identity
+        ):
+            raise KeystoreError(f"private replacement destination changed: {path}")
+        _ensure_private_permissions(path, 0o600)
+        parent_secured = _lstat_direct_directory(
+            parent,
+            purpose="private replacement parent",
+        )
+        secured_destination = _lstat_regular_artifact(path)
+        if (
+            _identity(parent_secured) != _identity(parent_before)
+            or secured_destination is None
+            or _identity(secured_destination) != temporary_identity
+        ):
+            raise KeystoreError(f"private replacement paths changed: {path}")
     except BaseException:
         if fd >= 0:
             os.close(fd)
@@ -850,6 +936,8 @@ def _lstat_regular_artifact(path: Path) -> os.stat_result | None:
         return None
     except OSError as exc:
         raise KeystoreError(f"cannot inspect secret-store artifact {path}") from exc
+    if _is_reparse_point(info):
+        raise KeystoreError(f"secret-store artifact is a reparse point: {path}")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise KeystoreError(f"secret-store artifact is not a regular file: {path}")
     return info
@@ -864,6 +952,35 @@ def _artifact_present_nofollow(path: Path) -> bool:
     except OSError as exc:
         raise KeystoreError(f"cannot inspect secret-store artifact {path}") from exc
     return True
+
+
+def _artifact_state_nofollow(
+    path: Path,
+) -> tuple[int, int, int, int, int] | None:
+    """Snapshot one directory entry without following it."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect secret-store artifact {path}") from exc
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _transaction_artifact_states(
+    root: Path,
+) -> tuple[tuple[int, int, int, int, int] | None, ...]:
+    """Snapshot every artifact whose mutation requires the profile lock."""
+    return tuple(
+        _artifact_state_nofollow(root / filename)
+        for filename in (AUTHORITY_FILE, _KEY_FILE, _DATA_FILE, _LOCK_FILE)
+    )
 
 
 def _read_regular_file_nofollow(
@@ -881,7 +998,7 @@ def _read_regular_file_nofollow(
     try:
         fd = os.open(str(path), flags)
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or (
+        if _is_reparse_point(opened) or not stat.S_ISREG(opened.st_mode) or (
             opened.st_dev,
             opened.st_ino,
         ) != (expected.st_dev, expected.st_ino):
@@ -914,6 +1031,8 @@ def _read_file_store_readonly(root: Path) -> dict[str, str]:
         root_info = None
     except OSError as exc:
         raise KeystoreError(f"cannot inspect secret-store root {root}") from exc
+    if root_info is not None and _is_reparse_point(root_info):
+        raise KeystoreError(f"secret-store root is a reparse point: {root}")
     if root_info is not None and (
         stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode)
     ):
@@ -1007,6 +1126,28 @@ def _mark_os_unhealthy(state: _ProfileState) -> None:
 def _ensure_transaction_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _ensure_private_permissions(root, 0o700)
+
+
+def _preflight_mutation_store(root: Path) -> bool:
+    """Validate live transaction artifacts without creating or repairing them."""
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise KeystoreError(f"cannot inspect secret transaction root {root}") from exc
+    if _is_reparse_point(root_info):
+        raise KeystoreError(f"secret transaction root is a reparse point: {root}")
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise KeystoreError(
+            f"secret transaction root is not a direct directory: {root}"
+        )
+    authority_info = _lstat_regular_artifact(root / AUTHORITY_FILE)
+    for filename in (_KEY_FILE, _DATA_FILE, _LOCK_FILE):
+        _lstat_regular_artifact(root / filename)
+    if authority_info is not None:
+        load_authority_registry(root)
+    return True
 
 
 def _write_authority_registry(root: Path, registry: AuthorityRegistry) -> None:
@@ -1333,10 +1474,16 @@ def resolve_secret(key: str, *, legacy_value: str | None = None) -> str | None:
             # artifacts merely because they are being considered as a tier.
             if file_state_locked:
                 file_value = _read_file_store_readonly(root).get(key)
+                unlocked_states = None
             else:
-                # With no lock file, do not race a newly-created encrypted
-                # store by reading it unlocked. A post-read check below retries
-                # under the lock if a writer creates transaction state.
+                # No file-tier artifact may be trusted or ignored without its
+                # transaction lock. In particular, accepting an OS value while
+                # encrypted data already exists can hide a competing value.
+                unlocked_states = _transaction_artifact_states(root)
+                if any(state is not None for state in unlocked_states):
+                    raise KeystoreError(
+                        "secret-store artifacts exist without the transaction lock"
+                    )
                 file_value = None
             try:
                 os_value = OSKeystore(profile_identity).get(key)
@@ -1344,6 +1491,13 @@ def resolve_secret(key: str, *, legacy_value: str | None = None) -> str | None:
             except Exception:
                 os_value = None
                 os_known = False
+            if (
+                unlocked_states is not None
+                and _transaction_artifact_states(root) != unlocked_states
+            ):
+                raise KeystoreError(
+                    "secret-store artifacts changed during unlocked resolution"
+                )
             value, _tiers = _infer_pre_registry_tiers(
                 file_value,
                 os_known,
@@ -1365,7 +1519,9 @@ def resolve_secret(key: str, *, legacy_value: str | None = None) -> str | None:
         if _artifact_present_nofollow(lock_path):
             with _store_lock(root, create=False, secure=False):
                 return _resolve_current(file_state_locked=True)
-        if _artifact_present_nofollow(root / AUTHORITY_FILE):
+        if legacy_value in {None, ""} and any(
+            state is not None for state in _transaction_artifact_states(root)
+        ):
             return None
         return result
     except Exception:
@@ -1396,19 +1552,10 @@ def set_secrets(values: Mapping[str, str]) -> None:
     root = _secrets_root(profile_identity)
     try:
         preselected: SecretAuthority | None = None
-        if not root.exists():
+        if not _preflight_mutation_store(root):
             preselected = _selected_new_authority(mode)
             if preselected is SecretAuthority.FILE:
                 FileKeystore(root)._require_persistent_storage_for_new_key()
-        else:
-            # Reject linked or special live artifacts before even repairing
-            # root permissions or creating a transaction lock. Corruption is
-            # exclusively doctor/repair territory.
-            authority_info = _lstat_regular_artifact(root / AUTHORITY_FILE)
-            for filename in (_KEY_FILE, _DATA_FILE):
-                _lstat_regular_artifact(root / filename)
-            if authority_info is not None:
-                load_authority_registry(root)
         _ensure_transaction_root(root)
         with _store_lock(root):
             registry = load_authority_registry(root)
@@ -1543,7 +1690,8 @@ def move_secret(
     root = _secrets_root(profile_identity)
     target = SecretAuthority(destination)
     try:
-        if target is SecretAuthority.FILE and not root.exists():
+        root_exists = _preflight_mutation_store(root)
+        if target is SecretAuthority.FILE and not root_exists:
             FileKeystore(root)._require_persistent_storage_for_new_key()
         _ensure_transaction_root(root)
         with _store_lock(root):
@@ -1570,6 +1718,7 @@ def delete_secret(key: str) -> None:
     profile_identity = _active_profile_identity()
     root = _secrets_root(profile_identity)
     try:
+        _preflight_mutation_store(root)
         _ensure_transaction_root(root)
         with _store_lock(root):
             registry = load_authority_registry(root)

@@ -192,6 +192,17 @@ Corrupt artifacts are atomically renamed into a timestamped quarantine below
 the secrets directory before replacement. Quarantine is recoverable until the
 operator explicitly prunes it.
 
+A corrupt authority registry cannot prove that an absent known plugin key was
+never registered: the lost entry may have been a `cleared` tombstone. Default
+doctor/repair therefore reports each such key as ambiguous and refuses to
+reconstruct authority, even when other surviving tier values are unambiguous.
+The explicit `--reset-unrecoverable --apply --yes` recovery quarantines the
+corrupt registry under the existing transaction lock, reconstructs surviving
+unambiguous `os`/`file` entries, and records `cleared` for every absent known
+key. The plan, findings, report, and quarantine manifest contain logical keys
+and stable codes only, never secret values. Without `--yes`, a noninteractive
+apply refuses before changing any file.
+
 If the master key is lost and no healthy alternate copy exists, repair reports
 the affected logical keys as unrecoverable. An explicit
 `--reset-unrecoverable --apply` operation quarantines the unusable artifacts,
@@ -239,21 +250,23 @@ and file-keystore replacement paths all invoke this shared boundary.
 Container and mount detection move into a small shared module with no config or
 keystore dependency cycle. A missing file-keystore master key may be created in
 a container only when the effective secrets path is on proven persistent
-storage. A distinct bind mount or named volume is affirmative evidence in
-Docker and Podman. In Kubernetes and runtimes that cannot distinguish durable
-storage from runtime-scoped storage, a generic distinct non-memory filesystem
-is `UNKNOWN`: disk-backed `emptyDir` and PVC-like mountinfo are not durable
-proof. Operators may promote that evidence only by verifying the deployment's
-storage class and retention policy and explicitly setting
+storage. A distinct bind mount or named volume is affirmative evidence only
+when the same parsed runtime evidence positively identifies Docker or Podman.
+A process identified as containerized only by a union root is an ambiguous
+runtime, as is any container not positively identified as Docker or Podman. In
+Kubernetes and those ambiguous runtimes, a generic distinct non-memory
+filesystem is `UNKNOWN`: disk-backed `emptyDir` and PVC-like mountinfo are not
+durable proof. Operators may promote that evidence only by verifying the
+deployment's storage class and retention policy and explicitly setting
 `security.container_persistence_acknowledged: true` in the active profile's
 `config.yaml`. The acknowledgement is read afresh for each inspection and is
 never exposed as a `HERMES_*` environment variable.
 
-Overlay, tmpfs, aufs, and unresolved ephemeral roots continue to fail closed.
-If mount information cannot establish persistence, the error points to a
-persistent mount, the operator acknowledgement where applicable, or the
-explicit recovery/init workflow. An acknowledgement never overrides a known
-memory or union filesystem. A fresh documented Docker/Podman `/opt/data`
+Overlay, fuse-overlayfs, tmpfs, aufs, and unresolved ephemeral roots continue
+to fail closed. If mount information cannot establish persistence, the error
+points to a persistent mount, the operator acknowledgement where applicable,
+or the explicit recovery/init workflow. An acknowledgement never overrides a
+known memory or union filesystem. A fresh documented Docker/Podman `/opt/data`
 volume must initialize successfully and survive restart.
 
 ## Strict Dry-run and Stable Errors

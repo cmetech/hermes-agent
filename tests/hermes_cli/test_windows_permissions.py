@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -15,6 +17,15 @@ SID = "S-1-5-21-1-2-3-1001"
 PLUGIN_KEY = "HERMES_PLUGIN_0123456789ABCDEF0123456789ABCDEF_TOKEN"
 
 
+def _with_reparse_attribute(info):
+    return SimpleNamespace(
+        st_mode=info.st_mode,
+        st_dev=info.st_dev,
+        st_ino=info.st_ino,
+        st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+    )
+
+
 def _completed(*, returncode: int = 0, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess(
         args=["powershell"],
@@ -22,6 +33,41 @@ def _completed(*, returncode: int = 0, stdout: str = "", stderr: str = ""):
         stdout=stdout,
         stderr=stderr,
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "function_name"),
+    [
+        ("file", "restrict_file_to_current_user"),
+        ("directory", "restrict_directory_to_current_user"),
+        ("file", "inspect_file_acl"),
+        ("directory", "inspect_directory_acl"),
+    ],
+)
+def test_acl_paths_reject_windows_reparse_points_before_powershell(
+    tmp_path, monkeypatch, kind, function_name
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = tmp_path / "artifact"
+    target.mkdir() if kind == "directory" else target.write_bytes(b"credential")
+    reparse_info = _with_reparse_attribute(target.lstat())
+    real_lstat = Path.lstat
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda candidate: (
+            reparse_info if candidate == target else real_lstat(candidate)
+        ),
+    )
+    monkeypatch.setattr(permissions, "_current_windows_sid", lambda: SID)
+    run = mock.Mock(return_value=_completed())
+    monkeypatch.setattr(permissions.subprocess, "run", run)
+
+    with pytest.raises(permissions.WindowsAclError, match="reparse"):
+        getattr(permissions, function_name)(target)
+
+    run.assert_not_called()
 
 
 def test_file_acl_uses_constant_script_and_filtered_environment(tmp_path, monkeypatch):

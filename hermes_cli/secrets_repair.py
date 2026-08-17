@@ -402,6 +402,20 @@ def _inspect_secrets() -> _SecretSnapshot:
                 )
                 break
 
+    if registry_corrupt and not file_corrupt and os_available:
+        for key in keys:
+            file_value = None if file_values is None else file_values.get(key)
+            if file_value is None and os_values.get(key) is None:
+                findings.append(
+                    _finding(
+                        "AUTHORITY_TOMBSTONE_AMBIGUOUS",
+                        "error",
+                        key,
+                        "the corrupt authority registry may have contained a "
+                        "cleared tombstone for this absent known key",
+                    )
+                )
+
     findings.extend(_inspect_permissions(root))
     findings.extend(_abandoned_temp_findings(root))
 
@@ -640,15 +654,31 @@ def _build_plan(
             for finding in snapshot.findings
             if finding.code == "COMPETING_VALUES"
         ]
+        ambiguous_tombstones = [
+            finding
+            for finding in snapshot.findings
+            if finding.code == "AUTHORITY_TOMBSTONE_AMBIGUOUS"
+        ]
         if snapshot.file_corrupt or (not snapshot.os_available and snapshot.keys):
             blocked.append(_blocked(snapshot, "AUTHORITY_CORRUPT"))
             if not snapshot.os_available and snapshot.keys:
                 blocked.append(_blocked(snapshot, "OS_UNAVAILABLE"))
         elif competing:
             blocked.extend(competing)
+        elif ambiguous_tombstones and not reset_unrecoverable:
+            blocked.extend(ambiguous_tombstones)
         else:
             actions.append(
-                RepairAction("REBUILD_AUTHORITY", None, "corrupt", preferred)
+                RepairAction(
+                    (
+                        "RESET_UNRECOVERABLE_AUTHORITY"
+                        if ambiguous_tombstones
+                        else "REBUILD_AUTHORITY"
+                    ),
+                    None,
+                    "corrupt",
+                    preferred,
+                )
             )
             nonselected = "file" if preferred == "os" else "os"
             for key in snapshot.keys:
@@ -982,7 +1012,12 @@ def _registry_with(
     return AuthorityRegistry(version=AUTHORITY_VERSION, entries=entries)
 
 
-def _reconstructed_registry(snapshot: _SecretSnapshot, preferred: str) -> AuthorityRegistry:
+def _reconstructed_registry(
+    snapshot: _SecretSnapshot,
+    preferred: str,
+    *,
+    clear_absent: bool = False,
+) -> AuthorityRegistry:
     entries: dict[str, SecretAuthority] = {}
     for key in snapshot.keys:
         file_value = (
@@ -997,6 +1032,8 @@ def _reconstructed_registry(snapshot: _SecretSnapshot, preferred: str) -> Author
             entries[key] = SecretAuthority.FILE
         elif os_value is not None:
             entries[key] = SecretAuthority.OS
+        elif clear_absent:
+            entries[key] = SecretAuthority.CLEARED
     return AuthorityRegistry(version=AUTHORITY_VERSION, entries=entries)
 
 
@@ -1071,7 +1108,11 @@ def apply_secret_repair(
     if plan.blocked_findings:
         raise RepairRefusedError("repair plan contains blocked findings")
     reset_requested = any(
-        action.code == "RESET_UNRECOVERABLE" for action in plan.actions
+        action.code in {
+            "RESET_UNRECOVERABLE",
+            "RESET_UNRECOVERABLE_AUTHORITY",
+        }
+        for action in plan.actions
     )
     if reset_requested and not confirm_reset:
         raise RepairRefusedError("unrecoverable reset requires confirmation")
@@ -1105,6 +1146,7 @@ def apply_secret_repair(
             "REPAIR_PERMISSIONS": 0,
             "CLEAN_ABANDONED_TEMP": 1,
             "REBUILD_AUTHORITY": 2,
+            "RESET_UNRECOVERABLE_AUTHORITY": 2,
             "DELETE_STALE_COPY": 3,
             "RESUME_MOVE": 4,
             "MOVE_SECRET": 5,
@@ -1153,7 +1195,10 @@ def apply_secret_repair(
                     )
                     _assert_path_unchanged(snapshot, path)
                     path.unlink()
-                elif action.code == "REBUILD_AUTHORITY":
+                elif action.code in {
+                    "REBUILD_AUTHORITY",
+                    "RESET_UNRECOVERABLE_AUTHORITY",
+                }:
                     if action.key is None:
                         authority_path = root / AUTHORITY_FILE
                         _assert_path_unchanged(snapshot, authority_path)
@@ -1174,13 +1219,25 @@ def apply_secret_repair(
                         quarantine = _quarantine_artifacts(
                             root,
                             [root / AUTHORITY_FILE],
-                            finding_codes=("AUTHORITY_CORRUPT",),
+                            finding_codes=(
+                                "AUTHORITY_CORRUPT",
+                                *(
+                                    ("AUTHORITY_TOMBSTONE_AMBIGUOUS",)
+                                    if action.code
+                                    == "RESET_UNRECOVERABLE_AUTHORITY"
+                                    else ()
+                                ),
+                            ),
                         )
                         if quarantine is not None:
                             quarantine_paths.append(quarantine)
                         assert action.destination in {"os", "file"}
                         registry = _reconstructed_registry(
-                            snapshot, action.destination
+                            snapshot,
+                            action.destination,
+                            clear_absent=(
+                                action.code == "RESET_UNRECOVERABLE_AUTHORITY"
+                            ),
                         )
                         sk._write_authority_registry(root, registry)
                     else:

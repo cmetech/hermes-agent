@@ -55,17 +55,17 @@ def test_deepest_enclosing_mount_controls_classification(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("runtime", "mount_line", "expected_reason_fragment"),
+    ("runtime_marker", "mount_line", "expected_reason_fragment"),
     [
         (
-            "docker",
+            "/.dockerenv",
             _mountinfo_line(
                 "/opt/data", fs_type="ext4", source="/dev/nvme0n1p1"
             ),
             "volume",
         ),
         (
-            "podman",
+            "/run/.containerenv",
             _mountinfo_line(
                 "/opt/data",
                 fs_type="xfs",
@@ -78,20 +78,21 @@ def test_deepest_enclosing_mount_controls_classification(tmp_path):
     ],
 )
 def test_distinct_volume_and_bind_mounts_are_persistent(
-    tmp_path, monkeypatch, runtime, mount_line, expected_reason_fragment
+    monkeypatch, runtime_marker, mount_line, expected_reason_fragment
 ):
-    from hermes_cli import container_storage
-
-    monkeypatch.setattr(
-        container_storage, "_container_runtime_kind", lambda: runtime
+    mountinfo = (
+        _mountinfo_line("/", fs_type="overlay", source="overlay") + mount_line
     )
-    mountinfo = _write_mountinfo(
-        tmp_path / "mountinfo",
-        _mountinfo_line("/", fs_type="overlay", source="overlay") + mount_line,
+    _patch_container_inputs(
+        monkeypatch,
+        existing={runtime_marker},
+        mountinfo=mountinfo,
     )
 
+    assert is_container() is True
     result = inspect_mount_persistence(
-        Path("/opt/data/secrets/not-created-yet"), mountinfo_path=mountinfo
+        Path("/opt/data/secrets/not-created-yet"),
+        mountinfo_path=Path("/proc/self/mountinfo"),
     )
 
     assert result.state is PersistenceState.PERSISTENT
@@ -174,7 +175,16 @@ def test_kubernetes_pvc_acknowledgement_is_read_fresh_each_time(
     assert third.state is PersistenceState.UNKNOWN
 
 
-def test_mountinfo_escapes_are_decoded_for_nonexistent_children(tmp_path):
+def test_mountinfo_escapes_are_decoded_for_nonexistent_children(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "security:\n  container_persistence_acknowledged: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     decoded_mount = Path("/vol with space/tab\tline\nback\\slash")
     encoded_mount = "/vol\\040with\\040space/tab\\011line\\012back\\134slash"
     mountinfo = _write_mountinfo(
@@ -288,6 +298,71 @@ def test_same_depth_stacked_mounts_are_unknown(tmp_path):
 
     assert result.state is PersistenceState.UNKNOWN
     assert "ambiguous" in result.reason
+
+
+def test_overlay_root_only_container_requires_acknowledgement_for_generic_mount(
+    monkeypatch,
+):
+    mountinfo = (
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line("/opt/data", fs_type="ext4", source="/dev/xvda")
+    )
+    _patch_container_inputs(monkeypatch, mountinfo=mountinfo)
+
+    assert is_container() is True
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"),
+        mountinfo_path=Path("/proc/self/mountinfo"),
+    )
+
+    assert result.state is PersistenceState.UNKNOWN
+    assert "ambiguous container" in result.reason
+    assert "security.container_persistence_acknowledged" in result.reason
+
+
+def test_fuse_overlayfs_mount_stays_ephemeral_despite_acknowledgement(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "security:\n  container_persistence_acknowledged: true\n",
+        encoding="utf-8",
+    )
+    mountinfo = (
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line(
+            "/opt/data",
+            fs_type="fuse-overlayfs",
+            source="fuse-overlayfs",
+        )
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    monkeypatch.delenv("HERMES_CONTAINER", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+
+    def read_text(self, *args, **kwargs):
+        if self == Path("/proc/1/cgroup"):
+            return "0::/\n"
+        if self == Path("/proc/self/mountinfo"):
+            return mountinfo
+        if self == config_path:
+            return config_path.open(encoding="utf-8").read()
+        raise FileNotFoundError(str(self))
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    assert is_container() is True
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"),
+        mountinfo_path=Path("/proc/self/mountinfo"),
+    )
+
+    assert result.state is PersistenceState.EPHEMERAL
+    assert result.fs_type == "fuse-overlayfs"
 
 
 def _patch_container_inputs(

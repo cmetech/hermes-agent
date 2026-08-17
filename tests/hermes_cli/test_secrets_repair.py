@@ -43,6 +43,7 @@ from hermes_cli.secrets_repair import (
 
 
 KEY = "HERMES_PLUGIN_0123456789ABCDEF0123456789ABCDEF_TOKEN"
+ABSENT_KEY = "HERMES_PLUGIN_FEDCBA9876543210FEDCBA9876543210_TOKEN"
 SECRET = "secret-value-must-never-be-rendered"
 
 
@@ -527,6 +528,78 @@ def test_repair_quarantines_and_reconstructs_corrupt_authority(
     ) == 0o600
 
 
+def test_corrupt_authority_with_absent_known_key_blocks_tombstone_erasure(
+    profile, fake_keyring
+):
+    root = profile / "secrets"
+    root.mkdir(parents=True, mode=0o700)
+    (root / "keystore.lock").write_bytes(b"\0")
+    os.chmod(root / "keystore.lock", 0o600)
+    (root / "authority.json").write_text("{broken-authority", encoding="utf-8")
+    os.chmod(root / "authority.json", 0o600)
+    before = snapshot_tree(profile)
+
+    assert sk.resolve_secret(KEY, legacy_value=SECRET) is None
+    report = diagnose_secrets()
+    plan = plan_secret_repair()
+
+    assert "AUTHORITY_TOMBSTONE_AMBIGUOUS" in {
+        finding.code for finding in report.findings
+    }
+    assert "AUTHORITY_TOMBSTONE_AMBIGUOUS" in {
+        finding.code for finding in plan.blocked_findings
+    }
+    assert plan.actions == ()
+    with pytest.raises(RepairRefusedError):
+        apply_secret_repair(plan)
+    assert snapshot_tree(profile) == before
+    assert sk.resolve_secret(KEY, legacy_value=SECRET) is None
+    assert SECRET not in repr(report)
+    assert SECRET not in repr(plan)
+
+
+def test_confirmed_corrupt_authority_reset_clears_absent_known_keys_and_rebuilds_values(
+    profile, fake_keyring, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        PluginConfigurationService,
+        "secret_storage_keys",
+        lambda self: [KEY, ABSENT_KEY],
+    )
+    write_file_secret(profile)
+    root = profile / "secrets"
+    (root / "authority.json").write_text("{broken-authority", encoding="utf-8")
+    os.chmod(root / "authority.json", 0o600)
+    (profile / ".env").write_text(f"{ABSENT_KEY}={SECRET}\n", encoding="utf-8")
+    before = snapshot_tree(profile)
+    parser = build_secrets_parser()
+
+    without_yes = parser.parse_args(
+        ["secrets", "repair", "--reset-unrecoverable", "--apply"]
+    )
+    with mock.patch("sys.stdin.isatty", return_value=False):
+        assert without_yes.func(without_yes) == 2
+    assert snapshot_tree(profile) == before
+
+    with_yes = parser.parse_args(
+        [
+            "secrets",
+            "repair",
+            "--reset-unrecoverable",
+            "--apply",
+            "--yes",
+        ]
+    )
+    assert with_yes.func(with_yes) == 0
+
+    assert sk.get_authority(KEY) is SecretAuthority.FILE
+    assert sk.get_authority(ABSENT_KEY) is SecretAuthority.CLEARED
+    assert sk.FileKeystore(root).get(KEY) == SECRET
+    assert sk.resolve_secret(ABSENT_KEY, legacy_value=SECRET) is None
+    assert diagnose_secrets().findings == ()
+    assert SECRET not in capsys.readouterr().out
+
+
 def test_corrupt_authority_equal_duplicates_converge_in_one_apply(
     profile, fake_keyring
 ):
@@ -814,8 +887,8 @@ def test_absolute_authority_symlink_is_quarantined_without_following_target(
 
     report = diagnose_secrets()
     assert "AUTHORITY_CORRUPT" in {finding.code for finding in report.findings}
-    plan = plan_secret_repair()
-    applied = apply_secret_repair(plan)
+    plan = plan_secret_repair(reset_unrecoverable=True)
+    applied = apply_secret_repair(plan, confirm_reset=True)
 
     assert applied.failed == ()
     assert outside.read_bytes() == before_bytes
@@ -836,7 +909,10 @@ def test_dangling_authority_symlink_is_detected_and_quarantined(
     (root / "authority.json").symlink_to(missing_target)
 
     assert "AUTHORITY_CORRUPT" in finding_codes()
-    applied = apply_secret_repair(plan_secret_repair())
+    applied = apply_secret_repair(
+        plan_secret_repair(reset_unrecoverable=True),
+        confirm_reset=True,
+    )
 
     assert applied.failed == ()
     quarantined = applied.quarantine_paths[0] / "authority.json"

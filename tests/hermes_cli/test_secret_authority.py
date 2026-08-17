@@ -1,8 +1,22 @@
 """Strict schema tests for durable per-key secret authority metadata."""
 
 import json
+import stat
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
+
+
+def _with_reparse_attribute(info):
+    return SimpleNamespace(
+        st_mode=info.st_mode,
+        st_dev=info.st_dev,
+        st_ino=info.st_ino,
+        st_size=info.st_size,
+        st_mtime_ns=info.st_mtime_ns,
+        st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+    )
 
 
 def _authority_api():
@@ -118,3 +132,34 @@ def test_authority_document_contains_states_but_never_secret_values(tmp_path):
 
     assert decoded == {"version": 1, "authorities": {"K": "file"}}
     assert secret.encode() not in encoded
+
+
+@pytest.mark.parametrize("kind", ["root", "artifact"])
+def test_authority_registry_rejects_windows_reparse_path(tmp_path, kind):
+    (
+        _AuthorityRegistry,
+        AuthorityRegistryError,
+        _SecretAuthority,
+        _encode_authority_registry,
+        load_authority_registry,
+    ) = _authority_api()
+    root = tmp_path / "secrets"
+    root.mkdir()
+    authority_path = root / "authority.json"
+    authority_path.write_bytes(b'{"version":1,"authorities":{}}\n')
+    target = root if kind == "root" else authority_path
+    reparse_info = _with_reparse_attribute(target.lstat())
+    real_lstat = type(authority_path).lstat
+
+    with (
+        mock.patch.object(
+            type(authority_path),
+            "lstat",
+            autospec=True,
+            side_effect=lambda candidate: (
+                reparse_info if candidate == target else real_lstat(candidate)
+            ),
+        ),
+        pytest.raises(AuthorityRegistryError, match="reparse|regular"),
+    ):
+        load_authority_registry(root)
