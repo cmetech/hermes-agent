@@ -11,8 +11,10 @@ Covers:
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 
 from hermes_cli.plugins import (
+    PluginCliCommandCollisionError,
     PluginContext,
     PluginManager,
     PluginManifest,
@@ -47,11 +49,33 @@ class TestRegisterCliCommand:
         assert entry["handler_fn"] is handler
         assert entry["plugin"] == "test-plugin"
 
-    def test_overwrites_on_duplicate(self):
+    def test_duplicate_from_other_plugin_raises_without_replacement(self):
         ctx, mgr = self._make_ctx()
+        first = MagicMock()
+        ctx.register_cli_command("x", "first", first)
+        other = PluginContext(PluginManifest(name="other"), mgr)
+
+        with pytest.raises(PluginCliCommandCollisionError, match="already registered"):
+            other.register_cli_command("x", "second", MagicMock())
+
+        assert mgr._cli_commands["x"]["setup_fn"] is first
+        assert mgr._cli_commands["x"]["plugin"] == "test-plugin"
+
+    def test_duplicate_from_same_plugin_also_raises(self):
+        ctx, _mgr = self._make_ctx()
         ctx.register_cli_command("x", "first", MagicMock())
-        ctx.register_cli_command("x", "second", MagicMock())
-        assert mgr._cli_commands["x"]["help"] == "second"
+
+        with pytest.raises(PluginCliCommandCollisionError):
+            ctx.register_cli_command("x", "second", MagicMock())
+
+    def test_command_owner_uses_canonical_manifest_key(self):
+        mgr = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="Display Name", key="stable-id"), mgr
+        )
+        ctx.register_cli_command("x", "help", MagicMock())
+
+        assert mgr._cli_commands["x"]["plugin"] == "stable-id"
 
 
 # ── Memory plugin CLI discovery ───────────────────────────────────────────

@@ -101,6 +101,10 @@ class PluginStaticInventoryCapacityError(RuntimeError):
     """Raised when a bounded static manifest scan exhausts its visit budget."""
 
 
+class PluginCliCommandCollisionError(RuntimeError):
+    """Raised when a plugin claims an existing top-level CLI command."""
+
+
 @dataclass
 class _PluginStaticInventoryVisitBudget:
     maximum: int
@@ -644,13 +648,22 @@ class PluginContext:
         The *setup_fn* receives an argparse subparser and should add any
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
         as the default dispatch function via ``set_defaults(func=...)``."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("plugin CLI command name must be a non-empty string")
+        plugin_id = self.manifest.key or self.manifest.name
+        existing = self._manager._cli_commands.get(name)
+        if existing is not None:
+            raise PluginCliCommandCollisionError(
+                f"plugin CLI command {name!r} is already registered by "
+                f"{existing.get('plugin')!r}"
+            )
         self._manager._cli_commands[name] = {
             "name": name,
             "help": help,
             "description": description,
             "setup_fn": setup_fn,
             "handler_fn": handler_fn,
-            "plugin": self.manifest.name,
+            "plugin": plugin_id,
         }
         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
 
@@ -2268,6 +2281,7 @@ class PluginManager:
         )
         with self._background_service_lock:
             _services_before = set(self._background_services)
+        _cli_commands_before: set[str] | None = None
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -2297,6 +2311,7 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
+                _cli_commands_before = set(self._cli_commands)
                 self._registering_plugin_id = _plugin_id
                 self._registering_manifest = manifest
                 try:
@@ -2335,11 +2350,15 @@ class PluginManager:
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
-                        if self._cli_commands[c].get("plugin") == manifest.name
+                        if self._cli_commands[c].get("plugin") == _plugin_id
                     ),
                 )
 
         except Exception as exc:
+            if _cli_commands_before is not None:
+                for command_name in set(self._cli_commands) - _cli_commands_before:
+                    if self._cli_commands[command_name].get("plugin") == _plugin_id:
+                        self._cli_commands.pop(command_name, None)
             with self._background_service_lock:
                 for qualified_name in (
                     set(self._background_services) - _services_before
