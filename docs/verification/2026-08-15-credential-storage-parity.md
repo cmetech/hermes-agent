@@ -4,205 +4,276 @@
 
 **Hermes branch:** `feat/hermes-credential-storage-parity`
 
-**Verified commit:** `1ede2f2674694b8aa6ceba0bf84a628e8198c51f`
+**Verified code commit:** `d45ca5701ce3347b4dcc431dde9c557fbc1cecf7`
 
-**Status:** macOS PASS; Windows, Linux, and Container OUTSTANDING
+**Verification record commit:** docs-only child of the verified code commit; it
+does not change the code that was exercised.
+
+**Status:** macOS PASS; Docker-specific persistence PASS; Windows,
+Linux-native, and Kubernetes OUTSTANDING
 
 ## Platform matrix
 
-| Platform | Status | Verification date | Owner | Evidence |
-|---|---|---|---|---|
-| macOS 26.5 (Darwin 25.5.0, arm64) | **PASS** | 2026-08-16 | Hermes maintainers | OS Keychain backend, production CLI and live Electron reads, built-in scheduler read, recovery workflows, startup regression, focused suites, and full repository suite all passed. |
-| Windows | **OUTSTANDING** | 2026-08-16 | Hermes maintainers — platform verification follow-up | Not run: backend, prompt behavior, CLI/desktop interpreters, environment isolation, recovery, and full suite remain outstanding. |
-| Linux | **OUTSTANDING** | 2026-08-16 | Hermes maintainers — platform verification follow-up | Not run: backend, prompt behavior, CLI/desktop interpreters, environment isolation, recovery, and full suite remain outstanding. |
-| Container | **OUTSTANDING** | 2026-08-16 | Hermes maintainers — platform verification follow-up | Not run: backend, prompt behavior, CLI/desktop interpreters, environment isolation, recovery, and full suite remain outstanding. |
+| Platform | Status | Verification date | Evidence |
+|---|---|---|---|
+| macOS 26.5 (Darwin 25.5.0, arm64) | **PASS** | 2026-08-16 | Production named-profile CLI/Keychain, actual rebuilt Electron renderer, builtin scheduler, complete recovery matrix, automated suites, and exact cleanup passed. |
+| Docker 29.4.0, named volume | **PASS — DOCKER ONLY** | 2026-08-16 | A freshly rebuilt current image passed both real persistence tests; a distinct second container read the first container's value from the same unique named volume. Containers and volume were then removed. |
+| Windows | **OUTSTANDING** | 2026-08-16 | Native backend, prompt behavior, ACL/reparse behavior, CLI/Desktop interpreter resolution, recovery, and full suite were not run. |
+| Linux-native | **OUTSTANDING** | 2026-08-16 | Native OS-keystore behavior, prompt behavior, permissions, CLI/Desktop interpreter resolution, recovery, and full suite were not run. |
+| Kubernetes | **OUTSTANDING** | 2026-08-16 | A real cluster, storage class/retention policy, acknowledgement behavior, recovery, and restart persistence were not exercised. |
 
-The outstanding rows are not inferred passes. Each requires execution on its
-named platform.
+The Docker result is specific to the tested Docker named-volume environment.
+It is not evidence for Linux-native, Kubernetes, Podman, or another container
+runtime. Outstanding rows are not inferred passes.
 
-## macOS credential evidence
+## Verification boundary and accepted automated gates
 
-The gate used a newly generated disposable `HERMES_HOME` and the
-`ericsson-gitlab` plugin's `pat` field. Before writing anything, a direct
-Keychain lookup proved that the derived account
-`hermes-profile-bbdb376a682f9b6a3cf6bfee4a49d0c6652a655216e977a63014d1712a7d0670`
-did not exist. The dummy value was generated in-process, was never printed or
-passed on a command line, and did not overwrite a user credential.
+The branch, immutable code HEAD, and tracked-clean state were checked before
+the live macOS pass. The following gates were executed and accepted by the
+root verifier against the same immutable code HEAD; the fresh macOS verifier
+recorded them and did not rerun them.
 
-- The production backend resolved to `os`, and the durable authority was
-  `os`.
-- The CLI invocation interpreter was
-  `/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python`.
-- Production `PluginConfigurationService.update` and `detail` calls wrote and
-  read the disposable value successfully. The detail API reported
-  `is_set=true` without returning the value.
-- The logical key
-  `HERMES_PLUGIN_C1E0736797ECCC74564A133264A91695_PAT` was absent from both the
-  disposable `.env` and `os.environ`. The dummy plaintext was absent from all
-  profile files, including authority metadata.
-
-An observer-only formatting error (`AttributeError`) occurred after the first
-production write. No result was claimed from that attempt: the exact account
-was immediately cleared, direct lookup proved it absent, and the complete
-write/read/isolation check was rerun successfully from a clean precondition.
-
-## Desktop and prompt behavior
-
-The current desktop bundle was rebuilt and launched as the actual Electron app
-against the same disposable profile. Using the real renderer, Settings →
-Plugins showed `ericsson-gitlab`, `Personal access token`, `Required`, and
-`Secret set`. The live result was observed twice, including a screenshot
-inspection. No credential dialog appeared and no new `SecurityAgent` or
-`CoreServicesUIAgent` process appeared, covering both the initial and repeated
-read.
-
-The desktop spawned exactly one headless backend with this interpreter and
-command:
-
-```text
-/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python -m hermes_cli.main serve --host 127.0.0.1 --port 0
-```
-
-Its environment contained the exact disposable `HERMES_HOME`. All processes
-owned by that exact profile were stopped before the scheduler gate.
-
-## Detached scheduler evidence
-
-With no profile-owned GUI, backend, gateway, or ticker process running, the
-production CLI created one due one-shot, no-agent job. An actual
-`hermes cron tick` executed it; no direct/manual job execution was used.
-
-- Job: `credential-storage-remediation-scheduler-gate` (`7a4755dce228`)
-- Execution: `e9d985fee1e84f788cb276357d625704`
-- Durable history source: `builtin`
-- Completion time: `2026-08-16T18:41:00.977349-04:00`
-- Result marker:
-  `CREDENTIAL_GATE_OK backend=os interpreter=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python`
-
-The scheduled script resolved the disposable credential through the
-production `PluginConfigurationService.detail` path. It did not print the
-credential and ran without a GUI.
-
-## Recovery evidence
-
-All recovery tests used only the disposable profile and credential account.
-The initial drift combined an equal stale file-tier duplicate, an abandoned
-authority temp file, a `0755` secrets directory, and `0644` secret files.
-
-- `hermes secrets doctor` reported `ABANDONED_TEMP`, `PERMISSION_DRIFT`, and
-  `STALE_DUPLICATE`.
-- Default `hermes secrets repair` planned `CLEAN_ABANDONED_TEMP`,
-  `DELETE_STALE_COPY`, and `REPAIR_PERMISSIONS` without mutation. A byte-and-
-  mode snapshot remained exactly
-  `764bb139ccc7ffd272edc0f90c885efa864f2b79c408479727df20c5e9d5c518`
-  before doctor, after doctor, and after default repair.
-- `repair --apply` performed the plan under the production lock. The directory
-  became `0700`, secret files became `0600`, the stale duplicate and abandoned
-  temp disappeared, and the next doctor run was clean.
-
-For recoverable corruption, authority was moved to the file tier, a healthy
-equal OS copy was retained, and the disposable file master key was corrupted.
-Doctor reported `FILE_STORE_CORRUPT`; apply rebuilt the file store from the OS
-copy and quarantined the corrupt encrypted store, key, and value-free manifest
-under `20260816T224210.609662Z-26bb0cbe`. Doctor was clean afterward.
-
-For an entirely unrecoverable disposable file tier, noninteractive
-`--reset-unrecoverable --apply` without `--yes` failed with exit code 2 and the
-required confirmation error. Its byte-and-mode snapshot remained
-`b0ed1b5793d6ae6bb33ac5a9477276a5f4f7ef797dac5ab654faa927fde2e495`.
-Repeating with `--yes` applied `RESET_UNRECOVERABLE`, set authority to
-`cleared`, and quarantined the remaining encrypted store and manifest under
-`20260816T224238.611266Z-1d26aa92`; it did not delete the earlier recovery
-quarantine. The final doctor run was clean.
-
-## Automated test evidence
-
-The exact ten-file remediation suite passed:
+The exact focused ten-file suite passed:
 
 ```text
 scripts/run_tests.sh tests/test_command_secret_source.py tests/test_bitwarden_secrets.py tests/hermes_cli/test_env_loader.py tests/hermes_cli/test_secret_authority.py tests/hermes_cli/test_secret_keystore.py tests/hermes_cli/test_plugin_configuration_storage.py tests/hermes_cli/test_secrets_repair.py tests/hermes_cli/test_windows_permissions.py tests/hermes_cli/test_container_storage.py tests/hermes_cli/test_secrets_migrate.py -v
-10 files, 380 passed, 0 failed in 17.2s (14 workers)
+10 files, 436 passed, 0 failed (14 workers)
 ```
 
-The exact real-startup regression passed:
+The real-startup regression passed:
 
 ```text
 scripts/run_tests.sh tests/hermes_cli/test_env_loader.py::test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them -v
-1 file, 1 passed, 0 failed in 0.4s (14 workers)
+1 file, 1 passed, 0 failed (14 workers)
 ```
 
-The complete suite passed on the verified commit:
+The freshly rebuilt-image real Docker gate passed:
+
+```text
+scripts/run_tests.sh tests/docker/test_secret_keystore_persistence.py --file-timeout 600 -v
+1 file, 2 passed, 0 failed
+```
+
+The rebuilt image was
+`sha256:c8120683b57fa1ce805555ee4f305f3c9c4cc3be207269a73e94ef33fcfea486`.
+Write container `stoic_haibt` and read container `condescending_davinci` were
+distinct and mounted unique volume
+`hermes-secret-persistence-87211a09870a458fa281795c367eab4e`; the second
+container read the value persisted by the first. Exact and ancestor-wide
+cleanup checks later found no matching container or volume.
+
+The mandatory full repository run passed:
 
 ```text
 scripts/run_tests.sh
-2834 files, 33831 passed, 0 failed in 999.6s (14 workers)
+2834 files, 33887 passed, 0 failed in 1075.0s (14 workers)
 ```
 
-Four files were retry-only flakes and passed on attempt 2:
+Only these two files were retry-only flakes, and both passed on attempt 2:
 
-- `tests/run_agent/test_primary_runtime_restore.py`
-- `tests/plugins/workflow/test_performance_bounds.py`
 - `tests/plugins/workflow/test_retry.py`
 - `tests/scripts/test_workflow_upstream_merge.py`
 
-Baseline `bce1f704` had 2,827 files and zero failures; the verified candidate
-has seven additional test files and no additional failures.
+Before that full run, `tests/plugins/workflow/test_retry.py` passed in
+isolation with retries disabled (`85 passed, 0 failed`), and the targeted
+`real_inline_worker_tree_charges_one_durable_provider_ledger` selection passed
+with retries disabled (`10 passed, 0 failed`). No workflow file or path differed
+from the baseline.
 
-## Blocked runs and reviewed fixes
+## Fresh macOS production CLI evidence
 
-The earlier gate at `511bf205edc4fd2935eb10cc26ab68a1dcfa02a2` was not
-accepted: the repository suite exposed eight workflow-detail failures caused
-by speculative configuration reads expanding and persisting profile defaults.
-No platform verification record was committed from that run. The reviewed
-corrections were:
+The live pass used a brand-new global Hermes root outside the developer's real
+`~/.hermes`, named profile `credcorrected-50d8c6eb`, and an isolated Desktop
+userData directory. Before setup, the global root, profile, userData, exact
+Keychain account, cron name, CDP port, build artifacts, and exact-profile
+processes were absent or free. `HERMES_PROFILE` was never used.
 
-- `6021ad3c0` — non-mutating mode reads
-- `80ebda865` — malformed-config read side-effect suppression
-- `3c85ae48b` — speculative-expansion warning suppression
-
-The first Task 8 run at `8e169de170e125790c221dc79482f0f59b170a52`
-also remained blocked. Its focused and startup gates passed, but the full suite
-reported 33,818 passes and one deterministic authority-precedence failure in
-964.4 seconds:
+Profile creation and configuration used the supported production interface:
 
 ```text
-tests/hermes_cli/test_plugin_setup_actions.py::test_connector_secret_authority_precedence_is_managed_scope_external_file
+HERMES_HOME=<GLOBAL_ROOT> .venv/bin/python -m hermes_cli.main profile create credcorrected-50d8c6eb --no-alias --no-skills
+HERMES_HOME=<GLOBAL_ROOT> .venv/bin/python -m hermes_cli.main --profile credcorrected-50d8c6eb config set secret_keystore os
 ```
 
-`tests/scripts/test_workflow_upstream_merge.py` was a retry-only flake during
-that run. No platform action or documentation update followed the failed gate.
-Commit `1ede2f267` (`fix: preserve external secret authority precedence`)
-resolved the deterministic failure. Every automated and macOS platform gate
-was then restarted and passed at the verified commit.
+A profile-local disposable plugin exposed one write-only field. Its value was
+generated in-process, never printed, never passed on a command line, and never
+placed in an environment variable.
 
-## Cleanup
+- The exact profile home was `<GLOBAL_ROOT>/profiles/credcorrected-50d8c6eb`.
+- The production backend and durable authority were both exactly `os`.
+- A fresh `PluginConfigurationService` instance after backend-cache reset read
+  the same value; an in-process SHA-256 equality assertion succeeded.
+- `detail()` returned `is_set=true` and no `value` member.
+- Direct Keychain presence lookup for the exact profile-scoped account
+  `hermes-profile-2e983f2266286702b71884a11a1355ff5b2337998d14dc4fee7981119881597c`
+  succeeded without requesting or printing the value.
+- The logical key was absent from parent and child environments and `.env`.
+  A recursive scan found no plaintext in profile files or authority metadata.
+- `secrets/` was `0700`; live authority and lock files were `0600`.
+- The interpreter was the repository
+  `/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python`.
 
-After evidence capture, only gate-owned artifacts were removed:
+## Corrected actual Electron renderer and prompt behavior
 
-- the exact job `7a4755dce228` was removed and the disposable registry reported
-  no scheduled jobs;
-- the production service cleared the exact Keychain account, followed by a
-  direct absent lookup;
-- the logical key was absent from the process environment;
-- no process retained the exact disposable `HERMES_HOME`;
-- desktop branding files generated by the build were restored to their exact
-  pre-gate tracked state;
-- generated `plugins/model-providers/otto` and the entire disposable root,
-  including profile, screenshots, helper, scheduler output, and recovery
-  quarantines, were moved to macOS Trash.
+An earlier verifier attempt used a profile-shaped `HERMES_HOME` together with
+unsupported `HERMES_PROFILE`. Desktop intentionally normalizes its input to a
+global root and selects named profiles through isolated
+`active-profile.json`; that invalid launch therefore reached the default root.
+This was a verifier-procedure error, not a product failure, and all of its exact
+processes were cleaned.
 
-Three rejected cron-creation probes (absolute script path, unsupported `1s`
-schedule, and stale past timestamp) produced no job and no run before the
-successful gate.
+For the corrected pass, `npm run build` produced the current renderer and
+Electron bundles, transformed 14,977 modules, staged native `node-pty`, and
+passed its postbuild assertion. The 12 build-owned tracked rewrites were
+restored exactly from the immutable code HEAD before launch. The isolated
+userData file contained valid JSON with exactly:
 
-A final negative check found one previously launched, detached
-`gateway restart` process (plus its two children) still carrying the exact
-disposable `HERMES_HOME`; it had recreated profile runtime state after the
-first Trash move. Only those exact-profile processes were terminated, and the
-recreated exact profile was moved separately to Trash.
+```json
+{"profile":"credcorrected-50d8c6eb"}
+```
 
-Negative verification confirmed the original disposable profile path absent,
-the exact Keychain account absent, zero exact-profile processes, no generated
-provider directory, an empty disposable cron registry before profile removal,
-and a tracked-clean checkout. Pre-existing unrelated untracked paths were not
-modified.
+The actual Electron application was then launched with only the supported
+authority inputs:
+
+```text
+HERMES_HOME=<GLOBAL_ROOT>
+HERMES_DESKTOP_USER_DATA_DIR=<ISOLATED_USER_DATA>
+HERMES_DESKTOP_HERMES_ROOT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
+HERMES_DESKTOP_CDP_PORT=50528
+```
+
+The freshly built renderer loaded from `apps/desktop/dist/index.html` and was
+observed through bounded localhost CDP. The actual named-profile child argv was:
+
+```text
+/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python -m hermes_cli.main --profile credcorrected-50d8c6eb serve --host 127.0.0.1 --port 0
+```
+
+Its interpreter and repository backend were exact. After `--profile` was
+applied, a real descendant spawned by that serve process inherited
+`HERMES_HOME=<GLOBAL_ROOT>/profiles/credcorrected-50d8c6eb`, with
+`HERMES_PROFILE` absent. This process-level inheritance proves the backend's
+effective named-profile environment.
+
+The actual renderer reached `#/settings?tab=plugins`. Its live Plugins view
+showed the unique disposable plugin and field as `Secret set`; a full renderer
+reload repeated the same assertions. No credential value appeared in captured
+output. The prompt baseline and both reads contained only the same pre-existing
+CoreServicesUIAgent PID/create-time tuple and no SecurityAgent, so there were
+zero new Keychain prompt/dialog processes.
+
+Two corrected-pass launch diagnostics also had no product significance: one
+relative Electron binary typo exited 127, and the production-stamped bundle
+correctly withheld CDP until the generated development main bundle was used to
+inspect the same freshly built renderer. Each diagnostic process tree was
+cleaned before the accepted run.
+
+## Builtin scheduler evidence
+
+With Electron, CDP, backend, gateway, and exact-profile process counts all
+zero, the production CLI created one due one-shot no-agent job under the named
+profile. Only an actual `cron tick` executed it; no direct/manual helper
+invocation was used.
+
+- Job: `credential-final-50d8c6eb` (`e4b85da3ea3e`)
+- Execution: `e1ed6c0efd3046f08a9a797a921e63c8`
+- Durable history source/status: `builtin` / `completed`
+- Claimed: `2026-08-16T23:24:25.969360-04:00`
+- Finished: `2026-08-16T23:24:26.211823-04:00`
+- Value-free result marker:
+  `CREDENTIAL_CORRECTED_GATE_OK backend=os interpreter=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python profile_home_ok=true`
+
+The scheduled helper imported the repository production credential service,
+read the durable field without printing it, required `backend=os` and
+`authority=os`, and asserted the exact named-profile home. Its recorded PID was
+absent after completion; exact-profile process count and GUI prompt delta were
+both zero.
+
+## Recovery evidence
+
+All recovery cases were confined to the disposable named profile and its exact
+account. Findings, plans, reports, and quarantine manifests were value-free.
+
+For combined permission, duplicate, and temporary-artifact drift, doctor
+reported `ABANDONED_TEMP`, six `PERMISSION_DRIFT` findings, and
+`STALE_DUPLICATE`. Default repair planned `CLEAN_ABANDONED_TEMP`,
+`DELETE_STALE_COPY`, and six `REPAIR_PERMISSIONS` actions. A whole-profile
+content/metadata snapshot covering path, type, mode, uid, gid, inode, size,
+mtime, and file bytes remained exactly
+`7dfdeeb077cf35b55c2d47bdf358ecad85886b08378b9aaff2408a7106af286d`
+before doctor, after doctor, and after default repair. Apply removed the equal
+nonauthoritative copy and abandoned temp, restored `0700`/`0600`, and the next
+doctor was clean.
+
+For corrupt-tier reconstruction, file authority had an equal healthy OS
+recovery copy when the 32-byte file master key was corrupted. Doctor reported
+`FILE_STORE_CORRUPT`; apply performed `REBUILD_FILE_STORE`, rebuilt a readable
+file authority from OS, removed the recovery duplicate, and quarantined the
+corrupt key, ciphertext, and value-free manifest under
+`20260817T032822.779758Z-45835ad2`. Doctor was clean afterward.
+
+For unambiguous corrupt-authority reconstruction, all five static inventory
+keys had file-only disposable values before authority metadata was corrupted.
+Doctor reported `AUTHORITY_CORRUPT`; default apply performed
+`REBUILD_AUTHORITY`, reconstructed five `file` entries, retained readable
+values, and quarantined the corrupt authority plus value-free manifest under
+`20260817T033001.516447Z-ac3e90fb`. The earlier quarantine remained intact and
+doctor was clean.
+
+For corrupt-authority tombstone ambiguity, the target first had durable
+`cleared` state and no tier value, while a process-generated stale legacy
+plaintext entry remained in `.env` but was suppressed. Doctor reported
+`AUTHORITY_CORRUPT` and `AUTHORITY_TOMBSTONE_AMBIGUOUS`; default repair exited
+1 and refused reconstruction. Noninteractive
+`--reset-unrecoverable --apply` without `--yes` exited 2 with the required
+confirmation error. A byte/metadata snapshot of `.env`, `config.yaml`, and the
+complete secrets tree remained exactly
+`88a641a7975b5ed428a8e5339eef383980fb48f5e3fefdd4b3c7eaa832a89730`
+across the refusal.
+
+Confirmed `--reset-unrecoverable --apply --yes` applied
+`RESET_UNRECOVERABLE_AUTHORITY`, quarantined the corrupt authority plus
+value-free manifest under `20260817T033223.743778Z-dae75972`, reconstructed the
+four surviving `file` entries, and wrote durable `cleared` for the absent
+target. The stale legacy entry remained present yet both production resolution
+and `detail()` suppressed it. The target was absent from file and OS tiers, all
+three quarantines remained recoverable until cleanup, and the following doctor
+was clean.
+
+## Cleanup and negative proof
+
+Only exact pass-owned artifacts were removed.
+
+- Supported cleanup cleared all five disposable recovery keys and legacy
+  entries, leaving doctor clean before profile removal.
+- Exact cron job `e4b85da3ea3e` was removed; the named-profile registry listed
+  no scheduled jobs.
+- Direct lookup proved the exact Keychain account absent.
+- Exact disposable/profile process count was zero; all recorded Electron,
+  backend, detached restart, and scheduler PIDs were absent; CDP port 50528 had
+  no listener. The prompt-agent baseline remained unchanged.
+- The entire temporary GLOBAL root/profile/userData, scheduler helper/output,
+  and all quarantines were moved to recoverable macOS Trash. Their original
+  `/private/tmp/hermes-credential-corrected.40a108` path is absent.
+- Precheck-absent `apps/desktop/dist`, `apps/desktop/build`, and
+  `plugins/model-providers/otto` were moved to the same Trash tree. Their
+  repository paths and Desktop TypeScript build-info artifacts are absent.
+- Docker cleanup negatives found zero current-image ancestor containers, zero
+  exact test container names, zero matching volumes, and the exact unique
+  volume absent.
+
+The developer's real default/global `~/.hermes` was unchanged from the
+read-only precheck baseline:
+
+- `config.yaml`: mode `0600`, size `7926`, mtime-ns
+  `1786660052965968961`, SHA-256
+  `1f57ef590e479e81c8312c80fe657082d93bde19aaa4955cb13e12725051ed5b`;
+- `.env`: mode `0600`, size `23389`, mtime-ns
+  `1783260935902097407`, SHA-256
+  `cedd601f9d888bba40673ad90845fb7d38006fd2adc06026f42aed37ededca34`;
+- `profiles/` remained empty; both active-profile filename variants and
+  `~/.hermes/secrets` remained absent.
+
+Unrelated state and pre-existing untracked paths were preserved. The tracked
+verification record is the only intentional repository change after all live
+gates and cleanup passed.
