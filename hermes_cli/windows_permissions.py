@@ -493,8 +493,8 @@ def _validated_direct_path(path: Path, *, directory: bool) -> tuple[int, int]:
     kind = "directory" if directory else "file"
     try:
         info = Path(path).lstat()
-    except OSError as exc:
-        raise WindowsAclError(f"cannot inspect Windows ACL {kind} path") from exc
+    except (OSError, TypeError, ValueError):
+        raise WindowsAclError("cannot inspect Windows ACL path") from None
     if _is_reparse_point(info):
         raise WindowsAclError(f"Windows ACL {kind} path is a reparse point")
     if stat.S_ISLNK(info.st_mode):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import inspect
 import stat
 from dataclasses import fields
@@ -121,6 +122,165 @@ def _target(tmp_path: Path, *, directory: bool) -> Path:
     else:
         path.write_bytes(b"credential")
     return path
+
+
+def _uninitialized_native_api(permissions, *, kernel32, advapi32):
+    api = object.__new__(permissions._WindowsAclApi)
+    api.kernel32 = kernel32
+    api.advapi32 = advapi32
+    return api
+
+
+def test_native_create_file_call_uses_win32_argument_order(tmp_path):
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+
+    def create_file(*args):
+        calls.append(args)
+        return 0xA11
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(CreateFileW=create_file),
+        advapi32=SimpleNamespace(),
+    )
+    target = tmp_path / "credential"
+
+    handle = api.open_handle(
+        target,
+        access=READ_CONTROL | WRITE_DAC,
+        flags=FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+
+    assert handle == 0xA11
+    assert calls == [
+        (
+            str(target),
+            READ_CONTROL | WRITE_DAC,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    ]
+
+
+def test_native_get_security_info_uses_owner_dacl_outputs_and_frees_descriptor():
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+    freed = []
+
+    def get_security_info(*args):
+        calls.append(args)
+        args[3]._obj.value = 0x0A11
+        args[7]._obj.value = 0x0D35
+        return 0
+
+    def equal_sid(left, right):
+        assert left.value == 0x0A11
+        assert right.value == 0x051D
+        return True
+
+    def local_free(pointer):
+        freed.append(pointer.value)
+        return None
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(LocalFree=local_free),
+        advapi32=SimpleNamespace(
+            GetSecurityInfo=get_security_info,
+            EqualSid=equal_sid,
+        ),
+    )
+    information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+
+    state = api.read_acl(
+        0xA11,
+        permissions._CurrentUserSid(SID, 0x051D, None),
+        information,
+    )
+
+    assert state.owner_matches is True
+    assert state.dacl_present is False
+    assert len(calls) == 1
+    call = calls[0]
+    assert call[0:3] == (0xA11, 1, information)
+    assert call[3] is not None
+    assert call[4] is None
+    assert call[5] is not None
+    assert call[6] is None
+    assert call[7] is not None
+    assert freed == [0x0D35]
+
+
+@pytest.mark.parametrize("set_result", [0, 5], ids=["success", "failure"])
+def test_native_set_security_info_mutates_only_protected_dacl_and_frees_descriptor(
+    set_result,
+):
+    from hermes_cli import windows_permissions as permissions
+
+    set_calls = []
+    freed = []
+
+    def convert_descriptor(candidate_sddl, revision, descriptor_out, size_out):
+        assert candidate_sddl == sddl
+        assert revision == 1
+        descriptor_out._obj.value = 0x0D35
+        size_out._obj.value = 64
+        return True
+
+    def get_dacl(descriptor, present_out, dacl_out, defaulted_out):
+        assert descriptor.value == 0x0D35
+        present_out._obj.value = True
+        dacl_out._obj.value = 0x0AC1
+        defaulted_out._obj.value = False
+        return True
+
+    def set_security_info(*args):
+        set_calls.append(args)
+        return set_result
+
+    def local_free(pointer):
+        freed.append(pointer.value)
+        return None
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(LocalFree=local_free),
+        advapi32=SimpleNamespace(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW=convert_descriptor,
+            GetSecurityDescriptorDacl=get_dacl,
+            SetSecurityInfo=set_security_info,
+        ),
+    )
+    mutation_flags = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+    sddl = f"D:P(A;;0x{FILE_PRIVATE_MASK:08x};;;{SID})"
+
+    if set_result:
+        with pytest.raises(OSError) as captured:
+            api.set_dacl(0xA11, sddl, mutation_flags)
+        assert captured.value.winerror == set_result
+    else:
+        api.set_dacl(0xA11, sddl, mutation_flags)
+
+    assert len(set_calls) == 1
+    call = set_calls[0]
+    assert call[0:3] == (0xA11, 1, mutation_flags)
+    assert call[3] is None
+    assert call[4] is None
+    assert isinstance(call[5], ctypes.c_void_p)
+    assert call[5].value == 0x0AC1
+    assert call[6] is None
+    assert not mutation_flags & (
+        OWNER_SECURITY_INFORMATION
+        | SACL_SECURITY_INFORMATION
+        | UNPROTECTED_DACL_SECURITY_INFORMATION
+    )
+    assert freed == [0x0D35]
 
 
 @pytest.mark.parametrize(
@@ -388,6 +548,34 @@ def test_native_failures_are_typed_and_do_not_disclose_payloads(tmp_path, monkey
     assert str(target) not in message
     assert secret not in message
     assert "Windows ACL" in message
+
+
+@pytest.mark.parametrize("failure_type", [OSError, ValueError, TypeError])
+def test_pre_open_path_failures_are_sanitized_without_exception_chaining(
+    tmp_path, monkeypatch, failure_type
+):
+    from hermes_cli import windows_permissions as permissions
+
+    secret = "credential-bearing-path-fragment"
+    target = tmp_path / secret
+    target.write_bytes(b"credential")
+
+    def fail_lstat(_path):
+        raise failure_type(f"cannot inspect {target}; secret={secret}")
+
+    monkeypatch.setattr(Path, "lstat", fail_lstat)
+    factory = mock.Mock()
+    monkeypatch.setattr(permissions, "_native_api", factory)
+
+    with pytest.raises(permissions.WindowsAclError) as captured:
+        permissions.restrict_file_to_current_user(target)
+
+    error = captured.value
+    assert str(error) == "cannot inspect Windows ACL path"
+    assert secret not in str(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    factory.assert_not_called()
 
 
 def test_public_api_signatures_and_inspection_shape_are_stable():
