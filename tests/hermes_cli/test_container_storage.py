@@ -100,6 +100,61 @@ def test_distinct_volume_and_bind_mounts_are_persistent(
     assert expected_reason_fragment in result.reason
 
 
+@pytest.mark.parametrize(
+    ("existing", "cgroup"),
+    [
+        ({"/.dockerenv"}, "0::/\n"),
+        ({"/run/.containerenv"}, "0::/\n"),
+        (set(), "12:memory:/docker/012345\n"),
+        (set(), "0::/machine.slice/libpod-012345.scope\n"),
+    ],
+    ids=["docker-file", "podman-file", "docker-cgroup", "podman-cgroup"],
+)
+def test_concrete_runtime_evidence_overrides_generic_container_hint(
+    monkeypatch, existing, cgroup
+):
+    mountinfo = (
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line("/opt/data", fs_type="ext4", source="/dev/xvda")
+    )
+    _patch_container_inputs(
+        monkeypatch,
+        existing=existing,
+        cgroup=cgroup,
+        mountinfo=mountinfo,
+    )
+    monkeypatch.setenv("HERMES_CONTAINER", "1")
+
+    assert is_container() is True
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"),
+        mountinfo_path=Path("/proc/self/mountinfo"),
+    )
+
+    assert result.state is PersistenceState.PERSISTENT
+    assert "persistent evidence" in result.reason
+
+
+def test_kubernetes_evidence_overrides_generic_container_hint(monkeypatch):
+    mountinfo = (
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line("/opt/data", fs_type="ext4", source="/dev/xvda")
+    )
+    _patch_container_inputs(monkeypatch, mountinfo=mountinfo)
+    monkeypatch.setenv("HERMES_CONTAINER", "1")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+
+    assert is_container() is True
+    result = inspect_mount_persistence(
+        Path("/opt/data/secrets"),
+        mountinfo_path=Path("/proc/self/mountinfo"),
+    )
+
+    assert result.state is PersistenceState.UNKNOWN
+    assert "Kubernetes" in result.reason
+    assert "ambiguous container" not in result.reason
+
+
 def test_kubernetes_disk_backed_emptydir_is_unknown_without_acknowledgement(
     tmp_path, monkeypatch
 ):

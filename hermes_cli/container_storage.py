@@ -123,9 +123,8 @@ def _unknown(reason: str) -> MountPersistence:
 
 def _container_runtime_kind(mounts: tuple[_MountInfo, ...] = ()) -> str:
     """Classify runtime markers plus the already-parsed mount evidence."""
-    if os.environ.get("HERMES_CONTAINER"):
-        return "ambiguous"
-    if os.environ.get("HERMES_DESKTOP_CHILD_PID"):
+    generic_container_hint = bool(os.environ.get("HERMES_CONTAINER"))
+    if os.environ.get("HERMES_DESKTOP_CHILD_PID") and not generic_container_hint:
         return "host"
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         return "kubernetes"
@@ -145,6 +144,8 @@ def _container_runtime_kind(mounts: tuple[_MountInfo, ...] = ()) -> str:
         return "docker"
     if "podman" in cgroup or "libpod" in cgroup:
         return "podman"
+    if generic_container_hint:
+        return "ambiguous"
     if any(marker in cgroup for marker in ("containerd", "crio", "cri-o", "/lxc/")):
         return "ambiguous"
     for mount in mounts:
