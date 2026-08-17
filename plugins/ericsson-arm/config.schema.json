@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "base_url",
+      "label": "Artifactory base URL",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Exact HTTP(S) Artifactory origin, without a path. Example: https://artifactory.rosetta.ericssondevops.com",
+      "validation": { "format": "url", "min_length": 8, "max_length": 2048 },
+      "readiness": true
+    },
+    {
+      "id": "auth_mode",
+      "label": "Authentication header",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "default": "bearer",
+      "help": "Send the token as Authorization: Bearer (modern JFrog access tokens) or as the legacy X-JFrog-Art-Api header.",
+      "validation": { "enum": ["bearer", "api_key"] },
+      "readiness": true
+    },
+    {
+      "id": "token",
+      "label": "Artifactory token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "help": "Write-only JFrog access or reference token.",
+      "validation": { "min_length": 1, "max_length": 4096 },
+      "readiness": true
+    },
+    {
+      "id": "client_cert_path",
+      "label": "Client certificate (PEM)",
+      "type": "string",
+      "storage": "setting",
+      "help": "Required when the instance is behind Cloudflare Access mTLS. Path to the client certificate PEM file.",
+      "validation": { "format": "path", "max_length": 4096 },
+      "readiness": true
+    },
+    {
+      "id": "client_key_path",
+      "label": "Client private key (PEM)",
+      "type": "string",
+      "storage": "setting",
+      "help": "Path to the private key for the client certificate. Set together with the certificate.",
+      "validation": { "format": "path", "max_length": 4096 },
+      "readiness": true
+    },
+    {
+      "id": "deploy_root",
+      "label": "Deploy source root",
+      "type": "string",
+      "storage": "setting",
+      "help": "When set, artefact uploads use POSIX descriptor traversal to stay under this directory. On Windows or unsupported platforms this confinement fails closed. Leave empty to allow any absolute path (the approval prompt still shows the exact file).",
+      "advanced": true,
+      "validation": { "format": "path", "max_length": 4096 }
+    },
+    {
+      "id": "max_deploy_megabytes",
+      "label": "Maximum upload size (MB)",
+      "type": "integer",
+      "storage": "setting",
+      "default": 2048,
+      "advanced": true,
+      "validation": { "minimum": 1, "maximum": 16384 }
+    },
+    {
+      "id": "request_timeout_seconds",
+      "label": "Request timeout (seconds)",
+      "type": "integer",
+      "storage": "setting",
+      "default": 60,
+      "help": "Hard deadline for each bounded Artifactory request. Higher than the other connectors because artefact operations move real bytes.",
+      "advanced": true,
+      "validation": { "minimum": 1, "maximum": 300 }
+    },
+    {
+      "id": "default_max_results",
+      "label": "Default maximum results",
+      "type": "integer",
+      "storage": "setting",
+      "default": 25,
+      "advanced": true,
+      "validation": { "minimum": 1, "maximum": 100 }
+    }
+  ]
+}

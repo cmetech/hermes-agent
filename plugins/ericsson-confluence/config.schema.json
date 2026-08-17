@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "id": "base_url",
+      "label": "Confluence base URL",
+      "type": "string",
+      "storage": "setting",
+      "required": true,
+      "help": "Exact HTTP(S) Confluence origin. Include /wiki for Confluence Cloud.",
+      "validation": { "format": "url", "min_length": 8, "max_length": 2048 },
+      "readiness": true
+    },
+    {
+      "id": "pat",
+      "label": "Personal access token",
+      "type": "string",
+      "storage": "secret",
+      "required": true,
+      "help": "Write-only Confluence bearer personal access token.",
+      "validation": { "min_length": 1, "max_length": 4096 },
+      "readiness": true
+    },
+    {
+      "id": "api_base_override",
+      "label": "REST API base path override",
+      "type": "string",
+      "storage": "setting",
+      "help": "Only if this instance serves the REST API somewhere other than /rest/api or /wiki/rest/api.",
+      "advanced": true,
+      "validation": { "max_length": 2048 }
+    },
+    {
+      "id": "request_timeout_seconds",
+      "label": "Request timeout (seconds)",
+      "type": "integer",
+      "storage": "setting",
+      "default": 30,
+      "advanced": true,
+      "validation": { "minimum": 1, "maximum": 120 }
+    },
+    {
+      "id": "default_max_results",
+      "label": "Default maximum results",
+      "type": "integer",
+      "storage": "setting",
+      "default": 25,
+      "advanced": true,
+      "validation": { "minimum": 1, "maximum": 100 }
+    }
+  ]
+}

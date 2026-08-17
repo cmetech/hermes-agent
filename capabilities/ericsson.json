@@ -32,6 +32,16 @@
       "path": "plugins/ericsson-sharepoint",
       "id": "ericsson-sharepoint",
       "enabled": false
+    },
+    {
+      "path": "plugins/ericsson-confluence",
+      "id": "ericsson-confluence",
+      "enabled": false
+    },
+    {
+      "path": "plugins/ericsson-arm",
+      "id": "ericsson-arm",
+      "enabled": false
     }
   ],
   "mcpServers": "mcp/mcp-servers.yaml",
@@ -89,6 +99,6 @@
       }
     }
   },
-  "vendoredFrom": "5a931bb047acd5367621db9a83890ca7dd0a67cd",
+  "vendoredFrom": "33593cde68470dc9fc2eeaa06bb0b8dfba51008a",
   "mcpServersFile": "mcp-servers.yaml"
 }
