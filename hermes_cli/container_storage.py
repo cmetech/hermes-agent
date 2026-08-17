@@ -12,10 +12,6 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-import yaml
-
-from hermes_constants import get_hermes_home
-
 
 class PersistenceState(Enum):
     PERSISTENT = "persistent"
@@ -168,18 +164,19 @@ def _container_runtime_kind(mounts: tuple[_MountInfo, ...] = ()) -> str:
 
 
 def _operator_acknowledges_container_persistence() -> bool:
-    """Read the active profile acknowledgement directly, without caching."""
+    """Read the active profile acknowledgement through the config owner."""
     try:
-        raw = yaml.safe_load(
-            (get_hermes_home() / "config.yaml").read_text(
-                encoding="utf-8", errors="strict"
-            )
+        from hermes_cli.config import get_config_path, load_config_readonly
+
+        config = load_config_readonly(
+            config_path=get_config_path(),
+            suppress_parse_failure_side_effects=True,
         )
-    except (OSError, UnicodeError, yaml.YAMLError):
+    except Exception:
         return False
-    if not isinstance(raw, dict):
+    if not isinstance(config, dict):
         return False
-    security = raw.get("security")
+    security = config.get("security")
     return (
         isinstance(security, dict)
         and security.get("container_persistence_acknowledged") is True

@@ -184,6 +184,55 @@ def test_kubernetes_disk_backed_emptydir_is_unknown_without_acknowledgement(
     assert "security.container_persistence_acknowledged" in result.reason
 
 
+def test_acknowledgement_uses_canonical_overlay_and_refreshes(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "security:\n  container_persistence_acknowledged: true\n",
+        encoding="utf-8",
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    managed_config = managed_dir / "config.yaml"
+    managed_config.write_text(
+        "security:\n  container_persistence_acknowledged: ${ACK_VALUE}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv("ACK_VALUE", "true")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    mountinfo = _write_mountinfo(
+        tmp_path / "mountinfo",
+        _mountinfo_line("/", fs_type="overlay", source="overlay")
+        + _mountinfo_line("/opt/data", fs_type="ext4", source="/dev/xvda"),
+    )
+
+    expanded_string = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+    managed_config.write_text(
+        "security:\n  container_persistence_acknowledged: true\n",
+        encoding="utf-8",
+    )
+    literal_true = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+    managed_config.write_text(
+        "security:\n  container_persistence_acknowledged: false\n",
+        encoding="utf-8",
+    )
+    literal_false = inspect_mount_persistence(
+        Path("/opt/data/secrets"), mountinfo_path=mountinfo
+    )
+
+    assert expanded_string.state is PersistenceState.UNKNOWN
+    assert literal_true.state is PersistenceState.PERSISTENT
+    assert literal_false.state is PersistenceState.UNKNOWN
+
+
 def test_kubernetes_pvc_acknowledgement_is_read_fresh_each_time(
     tmp_path, monkeypatch
 ):
