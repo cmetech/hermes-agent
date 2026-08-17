@@ -1,0 +1,7 @@
+name: ericsson-confluence
+version: 1.0.0
+description: "Ericsson Confluence tools — CQL search, Markdown page reads, space navigation, comments, and gated page authoring."
+author: Ericsson (cmetech)
+kind: standalone
+config_schema: config.schema.json
+provides_tools: [confluence_get_page, confluence_get_page_body, confluence_search, confluence_list_spaces, confluence_list_children, confluence_list_comments, confluence_create_page, confluence_update_page, confluence_add_comment]

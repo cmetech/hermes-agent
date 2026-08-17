@@ -28,6 +28,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli import container_storage
+
 logger = logging.getLogger("hermes.security_audit")
 
 # Sentinel so the audit only runs once per process even if both the CLI and
@@ -113,56 +115,8 @@ def _ssh_password_auth_enabled() -> Optional[str]:
 
 
 def _in_container() -> bool:
-    """Best-effort container detection (Docker / Podman / generic OCI)."""
-    if os.path.exists("/.dockerenv"):
-        return True
-    if os.environ.get("HERMES_DESKTOP_CHILD_PID"):
-        return False  # desktop child, not a server container
-    try:
-        cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="replace")
-        if any(tok in cgroup for tok in ("docker", "containerd", "kubepods", "libpod")):
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _path_is_mounted(path: Path) -> bool:
-    """True if *path* sits on (or under) a real mount point per /proc/mounts.
-
-    Container overlay/root filesystems are ephemeral; a bind/volume mount over
-    the data dir shows up as a distinct mount entry. We treat the path as
-    persisted when a mountpoint at or above it is NOT the container root
-    overlay.
-    """
-    try:
-        target = path.resolve()
-    except Exception:
-        target = path
-    try:
-        mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return True  # can't tell — fail safe (no warning)
-    best = None
-    best_fstype = ""
-    for line in mounts:
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        mountpoint, fstype = parts[1], parts[2]
-        try:
-            mp = Path(mountpoint)
-        except Exception:
-            continue
-        if mp == target or mp in target.parents:
-            # Longest matching mountpoint wins (most specific).
-            if best is None or len(str(mp)) > len(str(best)):
-                best = mp
-                best_fstype = fstype
-    if best is None:
-        return True
-    # overlay / tmpfs over the data dir = ephemeral container storage.
-    return best_fstype not in ("overlay", "tmpfs", "aufs")
+    """Compatibility wrapper around shared runtime detection."""
+    return container_storage.is_container()
 
 
 def _container_no_volume_mount(hermes_home: Optional[Path]) -> Optional[str]:
@@ -174,16 +128,15 @@ def _container_no_volume_mount(hermes_home: Optional[Path]) -> Optional[str]:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-    try:
-        if _path_is_mounted(home):
-            return None
-    except Exception:
+    evidence = container_storage.inspect_mount_persistence(home)
+    if evidence.state is container_storage.PersistenceState.PERSISTENT:
         return None
     return (
         f"Running in a container but the data dir ({home}) is NOT on a "
         "persistent volume mount — sessions, memory, skills, and API keys are "
-        "ephemeral and lost on container restart. Mount a host volume over the "
-        "HERMES_HOME data directory."
+        "ephemeral or persistence is unproven and may be lost on container "
+        "restart. Mount a host volume over the HERMES_HOME data directory. "
+        f"Evidence: {evidence.reason}."
     )
 
 

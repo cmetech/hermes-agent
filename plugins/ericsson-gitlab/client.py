@@ -1,33 +1,89 @@
-"""Bounded direct GitLab REST transport."""
+"""Bounded direct GitLab REST transport, on the shared connector client.
+
+Retry, Retry-After handling, backoff, deadlines and the circuit breaker now
+come from _common.client.BoundedClient.  Before this, a 429 was retried
+immediately with no delay (finding F1) -- the Jira connector had always done
+it correctly and this one had not, which is precisely the divergence a
+shared client prevents.
+"""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import time
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
 
 import httpx
 
 if __package__:
+    from ._common.client import BoundedClient
+    from ._common.errors import (
+        RETRYABLE_STATUSES,
+        ConnectorError,
+        category_for_status,
+    )
+    from ._common.transport import HttpxTransport
     from .models import GitLabAuth, GitLabError
-else:  # Standalone source tests import modules directly from the plugin root.
+else:
+    from _common.client import BoundedClient
+    from _common.errors import RETRYABLE_STATUSES, ConnectorError, category_for_status
+    from _common.transport import HttpxTransport
     from models import GitLabAuth, GitLabError
 
 
-_RETRYABLE = frozenset({429, 502, 503, 504})
-_STATUS_CATEGORY = {
-    400: "invalid_input",
-    401: "authentication",
-    403: "permission",
-    404: "not_found",
-    409: "conflict",
-    429: "rate_limited",
-}
+def _call_as_gitlab_error(operation):
+    """Call shared code and detach its exception graph at the boundary.
+
+    ConnectorError.detail may quote caller input, and GitLabError exists to
+    guarantee no remote or secret text ever reaches the host. Translating
+    here keeps that guarantee while carrying the remediation string through.
+    """
+    translated = None
+    try:
+        return operation()
+    except ConnectorError as exc:
+        translated = (exc.category, exc.remediation)
+    category, remediation = translated
+    raise GitLabError(category, remediation=remediation) from None
+
+
+class _ClientCompatibilityAdapter:
+    """Keep the raw stream hook consumed by legacy write operations."""
+
+    def __init__(self, bounded: BoundedClient, raw_client=None) -> None:
+        self._bounded = bounded
+        self._raw_client = raw_client
+
+    def request(self, *args, **kwargs):
+        return self._bounded.request(*args, **kwargs)
+
+    def operation_deadline(self) -> float:
+        return self._bounded.operation_deadline()
+
+    def close(self) -> None:
+        self._bounded.close()
+
+    @contextmanager
+    def stream(self, method: str, *args, **kwargs):
+        if self._raw_client is None:
+            raise RuntimeError("transport does not expose a streaming client")
+        mutating = method.upper() not in {"GET", "HEAD"}
+        try:
+            with self._raw_client.stream(method, *args, **kwargs) as response:
+                if mutating and response.status_code in RETRYABLE_STATUSES:
+                    raise GitLabError("write_ambiguous")
+                yield response
+        except GitLabError:
+            raise
+        except (httpx.TimeoutException, httpx.TransportError):
+            if mutating:
+                raise GitLabError("write_ambiguous") from None
+            raise
 
 
 class GitLabClient:
-    """Synchronous client with finite deadlines, retries, and response bounds."""
+    """Synchronous client with finite deadlines, retries and response bounds."""
 
     def __init__(
         self,
@@ -44,6 +100,8 @@ class GitLabClient:
         max_changes: int = 100,
         cancel_check: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        transport=None,
     ) -> None:
         if (
             not 0 < connect_timeout_seconds <= 30
@@ -57,7 +115,9 @@ class GitLabClient:
             or not 1 <= max_changes <= 500
         ):
             raise GitLabError("invalid_configuration")
+
         self.auth = authentication
+        # operations.py reads these directly; they are part of the contract.
         self.max_response_bytes = int(max_response_bytes)
         self.max_retries = int(max_retries)
         self.max_pages = int(max_pages)
@@ -69,42 +129,50 @@ class GitLabClient:
         self._read_timeout_seconds = float(read_timeout_seconds)
         self._cancel_check = cancel_check or (lambda: False)
         self._clock = clock
-        timeout = httpx.Timeout(
-            connect=connect_timeout_seconds,
-            read=read_timeout_seconds,
-            write=read_timeout_seconds,
-            pool=connect_timeout_seconds,
+
+        if transport is None:
+            transport = HttpxTransport(
+                base_url=authentication.origin,
+                headers={
+                    "PRIVATE-TOKEN": authentication.pat,
+                    "Accept": "application/json",
+                },
+                path_prefix="/api/v4/",
+                max_response_bytes=max_response_bytes,
+                connect_timeout_seconds=connect_timeout_seconds,
+                tls_context=getattr(authentication, "tls_context", None),
+            )
+        self._transport = transport
+        bounded_client = _call_as_gitlab_error(
+            lambda: BoundedClient(
+                transport,
+                service="gitlab",
+                max_retries=max_retries,
+                total_timeout_seconds=total_timeout_seconds,
+                request_timeout_seconds=read_timeout_seconds,
+                cancel_check=cancel_check,
+                clock=clock,
+                sleep=sleep,
+            )
         )
-        options: dict[str, Any] = {
-            "base_url": authentication.origin,
-            "headers": {
-                "PRIVATE-TOKEN": authentication.pat,
-                "Accept": "application/json",
-            },
-            "timeout": timeout,
-            "follow_redirects": False,
-            "trust_env": False,
-        }
-        if authentication.tls_context is not None:
-            options["verify"] = authentication.tls_context
-        self._client = httpx.Client(**options)
+        self._client = _ClientCompatibilityAdapter(
+            bounded_client, getattr(transport, "_client", None)
+        )
 
     def __repr__(self) -> str:
         return f"GitLabClient(origin={self.auth.origin!r})"
 
     def close(self) -> None:
-        self._client.close()
+        _call_as_gitlab_error(self._client.close)
+
+    def operation_deadline(self) -> float:
+        return self._client.operation_deadline()
 
     def _check_cancelled(self, deadline: float) -> None:
         if self._cancel_check():
             raise GitLabError("cancelled")
         if self._clock() >= deadline:
             raise GitLabError("deadline")
-
-    def operation_deadline(self) -> float:
-        """Create one deadline to share across every request in an operation."""
-
-        return self._clock() + self.total_timeout_seconds
 
     def _request_timeout(self, deadline: float) -> httpx.Timeout:
         remaining = deadline - self._clock()
@@ -118,22 +186,97 @@ class GitLabClient:
         )
 
     def _validate_path(self, path: str) -> None:
-        if (
-            not isinstance(path, str)
-            or not path.startswith("/api/v4/")
-            or len(path) > 8192
-            or urlsplit(path).scheme
-            or "\x00" in path
-        ):
-            raise GitLabError("invalid_input")
+        validator = getattr(self._transport, "_validate_path", None)
+        if validator is None:
+            return
+        _call_as_gitlab_error(lambda: validator(path))
 
     @staticmethod
     def _error_for_status(status: int) -> GitLabError:
-        if status in _STATUS_CATEGORY:
-            return GitLabError(_STATUS_CATEGORY[status])
-        if 500 <= status <= 599:
-            return GitLabError("transient")
-        return GitLabError("invalid_remote_data")
+        shared = ConnectorError(category_for_status(status), service="gitlab")
+        return GitLabError(shared.category, remediation=shared.remediation)
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Any | None = None,
+        deadline: float | None = None,
+    ) -> Any:
+        value, _headers = self._request(
+            method, path, params=params, json_body=json_body, deadline=deadline
+        )
+        return value
+
+    def request_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        deadline: float | None = None,
+    ):
+        """Fetch a non-JSON body (job traces, raw file contents).
+
+        Still bounded by the transport's max_response_bytes, so a runaway
+        job log cannot exhaust memory.
+        """
+        return _call_as_gitlab_error(
+            lambda: self._client.request(
+                method, path, params=params, json_body=None, deadline=deadline
+            )
+        )
+
+    def _request(self, method, path, *, params, json_body, deadline):
+        _status, value, headers = self.request_json_response(
+            method,
+            path,
+            params=params,
+            json_body=json_body,
+            deadline=deadline,
+        )
+        return value, headers
+
+    def request_json_response(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Any | None = None,
+        deadline: float | None = None,
+        raise_on_status: bool = True,
+    ) -> tuple[int, Any, Mapping[str, str]]:
+        """Return status, bounded decoded JSON and headers via the public client."""
+
+        if deadline is None:
+            deadline = self.operation_deadline()
+        response = _call_as_gitlab_error(
+            lambda: self._client.request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                deadline=deadline,
+                raise_on_status=raise_on_status,
+            )
+        )
+        invalid_json = False
+        try:
+            value = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            invalid_json = True
+        if invalid_json:
+            mutating = method.upper() not in {"GET", "HEAD"}
+            if not raise_on_status and response.status >= 400:
+                value = None
+            elif mutating:
+                raise GitLabError("write_ambiguous") from None
+            else:
+                raise GitLabError("invalid_remote_data") from None
+        return response.status, value, response.headers
 
     def get_json(
         self,
@@ -142,9 +285,9 @@ class GitLabClient:
         params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
     ) -> Any:
-        """Perform a proven-safe GET and decode one bounded JSON body."""
-
-        value, _headers = self.get_json_page(path, params=params, deadline=deadline)
+        value, _headers = self.get_json_page(
+            path, params=params, deadline=deadline
+        )
         return value
 
     def get_json_page(
@@ -154,48 +297,7 @@ class GitLabClient:
         params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
     ) -> tuple[Any, Mapping[str, str]]:
-        """Return bounded JSON plus a copied header map for pagination."""
-
-        self._validate_path(path)
-        if deadline is None:
-            deadline = self.operation_deadline()
-        attempt = 0
-        while True:
-            self._check_cancelled(deadline)
-            response = None
-            try:
-                with self._client.stream(
-                    "GET",
-                    path,
-                    params=params,
-                    timeout=self._request_timeout(deadline),
-                ) as current:
-                    response = current
-                    if 300 <= response.status_code < 400:
-                        raise GitLabError("invalid_remote_data")
-                    if response.status_code >= 400:
-                        error = self._error_for_status(response.status_code)
-                        if response.status_code in _RETRYABLE and attempt < self.max_retries:
-                            attempt += 1
-                            self._check_cancelled(deadline)
-                            continue
-                        raise error
-                    body = bytearray()
-                    for chunk in response.iter_bytes():
-                        self._check_cancelled(deadline)
-                        if len(body) + len(chunk) > self.max_response_bytes:
-                            raise GitLabError("capacity")
-                        body.extend(chunk)
-            except GitLabError:
-                raise
-            except (httpx.TimeoutException, httpx.TransportError):
-                self._check_cancelled(deadline)
-                if attempt < self.max_retries:
-                    attempt += 1
-                    self._check_cancelled(deadline)
-                    continue
-                raise GitLabError("transient") from None
-            try:
-                return json.loads(bytes(body)), dict(response.headers)
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                raise GitLabError("invalid_remote_data") from None
+        """Return bounded JSON plus headers, for X-Total pagination."""
+        return self._request(
+            "GET", path, params=params, json_body=None, deadline=deadline
+        )

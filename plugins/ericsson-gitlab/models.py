@@ -20,14 +20,24 @@ SAFE_ERROR_MESSAGES = {
     "cancelled": "GitLab request was cancelled",
     "deadline": "GitLab request deadline was exceeded",
     "capacity": "GitLab result exceeded a safe limit",
+    "write_ambiguous": "GitLab write outcome is unknown",
+    "circuit_open": "GitLab calls are paused after repeated failures",
+    "confirmation_required": "GitLab change needs explicit confirmation",
 }
 
 
 class GitLabError(RuntimeError):
     """Stable error with no remote body, path, or credential text."""
 
-    def __init__(self, category: str, message: str | None = None) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str | None = None,
+        *,
+        remediation: str | None = None,
+    ) -> None:
         self.category = category if category in SAFE_ERROR_MESSAGES else "transient"
+        self.remediation = remediation
         super().__init__(message or SAFE_ERROR_MESSAGES[self.category])
 
 

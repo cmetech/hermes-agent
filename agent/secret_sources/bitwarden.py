@@ -59,6 +59,7 @@ from agent.secret_sources._cache import (
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
 from agent.secret_sources.base import get_source_environment
+from hermes_cli.plugin_secret_keys import without_plugin_secret_keys
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,7 @@ def _platform_asset_name() -> str:
         try:
             res = subprocess.run(
                 ["ldd", "--version"],
+                env=without_plugin_secret_keys(os.environ),
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 timeout=2,
@@ -677,6 +679,7 @@ def _run_bws_list(
         env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     else:
         env = dict(source_env)
+    env = without_plugin_secret_keys(env)
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")

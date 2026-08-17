@@ -4,13 +4,13 @@
 
 **Goal:** Store per-profile plugin secrets (Jira/GitLab/Confluence/ARM PATs) in the OS-native credential store with an encrypted-file fallback, so no plugin PAT is ever written to `~/.hermes/.env` in plaintext or exported into `os.environ`.
 
-**Architecture:** A new `hermes_cli/secret_keystore.py` provides a two-tier store mirroring super-cli's design: probe an OS keystore (`keyring` → macOS Keychain / Windows Credential Manager / Linux Secret Service); if unreachable, fall back to an AES-GCM encrypted file with `0700` directory and `0600` key and ciphertext. Lookups are lazy and per-key — the module never enumerates and never touches `os.environ`. It is wired into `plugin_configuration.py` at exactly two points: consulted in `_resolved()` only when the existing legacy authorities miss, and used in place of `save_env_value()` on the write path. A `hermes secrets migrate` command moves existing `HERMES_PLUGIN_*` entries out of `.env`.
+**Architecture:** A new `hermes_cli/secret_keystore.py` provides a two-tier store mirroring super-cli's design: probe an OS keystore (`keyring` → macOS Keychain / Windows Credential Manager / Linux Secret Service); if unreachable, fall back to an AES-GCM encrypted file with `0700` directory and `0600` key and ciphertext. File-tier transactions are cross-process locked and atomically replaced. Lookups are lazy and per-key — the module never enumerates and never touches `os.environ`. It is wired into `plugin_configuration.py` at three points: consulted in `_resolved()` only when the existing legacy authorities miss, used in place of `save_env_value()` on the write path, and cleared alongside the `.env` entry in `clear_secret()` so a revocation actually revokes. A `hermes secrets migrate` command moves existing `HERMES_PLUGIN_*` entries out of `.env`, while startup scrubs still-unmigrated plugin keys from the process environment without breaking legacy file resolution.
 
 **Tech Stack:** Python 3.11+, `keyring` (new dependency), `cryptography` 48.0.1 (already pinned), pytest via `scripts/run_tests.sh`.
 
-**Spec:** `/Users/coreyellis/tmp_supercli/SUPER-CLI-ARCHITECTURE.md` §4.2 (super-cli's credential model, the design being matched) and `/Users/coreyellis/tmp_supercli/PLUGIN-GAP-ANALYSIS.md` (the gap this closes).
+**Spec:** `SUPER-CLI-ARCHITECTURE.md` (super-cli analysis workspace) §4.2 (super-cli's credential model, the design being matched) and `PLUGIN-GAP-ANALYSIS.md` (super-cli analysis workspace) (the gap this closes).
 
-**Repo:** `/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent`
+**Repo:** `hermes-agent` (this repo)
 
 ## Global Constraints
 
@@ -18,6 +18,7 @@
 - **Purely additive to the precedence ladder.** 556 test files touch `.env` / `load_env` / `save_env_value`. Do NOT change `save_env_value` or `load_env` semantics for any key other than `HERMES_PLUGIN_*`.
 - **Never place a plugin secret in `os.environ`.** No `os.environ[...] = ...`, no `mirror_process_env=True`, no registration as a startup `SecretSource` (its `apply_all` writes to `os.environ` by design).
 - **Never block on an interactive prompt.** The backend runs headless under the desktop app, the workflow scheduler and cron. Probing and reads must fail fast to the fallback rather than hang.
+- **Never abandon a credential mutation.** Python cannot cancel a timed-out keyring worker. Only probes and reads may use the daemon timeout helper; `set`/`delete` stay synchronous so a mutation cannot commit after failure and tier demotion were reported.
 - **Never silently write plaintext.** If both keystore tiers fail, raise — do not fall back to `.env`.
 - **File modes match super-cli exactly:** directory `0o700`, key file `0o600`, ciphertext `0o600`.
 - **Existing precedence is preserved:** managed env > secret scope > external secret sources > `.env` — the keystore is consulted only when all of those miss.
@@ -31,22 +32,26 @@ These were judgement calls made while writing the plan. Flag any you disagree wi
 |---|---|---|
 | D1 | Keystore is consulted **last**, only when legacy authorities miss | Preserves managed/scope/external override precedence and keeps un-migrated `.env` working. Purely additive. |
 | D2 | Migration is **explicit** (`hermes secrets migrate`), not automatic on read | An automatic migration mutating `.env` as a side effect of a read is surprising and hard to test. Explicit + `--dry-run` is reviewable. |
-| D3 | Keystore is **default-on** (`auto`), overridable via `HERMES_SECRET_KEYSTORE` | Opt-in leaves the insecure default in place, which is the actual problem. `auto` degrades safely via probe. |
+| D3 | Keystore is **default-on** (`auto`), overridable via `secret_keystore` in `config.yaml` | Opt-in leaves the insecure default in place, which is the actual problem; `auto` degrades safely via probe. The mode lives in `config.yaml`, not a new `HERMES_*` var: `AGENTS.md:124` rejects those for non-secret config and this is a feature flag. `HERMES_SECRET_KEYSTORE` survives only as the internal bridge that same rule permits — undocumented, for tests and emergency override. |
 | D4 | In containers, the file tier requires a **persisted** key; an ephemeral key is refused loudly | Silently generating a key that vanishes on restart would destroy credentials and be blamed on this feature. |
 | D5 | Service name `hermes.plugin-secrets` | Mirrors super-cli's `contextcore.super-cli`; namespaced so it never collides with other Hermes keychain items. |
+| D6 | Bound probes/reads, but keep OS `set`/`delete` synchronous | `keyring` has no cancellation primitive. A synchronous caller observes the actual completion or failure; a safe fail-fast mutation would require an explicit outcome-unknown state machine and reconciliation before any tier switch, not the read-time daemon helper. |
 
 ## File Structure
 
 | File | Responsibility |
 |---|---|
-| **Create** `hermes_cli/secret_keystore.py` | Two-tier keystore: probe, OS backend, encrypted-file backend, lazy `get_secret`/`set_secret`/`delete_secret`. Self-contained; no Hermes config imports beyond `get_hermes_home`. |
+| **Create** `hermes_cli/secret_keystore.py` | Two-tier keystore: probe, OS backend, transaction-locked atomic encrypted-file backend, lazy `get_secret`/`set_secret`/`delete_secret`. Self-contained apart from `get_hermes_home` and `load_config_readonly` (mode). |
 | **Create** `tests/hermes_cli/test_secret_keystore.py` | Unit tests for both backends, probe behaviour, file modes, crypto round-trip. |
 | **Create** `hermes_cli/secrets_migrate.py` | `HERMES_PLUGIN_*` migration: enumerate from `.env`, write to keystore, verify read-back, remove from `.env`. |
+| **Create** `hermes_cli/plugin_secret_keys.py` | Dependency-free predicate for recognizing the exact legacy plugin-secret key shape. Shared by migration and startup scrubbing. |
 | **Create** `tests/hermes_cli/test_secrets_migrate.py` | Migration tests including dry-run and verify-before-delete. |
+| **Modify** `hermes_cli/env_loader.py` | Remove legacy plugin-secret keys from `os.environ` after startup sources load, without changing `load_env()` compatibility. |
+| **Modify** `tests/hermes_cli/test_env_loader.py` | Real-startup regression proving a legacy `.env` plugin PAT remains readable through `load_env()` but is not exported process-wide. |
 | **Modify** `hermes_cli/plugin_configuration.py:1024-1042` | Read path: consult keystore when legacy authorities miss. |
 | **Modify** `hermes_cli/plugin_configuration.py:1182-1193` | Write path: keystore instead of `save_env_value`. |
 | **Modify** `pyproject.toml` | Add `keyring` dependency. |
-| **Modify** `hermes_cli/plugins_cmd.py` | Register the `secrets migrate` subcommand. |
+| **Modify** `hermes_cli/main.py:11521` | Add `migrate` to the existing `secrets` subparser. |
 | **Modify** `hermes_cli/config.py:861-876` | `_secure_file`: apply a real ACL on Windows instead of no-op. |
 | **Create** `tests/hermes_cli/test_secure_file_windows.py` | Windows ACL behaviour, managed/container skips, POSIX unchanged. |
 
@@ -78,7 +83,9 @@ In `pyproject.toml`, in the same dependency list that contains `cryptography==48
 - [ ] **Step 2: Install and verify the import**
 
 Run: `.venv/bin/python -m pip install 'keyring==25.6.0'`
-Then: `.venv/bin/python -c "import keyring; print(keyring.__version__)"`
+Then: `.venv/bin/python -c "import keyring, importlib.metadata as m; print(m.version('keyring'))"`
+
+`keyring` exposes no `__version__` attribute — importlib.metadata is the portable way to read an installed distribution's version, and it also proves the *distribution* is installed rather than merely importable.
 Expected: `25.6.0`
 
 - [ ] **Step 3: Verify no dependency resolution conflict**
@@ -118,13 +125,24 @@ Create `tests/hermes_cli/test_secret_keystore.py`:
 ```python
 """Tests for hermes_cli.secret_keystore — two-tier plugin secret storage."""
 
+import multiprocessing
 import os
 import stat
 import sys
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from hermes_cli.secret_keystore import FileKeystore, KeystoreError
+
+
+def _concurrent_file_writer(root, prefix, start, count):
+    """Spawn-safe worker used by the real cross-process transaction test."""
+    store = FileKeystore(Path(root))
+    start.wait(timeout=10)
+    for index in range(count):
+        store.set(f"{prefix}-{index}", f"value-{prefix}-{index}")
 
 
 class TestFileKeystore:
@@ -181,7 +199,90 @@ class TestFileKeystore:
         (tmp_path / "keystore.key").write_bytes(b"\x00" * 32)
         with pytest.raises(KeystoreError, match="cannot decrypt"):
             FileKeystore(tmp_path).get("K")
+
+    def test_interrupted_atomic_replace_preserves_previous_ciphertext(self, tmp_path):
+        """Direct truncation destroys the last good store when a write fails."""
+        store = FileKeystore(tmp_path)
+        store.set("existing", "survives")
+
+        with mock.patch(
+            "hermes_cli.secret_keystore.os.replace", side_effect=OSError("disk full")
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                store.set("new", "not-committed")
+
+        reopened = FileKeystore(tmp_path)
+        assert reopened.get("existing") == "survives"
+        assert reopened.get("new") is None
+
+    def test_concurrent_processes_do_not_lose_updates_or_split_the_key(self, tmp_path):
+        """Hermes CLI, gateway and desktop may write one profile concurrently."""
+        ctx = multiprocessing.get_context("spawn")
+        start = ctx.Event()
+        workers = [
+            ctx.Process(
+                target=_concurrent_file_writer,
+                args=(str(tmp_path), f"p{worker}", start, 12),
+            )
+            for worker in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            start.set()
+            for worker in workers:
+                worker.join(timeout=20)
+                assert not worker.is_alive(), "keystore transaction deadlocked"
+                assert worker.exitcode == 0
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        store = FileKeystore(tmp_path)
+        assert len(store.keys()) == 48
+        for worker in range(4):
+            for index in range(12):
+                assert store.get(f"p{worker}-{index}") == f"value-p{worker}-{index}"
+
+
+class TestContainerKeyPersistence:
+    """Decision D4: an ephemeral key in a container is refused loudly.
+
+    Generating one silently is the worst available outcome -- every secret
+    written under it becomes unreadable at the next restart, and the symptom
+    ("my credentials vanished") gives no hint of the cause.
+    """
+
+    def test_new_key_in_a_container_is_refused(self, tmp_path):
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
+            with pytest.raises(KeystoreError, match="persistent volume"):
+                FileKeystore(tmp_path).set("K", "v")
+
+    def test_refusal_leaves_no_key_file_behind(self, tmp_path):
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
+            with pytest.raises(KeystoreError):
+                FileKeystore(tmp_path).set("K", "v")
+        assert not (tmp_path / "keystore.key").exists()
+
+    def test_an_existing_key_in_a_container_is_fine(self, tmp_path):
+        """A mounted volume with a key already on it is the supported setup —
+        the refusal is about *creating* a key, not about containers."""
+        FileKeystore(tmp_path).set("K", "v")           # key created outside the container
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=True):
+            assert FileKeystore(tmp_path).get("K") == "v"
+
+    def test_outside_a_container_a_new_key_is_created(self, tmp_path):
+        with mock.patch("hermes_cli.secret_keystore._in_container", return_value=False):
+            FileKeystore(tmp_path).set("K", "v")
+        assert (tmp_path / "keystore.key").exists()
 ```
+
+Patch `hermes_cli.secret_keystore._in_container` because D4 intentionally uses that
+narrow local predicate. `config._is_container()` also treats `HERMES_SKIP_CHMOD` as a
+container signal; that setting is a permission opt-out for NFS/SMB hosts and must not
+cause key creation to be refused.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -210,12 +311,24 @@ Two properties are load-bearing and must not be relaxed:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets as _secrets
+import tempfile
+import threading
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# The one Hermes import this module allows itself beyond get_hermes_home.
+# _is_container already exists at hermes_cli/config.py:836 and honours the
+# HERMES_CONTAINER / HERMES_SKIP_CHMOD opt-outs plus the /.dockerenv marker,
+# so container detection stays one implementation rather than two.
+#
+# D4's container check is _in_container() below rather than
+# config._is_container(): that helper also returns True for HERMES_SKIP_CHMOD,
+# a permission opt-out used on NFS and SMB mounts that are not containers.
 
 __all__ = ["KeystoreError", "FileKeystore"]
 
@@ -223,6 +336,8 @@ _KEY_BYTES = 32
 _NONCE_BYTES = 12
 _KEY_FILE = "keystore.key"
 _DATA_FILE = "keystore.enc"
+_LOCK_FILE = "keystore.lock"
+_FILE_THREAD_LOCK = threading.RLock()
 
 
 class KeystoreError(RuntimeError):
@@ -259,6 +374,24 @@ class FileKeystore:
                     f"got {len(raw)}"
                 )
             return raw
+
+        # D4: in a container, minting a fresh key is usually a silent
+        # data-loss bug rather than first-run setup. If HERMES_HOME is not a
+        # persisted volume, the key dies with the container and every secret
+        # encrypted under it becomes permanently unreadable -- and the symptom
+        # ("all my credentials vanished after a restart") points nowhere near
+        # the cause. Refuse loudly instead, and name the fix.
+        if _in_container():
+            raise KeystoreError(
+                f"refusing to generate a new encryption key at {path} inside a "
+                f"container. The key would not survive a restart and every "
+                f"secret written under it would become unreadable. Mount "
+                f"HERMES_HOME on a persistent volume. Setting "
+                f"secret_keystore: off in config.yaml disables the keystore "
+                f"entirely -- it does NOT resume .env writes, which the write "
+                f"path refuses by design."
+            )
+
         raw = _secrets.token_bytes(_KEY_BYTES)
         _write_private(path, raw)
         return raw
@@ -300,20 +433,64 @@ class FileKeystore:
     # -- public API -----------------------------------------------------
 
     def get(self, key: str) -> str | None:
-        return self._read_all().get(key)
+        with _store_lock(self._root):
+            return self._read_all().get(key)
 
     def set(self, key: str, value: str) -> None:
-        data = self._read_all()
-        data[key] = value
-        self._write_all(data)
-
-    def delete(self, key: str) -> None:
-        data = self._read_all()
-        if data.pop(key, None) is not None:
+        # The lock covers the complete read-modify-write transaction. Locking
+        # only _write_all still loses one writer's update when two Hermes
+        # processes read the same previous dictionary.
+        with _store_lock(self._root):
+            data = self._read_all()
+            data[key] = value
             self._write_all(data)
 
+    def delete(self, key: str) -> None:
+        with _store_lock(self._root):
+            data = self._read_all()
+            if data.pop(key, None) is not None:
+                self._write_all(data)
+
     def keys(self) -> list[str]:
-        return list(self._read_all())
+        with _store_lock(self._root):
+            return list(self._read_all())
+
+
+@contextlib.contextmanager
+def _store_lock(root: Path):
+    """Serialize one whole file-store transaction across threads/processes.
+
+    The separate lock file remains stable while key/ciphertext files are
+    replaced atomically. Native advisory locks are released automatically if
+    a process crashes. The thread lock is also required because POSIX flock
+    ownership semantics alone do not provide a portable same-process mutex.
+    """
+    lock_path = root / _LOCK_FILE
+    with _FILE_THREAD_LOCK:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            _chmod(lock_path, 0o600)
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _chmod(path: Path, mode: int) -> None:
@@ -324,31 +501,61 @@ def _chmod(path: Path, mode: int) -> None:
         pass
 
 
-def _write_private(path: Path, payload: bytes) -> None:
-    """Write owner-only, creating with restrictive mode from the start.
+def _in_container() -> bool:
+    """Container detection for D4, narrower than config._is_container.
 
-    os.open with 0o600 avoids the window where a chmod-after-write would
-    leave the file world-readable.
+    config._is_container() also returns True for HERMES_SKIP_CHMOD, which is
+    a *permission* opt-out people set on NFS and SMB mounts where 0600 breaks
+    multi-UID access -- ordinary hosts, not containers. Reusing it here would
+    refuse key creation on an NFS box and give the operator a message about
+    persistent volumes that makes no sense on their machine.
+
+    HERMES_CONTAINER stays honoured: that one does mean "container".
     """
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if os.environ.get("HERMES_CONTAINER"):
+        return True
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
     try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
+            cgroup = handle.read()
+    except OSError:
+        return False
+    return any(marker in cgroup for marker in ("docker", "lxc", "kubepods"))
+
+
+def _write_private(path: Path, payload: bytes) -> None:
+    """Atomically replace an owner-only file.
+
+    The temporary file lives beside the target, so os.replace is atomic on the
+    same filesystem. A crash or disk error before replace leaves the last good
+    key/ciphertext intact rather than exposing a truncated live file.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as handle:
+            fd = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        _chmod(path, 0o600)
     except BaseException:
-        try:
+        if fd >= 0:
             os.close(fd)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
         raise
-    _chmod(path, 0o600)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secret_keystore.py -v`
-Expected: PASS (11 tests)
+Expected: PASS (16 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -382,7 +589,9 @@ Append to `tests/hermes_cli/test_secret_keystore.py`:
 from unittest import mock
 
 from hermes_cli.secret_keystore import (
+    PROBE_TIMEOUT_SECONDS,
     SERVICE_NAME,
+    _PROBE_VALUE,
     OSKeystore,
     probe_os_keystore,
 )
@@ -455,7 +664,61 @@ class TestProbe:
         fake.get_password = lambda service, name: "wrong-value"
         with mock.patch("hermes_cli.secret_keystore.keyring", fake):
             assert probe_os_keystore() is False
+
+    def test_probe_gives_up_on_a_hanging_backend(self):
+        """The failure mode that a try/except cannot catch.
+
+        A locked Linux keyring or a D-Bus Secret Service that never answers
+        blocks inside keyring rather than raising. The Global Constraints
+        require probing to "fail fast to the fallback rather than hang", and
+        an exception handler does not deliver that.
+
+        The worker is released and joined INSIDE the patch. An earlier draft
+        exited the `with` block first, which restored the real keyring module
+        while the abandoned worker was still mid-round-trip -- so its next
+        call resolved the real backend and touched the developer's actual
+        keychain. Releasing first keeps the fake in place for the whole life
+        of the thread.
+        """
+        import threading
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def set_password(self, service, name, value):
+                released.wait(timeout=10)   # unblocked by the test, not the probe
+
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                return _PROBE_VALUE
+
+            def delete_password(self, service, name):
+                finished.set()
+
+        with mock.patch("hermes_cli.secret_keystore.keyring", _HangingKeyring()):
+            start = time.monotonic()
+            result = probe_os_keystore(timeout_seconds=0.25)
+            elapsed = time.monotonic() - start
+
+            assert result is False
+            assert elapsed < 5.0, (
+                f"probe blocked for {elapsed:.1f}s instead of failing fast"
+            )
+
+            # Let the abandoned worker finish against the fake, then wait for
+            # it, so no thread outlives the patch.
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_probe_timeout_is_configurable_and_defaulted(self):
+        import inspect
+
+        signature = inspect.signature(probe_os_keystore)
+        assert signature.parameters["timeout_seconds"].default == PROBE_TIMEOUT_SECONDS
 ```
+
+Add `import time` and `PROBE_TIMEOUT_SECONDS` to this test module's imports.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -480,9 +743,34 @@ try:  # pragma: no cover - import guard exercised via mock.patch
 except Exception:  # ImportError, or a backend that explodes at import time
     keyring = None
 
+# Imported by class rather than matched on type(exc).__name__: a string
+# comparison silently stops working if keyring renames or re-homes the
+# exception, and the failure mode is a swallowed revocation error.
+try:  # pragma: no cover - exercised via mock.patch
+    from keyring.errors import PasswordDeleteError as _PasswordDeleteError
+except Exception:  # keyring absent, or an older layout
+    class _PasswordDeleteError(Exception):
+        """Never raised; keeps the except clause below well-typed."""
+
+
 SERVICE_NAME = "hermes.plugin-secrets"
 _PROBE_KEY = "__hermes_probe__"
 _PROBE_VALUE = "ok"
+# The probe runs once per process, on the path that decides which tier to
+# use. A locked Linux keyring or an unresponsive D-Bus Secret Service blocks
+# rather than raising, so the bound has to be a timeout, not an except.
+PROBE_TIMEOUT_SECONDS = 3.0
+# Task 3 owns the health primitives because OSKeystore uses them immediately.
+# Task 4 replaces _mark_os_unhealthy's body to add auto-tier demotion, but the
+# Task 3 commit is independently runnable and green.
+_OS_HEALTHY = True
+_OS_CALL_LOCK = threading.Lock()
+
+
+def _mark_os_unhealthy() -> None:
+    """Latch future bounded OS reads off for the life of this process."""
+    global _OS_HEALTHY
+    _OS_HEALTHY = False
 
 
 class OSKeystore:
@@ -495,43 +783,130 @@ class OSKeystore:
 
     name = "os"
 
-    def get(self, key: str) -> str | None:
+    def _guard(self) -> None:
+        """Refuse if this backend is unavailable or already hung.
+
+        Bounded reads call this while holding _OS_CALL_LOCK. That makes the
+        check-and-spawn transition atomic: concurrent callers cannot all see a
+        healthy latch and each abandon a worker before the first timeout.
+        """
         if keyring is None:
             raise KeystoreError("keyring is not available")
-        try:
-            return keyring.get_password(SERVICE_NAME, key)
-        except Exception as exc:
-            raise KeystoreError(f"keystore read failed for {key}") from exc
+        if not _OS_HEALTHY:
+            raise KeystoreError(
+                "os keystore stopped responding earlier in this process"
+            )
+
+    def _bounded_read(self, operation):
+        # Hold the lock through the timeout decision. Waiting callers then see
+        # the false latch and fail without starting another worker.
+        with _OS_CALL_LOCK:
+            self._guard()
+            sentinel = object()
+            try:
+                value = _call_bounded(operation, PROBE_TIMEOUT_SECONDS, sentinel)
+            except Exception as exc:
+                raise KeystoreError("keystore read failed") from exc
+            if value is sentinel:
+                _mark_os_unhealthy()
+                raise KeystoreError("keystore read timed out")
+            return value
+
+    def get(self, key: str) -> str | None:
+        """Read one secret, bounded.
+
+        A successful probe does not make later reads safe: a keychain can be
+        unlocked at startup and locked again by screen-lock or policy while
+        the process runs. The Global Constraint covers reads as well as the
+        probe, so the same bound applies here. A timeout raises KeystoreError,
+        which get_secret turns into "not configured" rather than a hang.
+        """
+        return self._bounded_read(lambda: keyring.get_password(SERVICE_NAME, key))
 
     def set(self, key: str, value: str) -> None:
-        if keyring is None:
-            raise KeystoreError("keyring is not available")
+        """Write one secret synchronously, with failures propagated.
+
+        keyring exposes no cancellation primitive. Putting a mutation on the
+        daemon timeout worker is unsafe: a timed-out set_password can commit
+        later, after the caller was told it failed and after auto mode moved to
+        the file tier. A later restart would then resurrect that credential.
+        Probe/read are bounded because their user-secret operation is
+        side-effect free; mutations remain synchronous until the backend can
+        offer a cancellable or reconcilable API.
+        """
+        self._guard()
         try:
             keyring.set_password(SERVICE_NAME, key, value)
         except Exception as exc:
-            raise KeystoreError(f"keystore write failed for {key}") from exc
+            raise KeystoreError("keystore write failed") from exc
 
     def delete(self, key: str) -> None:
-        if keyring is None:
-            raise KeystoreError("keyring is not available")
+        """Remove one secret. Absent is success; anything else raises.
+
+        The distinction matters because this is the revocation path. keyring
+        raises PasswordDeleteError specifically for "no such item", so an
+        absent key is separable from a backend that refused -- and a refusal
+        must reach the caller. Swallowing every exception here would make
+        clear_secret report success while the credential kept working, which
+        is the failure this whole feature exists to prevent.
+        """
+        self._guard()
+
+        def _delete():
+            try:
+                keyring.delete_password(SERVICE_NAME, key)
+            except _PasswordDeleteError:
+                return None  # already absent -- the desired end state
+            return None
+
         try:
-            keyring.delete_password(SERVICE_NAME, key)
-        except Exception:
-            # Deleting an absent item is not an error, and no backend
-            # distinguishes "missing" from "failed" portably.
-            pass
+            _delete()
+        except Exception as exc:
+            raise KeystoreError("keystore delete failed") from exc
 
 
-def probe_os_keystore() -> bool:
-    """Return True only when a full set/get/delete round trip succeeds.
+def _call_bounded(operation, timeout_seconds: float, default):
+    """Run `operation` on a daemon worker, returning `default` on timeout.
 
-    Mirrors super-cli's ``NewStore``, which writes a ``probe`` entry before
-    committing to the OS keyring.  Any exception means "unavailable" — a
-    headless Linux box with no D-Bus session, a container, or a locked
-    keychain must degrade to the file tier rather than raise.
+    Two failure modes exist and only one is an exception. A missing backend
+    RAISES and is handled by the caller's except. A locked keyring or an
+    unresponsive D-Bus Secret Service HANGS, and no except clause will ever
+    see it -- while the Global Constraints require probing *and reads* to
+    fail fast to the fallback rather than block. The backend runs headless
+    under the desktop app, the workflow scheduler and cron, where a hang is
+    indistinguishable from a crash.
+
+    signal.alarm is not an option: it only works on the main thread of the
+    main interpreter and this runs inside a spawned backend. This helper is
+    deliberately limited to probes and reads. A read has no side effect; the
+    probe touches only its namespaced, self-cleaning key. It must never wrap
+    set_secret/delete_secret: Python cannot cancel the worker, so a timed-out
+    credential mutation could commit after failure was reported. Tests faking
+    the probe backend must keep the fake in place until the worker is done.
     """
-    if keyring is None:
-        return False
+    import threading
+
+    outcome: list = []
+
+    def _run() -> None:
+        try:
+            outcome.append(operation())
+        except BaseException as exc:   # noqa: BLE001 - relayed to the caller
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_run, name="hermes-keystore-io", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive() or not outcome:
+        return default
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _probe_round_trip() -> bool:
+    """One set/get/delete cycle. Runs on a worker thread — see below."""
     try:
         keyring.set_password(SERVICE_NAME, _PROBE_KEY, _PROBE_VALUE)
         observed = keyring.get_password(SERVICE_NAME, _PROBE_KEY)
@@ -543,12 +918,44 @@ def probe_os_keystore() -> bool:
         except Exception:
             pass
     return observed == _PROBE_VALUE
+
+
+def probe_os_keystore(timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> bool:
+    """Return True only when a full set/get/delete round trip succeeds in time.
+
+    Mirrors super-cli's ``NewStore``, which writes a ``probe`` entry before
+    committing to the OS keyring.  Two distinct failure modes have to be
+    handled, and only one of them is an exception:
+
+    * **Raises** — no backend installed, permission denied, keyring absent.
+      Caught by ``_probe_round_trip``.
+    * **Hangs** — a locked Linux keyring, or a D-Bus Secret Service that
+      accepts the call and never answers.  No ``except`` clause will ever
+      see this, and the Global Constraints require failing fast to the
+      fallback rather than blocking: the backend runs headless under the
+      desktop app, the workflow scheduler and cron, where a hang is
+      indistinguishable from a crash.
+
+    A daemon worker thread bounds the second case.  ``signal.alarm`` is not
+    an option — it only works on the main thread of the main interpreter,
+    and this runs inside a spawned backend.  The thread is abandoned rather
+    than killed, which is safe: it holds no lock this process needs, and
+    daemon threads do not block interpreter shutdown. It DOES still complete
+    its call afterwards -- for the probe that means writing and then deleting
+    a namespaced probe key, idempotent and self-cleaning, but a real write.
+    Any test faking the backend must keep the fake in place until the worker
+    has finished, or the abandoned thread will reach the real keyring.
+    """
+    if keyring is None:
+        return False
+    # Timeout -> False -> fall through to the file tier.
+    return _call_bounded(_probe_round_trip, timeout_seconds, False)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secret_keystore.py -v`
-Expected: PASS (19 tests)
+Expected: PASS (26 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -663,7 +1070,244 @@ class TestModuleLevelAPI:
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secret_keystore.py -v -k "BackendSelection or ModuleLevelAPI"`
 Expected: FAIL — `AttributeError: module 'hermes_cli.secret_keystore' has no attribute 'reset_backend_cache'`
 
-- [ ] **Step 3: Implement the facade**
+- [ ] **Step 3: Register the setting in DEFAULT_CONFIG**
+
+`hermes config set secret_keystore file` validates the key against `DEFAULT_CONFIG`
+(`hermes_cli/config.py:4883` → `_validate_config_key`); an unregistered key is rejected with
+a "did you mean" suggestion. Without this the *documented* way to change the mode does not
+work at all, and only the undocumented env bridge would — precisely backwards.
+
+In `hermes_cli/config_defaults.py`, add to `DEFAULT_CONFIG`:
+
+```python
+    # Where plugin secrets live: "auto" probes the OS keystore and falls back
+    # to an encrypted file; "os" / "file" pin one tier; "off" disables the
+    # keystore entirely -- it does NOT resume .env writes, which the write
+    # path refuses by design.
+    "secret_keystore": "auto",
+```
+
+Add a test to `tests/hermes_cli/test_secret_keystore.py` covering the real path, not just
+the bridge:
+
+```python
+class TestBoundedReads:
+    def test_a_blocking_read_times_out_rather_than_hanging(self):
+        """The probe passing does not make later reads safe: a keychain can
+        be unlocked at startup and re-locked by screen-lock mid-process."""
+        import threading
+        import time as _time
+
+        import hermes_cli.secret_keystore as sk
+
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+                return "late"
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            store = sk.OSKeystore()
+            start = _time.monotonic()
+            with pytest.raises(sk.KeystoreError, match="timed out"):
+                store.get("K")
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, f"read blocked for {elapsed:.1f}s"
+            released.set()
+            assert finished.wait(timeout=5.0), "abandoned worker never completed"
+
+    def test_concurrent_reads_spawn_at_most_one_worker(self, tmp_path, monkeypatch):
+        """The latch must cover concurrent callers, not only a serial loop."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+        callers_ready = threading.Barrier(6)
+        calls = []
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                calls.append(name)
+                released.wait(timeout=10)
+                finished.set()
+
+        results = []
+
+        def _resolve(index):
+            callers_ready.wait(timeout=5)
+            results.append(sk.get_secret(f"K{index}"))
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            with mock.patch.object(sk, "PROBE_TIMEOUT_SECONDS", 0.2):
+                assert sk.get_backend().name == "os"
+                callers = [
+                    threading.Thread(target=_resolve, args=(index,))
+                    for index in range(5)
+                ]
+                for caller in callers:
+                    caller.start()
+                callers_ready.wait(timeout=5)
+                for caller in callers:
+                    caller.join(timeout=5)
+                    assert not caller.is_alive()
+
+            # Exactly one call reached keyring. The other four waited for the
+            # atomic check/spawn transition, then saw the false latch.
+            assert len(calls) == 1
+            assert results == [None] * 5
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_forced_os_mode_is_not_demoted(self, tmp_path, monkeypatch):
+        """"os" pins the tier. Demoting would move reads to a store that does
+        not hold the operator's secrets, which looks like data loss."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+        released = threading.Event()
+        finished = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+                finished.set()
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            assert sk.get_backend().name == "os"
+            assert sk.get_secret("K") is None       # timed out, swallowed
+            assert sk.get_backend().name == "os"    # tier NOT swapped
+            assert sk._OS_HEALTHY is False          # but latched unusable
+            released.set()
+            assert finished.wait(timeout=5), "abandoned worker never completed"
+
+    def test_a_timed_out_read_demotes_the_backend(self, tmp_path, monkeypatch):
+        """One hang is enough evidence. Without demotion, resolving N secrets
+        against a wedged keychain abandons N threads and burns N timeouts."""
+        import threading
+
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "auto")
+        released = threading.Event()
+
+        class _HangingKeyring:
+            def get_password(self, service, name):
+                released.wait(timeout=10)
+
+        sk.reset_backend_cache()
+        with mock.patch.object(sk, "keyring", _HangingKeyring()):
+            with mock.patch.object(sk, "probe_os_keystore", return_value=True):
+                assert sk.get_backend().name == "os"
+                assert sk.get_secret("K") is None       # timed out, swallowed
+                assert sk.get_backend().name == "file"  # demoted
+            released.set()
+
+
+class TestRevocationFailuresPropagate:
+    """Already repaired once. Untested, it regresses silently -- and its
+    symptom is a credential the dashboard says is gone that still works."""
+
+    def test_os_delete_raises_when_the_backend_refuses(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = RuntimeError("dbus refused")
+        with mock.patch.object(sk, "keyring", broken):
+            with pytest.raises(sk.KeystoreError):
+                sk.OSKeystore().delete("K")
+
+    def test_os_delete_treats_absent_as_success(self):
+        import hermes_cli.secret_keystore as sk
+
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.delete_password.side_effect = sk._PasswordDeleteError("no such item")
+        with mock.patch.object(sk, "keyring", broken):
+            sk.OSKeystore().delete("K")   # must not raise
+
+    def test_module_delete_secret_propagates(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sk.reset_backend_cache()
+        broken = mock.Mock()
+        broken.name = "os"
+        broken.delete.side_effect = sk.KeystoreError("refused")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(sk.KeystoreError):
+                sk.delete_secret("K")
+
+
+class TestConfigSetting:
+    def test_mode_is_a_settable_config_key(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG.get("secret_keystore") == "auto"
+
+    def test_config_key_passes_validation(self):
+        from hermes_cli.config import _validate_config_key
+
+        assert _validate_config_key("secret_keystore")[0] is True
+
+    def test_config_yaml_value_is_honoured(self, tmp_path, monkeypatch):
+        """The documented path. Earlier tests only exercised the env bridge,
+        so a mode read that ignored config.yaml would have passed them all."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend().name == "file"
+
+    def test_env_bridge_overrides_config(self, tmp_path, monkeypatch):
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "file"},
+        )
+        sk.reset_backend_cache()
+        assert sk.get_backend() is None
+
+    def test_a_typo_in_config_falls_back_to_auto(self, monkeypatch):
+        """This runs on the credential-resolution path; a typo must not make
+        every plugin unreadable."""
+        import hermes_cli.secret_keystore as sk
+
+        monkeypatch.delenv("HERMES_SECRET_KEYSTORE", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda *a, **k: {"secret_keystore": "fille"},
+        )
+        sk.reset_backend_cache()
+        # A typo resolves to "auto", and "auto" probes the OS keystore -- so
+        # without this patch the test would write a probe entry into the
+        # developer's real Keychain, or raise an authorisation prompt in CI.
+        with mock.patch.object(sk, "probe_os_keystore", return_value=False):
+            assert sk.get_backend() is not None
+            assert sk.get_backend().name == "file"
+```
+
+- [ ] **Step 4: Implement the facade**
 
 In `hermes_cli/secret_keystore.py`, extend `__all__` and append:
 
@@ -676,20 +1320,54 @@ __all__ += [
     "reset_backend_cache",
 ]
 
-import threading
-
 _BACKEND = None
 _BACKEND_RESOLVED = False
 _BACKEND_LOCK = threading.Lock()
-_MODE_ENV = "HERMES_SECRET_KEYSTORE"
+# _OS_HEALTHY, _OS_CALL_LOCK and the base _mark_os_unhealthy() are introduced
+# in Task 3 because OSKeystore already consumes them there. This task extends
+# the marker with automatic-tier demotion.
+# AGENTS.md:124 rejects new HERMES_* env vars for non-secret config: ".env is
+# for secrets only ... All behavioral settings -- timeouts, thresholds, feature
+# flags, display prefs -- go in config.yaml." The keystore mode is a feature
+# flag, so config.yaml is its home. AGENTS.md does permit an internal bridge
+# env var, which _MODE_ENV remains -- undocumented, for tests and emergency
+# override only. User-facing docs must point at config.yaml.
+_MODE_KEY = "secret_keystore"
+_MODE_ENV = "HERMES_SECRET_KEYSTORE"  # internal bridge; not user-facing
+_VALID_MODES = frozenset({"auto", "os", "file", "off"})
+
+
+def _resolve_mode() -> str:
+    """config.yaml `secret_keystore`, with an internal env bridge.
+
+    Precedence is env-then-config so a test or an operator unpicking a broken
+    keychain can override without editing config.yaml. An unrecognised value
+    falls back to "auto" rather than raising: this runs on the credential
+    resolution path, and a typo in config.yaml must not make every plugin
+    unreadable.
+    """
+    raw = os.environ.get(_MODE_ENV)
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            raw = config.get(_MODE_KEY) if isinstance(config, dict) else None
+        except Exception:
+            raw = None
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in _VALID_MODES else "auto"
 
 
 def reset_backend_cache() -> None:
     """Clear the cached backend. For tests and for post-migration re-probe."""
-    global _BACKEND, _BACKEND_RESOLVED
-    with _BACKEND_LOCK:
-        _BACKEND = None
-        _BACKEND_RESOLVED = False
+    global _BACKEND, _BACKEND_RESOLVED, _OS_HEALTHY
+    # Match the read-time lock order: OS call lock, then backend lock.
+    with _OS_CALL_LOCK:
+        with _BACKEND_LOCK:
+            _BACKEND = None
+            _BACKEND_RESOLVED = False
+            _OS_HEALTHY = True
 
 
 def _secrets_root():
@@ -710,7 +1388,7 @@ def get_backend():
     with _BACKEND_LOCK:
         if _BACKEND_RESOLVED:
             return _BACKEND
-        mode = (os.environ.get(_MODE_ENV) or "auto").strip().lower()
+        mode = _resolve_mode()
         if mode == "off":
             _BACKEND = None
         elif mode == "file":
@@ -725,18 +1403,51 @@ def get_backend():
         return _BACKEND
 
 
+def _mark_os_unhealthy() -> None:
+    """Latch the OS keystore as unusable, and in "auto" fall back to file.
+
+    Two separable things happen here, and conflating them was a real defect:
+
+    * The **latch** (`_OS_HEALTHY = False`) always applies. `_OS_CALL_LOCK`
+      makes the check-and-spawn transition atomic, so even concurrent readers
+      can abandon at most one worker per process.
+    * The **demotion** applies only in "auto" mode. "os" pins the tier
+      deliberately; swapping under the operator would move reads to a store
+      that does not hold their secrets, which presents as data loss rather
+      than as the keychain problem it actually is.
+
+    Deliberately not a circuit breaker with a recovery window: a keychain
+    that stops answering mid-process stays that way until the session is
+    unlocked, and re-probing on a timer would reintroduce the stall on a
+    schedule.
+    """
+    global _OS_HEALTHY, _BACKEND, _BACKEND_RESOLVED
+    _OS_HEALTHY = False
+    if _resolve_mode() == "os":
+        return
+    with _BACKEND_LOCK:
+        if _BACKEND is not None and getattr(_BACKEND, "name", None) == "os":
+            _BACKEND = FileKeystore(_secrets_root())
+            _BACKEND_RESOLVED = True
+
+
 def get_secret(key: str) -> str | None:
     """Return one secret, or None.
 
     Never raises.  A read failure must look like "not configured" so the
     caller reports a missing credential instead of crashing an agent turn.
     """
-    backend = get_backend()
-    if backend is None:
-        return None
+    # get_backend() is inside the try on purpose. It constructs FileKeystore,
+    # which creates $HERMES_HOME/secrets and can raise OSError, and it runs
+    # D4's container check, which raises KeystoreError. Leaving it outside
+    # would break the "never raises" contract on the exact paths most likely
+    # to fail -- a read-only home, a full disk, a container without a volume.
     try:
+        backend = get_backend()
+        if backend is None:
+            return None
         return backend.get(key)
-    except KeystoreError:
+    except (KeystoreError, OSError):
         return None
 
 
@@ -749,27 +1460,32 @@ def set_secret(key: str, value: str) -> None:
     backend = get_backend()
     if backend is None:
         raise KeystoreError(
-            f"secret keystore is disabled ({_MODE_ENV}=off); cannot store {key}"
+            f"secret keystore is disabled (secret_keystore: off in config.yaml); "
+            f"cannot store {key}"
         )
     backend.set(key, value)
 
 
 def delete_secret(key: str) -> None:
+    """Remove one secret. Raises KeystoreError if the backend refused.
+
+    Deliberately NOT symmetric with get_secret, which swallows failures so a
+    read looks like "not configured". A failed delete is a failed revocation:
+    the caller must be able to tell the operator the credential is still live
+    rather than showing them a cleared field.
+    """
     backend = get_backend()
     if backend is None:
         return
-    try:
-        backend.delete(key)
-    except KeystoreError:
-        pass
+    backend.delete(key)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secret_keystore.py -v`
-Expected: PASS (28 tests)
+Expected: PASS (47 tests)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add hermes_cli/secret_keystore.py tests/hermes_cli/test_secret_keystore.py
@@ -794,70 +1510,135 @@ This is the additive change that keeps all 556 env-touching tests green. The key
 
 Append to `tests/hermes_cli/test_plugin_configuration_storage.py`:
 
+**Every test here drives `PluginConfigurationService`, never `secret_keystore` directly.**
+That is the whole point of this task: the behaviour under test is *"the read path
+consults the keystore"*, and a test that calls `sk.set_secret()` then `sk.get_secret()`
+asserts only that Task 4 works — it would pass with `_resolved()` completely untouched,
+letting this task be marked done while changing nothing. Use the file's existing
+`_service()` helper and read resolved state through `service.detail()`, exactly as
+`test_profile_secret_reads_ignore_process_global_value` already does.
+
 ```python
 from unittest import mock
 
 import hermes_cli.secret_keystore as sk
-from hermes_cli.plugin_configuration import _secret_storage_key
+
+
+def _token_field(service):
+    """Resolved state of the sample connector's secret field, via detail()."""
+    return next(
+        field
+        for field in service.detail("sample-connector")["fields"]
+        if field["id"] == "token"
+    )
 
 
 class TestKeystoreReadPath:
-    def test_keystore_value_used_when_env_has_no_entry(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    def test_keystore_value_is_resolved_when_env_has_no_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """RED before Task 5: .env has no entry, so detail() reports the
+        field unset no matter what the keystore holds."""
+        from hermes_cli.plugin_configuration import _secret_storage_key
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
         sk.reset_backend_cache()
-        key = _secret_storage_key("ericsson-jira", "pat")
-        sk.set_secret(key, "from-keystore")
-        assert sk.get_secret(key) == "from-keystore"
+        service, _ = _service(tmp_path)
+        sk.set_secret(_secret_storage_key("sample-connector", "token"), "from-keystore")
+
+        assert _token_field(service)["is_set"] is True
 
     def test_legacy_env_value_wins_over_keystore(self, tmp_path, monkeypatch):
         """Un-migrated .env entries must keep working, and managed/scoped
-        overrides ride the same path — so legacy authorities take precedence."""
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        overrides ride the same path — so legacy authorities take precedence.
+
+        Asserted through the real resolution order rather than a reimplementation
+        of it: the point is that `_resolved` consults the keystore *after* the
+        profile store, and only a test that runs `_resolved` can show that.
+        """
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationService,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
         sk.reset_backend_cache()
-        key = _secret_storage_key("ericsson-jira", "pat")
+        service, manager = _service(tmp_path)
+        key = _secret_storage_key("sample-connector", "token")
         sk.set_secret(key, "from-keystore")
-        with mock.patch(
-            "hermes_cli.plugin_configuration.PluginConfigurationService"
-            "._profile_secret_values",
+
+        with mock.patch.object(
+            PluginConfigurationService,
+            "_profile_secret_values",
             staticmethod(lambda: {key: "from-env"}),
         ):
-            resolved = _resolve_secret_for_test(key)
-        assert resolved == "from-env"
+            resolved, _invalid = service._resolved(
+                "sample-connector", manager._plugins["sample-connector"]
+            )
 
-    def test_keystore_read_failure_yields_not_configured(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert resolved["token"] == "from-env"
+
+    def test_keystore_is_consulted_only_after_the_profile_store_misses(
+        self, tmp_path, monkeypatch
+    ):
+        """Precedence is an ordering property, so assert on the call itself.
+
+        Without this, a read path that consulted the keystore *first* and then
+        let .env overwrite the result would still satisfy the test above.
+        """
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationService,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         sk.reset_backend_cache()
+        service, manager = _service(tmp_path)
+        key = _secret_storage_key("sample-connector", "token")
+
+        with mock.patch.object(
+            PluginConfigurationService,
+            "_profile_secret_values",
+            staticmethod(lambda: {key: "from-env"}),
+        ):
+            with mock.patch.object(sk, "get_secret") as get_secret:
+                service._resolved(
+                    "sample-connector", manager._plugins["sample-connector"]
+                )
+
+        get_secret.assert_not_called()
+
+    def test_keystore_read_failure_leaves_the_field_unconfigured(
+        self, tmp_path, monkeypatch
+    ):
+        """A broken keystore must not raise out of a read path the dashboard
+        calls on every page load — it degrades to 'not configured'."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
         broken = mock.Mock()
         broken.name = "os"
         broken.get.side_effect = sk.KeystoreError("boom")
+
         with mock.patch.object(sk, "get_backend", return_value=broken):
-            assert sk.get_secret("anything") is None
-```
-
-Add this helper at the top of the same file, so the precedence test exercises the real resolution order rather than reimplementing it:
-
-```python
-def _resolve_secret_for_test(storage_key: str) -> str | None:
-    """Mirror of the SECRET branch in PluginConfigurationService._resolved.
-
-    Kept in the test file deliberately: if the production precedence changes,
-    this assertion should be updated consciously rather than silently pass.
-    """
-    from hermes_cli.plugin_configuration import PluginConfigurationService
-
-    values = PluginConfigurationService._profile_secret_values()
-    value = values.get(storage_key)
-    if value in {None, ""}:
-        value = sk.get_secret(storage_key)
-    return value
+            assert _token_field(service)["is_set"] is False
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_plugin_configuration_storage.py -v -k KeystoreReadPath`
-Expected: FAIL — `ImportError: cannot import name '_secret_storage_key'` or `AttributeError` on `sk.reset_backend_cache`, depending on task ordering.
+
+Expected: FAIL, and **check the reason**. The first test must fail on
+`assert _token_field(service)["is_set"] is True` — i.e. the read path does not yet
+consult the keystore. If instead it errors on an import or a missing
+`sk.reset_backend_cache`, Task 4 is incomplete: fix that first, then re-run, because an
+import error proves nothing about the behaviour this task adds.
+
+`test_keystore_is_consulted_only_after_the_profile_store_misses` is expected to **pass**
+before implementation — nothing calls the keystore yet. It is a regression guard for the
+ordering, not a RED test, and it must still pass after Step 3.
 
 - [ ] **Step 3: Modify the read path**
 
@@ -922,47 +1703,106 @@ git commit -m "feat: resolve plugin secrets from OS keystore when .env has no en
 ### Task 6: Write path — store to the keystore instead of `.env`
 
 **Files:**
-- Modify: `hermes_cli/plugin_configuration.py:1182-1193`
+- Modify: `hermes_cli/plugin_configuration.py:1182-1193` (save path, in `update()`)
+- Modify: `hermes_cli/plugin_configuration.py:1196-1220` (`clear_secret()`)
 - Test: `tests/hermes_cli/test_plugin_configuration_storage.py`
 
 **Interfaces:**
-- Consumes: `secret_keystore.set_secret`, `secret_keystore.KeystoreError`
-- Produces: no new public API; saved secrets no longer reach `.env`
+- Consumes: `secret_keystore.set_secret`, `secret_keystore.delete_secret`, `secret_keystore.KeystoreError`
+- Produces: no new public API; saved secrets no longer reach `.env`, and cleared secrets are removed from **both** tiers
 
-- [ ] **Step 1: Write the failing test**
+**`clear_secret` is part of this task, not a follow-up.** Moving writes to the keystore
+while leaving `clear_secret` calling `remove_env_value` alone produces a revocation bug:
+the operator clears a credential in the dashboard, the UI reports it gone because `.env`
+no longer has it, and the keystore copy keeps authenticating. A credential that cannot be
+revoked through the revoke button is worse than one stored in plaintext.
+
+- [ ] **Step 1: Write the failing tests**
+
+As in Task 5, every test drives `PluginConfigurationService` — `update()` and
+`clear_secret()` — never `secret_keystore` directly. A test that calls `sk.set_secret()`
+and then inspects `.env` is asserting that Task 2 works, and would pass with this task's
+production change never made.
 
 Append to `tests/hermes_cli/test_plugin_configuration_storage.py`:
 
 ```python
 class TestKeystoreWritePath:
-    def test_saved_secret_does_not_reach_env_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    def test_saved_secret_does_not_reach_the_env_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
         sk.reset_backend_cache()
-        env_path = tmp_path / ".env"
-        env_path.write_text("EXISTING=keepme\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
 
-        key = _secret_storage_key("ericsson-jira", "pat")
-        sk.set_secret(key, "should-not-be-in-env")
+        service.update("sample-connector", secrets={"token": "should-not-be-in-env"})
 
-        contents = env_path.read_text(encoding="utf-8")
+        env_path = tmp_path / "profile" / ".env"
+        contents = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
         assert "should-not-be-in-env" not in contents
-        assert "EXISTING=keepme" in contents
 
-    def test_keystore_write_failure_raises_not_silently_plaintext(
+    def test_saved_secret_is_readable_back_through_detail(self, tmp_path, monkeypatch):
+        """Round trip through the production paths, not the keystore API."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        service.update("sample-connector", secrets={"token": "v"})
+
+        assert _token_field(service)["is_set"] is True
+
+    def test_unrelated_env_entries_are_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        env_path = tmp_path / "profile" / ".env"
+        env_path.write_text("EXISTING=keepme\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+
+        service.update("sample-connector", secrets={"token": "v"})
+
+        assert "EXISTING=keepme" in env_path.read_text(encoding="utf-8")
+
+    def test_keystore_write_failure_raises_rather_than_writing_plaintext(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        """Global Constraint: never silently write plaintext. If both tiers
+        are unavailable the save must fail loudly."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "off")
         sk.reset_backend_cache()
-        with pytest.raises(sk.KeystoreError):
-            sk.set_secret("HERMES_PLUGIN_X_PAT", "v")
+        service, _ = _service(tmp_path)
+
+        with pytest.raises(PluginConfigurationError):
+            service.update("sample-connector", secrets={"token": "v"})
+
+        env_path = tmp_path / "profile" / ".env"
+        contents = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        assert "token" not in contents.lower() or "v" not in contents
+
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+**Write and clear are two RED/GREEN cycles, not one.** Add and run `TestKeystoreWritePath`
+first, implement the write path, and only then add `TestKeystoreClearPath`. The ordering is
+forced by what makes the clear tests fail:
+
+> Before the write path changes, `update()` still writes to `.env`, and the existing
+> `clear_secret` still removes from `.env` — so the whole round trip already works and
+> **`test_clearing_removes_the_keystore_copy` would pass against unmodified code.** It only
+> becomes a genuine RED once writes land in the keystore and the clear is left behind.
+
+Writing both suites up front and running them together would show a green clear test and
+invite the conclusion that no clear-path work is needed — which is precisely the revocation
+bug this task exists to close.
+
+- [ ] **Step 2: Run the write tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_plugin_configuration_storage.py -v -k KeystoreWritePath`
-Expected: FAIL
+
+Expected: FAIL — `test_saved_secret_does_not_reach_the_env_file` fails because the secret
+*is* in `.env`. If it errors on an import instead, an earlier task is incomplete; fix that
+first, because an import error proves nothing about this task's behaviour.
 
 - [ ] **Step 3: Modify the write path**
 
@@ -1003,12 +1843,162 @@ with:
 
 Leave the `save_env_value` / `ConfigurationPersistenceError` import in place if it is still used for non-secret settings elsewhere in the file; remove it only if it becomes unused (the linter will tell you).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Now write the clear tests, and verify they fail**
+
+Only now — with writes landing in the keystore — is the clear path genuinely broken.
+Append to `tests/hermes_cli/test_plugin_configuration_storage.py`:
+
+```python
+class TestKeystoreClearPath:
+    def test_clearing_removes_the_keystore_copy(self, tmp_path, monkeypatch):
+        """The revocation bug this task exists to prevent: writes go to the
+        keystore, so a clear that only touches .env leaves the credential
+        live while the UI reports it gone."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+        service.update("sample-connector", secrets={"token": "live-credential"})
+        assert _token_field(service)["is_set"] is True
+
+        service.clear_secret("sample-connector", "token")
+
+        assert _token_field(service)["is_set"] is False
+
+    def test_clearing_an_absent_secret_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        service.clear_secret("sample-connector", "token")
+
+        assert _token_field(service)["is_set"] is False
+
+    def test_a_refused_revocation_raises_and_keeps_the_env_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """If the keystore refuses, the operator must be told -- and the .env
+        entry must survive, because removing it while the keystore copy still
+        authenticates would leave a live credential with nothing pointing at
+        it. Fail with both copies intact rather than half-revoked."""
+        from hermes_cli.plugin_configuration import (
+            PluginConfigurationError,
+            _secret_storage_key,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        key = _secret_storage_key("sample-connector", "token")
+        (tmp_path / "profile" / ".env").write_text(
+            f"{key}=legacy-plaintext\n", encoding="utf-8"
+        )
+        service, _ = _service(tmp_path)
+
+        broken = mock.Mock()
+        broken.name = "file"
+        broken.delete.side_effect = sk.KeystoreError("refused")
+        with mock.patch.object(sk, "get_backend", return_value=broken):
+            with pytest.raises(PluginConfigurationError):
+                service.clear_secret("sample-connector", "token")
+
+        contents = (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
+        assert "legacy-plaintext" in contents, "env entry removed despite a failed revocation"
+
+    def test_clearing_still_removes_an_unmigrated_env_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """Profiles that have not run `hermes secrets migrate` keep a .env
+        entry. Clearing must remove both tiers, not swap which one it forgets."""
+        from hermes_cli.plugin_configuration import _secret_storage_key
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        sk.reset_backend_cache()
+        (tmp_path / "profile").mkdir(parents=True, exist_ok=True)
+        key = _secret_storage_key("sample-connector", "token")
+        (tmp_path / "profile" / ".env").write_text(
+            f"{key}=legacy-plaintext\n", encoding="utf-8"
+        )
+        service, _ = _service(tmp_path)
+
+        service.clear_secret("sample-connector", "token")
+
+        contents = (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
+        assert "legacy-plaintext" not in contents
+```
+
+Run: `scripts/run_tests.sh tests/hermes_cli/test_plugin_configuration_storage.py -v -k KeystoreClearPath`
+
+Expected: FAIL — `test_clearing_removes_the_keystore_copy` fails on its final assertion.
+The field is still set after the clear, because `clear_secret` removed only the `.env`
+entry while the credential lives in the keystore. That is the revocation bug.
+
+- [ ] **Step 5: Modify the clear path**
+
+In the same file, `clear_secret()` currently removes only the `.env` entry. Now that writes
+land in the keystore, that leaves the credential live. Replace its persistence block
+(currently lines 1209-1219):
+
+```python
+        from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
+
+        try:
+            remove_env_value(
+                _secret_storage_key(canonical_id, field_id),
+                mirror_process_env=False,
+                strict=True,
+            )
+        except ConfigurationPersistenceError as exc:
+            raise PluginConfigurationError(
+                "plugin configuration could not be persisted"
+            ) from exc
+```
+
+with:
+
+```python
+        from hermes_cli.config import ConfigurationPersistenceError, remove_env_value
+
+        storage_key = _secret_storage_key(canonical_id, field_id)
+        # Clear BOTH tiers. The keystore holds anything written since this
+        # feature landed; .env still holds anything from a profile that has
+        # not run `hermes secrets migrate`. Removing only one leaves a
+        # credential that the dashboard reports as cleared and that still
+        # authenticates -- worse than never having moved it.
+        try:
+            secret_keystore.delete_secret(storage_key)
+        except secret_keystore.KeystoreError as exc:
+            raise PluginConfigurationError(
+                "plugin configuration could not be persisted"
+            ) from exc
+        try:
+            remove_env_value(
+                storage_key,
+                mirror_process_env=False,
+                strict=True,
+            )
+        except ConfigurationPersistenceError as exc:
+            raise PluginConfigurationError(
+                "plugin configuration could not be persisted"
+            ) from exc
+```
+
+Order matters: the keystore is cleared first, because it is the tier that would still
+authenticate. If the `.env` removal then fails, the operator gets an error and a
+credential that is already revoked — the safe direction to fail in.
+
+`delete_secret` must treat an absent key as success (Task 2 and Task 3 both specify this),
+so clearing a field that was never set is not an error.
+
+- [ ] **Step 6: Run the full storage suite to verify everything passes**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_plugin_configuration_storage.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Verify the five plugin-secret test files still pass**
+- [ ] **Step 7: Verify the five plugin-secret test files still pass**
 
 Run:
 ```bash
@@ -1020,11 +2010,11 @@ scripts/run_tests.sh tests/hermes_cli/test_plugin_configuration.py \
 ```
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add hermes_cli/plugin_configuration.py tests/hermes_cli/test_plugin_configuration_storage.py
-git commit -m "feat: persist plugin secrets to keystore instead of .env"
+git commit -m "feat: persist and clear plugin secrets via the keystore, not .env"
 ```
 
 ---
@@ -1032,18 +2022,28 @@ git commit -m "feat: persist plugin secrets to keystore instead of .env"
 ### Task 7: `hermes secrets migrate`
 
 **Files:**
+- Create: `hermes_cli/plugin_secret_keys.py`
 - Create: `hermes_cli/secrets_migrate.py`
 - Create: `tests/hermes_cli/test_secrets_migrate.py`
-- Modify: `hermes_cli/plugins_cmd.py`
+- Modify: `hermes_cli/env_loader.py:462-534`
+- Modify: `tests/hermes_cli/test_env_loader.py`
+- Modify: `hermes_cli/main.py:11521` (the existing `secrets` subparser)
 
 **Interfaces:**
 - Consumes: `secret_keystore.set_secret`/`get_secret`, `hermes_cli.config.load_env`, `hermes_cli.config.remove_env_value`
 - Produces:
+  - `is_plugin_secret_key(name: str) -> bool`
   - `find_legacy_secrets() -> dict[str, str]`
   - `migrate_secrets(dry_run: bool = False) -> MigrationReport`
   - `@dataclass MigrationReport(migrated: list[str], failed: list[str], dry_run: bool)`
 
 Verify-before-delete is the critical ordering: read the value back out of the keystore and compare before removing the `.env` line. Deleting first and failing to write loses the user's credential permanently.
+
+This task also closes the startup half of the migration contract. D1 keeps an
+unmigrated `.env` value readable through `config.load_env()`, but the real startup
+loader must remove the exact legacy plugin-secret key shape from `os.environ` after
+all dotenv, external-secret and managed sources have run. That preserves legacy
+resolution without handing every child process a copy of the PAT.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1063,6 +2063,12 @@ from hermes_cli.secrets_migrate import (
     migrate_secrets,
 )
 
+# A valid storage key: HERMES_PLUGIN_<32 uppercase hex>_<SLUG>, matching
+# _secret_storage_key()'s sha256(...).hexdigest()[:32].upper() in
+# plugin_configuration.py. A shorter digest would not match
+# _PLUGIN_SECRET_KEY and every test using it would silently find nothing.
+KEY = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+
 
 @pytest.fixture(autouse=True)
 def _keystore(tmp_path, monkeypatch):
@@ -1076,8 +2082,8 @@ def _keystore(tmp_path, monkeypatch):
 class TestFindLegacySecrets:
     def test_selects_only_plugin_secret_keys(self):
         env = {
-            "HERMES_PLUGIN_ABC123_PAT": "tok1",
-            "HERMES_PLUGIN_DEF456_API_TOKEN": "tok2",
+            "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": "tok1",
+            "HERMES_PLUGIN_E5F60718E5F60718E5F60718E5F60718_API_TOKEN": "tok2",
             "HERMES_PLUGIN_PAYLOAD_MAX_CHARS": "50000",
             "ANTHROPIC_API_KEY": "sk-x",
             "HERMES_HOME": "/somewhere",
@@ -1085,87 +2091,192 @@ class TestFindLegacySecrets:
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             found = find_legacy_secrets()
         assert set(found) == {
-            "HERMES_PLUGIN_ABC123_PAT",
-            "HERMES_PLUGIN_DEF456_API_TOKEN",
+            "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT",
+            "HERMES_PLUGIN_E5F60718E5F60718E5F60718E5F60718_API_TOKEN",
         }
 
     def test_ignores_empty_values(self):
         with mock.patch(
             "hermes_cli.secrets_migrate.load_env",
-            return_value={"HERMES_PLUGIN_ABC123_PAT": ""},
+            return_value={"HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": ""},
         ):
             assert find_legacy_secrets() == {}
 
 
 class TestMigrate:
     def test_dry_run_writes_nothing(self):
-        env = {"HERMES_PLUGIN_ABC123_PAT": "tok"}
+        env = {"HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": "tok"}
         removed = []
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 report = migrate_secrets(dry_run=True)
-        assert report.migrated == ["HERMES_PLUGIN_ABC123_PAT"]
+        assert report.migrated == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
         assert report.dry_run is True
         assert removed == []
-        assert sk.get_secret("HERMES_PLUGIN_ABC123_PAT") is None
+        assert sk.get_secret("HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT") is None
 
     def test_migrates_then_removes_from_env(self):
-        env = {"HERMES_PLUGIN_ABC123_PAT": "tok"}
+        env = {"HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": "tok"}
         removed = []
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 report = migrate_secrets()
-        assert report.migrated == ["HERMES_PLUGIN_ABC123_PAT"]
-        assert sk.get_secret("HERMES_PLUGIN_ABC123_PAT") == "tok"
-        assert removed == ["HERMES_PLUGIN_ABC123_PAT"]
+        assert report.migrated == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
+        assert sk.get_secret("HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT") == "tok"
+        assert removed == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
 
     def test_env_entry_kept_when_keystore_write_fails(self):
-        env = {"HERMES_PLUGIN_ABC123_PAT": "tok"}
+        env = {"HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": "tok"}
         removed = []
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 with mock.patch.object(
                     sk, "set_secret", side_effect=sk.KeystoreError("boom")
                 ):
                     report = migrate_secrets()
-        assert report.failed == ["HERMES_PLUGIN_ABC123_PAT"]
+        assert report.failed == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
         assert report.migrated == []
         assert removed == []
 
     def test_env_entry_kept_when_readback_mismatches(self):
-        env = {"HERMES_PLUGIN_ABC123_PAT": "tok"}
+        env = {"HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT": "tok"}
         removed = []
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
             with mock.patch(
                 "hermes_cli.secrets_migrate.remove_env_value",
-                side_effect=lambda k: removed.append(k),
+                side_effect=lambda k, **kwargs: (removed.append(k), True)[1],
             ):
                 with mock.patch.object(sk, "get_secret", return_value="different"):
                     report = migrate_secrets()
-        assert report.failed == ["HERMES_PLUGIN_ABC123_PAT"]
+        assert report.failed == ["HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"]
         assert removed == []
 
     def test_no_legacy_secrets_is_a_clean_noop(self):
         with mock.patch("hermes_cli.secrets_migrate.load_env", return_value={}):
             report = migrate_secrets()
         assert report == MigrationReport(migrated=[], failed=[], dry_run=False)
+
+    def test_a_failed_env_removal_is_reported_as_failed_not_migrated(self):
+        """The whole point of checking remove_env_value's return. Reporting a
+        key as migrated while its plaintext survives in .env is the one
+        outcome this command must never produce -- the operator stops looking."""
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value",
+                side_effect=lambda k, **kwargs: False,
+            ):
+                report = migrate_secrets()
+        assert report.migrated == []
+        assert report.failed == [KEY]
+
+    def test_a_persistence_error_during_removal_is_also_failed(self):
+        from hermes_cli.config import ConfigurationPersistenceError
+
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value",
+                side_effect=ConfigurationPersistenceError("disk full"),
+            ):
+                report = migrate_secrets()
+        assert report.migrated == []
+        assert report.failed == [KEY]
+
+    def test_removal_is_strict_and_does_not_touch_process_env(self):
+        """strict=True so a failed write raises instead of returning False
+        quietly; mirror_process_env=False because a plugin secret must never
+        enter os.environ, migration included."""
+        env = {KEY: "tok"}
+        with mock.patch("hermes_cli.secrets_migrate.load_env", return_value=env):
+            with mock.patch(
+                "hermes_cli.secrets_migrate.remove_env_value", return_value=True
+            ) as remove:
+                migrate_secrets()
+        assert remove.call_args.kwargs["strict"] is True
+        assert remove.call_args.kwargs["mirror_process_env"] is False
+```
+
+Add this real-startup regression to `tests/hermes_cli/test_env_loader.py`:
+
+```python
+def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
+    tmp_path, monkeypatch
+):
+    """Catch either side of the contract breaking.
+
+    Removing the scrub leaks the PAT to every child process. Filtering the
+    file parser instead breaks D1 for profiles that have not migrated yet.
+    """
+    from hermes_cli import config
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    (home / ".env").write_text(
+        f"{key}=legacy-pat\nANTHROPIC_API_KEY=normal-provider-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(key, "stale-parent-value")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config.invalidate_env_cache()
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert key not in os.environ
+    assert os.environ["ANTHROPIC_API_KEY"] == "normal-provider-key"
+    assert config.load_env()[key] == "legacy-pat"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `scripts/run_tests.sh tests/hermes_cli/test_secrets_migrate.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_cli.secrets_migrate'`
+Run:
+
+```bash
+scripts/run_tests.sh \
+  tests/hermes_cli/test_secrets_migrate.py \
+  tests/hermes_cli/test_env_loader.py::test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them -v
+```
+
+Expected: FAIL for two independent reasons — `hermes_cli.secrets_migrate` does not
+exist, and the real startup loader leaves the seeded plugin key in `os.environ`.
 
 - [ ] **Step 3: Implement the migration**
+
+Create `hermes_cli/plugin_secret_keys.py` first. It is intentionally dependency-free
+because `env_loader` imports it during process startup:
+
+```python
+"""Recognition of legacy per-plugin secret storage keys."""
+
+from __future__ import annotations
+
+import re
+
+__all__ = ["is_plugin_secret_key"]
+
+# Keys minted by plugin_configuration._secret_storage_key:
+# HERMES_PLUGIN_<sha256 prefix: 32 uppercase hex>_<field slug>.
+_PLUGIN_SECRET_KEY = re.compile(
+    r"^HERMES_PLUGIN_[0-9A-F]{32}_[A-Z0-9_]+$"
+)
+
+
+def is_plugin_secret_key(name: str) -> bool:
+    """True only for the persisted per-plugin secret-key namespace."""
+    return _PLUGIN_SECRET_KEY.fullmatch(name) is not None
+```
 
 Create `hermes_cli/secrets_migrate.py`:
 
@@ -1184,20 +2295,17 @@ Removing first and failing to write would destroy the credential.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 from hermes_cli import secret_keystore
-from hermes_cli.config import load_env, remove_env_value
+from hermes_cli.config import (
+    ConfigurationPersistenceError,
+    load_env,
+    remove_env_value,
+)
+from hermes_cli.plugin_secret_keys import is_plugin_secret_key
 
 __all__ = ["MigrationReport", "find_legacy_secrets", "migrate_secrets"]
-
-# Matches keys minted by plugin_configuration._secret_storage_key:
-#   HERMES_PLUGIN_<32 uppercase hex>_<SLUG>
-# The digest anchor is what keeps unrelated names such as
-# HERMES_PLUGIN_PAYLOAD_MAX_CHARS out of the migration set.
-_PLUGIN_SECRET_KEY = re.compile(r"^HERMES_PLUGIN_[0-9A-F]{32}_[A-Z0-9_]+$")
-
 
 @dataclass
 class MigrationReport:
@@ -1211,7 +2319,7 @@ def find_legacy_secrets() -> dict[str, str]:
     return {
         key: value
         for key, value in load_env().items()
-        if _PLUGIN_SECRET_KEY.match(key) and value
+        if is_plugin_secret_key(key) and value
     }
 
 
@@ -1236,19 +2344,83 @@ def migrate_secrets(dry_run: bool = False) -> MigrationReport:
             # is not lost, and let the operator investigate.
             report.failed.append(key)
             continue
-        remove_env_value(key)
+        # strict=True so a failed write raises rather than returning False,
+        # and the boolean is still checked: reporting a key as migrated while
+        # its plaintext survives in .env is the one outcome this command must
+        # never produce, because the operator will stop looking.
+        try:
+            removed = remove_env_value(key, mirror_process_env=False, strict=True)
+        except ConfigurationPersistenceError:
+            removed = False
+        if not removed:
+            report.failed.append(key)
+            continue
         report.migrated.append(key)
     return report
 ```
 
+In `hermes_cli/env_loader.py`, import the same predicate and add a narrow scrubber:
+
+```python
+from hermes_cli.plugin_secret_keys import is_plugin_secret_key
+
+
+def _scrub_plugin_secrets_from_process_env() -> None:
+    """Remove legacy plugin PAT variables after all startup sources load.
+
+    This intentionally does not rewrite `.env`. `config.load_env()` must keep
+    returning the value until the operator runs `hermes secrets migrate`.
+    """
+    for key in tuple(os.environ):
+        if is_plugin_secret_key(key):
+            del os.environ[key]
+```
+
+Call it in `load_hermes_dotenv()` immediately after the existing external and managed
+sources, before the terminal config bridge:
+
+```python
+    _apply_external_secret_sources(home_path)
+    _apply_managed_env()
+    _scrub_plugin_secrets_from_process_env()
+
+    # Existing terminal-config bridge follows unchanged.
+    _reapply_terminal_config_bridge(home_path)
+```
+
+The position is load-bearing: scrubbing before `_apply_external_secret_sources()` or
+`_apply_managed_env()` would allow a later source to reintroduce the key. Filtering
+`config.load_env()` would instead break D1 and is expressly forbidden.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `scripts/run_tests.sh tests/hermes_cli/test_secrets_migrate.py -v`
-Expected: PASS (8 tests)
+Run:
+
+```bash
+scripts/run_tests.sh \
+  tests/hermes_cli/test_secrets_migrate.py \
+  tests/hermes_cli/test_env_loader.py::test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them -v
+```
+
+Expected: PASS (10 migration tests plus the startup-loader regression).
 
 - [ ] **Step 5: Wire up the CLI subcommand**
 
-In `hermes_cli/plugins_cmd.py`, register a `secrets migrate` subcommand following the argparse/dispatch pattern already used in that file for existing subcommands. The handler:
+**The `secrets` command lives in `hermes_cli/main.py`, not `plugins_cmd.py`.** `main.py:11521`
+already creates it — `subparsers.add_parser("secrets", help="Manage external secret sources
+(Bitwarden, 1Password)")` — with its own sub-subparsers beneath. `plugins_cmd.py` contains no
+`add_parser` calls at all; it is a handler module reached via `plugins_command`, so there is
+no argparse pattern in that file to follow.
+
+Add `migrate` to the **existing** `secrets` command's sub-subparser in `main.py`, beside the
+external-secret-manager subcommands already there. Do not create a second `secrets` parser —
+argparse would raise on the duplicate name, and the failure surfaces at import time as a
+confusing conflict error rather than anything about this feature.
+
+Put the handler in `hermes_cli/secrets_migrate.py` next to `migrate_secrets` and reference it
+from `main.py`, keeping `main.py`'s addition to a parser block and a `set_defaults(func=...)`:
+
+The handler:
 
 ```python
 def _handle_secrets_migrate(args) -> int:
@@ -1291,6 +2463,19 @@ Add the parser wiring alongside the file's existing subparsers:
     migrate_parser.set_defaults(func=_handle_secrets_migrate)
 ```
 
+`_handle_secrets_migrate` lives in `hermes_cli/secrets_migrate.py`, so `main.py` must bring
+it into scope. Import it **lazily**, inside the function that builds the parser, matching how
+`main.py:11361` already defers `from hermes_cli.plugins_cmd import plugins_command`. A
+module-level import would pull in `secret_keystore` and through it `keyring` on every
+`hermes` invocation, including `--help` and shell completion:
+
+```python
+    from hermes_cli.secrets_migrate import _handle_secrets_migrate
+```
+
+Place it immediately above the `migrate_parser = ...` block so the name is defined before
+`set_defaults` references it.
+
 - [ ] **Step 6: Verify the command end to end**
 
 Run: `.venv/bin/python -m hermes_cli secrets migrate --dry-run`
@@ -1304,7 +2489,13 @@ Expected: identical hashes.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add hermes_cli/secrets_migrate.py tests/hermes_cli/test_secrets_migrate.py hermes_cli/plugins_cmd.py
+git add \
+  hermes_cli/plugin_secret_keys.py \
+  hermes_cli/secrets_migrate.py \
+  hermes_cli/env_loader.py \
+  hermes_cli/main.py \
+  tests/hermes_cli/test_secrets_migrate.py \
+  tests/hermes_cli/test_env_loader.py
 git commit -m "feat: add 'hermes secrets migrate' to move plugin PATs out of .env"
 ```
 
@@ -1340,41 +2531,78 @@ from hermes_cli import config
 
 
 class TestWindowsAcl:
-    def test_windows_path_invokes_icacls(self, tmp_path):
+    def test_windows_path_rebuilds_the_dacl_via_powershell(self, tmp_path):
         target = tmp_path / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
-            with mock.patch.object(config.subprocess, "run") as run:
-                run.return_value = mock.Mock(returncode=0)
-                config._secure_file(target)
+            with mock.patch.object(config, "_current_windows_sid",
+                                   return_value="S-1-5-21-1-2-3-1001"):
+                with mock.patch.object(config.subprocess, "run") as run:
+                    run.return_value = mock.Mock(returncode=0)
+                    config._secure_file(target)
         assert run.called
         argv = run.call_args[0][0]
-        assert argv[0] == "icacls"
-        assert str(target) in argv
-        assert "/inheritance:r" in argv
+        assert argv[0] == "powershell"
+        # Read the script from -Command's operand, not argv[-1]: what trails
+        # the command has changed twice already and positional indexing hid it.
+        script = argv[argv.index("-Command") + 1]
+        # Inheritance detached AND inherited copies discarded.
+        assert "SetAccessRuleProtection($true,$false)" in script
+        # Every explicit ACE purged. icacls could not do this: /inheritance:r
+        # drops only inherited ACEs and /remove:g only the SIDs it is given.
+        assert "PurgeAccessRules" in script
+        # Exactly one rule added back.
+        assert script.count("AddAccessRule") == 1
+        # Identity arrives as data, not baked into the source.
+        assert "S-1-5-21-1-2-3-1001" not in script
+        assert "$env:HERMES_ACL_SID" in script
+        assert "Administrators" not in script
+        child_env = run.call_args.kwargs["env"]
+        assert child_env["HERMES_ACL_SID"] == "S-1-5-21-1-2-3-1001"
 
-    def test_grant_is_restricted_to_the_current_user(self, tmp_path):
-        target = tmp_path / ".env"
+    def test_the_path_is_passed_as_data_not_interpolated_source(self, tmp_path):
+        """A path is user-controlled. Interpolating it into PowerShell source
+        lets a directory named  '; rm -r x; $y='  run as code -- and Windows
+        permits single quotes in file names."""
+        hostile = tmp_path / "it's ok'; Write-Output PWNED; $x='"
+        hostile.mkdir()
+        target = hostile / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
-            with mock.patch.object(config, "_current_windows_principal",
-                                   return_value="CORP\\alice"):
+            with mock.patch.object(config, "_current_windows_sid",
+                                   return_value="S-1-5-21-1-2-3-1001"):
                 with mock.patch.object(config.subprocess, "run") as run:
                     run.return_value = mock.Mock(returncode=0)
                     config._secure_file(target)
         argv = run.call_args[0][0]
-        assert any("CORP\\alice" in part for part in argv)
+        script = argv[argv.index("-Command") + 1]
+        assert "PWNED" not in script, "path was interpolated into the script body"
+        assert str(target) not in script, "path reached the script source at all"
+        # It travels through the child environment instead, where it is data.
+        assert run.call_args.kwargs["env"]["HERMES_ACL_PATH"] == str(target)
 
-    def test_icacls_failure_does_not_raise(self, tmp_path):
+    def test_no_sid_means_no_call_and_no_silent_success(self, tmp_path):
+        """If the SID cannot be resolved the DACL cannot be built correctly.
+        Doing nothing and reporting success would be the worst outcome."""
+        target = tmp_path / ".env"
+        target.write_text("SECRET=x", encoding="utf-8")
+        config._WARNED_ACL_PATHS.clear()
+        with mock.patch.object(config.sys, "platform", "win32"):
+            with mock.patch.object(config, "_current_windows_sid", return_value=""):
+                with mock.patch.object(config.subprocess, "run") as run:
+                    config._secure_file(target)
+        assert not run.called
+
+    def test_acl_failure_does_not_raise(self, tmp_path):
         """A failed ACL must not break setup — but see the next test."""
         target = tmp_path / ".env"
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(config.subprocess, "run",
-                                   side_effect=OSError("no icacls")):
+                                   side_effect=OSError("no powershell")):
                 config._secure_file(target)
 
-    def test_icacls_failure_warns_once(self, tmp_path, capsys):
+    def test_acl_failure_warns_once(self, tmp_path, capsys):
         """Silently passing is exactly what produced this gap. A failure the
         operator never sees is indistinguishable from no protection."""
         config._WARNED_ACL_PATHS.clear()
@@ -1382,7 +2610,7 @@ class TestWindowsAcl:
         target.write_text("SECRET=x", encoding="utf-8")
         with mock.patch.object(config.sys, "platform", "win32"):
             with mock.patch.object(config.subprocess, "run",
-                                   side_effect=OSError("no icacls")):
+                                   side_effect=OSError("no powershell")):
                 config._secure_file(target)
                 config._secure_file(target)
         warnings = capsys.readouterr().err
@@ -1420,7 +2648,7 @@ class TestWindowsAcl:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secure_file_windows.py -v`
-Expected: FAIL — `AttributeError: module 'hermes_cli.config' has no attribute '_current_windows_principal'`
+Expected: FAIL — `AttributeError: module 'hermes_cli.config' has no attribute '_current_windows_sid'`
 
 - [ ] **Step 3: Implement**
 
@@ -1435,40 +2663,104 @@ _WARNED_ACL_PATHS: set[str] = set()
 Then replace `_secure_file` and add its Windows helpers:
 
 ```python
-def _current_windows_principal() -> str:
-    """Return DOMAIN\\user for the current account, for an icacls grant.
+# Belt and braces: the SID comes from `whoami /user`, but it is checked
+# against this before reaching PowerShell so a surprising whoami cannot
+# widen the surface.
+_SID_RE = re.compile(r"^S-1-[0-9-]{1,60}$")
 
-    getpass.getuser() reads USERNAME, which is what icacls expects; the
-    domain qualifier matters on corporate machines where a bare username can
-    be ambiguous between the local SAM and the domain.
+
+def _current_windows_sid() -> str:
+    """Return the current account's SID as a string, or "" if unavailable.
+
+    A SID rather than DOMAIN\\user because the DACL is built by SID: names
+    are localised ("Administratoren"), ambiguous between the local SAM and
+    the domain, and a name that fails to resolve turns a permission tightening
+    into an error. The SID is stable and unambiguous.
+
+    whoami is present on every supported Windows and needs no pywin32.
     """
-    import getpass
-
-    user = getpass.getuser()
-    domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{user}" if domain else user
+    try:
+        completed = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    # Output: "DOMAIN\user","S-1-5-21-..."
+    fields = [f.strip().strip('"') for f in completed.stdout.strip().split(",")]
+    for field in fields:
+        if field.startswith("S-1-"):
+            return field
+    return ""
 
 
 def _windows_restrict_acl(path) -> bool:
-    """Grant only the current user, dropping inherited ACEs. True if applied.
+    """Leave exactly one ACE: the current user. True if applied.
 
-    /inheritance:r removes inherited entries -- without it the grant is
-    additive and whatever the profile directory already allowed still
-    applies, which is the entire problem being fixed.
+    icacls cannot express "replace the whole DACL" -- ``/inheritance:r``
+    drops only *inherited* ACEs, and ``/remove:g`` drops only the SIDs you
+    name, so neither reaches an explicit ACE left by an older Hermes, a
+    restore from backup, or a copy from another profile. Enumerating them
+    first is possible but means parsing localised icacls output.
+
+    PowerShell can express it directly. ``SetAccessRuleProtection($true,
+    $false)`` detaches inheritance and discards the inherited copies;
+    ``PurgeAccessRules`` removes every explicit rule for an identity; the
+    single ``AddAccessRule`` then leaves exactly one ACE. Identities are
+    well-known SIDs, not names: "Administrators" is "Administratoren" on a
+    German install and "Administrateurs" on a French one, and a name that
+    does not resolve makes icacls fail rather than skip.
     """
-    principal = _current_windows_principal()
+    sid = _current_windows_sid()
+    if not sid:
+        # Without a SID the DACL cannot be built correctly. Returning False
+        # lets the caller warn; doing nothing and reporting success would be
+        # the one outcome worse than the gap being fixed.
+        return False
+
+    if not _SID_RE.fullmatch(sid):
+        return False
+
+    # The path is user-controlled and must never be interpolated into the
+    # script body: Windows permits single quotes in file names, so a
+    # directory called  it's ok'; <code>; $x='  would execute as code.
+    #
+    # It is passed through the ENVIRONMENT instead. powershell.exe's
+    # `-Command <string>` form does not populate $args -- that only works for
+    # `-File script.ps1 a b` or an explicit script block -- so an earlier
+    # draft's `-Command ... -args path sid` silently passed nothing and the
+    # script would have operated on $null. Environment variables need no
+    # quoting, are never parsed as source, and work with -Command.
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$p=$env:HERMES_ACL_PATH;"
+        "$id=New-Object System.Security.Principal.SecurityIdentifier("
+        "$env:HERMES_ACL_SID);"
+        "$acl=Get-Acl -LiteralPath $p;"
+        # $true = protect from inheritance, $false = do not copy inherited ACEs
+        "$acl.SetAccessRuleProtection($true,$false);"
+        # Drop every explicit rule, including ones for identities we cannot name
+        "foreach($r in @($acl.Access)){[void]$acl.PurgeAccessRules($r.IdentityReference)};"
+        "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
+        "$id,'Read,Write','Allow');"
+        "$acl.AddAccessRule($rule);"
+        "Set-Acl -LiteralPath $p -AclObject $acl;"
+    )
+    child_env = dict(os.environ)
+    child_env["HERMES_ACL_PATH"] = str(path)
+    child_env["HERMES_ACL_SID"] = sid
     try:
         completed = subprocess.run(
-            [
-                "icacls",
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"{principal}:(R,W)",
-            ],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True,
             timeout=15,
             check=False,
+            env=child_env,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1478,7 +2770,7 @@ def _windows_restrict_acl(path) -> bool:
 def _secure_file(path):
     """Restrict a file to its owner.
 
-    POSIX: chmod 0600. Windows: icacls with inheritance removed -- the mode
+    POSIX: chmod 0600. Windows: a rebuilt single-ACE DACL -- the mode
     argument to os.chmod is close to meaningless there, which is why this
     used to be documented as a no-op and left credentials with whatever the
     user profile directory happened to allow.
@@ -1506,7 +2798,7 @@ def _secure_file(path):
             print(
                 f"  Warning: could not restrict access to {path}. It may be "
                 f"readable by other accounts on this machine. Check that "
-                f"icacls.exe is available on PATH.",
+                f"powershell.exe is available on PATH.",
                 file=sys.stderr,
             )
         return
@@ -1522,7 +2814,7 @@ Ensure `subprocess` and `sys` are imported at the top of `config.py` if they are
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/hermes_cli/test_secure_file_windows.py -v`
-Expected: PASS (7 tests)
+Expected: PASS (8 tests)
 
 - [ ] **Step 5: Verify no regression in the broader config suite**
 
@@ -1536,7 +2828,7 @@ git add hermes_cli/config.py tests/hermes_cli/test_secure_file_windows.py
 git commit -m "fix: restrict .env with an ACL on Windows instead of silently no-op"
 ```
 
-> **Cross-repo follow-up, not covered here.** `ericsson-capabilities/plugins/ericsson-teams/graph_auth.py` has the same gap on the same platform. Its POSIX path (`_persist_posix`) is careful — `0o700` directory, `O_NOFOLLOW`, `O_DIRECTORY`, `O_CLOEXEC`, atomic replace through a directory fd — but `_persist_portable` passes `0o600` to `os.open` on Windows, where the mode is largely ignored, and its `mkdir` sets no mode at all. That file holds **Entra refresh tokens**, which are longer-lived than a PAT and can mint new access tokens. The fix is the same `icacls` treatment applied to `$HERMES_HOME/ericsson/`. It belongs in the connector repo, so it cannot be a task in this plan — raise it as its own change.
+> **Cross-repo follow-up, not covered here.** `ericsson-capabilities/plugins/ericsson-teams/graph_auth.py` has the same gap on the same platform. Its POSIX path (`_persist_posix`) is careful — `0o700` directory, `O_NOFOLLOW`, `O_DIRECTORY`, `O_CLOEXEC`, atomic replace through a directory fd — but `_persist_portable` passes `0o600` to `os.open` on Windows, where the mode is largely ignored, and its `mkdir` sets no mode at all. That file holds **Entra refresh tokens**, which are longer-lived than a PAT and can mint new access tokens. The fix is the same DACL treatment applied to `$HERMES_HOME/ericsson/`. It belongs in the connector repo, so it cannot be a task in this plan — raise it as its own change.
 
 ---
 
@@ -1549,7 +2841,18 @@ git commit -m "fix: restrict .env with an ACL on Windows instead of silently no-
 - Consumes: everything from Tasks 1-8
 - Produces: a signed-off verification record
 
-This task is manual and **blocking**. The macOS dual-binary case in particular cannot be caught by unit tests: Keychain ACLs are bound to the accessing binary, and the desktop spawns its own interpreter (`buildDesktopBackendEnv` takes a `venvRoot`). If the desktop's interpreter path differs from the CLI's, macOS sees two applications and issues two separate authorisation prompts — or fails silently when the backend runs detached.
+This task is manual. The macOS dual-binary case in particular cannot be caught by unit tests: Keychain ACLs are bound to the accessing binary, and the desktop spawns its own interpreter (`buildDesktopBackendEnv` takes a `venvRoot`). If the desktop's interpreter path differs from the CLI's, macOS sees two applications and issues two separate authorisation prompts — or fails silently when the backend runs detached.
+
+**How much of this blocks the merge.** An earlier draft made all four platforms blocking, which no single machine can satisfy — so the plan could not complete anywhere. The ruling:
+
+| Platform | Status | Rationale |
+|---|---|---|
+| **macOS** | **Blocking** | The dual-binary Keychain case is the failure this task exists to catch, and it is the development platform. |
+| Windows | Non-blocking — record as outstanding | Task 8's ACL work is unit-tested. The manual leg confirms real DPAPI behaviour and belongs on the Windows box, which `CLAUDE.md:106` already names as the live end-to-end target. |
+| Linux | Non-blocking — record as outstanding | The headless / no-D-Bus path degrades to the file tier, covered by Task 2 and by Task 3's probe tests including the hanging-backend case. |
+| Container | Non-blocking — record as outstanding | D4's refusal is unit-tested in Task 2. The manual leg only confirms the message an operator actually sees. |
+
+Complete the macOS leg, then record each remaining platform in the verification document explicitly as **outstanding**, with a date and an owner. Do not mark them passed and do not delete the rows: an unrun check recorded as outstanding is a known gap, while one silently dropped is a false clean bill of health.
 
 - [ ] **Step 1: Record the resolved backend on each platform**
 
@@ -1597,6 +2900,7 @@ Expected: the first returns entries; the second returns nothing.
 Then confirm Task 8's ACL actually applied:
 
 ```powershell
+# One ACE only, for the current user, with no (I) inherited markers.
 icacls "$env:USERPROFILE\.hermes\.env"
 ```
 Expected: only the current user listed, and **no** `(I)` inherited-entry markers. Inherited ACEs present means `/inheritance:r` did not take effect and the file is still broadly readable.
@@ -1608,14 +2912,42 @@ In the Docker image, confirm the backend resolves to `file`, then verify a crede
 **Pass:** credential still resolves after restart.
 **Fail:** the key is ephemeral (D4) → the image must mount `~/.hermes/secrets` on a volume, or the deployment must use an external secret source. Document whichever is chosen.
 
-- [ ] **Step 6: Verify no plugin PAT reaches `os.environ`**
+- [ ] **Step 6: Verify no plugin PAT reaches the process environment**
 
-With a plugin credential configured, from a running backend:
+This is the one constraint with no reliable external check, so it is verified
+**in process, by an automated test**, not by inspecting a running backend.
+
+Three external approaches were tried and each is wrong:
+
+| Approach | Why it fails |
+|---|---|
+| `python -c "print([k for k in os.environ ...])"` | A fresh interpreter never ran Hermes' startup loader, so it prints `[]` whether or not the leak exists. |
+| `Get-Process(...).StartInfo.EnvironmentVariables` | `StartInfo` describes how *you would start* a process; on a Process object obtained by querying the system it is empty. |
+| `wmic process ... get commandline` | Returns the command line. Windows exposes no supported way to read another process's environment block without a debugger handle. |
+
+A temporary debug tool was also considered and rejected: `AGENTS.md` explicitly
+does not want a new core tool when an existing mechanism does the job.
+
+Task 7 adds the durable regression at the real boundary. Run it here as a release
+gate rather than introducing a second, weaker test:
 
 ```bash
-.venv/bin/python -c "import os,re; print([k for k in os.environ if re.match(r'HERMES_PLUGIN_[0-9A-F]{32}_', k)])"
+scripts/run_tests.sh \
+  tests/hermes_cli/test_env_loader.py::test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them \
+  -v
 ```
-Expected: `[]`
+
+The fixture deliberately places a valid legacy plugin PAT in `.env`, invokes
+`env_loader.load_hermes_dotenv()` — the function called by CLI, gateway, TUI and
+agent startup — then proves both sides of the compatibility contract: the key is
+absent from `os.environ`, while `config.load_env()` still returns it for D1 until
+explicit migration.
+
+**Pass:** the real-startup regression is green on this platform.
+**Fail:** a plugin key reached `os.environ` — every child process Hermes spawns
+would inherit the credential. That is the defect this whole plan exists to close,
+so treat it as blocking regardless of which platform surfaced it.
+
 
 - [ ] **Step 7: Full regression run**
 
@@ -1638,7 +2970,7 @@ git commit -m "docs: record credential storage parity platform verification"
 **Spec coverage.** Every element of super-cli's model in `SUPER-CLI-ARCHITECTURE.md` §4.2 maps to a task: OS keyring → Task 3; probe-then-fallback → Tasks 3 and 4; AES-GCM file with `0700`/`0600` → Task 2; lazy per-key resolution → Tasks 4 and 5; no plaintext at rest → Tasks 6 and 7. The gap-analysis item "plaintext PATs with no ACL on Windows" is closed by Tasks 3, 6 and verified in Task 8 Step 4.
 
 **Deliberately out of scope**, and tracked separately rather than silently dropped:
-- **The MSAL token cache on Windows.** `ericsson-teams/graph_auth.py:_persist_portable` has the identical gap on the identical platform, protecting **Entra refresh tokens** — a longer-lived credential than any PAT, since it can mint new access tokens. Its POSIX sibling is meticulous (`0o700`, `O_NOFOLLOW`, `O_DIRECTORY`, `O_CLOEXEC`, atomic replace via directory fd), which makes the Windows path's silence more surprising, not less. The fix is Task 8's `icacls` treatment applied to `$HERMES_HOME/ericsson/`. It lives in `ericsson-capabilities`, so it cannot be a task in this plan — it needs its own change in that repo.
+- **The MSAL token cache on Windows.** `ericsson-teams/graph_auth.py:_persist_portable` has the identical gap on the identical platform, protecting **Entra refresh tokens** — a longer-lived credential than any PAT, since it can mint new access tokens. Its POSIX sibling is meticulous (`0o700`, `O_NOFOLLOW`, `O_DIRECTORY`, `O_CLOEXEC`, atomic replace via directory fd), which makes the Windows path's silence more surprising, not less. The fix is Task 8's DACL treatment applied to `$HERMES_HOME/ericsson/`. It lives in `ericsson-capabilities`, so it cannot be a task in this plan — it needs its own change in that repo.
 - Migrating `ericsson-sharepoint` and `ericsson-teams` credential *fields* — those plugins have their own `auth.py`, and they inherit Tasks 1–7 only insofar as they use `storage: secret` fields.
 - **Entra platform identity generally.** Not needed for Jira/Confluence/GitLab/ARM, which are all PAT-authenticated. It becomes relevant only if EVMS is added or if Ericsson moves those four to SSO-only.
 

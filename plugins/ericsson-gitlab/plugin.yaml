@@ -19,8 +19,19 @@ provides_tools:
   - gitlab_read_merge_request
   - gitlab_list_pipelines
   - gitlab_inspect_ci
+  - gitlab_job_log
+  - gitlab_retry_job
+  - gitlab_play_job
+  - gitlab_retry_pipeline
   - gitlab_create_branch
   - gitlab_commit_changes
   - gitlab_create_merge_request
+  - gitlab_create_mr_note
+  - gitlab_reply_to_discussion
+  - gitlab_resolve_discussion
+  - gitlab_merge_request_approvals
+  - gitlab_approve_merge_request
+  - gitlab_merge_merge_request
+  - gitlab_update_merge_request
 provides_hooks:
   - pre_tool_call

@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Modules that must NEVER be imported by the fast path. Each one either
@@ -104,3 +106,86 @@ def test_fast_version_reports_install_method_stamp(tmp_path):
     result = _run_version({"HERMES_HOME": str(home), "TERMUX_VERSION": ""})
     assert result.returncode == 0, result.stderr
     assert "Install method: git" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["secrets", "migrate", "--dry-run"],
+        ["-p", "work", "secrets", "migrate", "--dry-run"],
+        ["secrets", "--profile", "work", "migrate", "--dry-run"],
+        ["secrets", "migrate", "--dry-run", "--profile=work"],
+    ],
+)
+def test_exact_migration_dry_run_owns_readonly_startup(argv):
+    from hermes_cli.main import _early_readonly_startup_target
+
+    assert _early_readonly_startup_target(argv) == "secrets-migrate-dry-run"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["secrets", "migrate"],
+        ["secrets", "migrate", "--dry"],
+        ["secrets", "migrate", "--dry-run=true"],
+        ["secrets", "migrate", "--dry-run", "--dry-run"],
+        ["secrets", "migrate", "--dry-run", "extra"],
+        ["secrets", "migr", "--dry-run"],
+        ["secret", "migrate", "--dry-run"],
+        ["--profile", "--dry-run", "secrets", "migrate", "--dry-run"],
+        ["--profile", "bad:name", "secrets", "migrate", "--dry-run"],
+        ["--profile=bad:name", "secrets", "migrate", "--dry-run"],
+        ["--version", "secrets", "migrate", "--dry-run"],
+        ["--oneshot", "prompt", "secrets", "migrate", "--dry-run"],
+    ],
+)
+def test_migration_dry_run_lookalikes_use_normal_startup(argv):
+    from hermes_cli.main import _early_readonly_startup_target
+
+    assert _early_readonly_startup_target(argv) is None
+
+
+@pytest.mark.parametrize(
+    ("profile_args", "parser_error"),
+    [
+        (
+            ["--profile", "first", "--profile=second"],
+            "unrecognized arguments: --profile=second",
+        ),
+        (
+            ["--profile=first", "--profile", "second"],
+            "argument command: invalid choice: 'second'",
+        ),
+    ],
+    ids=("split-then-equals", "equals-then-split"),
+)
+def test_real_console_duplicate_profiles_use_normal_parser(
+    tmp_path, profile_args, parser_error
+):
+    hermes = REPO_ROOT / ".venv" / "bin" / "hermes"
+    assert hermes.is_file(), "the real .venv/bin/hermes entrypoint is required"
+    hermes_root = tmp_path / "hermes-root"
+    (hermes_root / "profiles" / "first").mkdir(parents=True)
+    (hermes_root / "profiles" / "second").mkdir(parents=True)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_root)
+
+    result = subprocess.run(
+        [
+            str(hermes),
+            *profile_args,
+            "secrets",
+            "migrate",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 2
+    assert parser_error in result.stderr
+    assert "backend not probed" not in result.stdout

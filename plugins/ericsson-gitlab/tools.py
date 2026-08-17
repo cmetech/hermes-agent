@@ -284,6 +284,53 @@ SCHEMAS = {
         },
         ["project"],
     ),
+    "gitlab_job_log": _schema(
+        "gitlab_job_log",
+        "Read one GitLab CI job's log. Returns the tail by default, because "
+        "a failing job's cause is normally at the end.",
+        {
+            "project": _PROJECT,
+            "job_id": {"type": "integer", "minimum": 1},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 200000},
+        },
+        ["project", "job_id"],
+    ),
+    "gitlab_retry_job": _schema(
+        "gitlab_retry_job",
+        "Retry one failed GitLab CI job. Read gitlab_job_log first because "
+        "retrying without diagnosing usually reproduces the failure. "
+        "Requires dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "job_id": {"type": "integer", "minimum": 1},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "job_id"],
+    ),
+    "gitlab_play_job": _schema(
+        "gitlab_play_job",
+        "Start one manual GitLab CI job. Requires dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "job_id": {"type": "integer", "minimum": 1},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "job_id"],
+    ),
+    "gitlab_retry_pipeline": _schema(
+        "gitlab_retry_pipeline",
+        "Retry failed or canceled jobs in one GitLab pipeline. Requires "
+        "dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "pipeline_id": {"type": "integer", "minimum": 1},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "pipeline_id"],
+    ),
     "gitlab_create_branch": _schema(
         "gitlab_create_branch",
         "Create or reuse one bounded ticket branch after host approval.",
@@ -351,6 +398,129 @@ SCHEMAS = {
             "dry_run": {"type": "boolean"},
         },
         ["project", "source_branch"],
+    ),
+    "gitlab_create_mr_note": _schema(
+        "gitlab_create_mr_note",
+        "Post one note on a GitLab merge request. Requires dry_run or "
+        "confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "body": {"type": "string", "minLength": 1, "maxLength": 100000},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid", "body"],
+    ),
+    "gitlab_reply_to_discussion": _schema(
+        "gitlab_reply_to_discussion",
+        "Reply inside one GitLab merge-request discussion thread. Get "
+        "discussion_id from gitlab_list_merge_request_discussions. Requires "
+        "dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "discussion_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+            },
+            "body": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100000,
+            },
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid", "discussion_id", "body"],
+    ),
+    "gitlab_resolve_discussion": _schema(
+        "gitlab_resolve_discussion",
+        "Mark one GitLab merge-request discussion resolved, or reopen it with "
+        "resolved false. Requires dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "discussion_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+            },
+            "resolved": {"type": "boolean"},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid", "discussion_id"],
+    ),
+    "gitlab_merge_request_approvals": _schema(
+        "gitlab_merge_request_approvals",
+        "Read approval state for one GitLab merge request: how many "
+        "approvals are required, how many remain, and who has approved.",
+        {"project": _PROJECT, "iid": {"type": "integer", "minimum": 1}},
+        ["project", "iid"],
+    ),
+    "gitlab_approve_merge_request": _schema(
+        "gitlab_approve_merge_request",
+        "Approve one GitLab merge request. Supply sha to pin the approval to "
+        "a reviewed commit so GitLab refuses if the branch moved. Requires "
+        "dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "sha": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid"],
+    ),
+    "gitlab_merge_merge_request": _schema(
+        "gitlab_merge_merge_request",
+        "Merge one GitLab merge request. Supply sha to pin the merge to the "
+        "reviewed commit so GitLab refuses if the branch moved. Omit squash "
+        "and remove_source_branch to keep the project's own defaults. "
+        "Requires dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "sha": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+            "squash": {"type": "boolean"},
+            "remove_source_branch": {"type": "boolean"},
+            "merge_when_pipeline_succeeds": {"type": "boolean"},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid"],
+    ),
+    "gitlab_update_merge_request": _schema(
+        "gitlab_update_merge_request",
+        "Edit one existing GitLab merge request: title, description, labels, "
+        "draft state, or close/reopen. Labels are added and removed "
+        "individually rather than replaced wholesale. Draft changes require "
+        "title in the same call. Requires dry_run or confirm.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1},
+            "title": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "description": {"type": "string", "maxLength": 65536},
+            "add_labels": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 255},
+                "minItems": 1,
+                "maxItems": 50,
+            },
+            "remove_labels": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 255},
+                "minItems": 1,
+                "maxItems": 50,
+            },
+            "state_event": {"type": "string", "enum": ["close", "reopen"]},
+            "draft": {"type": "boolean"},
+            "dry_run": {"type": "boolean"},
+            "confirm": {"type": "boolean"},
+        },
+        ["project", "iid"],
     ),
 }
 
@@ -484,6 +654,33 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 max_groups=values.get("max_groups", 10),
                 max_variables=values.get("max_variables", 500),
             )
+        if name == "gitlab_job_log":
+            return operations.job_log(
+                values["project"],
+                values["job_id"],
+                max_bytes=values.get("max_bytes", 20000),
+            )
+        if name == "gitlab_retry_job":
+            return operations.retry_job(
+                values["project"],
+                values["job_id"],
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_play_job":
+            return operations.play_job(
+                values["project"],
+                values["job_id"],
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_retry_pipeline":
+            return operations.retry_pipeline(
+                values["project"],
+                values["pipeline_id"],
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
         if name == "gitlab_create_branch":
             return operations.create_branch(
                 values["project"],
@@ -511,6 +708,70 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 remove_source_branch=values.get("remove_source_branch", True),
                 squash=values.get("squash", False),
                 dry_run=values.get("dry_run", False),
+            )
+        if name == "gitlab_create_mr_note":
+            return operations.create_mr_note(
+                values["project"],
+                values["iid"],
+                values["body"],
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_reply_to_discussion":
+            return operations.reply_to_discussion(
+                values["project"],
+                values["iid"],
+                values["discussion_id"],
+                values["body"],
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_resolve_discussion":
+            return operations.resolve_discussion(
+                values["project"],
+                values["iid"],
+                values["discussion_id"],
+                resolved=values.get("resolved", True),
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_merge_request_approvals":
+            return operations.merge_request_approvals(
+                values["project"], values["iid"]
+            )
+        if name == "gitlab_approve_merge_request":
+            return operations.approve_merge_request(
+                values["project"],
+                values["iid"],
+                sha=values.get("sha"),
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_merge_merge_request":
+            return operations.merge_merge_request(
+                values["project"],
+                values["iid"],
+                sha=values.get("sha"),
+                squash=values.get("squash"),
+                remove_source_branch=values.get("remove_source_branch"),
+                merge_when_pipeline_succeeds=values.get(
+                    "merge_when_pipeline_succeeds", False
+                ),
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
+            )
+        if name == "gitlab_update_merge_request":
+            return operations.update_merge_request(
+                values["project"],
+                values["iid"],
+                title=values.get("title"),
+                description=values.get("description"),
+                add_labels=values.get("add_labels"),
+                remove_labels=values.get("remove_labels"),
+                state_event=values.get("state_event"),
+                draft=values.get("draft"),
+                dry_run=values.get("dry_run", False),
+                confirm=values.get("confirm", False),
             )
         return operations.list_pipelines(
             values["project"],

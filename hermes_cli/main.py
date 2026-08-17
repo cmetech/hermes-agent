@@ -176,7 +176,136 @@ def _workflow_schema_owns_early_startup(argv: list[str]) -> bool:
     return False
 
 
-_WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = _workflow_schema_owns_early_startup(sys.argv[1:])
+def _early_readonly_startup_target(argv: list[str]) -> str | None:
+    """Classify startup owned by a dependency-light, non-mutating command.
+
+    This runs before recovery, dotenv, logging, and the normal parser graph,
+    so it intentionally uses only token inspection. Selected commands are
+    either exact token forms or parsed by their narrow command-owned parser
+    before execution later in startup.
+    """
+    if _workflow_schema_owns_early_startup(argv):
+        return "workflow-schema"
+
+    # Migration dry-run is safe to dispatch before normal startup only when
+    # the complete argv is exact after removing one supported profile override.
+    # In particular, do not inherit argparse's abbreviation behavior here:
+    # lookalikes must stay on the ordinary parser path.
+    def _valid_profile_id(value: str) -> bool:
+        leading = "abcdefghijklmnopqrstuvwxyz0123456789"
+        allowed = leading + "_-"
+        return (
+            1 <= len(value) <= 64
+            and value[0] in leading
+            and all(character in allowed for character in value)
+        )
+
+    migrate_argv: list[str] = []
+    profile_override_seen = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--profile", "-p"}:
+            if (
+                profile_override_seen
+                or i + 1 >= len(argv)
+                or not _valid_profile_id(argv[i + 1])
+            ):
+                break
+            profile_override_seen = True
+            i += 2
+            continue
+        if arg.startswith("--profile="):
+            profile_id = arg.partition("=")[2].lower()
+            if profile_override_seen or not _valid_profile_id(profile_id):
+                break
+            profile_override_seen = True
+            i += 1
+            continue
+        migrate_argv.append(arg)
+        i += 1
+    else:
+        if migrate_argv == ["secrets", "migrate", "--dry-run"]:
+            return "secrets-migrate-dry-run"
+
+    command_index = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return None
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("--profile=") or (arg.startswith("--") and "=" in arg):
+            i += 1
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        command_index = i
+        break
+    if command_index is None or argv[command_index] != "secrets":
+        return None
+
+    # Preserve normal dispatch precedence for global version/oneshot options.
+    i = 0
+    while i < command_index:
+        arg = argv[i]
+        if arg in {"--version", "-V", "-z", "--oneshot"}:
+            return None
+        if arg.startswith("--oneshot="):
+            return None
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < command_index and not argv[i].startswith("-"):
+                i += 1
+            continue
+        i += 1
+
+    action = None
+    i = command_index + 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--profile", "-p"}:
+            i += 2
+            continue
+        if arg.startswith("--profile=") or arg.startswith("-"):
+            i += 1
+            continue
+        action = arg
+        break
+    if action == "doctor":
+        return "secrets-doctor"
+    if action == "repair" and "--apply" not in argv[command_index + 1 :]:
+        return "secrets-repair"
+    return None
+
+
+_EARLY_READONLY_STARTUP_TARGET = _early_readonly_startup_target(sys.argv[1:])
+_WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = (
+    _EARLY_READONLY_STARTUP_TARGET == "workflow-schema"
+)
+_EARLY_READONLY_OWNS_STARTUP = _EARLY_READONLY_STARTUP_TARGET is not None
+
+
+def _authorized_early_readonly_startup_target(argv: list[str]) -> str | None:
+    """Classify current argv without upgrading a rejected startup candidate."""
+    target = _early_readonly_startup_target(argv)
+    if (
+        target == "secrets-migrate-dry-run"
+        and _EARLY_READONLY_STARTUP_TARGET != target
+    ):
+        return None
+    return target
 
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
@@ -192,7 +321,7 @@ _WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = _workflow_schema_owns_early_startup(sys.ar
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-if not _WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP:
+if not _EARLY_READONLY_OWNS_STARTUP:
     try:
         _early_recovery_mod.recover_if_needed()
     except Exception:
@@ -835,13 +964,25 @@ _WORKFLOW_SCHEMA_EARLY_ARGS = _parse_workflow_schema_candidate(sys.argv[1:])
 _WORKFLOW_SCHEMA_READONLY_STARTUP = (
     _normal_dispatch_target(_WORKFLOW_SCHEMA_EARLY_ARGS) == "workflow-schema"
 )
+_SECRET_READONLY_EARLY_TARGET = _authorized_early_readonly_startup_target(
+    sys.argv[1:]
+)
+_EARLY_READONLY_STARTUP = (
+    _WORKFLOW_SCHEMA_READONLY_STARTUP
+    or _SECRET_READONLY_EARLY_TARGET
+    in {
+        "secrets-doctor",
+        "secrets-repair",
+        "secrets-migrate-dry-run",
+    }
+)
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import INHERITED_PYTHON_ENV_VARS, get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-if not _WORKFLOW_SCHEMA_READONLY_STARTUP:
+if not _EARLY_READONLY_STARTUP:
     load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
@@ -892,7 +1033,7 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-if not _WORKFLOW_SCHEMA_READONLY_STARTUP:
+if not _EARLY_READONLY_STARTUP:
     try:
         from hermes_logging import setup_logging as _setup_logging
 
@@ -11392,10 +11533,37 @@ def _try_workflow_schema_readonly() -> bool:
     return True
 
 
-def main() -> int:
-    """Main entry point for hermes CLI."""
+def _try_early_readonly() -> int | None:
+    """Run exact read-only commands before every mutating startup seam."""
     if _try_workflow_schema_readonly():
         return 0
+    current_argv = list(sys.argv[1:])
+    target = _authorized_early_readonly_startup_target(current_argv)
+    if target == "secrets-migrate-dry-run":
+        from hermes_cli.secrets_migrate import _handle_secrets_migrate
+
+        class _DryRunArgs:
+            dry_run = True
+
+        return int(_handle_secrets_migrate(_DryRunArgs()) or 0)
+    if target not in {"secrets-doctor", "secrets-repair"}:
+        return None
+    from hermes_cli.secrets_repair import parse_readonly_cli
+
+    args = parse_readonly_cli(current_argv)
+    expected = (
+        "doctor" if target == "secrets-doctor" else "repair"
+    )
+    if getattr(args, "secrets_command", None) != expected:
+        return None
+    return int(args.func(args) or 0)
+
+
+def main() -> int:
+    """Main entry point for hermes CLI."""
+    early_readonly_rc = _try_early_readonly()
+    if early_readonly_rc is not None:
+        return early_readonly_rc
 
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
@@ -11530,6 +11698,24 @@ def main() -> int:
     )
     secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command")
 
+    # Lazy import: only the full parser setup pays for the migration module;
+    # importing hermes_cli.main itself does not load the keystore stack.
+    from hermes_cli.secrets_migrate import _handle_secrets_migrate
+    from hermes_cli.secrets_repair import register_cli as _register_secrets_repair
+
+    _register_secrets_repair(secrets_subparsers)
+
+    migrate_parser = secrets_subparsers.add_parser(
+        "migrate",
+        help="Move plugin secrets from .env into the OS keystore",
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would move without changing anything",
+    )
+    migrate_parser.set_defaults(func=_handle_secrets_migrate)
+
     secrets_bw = secrets_subparsers.add_parser(
         "bitwarden",
         aliases=["bw"],
@@ -11556,6 +11742,8 @@ def main() -> int:
         if sub in ("bitwarden", "bw") and bw_sub is not None:
             return args.func(args)
         if sub in ("onepassword", "op", "1password") and op_sub is not None:
+            return args.func(args)
+        if sub in {"doctor", "repair"} and getattr(args, "func", None) is not _dispatch_secrets:
             return args.func(args)
         secrets_parser.print_help()
         return 0

@@ -19,6 +19,21 @@ from hermes_cli.plugins import LoadedPlugin, PluginManager, PluginManifest
 PLUGIN_ID = "sample-connector"
 
 
+@pytest.fixture(autouse=True)
+def _file_keystore(monkeypatch):
+    """Keep every API-module test away from the developer's OS keychain."""
+    from hermes_cli import secret_keystore
+
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+    secret_keystore.reset_backend_cache()
+    try:
+        yield
+    finally:
+        # This runs before monkeypatch restores the environment, so no cached
+        # backend can survive with a mode or profile from this test.
+        secret_keystore.reset_backend_cache()
+
+
 def _schema(*, setup_actions: bool = True) -> dict:
     descriptor = {
         "version": 1,
@@ -229,7 +244,12 @@ def test_detail_update_secret_clear_and_readiness_are_profile_scoped(api):
     }
     assert "profile-secret" not in updated.text
     assert not (home / ".env").exists()
-    assert "profile-secret" in (profile / ".env").read_text(encoding="utf-8")
+    assert not (profile / ".env").exists()
+    assert all(
+        b"profile-secret" not in path.read_bytes()
+        for path in profile.rglob("*")
+        if path.is_file()
+    )
 
     readiness = client.post(
         f"/api/plugin-configurations/{PLUGIN_ID}/readiness",

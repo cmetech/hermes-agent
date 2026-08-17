@@ -1,9 +1,117 @@
 import codecs
 import importlib
+import logging
 import os
 import sys
 
 from hermes_cli.env_loader import load_hermes_dotenv
+
+
+def test_startup_sanitize_applies_windows_acl_after_replacement(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import env_loader, windows_permissions
+
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"TOKEN=value\x00\r\n")
+    restrict = importlib.import_module("unittest.mock").Mock()
+    monkeypatch.setattr(env_loader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_permissions, "restrict_file_to_current_user", restrict
+    )
+
+    env_loader._sanitize_env_file_if_needed(env_file)
+
+    restrict.assert_called_once_with(env_file)
+    assert env_file.read_bytes() == b"TOKEN=value\n"
+
+
+def test_startup_sanitize_acl_failure_is_best_effort_and_diagnosable(
+    tmp_path, monkeypatch, caplog
+):
+    from hermes_cli import env_loader, windows_permissions
+
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"TOKEN=value\x00\r\n")
+    monkeypatch.setattr(env_loader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_permissions,
+        "restrict_file_to_current_user",
+        lambda _path: (_ for _ in ()).throw(
+            windows_permissions.WindowsAclError("access denied")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
+        env_loader._sanitize_env_file_if_needed(env_file)
+
+    assert env_file.read_bytes() == b"TOKEN=value\n"
+    assert any(
+        "ACL drift" in record.message and str(env_file) in record.message
+        for record in caplog.records
+    )
+
+
+def test_startup_sanitize_no_rewrite_still_retries_acl_and_warns(
+    tmp_path, monkeypatch, caplog
+):
+    from hermes_cli import env_loader, windows_permissions
+
+    env_file = tmp_path / ".env"
+    original = b"TOKEN=value\n"
+    env_file.write_bytes(original)
+    monkeypatch.setattr(env_loader.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_permissions,
+        "restrict_file_to_current_user",
+        lambda _path: (_ for _ in ()).throw(
+            windows_permissions.WindowsAclError("access denied")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
+        env_loader._sanitize_env_file_if_needed(env_file)
+
+    assert env_file.read_bytes() == original
+    assert any(
+        "ACL drift" in record.message and str(env_file) in record.message
+        for record in caplog.records
+    )
+
+
+def test_startup_scrubs_legacy_plugin_secrets_but_load_env_still_reads_them(
+    tmp_path, monkeypatch
+):
+    """Startup hides legacy PATs while compatibility reads keep working."""
+    from hermes_cli import config
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    key = "HERMES_PLUGIN_A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4_PAT"
+    (home / ".env").write_text(
+        f"{key}=legacy-pat\nANTHROPIC_API_KEY=normal-provider-key\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  command:\n"
+        "    enabled: true\n"
+        "    command: >-\n"
+        f"      if [ -n \"${{{key}+present}}\" ]; then printf STARTUP_HELPER=present; else printf STARTUP_HELPER=absent; fi\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(key, "stale-parent-value")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config.invalidate_env_cache()
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["STARTUP_HELPER"] == "absent"
+    assert key not in os.environ
+    assert os.environ["ANTHROPIC_API_KEY"] == "normal-provider-key"
+    assert config.load_env()[key] == "legacy-pat"
 
 
 
