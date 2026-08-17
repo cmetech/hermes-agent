@@ -75,6 +75,83 @@ SHAREPOINT_PLUGIN_SKILLS = {
 }
 
 
+class _MemoryKeyring:
+    def __init__(self):
+        self.values = {}
+
+    def get_password(self, service, name):
+        return self.values.get((service, name))
+
+    def set_password(self, service, name, value):
+        self.values[(service, name)] = value
+
+    def delete_password(self, service, name):
+        from hermes_cli import secret_keystore
+
+        try:
+            del self.values[(service, name)]
+        except KeyError as exc:
+            raise secret_keystore._PasswordDeleteError("already absent") from exc
+
+
+class _ServiceNativeAcl:
+    """Native ACL seam for exercising service transactions on any host OS."""
+
+    def __init__(self, permissions):
+        self._permissions = permissions
+        self._paths = {}
+        self._next_handle = 1
+        self.applied = []
+
+    def open_handle(self, path, *, access, flags):
+        handle = self._next_handle
+        self._next_handle += 1
+        self._paths[handle] = Path(path)
+        return handle
+
+    def close_handle(self, handle):
+        assert handle in self._paths
+
+    def handle_metadata(self, handle):
+        path = self._paths[handle]
+        info = path.lstat()
+        attributes = (
+            self._permissions._FILE_ATTRIBUTE_DIRECTORY if path.is_dir() else 0
+        )
+        return self._permissions._HandleMetadata(
+            attributes=attributes,
+            identity=self._permissions._FileIdentity(info.st_dev, info.st_ino),
+        )
+
+    def current_user(self):
+        return self._permissions._CurrentUserSid("S-1-5-21-1-2-3-1001", 1, None)
+
+    def read_acl(self, handle, current_user, security_information):
+        directory = self._paths[handle].is_dir()
+        return self._permissions._AclState(
+            owner_matches=True,
+            dacl_present=True,
+            protected=True,
+            ace_count=1,
+            ace_type=self._permissions._ACCESS_ALLOWED_ACE_TYPE,
+            ace_flags=(
+                self._permissions._OBJECT_INHERIT_ACE
+                | self._permissions._CONTAINER_INHERIT_ACE
+                if directory
+                else 0
+            ),
+            ace_mask=(
+                self._permissions.DIRECTORY_PRIVATE_MASK
+                if directory
+                else self._permissions.FILE_PRIVATE_MASK
+            ),
+            ace_sid_matches=True,
+        )
+
+    def set_dacl(self, handle, sddl, security_information):
+        self.applied.append(self._paths[handle])
+
+
 def _vendor_source(home: Path) -> None:
     source = resolve_ericsson_connector_source()
     shutil.copytree(
@@ -84,6 +161,115 @@ def _vendor_source(home: Path) -> None:
     router = home / "skills" / "ericsson" / "gitlab"
     router.mkdir(parents=True)
     shutil.copy2(source.router_skill, router)
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "field_id"),
+    [
+        ("ericsson-arm", "token"),
+        ("ericsson-jira", "pat"),
+        ("ericsson-confluence", "pat"),
+    ],
+)
+def test_disabled_descriptor_plugin_secret_round_trip_on_windows(
+    tmp_path, monkeypatch, plugin_id, field_id
+):
+    from hermes_cli import secret_keystore, windows_permissions
+    from hermes_cli.plugin_configuration import (
+        PluginConfigurationService,
+        _secret_storage_key,
+    )
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.secret_authority import load_authority_registry
+
+    repo_root = Path(__file__).resolve().parents[2]
+    capability_manifest = json.loads(
+        (repo_root / "capabilities" / "ericsson.json").read_text(encoding="utf-8")
+    )
+    plugin_entry = next(
+        entry
+        for entry in capability_manifest["plugins"]
+        if isinstance(entry, dict) and entry.get("id") == plugin_id
+    )
+    assert plugin_entry["enabled"] is False
+
+    home = tmp_path / plugin_id
+    home.mkdir()
+    shutil.copytree(
+        repo_root / "plugins" / plugin_id,
+        home / "plugins" / plugin_id,
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": [], "disabled": [plugin_id]}}),
+        encoding="utf-8",
+    )
+    keyring = _MemoryKeyring()
+    native = _ServiceNativeAcl(windows_permissions)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "os")
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+    monkeypatch.setattr(secret_keystore, "keyring", keyring)
+    monkeypatch.setattr(secret_keystore, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_permissions, "_native_api", lambda: native)
+    secret_keystore.reset_backend_cache()
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    service = PluginConfigurationService(manager)
+    storage_key = _secret_storage_key(plugin_id, field_id)
+    account = secret_keystore._os_account_name(storage_key, str(home.resolve()))
+    first = f"{plugin_id}-{field_id}-synthetic-first"
+    replacement = f"{plugin_id}-{field_id}-synthetic-replacement"
+
+    first_detail = service.update(plugin_id, secrets={field_id: first})
+    first_field = next(
+        field for field in first_detail["fields"] if field["id"] == field_id
+    )
+    assert first_field["is_set"] is True
+    assert "value" not in first_field
+    assert first_detail["enabled"] is False
+    assert secret_keystore.resolve_secret(storage_key) == first
+    registry = load_authority_registry(home / "secrets")
+    assert registry is not None
+    assert dict(registry.entries) == {storage_key: secret_keystore.SecretAuthority.OS}
+    assert keyring.values[(secret_keystore.SERVICE_NAME, account)] == first
+
+    replacement_detail = service.update(
+        plugin_id, secrets={field_id: replacement}
+    )
+    assert replacement_detail["enabled"] is False
+    assert secret_keystore.resolve_secret(storage_key) == replacement
+    registry = load_authority_registry(home / "secrets")
+    assert registry is not None
+    assert dict(registry.entries) == {storage_key: secret_keystore.SecretAuthority.OS}
+    assert keyring.values[(secret_keystore.SERVICE_NAME, account)] == replacement
+
+    cleared_detail = service.clear_secret(plugin_id, field_id)
+    cleared_field = next(
+        field for field in cleared_detail["fields"] if field["id"] == field_id
+    )
+    assert cleared_field["is_set"] is False
+    assert cleared_detail["enabled"] is False
+    assert (secret_keystore.SERVICE_NAME, account) not in keyring.values
+    assert (
+        secret_keystore.get_authority(storage_key)
+        is secret_keystore.SecretAuthority.CLEARED
+    )
+    assert manager._plugins[plugin_id].enabled is False
+    assert home / "secrets" in native.applied
+    assert home / "secrets" / "keystore.lock" in native.applied
+    status_json = json.dumps(
+        [first_detail, replacement_detail, cleared_detail], sort_keys=True
+    )
+    assert first not in status_json
+    assert replacement not in status_json
+    assert first not in (home / "secrets" / "authority.json").read_text(
+        encoding="utf-8"
+    )
+    assert replacement not in (home / "secrets" / "authority.json").read_text(
+        encoding="utf-8"
+    )
+    secret_keystore.reset_backend_cache()
 
 
 def _git_fixture(root: Path) -> str:

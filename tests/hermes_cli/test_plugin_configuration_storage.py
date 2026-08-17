@@ -1349,6 +1349,33 @@ class TestKeystoreBatchServicePath:
             ):
                 service.update("sample-connector", secrets={"token": "valid-token"})
 
+    def test_windows_native_acl_failure_keeps_plugin_error_envelope_redacted(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import windows_permissions
+
+        synthetic = "windows-service-synthetic-secret"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        monkeypatch.setattr(sk, "_is_windows", lambda: True)
+        monkeypatch.setattr(sk, "_in_container", lambda: False)
+
+        def fail_native_api():
+            raise OSError(f"access denied: {synthetic}")
+
+        monkeypatch.setattr(windows_permissions, "_native_api", fail_native_api)
+        sk.reset_backend_cache()
+        service, _ = _service(tmp_path)
+
+        with pytest.raises(PluginConfigurationError) as captured:
+            service.update("sample-connector", secrets={"token": synthetic})
+
+        assert str(captured.value) == "plugin configuration could not be persisted"
+        exception = captured.value
+        while exception is not None:
+            assert synthetic not in str(exception)
+            exception = exception.__cause__
+
     def test_clear_failure_from_an_ordinary_backend_exception_is_normalized(
         self, tmp_path, monkeypatch
     ):
