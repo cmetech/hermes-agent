@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -717,3 +718,25 @@ class TestAuthoritySeparation:
                 mode="read",
                 invocation_id="invocation-1",
             )
+
+
+def test_application_command_port_is_documented():
+    repository = Path(__file__).resolve().parents[2]
+    plugin_guide = (
+        repository / "website/docs/developer-guide/plugins/index.md"
+    ).read_text(encoding="utf-8")
+    cli_guide = (
+        repository / "website/docs/developer-guide/extending-the-cli.md"
+    ).read_text(encoding="utf-8")
+    combined = f"{plugin_guide}\n{cli_guide}"
+
+    for required_term in (
+        "register_application_commands",
+        "invoke_application_command",
+        "register_cli_command",
+        "dry_run",
+        "confirm",
+    ):
+        assert required_term in combined
+    assert "does not mint or replace model-tool approval" in combined.lower()
+    assert "must not import another plugin's implementation" in combined.lower()
