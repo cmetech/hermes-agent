@@ -110,8 +110,7 @@ placed in an environment variable.
 - The logical key was absent from parent and child environments and `.env`.
   A recursive scan found no plaintext in profile files or authority metadata.
 - `secrets/` was `0700`; live authority and lock files were `0600`.
-- The interpreter was the repository
-  `/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python`.
+- The interpreter was the repository `<REPO_ROOT>/.venv/bin/python`.
 
 ## Corrected actual Electron renderer and prompt behavior
 
@@ -138,7 +137,7 @@ authority inputs:
 ```text
 HERMES_HOME=<GLOBAL_ROOT>
 HERMES_DESKTOP_USER_DATA_DIR=<ISOLATED_USER_DATA>
-HERMES_DESKTOP_HERMES_ROOT=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
+HERMES_DESKTOP_HERMES_ROOT=<REPO_ROOT>
 HERMES_DESKTOP_CDP_PORT=50528
 ```
 
@@ -146,7 +145,7 @@ The freshly built renderer loaded from `apps/desktop/dist/index.html` and was
 observed through bounded localhost CDP. The actual named-profile child argv was:
 
 ```text
-/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python -m hermes_cli.main --profile credcorrected-50d8c6eb serve --host 127.0.0.1 --port 0
+<REPO_ROOT>/.venv/bin/python -m hermes_cli.main --profile credcorrected-50d8c6eb serve --host 127.0.0.1 --port 0
 ```
 
 Its interpreter and repository backend were exact. After `--profile` was
@@ -181,7 +180,7 @@ invocation was used.
 - Claimed: `2026-08-16T23:24:25.969360-04:00`
 - Finished: `2026-08-16T23:24:26.211823-04:00`
 - Value-free result marker:
-  `CREDENTIAL_CORRECTED_GATE_OK backend=os interpreter=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python profile_home_ok=true`
+  `CREDENTIAL_CORRECTED_GATE_OK backend=os interpreter=<REPO_ROOT>/.venv/bin/python profile_home_ok=true`
 
 The scheduled helper imported the repository production credential service,
 read the durable field without printing it, required `backend=os` and
@@ -210,7 +209,9 @@ recovery copy when the 32-byte file master key was corrupted. Doctor reported
 `FILE_STORE_CORRUPT`; apply performed `REBUILD_FILE_STORE`, rebuilt a readable
 file authority from OS, removed the recovery duplicate, and quarantined the
 corrupt key, ciphertext, and value-free manifest under
-`20260817T032822.779758Z-45835ad2`. Doctor was clean afterward.
+`20260817T032822.779758Z-45835ad2`. The configured secret-storage mode was then
+separately aligned to `file`; only after that alignment was the following
+doctor clean.
 
 For unambiguous corrupt-authority reconstruction, all five static inventory
 keys had file-only disposable values before authority metadata was corrupted.
@@ -262,17 +263,16 @@ Only exact pass-owned artifacts were removed.
   exact test container names, zero matching volumes, and the exact unique
   volume absent.
 
-The developer's real default/global `~/.hermes` was unchanged from the
-read-only precheck baseline:
-
-- `config.yaml`: mode `0600`, size `7926`, mtime-ns
-  `1786660052965968961`, SHA-256
-  `1f57ef590e479e81c8312c80fe657082d93bde19aaa4955cb13e12725051ed5b`;
-- `.env`: mode `0600`, size `23389`, mtime-ns
-  `1783260935902097407`, SHA-256
-  `cedd601f9d888bba40673ad90845fb7d38006fd2adc06026f42aed37ededca34`;
-- `profiles/` remained empty; both active-profile filename variants and
-  `~/.hermes/secrets` remained absent.
+The read-only baseline for the developer's real default/global `~/.hermes` was
+captured after the initial invalid Electron verifier attempt and before the
+corrected pass. For the corrected pass, before/after content digests and
+metadata for `config.yaml` and `.env` matched; the relevant global and
+named-profile listings also matched, with `profiles/` still empty and both
+active-profile filename variants and `~/.hermes/secrets` still absent. These
+comparisons prove that the corrected pass and final cleanup preserved the
+captured state, but they do not establish invariance before or during the
+invalid attempt. That attempt remains a verifier-procedure error, not a product
+failure. Exact local audit values remain solely in the ignored verifier report.
 
 Unrelated state and pre-existing untracked paths were preserved. The tracked
 verification record is the only intentional repository change after all live
