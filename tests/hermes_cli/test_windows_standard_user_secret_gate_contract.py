@@ -209,6 +209,24 @@ def test_harness_scrubs_injected_failure_and_still_runs_finally_cleanup(
         assert rendered not in output.getvalue()
 
 
+def test_harness_emits_only_a_bounded_native_probe_failure_stage(tmp_path) -> None:
+    gate = _load_harness()
+
+    class ProbeFailureAdapter(_ContractAdapter):
+        def exercise_write_probe(self, profile: Path) -> None:
+            assert profile == self.profile
+            self.calls.append("explicit-write-probe")
+            raise gate._GateCaseFailure("probe-create-directory")
+
+    output = io.StringIO()
+
+    assert gate.main(adapter=ProbeFailureAdapter(tmp_path), output=output) == 1
+    assert output.getvalue().splitlines()[-2:] == [
+        "explicit-write-probe FAIL reason=probe-create-directory",
+        "cleanup PASS",
+    ]
+
+
 def _write_launcher_adapter(
     path: Path,
     *,
@@ -465,6 +483,42 @@ def test_launcher_redacts_unexpected_child_output_and_propagates_child_failure(
         "remove-user",
         "remove-workspace",
     ]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    sorted(_load_harness()._PROBE_FAILURE_REASONS - {"probe-unknown"}),
+)
+def test_launcher_preserves_every_bounded_native_probe_failure_stage(
+    tmp_path, reason
+) -> None:
+    result, _trace = _run_launcher(
+        tmp_path,
+        child_exit=1,
+        child_output=f"""platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe FAIL reason={reason}
+cleanup PASS
+""",
+    )
+
+    assert result.returncode != 0
+    assert f"explicit-write-probe FAIL reason={reason}" in result.stdout
+
+
+def test_launcher_redacts_an_unrecognized_native_probe_failure_stage(tmp_path) -> None:
+    private_reason = "probe-private-injected-detail"
+    result, _trace = _run_launcher(
+        tmp_path,
+        child_exit=1,
+        child_output=f"explicit-write-probe FAIL reason={private_reason}\n",
+    )
+
+    assert result.returncode != 0
+    assert private_reason not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

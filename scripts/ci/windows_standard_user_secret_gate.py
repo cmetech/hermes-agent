@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import stat
@@ -35,6 +36,35 @@ _TRANSACTION_CASE_FILES = {
     "keystore.key",
     "keystore.lock",
 }
+_PROBE_FAILURE_REASONS = frozenset(
+    {
+        "probe-native-api",
+        "probe-open-root",
+        "probe-create-directory",
+        "probe-protect-directory",
+        "probe-create-file",
+        "probe-protect-file",
+        "probe-write-file",
+        "probe-flush-file",
+        "probe-cleanup-file-delete",
+        "probe-cleanup-file-close",
+        "probe-cleanup-directory-delete",
+        "probe-cleanup-directory-close",
+        "probe-cleanup-root-close",
+        "probe-unknown",
+    }
+)
+_PROBE_FAILURE_REASON_RE = re.compile(
+    r"\((probe-[a-z-]+)(?::[A-Za-z_][A-Za-z0-9_]*)?\)"
+)
+
+
+class _GateCaseFailure(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        if reason not in _PROBE_FAILURE_REASONS:
+            reason = "probe-unknown"
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -491,7 +521,14 @@ class NativeWindowsAdapter:
     def exercise_write_probe(self, profile: Path) -> None:
         result = self._run_doctor(write_probe=True)
         if result.returncode != 0 or "WRITE_PROBE_OK" not in result.stdout:
-            raise RuntimeError("explicit write probe failed")
+            reason = "probe-unknown"
+            for line in result.stdout.splitlines():
+                if line.startswith(("[WRITE_PROBE_FAILED]", "[WRITE_PROBE_CLEANUP_FAILED]")):
+                    match = _PROBE_FAILURE_REASON_RE.search(line)
+                    if match:
+                        reason = match.group(1)
+                        break
+            raise _GateCaseFailure(reason)
         if any(profile.glob(".secret-write-probe-*")):
             raise RuntimeError("explicit write probe left an artifact")
 
@@ -652,6 +689,12 @@ def _emit(output: TextIO, case: str, passed: bool, detail: str | None = None) ->
     line = f"{case} {suffix}"
     if case == "cleanup" and not passed and detail:
         line += f" path={detail}"
+    elif (
+        case == "explicit-write-probe"
+        and not passed
+        and detail in _PROBE_FAILURE_REASONS
+    ):
+        line += f" reason={detail}"
     print(line, file=output, flush=True)
 
 
@@ -714,8 +757,9 @@ def main(
                     profile = adapter.create_profile()
                 else:
                     operation()
-            except Exception:
-                _emit(output, case, False)
+            except Exception as error:
+                detail = error.reason if isinstance(error, _GateCaseFailure) else None
+                _emit(output, case, False, detail)
                 failed = True
                 break
             _emit(output, case, True)

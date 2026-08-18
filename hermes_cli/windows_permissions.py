@@ -27,6 +27,8 @@ class _WindowsPrivateProbeResult:
 
     failure_type: str | None
     cleanup_failed: bool
+    failure_stage: str | None = None
+    cleanup_stage: str | None = None
 
 
 OWNER_SECURITY_INFORMATION = 0x00000001
@@ -1301,54 +1303,75 @@ def _run_private_acl_write_probe(
     directory_handle: int | None = None
     file_handle: int | None = None
     failure_type: str | None = None
+    failure_stage: str | None = None
     cleanup_failed = False
+    cleanup_stage: str | None = None
+    stage = "probe-native-api"
     try:
         api = _native_api()
+        stage = "probe-open-root"
         root_handle = _open_probe_root(api, root, root_handles)
+        stage = "probe-create-directory"
         directory_handle = api.create_relative(
             root_handle,
             directory_name,
             directory=True,
             access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_ADD_FILE,
         )
+        stage = "probe-protect-directory"
         _operate_handle(api, directory_handle, directory=True, apply=True)
+        stage = "probe-create-file"
         file_handle = api.create_relative(
             directory_handle,
             _PROBE_FILE_NAME,
             directory=False,
             access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_WRITE_DATA,
         )
+        stage = "probe-protect-file"
         _operate_handle(api, file_handle, directory=False, apply=True)
+        stage = "probe-write-file"
         api.write_handle(file_handle, _PROBE_CONTENTS)
+        stage = "probe-flush-file"
         api.flush_handle(file_handle)
     except Exception as exc:
         failure_type = type(exc).__name__
+        failure_stage = stage
     finally:
         if api is not None and file_handle is not None:
             try:
                 api.delete_on_close(file_handle)
             except Exception:
                 cleanup_failed = True
+                cleanup_stage = cleanup_stage or "probe-cleanup-file-delete"
             try:
                 api.close_handle(file_handle)
             except Exception:
                 cleanup_failed = True
+                cleanup_stage = cleanup_stage or "probe-cleanup-file-close"
         if api is not None and directory_handle is not None:
             try:
                 api.delete_on_close(directory_handle)
             except Exception:
                 cleanup_failed = True
+                cleanup_stage = cleanup_stage or "probe-cleanup-directory-delete"
             try:
                 api.close_handle(directory_handle)
             except Exception:
                 cleanup_failed = True
+                cleanup_stage = cleanup_stage or "probe-cleanup-directory-close"
         if api is not None:
             for handle, _identity in reversed(root_handles):
                 try:
                     api.close_handle(handle)
                 except Exception:
                     cleanup_failed = True
-    return _WindowsPrivateProbeResult(failure_type, cleanup_failed)
+                    cleanup_stage = cleanup_stage or "probe-cleanup-root-close"
+    return _WindowsPrivateProbeResult(
+        failure_type,
+        cleanup_failed,
+        failure_stage,
+        cleanup_stage,
+    )
 
 
 def restrict_file_to_current_user(path: Path) -> None:

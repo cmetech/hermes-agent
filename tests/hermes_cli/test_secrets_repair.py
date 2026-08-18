@@ -1213,7 +1213,7 @@ def test_write_probe_acl_failure_is_redacted_and_cleaned(profile, monkeypatch):
         windows_permissions,
         "_run_private_acl_write_probe",
         lambda *_args, **_kwargs: windows_permissions._WindowsPrivateProbeResult(
-            "RuntimeError", False
+            "RuntimeError", False, "probe-create-directory"
         ),
     )
 
@@ -1223,6 +1223,7 @@ def test_write_probe_acl_failure_is_redacted_and_cleaned(profile, monkeypatch):
         ("WRITE_PROBE_FAILED", "error")
     ]
     assert "RuntimeError" in findings[0].message
+    assert "probe-create-directory" in findings[0].message
     assert "private path: do not leak" not in findings[0].message
     assert list(profile.glob(".secret-write-probe-*")) == []
 

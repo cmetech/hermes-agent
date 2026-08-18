@@ -596,7 +596,9 @@ def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, .
     created_sentinel = False
     failure: Exception | None = None
     failure_type: str | None = None
+    failure_stage: str | None = None
     cleanup_failed = False
+    cleanup_stage: str | None = None
 
     try:
         root = (
@@ -732,8 +734,10 @@ def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, .
                 directory_name=directory_name,
             )
             cleanup_failed = result.cleanup_failed
+            cleanup_stage = result.cleanup_stage
             if result.failure_type is not None:
                 failure_type = result.failure_type
+                failure_stage = result.failure_stage
                 raise sk.KeystoreError("Windows private probe failed")
         except Exception as exc:
             failure = exc
@@ -754,7 +758,9 @@ def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, .
                 "WRITE_PROBE_FAILED",
                 "error",
                 None,
-                f"synthetic ACL write probe failed ({failure_type or type(failure).__name__})",
+                "synthetic ACL write probe failed "
+                f"({failure_stage + ':' if failure_stage else ''}"
+                f"{failure_type or type(failure).__name__})",
             )
         )
     if cleanup_failed:
@@ -765,7 +771,8 @@ def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, .
                 "WRITE_PROBE_CLEANUP_FAILED",
                 "error",
                 None,
-                f"remove synthetic probe artifact manually: {artifact}",
+                f"remove synthetic probe artifact manually: {artifact}"
+                + (f" ({cleanup_stage})" if cleanup_stage else ""),
             )
         )
     return tuple(findings)

@@ -506,6 +506,27 @@ def test_private_write_probe_rejects_non_relative_artifact_names(tmp_path):
         )
 
 
+def test_private_write_probe_reports_a_bounded_native_api_failure_stage(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    monkeypatch.setattr(
+        permissions,
+        "_native_api",
+        lambda: (_ for _ in ()).throw(RuntimeError("private native detail")),
+    )
+
+    result = permissions._run_private_acl_write_probe(
+        tmp_path,
+        directory_name=f".secret-write-probe-{'a' * 32}",
+    )
+
+    assert result.failure_type == "RuntimeError"
+    assert result.failure_stage == "probe-native-api"
+    assert result.cleanup_stage is None
+
+
 def test_private_write_probe_uses_only_relative_handles_and_deletes_them(
     tmp_path, monkeypatch
 ):
@@ -653,7 +674,13 @@ def test_private_write_probe_closes_artifact_handles_when_cleanup_marking_fails(
     )
 
     try:
-        assert result == permissions._WindowsPrivateProbeResult(None, True)
+        assert result == permissions._WindowsPrivateProbeResult(
+            None,
+            True,
+            None,
+            "probe-cleanup-file-delete",
+        )
+        assert result.cleanup_stage == "probe-cleanup-file-delete"
         assert api.children == {}
     finally:
         for handle in tuple(api.children):

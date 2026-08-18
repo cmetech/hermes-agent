@@ -197,7 +197,10 @@ function Read-RedactedChildOutput([string]$path) {
     }
     $observed = @(Get-Content -LiteralPath $path)
     foreach ($line in $observed) {
-        if ($line -match '^(platform-preflight|fresh-profile|arm-disabled-auto-keyring|file-tier-acl-repair|plain-doctor-read-only|explicit-write-probe|teams-cache-round-trip|reparse-rejection|cleanup) (PASS|FAIL)$') {
+        if ($line -match '^explicit-write-probe FAIL reason=probe-(native-api|open-root|create-directory|protect-directory|create-file|protect-file|write-file|flush-file|cleanup-file-delete|cleanup-file-close|cleanup-directory-delete|cleanup-directory-close|cleanup-root-close|unknown)$') {
+            $lines += $line
+        }
+        elseif ($line -match '^(platform-preflight|fresh-profile|arm-disabled-auto-keyring|file-tier-acl-repair|plain-doctor-read-only|explicit-write-probe|teams-cache-round-trip|reparse-rejection|cleanup) (PASS|FAIL)$') {
             $lines += $line
         }
         elseif ($line -match '^cleanup FAIL path=.+$') {
