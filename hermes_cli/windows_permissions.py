@@ -203,6 +203,35 @@ class _WindowsCallError(OSError):
         self.winerror = code
 
 
+class _ProbeRootFailure(RuntimeError):
+    def __init__(self, stage: str, failure_type: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
+        self.failure_type = failure_type
+
+
+def _probe_failure_category(exc: Exception) -> str:
+    if not isinstance(exc, _WindowsCallError):
+        return "other"
+    code = int(exc.winerror) & 0xFFFFFFFF
+    if code in {5, 0xC0000022}:
+        return "access-denied"
+    if code in {32, 0xC0000043}:
+        return "sharing-violation"
+    if code in {87, 0xC000000D}:
+        return "invalid-parameter"
+    if code in {2, 3, 0xC0000034, 0xC000003A}:
+        return "not-found"
+    if code == 0xC000050B:
+        return "reparse"
+    return "other"
+
+
+def _probe_root_failure(stage: str, exc: Exception) -> _ProbeRootFailure:
+    category = _probe_failure_category(exc)
+    return _ProbeRootFailure(f"probe-open-root-{stage}-{category}", type(exc).__name__)
+
+
 class _WindowsAclApi:
     """Minimal ctypes adapter for handle-authoritative Windows ACL operations."""
 
@@ -1208,26 +1237,35 @@ def _open_probe_root(
     held: list[tuple[int, _FileIdentity | None]],
 ) -> int:
     """Walk or create one absolute directory from an immutable anchor handle."""
-    anchor, components = _probe_root_parts(root)
+    try:
+        anchor, components = _probe_root_parts(root)
+    except Exception as exc:
+        raise _probe_root_failure("parse", exc) from None
     base_access = _SYNCHRONIZE
     path_handles: list[tuple[int, _FileIdentity]] = []
     component_names: list[str | None] = [None]
     can_create_child: list[bool] = [False]
 
-    def track(handle: int) -> _HandleMetadata:
+    def track(handle: int, stage: str) -> _HandleMetadata:
         index = len(held)
         held.append((handle, None))
-        metadata = api.handle_metadata(handle)
-        _verify_metadata(metadata, directory=True)
+        try:
+            metadata = api.handle_metadata(handle)
+            _verify_metadata(metadata, directory=True)
+        except Exception as exc:
+            raise _probe_root_failure(stage, exc) from None
         held[index] = (handle, metadata.identity)
         return metadata
 
-    anchor_handle = api.open_handle(
-        anchor,
-        access=0,
-        flags=_open_flags(directory=True),
-    )
-    anchor_metadata = track(anchor_handle)
+    try:
+        anchor_handle = api.open_handle(
+            anchor,
+            access=0,
+            flags=_open_flags(directory=True),
+        )
+    except Exception as exc:
+        raise _probe_root_failure("anchor-open", exc) from None
+    anchor_metadata = track(anchor_handle, "anchor-validate")
     path_handles.append((anchor_handle, anchor_metadata.identity))
 
     for index, component in enumerate(components):
@@ -1240,39 +1278,50 @@ def _open_probe_root(
             )
         except Exception as exc:
             if not _missing_relative_object(exc):
-                raise
+                raise _probe_root_failure("component-open", exc) from None
             if not can_create_child[-1]:
                 parent_identity = path_handles[-1][1]
-                if len(path_handles) == 1:
-                    replacement = api.open_handle(
-                        anchor,
-                        access=base_access | _FILE_ADD_SUBDIRECTORY,
-                        flags=_open_flags(directory=True),
-                    )
-                else:
-                    parent_name = component_names[-1]
-                    assert parent_name is not None
-                    replacement = api.open_relative_directory(
-                        path_handles[-2][0],
-                        parent_name,
-                        access=base_access | _FILE_ADD_SUBDIRECTORY,
-                    )
-                replacement_metadata = track(replacement)
+                try:
+                    if len(path_handles) == 1:
+                        replacement = api.open_handle(
+                            anchor,
+                            access=base_access | _FILE_ADD_SUBDIRECTORY,
+                            flags=_open_flags(directory=True),
+                        )
+                    else:
+                        parent_name = component_names[-1]
+                        assert parent_name is not None
+                        replacement = api.open_relative_directory(
+                            path_handles[-2][0],
+                            parent_name,
+                            access=base_access | _FILE_ADD_SUBDIRECTORY,
+                        )
+                except Exception as replacement_exc:
+                    raise _probe_root_failure(
+                        "parent-upgrade", replacement_exc
+                    ) from None
+                replacement_metadata = track(replacement, "parent-upgrade")
                 if replacement_metadata.identity != parent_identity:
-                    raise WindowsAclError(
-                        "Windows probe root component changed while opening"
-                    )
+                    raise _probe_root_failure(
+                        "parent-upgrade",
+                        WindowsAclError(
+                            "Windows probe root component changed while opening"
+                        ),
+                    ) from None
                 path_handles[-1] = (replacement, replacement_metadata.identity)
                 can_create_child[-1] = True
                 parent_handle = replacement
-            handle = api.create_relative_directory(
-                parent_handle,
-                component,
-                access=base_access | _FILE_ADD_SUBDIRECTORY,
-            )
+            try:
+                handle = api.create_relative_directory(
+                    parent_handle,
+                    component,
+                    access=base_access | _FILE_ADD_SUBDIRECTORY,
+                )
+            except Exception as create_exc:
+                raise _probe_root_failure("component-create", create_exc) from None
             access |= _FILE_ADD_SUBDIRECTORY
 
-        metadata = track(handle)
+        metadata = track(handle, "component-validate")
         path_handles.append((handle, metadata.identity))
         component_names.append(component)
         can_create_child.append(bool(access & _FILE_ADD_SUBDIRECTORY))
@@ -1280,12 +1329,18 @@ def _open_probe_root(
     for handle, identity in held:
         if identity is None:
             continue
-        metadata = api.handle_metadata(handle)
-        _verify_metadata(metadata, directory=True)
+        try:
+            metadata = api.handle_metadata(handle)
+            _verify_metadata(metadata, directory=True)
+        except Exception as exc:
+            raise _probe_root_failure("revalidate", exc) from None
         if metadata.identity != identity:
-            raise WindowsAclError(
-                "Windows probe root component changed during traversal"
-            )
+            raise _probe_root_failure(
+                "revalidate",
+                WindowsAclError(
+                    "Windows probe root component changed during traversal"
+                ),
+            ) from None
     return path_handles[-1][0]
 
 
@@ -1334,8 +1389,12 @@ def _run_private_acl_write_probe(
         stage = "probe-flush-file"
         api.flush_handle(file_handle)
     except Exception as exc:
-        failure_type = type(exc).__name__
-        failure_stage = stage
+        if isinstance(exc, _ProbeRootFailure):
+            failure_type = exc.failure_type
+            failure_stage = exc.stage
+        else:
+            failure_type = type(exc).__name__
+            failure_stage = stage
     finally:
         if api is not None and file_handle is not None:
             try:

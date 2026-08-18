@@ -1228,6 +1228,29 @@ def test_write_probe_acl_failure_is_redacted_and_cleaned(profile, monkeypatch):
     assert list(profile.glob(".secret-write-probe-*")) == []
 
 
+def test_write_probe_reports_only_bounded_root_failure_detail(profile, monkeypatch):
+    from hermes_cli import secrets_repair as repair
+    from hermes_cli import windows_permissions
+
+    monkeypatch.setattr(repair.sk, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        windows_permissions,
+        "_run_private_acl_write_probe",
+        lambda *_args, **_kwargs: windows_permissions._WindowsPrivateProbeResult(
+            "_WindowsCallError",
+            False,
+            "probe-open-root-component-open-access-denied",
+        ),
+    )
+
+    findings = repair._run_write_probe(profile)
+
+    assert findings[0].message.endswith(
+        "(probe-open-root-component-open-access-denied:_WindowsCallError)"
+    )
+    assert str(profile) not in findings[0].message
+
+
 def test_write_probe_reports_manual_cleanup_path_without_exception_payload(
     profile, monkeypatch
 ):

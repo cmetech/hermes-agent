@@ -36,6 +36,24 @@ _TRANSACTION_CASE_FILES = {
     "keystore.key",
     "keystore.lock",
 }
+_PROBE_ROOT_FAILURE_STAGES = frozenset({
+    "parse",
+    "anchor-open",
+    "anchor-validate",
+    "component-open",
+    "parent-upgrade",
+    "component-create",
+    "component-validate",
+    "revalidate",
+})
+_PROBE_FAILURE_CATEGORIES = frozenset({
+    "access-denied",
+    "sharing-violation",
+    "invalid-parameter",
+    "not-found",
+    "reparse",
+    "other",
+})
 _PROBE_FAILURE_REASONS = frozenset(
     {
         "probe-native-api",
@@ -52,6 +70,11 @@ _PROBE_FAILURE_REASONS = frozenset(
         "probe-cleanup-directory-close",
         "probe-cleanup-root-close",
         "probe-unknown",
+    }
+    | {
+        f"probe-open-root-{stage}-{category}"
+        for stage in _PROBE_ROOT_FAILURE_STAGES
+        for category in _PROBE_FAILURE_CATEGORIES
     }
 )
 _PROBE_FAILURE_REASON_RE = re.compile(

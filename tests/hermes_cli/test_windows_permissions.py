@@ -527,6 +527,50 @@ def test_private_write_probe_reports_a_bounded_native_api_failure_stage(
     assert result.cleanup_stage is None
 
 
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        (5, "access-denied"),
+        (0xC0000022, "access-denied"),
+        (32, "sharing-violation"),
+        (0xC0000043, "sharing-violation"),
+        (87, "invalid-parameter"),
+        (0xC000000D, "invalid-parameter"),
+        (2, "not-found"),
+        (3, "not-found"),
+        (0xC0000034, "not-found"),
+        (0xC000003A, "not-found"),
+        (0xC000050B, "reparse"),
+        (1314, "other"),
+    ],
+)
+def test_private_write_probe_maps_native_errors_to_bounded_categories(code, category):
+    from hermes_cli import windows_permissions as permissions
+
+    error = permissions._WindowsCallError("private operation", code)
+
+    assert permissions._probe_failure_category(error) == category
+
+
+def test_private_write_probe_reports_bounded_anchor_open_failure(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    class AnchorFailureApi:
+        def open_handle(self, *_args, **_kwargs):
+            raise permissions._WindowsCallError("private operation", 5)
+
+    monkeypatch.setattr(permissions, "_native_api", AnchorFailureApi)
+
+    result = permissions._run_private_acl_write_probe(
+        tmp_path / "profile",
+        directory_name=f".secret-write-probe-{'a' * 32}",
+    )
+
+    assert result.failure_type == "_WindowsCallError"
+    assert result.failure_stage == "probe-open-root-anchor-open-access-denied"
+    assert result.cleanup_stage is None
+
+
 def test_private_write_probe_uses_only_relative_handles_and_deletes_them(
     tmp_path, monkeypatch
 ):
@@ -996,6 +1040,14 @@ def test_private_write_probe_closes_handles_acquired_before_validation_failure(
     )
 
     assert result.failure_type == "RuntimeError"
+    assert (
+        result.failure_stage
+        == {
+            "anchor": "probe-open-root-anchor-validate-other",
+            "child": "probe-open-root-component-validate-other",
+            "replacement": "probe-open-root-parent-upgrade-other",
+        }[failure_stage]
+    )
     assert result.cleanup_failed is False
     assert {"anchor": [1], "child": [2, 1], "replacement": [2, 1]}[
         failure_stage

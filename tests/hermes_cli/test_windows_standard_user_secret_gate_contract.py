@@ -227,6 +227,47 @@ def test_harness_emits_only_a_bounded_native_probe_failure_stage(tmp_path) -> No
     ]
 
 
+def test_harness_preserves_a_bounded_root_substage_and_error_category(tmp_path) -> None:
+    gate = _load_harness()
+
+    class ProbeFailureAdapter(_ContractAdapter):
+        def exercise_write_probe(self, profile: Path) -> None:
+            assert profile == self.profile
+            self.calls.append("explicit-write-probe")
+            raise gate._GateCaseFailure("probe-open-root-component-open-access-denied")
+
+    output = io.StringIO()
+
+    assert gate.main(adapter=ProbeFailureAdapter(tmp_path), output=output) == 1
+    assert output.getvalue().splitlines()[-2:] == [
+        "explicit-write-probe FAIL reason=probe-open-root-component-open-access-denied",
+        "cleanup PASS",
+    ]
+
+
+def test_native_adapter_extracts_only_a_bounded_root_probe_reason(
+    tmp_path, monkeypatch
+) -> None:
+    gate = _load_harness()
+    adapter = gate.NativeWindowsAdapter(workspace=tmp_path)
+    output = (
+        "[WRITE_PROBE_FAILED] synthetic failure "
+        "(probe-open-root-component-open-access-denied:_WindowsCallError)\n"
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_run_doctor",
+        lambda *, write_probe: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=output, stderr=""
+        ),
+    )
+
+    with pytest.raises(gate._GateCaseFailure) as exc_info:
+        adapter.exercise_write_probe(tmp_path)
+
+    assert exc_info.value.reason == "probe-open-root-component-open-access-denied"
+
+
 def _write_launcher_adapter(
     path: Path,
     *,
