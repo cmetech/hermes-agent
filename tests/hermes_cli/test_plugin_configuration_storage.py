@@ -382,7 +382,7 @@ def test_profile_only_env_writer_never_mirrors_into_process_or_child(tmp_path):
 
     assert os.environ.get(key) is None
     assert inherited == ""
-    assert "profile-secret" in (tmp_path / "profile" / ".env").read_text()
+    assert "profile-secret" in (tmp_path / "profile" / ".env").read_text(encoding="utf-8")
 
 
 def test_profile_only_env_writer_preserves_legacy_file_serialization(tmp_path):
@@ -451,8 +451,8 @@ def test_profile_only_env_writer_isolates_concurrent_context_profiles(tmp_path):
     second.join(2)
 
     assert errors == []
-    assert "secret-a" in (tmp_path / "a" / ".env").read_text()
-    assert "secret-b" in (tmp_path / "b" / ".env").read_text()
+    assert "secret-a" in (tmp_path / "a" / ".env").read_text(encoding="utf-8")
+    assert "secret-b" in (tmp_path / "b" / ".env").read_text(encoding="utf-8")
     assert key not in os.environ
 
 
