@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { en } from '@/i18n/en'
+import { brandText } from '@/test/brand-text'
 
 import { resolveVersionStatus } from './version-status'
 
@@ -53,10 +54,10 @@ describe('resolveVersionStatus', () => {
 
   it('leads the tooltip with the apply message while applying', () => {
     expect(client({ applyMessage: 'Pulling…', applying: true, version: '0.4.2' }).tooltip).toBe(
-      'Pulling… · Hermes Desktop v0.4.2'
+      brandText('Pulling… · Hermes Desktop v0.4.2')
     )
     expect(client({ applying: true, version: '0.4.2' }).tooltip).toBe(
-      `${copy.updateInProgress} · Hermes Desktop v0.4.2`
+      brandText(`${copy.updateInProgress} · Hermes Desktop v0.4.2`)
     )
   })
 
