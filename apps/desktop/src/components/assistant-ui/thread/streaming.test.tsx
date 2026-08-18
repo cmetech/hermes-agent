@@ -3,6 +3,8 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { useEffect, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { brandText } from '@/test/brand-text'
+
 import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
@@ -486,13 +488,13 @@ describe('assistant-ui streaming renderer', () => {
 
     const { container } = render(<StreamingHarness onControls={registerControls} />)
 
-    expect(screen.getByRole('status', { name: 'Hermes is loading a response' })).toBeTruthy()
+    expect(screen.getByRole('status', { name: brandText('Hermes is loading a response') })).toBeTruthy()
 
     await waitFor(() => {
       expect(container.textContent).toContain('first chunk')
     })
     expect(container.textContent).not.toContain('second chunk')
-    expect(screen.queryByRole('status', { name: 'Hermes is loading a response' })).toBeNull()
+    expect(screen.queryByRole('status', { name: brandText('Hermes is loading a response') })).toBeNull()
 
     // Producer-gated, not wall-clock-gated: the old test slept 80ms and
     // assumed a 500ms timer could not fire before the assertion. On a loaded
