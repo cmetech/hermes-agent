@@ -280,7 +280,11 @@ def test_private_directory_binding_applies_and_inspects_one_held_handle(
     assert api.opens == [
         (
             target,
-            READ_CONTROL | WRITE_DAC | FILE_TRAVERSE | FILE_ADD_FILE,
+            READ_CONTROL
+            | WRITE_DAC
+            | FILE_READ_ATTRIBUTES
+            | FILE_TRAVERSE
+            | FILE_ADD_FILE,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
         )
     ]
@@ -325,7 +329,7 @@ def test_private_file_write_publish_and_final_inspection_share_one_held_handle(
             self.events.append(("apply", handle))
 
         def create_relative(self, parent, name, *, directory, access):
-            self.events.append(("create", parent, name, directory))
+            self.events.append(("create", parent, name, directory, access))
             return self.file_handle
 
         def set_delete_on_close(self, handle, delete):
@@ -354,7 +358,18 @@ def test_private_file_write_publish_and_final_inspection_share_one_held_handle(
         ("inspect", api.handle),
         ("apply", api.handle),
         ("inspect", api.handle),
-        ("create", api.handle, "temporary", False),
+        (
+            "create",
+            api.handle,
+            "temporary",
+            False,
+            READ_CONTROL
+            | WRITE_DAC
+            | DELETE
+            | SYNCHRONIZE
+            | FILE_READ_ATTRIBUTES
+            | FILE_WRITE_DATA,
+        ),
         ("inspect", api.file_handle),
         ("apply", api.file_handle),
         ("inspect", api.file_handle),
@@ -396,7 +411,7 @@ def test_private_file_read_is_bounded_on_the_acl_held_handle(tmp_path, monkeypat
             self.events.append(("apply", handle))
 
         def open_relative_file(self, parent, name, *, access):
-            self.events.append(("open", parent, name))
+            self.events.append(("open", parent, name, access))
             return self.file_handle
 
         def read_handle(self, handle, size):
@@ -417,6 +432,16 @@ def test_private_file_read_is_bounded_on_the_acl_held_handle(tmp_path, monkeypat
         ("apply", api.file_handle),
         ("inspect", api.file_handle),
     ]
+    assert api.events[3] == (
+        "open",
+        api.handle,
+        "cache.json",
+        READ_CONTROL
+        | WRITE_DAC
+        | SYNCHRONIZE
+        | FILE_READ_ATTRIBUTES
+        | permissions._FILE_READ_DATA,
+    )
     assert [event[0] for event in file_events[3:]] == ["read", "read", "read"]
     assert api.closed == [api.file_handle, api.handle]
 
@@ -683,10 +708,20 @@ def test_private_write_probe_uses_only_relative_handles_and_deletes_them(
         (probe_handle, "sentinel", False),
     ]
     assert api.relative[0][3] == (
-        READ_CONTROL | WRITE_DAC | DELETE | SYNCHRONIZE | FILE_ADD_FILE
+        READ_CONTROL
+        | WRITE_DAC
+        | DELETE
+        | SYNCHRONIZE
+        | FILE_READ_ATTRIBUTES
+        | FILE_ADD_FILE
     )
     assert api.relative[1][3] == (
-        READ_CONTROL | WRITE_DAC | DELETE | SYNCHRONIZE | FILE_WRITE_DATA
+        READ_CONTROL
+        | WRITE_DAC
+        | DELETE
+        | SYNCHRONIZE
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_DATA
     )
     assert api.acl_events == [
         ("inspect", probe_handle),
@@ -788,7 +823,12 @@ def test_private_write_probe_creates_absent_root_from_held_ancestor(
     assert set(api.relative_opens) <= {
         SYNCHRONIZE | FILE_READ_ATTRIBUTES,
         SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_ADD_SUBDIRECTORY,
-        READ_CONTROL | WRITE_DAC | DELETE | SYNCHRONIZE | FILE_ADD_FILE,
+        READ_CONTROL
+        | WRITE_DAC
+        | DELETE
+        | SYNCHRONIZE
+        | FILE_READ_ATTRIBUTES
+        | FILE_ADD_FILE,
     }
 
 
@@ -1303,7 +1343,10 @@ def test_public_operations_open_the_target_without_traversing_reparse_points(
     assert opened_path == target
     assert flags & FILE_FLAG_OPEN_REPARSE_POINT
     assert bool(flags & FILE_FLAG_BACKUP_SEMANTICS) is directory
-    assert access == (READ_CONTROL | WRITE_DAC if applying else READ_CONTROL)
+    expected_access = READ_CONTROL | FILE_READ_ATTRIBUTES
+    if applying:
+        expected_access |= WRITE_DAC
+    assert access == expected_access
     assert not access & (ACCESS_SYSTEM_SECURITY | WRITE_OWNER)
     assert api.closed == [api.handle]
 

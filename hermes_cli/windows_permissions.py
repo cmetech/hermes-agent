@@ -913,7 +913,12 @@ class _WindowsPrivateDirectory:
                 name,
                 directory=False,
                 access=(
-                    READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_WRITE_DATA
+                    READ_CONTROL
+                    | WRITE_DAC
+                    | _DELETE
+                    | _SYNCHRONIZE
+                    | _FILE_READ_ATTRIBUTES
+                    | _FILE_WRITE_DATA
                 ),
             )
             _operate_handle(self._api, handle, directory=False, apply=True)
@@ -950,7 +955,13 @@ class _WindowsPrivateDirectory:
             handle = self._api.open_relative_file(
                 self._require_handle(),
                 name,
-                access=(READ_CONTROL | WRITE_DAC | _SYNCHRONIZE | _FILE_READ_DATA),
+                access=(
+                    READ_CONTROL
+                    | WRITE_DAC
+                    | _SYNCHRONIZE
+                    | _FILE_READ_ATTRIBUTES
+                    | _FILE_READ_DATA
+                ),
             )
             _operate_handle(self._api, handle, directory=False, apply=True)
             private_file = _WindowsPrivateFile(
@@ -1136,7 +1147,13 @@ def open_private_directory(path: Path) -> _WindowsPrivateDirectory:
     try:
         handle = api.open_bound_handle(
             path,
-            access=READ_CONTROL | WRITE_DAC | _FILE_TRAVERSE | _FILE_ADD_FILE,
+            access=(
+                READ_CONTROL
+                | WRITE_DAC
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_TRAVERSE
+                | _FILE_ADD_FILE
+            ),
             flags=_open_flags(directory=True),
         )
         _operate_handle(api, handle, directory=True, apply=True)
@@ -1169,7 +1186,9 @@ def _operate(
     handle: int | None = None
     primary_failed = False
     try:
-        access = READ_CONTROL | WRITE_DAC if apply else READ_CONTROL
+        access = READ_CONTROL | _FILE_READ_ATTRIBUTES
+        if apply:
+            access |= WRITE_DAC
         handle = api.open_handle(
             path, access=access, flags=_open_flags(directory=directory)
         )
@@ -1372,7 +1391,14 @@ def _run_private_acl_write_probe(
             root_handle,
             directory_name,
             directory=True,
-            access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_ADD_FILE,
+            access=(
+                READ_CONTROL
+                | WRITE_DAC
+                | _DELETE
+                | _SYNCHRONIZE
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_ADD_FILE
+            ),
         )
         stage = "probe-protect-directory"
         _operate_handle(api, directory_handle, directory=True, apply=True)
@@ -1381,7 +1407,14 @@ def _run_private_acl_write_probe(
             directory_handle,
             _PROBE_FILE_NAME,
             directory=False,
-            access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_WRITE_DATA,
+            access=(
+                READ_CONTROL
+                | WRITE_DAC
+                | _DELETE
+                | _SYNCHRONIZE
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_WRITE_DATA
+            ),
         )
         stage = "probe-protect-file"
         _operate_handle(api, file_handle, directory=False, apply=True)
