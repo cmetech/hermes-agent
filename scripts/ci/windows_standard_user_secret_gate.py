@@ -100,6 +100,8 @@ _TEAMS_TRACE_OPERATIONS = frozenset(
         "publish-verify-user",
         "publish-verify-acl",
         "read-file",
+        "missing",
+        "mismatch",
     }
     | {
         f"publish-rename-file-{category}"
@@ -789,8 +791,10 @@ class NativeWindowsAdapter:
         cache_path = module.cache_path()
         self._teams_cache_path = cache_path
         first_text = run_phase("first-read", module._read_cache_text)
+        if first_text is None:
+            raise _GateCaseFailure("teams-first-read-missing")
         if first_text != first_cache.serialized:
-            raise _GateCaseFailure("teams-first-read-outer")
+            raise _GateCaseFailure("teams-first-read-mismatch")
         try:
             parent_acl = windows_permissions.inspect_directory_acl(cache_path.parent)
         except Exception:
@@ -807,8 +811,10 @@ class NativeWindowsAdapter:
         replacement_cache = _ChangedTeamsCache(replacement)
         run_phase("replacement-persist", lambda: module._persist(replacement_cache))
         replacement_text = run_phase("replacement-read", module._read_cache_text)
+        if replacement_text is None:
+            raise _GateCaseFailure("teams-replacement-read-missing")
         if replacement_text != replacement_cache.serialized:
-            raise _GateCaseFailure("teams-replacement-read-outer")
+            raise _GateCaseFailure("teams-replacement-read-mismatch")
         try:
             file_acl = windows_permissions.inspect_file_acl(cache_path)
         except Exception:

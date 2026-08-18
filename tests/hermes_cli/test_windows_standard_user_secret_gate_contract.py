@@ -330,6 +330,32 @@ def test_native_teams_gate_reports_the_last_bounded_host_operation(
     assert exc_info.value.reason == "teams-first-persist-publish-file"
 
 
+@pytest.mark.parametrize(
+    ("observed", "reason"),
+    [
+        (None, "teams-first-read-missing"),
+        ("different synthetic cache", "teams-first-read-mismatch"),
+    ],
+)
+def test_native_teams_gate_distinguishes_bounded_first_read_results(
+    tmp_path, monkeypatch, observed, reason
+) -> None:
+    gate = _load_harness()
+    adapter = gate.NativeWindowsAdapter(workspace=tmp_path)
+    module = SimpleNamespace(
+        _WindowsAclApi=lambda **kwargs: SimpleNamespace(**kwargs),
+        _persist=lambda _cache: None,
+        cache_path=lambda: tmp_path / "cache" / "cache.json",
+        _read_cache_text=lambda: observed,
+    )
+    monkeypatch.setattr(adapter, "_load_vendored_teams_module", lambda: module)
+
+    with pytest.raises(gate._GateCaseFailure) as exc_info:
+        adapter.exercise_teams_cache(tmp_path, b"first", b"replacement")
+
+    assert exc_info.value.reason == reason
+
+
 def test_native_teams_gate_distinguishes_a_native_rename_failure(
     tmp_path, monkeypatch
 ) -> None:
