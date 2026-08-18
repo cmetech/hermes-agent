@@ -16,13 +16,15 @@ import { WorkflowsView } from './index'
 
 const WORKFLOW_NAME = 'Portable contract'
 const MERMAID_SOURCE = 'flowchart TD\n  start["Start"] --> finish["Finish"]'
-const renderer = vi.hoisted(() => ({ calls: vi.fn<(code: string) => void>() }))
+const renderer = vi.hoisted(() => ({
+  calls: vi.fn<(code: string, presentation: 'inline' | 'workflow' | undefined) => void>()
+}))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 const workflowCopy = TRANSLATIONS.en.operations
 
 vi.mock('@/components/assistant-ui/embeds/mermaid-embed', () => ({
-  default: ({ code }: { code: string }) => {
-    renderer.calls(code)
+  default: ({ code, presentation }: { code: string; presentation?: 'inline' | 'workflow' }) => {
+    renderer.calls(code, presentation)
 
     if (code === 'renderer throws') {
       throw new Error('renderer failed')
@@ -224,7 +226,7 @@ describe('workflow View dialog', () => {
     const dialog = await openView()
 
     expect((await within(dialog).findByTestId('shared-mermaid-renderer')).textContent).toBe(MERMAID_SOURCE)
-    expect(renderer.calls).toHaveBeenCalledWith(MERMAID_SOURCE)
+    expect(renderer.calls).toHaveBeenCalledWith(MERMAID_SOURCE, 'workflow')
     expect(apiStructured).toHaveBeenCalledWith({
       path: `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}?catalog_source=profile`,
       profile: 'profile-a'
