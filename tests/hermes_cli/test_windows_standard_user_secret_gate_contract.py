@@ -130,6 +130,29 @@ def test_harness_refuses_non_windows_without_explicit_adapter(monkeypatch) -> No
     assert output.getvalue().splitlines() == ["platform-preflight FAIL"]
 
 
+def test_native_adapter_accepts_explicit_workspace_without_inherited_environment(
+    tmp_path, monkeypatch
+) -> None:
+    gate = _load_harness()
+    monkeypatch.delenv("HERMES_WINDOWS_GATE_WORKSPACE", raising=False)
+
+    adapter = gate.NativeWindowsAdapter(workspace=tmp_path)
+    profile = adapter.create_profile()
+    try:
+        assert profile.parent == tmp_path
+        assert (profile / "config.yaml").is_file()
+    finally:
+        adapter.cleanup(profile)
+
+
+def test_native_launcher_passes_workspace_to_credentialed_child() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert '"--workspace"' in launcher
+    argument_list = launcher.split("-ArgumentList", 1)[1].split("-Credential", 1)[0]
+    assert "$workspace" in argument_list
+
+
 def test_harness_adapter_contract_covers_native_cases_and_synthetic_cleanup(
     tmp_path,
 ) -> None:

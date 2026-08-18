@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -130,8 +131,9 @@ class _ChangedTeamsCache:
 
 
 class NativeWindowsAdapter:
-    def __init__(self) -> None:
+    def __init__(self, *, workspace: Path | None = None) -> None:
         self._profile: Path | None = None
+        self._workspace = workspace
         self._old_home = os.environ.get("HERMES_HOME")
         self._old_mode = os.environ.get(_MODE_ENV)
         self._storage_key: str | None = None
@@ -234,10 +236,12 @@ class NativeWindowsAdapter:
             raise RuntimeError("workspace must be a direct directory")
 
     def create_profile(self) -> Path:
-        raw_workspace = os.environ.get(_WORKSPACE_ENV)
-        if not raw_workspace:
-            raise RuntimeError("private CI workspace is unavailable")
-        workspace = Path(raw_workspace)
+        workspace = self._workspace
+        if workspace is None:
+            raw_workspace = os.environ.get(_WORKSPACE_ENV)
+            if not raw_workspace:
+                raise RuntimeError("private CI workspace is unavailable")
+            workspace = Path(raw_workspace)
         self._require_direct_directory(workspace)
         profile = Path(
             tempfile.mkdtemp(prefix="hermes-standard-user-secret-", dir=workspace)
@@ -654,13 +658,15 @@ def _emit(output: TextIO, case: str, passed: bool, detail: str | None = None) ->
 def main(
     adapter: GateAdapter | None = None,
     output: TextIO | None = None,
+    *,
+    workspace: Path | None = None,
 ) -> int:
     output = output or sys.stdout
     if adapter is None:
         if os.name != "nt":
             _emit(output, "platform-preflight", False)
             return 1
-        adapter = NativeWindowsAdapter()
+        adapter = NativeWindowsAdapter(workspace=workspace)
 
     synthetic = SyntheticInputs.generate()
     profile: Path | None = None
@@ -726,4 +732,7 @@ def main(
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workspace", type=Path)
+    arguments = parser.parse_args()
+    raise SystemExit(main(workspace=arguments.workspace))

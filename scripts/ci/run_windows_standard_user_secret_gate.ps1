@@ -99,7 +99,11 @@ function New-NativeGateAdapter {
             )
             $process = Start-Process `
                 -FilePath $script:PythonPath `
-                -ArgumentList @($script:HarnessPath) `
+                -ArgumentList @(
+                    "`"$script:HarnessPath`""
+                    "--workspace"
+                    "`"$workspace`""
+                ) `
                 -Credential $credential `
                 -LoadUserProfile `
                 -WorkingDirectory $script:RepoRoot `
