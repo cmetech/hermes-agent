@@ -124,7 +124,7 @@ function Diagram({ code }: { code: string }) {
     <div className="max-h-[55dvh] max-w-full overflow-auto" data-workflow-view-scroll>
       <RichBoundary fallback={fallback} resetKey={code}>
         <Suspense fallback={<DiagramSourcePreview code={code} muted />}>
-          <MermaidRenderer code={code} streaming={false} />
+          <MermaidRenderer code={code} presentation="workflow" streaming={false} />
         </Suspense>
       </RichBoundary>
     </div>
