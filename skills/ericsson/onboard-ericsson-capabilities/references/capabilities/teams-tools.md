@@ -55,11 +55,17 @@ asked separately at the moment they are needed.
 
 List/read operations access Graph data. Send/reply changes Teams and is never a
 configuration test. The local MSAL cache stays outside ordinary chat and summaries.
+On Windows, its parent directory, publication temporary, and final cache use the
+generic protected current-user ACL. This is supported from a standard-user session;
+it does not require elevation or `SeSecurityPrivilege`.
 
 ## Readiness
 
 Confirm plugin discovery, Python `msal`, optional client-ID override, device-code
-sign-in, delegated permissions, then list teams read-only. Never paste device codes.
+sign-in, delegated permissions, then list teams read-only. Never paste device codes,
+tokens, or cache contents into chat or diagnostics. The cache at
+`$HERMES_HOME/ericsson/msal_token_cache.json` is separate from plugin descriptor
+secrets and from `hermes secrets doctor --write-probe`.
 
 ## Demonstration
 
@@ -74,4 +80,8 @@ authentication cache contents are never shown or copied.
 ## Troubleshooting
 
 Separate dependency, sign-in timeout, consent, permission, and zero-access cases. An
-uncertain send is inspected before any rerun to avoid duplicate messages.
+uncertain send is inspected before any rerun to avoid duplicate messages. An ACL,
+ownership, wrong-type, or reparse-point cache failure is fail-closed: remediate the
+local filesystem condition through the approved support process, clear the affected
+session, and run `teams_auth` again. Do not copy, edit, print, or use cache contents
+as diagnostic evidence.
