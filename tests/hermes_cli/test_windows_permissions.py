@@ -377,7 +377,7 @@ def test_private_file_write_publish_and_final_inspection_share_one_held_handle(
         ("write", api.file_handle, b"synthetic-cache"),
         ("flush", api.file_handle),
         ("delete", api.file_handle, False),
-        ("rename", api.file_handle, api.handle, "cache.json", True),
+        ("rename", api.file_handle, 0, "cache.json", True),
         ("inspect", api.file_handle),
     ]
     assert api.closed == [api.file_handle, api.handle]

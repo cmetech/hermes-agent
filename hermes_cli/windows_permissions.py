@@ -1081,9 +1081,10 @@ class _WindowsPrivateFile:
         try:
             self._api.set_delete_on_close(handle, False)
             self._delete_armed = False
+            # A simple name with a null root renames within the held file's directory.
             self._api.rename_handle(
                 handle,
-                self._parent_handle,
+                0,
                 name,
                 replace=True,
             )
