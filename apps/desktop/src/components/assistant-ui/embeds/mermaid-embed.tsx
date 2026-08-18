@@ -12,6 +12,10 @@ import { useIsDark } from './use-is-dark'
 
 let lastTheme: 'dark' | 'default' | null = null
 
+interface MermaidRendererProps extends RichFenceProps {
+  presentation?: 'inline' | 'workflow'
+}
+
 // Re-initialise only on first use / theme flip. `securityLevel: 'strict'` makes
 // mermaid sanitise label HTML and drop click handlers, so the rendered SVG is
 // safe to inject.
@@ -42,7 +46,7 @@ function SourcePreview({ code, muted }: { code: string; muted?: boolean }) {
 // Lazy chunk (pulls in mermaid). Renders ```mermaid fences as diagrams; shows
 // the source while the message streams (partial syntax throws) and falls back
 // to source on parse failure.
-export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
+export default function MermaidRenderer({ code, streaming, presentation = 'inline' }: MermaidRendererProps) {
   const isDark = useIsDark()
   const [svg, setSvg] = useState('')
   const [failed, setFailed] = useState(false)
@@ -90,22 +94,31 @@ export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
     return <SourcePreview code={code} muted />
   }
 
-  // Click to open the diagram full-screen with pan/zoom + copy-as-PNG. The
-  // overlay keeps the diagram's natural width (capped to the viewport) so it
-  // renders before any zoom; the inline version stays capped at 33dvh.
+  const workflowPresentation = presentation === 'workflow'
+
+  // The full view gives the SVG a stage-sized viewport, so Mermaid's viewBox
+  // performs the resting fit/centre operation before pan/zoom transforms apply.
+  // Chat diagrams remain compact; the dedicated workflow view gets a larger
+  // stable viewport instead of inheriting the transcript-oriented 33dvh cap.
   return (
     <Zoomable
+      fit="contain"
       label="Open diagram"
       onCopy={() => copySvgAsPng(svg)}
       overlay={
         <div
-          className="[&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-h-[80vh] [&_svg]:max-w-[85vw]"
+          className="size-full p-6 pb-16 [&_svg]:block [&_svg]:size-full [&_svg]:!max-h-none [&_svg]:!max-w-none"
           dangerouslySetInnerHTML={{ __html: svg }}
         />
       }
     >
       <div
-        className="overflow-hidden p-3 [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-h-[33dvh] [&_svg]:max-w-full"
+        className={cn(
+          'overflow-hidden p-3 [&_svg]:mx-auto [&_svg]:block [&_svg]:max-w-full',
+          workflowPresentation
+            ? 'h-[clamp(16rem,50dvh,34rem)] [&_svg]:size-full [&_svg]:!max-h-none [&_svg]:!max-w-none'
+            : '[&_svg]:h-auto [&_svg]:max-h-[33dvh]'
+        )}
         dangerouslySetInnerHTML={{ __html: svg }}
       />
     </Zoomable>

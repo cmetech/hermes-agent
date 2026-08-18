@@ -18,6 +18,8 @@ interface ZoomableProps {
   onCopy?: () => Promise<void> | void
   /** Accessible label for the expand affordance. */
   label?: string
+  /** Make the full-view content fill the pan/zoom stage at the resting 1x transform. */
+  fit?: 'contain' | 'natural'
   className?: string
 }
 
@@ -27,7 +29,14 @@ interface ZoomableProps {
  * (see useZoomPan) and optionally copied. Content-agnostic — wrap a diagram,
  * image, or any node.
  */
-export function Zoomable({ children, overlay, onCopy, label = 'Open full view', className }: ZoomableProps) {
+export function Zoomable({
+  children,
+  overlay,
+  onCopy,
+  label = 'Open full view',
+  fit = 'natural',
+  className
+}: ZoomableProps) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -35,9 +44,9 @@ export function Zoomable({ children, overlay, onCopy, label = 'Open full view', 
       <div className={cn('group/zoomable relative', className)}>
         {/* The whole content is the trigger — click anywhere to open, like an image. */}
         <button
+          aria-label={label}
           className="block w-full cursor-zoom-in text-left"
           onClick={() => setOpen(true)}
-          title={label}
           type="button"
         >
           {children}
@@ -50,7 +59,7 @@ export function Zoomable({ children, overlay, onCopy, label = 'Open full view', 
         </span>
       </div>
       {open && (
-        <ZoomPanViewer onCopy={onCopy} onOpenChange={setOpen} open={open}>
+        <ZoomPanViewer fit={fit} onCopy={onCopy} onOpenChange={setOpen} open={open}>
           {overlay ?? children}
         </ZoomPanViewer>
       )}
@@ -60,11 +69,13 @@ export function Zoomable({ children, overlay, onCopy, label = 'Open full view', 
 
 function ZoomPanViewer({
   children,
+  fit,
   onCopy,
   onOpenChange,
   open
 }: {
   children: ReactNode
+  fit: 'contain' | 'natural'
   onCopy?: () => Promise<void> | void
   onOpenChange: (open: boolean) => void
   open: boolean
@@ -91,7 +102,7 @@ function ZoomPanViewer({
           {...stageProps}
         >
           <div className="absolute inset-0 grid place-items-center">
-            <div className="origin-center" style={style}>
+            <div className={cn('origin-center', fit === 'contain' && 'size-full')} data-zoom-pan-content style={style}>
               {children}
             </div>
           </div>
