@@ -75,7 +75,7 @@ _FILE_ADD_SUBDIRECTORY = 0x00000004
 _FILE_TRAVERSE = 0x00000020
 _FILE_READ_ATTRIBUTES = 0x00000080
 _FILE_DISPOSITION_INFO_CLASS = 4
-_FILE_RENAME_INFO_CLASS = 3
+_FILE_RENAME_INFORMATION_CLASS = 10
 _STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
 _STATUS_OBJECT_NAME_COLLISION = 0xC0000035
 _PROBE_DIRECTORY_RE = re.compile(r"^\.secret-write-probe-[0-9a-f]{32}$")
@@ -386,6 +386,14 @@ class _WindowsAclApi:
             wintypes.ULONG,
         ]
         self.ntdll.NtCreateFile.restype = wintypes.LONG
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IO_STATUS_BLOCK),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        self.ntdll.NtSetInformationFile.restype = wintypes.LONG
 
     @staticmethod
     def _raise(operation: str, code: int | None = None) -> None:
@@ -566,13 +574,16 @@ class _WindowsAclApi:
             encoded_name,
             len(encoded_name),
         )
-        if not self.kernel32.SetFileInformationByHandle(
+        status = _IO_STATUS_BLOCK()
+        result = self.ntdll.NtSetInformationFile(
             handle,
-            _FILE_RENAME_INFO_CLASS,
+            ctypes.byref(status),
             storage,
             size,
-        ):
-            self._raise("publish Windows private file")
+            _FILE_RENAME_INFORMATION_CLASS,
+        )
+        if result < 0:
+            self._raise("publish Windows private file", int(result))
 
     def handle_metadata(self, handle: int) -> _HandleMetadata:
         information = _BY_HANDLE_FILE_INFORMATION()

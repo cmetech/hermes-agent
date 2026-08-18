@@ -983,13 +983,13 @@ def test_native_private_file_delete_disposition_is_handle_bound(delete):
     assert ctypes.sizeof(permissions._FILE_DISPOSITION_INFO) == 1
 
 
-def test_native_private_file_publish_renames_the_held_handle_relative_to_parent():
+def test_native_private_file_publish_uses_the_same_directory_native_contract():
     from hermes_cli import windows_permissions as permissions
 
     values = []
     buffers = []
 
-    def set_information(handle, info_class, information, size):
+    def set_information(handle, io_status, information, size, info_class):
         rename = ctypes.cast(
             information,
             ctypes.POINTER(permissions._FILE_RENAME_INFO),
@@ -1007,22 +1007,24 @@ def test_native_private_file_publish_renames_the_held_handle_relative_to_parent(
             size,
         ))
         buffers.append(ctypes.string_at(information, size))
-        return True
+        assert io_status
+        return 0
 
     api = _uninitialized_native_api(
         permissions,
-        kernel32=SimpleNamespace(SetFileInformationByHandle=set_information),
+        kernel32=SimpleNamespace(),
         advapi32=SimpleNamespace(),
+        ntdll=SimpleNamespace(NtSetInformationFile=set_information),
     )
 
-    api.rename_handle(0xF11, 0xD11, "cache.json", replace=True)
+    api.rename_handle(0xF11, 0, "cache.json", replace=True)
 
     assert values == [
         (
             0xF11,
-            3,
+            10,
             True,
-            0xD11,
+            None,
             "cache.json",
             ctypes.sizeof(permissions._FILE_RENAME_INFO)
             + len("cache.json".encode("utf-16-le"))
