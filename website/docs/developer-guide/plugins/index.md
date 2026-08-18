@@ -897,6 +897,93 @@ After registration, users can run `hermes my-plugin status`, `hermes my-plugin c
 
 **Active-provider gating:** Memory plugin CLI commands only appear when their provider is the active `memory.provider` in config. If a user hasn't set up your provider, your CLI commands won't clutter the help output.
 
+### Application command providers
+
+Use the application-command port when one plugin owns a visible
+`hermes <command>` tree but an independently enabled provider plugin owns the
+operation, configuration, and secrets. The caller registers its argparse tree
+with `ctx.register_cli_command()`. The provider registers deterministic
+operations with `ctx.register_application_commands()`, and the caller invokes
+one of them with `ctx.invoke_application_command()`.
+
+The provider and caller remain separate plugins:
+
+```python
+# provider plugin
+def register(ctx):
+    def execute(invocation):
+        configuration = ctx.configuration()  # fresh and owner-only
+        return run_operation(
+            invocation.operation,
+            dict(invocation.arguments),
+            configuration,
+            mode=invocation.mode.value,
+        )
+
+    ctx.register_application_commands(
+        operations={"records_get": "read", "records_update": "write"},
+        allowed_callers={"records-cli"},
+        handler=execute,
+    )
+```
+
+```python
+# always-loaded caller plugin
+import uuid
+
+def run_update(ctx, args):
+    result = ctx.invoke_application_command(
+        "records-provider",
+        "records_update",
+        {"record_id": args.record_id, "value": args.value},
+        mode="dry_run" if args.dry_run else "confirm",
+        invocation_id=str(uuid.uuid4()),
+    )
+    return render_result(result, as_json=args.json)
+
+def register(ctx):
+    ctx.register_cli_command(
+        name="records",
+        help="Read and update records",
+        setup_fn=setup_records_parser,
+        handler_fn=lambda args: run_update(ctx, args),
+    )
+```
+
+The caller owns parsing, local file/stdin acquisition, explicit write-intent
+flags, rendering, and exit codes. It must obtain explicit user intent before
+requesting `confirm`; a write accepts only `dry_run` or `confirm`, while a read
+accepts only `read`. The provider owns fresh `ctx.configuration()` resolution,
+protected secrets, clients, validation, and the operation implementation. Do
+not cache configuration, credentials, clients, or capability fingerprints.
+
+Provider and caller identities come from their respective `PluginContext`.
+The provider declares an explicit caller allowlist and immutable `read`/`write`
+operation classifications. Arguments and results must be JSON-native mappings;
+Hermes canonicalizes and copies them, rejects non-finite numbers and unsupported
+objects, and bounds each canonical payload to 1 MiB. Each invocation is bound
+to its provider, caller, operation, argument digest, unique invocation id, and
+the active profile's fresh connector-capability fingerprint. The invocation is
+immutable and active for one synchronous handler call only.
+
+An absent or disabled provider has no registration, so the always-loaded caller
+can show bounded enablement guidance without importing provider code. A caller
+must not import another plugin's implementation. Handle the stable
+`PluginApplicationCommandRegistrationError`,
+`PluginApplicationCommandUnavailable`, `PluginApplicationCommandDenied`,
+`PluginApplicationCommandInvalid`, and
+`PluginApplicationCommandExecutionError` classes at the command boundary;
+provider exception text is not exposed across the port.
+
+:::warning Separate from model-tool approval
+The application-command port does not mint or replace model-tool approval. It
+does not call `tools.registry.dispatch()`, `pre_tool_call`, model middleware, or
+the model approval UI. Likewise, a local command invocation cannot be used as
+`PluginToolAdmission`. Use this port only for explicit, deterministic local
+command intent; model tools continue through their existing private admission
+path.
+:::
+
 ### Register slash commands
 
 Plugins can register in-session slash commands — commands users type during a conversation (like `/lcm status` or `/ping`). These work in both CLI and gateway (Telegram, Discord, etc.).

@@ -37,6 +37,72 @@ def _with_reparse_attribute(info):
     return result
 
 
+class _RecordingNativeAcl:
+    """Successful native boundary that records every direct ACL target."""
+
+    def __init__(self, permissions):
+        self._permissions = permissions
+        self._next_handle = 1
+        self._paths = {}
+        self.applied = []
+        self.fail_path_after = None
+
+    def open_handle(self, path, *, access, flags):
+        path = Path(path)
+        if self.fail_path_after is not None and path == self.fail_path_after[0]:
+            self.fail_path_after[1] -= 1
+            if self.fail_path_after[1] == 0:
+                self.fail_path_after = None
+                raise OSError("injected native ACL refusal")
+        handle = self._next_handle
+        self._next_handle += 1
+        self._paths[handle] = path
+        return handle
+
+    def close_handle(self, handle):
+        assert handle in self._paths
+
+    def handle_metadata(self, handle):
+        path = self._paths[handle]
+        info = path.lstat()
+        attributes = (
+            self._permissions._FILE_ATTRIBUTE_DIRECTORY if path.is_dir() else 0
+        )
+        return self._permissions._HandleMetadata(
+            attributes=attributes,
+            identity=self._permissions._FileIdentity(info.st_dev, info.st_ino),
+        )
+
+    def current_user(self):
+        return self._permissions._CurrentUserSid("S-1-5-21-1-2-3-1001", 1, None)
+
+    def read_acl(self, handle, current_user, security_information):
+        path = self._paths[handle]
+        directory = path.is_dir()
+        return self._permissions._AclState(
+            owner_matches=True,
+            dacl_present=True,
+            protected=True,
+            ace_count=1,
+            ace_type=self._permissions._ACCESS_ALLOWED_ACE_TYPE,
+            ace_flags=(
+                self._permissions._OBJECT_INHERIT_ACE
+                | self._permissions._CONTAINER_INHERIT_ACE
+                if directory
+                else 0
+            ),
+            ace_mask=(
+                self._permissions.DIRECTORY_PRIVATE_MASK
+                if directory
+                else self._permissions.FILE_PRIVATE_MASK
+            ),
+            ace_sid_matches=True,
+        )
+
+    def set_dacl(self, handle, sddl, security_information):
+        self.applied.append(self._paths[handle])
+
+
 class TestWindowsCredentialAclBoundaries:
     @pytest.mark.parametrize("kind", ["root", "artifact"])
     def test_windows_reparse_store_paths_are_rejected(self, tmp_path, kind):
@@ -95,7 +161,11 @@ class TestWindowsCredentialAclBoundaries:
         ):
             secret_keystore._write_private(path, b"new-ciphertext")
 
-        restrict.assert_not_called()
+        secured_paths = [call.args[0] for call in restrict.call_args_list]
+        assert path not in secured_paths
+        assert len(secured_paths) == 1
+        assert secured_paths[0].name.startswith(".keystore.enc.")
+        assert secured_paths[0].name.endswith(".tmp")
 
     def test_private_replace_rejects_parent_identity_swap_before_acl(
         self, tmp_path
@@ -132,7 +202,11 @@ class TestWindowsCredentialAclBoundaries:
         ):
             secret_keystore._write_private(path, b"new-ciphertext")
 
-        restrict.assert_not_called()
+        secured_paths = [call.args[0] for call in restrict.call_args_list]
+        assert path not in secured_paths
+        assert len(secured_paths) == 1
+        assert secured_paths[0].name.startswith(".keystore.enc.")
+        assert secured_paths[0].name.endswith(".tmp")
 
     def test_private_replace_never_follows_a_late_destination_symlink(
         self, tmp_path
@@ -216,6 +290,76 @@ class TestWindowsCredentialAclBoundaries:
         assert root / "keystore.key" in secured_files
         assert secured_files.count(root / "keystore.enc") >= 2
         assert store.get("K") == "second"
+
+    def test_forced_file_transaction_acls_atomic_temporaries_through_native_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import windows_permissions
+
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        monkeypatch.setattr(secret_keystore, "_is_windows", lambda: True)
+        monkeypatch.setattr(secret_keystore, "_in_container", lambda: False)
+        native = _RecordingNativeAcl(windows_permissions)
+        monkeypatch.setattr(windows_permissions, "_native_api", lambda: native)
+        secret_keystore.reset_backend_cache()
+
+        secret_keystore.set_secret("HERMES_PLUGIN_WINDOWS_FILE_TOKEN", "first")
+
+        assert {
+            root,
+            root / "keystore.lock",
+            root / "keystore.key",
+            root / "keystore.enc",
+            root / "authority.json",
+        }.issubset(set(native.applied))
+        temporary_names = {
+            path.name for path in native.applied if path.name.endswith(".tmp")
+        }
+        assert any(name.startswith(".keystore.key.") for name in temporary_names)
+        assert any(name.startswith(".keystore.enc.") for name in temporary_names)
+        assert any(name.startswith(".authority.json.") for name in temporary_names)
+        assert (
+            secret_keystore.resolve_secret("HERMES_PLUGIN_WINDOWS_FILE_TOKEN")
+            == "first"
+        )
+        assert (
+            secret_keystore.get_authority("HERMES_PLUGIN_WINDOWS_FILE_TOKEN")
+            is secret_keystore.SecretAuthority.FILE
+        )
+
+    def test_forced_file_native_acl_failure_restores_value_and_authority(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import windows_permissions
+
+        home = tmp_path / "profile"
+        root = home / "secrets"
+        key = "HERMES_PLUGIN_WINDOWS_ROLLBACK_TOKEN"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_SECRET_KEYSTORE", "file")
+        monkeypatch.setattr(secret_keystore, "_is_windows", lambda: True)
+        monkeypatch.setattr(secret_keystore, "_in_container", lambda: False)
+        native = _RecordingNativeAcl(windows_permissions)
+        monkeypatch.setattr(windows_permissions, "_native_api", lambda: native)
+        secret_keystore.reset_backend_cache()
+        secret_keystore.set_secret(key, "previous-value")
+        previous_registry = (root / "authority.json").read_bytes()
+        # Existing artifacts are revalidated before mutation. Fail the fourth
+        # ciphertext ACL open: the destination has been atomically replaced,
+        # so the transaction must compensate the value before returning.
+        native.fail_path_after = [root / "keystore.enc", 4]
+
+        with pytest.raises(KeystoreError, match="state restored"):
+            secret_keystore.set_secret(key, "replacement-value")
+
+        assert secret_keystore.resolve_secret(key) == "previous-value"
+        assert (
+            secret_keystore.get_authority(key) is secret_keystore.SecretAuthority.FILE
+        )
+        assert (root / "authority.json").read_bytes() == previous_registry
 
     def test_authority_replacement_is_acled_after_real_file_write(
         self, tmp_path, monkeypatch

@@ -508,6 +508,79 @@ def test_non_plugin_direct_path_does_not_add_reserved_dispatch_kwarg(monkeypatch
     ]
 
 
+def test_application_authority_is_never_claimed_as_model_tool_admission(monkeypatch):
+    from hermes_cli.plugin_application_commands import PluginApplicationCommandMode
+    from hermes_cli.plugins import _claim_plugin_tool_admission
+
+    manager = PluginManager()
+    provider = PluginContext(
+        PluginManifest(name="Records Provider", key="records-provider"), manager
+    )
+    caller = PluginContext(
+        PluginManifest(name="Records CLI", key="records-cli"), manager
+    )
+    captured = []
+    provider.register_application_commands(
+        operations={"records_get": "read"},
+        allowed_callers={"records-cli"},
+        handler=lambda invocation: captured.append(invocation) or {"ok": True},
+    )
+
+    class Snapshot:
+        def scoped_fingerprint(self, required_services, required_tools):
+            return "profile-fingerprint"
+
+    monkeypatch.setattr(
+        "hermes_cli.plugin_configuration.connector_capability_snapshot",
+        lambda: Snapshot(),
+    )
+    assert caller.invoke_application_command(
+        "records-provider",
+        "records_get",
+        {},
+        mode="read",
+        invocation_id="invocation-1",
+    ) == {"ok": True}
+    invocation = captured[0]
+
+    delivered = []
+    _context().register_tool(
+        TOOL_NAME,
+        "admission-test",
+        _schema(),
+        lambda args, **kwargs: delivered.append(kwargs) or "ok",
+    )
+    entry = registry.get_entry(TOOL_NAME)
+    assert _claim_plugin_tool_admission(
+        invocation,
+        tool_name=TOOL_NAME,
+        args={},
+        tool_call_id="call-1",
+        turn_id="turn-1",
+        registration_token=entry._plugin_registration_token,
+    ) is False
+
+    for invalid_host_authority in (
+        invocation,
+        PluginApplicationCommandMode.CONFIRM,
+    ):
+        blocked = registry.dispatch(
+            TOOL_NAME,
+            {},
+            _tool_admission=invalid_host_authority,
+            tool_call_id="call-1",
+            turn_id="turn-1",
+        )
+        assert json.loads(blocked)["error"].startswith("BLOCKED:")
+
+    assert registry.dispatch(
+        TOOL_NAME,
+        {},
+        tool_admission=invocation,
+    ) == "ok"
+    assert delivered == [{}]
+
+
 @pytest.mark.parametrize(
     "malformed_result",
     [

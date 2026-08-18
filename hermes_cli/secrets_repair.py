@@ -104,6 +104,9 @@ _LIVE_FILE_MODES = {
     "keystore.lock": 0o600,
     AUTHORITY_FILE: 0o600,
 }
+_WRITE_PROBE_PREFIX = ".secret-write-probe-"
+_WRITE_PROBE_SENTINEL = "sentinel"
+_WRITE_PROBE_CONTENTS = b"hermes-secret-write-probe\n"
 _PLAN_FINGERPRINT_KEY = secrets.token_bytes(32)
 _PLAN_BINDINGS: dict[
     int,
@@ -439,9 +442,13 @@ def _inspect_secrets() -> _SecretSnapshot:
                 continue
             if authority is SecretAuthority.OS and not os_known:
                 continue
-            authoritative = file_value if authority is SecretAuthority.FILE else os_value
+            authoritative = (
+                file_value if authority is SecretAuthority.FILE else os_value
+            )
             alternate = os_value if authority is SecretAuthority.FILE else file_value
-            alternate_known = os_known if authority is SecretAuthority.FILE else not file_corrupt
+            alternate_known = (
+                os_known if authority is SecretAuthority.FILE else not file_corrupt
+            )
             if authoritative is not None and alternate_known and alternate is not None:
                 findings.append(
                     _finding(
@@ -481,7 +488,8 @@ def _inspect_secrets() -> _SecretSnapshot:
                         "STALE_DUPLICATE",
                         "warning",
                         key,
-                        "a cleared key retains a stale copy in " + ", ".join(stale_tiers),
+                        "a cleared key retains a stale copy in "
+                        + ", ".join(stale_tiers),
                     )
                 )
         elif file_value is not None and os_known and os_value is not None:
@@ -552,14 +560,222 @@ def diagnose_secrets() -> DoctorReport:
     snapshot = _inspect_secrets()
     return DoctorReport(
         configured_mode=snapshot.configured_mode,
-        authorities=MappingProxyType(
-            {
-                key: authority.value
-                for key, authority in sorted(snapshot.authorities.items())
-            }
-        ),
+        authorities=MappingProxyType({
+            key: authority.value
+            for key, authority in sorted(snapshot.authorities.items())
+        }),
         findings=snapshot.findings,
     )
+
+
+def _write_probe_component_is_safe(
+    path: Path, *, directory: bool, expected_identity: tuple[int, int] | None = None
+) -> os.stat_result:
+    """Return no-follow metadata for one synthetic probe component."""
+    info = path.lstat()
+    if sk._is_reparse_point(info) or stat.S_ISLNK(info.st_mode):
+        raise sk.KeystoreError("write probe component is linked or reparse")
+    if (directory and not stat.S_ISDIR(info.st_mode)) or (
+        not directory and not stat.S_ISREG(info.st_mode)
+    ):
+        raise sk.KeystoreError("write probe component has the wrong type")
+    if (
+        expected_identity is not None
+        and (info.st_dev, info.st_ino) != expected_identity
+    ):
+        raise sk.KeystoreError("write probe component changed")
+    return info
+
+
+def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ...]:
+    """Exercise only profile-local file/directory ACL writes with synthetic data."""
+    root: Path | None = None
+    probe_dir: Path | None = None
+    sentinel: Path | None = None
+    created_probe_dir = False
+    created_sentinel = False
+    failure: Exception | None = None
+    failure_type: str | None = None
+    failure_stage: str | None = None
+    cleanup_failed = False
+    cleanup_stage: str | None = None
+
+    try:
+        root = (
+            Path(sk._active_profile_identity())
+            if profile_root is None
+            else Path(profile_root)
+        )
+    except Exception as exc:
+        failure = exc
+
+    def component_identity(info: os.stat_result) -> tuple[int, int]:
+        return (info.st_dev, info.st_ino)
+
+    def secure_descriptor(fd: int, *, directory: bool) -> tuple[int, int]:
+        info = os.fstat(fd)
+        if (directory and not stat.S_ISDIR(info.st_mode)) or (
+            not directory and not stat.S_ISREG(info.st_mode)
+        ):
+            raise sk.KeystoreError("write probe descriptor has the wrong type")
+        identity = component_identity(info)
+        os.fchmod(fd, 0o700 if directory else 0o600)
+        if component_identity(os.fstat(fd)) != identity:
+            raise sk.KeystoreError("write probe descriptor changed")
+        return identity
+
+    if root is not None and not sk._is_windows():
+        root_fd: int | None = None
+        probe_fd: int | None = None
+        sentinel_fd: int | None = None
+        probe_name: str | None = None
+        probe_identity: tuple[int, int] | None = None
+        sentinel_identity: tuple[int, int] | None = None
+
+        def close_descriptor(fd: int) -> None:
+            nonlocal cleanup_failed
+            try:
+                os.close(fd)
+            except Exception:
+                cleanup_failed = True
+
+        try:
+            try:
+                root_info = root.lstat()
+            except FileNotFoundError:
+                root.mkdir(parents=True, exist_ok=False)
+            else:
+                if (
+                    sk._is_reparse_point(root_info)
+                    or stat.S_ISLNK(root_info.st_mode)
+                    or not stat.S_ISDIR(root_info.st_mode)
+                ):
+                    raise sk.KeystoreError("write probe profile root is unsafe")
+
+            _write_probe_component_is_safe(root, directory=True)
+            root_fd = os.open(
+                root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                raise sk.KeystoreError(
+                    "write probe profile descriptor has the wrong type"
+                )
+            probe_name = f"{_WRITE_PROBE_PREFIX}{secrets.token_hex(16)}"
+            probe_dir = root / probe_name
+            os.mkdir(probe_name, mode=0o700, dir_fd=root_fd)
+            created_probe_dir = True
+            probe_fd = os.open(
+                probe_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+            probe_identity = secure_descriptor(probe_fd, directory=True)
+
+            sentinel = probe_dir / _WRITE_PROBE_SENTINEL
+            sentinel_fd = os.open(
+                _WRITE_PROBE_SENTINEL,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=probe_fd,
+            )
+            created_sentinel = True
+            sentinel_identity = secure_descriptor(sentinel_fd, directory=False)
+            with os.fdopen(sentinel_fd, "wb", closefd=False) as handle:
+                handle.write(_WRITE_PROBE_CONTENTS)
+                handle.flush()
+            os.fsync(sentinel_fd)
+        except Exception as exc:
+            failure = exc
+        finally:
+            if sentinel_fd is not None:
+                close_descriptor(sentinel_fd)
+            if created_probe_dir:
+                try:
+                    if root_fd is None or probe_name is None or probe_identity is None:
+                        raise sk.KeystoreError("write probe directory is unanchored")
+                    if created_sentinel:
+                        if probe_fd is None or sentinel_identity is None:
+                            raise sk.KeystoreError("write probe file is unanchored")
+                        entry = os.stat(
+                            _WRITE_PROBE_SENTINEL,
+                            dir_fd=probe_fd,
+                            follow_symlinks=False,
+                        )
+                        if component_identity(entry) != sentinel_identity:
+                            raise sk.KeystoreError(
+                                "write probe file changed before cleanup"
+                            )
+                        os.unlink(_WRITE_PROBE_SENTINEL, dir_fd=probe_fd)
+                    entry = os.stat(probe_name, dir_fd=root_fd, follow_symlinks=False)
+                    if component_identity(entry) != probe_identity:
+                        raise sk.KeystoreError(
+                            "write probe directory changed before cleanup"
+                        )
+                    os.rmdir(probe_name, dir_fd=root_fd)
+                except Exception:
+                    cleanup_failed = True
+            if probe_fd is not None:
+                close_descriptor(probe_fd)
+            if root_fd is not None:
+                close_descriptor(root_fd)
+    elif root is not None:
+        try:
+            from hermes_cli.windows_permissions import _run_private_acl_write_probe
+
+            directory_name = f"{_WRITE_PROBE_PREFIX}{secrets.token_hex(16)}"
+            probe_dir = root / directory_name
+            result = _run_private_acl_write_probe(
+                root,
+                directory_name=directory_name,
+            )
+            cleanup_failed = result.cleanup_failed
+            cleanup_stage = result.cleanup_stage
+            if result.failure_type is not None:
+                failure_type = result.failure_type
+                failure_stage = result.failure_stage
+                raise sk.KeystoreError("Windows private probe failed")
+        except Exception as exc:
+            failure = exc
+
+    findings: list[SecretFinding] = []
+    if failure is None and not cleanup_failed:
+        findings.append(
+            _finding(
+                "WRITE_PROBE_OK",
+                "info",
+                None,
+                "synthetic profile-local ACL write probe passed",
+            )
+        )
+    elif failure is not None:
+        findings.append(
+            _finding(
+                "WRITE_PROBE_FAILED",
+                "error",
+                None,
+                "synthetic ACL write probe failed "
+                f"({failure_stage + ':' if failure_stage else ''}"
+                f"{failure_type or type(failure).__name__})",
+            )
+        )
+    if cleanup_failed:
+        artifact = probe_dir if probe_dir is not None else root
+        assert artifact is not None
+        findings.append(
+            _finding(
+                "WRITE_PROBE_CLEANUP_FAILED",
+                "error",
+                None,
+                f"remove synthetic probe artifact manually: {artifact}"
+                + (f" ({cleanup_stage})" if cleanup_stage else ""),
+            )
+        )
+    return tuple(findings)
 
 
 def _preferred_tier(snapshot: _SecretSnapshot, move_to: str | None) -> str:
@@ -622,16 +838,18 @@ def _build_plan(
         None,
     )
     if snapshot.file_corrupt:
-        recoverable = bool(file_authority_keys) and snapshot.os_available and all(
-            snapshot.os_values.get(key) is not None for key in file_authority_keys
+        recoverable = (
+            bool(file_authority_keys)
+            and snapshot.os_available
+            and all(
+                snapshot.os_values.get(key) is not None for key in file_authority_keys
+            )
         )
         if recoverable and not snapshot.registry_corrupt:
             if storage_unproven is not None:
                 blocked.append(storage_unproven)
             else:
-                actions.append(
-                    RepairAction("REBUILD_FILE_STORE", None, "os", "file")
-                )
+                actions.append(RepairAction("REBUILD_FILE_STORE", None, "os", "file"))
         elif (
             reset_unrecoverable
             and not snapshot.registry_corrupt
@@ -694,9 +912,7 @@ def _build_plan(
                     and file_value == os_value
                 ):
                     actions.append(
-                        RepairAction(
-                            "DELETE_STALE_COPY", key, nonselected, None
-                        )
+                        RepairAction("DELETE_STALE_COPY", key, nonselected, None)
                     )
 
     if not snapshot.registry_corrupt and not snapshot.file_corrupt:
@@ -715,7 +931,9 @@ def _build_plan(
                 alternate = os_value if other == "os" else file_value
                 if move_to is not None and source != move_to:
                     if authoritative is None:
-                        blocked.append(_blocked(snapshot, "AUTHORITY_MODE_MISMATCH", key))
+                        blocked.append(
+                            _blocked(snapshot, "AUTHORITY_MODE_MISMATCH", key)
+                        )
                     else:
                         actions.append(
                             RepairAction("MOVE_SECRET", key, source, move_to)
@@ -730,11 +948,15 @@ def _build_plan(
                     continue
                 if source == "os" and not os_known:
                     blocked.append(_blocked(snapshot, "OS_UNAVAILABLE"))
-                elif authoritative is not None and alternate_known and alternate is not None:
-                    actions.append(
-                        RepairAction("DELETE_STALE_COPY", key, other, None)
-                    )
-                elif authoritative is None and alternate_known and alternate is not None:
+                elif (
+                    authoritative is not None
+                    and alternate_known
+                    and alternate is not None
+                ):
+                    actions.append(RepairAction("DELETE_STALE_COPY", key, other, None))
+                elif (
+                    authoritative is None and alternate_known and alternate is not None
+                ):
                     actions.append(RepairAction("RESUME_MOVE", key, source, other))
                 elif authoritative is None and alternate_known:
                     if reset_unrecoverable and source == "file":
@@ -752,13 +974,9 @@ def _build_plan(
                         )
             elif authority is SecretAuthority.CLEARED:
                 if file_value is not None:
-                    actions.append(
-                        RepairAction("DELETE_STALE_COPY", key, "file", None)
-                    )
+                    actions.append(RepairAction("DELETE_STALE_COPY", key, "file", None))
                 if os_known and os_value is not None:
-                    actions.append(
-                        RepairAction("DELETE_STALE_COPY", key, "os", None)
-                    )
+                    actions.append(RepairAction("DELETE_STALE_COPY", key, "os", None))
             else:
                 if file_value is not None and not os_known:
                     blocked.append(_blocked(snapshot, "OS_UNAVAILABLE"))
@@ -804,7 +1022,9 @@ def _build_plan(
         sorted(unique_actions, key=lambda item: (item.code, item.key or ""))
     )
     ordered_blocked = tuple(
-        sorted(unique_blocked, key=lambda item: (item.code, item.key or "", item.message))
+        sorted(
+            unique_blocked, key=lambda item: (item.code, item.key or "", item.message)
+        )
     )
     return RepairPlan(actions=ordered_actions, blocked_findings=ordered_blocked)
 
@@ -819,7 +1039,11 @@ def _snapshot_fingerprint(snapshot: _SecretSnapshot) -> bytes:
     value_digests: list[tuple[str, str, str]] = []
     if snapshot.file_values is not None:
         value_digests.extend(
-            ("file", key, _keyed_value_digest("file", key, snapshot.file_values.get(key)))
+            (
+                "file",
+                key,
+                _keyed_value_digest("file", key, snapshot.file_values.get(key)),
+            )
             for key in snapshot.keys
         )
     if snapshot.os_available:
@@ -937,8 +1161,10 @@ def _quarantine_artifacts(
 ) -> Path | None:
     root = Path(os.path.abspath(root))
     root_info = _lstat(root)
-    if root_info is None or stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(
-        root_info.st_mode
+    if (
+        root_info is None
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
     ):
         raise RepairRefusedError("quarantine root is not a direct directory")
     quarantinable: list[Path] = []
@@ -1043,9 +1269,7 @@ def _snapshot_tier_value(
     tier: str,
 ) -> str | None:
     if tier == "file":
-        return (
-            None if snapshot.file_values is None else snapshot.file_values.get(key)
-        )
+        return None if snapshot.file_values is None else snapshot.file_values.get(key)
     return snapshot.os_values.get(key)
 
 
@@ -1108,7 +1332,8 @@ def apply_secret_repair(
     if plan.blocked_findings:
         raise RepairRefusedError("repair plan contains blocked findings")
     reset_requested = any(
-        action.code in {
+        action.code
+        in {
             "RESET_UNRECOVERABLE",
             "RESET_UNRECOVERABLE_AUTHORITY",
         }
@@ -1183,9 +1408,7 @@ def apply_secret_repair(
                         raise RepairRefusedError(
                             "secret storage state changed after planning"
                         )
-                    sk._ensure_private_permissions(
-                        path, int(action.destination, 8)
-                    )
+                    sk._ensure_private_permissions(path, int(action.destination, 8))
                 elif action.code == "CLEAN_ABANDONED_TEMP":
                     assert action.source is not None
                     path = _assert_direct_repair_path(
@@ -1223,8 +1446,7 @@ def apply_secret_repair(
                                 "AUTHORITY_CORRUPT",
                                 *(
                                     ("AUTHORITY_TOMBSTONE_AMBIGUOUS",)
-                                    if action.code
-                                    == "RESET_UNRECOVERABLE_AUTHORITY"
+                                    if action.code == "RESET_UNRECOVERABLE_AUTHORITY"
                                     else ()
                                 ),
                             ),
@@ -1274,15 +1496,23 @@ def apply_secret_repair(
                         file_store=file_store,
                         os_store=os_store,
                     )
-                    if sk._read_tier(
-                        tier,
-                        action.key,
-                        file_store=file_store,
-                        os_store=os_store,
-                    ) is not None:
-                        raise sk.KeystoreError("stale-copy deletion verification failed")
+                    if (
+                        sk._read_tier(
+                            tier,
+                            action.key,
+                            file_store=file_store,
+                            os_store=os_store,
+                        )
+                        is not None
+                    ):
+                        raise sk.KeystoreError(
+                            "stale-copy deletion verification failed"
+                        )
                 elif action.code == "RESUME_MOVE":
-                    assert action.key is not None and action.destination in {"os", "file"}
+                    assert action.key is not None and action.destination in {
+                        "os",
+                        "file",
+                    }
                     _assert_tier_unchanged(
                         snapshot,
                         action.key,
@@ -1338,7 +1568,9 @@ def apply_secret_repair(
                     registry = _load_authority_registry_readonly(root)
                     file_keys = tuple(
                         key
-                        for key, authority in (registry.entries if registry else {}).items()
+                        for key, authority in (
+                            registry.entries if registry else {}
+                        ).items()
                         if authority is SecretAuthority.FILE
                     )
                     if action.code == "REBUILD_FILE_STORE":
@@ -1348,7 +1580,9 @@ def apply_secret_repair(
                             if snapshot.os_values.get(key) is not None
                         }
                         if len(recovered) != len(file_keys):
-                            raise sk.KeystoreError("healthy tier no longer covers file keys")
+                            raise sk.KeystoreError(
+                                "healthy tier no longer covers file keys"
+                            )
                         file_store._set_many_unlocked(recovered)
                         for key, value in recovered.items():
                             if file_store._get_unlocked(key) != value:
@@ -1382,7 +1616,9 @@ def apply_secret_repair(
                     f"{action.code} failed ({type(exc).__name__})",
                 )
                 return RepairReport(
-                    applied=tuple(sorted(applied, key=lambda item: (item.code, item.key or ""))),
+                    applied=tuple(
+                        sorted(applied, key=lambda item: (item.code, item.key or ""))
+                    ),
                     quarantine_paths=tuple(quarantine_paths),
                     failed=(failure,),
                 )
@@ -1400,7 +1636,7 @@ def _print_finding(finding: SecretFinding, *, stream=None) -> None:
     print(f"[{finding.code}]{logical_key}: {finding.message}", file=stream)
 
 
-def _handle_secrets_doctor(_args) -> int:
+def _handle_secrets_doctor(args) -> int:
     report = diagnose_secrets()
     print(f"Configured secret storage mode: {report.configured_mode}")
     for key, authority in sorted(report.authorities.items()):
@@ -1409,7 +1645,16 @@ def _handle_secrets_doctor(_args) -> int:
         print("No secret storage findings.")
     for finding in report.findings:
         _print_finding(finding)
-    return 1 if any(item.severity == "error" for item in report.findings) else 0
+    findings = report.findings
+    if getattr(args, "write_probe", False):
+        print(
+            "Running explicit synthetic ACL write probe; this creates and removes test files."
+        )
+        probe_findings = _run_write_probe()
+        for finding in probe_findings:
+            _print_finding(finding)
+        findings = findings + probe_findings
+    return 1 if any(item.severity == "error" for item in findings) else 0
 
 
 def _handle_secrets_repair(args) -> int:
@@ -1475,7 +1720,14 @@ def _handle_secrets_repair(args) -> int:
 def register_cli(subparsers) -> None:
     """Register doctor and repair under an existing secrets subparser set."""
     doctor = subparsers.add_parser(
-        "doctor", help="Inspect secret storage without making changes"
+        "doctor",
+        help="Inspect secret storage without making changes",
+        allow_abbrev=False,
+    )
+    doctor.add_argument(
+        "--write-probe",
+        action="store_true",
+        help="Explicitly run a synthetic profile-local ACL write probe",
     )
     doctor.set_defaults(func=_handle_secrets_doctor)
     repair = subparsers.add_parser(

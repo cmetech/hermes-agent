@@ -307,6 +307,7 @@ class TestPluginDiscovery:
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
+        mgr._application_command_providers["provider"] = object()
         mgr._discovered = True
 
         monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
@@ -324,6 +325,7 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+        assert mgr._application_command_providers == {}
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
@@ -331,6 +333,83 @@ class TestPluginDiscovery:
 
 class TestPluginLoading:
     """Tests for plugin module loading."""
+
+    def test_failed_registration_rolls_back_only_its_cli_commands(self, tmp_path):
+        mgr = PluginManager()
+        occupied_setup = MagicMock()
+        unrelated_setup = MagicMock()
+        PluginContext(
+            PluginManifest(name="First Owner", key="first-owner"), mgr
+        ).register_cli_command("occupied", "occupied", occupied_setup)
+        PluginContext(
+            PluginManifest(name="Unrelated", key="unrelated"), mgr
+        ).register_cli_command("unrelated", "unrelated", unrelated_setup)
+        plugin_dir = _make_plugin_dir(
+            tmp_path / "plugins",
+            "failing-plugin",
+            register_body=(
+                "ctx.register_cli_command('alpha', 'alpha', lambda parser: None)\n"
+                "    ctx.register_cli_command('occupied', 'collision', "
+                "lambda parser: None)"
+            ),
+            auto_enable=False,
+        )
+        manifest = PluginManifest(
+            name="Failing Plugin",
+            key="failing-plugin",
+            source="user",
+            path=str(plugin_dir),
+        )
+
+        mgr._load_plugin(manifest)
+
+        assert mgr._plugins["failing-plugin"].enabled is False
+        assert "already registered" in (mgr._plugins["failing-plugin"].error or "")
+        assert "alpha" not in mgr._cli_commands
+        assert mgr._cli_commands["occupied"] == {
+            "name": "occupied",
+            "help": "occupied",
+            "description": "",
+            "setup_fn": occupied_setup,
+            "handler_fn": None,
+            "plugin": "first-owner",
+        }
+        assert mgr._cli_commands["unrelated"]["setup_fn"] is unrelated_setup
+        assert mgr._cli_commands["unrelated"]["plugin"] == "unrelated"
+
+    def test_failed_registration_rolls_back_its_application_provider(self, tmp_path):
+        mgr = PluginManager()
+        unrelated = PluginContext(
+            PluginManifest(name="Unrelated", key="unrelated"), mgr
+        )
+        unrelated.register_application_commands(
+            operations={"unrelated_get": "read"},
+            allowed_callers={"unrelated-cli"},
+            handler=lambda invocation: {},
+        )
+        plugin_dir = _make_plugin_dir(
+            tmp_path / "plugins",
+            "failing-provider",
+            register_body=(
+                "ctx.register_application_commands("
+                "operations={'records_get': 'read'}, "
+                "allowed_callers={'records-cli'}, "
+                "handler=lambda invocation: {})\n"
+                "    raise RuntimeError('registration failed')"
+            ),
+            auto_enable=False,
+        )
+        manifest = PluginManifest(
+            name="Failing Provider",
+            key="failing-provider",
+            source="user",
+            path=str(plugin_dir),
+        )
+
+        mgr._load_plugin(manifest)
+
+        assert "failing-provider" not in mgr._application_command_providers
+        assert set(mgr._application_command_providers) == {"unrelated"}
 
 
 
