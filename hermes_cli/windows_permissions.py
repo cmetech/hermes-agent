@@ -64,6 +64,7 @@ _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_NON_DIRECTORY_FILE = 0x00000040
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 _FILE_OPEN_REPARSE_POINT = 0x00200000
+_FILE_READ_DATA = 0x00000001
 _FILE_WRITE_DATA = 0x00000002
 _SYNCHRONIZE = 0x00100000
 _DELETE = 0x00010000
@@ -71,7 +72,9 @@ _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
 _FILE_TRAVERSE = 0x00000020
 _FILE_DISPOSITION_INFO_CLASS = 4
+_FILE_RENAME_INFO_CLASS = 3
 _STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
 _PROBE_DIRECTORY_RE = re.compile(r"^\.secret-write-probe-[0-9a-f]{32}$")
 _PROBE_FILE_NAME = "sentinel"
 _PROBE_CONTENTS = b"hermes-secret-write-probe\n"
@@ -179,7 +182,16 @@ class _IO_STATUS_BLOCK(ctypes.Structure):
 
 
 class _FILE_DISPOSITION_INFO(ctypes.Structure):
-    _fields_ = [("DeleteFile", wintypes.BOOL)]
+    _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+
+class _FILE_RENAME_INFO(ctypes.Structure):
+    _fields_ = [
+        ("ReplaceIfExists", wintypes.BOOLEAN),
+        ("RootDirectory", wintypes.HANDLE),
+        ("FileNameLength", wintypes.DWORD),
+        ("FileName", wintypes.WCHAR * 1),
+    ]
 
 
 class _WindowsCallError(OSError):
@@ -224,6 +236,14 @@ class _WindowsAclApi:
             ctypes.c_void_p,
         ]
         kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+        ]
+        kernel32.ReadFile.restype = wintypes.BOOL
         kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
         kernel32.FlushFileBuffers.restype = wintypes.BOOL
         kernel32.SetFileInformationByHandle.argtypes = [
@@ -355,6 +375,20 @@ class _WindowsAclApi:
             self._raise("open Windows ACL object")
         return int(handle)
 
+    def open_bound_handle(self, path: Path, *, access: int, flags: int) -> int:
+        handle = self.kernel32.CreateFileW(
+            str(path),
+            access,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            None,
+            _OPEN_EXISTING,
+            flags,
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            self._raise("open Windows private directory")
+        return int(handle)
+
     def close_handle(self, handle: int) -> None:
         if not self.kernel32.CloseHandle(handle):
             self._raise("close Windows ACL object")
@@ -438,6 +472,16 @@ class _WindowsAclApi:
             exclusive=True,
         )
 
+    def open_relative_file(self, parent: int, name: str, *, access: int) -> int:
+        return self._open_relative(
+            parent,
+            name,
+            directory=False,
+            access=access,
+            disposition=_FILE_OPEN,
+            exclusive=True,
+        )
+
     def write_handle(self, handle: int, data: bytes) -> None:
         buffer = ctypes.create_string_buffer(data)
         written = wintypes.DWORD()
@@ -446,19 +490,57 @@ class _WindowsAclApi:
         ) or written.value != len(data):
             self._raise("write Windows probe artifact")
 
+    def read_handle(self, handle: int, size: int) -> bytes:
+        buffer = ctypes.create_string_buffer(size)
+        read = wintypes.DWORD()
+        if not self.kernel32.ReadFile(handle, buffer, size, ctypes.byref(read), None):
+            self._raise("read Windows private file")
+        return bytes(buffer.raw[: read.value])
+
     def flush_handle(self, handle: int) -> None:
         if not self.kernel32.FlushFileBuffers(handle):
             self._raise("flush Windows probe artifact")
 
     def delete_on_close(self, handle: int) -> None:
-        disposition = _FILE_DISPOSITION_INFO(True)
+        self.set_delete_on_close(handle, True)
+
+    def set_delete_on_close(self, handle: int, delete: bool) -> None:
+        disposition = _FILE_DISPOSITION_INFO(bool(delete))
         if not self.kernel32.SetFileInformationByHandle(
             handle,
             _FILE_DISPOSITION_INFO_CLASS,
             ctypes.byref(disposition),
             ctypes.sizeof(disposition),
         ):
-            self._raise("delete Windows probe artifact")
+            self._raise("set Windows private file disposition")
+
+    def rename_handle(
+        self,
+        handle: int,
+        parent: int,
+        name: str,
+        *,
+        replace: bool,
+    ) -> None:
+        encoded_name = name.encode("utf-16-le")
+        size = _FILE_RENAME_INFO.FileName.offset + len(encoded_name)
+        storage = ctypes.create_string_buffer(size)
+        information = _FILE_RENAME_INFO.from_buffer(storage)
+        information.ReplaceIfExists = bool(replace)
+        information.RootDirectory = parent
+        information.FileNameLength = len(encoded_name)
+        ctypes.memmove(
+            ctypes.addressof(storage) + _FILE_RENAME_INFO.FileName.offset,
+            encoded_name,
+            len(encoded_name),
+        )
+        if not self.kernel32.SetFileInformationByHandle(
+            handle,
+            _FILE_RENAME_INFO_CLASS,
+            storage,
+            size,
+        ):
+            self._raise("publish Windows private file")
 
     def handle_metadata(self, handle: int) -> _HandleMetadata:
         information = _BY_HANDLE_FILE_INFORMATION()
@@ -768,6 +850,279 @@ def _operate_handle(
     return None if apply else inspection
 
 
+class _WindowsPrivateDirectory:
+    """Held private directory used for handle-relative secret-file operations."""
+
+    def __init__(self, api: _WindowsAclApi, handle: int) -> None:
+        self._api = api
+        self._handle: int | None = handle
+
+    def __enter__(self) -> _WindowsPrivateDirectory:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            self.close()
+        except WindowsAclError:
+            if exc_type is None:
+                raise
+
+    def _require_handle(self) -> int:
+        if self._handle is None:
+            raise WindowsAclError("Windows private directory is closed")
+        return self._handle
+
+    def create_file(self, name: str) -> _WindowsPrivateFile:
+        name = _relative_private_name(name)
+        handle: int | None = None
+        try:
+            handle = self._api.create_relative(
+                self._require_handle(),
+                name,
+                directory=False,
+                access=(
+                    READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_WRITE_DATA
+                ),
+            )
+            _operate_handle(self._api, handle, directory=False, apply=True)
+            self._api.set_delete_on_close(handle, True)
+            private_file = _WindowsPrivateFile(
+                self._api,
+                handle,
+                parent_handle=self._require_handle(),
+                delete_armed=True,
+            )
+            handle = None
+            return private_file
+        except WindowsAclError:
+            raise
+        except Exception as exc:
+            if _relative_name_collision(exc):
+                raise FileExistsError("Windows private file name is reserved") from None
+            raise WindowsAclError("Windows private file creation failed") from None
+        finally:
+            if handle is not None:
+                try:
+                    self._api.set_delete_on_close(handle, True)
+                except Exception:
+                    pass
+                try:
+                    self._api.close_handle(handle)
+                except Exception:
+                    pass
+
+    def open_file(self, name: str) -> _WindowsPrivateFile | None:
+        name = _relative_private_name(name)
+        handle: int | None = None
+        try:
+            handle = self._api.open_relative_file(
+                self._require_handle(),
+                name,
+                access=(READ_CONTROL | WRITE_DAC | _SYNCHRONIZE | _FILE_READ_DATA),
+            )
+            _operate_handle(self._api, handle, directory=False, apply=True)
+            private_file = _WindowsPrivateFile(
+                self._api,
+                handle,
+                parent_handle=self._require_handle(),
+                delete_armed=False,
+            )
+            handle = None
+            return private_file
+        except Exception as exc:
+            if _missing_relative_object(exc):
+                return None
+            if isinstance(exc, WindowsAclError):
+                raise
+            raise WindowsAclError("Windows private file open failed") from None
+        finally:
+            if handle is not None:
+                try:
+                    self._api.close_handle(handle)
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            self._api.close_handle(handle)
+        except Exception:
+            raise WindowsAclError("Windows ACL operation failed") from None
+
+
+class _WindowsPrivateFile:
+    """Private native file held from ACL application through publication."""
+
+    def __init__(
+        self,
+        api: _WindowsAclApi,
+        handle: int,
+        *,
+        parent_handle: int,
+        delete_armed: bool,
+    ) -> None:
+        self._api = api
+        self._handle: int | None = handle
+        self._parent_handle = parent_handle
+        self._delete_armed = delete_armed
+        self._published = not delete_armed
+
+    def __enter__(self) -> _WindowsPrivateFile:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def _require_handle(self) -> int:
+        if self._handle is None:
+            raise WindowsAclError("Windows private file is closed")
+        return self._handle
+
+    def _inspect(self) -> WindowsAclInspection:
+        result = _operate_handle(
+            self._api,
+            self._require_handle(),
+            directory=False,
+            apply=False,
+        )
+        assert isinstance(result, WindowsAclInspection)
+        return result
+
+    def write_all(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise WindowsAclError("Windows private file payload is invalid")
+        try:
+            self._api.write_handle(self._require_handle(), data)
+        except WindowsAclError:
+            raise
+        except Exception:
+            raise WindowsAclError("Windows private file write failed") from None
+
+    def read_all(self, *, max_bytes: int) -> bytes:
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 0
+        ):
+            raise WindowsAclError("Windows private file size bound is invalid")
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            while True:
+                chunk = self._api.read_handle(self._require_handle(), 64 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise WindowsAclError("Windows private file exceeds its size bound")
+                chunks.append(chunk)
+        except WindowsAclError:
+            raise
+        except Exception:
+            raise WindowsAclError("Windows private file read failed") from None
+
+    def flush(self) -> None:
+        try:
+            self._api.flush_handle(self._require_handle())
+        except WindowsAclError:
+            raise
+        except Exception:
+            raise WindowsAclError("Windows private file flush failed") from None
+
+    def publish(self, name: str) -> None:
+        name = _relative_private_name(name)
+        handle = self._require_handle()
+        try:
+            self._api.set_delete_on_close(handle, False)
+            self._delete_armed = False
+            self._api.rename_handle(
+                handle,
+                self._parent_handle,
+                name,
+                replace=True,
+            )
+            inspection = self._inspect()
+            if not inspection.secure:
+                raise WindowsAclError("Windows private file ACL is not private")
+            self._published = True
+        except Exception:
+            try:
+                self._api.set_delete_on_close(handle, True)
+                self._delete_armed = True
+            except Exception:
+                pass
+            raise WindowsAclError("Windows private file publication failed") from None
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        cleanup_failed = False
+        if not self._published and not self._delete_armed:
+            try:
+                self._api.set_delete_on_close(handle, True)
+                self._delete_armed = True
+            except Exception:
+                cleanup_failed = True
+        try:
+            self._api.close_handle(handle)
+        except Exception:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise WindowsAclError("Windows private file cleanup failed") from None
+
+
+def _relative_private_name(name: str) -> str:
+    if not isinstance(name, str) or not name or len(name) > 128:
+        raise WindowsAclError("Windows private file name is invalid")
+    if (
+        name in {".", ".."}
+        or Path(name).name != name
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+    ):
+        raise WindowsAclError("Windows private file name is not relative")
+    return name
+
+
+def open_private_directory(path: Path) -> _WindowsPrivateDirectory:
+    """Protect, verify, and hold one directory for relative secret-file work."""
+    path = Path(path)
+    _validated_direct_path(path, directory=True)
+    try:
+        api = _native_api()
+    except WindowsAclError:
+        raise
+    except Exception:
+        raise WindowsAclError("Windows ACL operation failed") from None
+    handle: int | None = None
+    try:
+        handle = api.open_bound_handle(
+            path,
+            access=READ_CONTROL | WRITE_DAC | _FILE_TRAVERSE | _FILE_ADD_FILE,
+            flags=_open_flags(directory=True),
+        )
+        _operate_handle(api, handle, directory=True, apply=True)
+        binding = _WindowsPrivateDirectory(api, handle)
+        handle = None
+        return binding
+    except WindowsAclError:
+        raise
+    except Exception:
+        raise WindowsAclError("Windows ACL operation failed") from None
+    finally:
+        if handle is not None:
+            try:
+                api.close_handle(handle)
+            except Exception:
+                pass
+
+
 def _operate(
     path: Path, *, directory: bool, apply: bool
 ) -> WindowsAclInspection | None:
@@ -835,6 +1190,13 @@ def _missing_relative_object(exc: Exception) -> bool:
     return (
         isinstance(exc, _WindowsCallError)
         and (int(exc.winerror) & 0xFFFFFFFF) == _STATUS_OBJECT_NAME_NOT_FOUND
+    )
+
+
+def _relative_name_collision(exc: Exception) -> bool:
+    return (
+        isinstance(exc, _WindowsCallError)
+        and (int(exc.winerror) & 0xFFFFFFFF) == _STATUS_OBJECT_NAME_COLLISION
     )
 
 
@@ -1014,6 +1376,7 @@ __all__ = [
     "WindowsAclInspection",
     "inspect_directory_acl",
     "inspect_file_acl",
+    "open_private_directory",
     "restrict_directory_to_current_user",
     "restrict_file_to_current_user",
 ]

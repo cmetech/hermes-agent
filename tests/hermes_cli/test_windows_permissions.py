@@ -6,6 +6,7 @@ import ctypes
 import inspect
 import os
 import stat
+from ctypes import wintypes
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -208,6 +209,9 @@ class FakeNativeApi:
         self.opens.append((Path(path), access, flags))
         return self.handle
 
+    def open_bound_handle(self, path: Path, *, access: int, flags: int) -> int:
+        return self.open_handle(path, access=access, flags=flags)
+
     def close_handle(self, handle: int) -> None:
         self.closed.append(handle)
 
@@ -258,6 +262,238 @@ def _uninitialized_native_api(permissions, *, kernel32, advapi32, ntdll=None):
     api.advapi32 = advapi32
     api.ntdll = ntdll if ntdll is not None else SimpleNamespace()
     return api
+
+
+def test_private_directory_binding_applies_and_inspects_one_held_handle(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    target = _target(tmp_path, directory=True)
+    api = _install_api(monkeypatch, permissions, directory=True)
+    api.states = [api.private_state(), api.private_state(), api.private_state()]
+
+    with permissions.open_private_directory(target):
+        assert api.closed == []
+
+    assert api.opens == [
+        (
+            target,
+            READ_CONTROL | WRITE_DAC | FILE_TRAVERSE | FILE_ADD_FILE,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    ]
+    assert api.mutations == [
+        (
+            api.handle,
+            f"D:P(A;OICI;0x{DIRECTORY_PRIVATE_MASK:08x};;;{SID})",
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        )
+    ]
+    assert [handle for handle, _flags in api.reads] == [api.handle] * 2
+    assert api.closed == [api.handle]
+
+
+def test_private_file_write_publish_and_final_inspection_share_one_held_handle(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    class PrivateIoApi(FakeNativeApi):
+        def __init__(self):
+            super().__init__(permissions, directory=True)
+            self.handle = 0xD11
+            self.file_handle = 0xF11
+            self.file_state = self.private_state(
+                ace_flags=0,
+                ace_mask=FILE_PRIVATE_MASK,
+            )
+            self.events = []
+
+        def handle_metadata(self, handle):
+            return permissions._HandleMetadata(
+                FILE_ATTRIBUTE_DIRECTORY if handle == self.handle else 0,
+                permissions._FileIdentity(7, handle),
+            )
+
+        def read_acl(self, handle, current_user, security_information):
+            self.events.append(("inspect", handle))
+            return self.private_state() if handle == self.handle else self.file_state
+
+        def set_dacl(self, handle, sddl, security_information):
+            self.events.append(("apply", handle))
+
+        def create_relative(self, parent, name, *, directory, access):
+            self.events.append(("create", parent, name, directory))
+            return self.file_handle
+
+        def set_delete_on_close(self, handle, delete):
+            self.events.append(("delete", handle, delete))
+
+        def write_handle(self, handle, data):
+            self.events.append(("write", handle, data))
+
+        def flush_handle(self, handle):
+            self.events.append(("flush", handle))
+
+        def rename_handle(self, handle, parent, name, *, replace):
+            self.events.append(("rename", handle, parent, name, replace))
+
+    target = _target(tmp_path, directory=True)
+    api = PrivateIoApi()
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    with permissions.open_private_directory(target) as directory:
+        with directory.create_file("temporary") as private_file:
+            private_file.write_all(b"synthetic-cache")
+            private_file.flush()
+            private_file.publish("cache.json")
+
+    assert api.events == [
+        ("inspect", api.handle),
+        ("apply", api.handle),
+        ("inspect", api.handle),
+        ("create", api.handle, "temporary", False),
+        ("inspect", api.file_handle),
+        ("apply", api.file_handle),
+        ("inspect", api.file_handle),
+        ("delete", api.file_handle, True),
+        ("write", api.file_handle, b"synthetic-cache"),
+        ("flush", api.file_handle),
+        ("delete", api.file_handle, False),
+        ("rename", api.file_handle, api.handle, "cache.json", True),
+        ("inspect", api.file_handle),
+    ]
+    assert api.closed == [api.file_handle, api.handle]
+
+
+def test_private_file_read_is_bounded_on_the_acl_held_handle(tmp_path, monkeypatch):
+    from hermes_cli import windows_permissions as permissions
+
+    class PrivateReadApi(FakeNativeApi):
+        def __init__(self):
+            super().__init__(permissions, directory=True)
+            self.handle = 0xD11
+            self.file_handle = 0xF11
+            self.events = []
+            self.chunks = [b"synthetic-", b"cache", b""]
+
+        def handle_metadata(self, handle):
+            return permissions._HandleMetadata(
+                FILE_ATTRIBUTE_DIRECTORY if handle == self.handle else 0,
+                permissions._FileIdentity(7, handle),
+            )
+
+        def read_acl(self, handle, current_user, security_information):
+            self.events.append(("inspect", handle))
+            state = self.private_state()
+            if handle == self.file_handle:
+                state = self.private_state(ace_flags=0, ace_mask=FILE_PRIVATE_MASK)
+            return state
+
+        def set_dacl(self, handle, sddl, security_information):
+            self.events.append(("apply", handle))
+
+        def open_relative_file(self, parent, name, *, access):
+            self.events.append(("open", parent, name))
+            return self.file_handle
+
+        def read_handle(self, handle, size):
+            self.events.append(("read", handle, size))
+            return self.chunks.pop(0)
+
+    target = _target(tmp_path, directory=True)
+    api = PrivateReadApi()
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    with permissions.open_private_directory(target) as directory:
+        with directory.open_file("cache.json") as private_file:
+            assert private_file.read_all(max_bytes=32) == b"synthetic-cache"
+
+    file_events = [event for event in api.events if api.file_handle in event]
+    assert file_events[:3] == [
+        ("inspect", api.file_handle),
+        ("apply", api.file_handle),
+        ("inspect", api.file_handle),
+    ]
+    assert [event[0] for event in file_events[3:]] == ["read", "read", "read"]
+    assert api.closed == [api.file_handle, api.handle]
+
+
+def test_private_file_create_preserves_name_collision_for_bounded_retry(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    class CollisionApi(FakeNativeApi):
+        def __init__(self):
+            super().__init__(permissions, directory=True)
+
+        def create_relative(self, parent, name, *, directory, access):
+            raise permissions._WindowsCallError(
+                "synthetic private collision",
+                0xC0000035,
+            )
+
+    target = _target(tmp_path, directory=True)
+    api = CollisionApi()
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    with permissions.open_private_directory(target) as directory:
+        with pytest.raises(FileExistsError):
+            directory.create_file("temporary")
+
+
+def test_private_file_cleanup_retries_handle_delete_after_publish_failure(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import windows_permissions as permissions
+
+    class CleanupApi(FakeNativeApi):
+        def __init__(self):
+            super().__init__(permissions, directory=True)
+            self.handle = 0xD11
+            self.file_handle = 0xF11
+            self.delete_events = []
+
+        def handle_metadata(self, handle):
+            return permissions._HandleMetadata(
+                FILE_ATTRIBUTE_DIRECTORY if handle == self.handle else 0,
+                permissions._FileIdentity(7, handle),
+            )
+
+        def read_acl(self, handle, current_user, security_information):
+            if handle == self.handle:
+                return self.private_state()
+            return self.private_state(ace_flags=0, ace_mask=FILE_PRIVATE_MASK)
+
+        def create_relative(self, parent, name, *, directory, access):
+            return self.file_handle
+
+        def set_delete_on_close(self, handle, delete):
+            self.delete_events.append((handle, delete))
+            if delete and len(self.delete_events) == 3:
+                raise OSError("synthetic first cleanup failure")
+
+        def rename_handle(self, handle, parent, name, *, replace):
+            raise OSError("synthetic publication failure")
+
+    target = _target(tmp_path, directory=True)
+    api = CleanupApi()
+    monkeypatch.setattr(permissions, "_native_api", lambda: api)
+
+    with permissions.open_private_directory(target) as directory:
+        with pytest.raises(permissions.WindowsAclError):
+            with directory.create_file("temporary") as private_file:
+                private_file.publish("cache.json")
+
+    assert api.delete_events == [
+        (api.file_handle, True),
+        (api.file_handle, False),
+        (api.file_handle, True),
+        (api.file_handle, True),
+    ]
+    assert api.closed == [api.file_handle, api.handle]
 
 
 def test_private_write_probe_rejects_non_relative_artifact_names(tmp_path):
@@ -546,6 +782,140 @@ def test_native_probe_artifact_creation_is_exclusive(directory):
     assert calls[0][7] == 2
 
 
+def test_native_private_file_open_is_relative_and_rename_exclusive():
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+
+    def nt_create_file(*args):
+        calls.append(args)
+        args[0]._obj.value = 0xA11
+        return 0
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(),
+        advapi32=SimpleNamespace(),
+        ntdll=SimpleNamespace(NtCreateFile=nt_create_file),
+    )
+
+    handle = api.open_relative_file(
+        0x051D,
+        "cache.json",
+        access=READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
+    )
+
+    assert handle == 0xA11
+    assert len(calls) == 1
+    call = calls[0]
+    assert call[2]._obj.RootDirectory == 0x051D
+    assert call[6] == 0
+    assert call[7] == 1
+    assert call[8] & 0x00200000
+    assert call[8] & 0x00000040
+
+
+def test_native_private_file_read_uses_the_held_handle():
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+
+    def read_file(*args):
+        calls.append(args)
+        ctypes.memmove(args[1], b"abc", 3)
+        args[3]._obj.value = 3
+        return True
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(ReadFile=read_file),
+        advapi32=SimpleNamespace(),
+    )
+
+    assert api.read_handle(0xA11, 7) == b"abc"
+    assert calls[0][0] == 0xA11
+    assert calls[0][2] == 7
+
+
+@pytest.mark.parametrize("delete", [True, False])
+def test_native_private_file_delete_disposition_is_handle_bound(delete):
+    from hermes_cli import windows_permissions as permissions
+
+    values = []
+
+    def set_information(handle, info_class, information, size):
+        disposition = ctypes.cast(
+            information,
+            ctypes.POINTER(permissions._FILE_DISPOSITION_INFO),
+        ).contents
+        values.append((handle, info_class, bool(disposition.DeleteFile), size))
+        return True
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(SetFileInformationByHandle=set_information),
+        advapi32=SimpleNamespace(),
+    )
+
+    api.set_delete_on_close(0xA11, delete)
+
+    assert values == [
+        (
+            0xA11,
+            4,
+            delete,
+            ctypes.sizeof(permissions._FILE_DISPOSITION_INFO),
+        )
+    ]
+    assert ctypes.sizeof(permissions._FILE_DISPOSITION_INFO) == 1
+
+
+def test_native_private_file_publish_renames_the_held_handle_relative_to_parent():
+    from hermes_cli import windows_permissions as permissions
+
+    values = []
+
+    def set_information(handle, info_class, information, size):
+        rename = ctypes.cast(
+            information,
+            ctypes.POINTER(permissions._FILE_RENAME_INFO),
+        ).contents
+        name_bytes = ctypes.string_at(
+            ctypes.addressof(rename) + permissions._FILE_RENAME_INFO.FileName.offset,
+            rename.FileNameLength,
+        )
+        values.append((
+            handle,
+            info_class,
+            bool(rename.ReplaceIfExists),
+            rename.RootDirectory,
+            name_bytes.decode("utf-16-le"),
+            size,
+        ))
+        return True
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(SetFileInformationByHandle=set_information),
+        advapi32=SimpleNamespace(),
+    )
+
+    api.rename_handle(0xF11, 0xD11, "cache.json", replace=True)
+
+    assert values == [
+        (
+            0xF11,
+            3,
+            True,
+            0xD11,
+            "cache.json",
+            permissions._FILE_RENAME_INFO.FileName.offset
+            + len("cache.json".encode("utf-16-le")),
+        )
+    ]
+    assert permissions._FILE_RENAME_INFO._fields_[0][1] is wintypes.BOOLEAN
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     ["anchor", "child", "replacement"],
@@ -684,6 +1054,32 @@ def test_native_create_file_call_uses_win32_argument_order(tmp_path):
             None,
         )
     ]
+
+
+def test_native_private_directory_handle_denies_rename_sharing(tmp_path):
+    from hermes_cli import windows_permissions as permissions
+
+    calls = []
+
+    def create_file(*args):
+        calls.append(args)
+        return 0xA11
+
+    api = _uninitialized_native_api(
+        permissions,
+        kernel32=SimpleNamespace(CreateFileW=create_file),
+        advapi32=SimpleNamespace(),
+    )
+    target = tmp_path / "private-directory"
+
+    handle = api.open_bound_handle(
+        target,
+        access=READ_CONTROL | WRITE_DAC | FILE_TRAVERSE | FILE_ADD_FILE,
+        flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+    )
+
+    assert handle == 0xA11
+    assert calls[0][2] == 0x00000001 | 0x00000002
 
 
 def test_native_get_security_info_uses_owner_dacl_outputs_and_frees_descriptor():
@@ -1115,3 +1511,8 @@ def test_public_api_signatures_and_inspection_shape_are_stable():
         "detail",
     ]
     assert permissions.WindowsAclInspection.__dataclass_params__.frozen is True
+    assert "open_private_directory" in permissions.__all__
+    assert "WindowsPrivateDirectory" not in permissions.__all__
+    assert "WindowsPrivateFile" not in permissions.__all__
+    signature = inspect.signature(permissions.open_private_directory)
+    assert list(signature.parameters) == ["path"]
