@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -243,6 +244,90 @@ def test_harness_preserves_a_bounded_root_substage_and_error_category(tmp_path) 
         "explicit-write-probe FAIL reason=probe-open-root-component-open-access-denied",
         "cleanup PASS",
     ]
+
+
+def test_harness_preserves_a_bounded_teams_phase_and_operation(tmp_path) -> None:
+    gate = _load_harness()
+
+    class TeamsFailureAdapter(_ContractAdapter):
+        def exercise_teams_cache(
+            self, profile: Path, first: bytes, replacement: bytes
+        ) -> None:
+            assert profile == self.profile
+            self.calls.append("teams-cache-round-trip")
+            raise gate._GateCaseFailure("teams-first-persist-publish-file")
+
+    output = io.StringIO()
+
+    assert gate.main(adapter=TeamsFailureAdapter(tmp_path), output=output) == 1
+    assert output.getvalue().splitlines()[-2:] == [
+        "teams-cache-round-trip FAIL reason=teams-first-persist-publish-file",
+        "cleanup PASS",
+    ]
+
+
+def test_native_teams_gate_reports_the_last_bounded_host_operation(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import windows_permissions
+
+    gate = _load_harness()
+    adapter = gate.NativeWindowsAdapter(workspace=tmp_path)
+
+    class PrivateFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def write_all(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+        def publish(self, _name):
+            raise OSError("private native publish detail")
+
+    class PrivateDirectory:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def open_file(self, _name):
+            return None
+
+        def create_file(self, _name):
+            return PrivateFile()
+
+    module = SimpleNamespace()
+    module._WindowsAclApi = lambda **kwargs: SimpleNamespace(**kwargs)
+
+    def persist(cache):
+        api = module._windows_acl_api()
+        with api.open_private_directory(tmp_path / "cache") as directory:
+            with directory.create_file("temporary") as private_file:
+                private_file.write_all(cache.serialize().encode("utf-8"))
+                private_file.flush()
+                private_file.publish("cache.json")
+
+    module._persist = persist
+    module.cache_path = lambda: tmp_path / "cache" / "cache.json"
+    module._read_cache_text = lambda: None
+    monkeypatch.setattr(adapter, "_load_vendored_teams_module", lambda: module)
+    monkeypatch.setattr(
+        windows_permissions,
+        "open_private_directory",
+        lambda _path: PrivateDirectory(),
+    )
+
+    with pytest.raises(gate._GateCaseFailure) as exc_info:
+        adapter.exercise_teams_cache(tmp_path, b"first", b"replacement")
+
+    assert exc_info.value.reason == "teams-first-persist-publish-file"
 
 
 def test_native_adapter_extracts_only_a_bounded_root_probe_reason(
@@ -548,6 +633,28 @@ cleanup PASS
 
     assert result.returncode != 0
     assert f"explicit-write-probe FAIL reason={reason}" in result.stdout
+
+
+@pytest.mark.parametrize("reason", sorted(_load_harness()._TEAMS_FAILURE_REASONS))
+def test_launcher_preserves_every_bounded_teams_failure_stage(
+    tmp_path, reason
+) -> None:
+    result, _trace = _run_launcher(
+        tmp_path,
+        child_exit=1,
+        child_output=f"""platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe PASS
+teams-cache-round-trip FAIL reason={reason}
+cleanup PASS
+""",
+    )
+
+    assert result.returncode != 0
+    assert f"teams-cache-round-trip FAIL reason={reason}" in result.stdout
 
 
 def test_launcher_redacts_an_unrecognized_native_probe_failure_stage(tmp_path) -> None:

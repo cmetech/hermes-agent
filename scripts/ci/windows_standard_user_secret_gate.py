@@ -80,11 +80,43 @@ _PROBE_FAILURE_REASONS = frozenset(
 _PROBE_FAILURE_REASON_RE = re.compile(
     r"\((probe-[a-z-]+)(?::[A-Za-z_][A-Za-z0-9_]*)?\)"
 )
+_TEAMS_TRACE_PHASES = frozenset(
+    {"first-persist", "first-read", "replacement-persist", "replacement-read"}
+)
+_TEAMS_TRACE_OPERATIONS = frozenset(
+    {
+        "outer",
+        "open-directory",
+        "close-directory",
+        "open-file",
+        "create-file",
+        "close-file",
+        "write-file",
+        "flush-file",
+        "publish-file",
+        "read-file",
+    }
+)
+_TEAMS_FAILURE_REASONS = frozenset(
+    {
+        f"teams-{phase}-{operation}"
+        for phase in _TEAMS_TRACE_PHASES
+        for operation in _TEAMS_TRACE_OPERATIONS
+    }
+    | {
+        "teams-first-acl-directory",
+        "teams-first-acl-file",
+        "teams-replacement-acl-file",
+        "teams-cleanup-file",
+        "teams-cleanup-directory",
+    }
+)
+_GATE_FAILURE_REASONS = _PROBE_FAILURE_REASONS | _TEAMS_FAILURE_REASONS
 
 
 class _GateCaseFailure(RuntimeError):
     def __init__(self, reason: str) -> None:
-        if reason not in _PROBE_FAILURE_REASONS:
+        if reason not in _GATE_FAILURE_REASONS:
             reason = "probe-unknown"
         super().__init__(reason)
         self.reason = reason
@@ -581,33 +613,140 @@ class NativeWindowsAdapter:
 
         self._sensitive.extend((first.decode("ascii"), replacement.decode("ascii")))
         module = self._load_vendored_teams_module()
+        phase = "first-persist"
+        last_operation = "outer"
+
+        def mark(operation: str) -> None:
+            nonlocal last_operation
+            last_operation = operation
+
+        class TracedPrivateFile:
+            def __init__(self, private_file) -> None:
+                self._private_file = private_file
+
+            def __enter__(self):
+                self._private_file.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                if exc_type is None:
+                    mark("close-file")
+                try:
+                    return self._private_file.__exit__(exc_type, exc, traceback)
+                except Exception:
+                    mark("close-file")
+                    raise
+
+            def close(self) -> None:
+                mark("close-file")
+                self._private_file.close()
+
+            def write_all(self, data: bytes) -> None:
+                mark("write-file")
+                self._private_file.write_all(data)
+
+            def flush(self) -> None:
+                mark("flush-file")
+                self._private_file.flush()
+
+            def publish(self, name: str) -> None:
+                mark("publish-file")
+                self._private_file.publish(name)
+
+            def read_all(self, *, max_bytes: int) -> bytes:
+                mark("read-file")
+                return self._private_file.read_all(max_bytes=max_bytes)
+
+        class TracedPrivateDirectory:
+            def __init__(self, directory) -> None:
+                self._directory = directory
+
+            def __enter__(self):
+                self._directory.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                if exc_type is None:
+                    mark("close-directory")
+                try:
+                    return self._directory.__exit__(exc_type, exc, traceback)
+                except Exception:
+                    mark("close-directory")
+                    raise
+
+            def open_file(self, name: str):
+                mark("open-file")
+                private_file = self._directory.open_file(name)
+                return (
+                    None
+                    if private_file is None
+                    else TracedPrivateFile(private_file)
+                )
+
+            def create_file(self, name: str):
+                mark("create-file")
+                return TracedPrivateFile(self._directory.create_file(name))
+
+        def traced_open_private_directory(path: Path):
+            mark("open-directory")
+            return TracedPrivateDirectory(
+                windows_permissions.open_private_directory(path)
+            )
+
+        module._windows_acl_api = lambda: module._WindowsAclApi(
+            open_private_directory=traced_open_private_directory
+        )
+
+        def run_phase(name: str, operation):
+            nonlocal phase, last_operation
+            phase = name
+            last_operation = "outer"
+            try:
+                return operation()
+            except Exception:
+                raise _GateCaseFailure(f"teams-{phase}-{last_operation}") from None
+
         first_cache = _ChangedTeamsCache(first)
-        module._persist(first_cache)
+        run_phase("first-persist", lambda: module._persist(first_cache))
         cache_path = module.cache_path()
         self._teams_cache_path = cache_path
-        if module._read_cache_text() != first_cache.serialized:
-            raise RuntimeError("Teams cache create/read failed")
-        parent_acl = windows_permissions.inspect_directory_acl(cache_path.parent)
-        file_acl = windows_permissions.inspect_file_acl(cache_path)
-        if (
-            not parent_acl.secure
-            or parent_acl.detail is not None
-            or not file_acl.secure
-            or file_acl.detail is not None
-        ):
-            raise RuntimeError("Teams cache ACL is not exact")
+        first_text = run_phase("first-read", module._read_cache_text)
+        if first_text != first_cache.serialized:
+            raise _GateCaseFailure("teams-first-read-outer")
+        try:
+            parent_acl = windows_permissions.inspect_directory_acl(cache_path.parent)
+        except Exception:
+            raise _GateCaseFailure("teams-first-acl-directory") from None
+        try:
+            file_acl = windows_permissions.inspect_file_acl(cache_path)
+        except Exception:
+            raise _GateCaseFailure("teams-first-acl-file") from None
+        if not parent_acl.secure or parent_acl.detail is not None:
+            raise _GateCaseFailure("teams-first-acl-directory")
+        if not file_acl.secure or file_acl.detail is not None:
+            raise _GateCaseFailure("teams-first-acl-file")
 
         replacement_cache = _ChangedTeamsCache(replacement)
-        module._persist(replacement_cache)
-        if module._read_cache_text() != replacement_cache.serialized:
-            raise RuntimeError("Teams cache replacement failed")
-        file_acl = windows_permissions.inspect_file_acl(cache_path)
+        run_phase("replacement-persist", lambda: module._persist(replacement_cache))
+        replacement_text = run_phase("replacement-read", module._read_cache_text)
+        if replacement_text != replacement_cache.serialized:
+            raise _GateCaseFailure("teams-replacement-read-outer")
+        try:
+            file_acl = windows_permissions.inspect_file_acl(cache_path)
+        except Exception:
+            raise _GateCaseFailure("teams-replacement-acl-file") from None
         if not file_acl.secure or file_acl.detail is not None:
-            raise RuntimeError("Teams replacement ACL is not exact")
-        cache_path.unlink()
+            raise _GateCaseFailure("teams-replacement-acl-file")
+        try:
+            cache_path.unlink()
+        except Exception:
+            raise _GateCaseFailure("teams-cleanup-file") from None
         if cache_path.exists():
-            raise RuntimeError("Teams cache cleanup failed")
-        cache_path.parent.rmdir()
+            raise _GateCaseFailure("teams-cleanup-file")
+        try:
+            cache_path.parent.rmdir()
+        except Exception:
+            raise _GateCaseFailure("teams-cleanup-directory") from None
 
     @staticmethod
     def _snapshot_target(target: Path) -> tuple[tuple[object, ...], ...]:
@@ -717,6 +856,8 @@ def _emit(output: TextIO, case: str, passed: bool, detail: str | None = None) ->
         and not passed
         and detail in _PROBE_FAILURE_REASONS
     ):
+        line += f" reason={detail}"
+    elif case == "teams-cache-round-trip" and not passed and detail in _TEAMS_FAILURE_REASONS:
         line += f" reason={detail}"
     print(line, file=output, flush=True)
 
