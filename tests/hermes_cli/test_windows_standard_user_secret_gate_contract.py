@@ -31,6 +31,17 @@ EXPECTED_CASES = [
     "cleanup",
 ]
 
+COMPLETE_PASS_TRANSCRIPT = """platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe PASS
+teams-cache-round-trip PASS
+reparse-rejection PASS
+cleanup PASS
+"""
+
 
 def _load_harness():
     assert HARNESS.is_file(), "native gate Python harness is missing"
@@ -173,7 +184,7 @@ def _write_launcher_adapter(
     *,
     fail_operation: str | None = None,
     child_exit: int = 0,
-    child_output: str = "platform-preflight PASS\ncleanup PASS\n",
+    child_output: str = COMPLETE_PASS_TRANSCRIPT,
 ) -> None:
     failure = fail_operation or ""
     path.write_text(
@@ -203,6 +214,7 @@ function Add-GateTrace([string]$value) {
     GrantCheckout = {
         param($path, $user)
         Add-GateTrace 'grant-checkout:ReadAndExecute'
+        if ($failure -eq 'grant-checkout') { throw 'synthetic grant failure' }
     }
     GrantWorkspace = {
         param($path, $user)
@@ -219,18 +231,22 @@ function Add-GateTrace([string]$value) {
     RevokeCheckout = {
         param($path, $user)
         Add-GateTrace 'revoke-checkout'
+        if ($failure -eq 'revoke-checkout') { throw 'synthetic revoke failure' }
     }
     RemoveProfile = {
         param($user)
         Add-GateTrace 'remove-profile'
+        if ($failure -eq 'remove-profile') { throw 'synthetic profile failure' }
     }
     RemoveUser = {
         param($user)
         Add-GateTrace 'remove-user'
+        if ($failure -eq 'remove-user') { throw 'synthetic user failure' }
     }
     RemoveWorkspace = {
         param($path)
         Add-GateTrace 'remove-workspace'
+        if ($failure -eq 'remove-workspace') { throw 'synthetic workspace failure' }
         Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -245,7 +261,7 @@ def _run_launcher(
     *,
     fail_operation: str | None = None,
     child_exit: int = 0,
-    child_output: str = "platform-preflight PASS\ncleanup PASS\n",
+    child_output: str = COMPLETE_PASS_TRANSCRIPT,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     assert LAUNCHER.is_file(), "standard-user PowerShell launcher is missing"
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -356,6 +372,166 @@ def test_launcher_redacts_unexpected_child_output_and_propagates_child_failure(
     assert secret not in result.stdout
     assert secret not in result.stderr
     assert "platform-preflight PASS" in result.stdout
+    assert trace[-4:] == [
+        "revoke-checkout",
+        "remove-profile",
+        "remove-user",
+        "remove-workspace",
+    ]
+
+
+@pytest.mark.parametrize(
+    "child_output",
+    [
+        pytest.param(
+            """platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe PASS
+reparse-rejection PASS
+cleanup PASS
+""",
+            id="incomplete",
+        ),
+        pytest.param(
+            """platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe PASS
+teams-cache-round-trip PASS
+teams-cache-round-trip PASS
+reparse-rejection PASS
+cleanup PASS
+""",
+            id="duplicate",
+        ),
+        pytest.param(
+            """fresh-profile PASS
+platform-preflight PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only PASS
+explicit-write-probe PASS
+teams-cache-round-trip PASS
+cleanup PASS
+reparse-rejection PASS
+""",
+            id="reordered",
+        ),
+        pytest.param(
+            """platform-preflight PASS
+fresh-profile PASS
+arm-disabled-auto-keyring PASS
+file-tier-acl-repair PASS
+plain-doctor-read-only FAIL
+explicit-write-probe PASS
+teams-cache-round-trip PASS
+reparse-rejection PASS
+cleanup PASS
+""",
+            id="fail-status",
+        ),
+    ],
+)
+def test_launcher_rejects_any_transcript_other_than_nine_ordered_passes(
+    tmp_path, child_output
+) -> None:
+    result, trace = _run_launcher(tmp_path, child_output=child_output)
+
+    assert result.returncode != 0
+    assert "launcher-cleanup PASS" not in result.stdout
+    assert trace[-4:] == [
+        "revoke-checkout",
+        "remove-profile",
+        "remove-user",
+        "remove-workspace",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "private_marker"),
+    [
+        pytest.param(
+            "cleanup FAIL path=C:\\gate\\synthetic-secret-value",
+            "synthetic-secret-value",
+            id="secret",
+        ),
+        pytest.param(
+            "cleanup FAIL path=RuntimeError: synthetic-exception-private",
+            "synthetic-exception-private",
+            id="exception",
+        ),
+        pytest.param(
+            "cleanup FAIL path=authority:synthetic-S-1-5-21-999",
+            "synthetic-S-1-5-21-999",
+            id="authority",
+        ),
+        pytest.param(
+            "cleanup FAIL path=synthetic-unrelated-child-log",
+            "synthetic-unrelated-child-log",
+            id="unrelated",
+        ),
+        pytest.param(
+            "cleanup FAIL path=..\\..\\synthetic-escape-target",
+            "synthetic-escape-target",
+            id="escape-path",
+        ),
+    ],
+)
+def test_launcher_replaces_cleanup_detail_with_a_fixed_failure_token(
+    tmp_path, payload, private_marker
+) -> None:
+    result, trace = _run_launcher(
+        tmp_path,
+        child_output=COMPLETE_PASS_TRANSCRIPT + payload + "\n",
+    )
+
+    assert result.returncode != 0
+    assert private_marker not in result.stdout
+    assert private_marker not in result.stderr
+    assert "cleanup FAIL" in result.stdout.splitlines()
+    assert trace[-4:] == [
+        "revoke-checkout",
+        "remove-profile",
+        "remove-user",
+        "remove-workspace",
+    ]
+
+
+def test_launcher_revokes_checkout_after_a_partially_applied_grant_fails(
+    tmp_path,
+) -> None:
+    result, trace = _run_launcher(tmp_path, fail_operation="grant-checkout")
+
+    assert result.returncode != 0
+    assert trace == [
+        trace[0],
+        "check-not-administrator",
+        "create-private-workspace",
+        "grant-checkout:ReadAndExecute",
+        "revoke-checkout",
+        "remove-profile",
+        "remove-user",
+        "remove-workspace",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["revoke-checkout", "remove-profile", "remove-user", "remove-workspace"],
+)
+def test_launcher_cleanup_failures_fail_closed_and_do_not_short_circuit(
+    tmp_path, failure
+) -> None:
+    result, trace = _run_launcher(tmp_path, fail_operation=failure)
+
+    assert result.returncode != 0
+    assert "launcher-cleanup FAIL" in result.stdout.splitlines()
+    assert "launcher-cleanup PASS" not in result.stdout
     assert trace[-4:] == [
         "revoke-checkout",
         "remove-profile",

@@ -145,7 +145,17 @@ function New-NativeGateAdapter {
 }
 
 function Read-RedactedChildOutput([string]$path) {
-    $valid = $true
+    $expected = @(
+        "platform-preflight PASS"
+        "fresh-profile PASS"
+        "arm-disabled-auto-keyring PASS"
+        "file-tier-acl-repair PASS"
+        "plain-doctor-read-only PASS"
+        "explicit-write-probe PASS"
+        "teams-cache-round-trip PASS"
+        "reparse-rejection PASS"
+        "cleanup PASS"
+    )
     $lines = @()
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return [pscustomobject]@{
@@ -153,17 +163,26 @@ function Read-RedactedChildOutput([string]$path) {
             Valid = $false
         }
     }
-    foreach ($line in Get-Content -LiteralPath $path) {
+    $observed = @(Get-Content -LiteralPath $path)
+    foreach ($line in $observed) {
         if ($line -match '^(platform-preflight|fresh-profile|arm-disabled-auto-keyring|file-tier-acl-repair|plain-doctor-read-only|explicit-write-probe|teams-cache-round-trip|reparse-rejection|cleanup) (PASS|FAIL)$') {
             $lines += $line
         }
         elseif ($line -match '^cleanup FAIL path=.+$') {
-            $lines += $line
+            $lines += "cleanup FAIL"
         }
-        elseif ($line.Length -gt 0) {
-            $lines += "child-output FAIL"
-            $valid = $false
+    }
+    $valid = $observed.Count -eq $expected.Count
+    if ($valid) {
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            if ($observed[$index] -cne $expected[$index]) {
+                $valid = $false
+                break
+            }
         }
+    }
+    if (-not $valid) {
+        $lines += "child-output FAIL"
     }
     return [pscustomobject]@{
         Lines = $lines
@@ -175,7 +194,7 @@ $gateFailed = $false
 $cleanupFailed = $false
 $user = $null
 $workspace = $null
-$checkoutGranted = $false
+$checkoutGrantAttempted = $false
 $oldWorkspace = $env:HERMES_WINDOWS_GATE_WORKSPACE
 
 if ($env:CI -ne "true") {
@@ -211,8 +230,8 @@ try {
     if (-not $workspace) {
         throw "private workspace creation failed"
     }
+    $checkoutGrantAttempted = $true
     & $adapter.GrantCheckout $script:RepoRoot $user
-    $checkoutGranted = $true
     & $adapter.GrantWorkspace $workspace $user
 
     $stdout = Join-Path $workspace "gate.stdout"
@@ -248,7 +267,7 @@ finally {
     else {
         $env:HERMES_WINDOWS_GATE_WORKSPACE = $oldWorkspace
     }
-    if ($null -ne $user -and $checkoutGranted) {
+    if ($null -ne $user -and $checkoutGrantAttempted) {
         try {
             & $adapter.RevokeCheckout $script:RepoRoot $user
         }
