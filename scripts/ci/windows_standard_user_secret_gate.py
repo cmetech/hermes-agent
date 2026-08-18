@@ -731,8 +731,12 @@ def main(
     return 1 if failed else 0
 
 
-if __name__ == "__main__":
+def run_cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path)
-    arguments = parser.parse_args()
-    raise SystemExit(main(workspace=arguments.workspace))
+    arguments = parser.parse_args(argv)
+    return main(workspace=arguments.workspace)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())

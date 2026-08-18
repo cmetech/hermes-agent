@@ -35,8 +35,60 @@ function ConvertTo-GateSidString($user) {
     return [string]$user.SID
 }
 
+function Invoke-GateChildProcess {
+    param(
+        [scriptblock]$StartProcess,
+        $User,
+        $Password,
+        [string]$Workspace,
+        [string]$Stdout,
+        [string]$Stderr,
+        [string]$PythonPath,
+        [string]$HarnessPath,
+        [string]$RepoRoot,
+        [string]$ComputerName
+    )
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+        throw "locked Python environment is unavailable"
+    }
+    if (-not (Test-Path -LiteralPath $HarnessPath -PathType Leaf)) {
+        throw "checked-in Python harness is unavailable"
+    }
+    if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
+        throw "checked-out repository root is unavailable"
+    }
+    $credential = [System.Management.Automation.PSCredential]::new(
+        "$ComputerName\$($User.Name)",
+        $Password
+    )
+    $launchParameters = @{
+        FilePath = $PythonPath
+        ArgumentList = @(
+            "`"$HarnessPath`""
+            "--workspace"
+            "`"$Workspace`""
+        )
+        Credential = $credential
+        LoadUserProfile = $true
+        WorkingDirectory = $RepoRoot
+        RedirectStandardOutput = $Stdout
+        RedirectStandardError = $Stderr
+        Wait = $true
+        PassThru = $true
+    }
+    $process = & $StartProcess $launchParameters
+    if ($null -eq $process) {
+        throw "standard-user child launch returned no process"
+    }
+    return [int]$process.ExitCode
+}
+
 function New-NativeGateAdapter {
     return [pscustomobject]@{
+        PythonPath = $script:PythonPath
+        HarnessPath = $script:HarnessPath
+        RepoRoot = $script:RepoRoot
+        ComputerName = $env:COMPUTERNAME
         NewUser = {
             param($name, $password)
             New-LocalUser `
@@ -85,33 +137,9 @@ function New-NativeGateAdapter {
                 throw "workspace bootstrap ACL failed"
             }
         }
-        Launch = {
-            param($user, $password, $workspace, $stdout, $stderr)
-            if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
-                throw "locked Python environment is unavailable"
-            }
-            if (-not (Test-Path -LiteralPath $script:HarnessPath -PathType Leaf)) {
-                throw "checked-in Python harness is unavailable"
-            }
-            $credential = [System.Management.Automation.PSCredential]::new(
-                "$env:COMPUTERNAME\$($user.Name)",
-                $password
-            )
-            $process = Start-Process `
-                -FilePath $script:PythonPath `
-                -ArgumentList @(
-                    "`"$script:HarnessPath`""
-                    "--workspace"
-                    "`"$workspace`""
-                ) `
-                -Credential $credential `
-                -LoadUserProfile `
-                -WorkingDirectory $script:RepoRoot `
-                -RedirectStandardOutput $stdout `
-                -RedirectStandardError $stderr `
-                -Wait `
-                -PassThru
-            return [int]$process.ExitCode
+        StartProcess = {
+            param([hashtable]$launchParameters)
+            Start-Process @launchParameters
         }
         RevokeCheckout = {
             param($path, $user)
@@ -241,7 +269,17 @@ try {
     $stdout = Join-Path $workspace "gate.stdout"
     $stderr = Join-Path $workspace "gate.stderr"
     $env:HERMES_WINDOWS_GATE_WORKSPACE = $workspace
-    $childExit = & $adapter.Launch $user $password $workspace $stdout $stderr
+    $childExit = Invoke-GateChildProcess `
+        -StartProcess $adapter.StartProcess `
+        -User $user `
+        -Password $password `
+        -Workspace $workspace `
+        -Stdout $stdout `
+        -Stderr $stderr `
+        -PythonPath $adapter.PythonPath `
+        -HarnessPath $adapter.HarnessPath `
+        -RepoRoot $adapter.RepoRoot `
+        -ComputerName $adapter.ComputerName
     $childOutput = Read-RedactedChildOutput $stdout
     foreach ($line in $childOutput.Lines) {
         Write-Output $line

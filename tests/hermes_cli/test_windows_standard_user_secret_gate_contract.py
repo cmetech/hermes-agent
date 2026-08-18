@@ -145,12 +145,19 @@ def test_native_adapter_accepts_explicit_workspace_without_inherited_environment
         adapter.cleanup(profile)
 
 
-def test_native_launcher_passes_workspace_to_credentialed_child() -> None:
-    launcher = LAUNCHER.read_text(encoding="utf-8")
+def test_harness_cli_routes_explicit_workspace_to_main(tmp_path, monkeypatch) -> None:
+    gate = _load_harness()
+    workspace = tmp_path / "workspace with spaces"
+    observed: list[Path | None] = []
 
-    assert '"--workspace"' in launcher
-    argument_list = launcher.split("-ArgumentList", 1)[1].split("-Credential", 1)[0]
-    assert "$workspace" in argument_list
+    def fake_main(*, workspace=None, output=sys.stdout, adapter=None):
+        observed.append(workspace)
+        return 23
+
+    monkeypatch.setattr(gate, "main", fake_main)
+
+    assert gate.run_cli(["--workspace", str(workspace)]) == 23
+    assert observed == [workspace]
 
 
 def test_harness_adapter_contract_covers_native_cases_and_synthetic_cleanup(
@@ -217,6 +224,10 @@ function Add-GateTrace([string]$value) {
     Add-Content -LiteralPath $env:GATE_TRACE -Value $value
 }
 [pscustomobject]@{
+    PythonPath = $env:GATE_PYTHON_PATH
+    HarnessPath = $env:GATE_HARNESS_PATH
+    RepoRoot = $env:GATE_REPO_ROOT
+    ComputerName = 'portable'
     NewUser = {
         param($name, $password)
         Add-GateTrace "new-user:$name"
@@ -243,13 +254,24 @@ function Add-GateTrace([string]$value) {
         param($path, $user)
         Add-GateTrace 'grant-workspace:Modify'
     }
-    Launch = {
-        param($user, $password, $workspace, $stdout, $stderr)
+    StartProcess = {
+        param([hashtable]$launchParameters)
         Add-GateTrace 'launch:LoadUserProfile'
-        Set-Content -LiteralPath $stdout -Value $env:GATE_CHILD_OUTPUT -NoNewline
-        Set-Content -LiteralPath $stderr -Value '' -NoNewline
+        [ordered]@{
+            FilePath = [string]$launchParameters.FilePath
+            ArgumentList = @($launchParameters.ArgumentList)
+            CredentialUserName = [string]$launchParameters.Credential.UserName
+            LoadUserProfile = [bool]$launchParameters.LoadUserProfile
+            WorkingDirectory = [string]$launchParameters.WorkingDirectory
+            RedirectStandardOutput = [string]$launchParameters.RedirectStandardOutput
+            RedirectStandardError = [string]$launchParameters.RedirectStandardError
+            Wait = [bool]$launchParameters.Wait
+            PassThru = [bool]$launchParameters.PassThru
+        } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $env:GATE_LAUNCH_SPEC
+        Set-Content -LiteralPath $launchParameters.RedirectStandardOutput -Value $env:GATE_CHILD_OUTPUT -NoNewline
+        Set-Content -LiteralPath $launchParameters.RedirectStandardError -Value '' -NoNewline
         if ($failure -eq 'launch') { throw 'synthetic launch failure' }
-        [int]$env:GATE_CHILD_EXIT
+        [pscustomobject]@{ ExitCode = [int]$env:GATE_CHILD_EXIT }
     }
     RevokeCheckout = {
         param($path, $user)
@@ -294,6 +316,14 @@ def _run_launcher(
     adapter = tmp_path / "launcher-adapter.ps1"
     trace = tmp_path / "trace.txt"
     workspace = tmp_path / "workspace"
+    launch_root = tmp_path / "launch paths with spaces"
+    python_path = launch_root / "python executable.exe"
+    harness_path = launch_root / "gate harness.py"
+    repo_root = launch_root / "repo root"
+    launch_spec = tmp_path / "launch spec.json"
+    repo_root.mkdir(parents=True)
+    python_path.touch()
+    harness_path.touch()
     _write_launcher_adapter(
         adapter,
         fail_operation=fail_operation,
@@ -310,6 +340,10 @@ def _run_launcher(
             "GATE_FAIL_OPERATION": fail_operation or "",
             "GATE_CHILD_EXIT": str(child_exit),
             "GATE_CHILD_OUTPUT": child_output,
+            "GATE_PYTHON_PATH": str(python_path),
+            "GATE_HARNESS_PATH": str(harness_path),
+            "GATE_REPO_ROOT": str(repo_root),
+            "GATE_LAUNCH_SPEC": str(launch_spec),
         }
     )
     result = subprocess.run(
@@ -330,6 +364,36 @@ def _run_launcher(
     )
     lines = trace.read_text(encoding="utf-8").splitlines() if trace.exists() else []
     return result, lines
+
+
+def test_native_launcher_builds_credentialed_child_invocation_with_spaced_paths(
+    tmp_path,
+) -> None:
+    root = tmp_path / "portable launcher root with spaces"
+
+    result, trace = _run_launcher(root)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    spec_path = root / "launch spec.json"
+    assert spec_path.is_file(), trace
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    credential_user = spec.pop("CredentialUserName")
+    assert credential_user.startswith("portable\\hsg-")
+    assert len(credential_user) == len("portable\\hsg-") + 12
+    assert spec == {
+        "FilePath": str(root / "launch paths with spaces" / "python executable.exe"),
+        "ArgumentList": [
+            f'"{root / "launch paths with spaces" / "gate harness.py"}"',
+            "--workspace",
+            f'"{root / "workspace"}"',
+        ],
+        "LoadUserProfile": True,
+        "WorkingDirectory": str(root / "launch paths with spaces" / "repo root"),
+        "RedirectStandardOutput": str(root / "workspace" / "gate.stdout"),
+        "RedirectStandardError": str(root / "workspace" / "gate.stderr"),
+        "Wait": True,
+        "PassThru": True,
+    }
 
 
 def test_launcher_creates_distinct_non_admin_user_and_limits_bootstrap_access(
