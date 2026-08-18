@@ -94,6 +94,11 @@ _TEAMS_TRACE_OPERATIONS = frozenset(
         "write-file",
         "flush-file",
         "publish-file",
+        "publish-disarm-delete",
+        "publish-rename-file",
+        "publish-verify-metadata",
+        "publish-verify-user",
+        "publish-verify-acl",
         "read-file",
     }
 )
@@ -120,6 +125,56 @@ class _GateCaseFailure(RuntimeError):
             reason = "probe-unknown"
         super().__init__(reason)
         self.reason = reason
+
+
+class _TracedWindowsAclApi:
+    """Record bounded publication substages while delegating native calls."""
+
+    def __init__(self, delegate, mark) -> None:
+        self._delegate = delegate
+        self._mark = mark
+        self._publishing = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+    def begin_publication(self) -> None:
+        self._publishing = True
+
+    def end_publication(self) -> None:
+        self._publishing = False
+
+    def set_delete_on_close(self, handle: int, delete: bool) -> None:
+        if self._publishing and not delete:
+            self._mark("publish-disarm-delete")
+        self._delegate.set_delete_on_close(handle, delete)
+
+    def rename_handle(
+        self,
+        handle: int,
+        parent: int,
+        name: str,
+        *,
+        replace: bool,
+    ) -> None:
+        if self._publishing:
+            self._mark("publish-rename-file")
+        self._delegate.rename_handle(handle, parent, name, replace=replace)
+
+    def handle_metadata(self, handle: int):
+        if self._publishing:
+            self._mark("publish-verify-metadata")
+        return self._delegate.handle_metadata(handle)
+
+    def current_user(self):
+        if self._publishing:
+            self._mark("publish-verify-user")
+        return self._delegate.current_user()
+
+    def read_acl(self, handle: int, current_user, security_information: int):
+        if self._publishing:
+            self._mark("publish-verify-acl")
+        return self._delegate.read_acl(handle, current_user, security_information)
 
 
 @dataclass(frozen=True)
@@ -651,7 +706,14 @@ class NativeWindowsAdapter:
 
             def publish(self, name: str) -> None:
                 mark("publish-file")
-                self._private_file.publish(name)
+                api = getattr(self._private_file, "_api", None)
+                if isinstance(api, _TracedWindowsAclApi):
+                    api.begin_publication()
+                try:
+                    self._private_file.publish(name)
+                finally:
+                    if isinstance(api, _TracedWindowsAclApi):
+                        api.end_publication()
 
             def read_all(self, *, max_bytes: int) -> bytes:
                 mark("read-file")
@@ -689,9 +751,15 @@ class NativeWindowsAdapter:
 
         def traced_open_private_directory(path: Path):
             mark("open-directory")
-            return TracedPrivateDirectory(
-                windows_permissions.open_private_directory(path)
+            native_api = windows_permissions._native_api
+            windows_permissions._native_api = lambda: _TracedWindowsAclApi(
+                native_api(), mark
             )
+            try:
+                directory = windows_permissions.open_private_directory(path)
+            finally:
+                windows_permissions._native_api = native_api
+            return TracedPrivateDirectory(directory)
 
         module._windows_acl_api = lambda: module._WindowsAclApi(
             open_private_directory=traced_open_private_directory

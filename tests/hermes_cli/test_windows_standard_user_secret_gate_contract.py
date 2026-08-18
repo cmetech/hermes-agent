@@ -330,6 +330,90 @@ def test_native_teams_gate_reports_the_last_bounded_host_operation(
     assert exc_info.value.reason == "teams-first-persist-publish-file"
 
 
+def test_native_teams_gate_distinguishes_a_native_rename_failure(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import windows_permissions
+
+    gate = _load_harness()
+    adapter = gate.NativeWindowsAdapter(workspace=tmp_path)
+
+    class NativeApi:
+        def set_delete_on_close(self, _handle, _delete):
+            return None
+
+        def rename_handle(self, _handle, _parent, _name, *, replace):
+            assert replace is True
+            raise OSError("private native rename detail")
+
+    class PrivateFile:
+        def __init__(self, api):
+            self._api = api
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def write_all(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+        def publish(self, name):
+            self._api.set_delete_on_close(1, False)
+            self._api.rename_handle(1, 2, name, replace=True)
+
+    class PrivateDirectory:
+        def __init__(self, api):
+            self._api = api
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def open_file(self, _name):
+            return None
+
+        def create_file(self, _name):
+            return PrivateFile(self._api)
+
+    module = SimpleNamespace()
+    module._WindowsAclApi = lambda **kwargs: SimpleNamespace(**kwargs)
+
+    def persist(cache):
+        api = module._windows_acl_api()
+        with api.open_private_directory(tmp_path / "cache") as directory:
+            with directory.create_file("temporary") as private_file:
+                private_file.write_all(cache.serialize().encode("utf-8"))
+                private_file.flush()
+                private_file.publish("cache.json")
+
+    module._persist = persist
+    module.cache_path = lambda: tmp_path / "cache" / "cache.json"
+    module._read_cache_text = lambda: None
+    monkeypatch.setattr(adapter, "_load_vendored_teams_module", lambda: module)
+    monkeypatch.setattr(windows_permissions, "_native_api", NativeApi)
+
+    def open_private_directory(_path):
+        return PrivateDirectory(windows_permissions._native_api())
+
+    monkeypatch.setattr(
+        windows_permissions,
+        "open_private_directory",
+        open_private_directory,
+    )
+
+    with pytest.raises(gate._GateCaseFailure) as exc_info:
+        adapter.exercise_teams_cache(tmp_path, b"first", b"replacement")
+
+    assert exc_info.value.reason == "teams-first-persist-publish-rename-file"
+
+
 def test_native_adapter_extracts_only_a_bounded_root_probe_reason(
     tmp_path, monkeypatch
 ) -> None:
