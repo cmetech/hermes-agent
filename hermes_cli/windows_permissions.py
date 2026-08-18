@@ -73,6 +73,7 @@ _DELETE = 0x00010000
 _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
 _FILE_TRAVERSE = 0x00000020
+_FILE_READ_ATTRIBUTES = 0x00000080
 _FILE_DISPOSITION_INFO_CLASS = 4
 _FILE_RENAME_INFO_CLASS = 3
 _STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
@@ -1241,7 +1242,7 @@ def _open_probe_root(
         anchor, components = _probe_root_parts(root)
     except Exception as exc:
         raise _probe_root_failure("parse", exc) from None
-    base_access = _SYNCHRONIZE
+    base_access = _SYNCHRONIZE | _FILE_READ_ATTRIBUTES
     path_handles: list[tuple[int, _FileIdentity]] = []
     component_names: list[str | None] = [None]
     can_create_child: list[bool] = [False]
