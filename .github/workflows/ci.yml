@@ -417,8 +417,9 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Ordinary ``skipped`` results
+  # are allowed, but Python-relevant changes require the native Windows
+  # security gate to finish successfully.
   #
   # Branch protection should require ONLY this check.
   #
@@ -466,13 +467,17 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          blocked = [name for name, info in needs.items() if info['result'] == 'failure']
+          python_relevant = needs['detect']['outputs'].get('python') == 'true'
+          windows_result = needs['windows-secret-storage']['result']
+          if python_relevant and windows_result != 'success' and 'windows-secret-storage' not in blocked:
+              blocked.append('windows-secret-storage')
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+              icon = '❌' if name in blocked else '✅'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if blocked:
+              print(f'::error::{len(blocked)} required job(s) did not pass: {\", \".join(blocked)}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

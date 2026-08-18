@@ -569,8 +569,43 @@ def test_workflow_gates_native_job_by_python_lane_and_aggregates_its_result() ->
     aggregate = workflow["jobs"]["all-checks-pass"]
     assert aggregate["if"] == "always()"
     assert "windows-secret-storage" in aggregate["needs"]
-    evaluator = aggregate["steps"][0]["run"]
-    assert "info['result'] == 'failure'" in evaluator
+
+
+@pytest.mark.parametrize(
+    ("python_lane", "windows_result", "expected_returncode"),
+    [
+        pytest.param("true", "success", 0, id="affected-success"),
+        pytest.param("false", "skipped", 0, id="unaffected-skip"),
+        pytest.param("true", "skipped", 1, id="affected-skip"),
+        pytest.param("true", "failure", 1, id="affected-failure"),
+        pytest.param("true", "cancelled", 1, id="affected-cancellation"),
+    ],
+)
+def test_aggregate_requires_native_success_for_python_relevant_runs(
+    tmp_path, python_lane, windows_result, expected_returncode
+) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    evaluator = workflow["jobs"]["all-checks-pass"]["steps"][0]["run"]
+    needs = {
+        "detect": {"result": "success", "outputs": {"python": python_lane}},
+        "tests": {"result": "success", "outputs": {}},
+        "windows-secret-storage": {"result": windows_result, "outputs": {}},
+    }
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", evaluator],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(output),
+            "NEEDS": json.dumps(needs),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
 
 
 def test_launcher_requires_ci_even_with_a_unit_test_adapter(tmp_path) -> None:
