@@ -200,7 +200,7 @@ function Read-RedactedChildOutput([string]$path) {
         if ($line -match '^explicit-write-probe FAIL reason=probe-(native-api|open-root|open-root-(parse|anchor-open|anchor-validate|component-open|parent-upgrade|component-create|component-validate|revalidate)-(access-denied|sharing-violation|invalid-parameter|not-found|reparse|other)|create-directory|protect-directory|create-file|protect-file|write-file|flush-file|cleanup-file-delete|cleanup-file-close|cleanup-directory-delete|cleanup-directory-close|cleanup-root-close|unknown)$') {
             $lines += $line
         }
-        elseif ($line -match '^teams-cache-round-trip FAIL reason=teams-((first-persist|first-read|replacement-persist|replacement-read)-(outer|open-directory|close-directory|open-file|create-file|close-file|write-file|flush-file|publish-(file|disarm-delete|rename-file|verify-metadata|verify-user|verify-acl)|read-file)|first-acl-directory|first-acl-file|replacement-acl-file|cleanup-file|cleanup-directory)$') {
+        elseif ($line -match '^teams-cache-round-trip FAIL reason=teams-((first-persist|first-read|replacement-persist|replacement-read)-(outer|open-directory|close-directory|open-file|create-file|close-file|write-file|flush-file|publish-(file|disarm-delete|rename-file(-(access-denied|sharing-violation|invalid-parameter|not-found|reparse|other))?|verify-metadata|verify-user|verify-acl)|read-file)|first-acl-directory|first-acl-file|replacement-acl-file|cleanup-file|cleanup-directory)$') {
             $lines += $line
         }
         elseif ($line -match '^(platform-preflight|fresh-profile|arm-disabled-auto-keyring|file-tier-acl-repair|plain-doctor-read-only|explicit-write-probe|teams-cache-round-trip|reparse-rejection|cleanup) (PASS|FAIL)$') {

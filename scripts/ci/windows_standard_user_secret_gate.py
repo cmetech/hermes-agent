@@ -101,6 +101,10 @@ _TEAMS_TRACE_OPERATIONS = frozenset(
         "publish-verify-acl",
         "read-file",
     }
+    | {
+        f"publish-rename-file-{category}"
+        for category in _PROBE_FAILURE_CATEGORIES
+    }
 )
 _TEAMS_FAILURE_REASONS = frozenset(
     {
@@ -130,9 +134,10 @@ class _GateCaseFailure(RuntimeError):
 class _TracedWindowsAclApi:
     """Record bounded publication substages while delegating native calls."""
 
-    def __init__(self, delegate, mark) -> None:
+    def __init__(self, delegate, mark, classify) -> None:
         self._delegate = delegate
         self._mark = mark
+        self._classify = classify
         self._publishing = False
 
     def __getattr__(self, name: str):
@@ -159,7 +164,12 @@ class _TracedWindowsAclApi:
     ) -> None:
         if self._publishing:
             self._mark("publish-rename-file")
-        self._delegate.rename_handle(handle, parent, name, replace=replace)
+        try:
+            self._delegate.rename_handle(handle, parent, name, replace=replace)
+        except Exception as exc:
+            if self._publishing:
+                self._mark(f"publish-rename-file-{self._classify(exc)}")
+            raise
 
     def handle_metadata(self, handle: int):
         if self._publishing:
@@ -753,7 +763,7 @@ class NativeWindowsAdapter:
             mark("open-directory")
             native_api = windows_permissions._native_api
             windows_permissions._native_api = lambda: _TracedWindowsAclApi(
-                native_api(), mark
+                native_api(), mark, windows_permissions._probe_failure_category
             )
             try:
                 directory = windows_permissions.open_private_directory(path)

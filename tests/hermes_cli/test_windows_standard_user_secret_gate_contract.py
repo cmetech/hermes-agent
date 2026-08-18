@@ -398,6 +398,11 @@ def test_native_teams_gate_distinguishes_a_native_rename_failure(
     module._read_cache_text = lambda: None
     monkeypatch.setattr(adapter, "_load_vendored_teams_module", lambda: module)
     monkeypatch.setattr(windows_permissions, "_native_api", NativeApi)
+    monkeypatch.setattr(
+        windows_permissions,
+        "_probe_failure_category",
+        lambda _exc: "sharing-violation",
+    )
 
     def open_private_directory(_path):
         return PrivateDirectory(windows_permissions._native_api())
@@ -411,7 +416,10 @@ def test_native_teams_gate_distinguishes_a_native_rename_failure(
     with pytest.raises(gate._GateCaseFailure) as exc_info:
         adapter.exercise_teams_cache(tmp_path, b"first", b"replacement")
 
-    assert exc_info.value.reason == "teams-first-persist-publish-rename-file"
+    assert (
+        exc_info.value.reason
+        == "teams-first-persist-publish-rename-file-sharing-violation"
+    )
 
 
 def test_native_adapter_extracts_only_a_bounded_root_probe_reason(
