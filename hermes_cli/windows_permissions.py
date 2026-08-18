@@ -555,7 +555,7 @@ class _WindowsAclApi:
         replace: bool,
     ) -> None:
         encoded_name = name.encode("utf-16-le")
-        size = _FILE_RENAME_INFO.FileName.offset + len(encoded_name)
+        size = ctypes.sizeof(_FILE_RENAME_INFO) + len(encoded_name) + 2
         storage = ctypes.create_string_buffer(size)
         information = _FILE_RENAME_INFO.from_buffer(storage)
         information.ReplaceIfExists = bool(replace)

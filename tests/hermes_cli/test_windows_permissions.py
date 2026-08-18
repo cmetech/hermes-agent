@@ -987,6 +987,7 @@ def test_native_private_file_publish_renames_the_held_handle_relative_to_parent(
     from hermes_cli import windows_permissions as permissions
 
     values = []
+    buffers = []
 
     def set_information(handle, info_class, information, size):
         rename = ctypes.cast(
@@ -1005,6 +1006,7 @@ def test_native_private_file_publish_renames_the_held_handle_relative_to_parent(
             name_bytes.decode("utf-16-le"),
             size,
         ))
+        buffers.append(ctypes.string_at(information, size))
         return True
 
     api = _uninitialized_native_api(
@@ -1022,11 +1024,16 @@ def test_native_private_file_publish_renames_the_held_handle_relative_to_parent(
             True,
             0xD11,
             "cache.json",
-            permissions._FILE_RENAME_INFO.FileName.offset
-            + len("cache.json".encode("utf-16-le")),
+            ctypes.sizeof(permissions._FILE_RENAME_INFO)
+            + len("cache.json".encode("utf-16-le"))
+            + 2,
         )
     ]
     assert permissions._FILE_RENAME_INFO._fields_[0][1] is wintypes.BOOLEAN
+    name_end = permissions._FILE_RENAME_INFO.FileName.offset + len(
+        "cache.json".encode("utf-16-le")
+    )
+    assert buffers[0][name_end:] == b"\0" * (len(buffers[0]) - name_end)
 
 
 @pytest.mark.parametrize(
