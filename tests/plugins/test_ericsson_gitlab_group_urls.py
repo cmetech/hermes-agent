@@ -36,14 +36,17 @@ def _client_with_transport(client_module, models_module, handler):
         origin="https://gitlab.example.test",
         pat="test-token",
     )
-    client = client_module.GitLabClient(authentication, max_retries=0)
-    client._client.close()
-    client._client = httpx.Client(
+    transport = client_module.HttpxTransport(
         base_url=authentication.origin,
         headers={"PRIVATE-TOKEN": authentication.pat, "Accept": "application/json"},
-        transport=httpx.MockTransport(handler),
+        path_prefix="/api/v4/",
+        mock_transport=httpx.MockTransport(handler),
     )
-    return client
+    return client_module.GitLabClient(
+        authentication,
+        max_retries=0,
+        transport=transport,
+    )
 
 
 def test_group_listing_accepts_gitlabs_canonical_groups_web_url() -> None:

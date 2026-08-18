@@ -8,6 +8,23 @@ description: "Build wrapper CLIs that extend the Hermes TUI with custom widgets,
 
 Hermes exposes protected extension hooks on `HermesCLI` so wrapper CLIs can add widgets, keybindings, and layout customizations without overriding the 1000+ line `run()` method. This keeps your extension decoupled from internal changes.
 
+Choose the extension surface that matches the user interaction:
+
+| Surface | Use it for |
+|---|---|
+| The protected hooks on this page | Wrapper-TUI widgets, keybindings, layout, styles, and wrapper-owned slash processing |
+| `ctx.register_cli_command()` | A real terminal tree such as `hermes records get ...` |
+| `ctx.register_application_commands()` plus `ctx.invoke_application_command()` | Deterministic execution owned by a separate enabled provider plugin |
+
+For a cross-plugin shell command, the caller owns argparse and rendering while
+the provider owns fresh configuration, secrets, and operations. Reads use
+`read`; writes require explicit `dry_run` or `confirm`. The caller must not
+import another plugin's implementation. See
+[Application command providers](/developer-guide/plugins#application-command-providers)
+for the complete pattern and stable errors. The application-command port does
+not mint or replace model-tool approval and does not run model-tool hooks or
+middleware.
+
 ## Extension points
 
 There are five extension seams available:

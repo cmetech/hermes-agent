@@ -796,6 +796,8 @@ def _write_private(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temporary_identity = _identity(os.fstat(handle.fileno()))
+        if _is_windows():
+            _ensure_private_permissions(Path(tmp_name), 0o600)
         parent_pre_replace = _lstat_direct_directory(
             parent,
             purpose="private replacement parent",

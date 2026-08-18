@@ -55,6 +55,7 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_application_commands import ApplicationCommandHandler
 from hermes_cli.plugin_configuration import (
     PluginConfigurationDescriptor,
     PluginRuntimeConfiguration,
@@ -99,6 +100,10 @@ class PluginToolOverrideError(PermissionError):
 
 class PluginStaticInventoryCapacityError(RuntimeError):
     """Raised when a bounded static manifest scan exhausts its visit budget."""
+
+
+class PluginCliCommandCollisionError(RuntimeError):
+    """Raised when a plugin claims an existing top-level CLI command."""
 
 
 @dataclass
@@ -644,15 +649,70 @@ class PluginContext:
         The *setup_fn* receives an argparse subparser and should add any
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
         as the default dispatch function via ``set_defaults(func=...)``."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("plugin CLI command name must be a non-empty string")
+        plugin_id = self.manifest.key or self.manifest.name
+        existing = self._manager._cli_commands.get(name)
+        if existing is not None:
+            raise PluginCliCommandCollisionError(
+                f"plugin CLI command {name!r} is already registered by "
+                f"{existing.get('plugin')!r}"
+            )
         self._manager._cli_commands[name] = {
             "name": name,
             "help": help,
             "description": description,
             "setup_fn": setup_fn,
             "handler_fn": handler_fn,
-            "plugin": self.manifest.name,
+            "plugin": plugin_id,
         }
         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
+
+    # -- application command registration ------------------------------------
+
+    def register_application_commands(
+        self,
+        *,
+        operations: Mapping[str, str],
+        allowed_callers: Collection[str],
+        handler: ApplicationCommandHandler,
+    ) -> None:
+        """Register this plugin's deterministic local command provider."""
+        from hermes_cli.plugin_application_commands import (
+            _register_application_commands,
+        )
+
+        _register_application_commands(
+            self._manager._application_command_providers,
+            provider_id=self.manifest.key or self.manifest.name,
+            operations=operations,
+            allowed_callers=allowed_callers,
+            handler=handler,
+        )
+
+    def invoke_application_command(
+        self,
+        provider_id: str,
+        operation: str,
+        arguments: Mapping[str, Any],
+        *,
+        mode: str,
+        invocation_id: str,
+    ) -> Mapping[str, Any]:
+        """Invoke an allowed provider as this canonical plugin identity."""
+        from hermes_cli.plugin_application_commands import (
+            _invoke_application_command,
+        )
+
+        return _invoke_application_command(
+            self._manager._application_command_providers,
+            caller_id=self.manifest.key or self.manifest.name,
+            provider_id=provider_id,
+            operation=operation,
+            arguments=arguments,
+            mode=mode,
+            invocation_id=invocation_id,
+        )
 
     # -- slash command registration -------------------------------------------
 
@@ -1423,6 +1483,7 @@ class PluginManager:
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
+        self._application_command_providers: Dict[str, Any] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
@@ -1585,6 +1646,7 @@ class PluginManager:
         self._plugin_tool_names.clear()
         self._plugin_platform_names.clear()
         self._cli_commands.clear()
+        self._application_command_providers.clear()
         self._plugin_commands.clear()
         self._plugin_skills.clear()
         self._aux_tasks.clear()
@@ -2268,6 +2330,8 @@ class PluginManager:
         )
         with self._background_service_lock:
             _services_before = set(self._background_services)
+        _cli_commands_before: set[str] | None = None
+        _application_command_providers_before: set[str] | None = None
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -2297,6 +2361,10 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
+                _cli_commands_before = set(self._cli_commands)
+                _application_command_providers_before = set(
+                    self._application_command_providers
+                )
                 self._registering_plugin_id = _plugin_id
                 self._registering_manifest = manifest
                 try:
@@ -2335,11 +2403,22 @@ class PluginManager:
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
-                        if self._cli_commands[c].get("plugin") == manifest.name
+                        if self._cli_commands[c].get("plugin") == _plugin_id
                     ),
                 )
 
         except Exception as exc:
+            if _application_command_providers_before is not None:
+                for provider_id in (
+                    set(self._application_command_providers)
+                    - _application_command_providers_before
+                ):
+                    if provider_id == _plugin_id:
+                        self._application_command_providers.pop(provider_id, None)
+            if _cli_commands_before is not None:
+                for command_name in set(self._cli_commands) - _cli_commands_before:
+                    if self._cli_commands[command_name].get("plugin") == _plugin_id:
+                        self._cli_commands.pop(command_name, None)
             with self._background_service_lock:
                 for qualified_name in (
                     set(self._background_services) - _services_before

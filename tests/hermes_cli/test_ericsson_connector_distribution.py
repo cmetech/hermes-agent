@@ -24,11 +24,22 @@ EXPECTED_GITLAB_READ_EXPLORATION_TOOLS = {
     "gitlab_list_merge_request_commits",
     "gitlab_list_merge_request_discussions",
 }
-EXPECTED_JIRA_TOOLS = {
+REQUIRED_JIRA_TOOLS = {
     "jira_my_tickets",
     "jira_search_issues",
     "jira_get_issue",
     "jira_add_comment",
+    "jira_list_fields",
+    "jira_get_project",
+    "jira_list_transitions",
+    "jira_search_assignable_users",
+    "jira_transition_issue",
+    "jira_assign_issue",
+    "jira_update_fields",
+    "jira_manage_labels",
+    "jira_create_issue",
+    "jira_list_link_types",
+    "jira_link_issues",
 }
 EXPECTED_SHAREPOINT_TOOLS = {
     "sharepoint_resolve_url",
@@ -72,7 +83,7 @@ def test_checked_in_jira_bundle_is_standalone_and_complete() -> None:
     )
 
     assert descriptor["kind"] == "standalone"
-    assert set(descriptor["provides_tools"]) == EXPECTED_JIRA_TOOLS
+    assert REQUIRED_JIRA_TOOLS <= set(descriptor["provides_tools"])
     assert (plugin_root / "config.schema.json").is_file()
     assert {path.parent.name for path in plugin_root.glob("skills/*/SKILL.md")} == {
         "ticket-research",

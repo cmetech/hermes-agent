@@ -14,6 +14,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 CLIENT_ID = os.environ.get("ERICSSON_GRAPH_CLIENT_ID",
                            "04b07795-8ddb-461a-bbee-02f9e1bf7b46")  # Azure CLI public client
@@ -21,6 +22,11 @@ AUTHORITY = "https://login.microsoftonline.com/organizations"
 SCOPES = ["https://graph.microsoft.com/.default"]
 
 _PENDING_FLOW = None
+_MAX_CACHE_BYTES = 16 * 1024 * 1024
+
+
+class _WindowsAclApi(NamedTuple):
+    open_private_directory: Callable[[Path], object]
 
 
 class AuthRequired(RuntimeError):
@@ -30,6 +36,18 @@ class AuthRequired(RuntimeError):
 def cache_path() -> Path:
     home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
     return home / "ericsson" / "msal_token_cache.json"
+
+
+def _platform_name() -> str:
+    return os.name
+
+
+def _windows_acl_api() -> _WindowsAclApi:
+    from hermes_cli.windows_permissions import open_private_directory
+
+    return _WindowsAclApi(
+        open_private_directory=open_private_directory,
+    )
 
 
 def _app():
@@ -45,8 +63,11 @@ def _app():
 
 def _read_cache_text() -> str | None:
     try:
-        if os.name == "posix":
+        platform = _platform_name()
+        if platform == "posix":
             return _read_cache_posix()
+        if platform == "nt":
+            return _read_cache_windows()
         path = cache_path()
         try:
             return path.read_text(encoding="utf-8")
@@ -56,6 +77,31 @@ def _read_cache_text() -> str | None:
         raise AuthRequired(
             "could not read the Microsoft Graph sign-in cache securely"
         ) from None
+
+
+def _load_windows_acl_api() -> _WindowsAclApi:
+    try:
+        return _windows_acl_api()
+    except Exception as error:
+        raise OSError("Windows ACL host API is unavailable") from error
+
+
+def _read_cache_windows() -> str | None:
+    path = cache_path()
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        return None
+    try:
+        api = _load_windows_acl_api()
+        with api.open_private_directory(path.parent) as directory:
+            private_file = directory.open_file(path.name)
+            if private_file is None:
+                return None
+            with private_file:
+                return private_file.read_all(max_bytes=_MAX_CACHE_BYTES).decode("utf-8")
+    except Exception as error:
+        raise OSError("could not read private Windows cache") from error
 
 
 def _read_cache_posix() -> str | None:
@@ -99,7 +145,7 @@ def _read_cache_posix() -> str | None:
             if not chunk:
                 break
             total += len(chunk)
-            if total > 16 * 1024 * 1024:
+            if total > _MAX_CACHE_BYTES:
                 raise ValueError("cache is too large")
             chunks.append(chunk)
         return b"".join(chunks).decode("utf-8")
@@ -114,14 +160,47 @@ def _persist(cache) -> None:
         return
     try:
         serialized = cache.serialize().encode("utf-8")
-        if os.name == "posix":
+        platform = _platform_name()
+        if platform == "posix":
             _persist_posix(serialized)
+        elif platform == "nt":
+            _persist_windows(serialized)
         else:
             _persist_portable(serialized)
     except (OSError, UnicodeError, TypeError, ValueError):
         raise AuthRequired(
             "could not store the Microsoft Graph sign-in cache securely"
         ) from None
+
+
+def _persist_windows(serialized: bytes) -> None:
+    """Atomically publish a cache protected by the host's Windows ACL API."""
+    path = cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        api = _load_windows_acl_api()
+        with api.open_private_directory(path.parent) as directory:
+            destination = directory.open_file(path.name)
+            if destination is not None:
+                destination.close()
+
+            private_file = None
+            for _ in range(8):
+                candidate = f".{path.name}.{secrets.token_hex(8)}.tmp"
+                try:
+                    private_file = directory.create_file(candidate)
+                except FileExistsError:
+                    continue
+                break
+            if private_file is None:
+                raise OSError("could not reserve a cache temporary file")
+
+            with private_file:
+                private_file.write_all(serialized)
+                private_file.flush()
+                private_file.publish(path.name)
+    except Exception as error:
+        raise OSError("could not store private Windows cache") from error
 
 
 def _persist_posix(serialized: bytes) -> None:
