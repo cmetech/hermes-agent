@@ -1209,7 +1209,7 @@ def _open_probe_root(
 ) -> int:
     """Walk or create one absolute directory from an immutable anchor handle."""
     anchor, components = _probe_root_parts(root)
-    base_access = _FILE_TRAVERSE | _SYNCHRONIZE
+    base_access = _SYNCHRONIZE
     path_handles: list[tuple[int, _FileIdentity]] = []
     component_names: list[str | None] = [None]
     can_create_child: list[bool] = [False]
@@ -1224,7 +1224,7 @@ def _open_probe_root(
 
     anchor_handle = api.open_handle(
         anchor,
-        access=base_access,
+        access=0,
         flags=_open_flags(directory=True),
     )
     anchor_metadata = track(anchor_handle)

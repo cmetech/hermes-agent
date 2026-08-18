@@ -623,12 +623,10 @@ def test_private_write_probe_uses_only_relative_handles_and_deletes_them(
     assert result == permissions._WindowsPrivateProbeResult(None, False)
     assert len(api.opens) == 1
     assert api.opens[0][0] == Path(tmp_path.anchor)
-    assert api.opens[0][1] == FILE_TRAVERSE | SYNCHRONIZE
+    assert api.opens[0][1] == 0
     assert [item[1] for item in api.walk] == list(tmp_path.parts[1:])
-    assert [item[2] for item in api.walk[:-1]] == [FILE_TRAVERSE | SYNCHRONIZE] * (
-        len(api.walk) - 1
-    )
-    assert api.walk[-1][2] == (FILE_TRAVERSE | SYNCHRONIZE | FILE_ADD_SUBDIRECTORY)
+    assert [item[2] for item in api.walk[:-1]] == [SYNCHRONIZE] * (len(api.walk) - 1)
+    assert api.walk[-1][2] == (SYNCHRONIZE | FILE_ADD_SUBDIRECTORY)
     root_handle = api.walk[-1][3]
     probe_handle = api.relative[0][0] + 1
     file_handle = probe_handle + 1
@@ -734,14 +732,14 @@ def test_private_write_probe_creates_absent_root_from_held_ancestor(
     assert result == permissions._WindowsPrivateProbeResult(None, False)
     assert root.is_dir()
     assert list(root.iterdir()) == []
-    assert api.root_opens == [FILE_TRAVERSE | SYNCHRONIZE]
+    assert api.root_opens == [0]
     assert api.root_creates == [
-        FILE_TRAVERSE | SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
-        FILE_TRAVERSE | SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
+        SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
+        SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
     ]
     assert set(api.relative_opens) <= {
-        FILE_TRAVERSE | SYNCHRONIZE,
-        FILE_TRAVERSE | SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
+        SYNCHRONIZE,
+        SYNCHRONIZE | FILE_ADD_SUBDIRECTORY,
         READ_CONTROL | WRITE_DAC | DELETE | SYNCHRONIZE | FILE_ADD_FILE,
     }
 
